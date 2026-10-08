@@ -457,20 +457,20 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     }
     const auto& page = plan.writes_[i];
     RecoveredOrderedGroup candidate{
-        .incarnation_ = plan.root_.incarnation_,
-        .id_ = page.id_,
-        .previous_ = page.previous_,
-        .next_ = page.next_,
-        .sequence_ = revision,
-        .lsn_ = revision,
-        .txid_ = tx->txid_,
-        .batch_txid_ = command_batch,
-        .item_count_ = group.location_.logical_size_,
-        .encoded_bytes_ = ordered_sizes[i],
-        .record_token_ = page.id_,
-        .retired_ = group.retired_,
-        .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
-        .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_};
+        {.incarnation_ = plan.root_.incarnation_,
+         .id_ = page.id_,
+         .previous_ = page.previous_,
+         .next_ = page.next_,
+         .sequence_ = revision,
+         .lsn_ = revision,
+         .item_count_ = group.location_.logical_size_,
+         .encoded_bytes_ = ordered_sizes[i],
+         .record_token_ = page.id_,
+         .retired_ = group.retired_,
+         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
+         .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_},
+        tx->txid_,
+        command_batch};
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {
       auto max_key = StreamRecordKey(page.entries_.back().value_);
       if (!max_key.ok()) co_return max_key.status();

@@ -65,19 +65,21 @@ std::vector<RecoveredOrderedGroup> Candidates(
   std::vector<RecoveredOrderedGroup> result;
   for (const auto& page : pages) {
     result.push_back(
-        {.incarnation_ = page.incarnation_,
-         .id_ = page.id_,
-         .previous_ = page.previous_,
-         .next_ = page.next_,
-         .sequence_ = seq,
-         .lsn_ = seq,
-         .txid_ = txid,
-         .item_count_ = page.entries_.size(),
-         .record_token_ = page.id_,
-         .retired_ = page.retired_,
-         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
-         .max_score_ =
-             page.entries_.empty() ? 0 : page.entries_.back().score_});
+        {{.incarnation_ = page.incarnation_,
+          .id_ = page.id_,
+          .previous_ = page.previous_,
+          .next_ = page.next_,
+          .sequence_ = seq,
+          .lsn_ = seq,
+          .item_count_ = page.entries_.size(),
+          .record_token_ = page.id_,
+          .retired_ = page.retired_,
+          .min_score_ =
+              page.entries_.empty() ? 0 : page.entries_.front().score_,
+          .max_score_ =
+              page.entries_.empty() ? 0 : page.entries_.back().score_},
+         txid,
+         0});
   }
   return result;
 }
@@ -782,6 +784,30 @@ TEST(GroupedCollectionTest, RankUpdatesPreserveViewsAcrossOrderedKinds) {
     ASSERT_TRUE(original->FindRank(7));
     EXPECT_EQ(original->FindRank(7)->group_index_, 2);
 
+    // The shared update path must reject malformed batches for every layout,
+    // including duplicates whose deltas would otherwise be applied twice.
+    for (auto field :
+         {&OrderedGroupEntry::incarnation_, &OrderedGroupEntry::id_,
+          &OrderedGroupEntry::sequence_, &OrderedGroupEntry::lsn_,
+          &OrderedGroupEntry::record_token_, &OrderedGroupEntry::item_count_}) {
+      auto invalid = changed;
+      invalid.*field = 0;
+      EXPECT_EQ(
+          original->Apply(root, 2, std::span(&invalid, 1), 2, member_changes)
+              .status()
+              .code(),
+          absl::StatusCode::kDataLoss);
+    }
+    const std::array duplicates{changed, changed};
+    EXPECT_EQ(
+        original->Apply(root, 2, duplicates, 2, member_changes).status().code(),
+        absl::StatusCode::kDataLoss);
+    auto bad_total = root;
+    ++bad_total.item_count_;
+    EXPECT_FALSE(
+        original->Apply(bad_total, 2, changes, 2, member_changes).ok());
+    EXPECT_EQ(original->CountBefore(3), 9);
+
     // Sharing a rank representation does not allow changing a collection
     // kind in place; the directory still owns that identity invariant.
     root.kind_ = kind == OrderedCollectionKind::kStream
@@ -1046,12 +1072,12 @@ TEST(GroupedCollectionTest, RecoveryFindsRetiredPagesFromUnorderedCandidates) {
   auto root = Root(pages, 82);
   auto candidates = Candidates(pages);
   for (std::uint64_t id = 2; id < 82; ++id)
-    candidates.push_back({.incarnation_ = root.incarnation_,
-                          .id_ = id,
-                          .sequence_ = 1,
-                          .lsn_ = 1,
-                          .record_token_ = id,
-                          .retired_ = true});
+    candidates.push_back({{.incarnation_ = root.incarnation_,
+                           .id_ = id,
+                           .sequence_ = 1,
+                           .lsn_ = 1,
+                           .record_token_ = id,
+                           .retired_ = true}});
   std::reverse(candidates.begin(), candidates.end());
   auto recovered = OrderedGroupDirectory::Recover(root, 1, candidates, {});
   ASSERT_TRUE(recovered.ok()) << recovered.status();
@@ -1189,12 +1215,12 @@ TEST(GroupedCollectionTest, EnvelopeOnlyDecodeAndDualDecisionRetirement) {
   root.revision_ = 10;
   auto candidates = Candidates({page}, 10, 100);
   candidates.front().batch_txid_ = 200;
-  candidates.push_back({.incarnation_ = 17,
-                        .id_ = 2,
-                        .sequence_ = 9,
-                        .lsn_ = 2,
-                        .record_token_ = 2,
-                        .retired_ = true});
+  candidates.push_back({{.incarnation_ = 17,
+                         .id_ = 2,
+                         .sequence_ = 9,
+                         .lsn_ = 2,
+                         .record_token_ = 2,
+                         .retired_ = true}});
   EXPECT_FALSE(
       OrderedGroupDirectory::Recover(root, 10, candidates, {100}, 7).ok());
   auto directory =
@@ -1237,14 +1263,14 @@ TEST(GroupedCollectionTest,
     for (std::size_t n = 0; n < pages; ++n) {
       counts.push_back(3 + n % 7);
       root.item_count_ += counts.back();
-      records.push_back({.incarnation_ = 17,
-                         .id_ = n + 1,
-                         .previous_ = n,
-                         .next_ = n + 1 == pages ? 0 : n + 2,
-                         .sequence_ = 1,
-                         .lsn_ = 1,
-                         .item_count_ = counts.back(),
-                         .record_token_ = n + 1});
+      records.push_back({{.incarnation_ = 17,
+                          .id_ = n + 1,
+                          .previous_ = n,
+                          .next_ = n + 1 == pages ? 0 : n + 2,
+                          .sequence_ = 1,
+                          .lsn_ = 1,
+                          .item_count_ = counts.back(),
+                          .record_token_ = n + 1}});
     }
     auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
     ASSERT_TRUE(directory.ok()) << directory.status();
@@ -1376,13 +1402,14 @@ TEST(GroupedCollectionTest,
     auto root = Root(pages, 72);
     if (kind == OrderedCollectionKind::kStream) root.stream_length_ = 0;
     auto records = Candidates(pages, 1, 100);
-    records.push_back({.incarnation_ = 17,
-                       .id_ = 71,
-                       .sequence_ = 1,
-                       .lsn_ = 1,
-                       .txid_ = 100,
-                       .record_token_ = 71,
-                       .retired_ = true});
+    records.push_back({{.incarnation_ = 17,
+                        .id_ = 71,
+                        .sequence_ = 1,
+                        .lsn_ = 1,
+                        .record_token_ = 71,
+                        .retired_ = true},
+                       100,
+                       0});
     auto directory = OrderedGroupDirectory::Recover(root, 1, records, {100});
     ASSERT_TRUE(directory.ok()) << directory.status();
     const auto pinned = *directory;

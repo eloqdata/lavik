@@ -794,24 +794,25 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     "ordered page disagrees with its record identity");
               }
               ordered_group = RecoveredOrderedGroup{
-                  .incarnation_ = decoded->incarnation_,
-                  .id_ = decoded->id_,
-                  .previous_ = decoded->previous_,
-                  .next_ = decoded->next_,
-                  .sequence_ = record.mutation_sequence_,
-                  .lsn_ = record.lsn_,
-                  .txid_ = record.txid_,
-                  .batch_txid_ = record.group_batch_txid_,
-                  .item_count_ = record.logical_size_,
-                  .encoded_bytes_ = group_bytes,
-                  .retired_ = record.group_retired_,
-                  .min_score_ = decoded->entries_.empty()
-                                    ? 0
-                                    : decoded->entries_.front().score_,
-                  .max_score_ = decoded->entries_.empty()
-                                    ? 0
-                                    : decoded->entries_.back().score_,
-              };
+                  {
+                      .incarnation_ = decoded->incarnation_,
+                      .id_ = decoded->id_,
+                      .previous_ = decoded->previous_,
+                      .next_ = decoded->next_,
+                      .sequence_ = record.mutation_sequence_,
+                      .lsn_ = record.lsn_,
+                      .item_count_ = record.logical_size_,
+                      .encoded_bytes_ = group_bytes,
+                      .retired_ = record.group_retired_,
+                      .min_score_ = decoded->entries_.empty()
+                                        ? 0
+                                        : decoded->entries_.front().score_,
+                      .max_score_ = decoded->entries_.empty()
+                                        ? 0
+                                        : decoded->entries_.back().score_,
+                  },
+                  record.txid_,
+                  record.group_batch_txid_};
               if (ordered_kind == OrderedCollectionKind::kStream &&
                   !decoded->retired_) {
                 auto max_key = StreamRecordKey(decoded->entries_.back().value_);
@@ -1544,18 +1545,19 @@ StorageEngine::Impl::RecoverOrderedObject(
     auto& physical = first[token];
     const auto& header = physical.auxiliary_group_;
     RecoveredOrderedGroup candidate{
-        .incarnation_ = header.incarnation_,
-        .id_ = id,
-        .sequence_ = header.sequence_,
-        .lsn_ = header.lsn_,
-        .txid_ = header.txid_,
-        .batch_txid_ = header.batch_txid_,
-        .item_count_ = header.field_count_,
-        .encoded_bytes_ = header.encoded_bytes_,
-        // The standalone ordered codec reserves zero as an invalid token.
-        .record_token_ = token + 1,
-        .retired_ = header.retired_,
-    };
+        {
+            .incarnation_ = header.incarnation_,
+            .id_ = id,
+            .sequence_ = header.sequence_,
+            .lsn_ = header.lsn_,
+            .item_count_ = header.field_count_,
+            .encoded_bytes_ = header.encoded_bytes_,
+            // The standalone ordered codec reserves zero as an invalid token.
+            .record_token_ = token + 1,
+            .retired_ = header.retired_,
+        },
+        header.txid_,
+        header.batch_txid_};
     if (physical.location_.external()) {
       const ExtentManifest& extents = store.AuxiliaryExtents(physical);
       if (extents == nullptr) {
@@ -1615,7 +1617,7 @@ StorageEngine::Impl::RecoverOrderedObject(
   if (!directory.ok()) co_return directory.status();
   std::vector<GroupedRecordLocation> locations;
   locations.reserve(candidates.size());
-  const auto append = [&](const RecoveredOrderedGroup& candidate) {
+  const auto append = [&](const OrderedGroupEntry& candidate) {
     auto& physical = first[candidate.record_token_ - 1];
     physical.grouped_reachable_ = true;
     locations.push_back(GroupedRecordLocation{

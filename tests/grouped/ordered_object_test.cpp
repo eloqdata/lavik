@@ -57,20 +57,20 @@ TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
                              .group_count_ = 2,
                              .revision_ = 1,
                              .stream_length_ = 1};
-  std::vector<RecoveredOrderedGroup> pages{{.incarnation_ = 17,
-                                            .id_ = 1,
-                                            .next_ = 2,
-                                            .sequence_ = 1,
-                                            .lsn_ = 1,
-                                            .item_count_ = 1,
-                                            .record_token_ = 1},
-                                           {.incarnation_ = 17,
-                                            .id_ = 2,
-                                            .previous_ = 1,
-                                            .sequence_ = 1,
-                                            .lsn_ = 2,
-                                            .item_count_ = 1,
-                                            .record_token_ = 2}};
+  std::vector<RecoveredOrderedGroup> pages{{{.incarnation_ = 17,
+                                             .id_ = 1,
+                                             .next_ = 2,
+                                             .sequence_ = 1,
+                                             .lsn_ = 1,
+                                             .item_count_ = 1,
+                                             .record_token_ = 1}},
+                                           {{.incarnation_ = 17,
+                                             .id_ = 2,
+                                             .previous_ = 1,
+                                             .sequence_ = 1,
+                                             .lsn_ = 2,
+                                             .item_count_ = 1,
+                                             .record_token_ = 2}}};
   auto directory = OrderedGroupDirectory::Recover(root, 1, pages, {});
   ASSERT_TRUE(directory.ok()) << directory.status();
   EXPECT_EQ(directory->CountBefore(0), 0);
@@ -127,26 +127,26 @@ OrderedInput OrderedFixture(ValueType type = ValueType::kList) {
                              .next_group_id_ = 4,
                              .group_count_ = 2,
                              .revision_ = 3};
-  std::vector<RecoveredOrderedGroup> candidates{{.incarnation_ = 17,
-                                                 .id_ = 1,
-                                                 .next_ = 3,
-                                                 .sequence_ = 3,
-                                                 .lsn_ = 1,
-                                                 .item_count_ = 2,
-                                                 .record_token_ = 1},
-                                                {.incarnation_ = 17,
-                                                 .id_ = 2,
-                                                 .sequence_ = 3,
-                                                 .lsn_ = 2,
-                                                 .record_token_ = 2,
-                                                 .retired_ = true},
-                                                {.incarnation_ = 17,
-                                                 .id_ = 3,
-                                                 .previous_ = 1,
-                                                 .sequence_ = 3,
-                                                 .lsn_ = 3,
-                                                 .item_count_ = 2,
-                                                 .record_token_ = 3}};
+  std::vector<RecoveredOrderedGroup> candidates{{{.incarnation_ = 17,
+                                                  .id_ = 1,
+                                                  .next_ = 3,
+                                                  .sequence_ = 3,
+                                                  .lsn_ = 1,
+                                                  .item_count_ = 2,
+                                                  .record_token_ = 1}},
+                                                {{.incarnation_ = 17,
+                                                  .id_ = 2,
+                                                  .sequence_ = 3,
+                                                  .lsn_ = 2,
+                                                  .record_token_ = 2,
+                                                  .retired_ = true}},
+                                                {{.incarnation_ = 17,
+                                                  .id_ = 3,
+                                                  .previous_ = 1,
+                                                  .sequence_ = 3,
+                                                  .lsn_ = 3,
+                                                  .item_count_ = 2,
+                                                  .record_token_ = 3}}};
   std::optional<HashGroupDirectory> members;
   if (kind == OrderedCollectionKind::kSortedSet) {
     root.member_index_ = grouped_test::MemberRoot(root);
@@ -197,14 +197,14 @@ TEST(GroupedOrderedObjectTest,
     std::vector<RecoveredOrderedGroup> records;
     std::vector<GroupedRecordLocation> locations;
     for (std::uint64_t i = 1; i <= count; ++i) {
-      records.push_back({.incarnation_ = 17,
-                         .id_ = base + i,
-                         .previous_ = i == 1 ? 0 : base + i - 1,
-                         .next_ = i == count ? 0 : base + i + 1,
-                         .sequence_ = 3,
-                         .lsn_ = i,
-                         .item_count_ = 1,
-                         .record_token_ = i});
+      records.push_back({{.incarnation_ = 17,
+                          .id_ = base + i,
+                          .previous_ = i == 1 ? 0 : base + i - 1,
+                          .next_ = i == count ? 0 : base + i + 1,
+                          .sequence_ = 3,
+                          .lsn_ = i,
+                          .item_count_ = 1,
+                          .record_token_ = i}});
       locations.push_back(
           {.id_ = {base + i, 0}, .location_ = OrderedLocation(i, 3, 1, type)});
     }
@@ -224,13 +224,13 @@ TEST(GroupedOrderedObjectTest,
     tail.lsn_ = 200;
     tail.record_token_ = 200;
     const std::array<RecoveredOrderedGroup, 2> changed{
-        tail, RecoveredOrderedGroup{.incarnation_ = 17,
-                                    .id_ = added_id,
-                                    .previous_ = root.last_group_,
-                                    .sequence_ = 4,
-                                    .lsn_ = 201,
-                                    .item_count_ = 1,
-                                    .record_token_ = 201}};
+        tail, RecoveredOrderedGroup{{.incarnation_ = 17,
+                                     .id_ = added_id,
+                                     .previous_ = root.last_group_,
+                                     .sequence_ = 4,
+                                     .lsn_ = 201,
+                                     .item_count_ = 1,
+                                     .record_token_ = 201}}};
     root.last_group_ = added_id;
     root.next_group_id_ = std::max(root.next_group_id_, added_id + 1);
     ++root.group_count_;
@@ -292,14 +292,14 @@ TEST(GroupedOrderedObjectTest, StringVectorSharesUntouchedPagesAndOldViews) {
   std::vector<RecoveredOrderedGroup> candidates;
   std::vector<GroupedRecordLocation> locations;
   for (std::uint64_t id = 1; id <= count; ++id) {
-    candidates.push_back({.incarnation_ = 17,
-                          .id_ = id,
-                          .previous_ = id - 1,
-                          .next_ = id == count ? 0 : id + 1,
-                          .sequence_ = 3,
-                          .lsn_ = id,
-                          .item_count_ = kStringGroupBytes,
-                          .record_token_ = id});
+    candidates.push_back({{.incarnation_ = 17,
+                           .id_ = id,
+                           .previous_ = id - 1,
+                           .next_ = id == count ? 0 : id + 1,
+                           .sequence_ = 3,
+                           .lsn_ = id,
+                           .item_count_ = kStringGroupBytes,
+                           .record_token_ = id}});
     locations.push_back(
         {.id_ = {id, 0},
          .location_ = OrderedLocation(id, 3, kStringGroupBytes, type),

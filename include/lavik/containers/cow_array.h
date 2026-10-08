@@ -25,7 +25,6 @@
 #include <iterator>
 #include <limits>
 #include <memory>
-#include <ranges>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -205,22 +204,6 @@ class CowArray {
   // Copy values into exact-capacity chunks. Admission failure releases all
   // partial storage; a single chunk needs no pointer-tree allocation.
   static absl::StatusOr<CowArray> From(std::span<const T> values) {
-    return FromSpan(values);
-  }
-  // Construct entries directly from a contiguous source range, avoiding a
-  // second full-size staging vector when the resident type drops input fields.
-  template <std::ranges::contiguous_range Range>
-    requires std::constructible_from<T,
-                                     const std::ranges::range_value_t<Range>&>
-  static absl::StatusOr<CowArray> From(const Range& values) {
-    using U = std::ranges::range_value_t<Range>;
-    return FromSpan(std::span<const U>(std::ranges::data(values),
-                                       std::ranges::size(values)));
-  }
-
- private:
-  template <typename U>
-  static absl::StatusOr<CowArray> FromSpan(std::span<const U> values) {
     CowArray result;
     if (values.empty()) return result;
     if (values.size() <= ChunkEntries) {
@@ -240,26 +223,10 @@ class CowArray {
     return result;
   }
 
- public:
   // Return a longer immutable view, sharing complete chunks. The partially
   // filled tail is copied with geometric capacity for subsequent appends.
   // Failure leaves the predecessor and its borrowed references untouched.
   absl::StatusOr<CowArray> Appended(std::span<const T> values) const {
-    return AppendSpan(values);
-  }
-  // Like From, append may convert input entries directly into resident ones.
-  template <std::ranges::contiguous_range Range>
-    requires std::constructible_from<T,
-                                     const std::ranges::range_value_t<Range>&>
-  absl::StatusOr<CowArray> Appended(const Range& values) const {
-    using U = std::ranges::range_value_t<Range>;
-    return AppendSpan(std::span<const U>(std::ranges::data(values),
-                                         std::ranges::size(values)));
-  }
-
- private:
-  template <typename U>
-  absl::StatusOr<CowArray> AppendSpan(std::span<const U> values) const {
     if (empty()) return From(values);
     if (values.empty()) return *this;
     if (values.size() > std::numeric_limits<std::size_t>::max() - size_)
@@ -308,7 +275,6 @@ class CowArray {
     return result;
   }
 
- public:
   std::size_t size() const noexcept { return root_ ? size_ : 0; }
   bool empty() const noexcept { return size() == 0; }
   const T& operator[](std::size_t index) const noexcept {
@@ -382,9 +348,8 @@ class CowArray {
     return absl::ResourceExhaustedError(
         "OOM copy-on-write array exceeds maxmemory");
   }
-  template <typename U>
   static absl::StatusOr<Link> AllocateChunk(std::size_t capacity,
-                                            std::span<const U> values) {
+                                            std::span<const T> values) {
     assert(capacity != 0 && capacity <= ChunkEntries &&
            values.size() <= capacity);
     if (capacity >
@@ -437,8 +402,7 @@ class CowArray {
       if (shift == 0) return link;
     }
   }
-  template <typename U>
-  static absl::StatusOr<Link> Build(std::span<const U> values, unsigned shift) {
+  static absl::StatusOr<Link> Build(std::span<const T> values, unsigned shift) {
     auto root = AllocateBranch(nullptr);
     if (!root.ok()) return root.status();
     auto& children = static_cast<Branch*>(root->get())->children_;

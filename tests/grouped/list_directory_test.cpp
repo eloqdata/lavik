@@ -48,15 +48,15 @@ class ListRingTest : public testing::Test {
         .revision_ = 1};
     std::vector<RecoveredOrderedGroup> records;
     for (std::size_t i = 0; i < count; ++i) {
-      records.push_back({.incarnation_ = 17,
-                         .id_ = i + 1,
-                         .previous_ = i,
-                         .next_ = i + 1 == count ? 0 : i + 2,
-                         .sequence_ = 1,
-                         .lsn_ = 1,
-                         .item_count_ = 1 + i % 7,
-                         .encoded_bytes_ = 64 + 16 * (1 + i % 7),
-                         .record_token_ = i + 1});
+      records.push_back({{.incarnation_ = 17,
+                          .id_ = i + 1,
+                          .previous_ = i,
+                          .next_ = i + 1 == count ? 0 : i + 2,
+                          .sequence_ = 1,
+                          .lsn_ = 1,
+                          .item_count_ = 1 + i % 7,
+                          .encoded_bytes_ = 64 + 16 * (1 + i % 7),
+                          .record_token_ = i + 1}});
       root.item_count_ += records.back().item_count_;
     }
     return OrderedGroupDirectory::Recover(root, 1, records, {}, 1);
@@ -76,23 +76,23 @@ class ListRingTest : public testing::Test {
     for (std::size_t i = 0; i < counts.size(); ++i) {
       const auto id =
           i == 0 ? old.groups()[begin].id_ : edit.root_.next_group_id_++;
-      inserted.push_back({.incarnation_ = 17,
-                          .id_ = id,
-                          .sequence_ = revision,
-                          .lsn_ = revision,
-                          .item_count_ = counts[i],
-                          .encoded_bytes_ = 64 + counts[i] * 16,
-                          .record_token_ = id});
+      inserted.push_back({{.incarnation_ = 17,
+                           .id_ = id,
+                           .sequence_ = revision,
+                           .lsn_ = revision,
+                           .item_count_ = counts[i],
+                           .encoded_bytes_ = 64 + counts[i] * 16,
+                           .record_token_ = id}});
     }
     for (std::size_t i = begin + (counts.empty() ? 0 : 1); i < begin + erased;
          ++i)
-      edit.changed_.push_back({.incarnation_ = 17,
-                               .id_ = old.groups()[i].id_,
-                               .sequence_ = revision,
-                               .lsn_ = revision,
-                               .encoded_bytes_ = 64,
-                               .record_token_ = old.groups()[i].id_,
-                               .retired_ = true});
+      edit.changed_.push_back({{.incarnation_ = 17,
+                                .id_ = old.groups()[i].id_,
+                                .sequence_ = revision,
+                                .lsn_ = revision,
+                                .encoded_bytes_ = 64,
+                                .record_token_ = old.groups()[i].id_,
+                                .retired_ = true}});
     edit.expected_.erase(edit.expected_.begin() + begin,
                          edit.expected_.begin() + begin + erased);
     edit.expected_.insert(edit.expected_.begin() + begin, inserted.begin(),

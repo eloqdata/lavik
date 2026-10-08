@@ -272,15 +272,13 @@ struct StreamPageMaxKey {
   std::optional<bool> LessThanOrEqual(std::string_view key) const noexcept;
 };
 
-struct RecoveredOrderedGroup {
+struct OrderedGroupEntry {
   std::uint64_t incarnation_ = 0;
   std::uint64_t id_ = 0;
   std::uint64_t previous_ = 0;
   std::uint64_t next_ = 0;
   std::uint64_t sequence_ = 0;
   std::uint64_t lsn_ = 0;
-  std::uint64_t txid_ = 0;
-  std::uint64_t batch_txid_ = 0;
   std::uint64_t item_count_ = 0;
   // Complete encoded page payload, including the ordered-page envelope.
   std::uint64_t encoded_bytes_ = 0;
@@ -297,57 +295,16 @@ struct RecoveredOrderedGroup {
   mutable StreamPageMaxKey stream_max_key_{};
 };
 
-// Recovery adjudicates transaction tags before constructing resident entries.
-// Keep those tags only in RecoveredOrderedGroup candidates; foreground
-// transaction publication/undo is tracked separately by the storage engine.
-// Incarnation, sequence, LSN and record token remain available for the existing
-// identity/version checks and for reconstructing candidate views.
-struct OrderedGroupEntry {
-  std::uint64_t incarnation_ = 0;
-  std::uint64_t id_ = 0;
-  std::uint64_t previous_ = 0;
-  std::uint64_t next_ = 0;
-  std::uint64_t sequence_ = 0;
-  std::uint64_t lsn_ = 0;
-  std::uint64_t item_count_ = 0;
-  std::uint64_t encoded_bytes_ = 0;
-  std::uint64_t record_token_ = 0;
-  bool retired_ = false;
-  double min_score_ = 0;
-  double max_score_ = 0;
-  mutable StreamPageMaxKey stream_max_key_{};
+// Recovery candidates add decision tags to the same metadata used by resident
+// pages and foreground validation. Once adjudicated, only the base entry is
+// retained. This is a value extension: no virtual dispatch or separate storage.
+struct RecoveredOrderedGroup : OrderedGroupEntry {
+  std::uint64_t txid_ = 0;
+  std::uint64_t batch_txid_ = 0;
 
-  OrderedGroupEntry() = default;
-  OrderedGroupEntry(const RecoveredOrderedGroup& item)
-      : incarnation_(item.incarnation_),
-        id_(item.id_),
-        previous_(item.previous_),
-        next_(item.next_),
-        sequence_(item.sequence_),
-        lsn_(item.lsn_),
-        item_count_(item.item_count_),
-        encoded_bytes_(item.encoded_bytes_),
-        record_token_(item.record_token_),
-        retired_(item.retired_),
-        min_score_(item.min_score_),
-        max_score_(item.max_score_),
-        stream_max_key_(item.stream_max_key_) {}
-  // A published entry converted back into a candidate is already adjudicated.
-  operator RecoveredOrderedGroup() const {
-    return {.incarnation_ = incarnation_,
-            .id_ = id_,
-            .previous_ = previous_,
-            .next_ = next_,
-            .sequence_ = sequence_,
-            .lsn_ = lsn_,
-            .item_count_ = item_count_,
-            .encoded_bytes_ = encoded_bytes_,
-            .record_token_ = record_token_,
-            .retired_ = retired_,
-            .min_score_ = min_score_,
-            .max_score_ = max_score_,
-            .stream_max_key_ = stream_max_key_};
-  }
+  RecoveredOrderedGroup(OrderedGroupEntry entry = {}, std::uint64_t txid = 0,
+                        std::uint64_t batch_txid = 0)
+      : OrderedGroupEntry(entry), txid_(txid), batch_txid_(batch_txid) {}
 };
 
 class OrderedGroupDirectory {
@@ -552,8 +509,11 @@ class OrderedGroupDirectory {
   std::variant<LinearIds, ListSlots> ids_;
   const LinearIds& linear_ids() const { return std::get<LinearIds>(ids_); }
   LinearIds& linear_ids() { return std::get<LinearIds>(ids_); }
-  absl::Status BuildListSlots(std::vector<RecoveredOrderedGroup> groups,
+  absl::Status BuildListSlots(std::vector<OrderedGroupEntry> groups,
                               std::size_t capacity);
+  // Only for a private after-image with validated, unchanged active topology.
+  // Resolve List identities directly to physical slots for rank updates.
+  absl::Status ReplacePages(std::span<const RecoveredOrderedGroup> changed);
   absl::StatusOr<OrderedGroupDirectory> ApplyList(
       const OrderedCollectionRoot& root, std::uint64_t revision,
       std::span<const RecoveredOrderedGroup> changed,
