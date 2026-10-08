@@ -51,6 +51,18 @@ CATCHUP_ASSERT_S = 15.0
 FLAP_CYCLES = 20
 
 
+def wait_for_load(load, timeout=10.0):
+    """Wait for acknowledged writes before injecting transport faults."""
+    # This is a readiness barrier, not a throughput benchmark. Slow CI storage
+    # can commit fewer than five writes in one second without losing progress.
+    try:
+        H.wait_until(
+            "load acknowledges five writes", timeout, lambda: load.ok_count >= 5
+        )
+    except H.Failure as error:
+        raise H.Failure(f"load did not become ready: {load.stats()}") from error
+
+
 def rpc_failure_count(nodes):
     """Count across members so an election cannot move the evidence stream."""
     return sum(int(node.status()["rpc_failures"]) for node in nodes if node.alive())
@@ -202,9 +214,7 @@ def main():
 
         load = H.LoadThread(nodes, history, prefix="tp")
         load.start()
-        time.sleep(1.0)
-        if load.ok_count < 5:
-            raise H.Failure(f"load thread made no progress: {load.stats()}")
+        wait_for_load(load)
 
         # Phase 1: half-open blackhole, 3 rounds.
         dropped_on = None
