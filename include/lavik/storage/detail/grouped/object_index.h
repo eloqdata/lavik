@@ -100,7 +100,7 @@ class GroupedObject {
       std::span<const GroupedRecordLocation> changed_locations);
 
   // Ordered collections share the same bounded physical index pages.
-  // For indexed Sorted Sets, locations include BOTH the ordered graph and
+  // For Sorted Sets, locations include BOTH the ordered graph and
   // member-prefix graph; either incomplete graph rejects publication.
   static absl::StatusOr<Handle> CreateOrdered(
       GroupedObjectVersion version, OrderedGroupDirectory directory,
@@ -198,6 +198,14 @@ class GroupedObject {
   void ForEachRecord(const RecordVisitor& visitor) const;
 
  private:
+  // Common physical ownership validation and allocation; directory-specific
+  // invariants are checked through overloads before constructing the view.
+  template <typename Directory>
+  static absl::StatusOr<PreparedHandle> PrepareCreateImpl(
+      GroupedObjectVersion version, Directory directory,
+      std::span<const GroupedRecordLocation> locations,
+      std::shared_ptr<ScanHashMapEntryArena> arena);
+
   GroupedObjectVersion version_;
   // Directory nodes. Manifest copies carry independent shared charges so
   // their readers can outlive this object without escaping maxmemory.
@@ -210,6 +218,10 @@ class GroupedObject {
   std::shared_ptr<const GroupedPhysicalState> physical_;
 };
 
+// Storage integration: user keys resolve to GroupedObject views here. Each
+// view owns a routing directory, which uses lavik::CowMap or FenwickTree
+// internally; those containers have no object publication/lifecycle semantics.
+//
 // Sparse second-level USER-KEY map. Only a grouped top-level RecordIndex
 // entry warrants a lookup here. This is deliberately ScanHashMap too; neither
 // field names nor pointers to replaceable top-level entries are map keys.

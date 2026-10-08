@@ -27,9 +27,10 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
+#include "lavik/containers/cow_array.h"
+#include "lavik/containers/fenwick_tree.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
-#include "lavik/storage/detail/grouped/metadata_array.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
@@ -98,10 +99,10 @@ struct OrderedCollectionRoot {
   // independent revision so repeated mutations in one replayed command are
   // distinguishable. Zero denotes the command sequence for standalone codecs.
   std::uint64_t revision_ = 0;
-  // Indexed Sorted Set roots bind a second, prefix-routed member -> score
-  // graph. Its revision may lag when only ordered links changed. The v1 root
-  // header explicitly records its presence; ordered-only roots never invent
-  // an index during decoding.
+  // Sorted Set roots bind a second, prefix-routed member -> score graph.
+  // Required for Sorted Sets and absent for every other kind. Its revision
+  // may lag when only ordered links changed; the v1 header records its
+  // presence.
   std::optional<GroupedHashRoot> member_index_ = std::nullopt;
   // Stream pages count internal records, including metadata for empty streams.
   // The user-visible length is independent of that physical record count.
@@ -299,8 +300,8 @@ class OrderedGroupDirectory {
   // The caller first adjudicates the root's transaction. Only committed
   // candidates at/before that root sequence can participate; missing links,
   // cycles, disconnected pages and aggregate count mismatches are corruption.
-  // Indexed roots additionally require an already-recovered member directory
-  // matching their embedded Hash root exactly; ordered-only roots forbid it.
+  // Sorted Sets require an already-recovered member directory matching their
+  // embedded Hash root exactly; other collection kinds forbid it.
   static absl::StatusOr<OrderedGroupDirectory> Recover(
       const OrderedCollectionRoot& root, std::uint64_t root_sequence,
       std::span<const RecoveredOrderedGroup> candidates,
@@ -325,10 +326,7 @@ class OrderedGroupDirectory {
     return members_ ? &*members_ : nullptr;
   }
 
-  struct Position {
-    std::size_t group_index_;
-    std::uint64_t offset_;
-  };
+  using Position = FenwickTree::Position;
   std::optional<Position> FindRank(std::uint64_t rank) const noexcept;
   // Number of records in pages preceding index; index may equal
   // groups().size().
@@ -355,11 +353,10 @@ class OrderedGroupDirectory {
   std::optional<std::size_t> FindIndex(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* Find(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* FindRecord(std::uint64_t id) const noexcept;
-  const GroupedMetadataArray<RecoveredOrderedGroup>& groups() const noexcept {
+  const CowArray<RecoveredOrderedGroup>& groups() const noexcept {
     return groups_;
   }
-  const GroupedMetadataArray<RecoveredOrderedGroup>& retired_groups()
-      const noexcept {
+  const CowArray<RecoveredOrderedGroup>& retired_groups() const noexcept {
     return retired_;
   }
   // Only the key-owning worker may learn missing boundaries from decoded
@@ -377,7 +374,7 @@ class OrderedGroupDirectory {
   // allocation accounts itself; callers use this only for scratch planning.
   std::size_t RetainedBytes() const noexcept {
     return groups_.RetainedBytes() + retired_.RetainedBytes() +
-           ids_.RetainedBytes() + ends_.RetainedBytes();
+           ids_.RetainedBytes() + ranks_.RetainedBytes();
   }
 
  private:
@@ -385,12 +382,12 @@ class OrderedGroupDirectory {
   std::uint64_t sequence_ = 0;
   std::uint64_t command_sequence_ = 0;
   std::uint64_t total_group_bytes_ = 0;
-  GroupedMetadataArray<RecoveredOrderedGroup> groups_;
-  GroupedMetadataArray<RecoveredOrderedGroup> retired_;
-  GroupedMetadataArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
-  // Lists/Sorted Sets retain cumulative ranks. Streams use Fenwick partial
-  // sums so append/trim count transfers detach only logarithmic rank cells.
-  GroupedMetadataArray<std::uint64_t, 256> ends_;
+  CowArray<RecoveredOrderedGroup> groups_;
+  CowArray<RecoveredOrderedGroup> retired_;
+  CowArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
+  // List, ZSet and Stream share the same Fenwick rank representation. String
+  // leaves this index empty and uses fixed-segment arithmetic instead.
+  FenwickTree ranks_;
   mutable std::array<char, 48> stream_header_{};
   mutable bool has_stream_header_ = false;
   // The inline directory shares owner-local AVL nodes; those nodes account

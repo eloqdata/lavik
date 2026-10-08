@@ -1092,10 +1092,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     co_return result;
   }
-  const bool indexed = object->has_member_index();
   std::size_t remaining_sources = 0;
   std::optional<SortedSetMemberProbe> member_probe;
-  if (indexed) {
+  {
     // Prefix routing retains only per-group metadata. Exact members and
     // scores are decoded from the selected Hash leaves, never trusted from
     // a digest alone. Batch requests read each selected leaf just once.
@@ -1178,47 +1177,41 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   // The two resident doubles bound old-score candidates without reading
   // unrelated pages. Equal-score runs still scan for exact members. Sort
   // and merge requested intervals so a batch reads an overlapping page only
-  // once; interval storage is covered by the per-input reservation. Legacy
-  // roots have no old-score lookup and keep the full membership scan.
+  // once; interval storage is covered by the per-input reservation.
   std::vector<std::pair<std::size_t, std::size_t>> source_ranges;
-  if (indexed) {
-    source_ranges.reserve(members.size());
-    for (const auto& [member, state] : members) {
-      if (!state.before_) continue;
-      const auto first = directory.LowerBoundScore(*state.before_);
-      const auto end = directory.UpperBoundScore(*state.before_);
-      if (first >= end)
-        co_return absl::DataLossError(
-            "member score lies outside ordered pages");
-      source_ranges.emplace_back(first, end);
-    }
-    std::sort(source_ranges.begin(), source_ranges.end());
-  } else {
-    source_ranges.emplace_back(0, metadata.size());
+  source_ranges.reserve(members.size());
+  for (const auto& [member, state] : members) {
+    if (!state.before_) continue;
+    const auto first = directory.LowerBoundScore(*state.before_);
+    const auto end = directory.UpperBoundScore(*state.before_);
+    if (first >= end)
+      co_return absl::DataLossError("member score lies outside ordered pages");
+    source_ranges.emplace_back(first, end);
   }
+  std::sort(source_ranges.begin(), source_ranges.end());
   std::size_t scanned_end = 0;
   for (const auto& [first, end] : source_ranges) {
     for (std::size_t i = std::max(first, scanned_end);
-         i < end && (!indexed || remaining_sources != 0); ++i) {
+         i < end && remaining_sources != 0; ++i) {
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
       for (const auto& entry : page->page_.snapshot_.entries_) {
         auto member = members.find(entry.value_);
         if (member == members.end()) continue;
         auto& state = member->second;
-        if ((!indexed && state.before_) || state.source_ != kNoPage)
+        if (state.source_ != kNoPage)
           co_return absl::DataLossError(
               "duplicate persisted Sorted Set member");
-        if (indexed && (!state.before_ || *state.before_ != entry.score_))
+        if (!state.before_ || *state.before_ != entry.score_)
           co_return absl::DataLossError("member-index/ordered score mismatch");
         state.before_ = state.after_ = entry.score_;
         state.source_ = i;
-        if (indexed) --remaining_sources;
+        --remaining_sources;
       }
     }
     scanned_end = std::max(scanned_end, end);
   }
-  if (indexed && remaining_sources != 0)
+  if (remaining_sources != 0)
     co_return absl::DataLossError(
         "member index refers to missing ordered member");
   status = ApplyInputs(operation, &members, &result);
@@ -1429,7 +1422,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   plan.root_.group_count_ = page_count;
   plan.root_.next_group_id_ = next_id;
   SortedSetMemberMutation member_mutation;
-  if (indexed) {
+  {
     // Names borrow command inputs, or the outer pop/range selection. Finish
     // index preparation here while those names are alive; only owned leaf
     // after-images escape in PreparedOrderedMutation. Never retain these
@@ -1463,7 +1456,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto written = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition, indexed ? &member_mutation : nullptr);
+      mutation_precondition, &member_mutation);
   if (!written.ok()) co_return written;
   co_return result;
 }

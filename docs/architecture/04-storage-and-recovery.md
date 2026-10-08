@@ -44,8 +44,8 @@ Their serving, transaction, recovery and graph-lifecycle boundaries are describe
 [Grouped collections](09-grouped-collections.md). Collection writes promote
 automatically at the compact-size threshold, while streaming imports construct
 grouped graphs directly. Hash/Set use prefix routing; List uses ordered pages.
-Newly built Sorted Sets combine ordered pages with a member-to-score prefix
-index under one atomic root; legacy ordered-only roots remain supported.
+Sorted Sets combine ordered pages with a member-to-score prefix
+index under one atomic root.
 [Streams](12-streams.md) use ordered logical records for messages, nodes,
 consumer groups and PEL state, with an independent user-visible message count.
 Explicit full-image callbacks retain aggregate
@@ -209,9 +209,9 @@ retain complete snapshots, not read-time mutation logs. The group payload
 envelope leaves framing space within the 1 GiB record-payload limit while
 preserving the independent 512 MiB limit for each field and value. Hash and Set
 use persisted-seed hash prefixes; List uses stable ordered page identities.
-Indexed Sorted Sets use both disjoint identity spaces under their collection
-type. The version-1 ordered-root payload has a checked presence flag for the
-optional appended member Hash root. Roots preserve an independent
+Sorted Sets use both disjoint identity spaces under their collection type.
+The version-1 ordered-root payload has a checked presence flag for its appended
+member Hash root, required for Sorted Sets and absent for other kinds. Roots preserve an independent
 group revision, distinct from the source command sequence shared by mutations
 in a replay envelope.
 Header length is derived from
@@ -1132,7 +1132,7 @@ current source code are authoritative for present storage behavior.
 | Temporary Redis export block allocation, framed command stream, readback, release, and restart discard | `src/storage/engine/redis_export_backlog.cpp`, `src/storage/engine/recovery.cpp` |
 | Parallel scans, block reassignment, epoch filtering, transaction decision collection, winner selection, and recovery accounting | `src/storage/engine/recovery.cpp`, `src/storage/engine/init.cpp` |
 | Append streams, mutation precondition, extent construction, WATCH/index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `include/lavik/storage/engine.h`, `src/storage/engine/write.cpp`, `src/storage/engine/hash_tree.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
-| Worker-sharded retained-memory admission and ownership, detached-index reclaim, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/lavik/memory.h`, `src/memory.cpp`, `include/lavik/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |
+| Worker-sharded retained-memory admission and ownership, detached-index reclaim, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/lavik/memory.h`, `src/memory.cpp`, `include/lavik/retained_allocator.h`, `include/lavik/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |
 | Staged and disk reads, bounded BatchGet waves, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/lavik/storage/engine.h` |
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |
 | Extent reclaim, defrag candidate selection, relocation durability fences, source retirement, and pacing | `src/storage/engine/defrag.cpp` |

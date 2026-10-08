@@ -23,7 +23,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
-#include "lavik/storage/scan_hash_map.h"
+#include "lavik/retained_allocator.h"
 
 namespace lavik::detail {
 
@@ -64,7 +64,7 @@ class ReplicationLogBlock {
   // Framing code accesses the committed prefix only. Memory never moves until
   // the block is destroyed; no returned view may outlive owner-local access.
   struct ByteDeleter {
-    storage::RetainedAllocationDomain domain_;
+    RetainedAllocationDomain domain_;
     void operator()(std::byte* pointer) noexcept;
   };
   std::unique_ptr<std::byte, ByteDeleter> bytes_;
@@ -76,7 +76,7 @@ class ReplicationLogBlock {
 
  private:
   using SparseOffsets =
-      std::vector<SparseOffset, storage::RetainedAllocator<SparseOffset>>;
+      std::vector<SparseOffset, RetainedAllocator<SparseOffset>>;
   std::size_t capacity_ = 0;
   SparseOffsets sparse_offsets_;
 };

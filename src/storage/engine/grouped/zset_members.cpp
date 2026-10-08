@@ -32,8 +32,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     std::optional<std::span<const SortedSetMemberChange>> checked_changes,
     SortedSetMemberProbe* probe) {
   SortedSetMemberMutation result;
-  if (ordered.root_.kind_ != OrderedCollectionKind::kSortedSet ||
-      (previous && !previous->has_member_index()))
+  if (ordered.root_.kind_ != OrderedCollectionKind::kSortedSet)
     co_return result;
   // Reject before staging either graph so private plans and admission are
   // released without changing the key or an outer EXEC prefix.

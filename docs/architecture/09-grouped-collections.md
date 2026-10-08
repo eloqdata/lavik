@@ -37,11 +37,10 @@ ordinary and Debug builds use the same read, mutation, recovery and maintenance
 adapters.
 
 Grouped Strings use fixed 8 KiB byte segments; Hash/Set use a persisted-seed
-prefix directory; List uses an ordered-page directory. Newly built Sorted Sets
-combine
-ordered `(score, member)` pages with a prefix directory mapping each member to
-its score. Both directories
-belong to one object and share its physical index and transaction lifecycle.
+prefix directory; List uses an ordered-page directory. Sorted Sets combine
+ordered `(score, member)` pages with a prefix directory mapping each member
+to its score. Both directories belong to one object and share its physical
+index and transaction lifecycle.
 A prefix directory alone does not supply rank or score/member ordering.
 
 Streams use ordered binary record keys for messages, logical macro-node
@@ -100,7 +99,7 @@ retaining only routing metadata. Full-page decoding validates local item
 ordering; Sorted Set materialization also checks
 score/binary-member ordering across adjacent pages.
 
-Indexed Sorted Sets persist each member twice: once in an ordered page and
+Sorted Sets persist each member twice: once in an ordered page and
 once as a Hash field whose value is an eight-byte little-endian IEEE-754
 score. The member index records scores, not ordered page identifiers, so
 ordered splits do not invalidate member routing. Neither directory retains
@@ -144,11 +143,11 @@ into the tree in one batch. It retains no payload or physical pins, and each
 snapshot owns its matching routing version. Ordered directories share
 owner-local metadata chunks across immutable views. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
-Local page replacements detach changed chunks. Lists and Sorted Sets update
-rank intervals whose counts change; Streams use a persistent partial-sum rank
-index to update logarithmic cells per changed count. Count-neutral replacements
-share ranks. Unchanged identities and retirement records remain shared. Stream
-suffix insertions preserve a validated predecessor prefix and check the
+Local page replacements detach changed chunks. Lists, Sorted Sets and Streams
+share a persistent Fenwick rank index, updating logarithmic cells per changed
+page count. Rank lookup and prefix counting use the same index; count-neutral
+replacements share it. Strings use fixed-segment arithmetic. Unchanged
+identities and retirement records remain shared. Stream suffix insertions preserve a validated predecessor prefix and check the
 remaining chain and aggregate counts; other topology changes validate the
 complete resulting chain. Only recovery selects among competing physical
 candidates. Retired identities remain available to GC. Routing and physical-index node references,
@@ -192,10 +191,10 @@ decision when present. Auxiliary records never enter the user-key winner merge
 or Redis key/expiry counts.
 
 The version-1 ordered-root payload has type-checked shapes: 72 bytes describe
-only the ordered graph, including String segments; 136 bytes append the 64-byte
-Hash root for an indexed Sorted Set; an 80-byte Stream root appends its
-user-visible length. A member-index presence flag must agree with the payload
-length, so a truncated indexed root cannot decode as an ordered-only root.
+the List or String ordered graph; 136 bytes append the 64-byte Hash root
+required for a Sorted Set; an 80-byte Stream root appends its user-visible
+length. A member-index presence flag must agree with the payload
+length and collection kind. Every Sorted Set root binds both graphs.
 
 The durable ordered kinds are List=1, Sorted Set=2, Stream=3 and String=4.
 String root and page counts measure bytes. Its page payload is a checked
@@ -209,10 +208,9 @@ number. Member auxiliaries use canonical Hash prefixes (including the unsplit
 identity space under the same Sorted Set type and incarnation. Recovery
 bounds each graph by its own root revision.
 
-Ordered-only Sorted Sets use the scan-based member path. New keys, compact
-promotions and streaming imports build indexed roots; decoding never invents
-an absent member index. Both shapes use the current unreleased v1 schema,
-without compatibility decoders or migration for earlier development layouts.
+New keys, compact promotions and streaming imports build both Sorted Set
+graphs before publication. The current unreleased v1 schema has no
+compatibility decoders or migration for earlier development layouts.
 
 Page score bounds are derived runtime metadata, not new durable fields. Writes
 derive them from complete replacement pages and publish them with the same
@@ -369,9 +367,9 @@ contents before forming a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
-metadata. Indexed score lookups read only the selected member-prefix pages;
-legacy score lookups and member ranks scan admitted ordered pages. Rank ranges
-start at the directory's selected pages; score ranges and score counts first
+metadata. Score lookups read only the selected member-prefix pages; member
+ranks scan admitted ordered pages. Rank ranges start at the directory's
+selected pages; score ranges and score counts first
 seek their candidate interval using resident score bounds, then read matching
 pages in physical order. Range, rank, count, scan, random and pop selection
 borrow member bytes from one owned read lease and validate complete page
@@ -383,7 +381,7 @@ index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset
 and result count. Read-only scans retain shared key intent, yield between pages
 and revalidate their population without retaining the store mutex. Add, increment,
-remove and GEOADD use the member index, when present, to resolve old scores
+remove and GEOADD use the member index to resolve old scores
 before locating ordered source pages and routing final scores against old page
 boundaries. Resident score bounds skip unrelated pages; equal-score runs still
 require pagewise exact member comparisons. Batched requests coalesce source
@@ -391,7 +389,7 @@ intervals and share destination boundary reads against the old logical view.
 Only changed pages and structural link neighbours remain decoded during
 publication; a score
 moving across the set does not retain or rewrite its intervening values.
-There is no resident per-member index: equal-score or legacy member searches
+There is no resident per-member index: equal-score member searches
 can still scale with the collection, while scratch scales with requested
 members, selected pages and routing metadata.
 Repeated input members and conditional updates are evaluated in request order
@@ -432,7 +430,7 @@ is still scannable. UUID references remain source-block dependencies so
 classification can still resolve the original key. Every live group, root and
 extent joins physical-owner accounting before orphan reclamation.
 
-For indexed Sorted Sets, reconstruction requires both complete directories
+For Sorted Sets, reconstruction requires both complete directories
 and validates reachable member snapshots and extent checksums as well as the
 ordered graph. GC, deletion and snapshot pins cover both identity spaces.
 Logical collection streams traverse only ordered pages, emitting each member
@@ -541,13 +539,19 @@ Grouped storage remains part of the storage engine, with implementation units
 under `src/storage/engine/grouped/` and internal model/codec headers under
 `include/lavik/storage/detail/grouped/`. It shares the engine's `Impl`, append
 and recovery services; the directory is not an independent public engine API.
-Its unit, command, recovery and fault tests live under `tests/grouped/`.
+The generic `lavik::CowMap`, `FenwickTree` and `CowArray` containers live
+under `include/lavik/containers/`; grouped routing directories compose them
+with collection invariants. `GroupedObjectIndex` is the storage-level user-key
+side table whose views own those directories and physical metadata.
+Grouped unit, command, recovery and fault tests live under `tests/grouped/`;
+the reusable containers have independent tests under `tests/containers/`.
 
 | Responsibility | Source |
 |---|---|
 | Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
 | Logical collection encodings and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
 | Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped/hash_random.cpp`, `hash_tree.cpp` |
+| Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/containers/cow_map.h`, `include/lavik/containers/fenwick_tree.h`, `include/lavik/containers/cow_array.h` |
 | Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped/object_index.h`, `src/storage/engine/grouped/object_index.cpp` |
 | Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/write.cpp`, `src/storage/engine/grouped/mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `include/lavik/storage/detail/grouped/commit.h` |
 | Root-only expiration/persistence publication | `src/storage/engine/grouped/metadata.cpp`, `src/storage/engine/grouped/object_index.cpp`, `write.cpp` |

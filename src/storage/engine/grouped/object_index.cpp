@@ -271,6 +271,25 @@ absl::Status ValidateLocation(const GroupedRecordLocation& group,
   return absl::OkStatus();
 }
 
+struct DirectoryRecordCounts {
+  std::uint64_t active_;
+  std::uint64_t retired_;
+};
+
+DirectoryRecordCounts RecordCounts(const HashGroupDirectory& directory) {
+  return {directory.root().group_count_, directory.retired_groups().size()};
+}
+
+DirectoryRecordCounts RecordCounts(const OrderedGroupDirectory& directory) {
+  const auto* members = directory.member_directory();
+  // A ZSet's two routing graphs share one physical owner. Counting only its
+  // ordered pages would accept an incomplete member graph at publication.
+  return {static_cast<std::uint64_t>(directory.root().group_count_) +
+              (members ? members->root().group_count_ : 0),
+          directory.retired_groups().size() +
+              (members ? members->retired_groups().size() : 0)};
+}
+
 // Index pages cap the cost of one copy-on-write mutation. The trie uses the
 // complete 72-bit group identity, not a potentially colliding runtime digest;
 // a path has a hard bound and lookup never walks earlier object versions.
@@ -764,8 +783,9 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::Create(
   return Handle(std::move(*prepared));
 }
 
-absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreate(
-    GroupedObjectVersion version, HashGroupDirectory directory,
+template <typename Directory>
+absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreateImpl(
+    GroupedObjectVersion version, Directory directory,
     std::span<const GroupedRecordLocation> locations,
     std::shared_ptr<ScanHashMapEntryArena> arena) {
   const auto valid_root = ValidateRoot(version, directory);
@@ -820,8 +840,8 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreate(
       record.extents_ = std::move(*owned);
     }
   }
-  if (active != directory.root().group_count_ ||
-      records.size() - active != directory.retired_groups().size()) {
+  const auto counts = RecordCounts(directory);
+  if (active != counts.active_ || records.size() - active != counts.retired_) {
     return absl::DataLossError("grouped object has missing active locations");
   }
   for (const auto block : extent_blocks) {
@@ -840,6 +860,14 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreate(
   (*object)->directory_ = std::move(directory);
   (*object)->physical_ = std::move(*physical);
   return std::move(*object);
+}
+
+absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreate(
+    GroupedObjectVersion version, HashGroupDirectory directory,
+    std::span<const GroupedRecordLocation> locations,
+    std::shared_ptr<ScanHashMapEntryArena> arena) {
+  return PrepareCreateImpl(version, std::move(directory), locations,
+                           std::move(arena));
 }
 
 absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareUpdate(
@@ -926,82 +954,8 @@ GroupedObject::PrepareCreateOrdered(
     GroupedObjectVersion version, OrderedGroupDirectory directory,
     std::span<const GroupedRecordLocation> locations,
     std::shared_ptr<ScanHashMapEntryArena> arena) {
-  const auto valid_root = ValidateRoot(version, directory);
-  if (!valid_root.ok()) return valid_root;
-  if (arena == nullptr) arena = MakeArena();
-  if (!arena->externally_admitted() || arena->externally_accounted()) {
-    return absl::InvalidArgumentError(
-        "grouped object requires an admitted worker arena");
-  }
-  std::vector<GroupedRecordLocation> records(locations.begin(),
-                                             locations.end());
-  std::sort(records.begin(), records.end(),
-            [](const auto& a, const auto& b) { return a.id_ < b.id_; });
-  absl::flat_hash_set<std::tuple<std::uint64_t, std::uint64_t, std::uint32_t>>
-      physical_records;
-  absl::flat_hash_set<std::uint64_t> extent_blocks;
-  std::map<std::uint64_t, std::pair<std::uint64_t, std::uint16_t>> allocations;
-  allocations.emplace(
-      version.root_.block_id(),
-      std::pair(version.root_.allocation_epoch(), version.root_.block_owner()));
-  std::size_t active = 0;
-  std::optional<GroupedRecordId> previous;
-  for (auto& record : records) {
-    const auto valid = ValidateLocation(record, version, directory);
-    if (!valid.ok()) return valid;
-    const auto& location = record.location_;
-    if (previous == record.id_ ||
-        !physical_records
-             .emplace(location.block_id(), location.allocation_epoch(),
-                      location.record_offset())
-             .second) {
-      return absl::DataLossError("duplicate group or physical record");
-    }
-    previous = record.id_;
-    active += !record.retired_;
-    const auto identity =
-        std::pair(location.allocation_epoch(), location.block_owner());
-    const auto [allocation, inserted] =
-        allocations.try_emplace(location.block_id(), identity);
-    if (!inserted && allocation->second != identity) {
-      return absl::DataLossError(
-          "grouped object has conflicting block allocations");
-    }
-    if (record.extents_) {
-      for (const auto& extent : *record.extents_) {
-        if (!extent_blocks.insert(extent.block_id_).second) {
-          return absl::DataLossError("different groups share an extent block");
-        }
-      }
-      auto owned = CopyManifest(*record.extents_, arena->allocation_domain());
-      if (!owned.ok()) return owned.status();
-      record.extents_ = std::move(*owned);
-    }
-  }
-  const auto* members = directory.member_directory();
-  if (active != static_cast<std::uint64_t>(directory.root().group_count_) +
-                    (members ? members->root().group_count_ : 0) ||
-      records.size() - active !=
-          directory.retired_groups().size() +
-              (members ? members->retired_groups().size() : 0)) {
-    return absl::DataLossError("grouped object has missing active locations");
-  }
-  for (const auto block : extent_blocks) {
-    if (allocations.contains(block)) {
-      return absl::DataLossError("group extent aliases a records block");
-    }
-  }
-  auto physical = AllocateObject<GroupedPhysicalState>(arena);
-  if (!physical.ok()) return physical.status();
-  (*physical)->arena_ = arena;
-  const auto built = BuildPhysicalState(**physical, nullptr, records);
-  if (!built.ok()) return built;
-  auto object = AllocateObject<GroupedObject>(arena);
-  if (!object.ok()) return object.status();
-  (*object)->version_ = version;
-  (*object)->directory_ = std::move(directory);
-  (*object)->physical_ = std::move(*physical);
-  return std::move(*object);
+  return PrepareCreateImpl(version, std::move(directory), locations,
+                           std::move(arena));
 }
 
 absl::StatusOr<GroupedObject::PreparedHandle>

@@ -20,6 +20,7 @@
 #include <map>
 
 #include "gtest/gtest.h"
+#include "member_directory_fixture.h"
 
 namespace lavik::storage {
 namespace {
@@ -66,7 +67,9 @@ SortedFixture Fixture() {
                              .next_group_id_ = 11,
                              .group_count_ = 10,
                              .revision_ = 1};
-  fixture.directory_ = *OrderedGroupDirectory::Recover(root, 1, candidates, {});
+  root.member_index_ = grouped_test::MemberRoot(root);
+  fixture.directory_ = *OrderedGroupDirectory::Recover(
+      root, 1, candidates, {}, 1, grouped_test::MemberDirectory(root));
   return fixture;
 }
 
@@ -97,7 +100,10 @@ void CheckApplied(const SortedFixture& fixture,
              page.entries_.empty() ? 0 : page.entries_.back().score_});
   }
   plan.root_.revision_ = 2;
-  auto directory = fixture.directory_.Apply(plan.root_, 2, changed, 2);
+  plan.root_.member_index_ = grouped_test::MemberRoot(plan.root_);
+  const auto member = grouped_test::MemberRecord(plan.root_);
+  auto directory = fixture.directory_.Apply(plan.root_, 2, changed, 2,
+                                            std::span(&member, 1));
   ASSERT_TRUE(directory.ok()) << directory.status();
   std::vector<OrderedCollectionEntry> actual;
   for (const auto& metadata : directory->groups()) {

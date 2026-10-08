@@ -1731,6 +1731,8 @@ if (BUILD_TESTING)
     tests/grouped/ordered_object_test.cpp
     tests/record_payload_cursor_test.cpp
     tests/grouped/object_index_test.cpp
+    tests/containers/persistent_containers_test.cpp
+    tests/containers/cow_array_test.cpp
     tests/local_shared_ptr_test.cpp
     tests/logging_test.cpp
     tests/lua_eval_test.cpp

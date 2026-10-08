@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "member_directory_fixture.h"
 
 namespace lavik::storage {
 namespace {
@@ -51,6 +52,10 @@ OrderedCollectionRoot Root(const std::vector<OrderedGroupSnapshot>& pages,
       .next_group_id_ = next_id,
       .group_count_ = static_cast<std::uint32_t>(pages.size())};
   for (const auto& page : pages) root.item_count_ += page.entries_.size();
+  if (root.kind_ == OrderedCollectionKind::kSortedSet) {
+    root.revision_ = 1;
+    root.member_index_ = grouped_test::MemberRoot(root);
+  }
   return root;
 }
 
@@ -430,20 +435,9 @@ TEST(GroupedCollectionTest, StringSegmentsValidateLengthsAndDirectPositions) {
   EXPECT_FALSE(DecodeOrderedGroup(*retired).ok());
 }
 
-TEST(GroupedCollectionTest, BothRootShapesUseV1AndCheckMemberIndexPresence) {
+TEST(GroupedCollectionTest, SortedSetRootChecksMemberIndexPresence) {
   auto root = Root({Page(1, 3, OrderedCollectionKind::kSortedSet)}, 2);
   root.revision_ = 9;
-  const auto ordered_only = EncodeOrderedCollectionRoot(root);
-  ASSERT_TRUE(ordered_only.ok());
-  EXPECT_EQ(ordered_only->size(), kOrderedCollectionRootBytes);
-  EXPECT_EQ(ordered_only->substr(8, 4), std::string("\x01\0\0\0", 4));
-  EXPECT_EQ((*ordered_only)[13], '\0');
-  auto decoded_ordered_only = DecodeOrderedCollectionRoot(*ordered_only);
-  ASSERT_TRUE(decoded_ordered_only.ok());
-  EXPECT_EQ(*decoded_ordered_only, root);
-  auto wrong_presence = *ordered_only;
-  wrong_presence[13] = 1;
-  EXPECT_FALSE(DecodeOrderedCollectionRoot(wrong_presence).ok());
   root.member_index_ = GroupedHashRoot{.incarnation_ = root.incarnation_,
                                        .field_count_ = 3,
                                        .group_count_ = 1,
@@ -738,6 +732,72 @@ TEST(GroupedCollectionTest, SparseSameTopologyUpdateMatchesFullRecovery) {
   EXPECT_FALSE(original->Apply(root, 2, std::span(&changed, 1), 2).ok());
 }
 
+TEST(GroupedCollectionTest, RankUpdatesPreserveViewsAcrossOrderedKinds) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet,
+        OrderedCollectionKind::kStream}) {
+    std::vector<OrderedGroupSnapshot> pages;
+    const std::array<std::size_t, 4> counts{3, 4, 2, 5};
+    std::size_t preceding = 0;
+    for (std::size_t i = 0; i < counts.size(); ++i) {
+      auto page = Page(i + 1, counts[i], kind);
+      if (kind == OrderedCollectionKind::kSortedSet) {
+        for (auto& entry : page.entries_) {
+          entry.score_ += preceding;
+          entry.value_ = std::to_string(i) + "-" + entry.value_;
+        }
+      }
+      preceding += counts[i];
+      page.previous_ = i;
+      page.next_ = i + 1 == counts.size() ? 0 : i + 2;
+      pages.push_back(std::move(page));
+    }
+    auto root = Root(pages, 5);
+    if (kind == OrderedCollectionKind::kStream) root.stream_length_ = 0;
+    std::optional<HashGroupDirectory> members;
+    if (root.member_index_) members = grouped_test::MemberDirectory(root);
+    auto original = OrderedGroupDirectory::Recover(root, 1, Candidates(pages),
+                                                   {}, 1, std::move(members));
+    ASSERT_TRUE(original.ok()) << original.status();
+    EXPECT_EQ(original->CountBefore(3), 9);
+    ASSERT_TRUE(original->FindRank(8));
+    EXPECT_EQ(original->FindRank(8)->group_index_, 2);
+
+    auto changed = original->groups()[1];
+    changed.sequence_ = changed.lsn_ = root.revision_ = 2;
+    ++changed.item_count_;
+    ++root.item_count_;
+    const std::array changes{changed};
+    std::vector<RecoveredGroupedRecord> member_changes;
+    if (root.member_index_) {
+      root.member_index_ = grouped_test::MemberRoot(root);
+      member_changes.push_back(grouped_test::MemberRecord(root));
+    }
+    auto updated = original->Apply(root, 2, changes, 2, member_changes);
+    ASSERT_TRUE(updated.ok()) << updated.status();
+    EXPECT_EQ(updated->CountBefore(3), 10);
+    ASSERT_TRUE(updated->FindRank(7));
+    EXPECT_EQ(updated->FindRank(7)->group_index_, 1);
+    EXPECT_EQ(original->CountBefore(3), 9);
+    ASSERT_TRUE(original->FindRank(7));
+    EXPECT_EQ(original->FindRank(7)->group_index_, 2);
+
+    // Sharing a rank representation does not allow changing a collection
+    // kind in place; the directory still owns that identity invariant.
+    root.kind_ = kind == OrderedCollectionKind::kStream
+                     ? OrderedCollectionKind::kList
+                     : OrderedCollectionKind::kStream;
+    root.member_index_.reset();
+    if (root.kind_ == OrderedCollectionKind::kStream)
+      root.stream_length_ = 0;
+    else
+      root.stream_length_.reset();
+    EXPECT_EQ(original->Apply(root, 2, changes, 2).status().code(),
+              absl::StatusCode::kFailedPrecondition);
+    EXPECT_EQ(original->CountBefore(3), 9);
+  }
+}
+
 TEST(GroupedCollectionTest, PageLookupHandlesContiguousAndSparseIds) {
   auto first = Page(7, 2);
   auto second = Page(8, 2);
@@ -918,9 +978,10 @@ TEST(GroupedCollectionTest,
   auto split =
       SplitOrderedGroup(Page(1, 8, OrderedCollectionKind::kSortedSet), 2, 104);
   ASSERT_TRUE(split.ok());
-  auto directory = OrderedGroupDirectory::Recover(
-      Root(split->groups_, split->next_group_id_), 1,
-      Candidates(split->groups_), {});
+  const auto root = Root(split->groups_, split->next_group_id_);
+  auto directory =
+      OrderedGroupDirectory::Recover(root, 1, Candidates(split->groups_), {}, 1,
+                                     grouped_test::MemberDirectory(root));
   ASSERT_TRUE(directory.ok());
   auto insert = PlanOrderedCollectionSplice(*directory, Loaded(split->groups_),
                                             2, 0, {{"new", 1.5}}, 104);
@@ -940,8 +1001,10 @@ TEST(GroupedCollectionTest,
   auto candidates = Candidates(split->groups_);
   auto writes = Candidates(reposition->writes_, 2, 8);
   candidates.insert(candidates.end(), writes.begin(), writes.end());
+  reposition->root_.revision_ = 2;
   auto recovered =
-      OrderedGroupDirectory::Recover(reposition->root_, 2, candidates, {8});
+      OrderedGroupDirectory::Recover(reposition->root_, 2, candidates, {8}, 2,
+                                     grouped_test::MemberDirectory(root));
   ASSERT_TRUE(recovered.ok()) << recovered.status();
   EXPECT_EQ(Materialize(*recovered, split->groups_, reposition->writes_),
             replacement);
@@ -1665,7 +1728,8 @@ TEST(GroupedCollectionTest, ScoreBoundsSeekGapsTiesInfinitiesAndExclusiveEnds) {
   }
   auto root = Root(pages, pages.size() + 1);
   const auto records = Candidates(pages);
-  auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
+  auto directory = OrderedGroupDirectory::Recover(
+      root, 1, records, {}, 1, grouped_test::MemberDirectory(root));
   ASSERT_TRUE(directory.ok()) << directory.status();
   for (double score :
        {-infinity, -2.0, -1.0, -0.0, 0.0, 1.0, 10.0, 11.0, 30.0, infinity}) {
@@ -1709,21 +1773,31 @@ TEST(GroupedCollectionTest, RecoveryRejectsInvalidAndNonMonotoneScoreBounds) {
   const auto root = Root({page, next}, 3);
   auto records = Candidates({page, next});
   const auto good = records;
-  ASSERT_TRUE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  ASSERT_TRUE(OrderedGroupDirectory::Recover(
+                  root, 1, records, {}, 1, grouped_test::MemberDirectory(root))
+                  .ok());
   records[1].min_score_ = 0;
-  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(
+                   root, 1, records, {}, 1, grouped_test::MemberDirectory(root))
+                   .ok());
   records = good;
   records[1].min_score_ = 4;
-  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(
+                   root, 1, records, {}, 1, grouped_test::MemberDirectory(root))
+                   .ok());
   records = good;
   records[1].max_score_ = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(
+                   root, 1, records, {}, 1, grouped_test::MemberDirectory(root))
+                   .ok());
   records = good;
   auto conflicting = records[1];
   conflicting.lsn_ = 2;
   conflicting.max_score_ = 4;
   records.push_back(conflicting);
-  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {}).ok());
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(
+                   root, 1, records, {}, 1, grouped_test::MemberDirectory(root))
+                   .ok());
 }
 
 }  // namespace

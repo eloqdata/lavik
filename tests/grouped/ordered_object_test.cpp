@@ -18,6 +18,7 @@
 
 #include "gtest/gtest.h"
 #include "lavik/storage/detail/grouped/object_index.h"
+#include "member_directory_fixture.h"
 
 namespace lavik::storage {
 namespace {
@@ -146,7 +147,13 @@ OrderedInput OrderedFixture(ValueType type = ValueType::kList) {
                                                  .lsn_ = 3,
                                                  .item_count_ = 2,
                                                  .record_token_ = 3}};
-  auto directory = OrderedGroupDirectory::Recover(root, 3, candidates, {}, 7);
+  std::optional<HashGroupDirectory> members;
+  if (kind == OrderedCollectionKind::kSortedSet) {
+    root.member_index_ = grouped_test::MemberRoot(root);
+    members = grouped_test::MemberDirectory(root);
+  }
+  auto directory = OrderedGroupDirectory::Recover(root, 3, candidates, {}, 7,
+                                                  std::move(members));
   EXPECT_TRUE(directory.ok()) << directory.status();
   OrderedInput input;
   if (!directory.ok()) return input;
@@ -162,6 +169,11 @@ OrderedInput OrderedFixture(ValueType type = ValueType::kList) {
              OrderedLocation(candidate.id_, 3, candidate.item_count_, type),
          .extents_ = nullptr,
          .retired_ = candidate.retired_});
+  }
+  if (kind == OrderedCollectionKind::kSortedSet) {
+    input.locations_.push_back({.id_ = {0, 0},
+                                .location_ = OrderedLocation(100, 3, 4, type),
+                                .extents_ = nullptr});
   }
   return input;
 }
@@ -352,12 +364,13 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
     EXPECT_EQ((*object)->revision(), 3);
     EXPECT_EQ((*object)->command_sequence(), 7);
     EXPECT_EQ((*object)->group_count(), 2);
-    EXPECT_EQ((*object)->record_count(), 3);
+    EXPECT_EQ((*object)->record_count(), type == ValueType::kSortedSet ? 4 : 3);
     EXPECT_NE((*object)->FindGroup(GroupedRecordId{1, 0}), nullptr);
     EXPECT_EQ((*object)->FindGroup(GroupedRecordId{2, 0}), nullptr);
     EXPECT_NE((*object)->FindRecord({2, 0}), nullptr);
     EXPECT_EQ((*object)->FindRecord({1, 1}), nullptr);
-    EXPECT_EQ((*object)->FindGroup("member"), nullptr);
+    EXPECT_EQ((*object)->FindGroup("member") != nullptr,
+              type == ValueType::kSortedSet);
     const auto position = (*object)->ordered_directory().FindRank(2);
     ASSERT_TRUE(position.has_value());
     EXPECT_EQ(position->group_index_, 1);
@@ -368,7 +381,7 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
       EXPECT_EQ(entry.value_type(), type);
       marker ? ++retired : ++active;
     });
-    EXPECT_EQ(active, 2);
+    EXPECT_EQ(active, type == ValueType::kSortedSet ? 3 : 2);
     EXPECT_EQ(retired, 1);
   }
 }
@@ -376,24 +389,17 @@ TEST(GroupedOrderedObjectTest, BothKindsRetainRetiredPhysicalRecordsAndRanks) {
 TEST(GroupedOrderedObjectTest, MemberIndexSharesPhysicalLifecycleAndOldViews) {
   auto input = OrderedFixture(ValueType::kSortedSet);
   auto root = input.directory_.root();
-  root.member_index_ = GroupedHashRoot{
-      .incarnation_ = 17, .field_count_ = 4, .group_count_ = 1, .revision_ = 3};
-  RecoveredGroupedRecord member{.incarnation_ = 17,
-                                .id_ = {0, 0},
-                                .sequence_ = 3,
-                                .lsn_ = 3,
-                                .field_count_ = 4};
-  auto members = HashGroupDirectory::Recover(*root.member_index_, 7,
-                                             std::span(&member, 1), {});
-  ASSERT_TRUE(members.ok()) << members.status();
+  auto member = grouped_test::MemberRecord(root);
+  auto members = grouped_test::MemberDirectory(root);
   std::vector<RecoveredOrderedGroup> pages(input.directory_.groups().begin(),
                                            input.directory_.groups().end());
   for (const auto& page : input.directory_.retired_groups())
     pages.push_back(page);
   EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 3, pages, {}, 7).ok());
   auto directory =
-      OrderedGroupDirectory::Recover(root, 3, pages, {}, 7, *members);
+      OrderedGroupDirectory::Recover(root, 3, pages, {}, 7, members);
   ASSERT_TRUE(directory.ok()) << directory.status();
+  input.locations_.pop_back();
   EXPECT_FALSE(
       GroupedObject::CreateOrdered(input.version_, *directory, input.locations_)
           .ok());

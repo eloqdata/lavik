@@ -33,13 +33,14 @@ std::size_t SparseCount(std::size_t capacity) {
 }  // namespace
 
 ReplicationLogBlock::ReplicationLogBlock()
-    : bytes_(nullptr, ByteDeleter{storage::RetainedAllocationDomain{
-                          .externally_admitted_ = true}}),
-      sparse_offsets_(storage::RetainedAllocator<SparseOffset>(
-          storage::RetainedAllocationDomain{.externally_admitted_ = true})) {}
+    : bytes_(
+          nullptr,
+          ByteDeleter{RetainedAllocationDomain{.externally_admitted_ = true}}),
+      sparse_offsets_(RetainedAllocator<SparseOffset>(
+          RetainedAllocationDomain{.externally_admitted_ = true})) {}
 
 void ReplicationLogBlock::ByteDeleter::operator()(std::byte* pointer) noexcept {
-  storage::DeallocateRetainedBytes(domain_, pointer, alignof(std::max_align_t));
+  DeallocateRetainedBytes(domain_, pointer, alignof(std::max_align_t));
 }
 
 std::size_t ReplicationLogBlock::AllocationBytes(std::size_t capacity) {
@@ -66,8 +67,8 @@ absl::StatusOr<ReplicationLogBlock> ReplicationLogBlock::Allocate(
   ReplicationLogBlock block;
   block.sparse_offsets_.reserve(SparseCount(capacity));
   block.bytes_.reset(static_cast<std::byte*>(
-      storage::TryAllocateRetainedBytes(block.bytes_.get_deleter().domain_,
-                                        capacity, alignof(std::max_align_t))));
+      TryAllocateRetainedBytes(block.bytes_.get_deleter().domain_, capacity,
+                               alignof(std::max_align_t))));
   block.capacity_ = capacity;
   reservation->Release();
   return block;
