@@ -23,11 +23,13 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
 #include "lavik/containers/cow_array.h"
+#include "lavik/containers/cow_map.h"
 #include "lavik/containers/fenwick_tree.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
@@ -311,10 +313,12 @@ class OrderedGroupDirectory {
 
   // Complete after-image metadata, not value deltas. Existing adjudicated
   // pages and retirement evidence stay adjudicated; only changed ids replace
-  // them. Stream suffix inserts reuse the checked prefix and validate new
-  // links; general structural edits validate the resulting complete chain
-  // directly. Recovery alone selects winners from competing physical
-  // candidates. The physical side index independently COWs only touched pages.
+  // them. Lists validate the replaced interval and its boundaries, preserving
+  // stable slots for end edits within capacity. Stream suffix inserts reuse the
+  // checked prefix and validate new links; general structural edits validate
+  // the resulting complete chain directly. Recovery alone selects winners from
+  // competing physical candidates. The physical side index independently COWs
+  // only touched pages.
   absl::StatusOr<OrderedGroupDirectory> Apply(
       const OrderedCollectionRoot& root, std::uint64_t revision,
       std::span<const RecoveredOrderedGroup> changed,
@@ -353,9 +357,99 @@ class OrderedGroupDirectory {
   std::optional<std::size_t> FindIndex(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* Find(std::uint64_t id) const noexcept;
   const RecoveredOrderedGroup* FindRecord(std::uint64_t id) const noexcept;
-  const CowArray<RecoveredOrderedGroup>& groups() const noexcept {
-    return groups_;
+  // Borrowed logical-order view. Iterators borrow the underlying array and
+  // head coordinates, not this temporary view; the directory must outlive them.
+  class Groups {
+   public:
+    class const_iterator {
+     public:
+      using value_type = RecoveredOrderedGroup;
+      using reference = const value_type&;
+      using pointer = const value_type*;
+      using difference_type = std::ptrdiff_t;
+      using iterator_category = std::random_access_iterator_tag;
+      using iterator_concept = std::random_access_iterator_tag;
+      const_iterator() = default;
+      reference operator*() const {
+        auto slot = head_ + index_;
+        if (slot >= array_->size()) slot -= array_->size();
+        return (*array_)[slot];
+      }
+      pointer operator->() const { return &**this; }
+      reference operator[](difference_type n) const { return *(*this + n); }
+      const_iterator& operator++() {
+        ++index_;
+        return *this;
+      }
+      const_iterator operator++(int) {
+        auto old = *this;
+        ++*this;
+        return old;
+      }
+      const_iterator& operator--() {
+        --index_;
+        return *this;
+      }
+      const_iterator operator--(int) {
+        auto old = *this;
+        --*this;
+        return old;
+      }
+      const_iterator& operator+=(difference_type n) {
+        index_ =
+            static_cast<std::size_t>(static_cast<difference_type>(index_) + n);
+        return *this;
+      }
+      const_iterator& operator-=(difference_type n) { return *this += -n; }
+      friend const_iterator operator+(const_iterator it, difference_type n) {
+        return it += n;
+      }
+      friend const_iterator operator+(difference_type n, const_iterator it) {
+        return it += n;
+      }
+      friend const_iterator operator-(const_iterator it, difference_type n) {
+        return it -= n;
+      }
+      friend difference_type operator-(const_iterator a, const_iterator b) {
+        assert(a.array_ == b.array_ && a.head_ == b.head_);
+        return static_cast<difference_type>(a.index_) -
+               static_cast<difference_type>(b.index_);
+      }
+      auto operator<=>(const const_iterator&) const = default;
+
+     private:
+      friend class Groups;
+      const_iterator(const CowArray<RecoveredOrderedGroup>* array,
+                     std::size_t head, std::size_t index)
+          : array_(array), head_(head), index_(index) {}
+      const CowArray<RecoveredOrderedGroup>* array_ = nullptr;
+      std::size_t head_ = 0, index_ = 0;
+    };
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    const RecoveredOrderedGroup& operator[](std::size_t index) const {
+      assert(index < size_);
+      return begin()[index];
+    }
+    const RecoveredOrderedGroup& front() const { return (*this)[0]; }
+    const RecoveredOrderedGroup& back() const { return (*this)[size_ - 1]; }
+    const_iterator begin() const { return {array_, head_, 0}; }
+    const_iterator end() const { return {array_, head_, size_}; }
+
+   private:
+    friend class OrderedGroupDirectory;
+    Groups(const CowArray<RecoveredOrderedGroup>* array, std::size_t head,
+           std::size_t size)
+        : array_(array), head_(head), size_(size) {}
+    const CowArray<RecoveredOrderedGroup>* array_;
+    std::size_t head_, size_;
+  };
+  Groups groups() const noexcept {
+    const auto* list = std::get_if<ListSlots>(&ids_);
+    return {&groups_, list ? list->head_ : 0, root_.group_count_};
   }
+  // Retirement iteration order is unspecified; resolve identities with
+  // FindRecord.
   const CowArray<RecoveredOrderedGroup>& retired_groups() const noexcept {
     return retired_;
   }
@@ -365,7 +459,7 @@ class OrderedGroupDirectory {
   absl::Status RememberStreamPageMaxKey(std::size_t index,
                                         std::string_view key) const;
   std::string_view stream_header() const noexcept {
-    return has_stream_header_
+    return has_stream_header()
                ? std::string_view(stream_header_.data(), stream_header_.size())
                : std::string_view{};
   }
@@ -374,7 +468,9 @@ class OrderedGroupDirectory {
   // allocation accounts itself; callers use this only for scratch planning.
   std::size_t RetainedBytes() const noexcept {
     return groups_.RetainedBytes() + retired_.RetainedBytes() +
-           ids_.RetainedBytes() + ranks_.RetainedBytes();
+           std::visit([](const auto& ids) { return ids.RetainedBytes(); },
+                      ids_) +
+           ranks_.RetainedBytes();
   }
 
  private:
@@ -384,12 +480,37 @@ class OrderedGroupDirectory {
   std::uint64_t total_group_bytes_ = 0;
   CowArray<RecoveredOrderedGroup> groups_;
   CowArray<RecoveredOrderedGroup> retired_;
-  CowArray<std::pair<std::uint64_t, std::size_t>, 256> ids_;
-  // List, ZSet and Stream share the same Fenwick rank representation. String
-  // leaves this index empty and uses fixed-segment arithmetic instead.
+  using LinearIds = CowArray<std::pair<std::uint64_t, std::size_t>, 256>;
+  struct PagePosition {
+    std::size_t slot_;
+    bool retired_;
+  };
+  struct ListSlots {
+    // Active ids name ring slots; retired ids name append-only retirement
+    // slots. One map prevents retired identities from being resurrected.
+    CowMap<std::uint64_t, PagePosition> positions_;
+    std::size_t head_ = 0;
+    std::size_t RetainedBytes() const noexcept {
+      return positions_.RetainedBytes();
+    }
+  };
+  std::variant<LinearIds, ListSlots> ids_;
+  const LinearIds& linear_ids() const { return std::get<LinearIds>(ids_); }
+  LinearIds& linear_ids() { return std::get<LinearIds>(ids_); }
+  absl::Status BuildListSlots(std::vector<RecoveredOrderedGroup> groups,
+                              std::size_t capacity);
+  absl::StatusOr<OrderedGroupDirectory> ApplyList(
+      const OrderedCollectionRoot& root, std::uint64_t revision,
+      std::span<const RecoveredOrderedGroup> changed,
+      std::uint64_t command_sequence) const;
+  // List counts physical ring slots; ZSet/Stream count logical page ordinals.
+  // Both use Fenwick partial sums. String leaves this index empty and uses
+  // fixed-segment arithmetic instead.
   FenwickTree ranks_;
   mutable std::array<char, 48> stream_header_{};
-  mutable bool has_stream_header_ = false;
+  // A validated header starts with LXS1; zero-initialization denotes absence.
+  // Using that existing byte avoids a separate flag/padding in every object.
+  bool has_stream_header() const noexcept { return stream_header_[0] != 0; }
   // The inline directory shares owner-local AVL nodes; those nodes account
   // their own allocations and must not be charged again by RetainedBytes().
   std::optional<HashGroupDirectory> members_;

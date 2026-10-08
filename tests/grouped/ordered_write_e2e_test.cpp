@@ -923,6 +923,57 @@ TEST(GroupedOrderedWriteE2e, ListPointSetOnlyRewritesTargetAndNeighbours) {
   ExpectList(client, "list", items);
 }
 
+TEST(GroupedOrderedWriteE2e,
+     ListEndSplitsWrapGrowAndRetireWithoutRewritingMiddle) {
+  PrivateDisk disk;
+  auto items = Items();
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(Push("list", items)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto before = disk.Auxiliaries("list");
+  ASSERT_FALSE(before.empty());
+  {
+    Server server(disk);
+    Client client(server.port());
+    // Each large item occupies a page. Forty front splits exercise ring wrap
+    // and capacity growth, followed by both-end removal and slot reuse.
+    for (unsigned i = 0; i < 40; ++i) {
+      std::string item(8192, static_cast<char>('a' + i % 26));
+      ASSERT_EQ(client.Command({"LPUSH", "list", item}).text_,
+                std::to_string(items.size() + 1));
+      items.insert(items.begin(), std::move(item));
+    }
+    items[128].assign(128, 'z');
+    ASSERT_EQ(client.Command({"LSET", "list", "128", items[128]}).text_, "OK");
+    ExpectList(client, "list", items);
+    for (unsigned i = 0; i < 40; ++i) {
+      ASSERT_EQ(client.Command({"LPOP", "list"}).text_, items.front());
+      items.erase(items.begin());
+    }
+    for (unsigned i = 0; i < 4; ++i) {
+      const std::string item(8192, 't');
+      ASSERT_EQ(client.Command({"RPUSH", "list", item}).text_,
+                std::to_string(items.size() + 1));
+      ASSERT_EQ(client.Command({"RPOP", "list"}).text_, item);
+    }
+    ExpectList(client, "list", items);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto after = disk.Auxiliaries("list");
+  for (const auto& [revision, pages] : after) {
+    if (revision <= before.rbegin()->first) continue;
+    EXPECT_LE(pages.size(), 3) << "revision " << revision;
+  }
+  Server recovered(disk);
+  Client client(recovered.port());
+  ExpectList(client, "list", items);
+}
+
 TEST(GroupedOrderedWriteE2e, ListReadIntervalsAcrossPagesAndRecovery) {
   PrivateDisk disk;
   auto items = Items();

@@ -146,11 +146,19 @@ accounts its own lifetime, independently of the number of views retaining it.
 Local page replacements detach changed chunks. Lists, Sorted Sets and Streams
 share a persistent Fenwick rank index, updating logarithmic cells per changed
 page count. Rank lookup and prefix counting use the same index; count-neutral
-replacements share it. Strings use fixed-segment arithmetic. Unchanged
-identities and retirement records remain shared. Stream suffix insertions preserve a validated predecessor prefix and check the
-remaining chain and aggregate counts; other topology changes validate the
-complete resulting chain. Only recovery selects among competing physical
-candidates. Retired identities remain available to GC. Routing and physical-index node references,
+replacements share it. List directories store pages in a persistent ring and
+count physical slots, translating logical ranks across its wrap boundary.
+An identity map names active slots or append-only retirement entries. End
+splits and removals within capacity preserve untouched slots and validate only
+the replaced chain interval and its boundary links. Capacity grows geometrically;
+growth and length-changing middle splices may rebuild the slot layout. Pops do
+not shrink capacity. These are runtime representations: durable page IDs,
+links and recovery validation remain unchanged.
+Strings use fixed-segment arithmetic. Unchanged identities and retirement
+records remain shared. Stream suffix insertions preserve a validated predecessor
+prefix and check the remaining chain and aggregate counts; other non-List
+topology changes validate the complete resulting chain. Only recovery selects
+among competing physical candidates. Retired identities remain available to GC. Routing and physical-index node references,
 including final destruction, remain on
 the key owner. Cross-worker readers exchange physical identities or stream
 handles that route metadata access and cleanup back to that owner. Retained

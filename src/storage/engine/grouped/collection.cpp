@@ -673,8 +673,10 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   result.sequence_ = root_sequence;
   result.command_sequence_ =
       command_sequence == 0 ? root_sequence : command_sequence;
+  const bool linear_ranks = root.kind_ != OrderedCollectionKind::kString &&
+                            root.kind_ != OrderedCollectionKind::kList;
   groups.reserve(winners.size());
-  if (root.kind_ != OrderedCollectionKind::kString) {
+  if (linear_ranks) {
     ends.reserve(winners.size());
     ids.reserve(winners.size());
   }
@@ -696,15 +698,14 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
     if (root.kind_ == OrderedCollectionKind::kSortedSet && !groups.empty() &&
         groups.back().max_score_ > group.min_score_)
       return absl::DataLossError("unordered recovered Sorted Set score bounds");
-    if (root.kind_ != OrderedCollectionKind::kString)
-      ids.emplace_back(group.id_, groups.size());
+    if (linear_ranks) ids.emplace_back(group.id_, groups.size());
     groups.push_back(group);
     count += group.item_count_;
     if (group.encoded_bytes_ >
         std::numeric_limits<std::uint64_t>::max() - result.total_group_bytes_)
       return absl::DataLossError("ordered group byte total overflows");
     result.total_group_bytes_ += group.encoded_bytes_;
-    if (root.kind_ != OrderedCollectionKind::kString) ends.push_back(count);
+    if (linear_ranks) ends.push_back(count);
     previous = id;
     id = group.next_;
     winners.erase(found);  // Also detects a cycle without a second set.
@@ -716,23 +717,42 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
   std::sort(ids.begin(), ids.end());
   std::sort(retired.begin(), retired.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
+  if (root.kind_ == OrderedCollectionKind::kList) {
+    result.ids_.emplace<ListSlots>();
+    auto retired_array = decltype(result.retired_)::From(retired);
+    if (!retired_array.ok()) return retired_array.status();
+    result.retired_ = std::move(*retired_array);
+    auto& positions = std::get<ListSlots>(result.ids_).positions_;
+    for (std::size_t i = 0; i < retired.size(); ++i) {
+      auto status = positions.Set(retired[i].id_, {i, true});
+      if (!status.ok()) return status;
+    }
+    auto status = result.BuildListSlots(std::move(groups), 0);
+    if (!status.ok()) return status;
+    return result;
+  }
   auto group_array = decltype(result.groups_)::From(groups);
   if (!group_array.ok()) return group_array.status();
   auto retired_array = decltype(result.retired_)::From(retired);
   if (!retired_array.ok()) return retired_array.status();
-  auto id_array = decltype(result.ids_)::From(ids);
+  auto id_array = LinearIds::From(ids);
   if (!id_array.ok()) return id_array.status();
   auto end_array = FenwickTree::FromCumulative(std::move(ends));
   if (!end_array.ok()) return end_array.status();
   result.groups_ = std::move(*group_array);
   result.retired_ = std::move(*retired_array);
-  result.ids_ = std::move(*id_array);
+  result.linear_ids() = std::move(*id_array);
   result.ranks_ = std::move(*end_array);
   return result;
 }
 
 std::optional<std::size_t> OrderedGroupDirectory::FindIndex(
     std::uint64_t id) const noexcept {
+  if (const auto* list = std::get_if<ListSlots>(&ids_)) {
+    const auto* found = list->positions_.Get(id);
+    if (!found || found->retired_) return std::nullopt;
+    return (found->slot_ + groups_.size() - list->head_) % groups_.size();
+  }
   if (root_.kind_ == OrderedCollectionKind::kString)
     return id != 0 && id <= groups_.size() ? std::optional<std::size_t>(id - 1)
                                            : std::nullopt;
@@ -744,9 +764,9 @@ std::optional<std::size_t> OrderedGroupDirectory::FindIndex(
     if (offset < groups_.size() && groups_[offset].id_ == id) return offset;
   }
   const auto found = std::lower_bound(
-      ids_.begin(), ids_.end(), id,
+      linear_ids().begin(), linear_ids().end(), id,
       [](const auto& item, auto target) { return item.first < target; });
-  return found != ids_.end() && found->first == id
+  return found != linear_ids().end() && found->first == id
              ? std::optional<std::size_t>(found->second)
              : std::nullopt;
 }
@@ -754,11 +774,16 @@ std::optional<std::size_t> OrderedGroupDirectory::FindIndex(
 const RecoveredOrderedGroup* OrderedGroupDirectory::Find(
     std::uint64_t id) const noexcept {
   const auto index = FindIndex(id);
-  return index ? &groups_[*index] : nullptr;
+  return index ? &groups()[*index] : nullptr;
 }
 
 const RecoveredOrderedGroup* OrderedGroupDirectory::FindRecord(
     std::uint64_t id) const noexcept {
+  if (const auto* list = std::get_if<ListSlots>(&ids_)) {
+    const auto* found = list->positions_.Get(id);
+    if (!found) return nullptr;
+    return found->retired_ ? &retired_[found->slot_] : &groups_[found->slot_];
+  }
   if (const auto* active = Find(id)) return active;
   const auto found = std::lower_bound(
       retired_.begin(), retired_.end(), id,
@@ -788,11 +813,261 @@ absl::Status OrderedGroupDirectory::RememberStreamHeader(
       !header.starts_with("LXS1") ||
       Load(header, 44, 4) != *root_.stream_length_)
     return absl::DataLossError("invalid Stream directory header");
-  if (has_stream_header_ && stream_header() != header)
+  if (has_stream_header() && stream_header() != header)
     return absl::DataLossError("Stream header changed within view");
   std::copy(header.begin(), header.end(), stream_header_.begin());
-  has_stream_header_ = true;
   return absl::OkStatus();
+}
+
+absl::Status OrderedGroupDirectory::BuildListSlots(
+    std::vector<RecoveredOrderedGroup> groups, std::size_t capacity) {
+  // Expansion is geometric and never accompanies a pop. Unused slots contain
+  // no identity and contribute zero to the Fenwick tree. Recovery starts at
+  // head zero; end edits may subsequently wrap without moving the middle.
+  if (capacity < groups.size())
+    capacity = std::min<std::size_t>(
+        UINT32_MAX, std::bit_ceil(std::max<std::size_t>(32, groups.size())));
+  auto scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
+      capacity * (sizeof(RecoveredOrderedGroup) + sizeof(std::uint64_t)) +
+      1024));
+  if (!scratch) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM List ring construction");
+  }
+  auto& list = std::get<ListSlots>(ids_);
+  list.head_ = 0;
+  for (std::size_t i = 0; i < groups.size(); ++i) {
+    auto status = list.positions_.Set(groups[i].id_, {i, false});
+    if (!status.ok()) return status;
+  }
+  groups.resize(capacity);
+  std::vector<std::uint64_t> cumulative;
+  cumulative.reserve(capacity);
+  std::uint64_t count = 0;
+  for (const auto& group : groups)
+    cumulative.push_back(count += group.item_count_);
+  auto slots = decltype(groups_)::From(groups);
+  if (!slots.ok()) return slots.status();
+  auto ranks = FenwickTree::FromCumulative(std::move(cumulative));
+  if (!ranks.ok()) return ranks.status();
+  groups_ = std::move(*slots);
+  ranks_ = std::move(*ranks);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
+    const OrderedCollectionRoot& root, std::uint64_t revision,
+    std::span<const RecoveredOrderedGroup> changed,
+    std::uint64_t command_sequence) const {
+  if (!ValidRoot(root) || (root.revision_ != 0 && root.revision_ != revision))
+    return absl::DataLossError("invalid List directory root");
+  auto scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
+      changed.size() * (sizeof(RecoveredOrderedGroup) * 2 + 256) + 1024));
+  if (!scratch) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM List directory changes");
+  }
+  const auto& list = std::get<ListSlots>(ids_);
+  const auto old_groups = groups();
+  absl::flat_hash_map<std::uint64_t, const RecoveredOrderedGroup*> replacements;
+  replacements.reserve(changed.size());
+  absl::int128 count = root_.item_count_, bytes = total_group_bytes_;
+  absl::int128 live_count = root_.group_count_;
+  std::size_t begin = old_groups.size(), end = 0, changed_live = 0;
+  bool same_topology = root.group_count_ == root_.group_count_ &&
+                       root.first_group_ == root_.first_group_ &&
+                       root.last_group_ == root_.last_group_;
+  for (const auto& item : changed) {
+    const auto* old = FindRecord(item.id_);
+    if (item.incarnation_ != root.incarnation_ || item.sequence_ != revision ||
+        item.id_ == 0 || item.id_ >= root.next_group_id_ || item.lsn_ == 0 ||
+        item.record_token_ == 0 ||
+        !replacements.emplace(item.id_, &item).second ||
+        (old && old->retired_ && !item.retired_) ||
+        (item.retired_
+             ? (item.item_count_ != 0 || item.previous_ != 0 || item.next_ != 0)
+             : item.item_count_ == 0) ||
+        std::isnan(item.min_score_) || std::isnan(item.max_score_) ||
+        item.min_score_ > item.max_score_)
+      return absl::DataLossError("invalid List changed page");
+    if (old && !old->retired_) {
+      const auto index = *FindIndex(item.id_);
+      begin = std::min(begin, index);
+      end = std::max(end, index + 1);
+      count -= old->item_count_;
+      bytes -= old->encoded_bytes_;
+      --live_count;
+    }
+    if (!item.retired_) {
+      count += item.item_count_;
+      bytes += item.encoded_bytes_;
+      ++live_count;
+      ++changed_live;
+    }
+    // Retired-only replacements do not affect the active chain.
+    if (!(old && old->retired_ && item.retired_) &&
+        !(old == nullptr && item.retired_))
+      same_topology &= old && !old->retired_ && !item.retired_ &&
+                       old->previous_ == item.previous_ &&
+                       old->next_ == item.next_;
+  }
+  if (count != root.item_count_ || live_count != root.group_count_ ||
+      bytes < 0 || bytes > UINT64_MAX)
+    return absl::DataLossError("List directory aggregate mismatch");
+
+  OrderedGroupDirectory result = *this;
+  result.root_ = root;
+  result.root_.revision_ = revision;
+  result.sequence_ = revision;
+  result.command_sequence_ = command_sequence;
+  result.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
+  auto& next_list = std::get<ListSlots>(result.ids_);
+  // Retirements append in arrival order, not ID order. Their positions share
+  // the identity map with live ring slots, avoiding an O(history) sorted merge
+  // when alternating pops retire IDs out of allocation order.
+  std::vector<RecoveredOrderedGroup> retirements;
+  for (auto item : changed) {
+    if (!item.retired_) continue;
+    item.txid_ = item.batch_txid_ = 0;
+    const auto* position = list.positions_.Get(item.id_);
+    if (position && position->retired_) {
+      auto status = result.retired_.Set(position->slot_, item);
+      if (!status.ok()) return status;
+    } else {
+      auto status = next_list.positions_.Set(
+          item.id_, {retired_.size() + retirements.size(), true});
+      if (!status.ok()) return status;
+      retirements.push_back(item);
+    }
+  }
+  if (!retirements.empty()) {
+    auto retired = result.retired_.Appended(retirements);
+    if (!retired.ok()) return retired.status();
+    result.retired_ = std::move(*retired);
+  }
+  std::vector<FenwickTree::CountChange> count_changes;
+  if (same_topology) {
+    for (auto item : changed) {
+      if (item.retired_) continue;
+      const auto slot = list.positions_.Get(item.id_)->slot_;
+      count_changes.emplace_back(
+          slot, absl::int128(item.item_count_) - groups_[slot].item_count_);
+      item.txid_ = item.batch_txid_ = 0;
+      auto status = result.groups_.Set(slot, item);
+      if (!status.ok()) return status;
+    }
+  } else {
+    // All changed old live pages lie in [begin,end). Pages outside it retain
+    // their checked links, so validate this interval and its two boundaries.
+    // Reciprocal links, exact length and changed-identity coverage exclude
+    // cycles, hidden/disconnected insertions and unreported removals.
+    if (begin == old_groups.size())
+      return absl::DataLossError(
+          "List topology change has no predecessor page");
+    const auto unchanged = old_groups.size() - (end - begin);
+    if (root.group_count_ < unchanged)
+      return absl::DataLossError("List replacement interval underflows");
+    const auto replacement_size = root.group_count_ - unchanged;
+    auto interval_scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
+        (replacement_size + end - begin) *
+            (sizeof(RecoveredOrderedGroup) + 256) +
+        1024));
+    if (!interval_scratch) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError("OOM List replacement interval");
+    }
+    const auto right = end == old_groups.size() ? 0 : old_groups[end].id_;
+    std::uint64_t previous = begin == 0 ? 0 : old_groups[begin - 1].id_;
+    std::uint64_t id =
+        begin == 0 ? root.first_group_ : old_groups[begin - 1].next_;
+    if ((begin != 0 && root.first_group_ != root_.first_group_) ||
+        (right != 0 && root.last_group_ != root_.last_group_))
+      return absl::DataLossError("List root changes an untouched boundary");
+    std::vector<RecoveredOrderedGroup> replacement;
+    replacement.reserve(replacement_size);
+    absl::flat_hash_set<std::uint64_t> visited;
+    visited.reserve(replacement_size);
+    std::size_t visited_changes = 0;
+    while (id != right) {
+      const auto found = replacements.find(id);
+      const auto* item = found == replacements.end() ? Find(id) : found->second;
+      const auto old_index = FindIndex(id);
+      if (!item || item->retired_ || item->previous_ != previous ||
+          (old_index && (*old_index < begin || *old_index >= end)) ||
+          replacement.size() == replacement_size || !visited.insert(id).second)
+        return absl::DataLossError("broken List replacement chain");
+      replacement.push_back(*item);
+      if (found != replacements.end()) {
+        ++visited_changes;
+        replacement.back().txid_ = replacement.back().batch_txid_ = 0;
+      }
+      previous = id;
+      id = item->next_;
+    }
+    if (replacement.size() != replacement_size ||
+        visited_changes != changed_live ||
+        (right == 0 ? previous != root.last_group_
+                    : old_groups[end].previous_ != previous))
+      return absl::DataLossError("disconnected List replacement pages");
+    for (std::size_t i = begin; i < end; ++i) {
+      if (visited.contains(old_groups[i].id_)) continue;
+      const auto removed = replacements.find(old_groups[i].id_);
+      if (removed == replacements.end() || !removed->second->retired_)
+        return absl::DataLossError("List removal lacks retirement evidence");
+    }
+    const auto capacity = groups_.size();
+    if (root.group_count_ > capacity ||
+        (begin != 0 && end != old_groups.size() &&
+         replacement_size != end - begin)) {
+      // Capacity growth or a length-changing middle splice may move all slots.
+      // Ordinary end edits never enter this path while spare capacity remains.
+      auto rebuild_scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
+          root.group_count_ * sizeof(RecoveredOrderedGroup) + 1024));
+      if (!rebuild_scratch) {
+        RecordMemoryRejection();
+        return absl::ResourceExhaustedError("OOM List directory rebuild");
+      }
+      std::vector<RecoveredOrderedGroup> rebuilt;
+      rebuilt.reserve(root.group_count_);
+      rebuilt.insert(rebuilt.end(), old_groups.begin(),
+                     old_groups.begin() + begin);
+      rebuilt.insert(rebuilt.end(), replacement.begin(), replacement.end());
+      rebuilt.insert(rebuilt.end(), old_groups.begin() + end, old_groups.end());
+      auto status = result.BuildListSlots(std::move(rebuilt), capacity);
+      if (!status.ok()) return status;
+      return result;
+    }
+    if (begin == 0)
+      next_list.head_ =
+          (list.head_ + end + capacity - replacement_size) % capacity;
+    // First clear the old interval, then overlay its replacement. Coalescing
+    // by physical slot prevents transient double-counting during head moves.
+    std::map<std::size_t, RecoveredOrderedGroup> slots;
+    for (std::size_t i = begin; i < end; ++i)
+      slots.emplace((list.head_ + i) % capacity, RecoveredOrderedGroup{});
+    for (std::size_t i = 0; i < replacement.size(); ++i) {
+      const auto slot = (next_list.head_ + begin + i) % capacity;
+      slots[slot] = replacement[i];
+      const auto* old = list.positions_.Get(replacement[i].id_);
+      if (!old || old->slot_ != slot) {
+        auto status =
+            next_list.positions_.Set(replacement[i].id_, {slot, false});
+        if (!status.ok()) return status;
+      }
+    }
+    for (const auto& [slot, item] : slots) {
+      if (item.id_ == groups_[slot].id_ && !replacements.contains(item.id_))
+        continue;
+      count_changes.emplace_back(
+          slot, absl::int128(item.item_count_) - groups_[slot].item_count_);
+      auto status = result.groups_.Set(slot, item);
+      if (!status.ok()) return status;
+    }
+  }
+  std::sort(count_changes.begin(), count_changes.end());
+  auto status = result.ranks_.ApplyCounts(count_changes, root.item_count_);
+  if (!status.ok()) return status;
+  return result;
 }
 
 absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
@@ -804,6 +1079,11 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       revision <= sequence_ || command_sequence < command_sequence_ ||
       root.next_group_id_ < root_.next_group_id_) {
     return absl::FailedPreconditionError("stale ordered directory update");
+  }
+  if (root.kind_ == OrderedCollectionKind::kList) {
+    if (!member_changes.empty())
+      return absl::DataLossError("List has member changes");
+    return ApplyList(root, revision, changed, command_sequence);
   }
   if (root.kind_ == OrderedCollectionKind::kString) {
     if (!ValidRoot(root) || !member_changes.empty() ||
@@ -896,22 +1176,21 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     result.command_sequence_ = command_sequence;
     result.groups_ = groups_;
     result.retired_ = retired_;
-    result.ids_ = ids_;
+    result.linear_ids() = linear_ids();
     result.ranks_ = ranks_;
     result.members_ = std::move(members);
-    if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {
+    if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header() &&
+        !changed_ids.contains(root.first_group_))
       result.stream_header_ = stream_header_;
-      result.has_stream_header_ = !changed_ids.contains(root.first_group_);
-    }
     absl::InlinedVector<std::pair<std::size_t, absl::int128>, 4> count_changes;
     count_changes.reserve(changed.size());
     absl::int128 count = root_.item_count_;
     absl::int128 bytes = total_group_bytes_;
     for (auto item : changed) {
       const auto found = std::lower_bound(
-          ids_.begin(), ids_.end(), item.id_,
+          linear_ids().begin(), linear_ids().end(), item.id_,
           [](const auto& entry, auto id) { return entry.first < id; });
-      if (found == ids_.end() || found->first != item.id_)
+      if (found == linear_ids().end() || found->first != item.id_)
         return absl::DataLossError("missing ordered same-topology page");
       if (item.item_count_ == 0 || item.record_token_ == 0 || item.lsn_ == 0 ||
           std::isnan(item.min_score_) || std::isnan(item.max_score_) ||
@@ -1072,13 +1351,13 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       }
       auto groups = groups_.Appended(extended);
       if (!groups.ok()) return groups.status();
-      auto ids = ids_.Appended(new_ids);
+      auto ids = linear_ids().Appended(new_ids);
       if (!ids.ok()) return ids.status();
       auto ranks =
           ranks_.WithSuffix(first, prefixes, prefix_changes, root.item_count_);
       if (!ranks.ok()) return ranks.status();
       rebuilt.groups_ = std::move(*groups);
-      rebuilt.ids_ = std::move(*ids);
+      rebuilt.linear_ids() = std::move(*ids);
       rebuilt.ranks_ = std::move(*ranks);
       rebuilt.retired_ = retired_;
       rebuilt.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
@@ -1092,12 +1371,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
           if (!status.ok()) return status;
         }
         const auto found = std::lower_bound(
-            ids_.begin(), ids_.end(), item.id_,
+            linear_ids().begin(), linear_ids().end(), item.id_,
             [](const auto& entry, auto id) { return entry.first < id; });
-        if (found != ids_.end() && found->first == item.id_ &&
+        if (found != linear_ids().end() && found->first == item.id_ &&
             found->second != index) {
-          auto status =
-              rebuilt.ids_.Set(found - ids_.begin(), {item.id_, index});
+          auto status = rebuilt.linear_ids().Set(found - linear_ids().begin(),
+                                                 {item.id_, index});
           if (!status.ok()) return status;
         }
       }
@@ -1109,9 +1388,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
           if (!status.ok()) return status;
         }
       }
-      if (has_stream_header_ && !changed_ids.contains(root.first_group_)) {
+      if (has_stream_header() && !changed_ids.contains(root.first_group_)) {
         rebuilt.stream_header_ = stream_header_;
-        rebuilt.has_stream_header_ = true;
       }
       return rebuilt;
     }
@@ -1221,7 +1499,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   // identities rather than sorting the entire directory after a middle split.
   std::sort(inserted_ids.begin(), inserted_ids.end());
   auto inserted = inserted_ids.begin();
-  for (const auto& [old_id, old_position] : ids_) {
+  for (const auto& [old_id, old_position] : linear_ids()) {
     if (positions[old_position] == absent) continue;
     for (; inserted != inserted_ids.end() && inserted->first < old_id;
          ++inserted)
@@ -1249,21 +1527,20 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       }
     }
   }
-  auto id_array = decltype(ids_)::From(ids);
+  auto id_array = LinearIds::From(ids);
   if (!id_array.ok()) return id_array.status();
   auto end_array = FenwickTree::FromCumulative(std::move(ends));
   if (!end_array.ok()) return end_array.status();
   rebuilt.groups_ = std::move(*group_array);
-  rebuilt.ids_ = std::move(*id_array);
+  rebuilt.linear_ids() = std::move(*id_array);
   rebuilt.ranks_ = std::move(*end_array);
-  if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header_) {
+  if (root.kind_ == OrderedCollectionKind::kStream && has_stream_header()) {
     const auto* old_first = Find(root_.first_group_);
     const auto* new_first = rebuilt.Find(root.first_group_);
     if (old_first != nullptr && new_first != nullptr &&
         old_first->id_ == new_first->id_ &&
         old_first->sequence_ == new_first->sequence_) {
       rebuilt.stream_header_ = stream_header_;
-      rebuilt.has_stream_header_ = true;
     }
   }
   return rebuilt;
@@ -1272,7 +1549,14 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
 std::uint64_t OrderedGroupDirectory::CountBefore(
     std::size_t index) const noexcept {
   if (index == 0) return 0;
-  if (index >= groups_.size()) return root_.item_count_;
+  if (index >= root_.group_count_) return root_.item_count_;
+  if (const auto* list = std::get_if<ListSlots>(&ids_)) {
+    const auto before = ranks_.CountBefore(list->head_);
+    const auto end = list->head_ + index;
+    if (end <= groups_.size()) return ranks_.CountBefore(end) - before;
+    return root_.item_count_ - before +
+           ranks_.CountBefore(end - groups_.size());
+  }
   if (root_.kind_ == OrderedCollectionKind::kString)
     return index * kStringGroupBytes;
   return ranks_.CountBefore(index);
@@ -1283,6 +1567,14 @@ std::optional<OrderedGroupDirectory::Position> OrderedGroupDirectory::FindRank(
   if (rank >= root_.item_count_) return std::nullopt;
   if (root_.kind_ == OrderedCollectionKind::kString)
     return Position{rank / kStringGroupBytes, rank % kStringGroupBytes};
+  if (const auto* list = std::get_if<ListSlots>(&ids_)) {
+    const auto before = ranks_.CountBefore(list->head_);
+    const auto first = root_.item_count_ - before;
+    auto position = ranks_.Locate(rank < first ? before + rank : rank - first);
+    position.group_index_ =
+        (position.group_index_ + groups_.size() - list->head_) % groups_.size();
+    return position;
+  }
   return ranks_.Locate(rank);
 }
 

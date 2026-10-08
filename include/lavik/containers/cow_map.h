@@ -20,6 +20,7 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -42,7 +43,7 @@ namespace lavik {
 //
 // Keys and values are trivially copyable; referenced resources remain the
 // caller's responsibility. All copies, access and destruction stay on the
-// allocating thread. Callers must bound the population to UINT32_MAX entries.
+// allocating thread.
 template <typename Key, typename Value>
 class CowMap {
   static_assert(std::is_trivially_copyable_v<Key>);
@@ -120,12 +121,22 @@ class CowMap {
 
    private:
     friend class CowMap;
-    // An AVL tree containing at most UINT32_MAX entries is far shallower than
-    // this fixed stack. Iteration never allocates retained/scratch memory.
+    // This stack covers an AVL tree whose node count fits a 64-bit size_t.
+    // Iteration never allocates retained/scratch memory.
     const Overlay* overlay_ = nullptr;
     std::array<const Node*, 96> path_{};
     unsigned depth_ = 0;
   };
+
+  // Conservative footprint including shared nodes; allocations already own
+  // these charges. Callers may use it for scratch planning, not re-accounting.
+  std::size_t RetainedBytes() const noexcept {
+    const auto node = AllocatorUsableSizeForRequest(sizeof(Node) + 1024);
+    const auto overlay =
+        overlay_ ? AllocatorUsableSizeForRequest(sizeof(Overlay) + 1024) : 0;
+    const auto limit = std::numeric_limits<std::size_t>::max();
+    return size() > (limit - overlay) / node ? limit : size() * node + overlay;
+  }
 
   std::size_t size() const noexcept { return Size(root_); }
   bool empty() const noexcept { return !root_; }
