@@ -1150,6 +1150,16 @@ if (BUILD_TESTING)
       set_tests_properties(meta_integration.gate_native_replication PROPERTIES
         LABELS meta-integration TIMEOUT 600 RUN_SERIAL TRUE)
       add_test(
+        NAME meta_integration.gate_ordered_cold_recovery
+        COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_native_replication.py
+                $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik>
+                $<TARGET_FILE:lavik-ctl> ${LAVIK_CLUSTER_CREATE_REDIS_CLI}
+                ordered_cold_recovery
+      )
+      set_tests_properties(meta_integration.gate_ordered_cold_recovery PROPERTIES
+        LABELS meta-integration TIMEOUT 180 RUN_SERIAL TRUE)
+      add_test(
         NAME meta_integration.native_fixture_startup
         COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_native_fixture_startup.py)

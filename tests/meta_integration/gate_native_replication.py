@@ -1005,6 +1005,90 @@ def grouped_streams(root):
             reader.close()
 
 
+def ordered_cold_recovery(root):
+    # These keys exceed grouped promotion and share a key owner. Cold recovery
+    # must preserve both alternatives of RecoveryOrderedMetadata's union:
+    # Stream routing prefixes and ZSet score bounds, alongside String pages.
+    stream = "{ordered-recovery}stream"
+    zset = "{ordered-recovery}zset"
+    string = "{ordered-recovery}string"
+    group = "same-prefix-" + "g" * 96
+    consumer = "consumer-" + "a" * 96
+
+    def state(client):
+        # Probe recovered routing before full reads can populate page caches.
+        return (
+            client.call("XRANGE", stream, "151-0", "175-0"),
+            client.call("XPENDING", stream, group),
+            client.call("ZRANGEBYSCORE", zset, -207, -183, "WITHSCORES"),
+            client.call("ZRANGEBYSCORE", zset, 105, 129, "WITHSCORES"),
+            client.call("GETRANGE", string, 4091, 8205),
+            client.call("XRANGE", stream, "-", "+"),
+            client.call("XINFO", "STREAM", stream, "FULL", "COUNT", 0),
+            client.call("ZRANGE", zset, 0, -1, "WITHSCORES"),
+            client.call("GET", string),
+        )
+
+    def snapshot(node):
+        reader = Client(node, readonly=True)
+        try:
+            return state(reader)
+        finally:
+            reader.close()
+
+    with pair(root, "ordered-cold-recovery", source_workers=2, target_workers=3) as (
+        meta,
+        source,
+        target,
+        writer,
+    ):
+        ready(meta)
+        for number in range(1, 301):
+            assert writer.call("XADD", stream, f"{number}-0", "field", "x" * 4096)
+        assert writer.call("XGROUP", "CREATE", stream, group, "0") == "OK"
+        writer.call(
+            "XREADGROUP", "GROUP", group, consumer, "COUNT", 80, "STREAMS", stream, ">"
+        )
+        # Keep PEL/group metadata while retiring old message pages. Long names
+        # also require a page read when a cached prefix cannot settle routing.
+        assert writer.call("XTRIM", stream, "MAXLEN", "=", 150) == 150
+        members = []
+        for number in range(512):
+            members.extend((number - 256, f"member-{number:04d}-" + "z" * 96))
+        assert writer.call("ZADD", zset, *members) == 512
+        value = "".join(f"{number:04d}" * 1024 for number in range(64))
+        assert writer.call("SET", string, value) == "OK"
+        expected = state(writer)
+        H.wait_until(
+            "mixed ordered types replicated", 45, lambda: snapshot(target) == expected
+        )
+
+        # Explicitly exclude checkpoint loading so this exercises the inline
+        # auxiliary scan/reconstruction path on both worker topologies.
+        for node in (source, target):
+            admin = Client(node, readonly=True)
+            try:
+                assert admin.call("CONFIG", "SET", "shutdown-checkpoint", "no") == "OK"
+            finally:
+                admin.close()
+        target.terminate()
+        source.terminate()
+        offsets = {
+            node: Path(node.log_path).stat().st_size for node in (source, target)
+        }
+        source.start()
+        target.start()
+        ready(meta)
+        H.wait_until(
+            "mixed ordered types cold recovered on both copies",
+            60,
+            lambda: all(snapshot(node) == expected for node in (source, target)),
+        )
+        for node in (source, target):
+            log = Path(node.log_path).read_bytes()[offsets[node] :].decode()
+            assert re.search(r"storage recovery:.*records=[1-9][0-9]*", log), log
+
+
 def replay_and_reconnect(root):
     with pair(root, "replay", seed=seed_collections) as (meta, source, target, writer):
         ready(meta)
@@ -2171,6 +2255,10 @@ def main():
     ) as directory:
         root = Path(directory)
         if len(sys.argv) > 5:
+            if sys.argv[5:] == ["ordered_cold_recovery"]:
+                ordered_cold_recovery(root)
+                H.log("PASS")
+                return
             assert sys.argv[5:] == ["tomb_raider"], sys.argv[5:]
             tomb_raider(root)
             if C.has_fault(C.DATA, b"LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE"):

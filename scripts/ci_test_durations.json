@@ -38,6 +38,7 @@
     "meta_integration.gate_managed_wait": 110,
     "meta_integration.gate_mtls": 60,
     "meta_integration.gate_native_replication": 545,
+    "meta_integration.gate_ordered_cold_recovery": 40,
     "meta_integration.native_fixture_startup": 0.2,
     "meta_integration.sentinel_discovery": 65,
     "meta_integration.sentinel_ha_controlled": 60,
