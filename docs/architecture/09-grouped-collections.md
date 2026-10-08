@@ -503,8 +503,12 @@ length and checked entry counts. A move-only page owns its resulting capacity
 charge through output backpressure, independently of token cancellation;
 buffers are destroyed before their allowance is returned. Admission failure
 cancels the snapshot and cannot replace a previous successful dump.
-Shutdown checkpoints decline grouped populations and leave ordinary durable
-recovery available.
+Shutdown checkpoints persist grouped root and directory metadata, including
+active and retired groups, extent manifests, routing links, local revisions,
+and both Sorted Set graphs. Startup restores immutable views without reading
+group payloads; ordinary reads validate those payloads lazily. Invalid or
+incomplete checkpoints discard restored views and reconstruct the graph from
+authoritative ordinary records. See [shutdown checkpoints](06-shutdown-index-checkpoints.md).
 
 RDB collection export and import do not require a single aggregate compact
 value. File import, Redis-PSYNC RDB population and RESTORE consume admitted

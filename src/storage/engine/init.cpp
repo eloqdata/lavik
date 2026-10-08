@@ -1318,6 +1318,19 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   status = co_await checkpoint_retired_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
 
+  if (checkpoint_active_.load(std::memory_order_acquire)) {
+    // Complete directories are already restored; do not reconstruct them from
+    // the ordinary bodies this checkpoint permits us to skip.
+    store.recovery_grouped_roots_.clear();
+  } else {
+    checkpoint_load.indirect_references_.clear();
+    // Discard published directory prefixes before cold graph reconstruction.
+    // Validated root entries retain recovery metadata for the winner merge.
+    for (auto& partition : store.partitions_)
+      for (std::uint8_t db = 0; db < options_.database_count_; ++db)
+        (void)partition.grouped_objects_[db].Detach();
+  }
+
   if (checkpoint_load_fell_back_.load(std::memory_order_acquire)) {
     // Checkpoint chunks become visible only after their CRC and structure
     // validate, but a later chunk can still invalidate the whole snapshot.
@@ -1346,6 +1359,23 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   status = co_await indirect_key_recovery_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
+  // KeyRecord recovery restores every durable UUID copy, including obsolete
+  // copies and extent ownership. Reattach the checkpoint's physical user-record
+  // references before any block can be reclaimed, even for deleted user keys.
+  for (const auto& ref : checkpoint_load.indirect_references_) {
+    auto handle = co_await FindIndirectKey(ref.key_id_);
+    if (!handle.ok()) {
+      Fail(handle.status());
+      co_return handle.status();
+    }
+    auto& refs =
+        store.indirect_key_references_[{ref.block_id_, ref.allocation_epoch_}];
+    if (!refs.emplace(ref.record_offset_, *handle).second) {
+      status = absl::DataLossError("duplicate checkpoint UUID dependency");
+      Fail(status);
+      co_return status;
+    }
+  }
   status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks,
                                        &committed_txids);
   if (!status.ok()) {
@@ -1370,6 +1400,21 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   if (!status.ok()) {
     co_return status;
   }
+
+  for (const auto& ref : checkpoint_load.indirect_references_) {
+    const auto* state = FindBlockState(store, ref.block_id_);
+    if (!state || !state->allocated_ ||
+        state->allocation_epoch_ != ref.allocation_epoch_ ||
+        state->kind_ != BlockKind::kRecords ||
+        ref.record_offset_ >= state->committed_bytes_) {
+      status = absl::DataLossError(
+          "checkpoint UUID dependency has no matching block");
+      Fail(status);
+      co_return status;
+    }
+  }
+  std::vector<CheckpointIndirectReference>{}.swap(
+      checkpoint_load.indirect_references_);
 
   // LSN comparisons are only between physical copies of one logical key
   // version. All publications for a key run on its current key owner. Seed

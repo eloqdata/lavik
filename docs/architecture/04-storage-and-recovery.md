@@ -271,9 +271,10 @@ allocation reserves and durability fences with other storage maintenance. It
 updates one UUID-to-location entry after the new copy is durable. Ordinary
 record defrag never interprets KeyRecords as user entries. Recovery first
 rebuilds the UUID registry and extent owners, then scans user records and
-reconstructs block dependencies before reclaiming orphans. Shutdown checkpoints
-are declined while indirect-key state remains, so startup follows this complete
-cold-recovery path.
+reconstructs block dependencies before reclaiming orphans. A shutdown checkpoint
+retains the complete keys and physical UUID dependencies so startup can skip
+user-record bodies; the KeyRecord pass still rebuilds the UUID registry and
+its physical copies before those dependencies are attached.
 
 User Strings of at least 16 KiB split their value into fixed 8 KiB group records,
 regardless of key length; smaller Strings retain their compact representation.
@@ -325,11 +326,11 @@ classifies matching chunks without reading every 8 MiB body. The exact
 per-partition, per-database capacities are then validated against the root and
 used to allocate each owner-local index's final power-of-two bucket table.
 Only after every owner has finished that allocation do scanners double-buffer
-the index and accounting bodies. The prefix directory redistributes those
+the checkpoint bodies. The prefix directory redistributes those
 blocks to their durable shard first, so the index owner performs both body I/O
 and installation without a cross-worker decoded batch. After validating the
-body checksum, each individually validated entry is installed directly from
-its pinned I/O buffer. The entry carries its validated logical partition and
+body checksum, each individually validated inline-key entry is installed
+directly from its pinned I/O buffer. The entry carries its validated logical partition and
 runtime digest, so key bytes have no intermediate owning copy and recovery
 does not recalculate Redis slots or key digests. A later invalid entry sends
 the installed valid prefix
@@ -337,8 +338,12 @@ through the ordinary cold-scan merge. io_uring
 owners can open every configured path; under SPDK the unchanged worker
 topology must also give the shard owner a qpair for the block's controller.
 This removes incremental index rehashing, cross-worker installation, decoded
-entry batches, and per-key routing hashes from checkpoint recovery while
-retaining worker-bounded temporary I/O memory.
+entry batches, and per-key routing hashes from inline-key checkpoint recovery while
+retaining worker-bounded temporary I/O memory. Grouped roots and indirect keys
+use sequenced metadata fragments, with admitted scratch for one complete key
+and directory. Grouped views are restored without reading collection values;
+UUID dependencies are reattached after the KeyRecord pass. On fallback, those
+views and dependencies are discarded and rebuilt by the ordinary scan.
 Barriers reduce
 per-worker block, entry, capacity, and shard totals and verify each loaded
 index against its declared size. The root's expected counts make missing

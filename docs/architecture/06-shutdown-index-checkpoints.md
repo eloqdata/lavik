@@ -19,8 +19,8 @@ limitations under the License.
 ## Role and authority
 
 A shutdown index checkpoint is an optional, one-use cache of the in-memory
-top-level indexes. It reduces restart disk traffic; it does not replace
-ordinary records or change command durability. Checkpoint loading validates
+top-level indexes and grouped collection directories. It reduces restart disk
+traffic; it does not replace ordinary records or change command durability. Checkpoint loading validates
 the serialized index structure, while the referenced ordinary record body is
 validated lazily when it is read. A structurally valid checkpoint can therefore
 restore a location whose later value read reports media corruption even when a
@@ -45,8 +45,10 @@ That work can create new staged records, so all workers perform a second
 seal/drain round and meet a second barrier. A final locked check rejects the
 checkpoint if expiration, flush work, or a runtime storage failure appeared
 behind either freeze. There is no online checkpoint flow. The build is
-therefore O(current index entries), including reading complete keys that are
-not retained inline; it does not scan obsolete record versions.
+therefore proportional to current index entries, group directory metadata, and
+physical indirect-key references, including reading complete keys that are not
+retained inline. It does not scan obsolete user-record bodies or serialize
+collection values.
 
 After request admission is closed and all accepted requests have drained, the
 shutdown thread snapshots the runtime atomic once before publishing the flush
@@ -81,14 +83,14 @@ contiguous block range. Its raw payload is `ceil(capacity_blocks / 8)` bytes;
 the A/B copies consume twice that amount plus page headers (32 MiB at the
 per-device 1 PiB limit).
 
-Each worker serializes three chunk kinds into ordinary 8 MiB checkpoint blocks.
+Each worker serializes typed chunks into ordinary 8 MiB checkpoint blocks.
 Its single capacity chunk contains the exact entry count for every owned
 partition and logical-database index, including empty indexes. The complete
 directory fits in one block even with one worker. Startup uses these counts to
 allocate final index bucket tables before it installs keys; the directory is
 also a completeness check independent of how index entries happen to be split
 across blocks.
-Index chunks contain the complete key, physical record location, database,
+Inline-key index chunks contain the complete key, record location, database,
 logical type and size, expiry and shielding state, and any extent manifest.
 Their 48-byte fixed entry header packs the 43-bit block id with the low 21 bits
 of its allocation epoch, and packs aligned offset, aligned length, owner,
@@ -111,8 +113,25 @@ checkpoint bytes per key and not rotating collision-flooding entropy at every
 clean restart; the seed remains local storage metadata and is never exposed in
 the Redis or replication protocols.
 
-Block-accounting chunks contain one entry for every live ordinary or extent
-block owned by the shard, not one entry per key. Each entry stores the block
+Grouped roots and indirect keys use a length-framed metadata stream. Sequenced
+fragments allow a complete key or directory to exceed one checkpoint block;
+small objects share fragments. Each object carries its complete key, root
+location and manifest. Grouped objects also carry the encoded root, active and
+retired group coordinates, manifests, local revisions, routing links, counts,
+and score bounds. Sorted Sets preserve both ordered and member directories.
+Runtime pointers and collection payloads are absent. The loader reconstructs
+immutable side-index views from this metadata; Stream page maxima may be
+loaded lazily by normal routing.
+
+Indirect-reference chunks retain each allocated user-record block's UUID
+dependencies, including obsolete and aborted records. Startup still scans
+KeyRecord bodies and key extents to rebuild the UUID registry and physical
+KeyRecord copies, then attaches these dependencies before reclamation. Dropping
+a deleted key from the winner index must not release a UUID needed by a future
+ordinary-record scan.
+
+Block-accounting chunks contain one entry per live ordinary record block or
+value-extent block, not one entry per key. Each entry stores the block
 identity, owner, aggregate live bytes, and the extra extent identity needed to
 validate a manifest against its physical header. The dense runtime block table
 is the authority for ordinary-block aggregates. While performing the required
@@ -121,7 +140,9 @@ because extent identity deliberately does not occupy every runtime
 `BlockState`, and an extent's recovery owner can differ from its key-index
 shard. The restored extent entry therefore resolves its physical owner only
 after the block-header scan.
-Capacity, index, and accounting chunks share the checkpoint block kind,
+KeyRecord blocks and key extents retain the accounting produced by UUID
+recovery and are excluded from the checkpoint accounting table.
+All chunk types share the checkpoint block kind,
 generation, bitmap, publication lifecycle, and payload CRC; an explicit
 chunk-kind field selects their entry layout.
 
@@ -136,7 +157,7 @@ the DMA memory.
 Publication order is:
 
 ```text
-write every checkpoint capacity, index, and accounting block
+write every checkpoint block, including object metadata and UUID dependencies
 write the checkpoint bitmap and synchronize data plus bitmap once per device
 publish the generation and expected counts through the root on every device
 ```
@@ -150,10 +171,10 @@ unchanged because a reused block id can hold a newer checkpoint generation.
 Until the final step completes, new blocks are unpublished acceleration state.
 A partial or failed build never changes the published generation. Its bitmap
 bits may remain as false positives, but the old root generation cannot select
-the new block headers. Insufficient foreground space, an index entry larger
-than one checkpoint block, transaction cleanup that cannot quiesce or relocate
-its winners, or I/O failure causes this shutdown's checkpoint attempt to fail
-without changing the durability of ordinary or transaction records. A tagged
+the new block headers. Insufficient foreground or metadata scratch space,
+transaction cleanup that cannot quiesce or relocate its winners, or I/O failure
+causes this shutdown's checkpoint attempt to fail without changing the
+durability of ordinary or transaction records. A tagged
 winner observed by shard serialization is an invariant check for incomplete
 cleanup, not a representation supported by the checkpoint. Checkpoint
 allocation does not consume the defrag reserve and does not wait for online
@@ -170,11 +191,6 @@ destruction and normal process return so LeakSanitizer still performs its
 exit-time scan. The shortcut is also never armed when checkpoint publication
 or the shutdown flush fails, and it cannot be used by an embedding that intends
 to reuse the storage engine in the same process.
-
-Indirect-key registries and their stale-record dependencies are not encoded by
-the checkpoint schema. A shard retaining any such state declines checkpoint
-publication; the authoritative KeyRecord and user-record blocks remain durable
-and startup rebuilds them through the storage engine's two-pass cold recovery.
 
 ## Startup consumption and fallback
 
@@ -204,9 +220,10 @@ nonempty `ScanHashMap` receives the same final power-of-two bucket count and
 
 After that allocation barrier, each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
-checksums. Before those body reads, the prefix results redistribute every index
-and accounting block to its durable shard. That owner reads, decodes, and
-installs the block locally, avoiding a cross-worker decoded batch. This is
+checksums. Before those body reads, the prefix results redistribute every body
+block to its durable shard and order object fragments by their stream sequence.
+That owner reads, decodes, and installs the block locally, avoiding a
+cross-worker decoded batch. This is
 always accessible on io_uring because every worker opens every path. On SPDK,
 checkpoint preparation verifies that the unchanged topology still gives the
 shard owner a qpair for the block's controller; otherwise the checkpoint falls
@@ -214,7 +231,7 @@ back instead of silently restoring the old cross-worker path. Each owner
 double-buffers checkpoint reads: after a block completes I/O it submits the
 next block before decoding and installing the current one. I/O, decoding, and
 index construction therefore proceed concurrently across owners. After the
-whole payload passes CRC32C, each index entry is bounds- and semantics-checked,
+whole payload passes CRC32C, each inline-key index entry is bounds- and semantics-checked,
 its stored partition is checked against the chunk shard, and it is installed
 directly from the pinned I/O buffer. Key bytes are copied only into their final
 index nodes; there is neither an owning decoded batch, a Redis-slot
@@ -224,18 +241,23 @@ final winner per logical key, successful loading inserts those entries without
 the multi-version arbitration used by the ordinary record scan. If a later
 entry is invalid, the already installed valid prefix is marked as a checkpoint
 winner and participates in the same authoritative cold-scan merge as prefixes
-from earlier blocks. An owner therefore holds at most two 8 MiB buffers plus
-final index state, so temporary entry memory remains bounded by worker count
-rather than key count. Barriers reduce the per-scanner block,
+from earlier blocks. Each owner holds two 8 MiB I/O buffers. Complex-object
+encoding also uses a bounded stream buffer; encoding and decoding reserve
+scratch for one complete key and its directory metadata at a time. Temporary
+object memory therefore depends on the largest key/directory, not collection
+value bytes or the total key population. Barriers reduce the per-scanner block,
 index-entry, accounting-entry, capacity, and shard results. Block and
-index-entry totals must exactly match the root, every worker must have all
-three chunk kinds represented, and each installed index size must equal its
-capacity declaration. The published total block count makes a missing chunk
+index-entry totals must exactly match the root, every worker must have
+capacity, index, and accounting chunks represented, and each installed index
+size must equal its capacity declaration. The published total block count makes a missing chunk
 detectable without adding another root field. If a block or the final
 completeness check fails, startup disables ordinary-body skipping and performs
 the full record scan. Entries
 from already validated checkpoint blocks remain installed and participate in
-the normal winner merge; the full scan supplies every missing key.
+the normal winner merge; the full scan supplies every missing key. Restored
+grouped views and UUID dependency chunks are discarded on fallback so the
+ordinary scan reconstructs complete graphs and physical dependencies. Validated
+root metadata remains available for the winner merge.
 
 After the one load attempt, startup writes an all-zero checkpoint bitmap before
 the parallel storage scan. On success, every matching index block is already
@@ -249,12 +271,14 @@ the consumed root still prevents reuse.
 
 With a valid checkpoint, recovery still scans the allocation bitmap and reads
 the two header pages of every remaining allocated block. It reads transaction
-block bodies to reconstruct durable commit evidence and extent headers for
-identity validation, but skips the 8 MiB bodies of ordinary record blocks. Its
+block bodies to reconstruct durable commit evidence, KeyRecord bodies and key
+extents to rebuild UUID state, and extent headers for identity validation. It
+skips ordinary record bodies and group payload reads during startup. Its
 disk work is:
 
 ```text
-O(allocated block headers + checkpoint bytes + transaction block bytes)
+O(allocated block headers + checkpoint bytes + KeyRecord/key-extent bytes
+  + transaction block bytes)
 ```
 
 Recovery still walks the rebuilt winner indexes once to charge live roots and
