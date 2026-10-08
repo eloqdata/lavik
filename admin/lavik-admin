@@ -13,7 +13,8 @@ case "${1:-}" in
 Usage: ./lavik-admin [ctl FLEET_COMMAND [ARGUMENT...]]
 
 Open http://localhost:4173 and sign in with the token printed at startup.
-Use Create cluster to prepare passwordless SSH and deploy to existing Linux hosts.
+Choose Try a demo cluster to start six local Docker nodes, or Create cluster
+to prepare passwordless SSH and deploy to existing Linux hosts.
 Data and Meta run on those hosts; closing Admin does not stop a cluster.
 
 Environment:

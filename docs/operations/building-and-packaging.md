@@ -24,7 +24,11 @@ and a local verification script.
 The optional [Lavik Admin service](lavik-admin.md) is included in all release
 archives, including nightly, and has a separate Docker package. It can deploy
 new clusters over SSH or connect to existing Meta and Data. Its own process
-does not run io_uring.
+does not run io_uring. The [Admin Docker quick start](../../admin/quickstart/README.md)
+downloads a checksummed minimal release and its bundled Node runtime; its runtime
+image installs only OS tools and does not compile Lavik. Release archives include
+the local-demo runtime assets so the running Admin can start the six demo nodes
+from its browser without a source checkout or another Admin container.
 
 ## Kernel requirements
 

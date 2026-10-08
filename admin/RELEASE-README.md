@@ -18,6 +18,30 @@ terminal. Keep this terminal running. The private workspace defaults to
 `~/.local/share/lavik-admin`; set `LAVIK_ADMIN_DATA` to use a different directory.
 Stopping Admin does not stop your clusters.
 
+## Try a demo cluster
+
+Start Docker Desktop on macOS, or Docker Engine with Compose v2 on Linux.
+In Admin choose **Create cluster → Try a demo cluster**. The button checks Docker,
+prepares its runtime image, installs the included Linux Lavik binaries, starts
+three Meta voters and three Data nodes, and creates `demo-cluster`. The browser
+shows progress and retryable errors, then offers **Open demo dashboard**.
+The Admin you already started remains the only Admin; no source checkout or
+separate setup command is needed. If the package binaries do not match Docker’s
+architecture, Admin downloads and verifies a matching nightly release instead.
+
+Allow about 3 GiB for Data files plus release/runtime storage. Docker must run
+Linux containers with io_uring support (Linux 6.1+). Use a local Docker context;
+remote Docker engines are rejected. Each workspace has its own project and
+Docker-allocated private network. Admin reaches nodes through `docker exec`,
+including on macOS; it does not require a Linux `lavik-ctl` running on the Mac,
+published node ports, or direct routing into Docker's network.
+
+You can leave the setup page while Admin works. After an interruption, return to
+**Try a demo cluster** to retry using the retained volumes and original release.
+Uncertain cluster initialization is only observed, never blindly repeated.
+Use **Remove cluster → Permanently tear down deployment** to delete the demo's
+nodes and volumes while keeping this Admin and unrelated Docker projects running.
+
 ## Prepare hosts
 
 Use existing AMD64 or ARM64 Linux hosts with Python 3, glibc 2.39 or newer

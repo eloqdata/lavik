@@ -918,3 +918,6 @@ dialog textarea {
 @media (max-width: 1000px) { .onboarding-options { grid-template-columns: 1fr; } }
 
 .setup-checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+
+/* Hidden confirmation controls must stay hidden despite label layout rules. */
+[hidden] { display: none !important; }

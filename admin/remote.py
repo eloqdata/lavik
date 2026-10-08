@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
-"""Stateless SSH helper. Persist ownership before provisioning, never erase data."""
+"""SSH helper: provision non-destructively; teardown requires retained ownership."""
 
 import base64
 import ctypes
@@ -18,6 +18,8 @@ import sys
 import tarfile
 import tempfile
 import secrets
+import signal
+import select
 import urllib.request
 import time
 
@@ -731,8 +733,247 @@ def start_node(request):
     return identity
 
 
+def teardown_units(root, request):
+    """Only exact retained launchers establish ownership of a service unit."""
+    units = []
+    if request["supervisor"] != "systemd":
+        return units
+    for node in request["nodes"]:
+        name = f"lavik-{request['cluster']}-{node['name']}.service"
+        path = Path.home() / ".config/systemd/user" / name
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked service unit: {path}")
+        if path.exists():
+            expected = "ExecStart=/usr/bin/python3 " + str(
+                root / node["name"] / "launch.py"
+            ).replace("%", "%%")
+            if expected not in path.read_text().splitlines():
+                raise RuntimeError(f"Refusing foreign service unit: {path}")
+        # A missing file does not prove that an already-loaded service stopped.
+        info = run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                name,
+                "--property=LoadState,ActiveState,FragmentPath",
+            ]
+        )
+        fields = dict(
+            line.split("=", 1) for line in info["stdout"].splitlines() if "=" in line
+        )
+        if not fields or (info["code"] and fields.get("LoadState") != "not-found"):
+            raise RuntimeError(f"Cannot inspect service {name}: {info['stderr']}")
+        fragment = fields.get("FragmentPath")
+        if fragment and fragment != str(path):
+            raise RuntimeError(f"Service uses a foreign unit: {name}")
+        if not path.exists() and fields.get("ActiveState") not in (
+            "inactive",
+            "failed",
+        ):
+            raise RuntimeError(f"Missing unit still has active state: {name}")
+        if path.exists():
+            units.append((name, path))
+    return units
+
+
+def stop_process(directory, root):
+    """A pidfd pins the checked identity; PID reuse must never signal another job."""
+    identity_path = directory / "process.json"
+    if not identity_path.exists():
+        return
+    identity = json.loads(identity_path.read_text())
+    if (
+        identity.get("boot")
+        != Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    ):
+        return
+    pid = int(identity["pid"])
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        proc = Path(f"/proc/{pid}")
+        try:
+            # Field 2 can contain spaces and parentheses; split after its final ')'.
+            fields = (proc / "stat").read_text().rsplit(")", 1)[1].split()
+            if fields[19] != identity["start"] or fields[0] == "Z":
+                return
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+        except FileNotFoundError:
+            return
+        permitted = {
+            str(root / "release/lavik").encode(),
+            str(root / "release/lavik-meta").encode(),
+        }
+        launcher = str(directory / "launch.py").encode()
+        if not argv or not (
+            argv[0] in permitted or (len(argv) > 1 and argv[1] == launcher)
+        ):
+            raise RuntimeError(f"Process identity does not belong to {directory}")
+        signal.pidfd_send_signal(fd, signal.SIGTERM)
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        if not poller.poll(60000):
+            raise RuntimeError(f"Process {pid} did not stop; data retained")
+    finally:
+        os.close(fd)
+
+
+def check_no_processes(root):
+    """A stale/missing process record never authorizes deleting live file storage."""
+    executables = {str(root / "release/lavik"), str(root / "release/lavik-meta")}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            executable = os.readlink(proc / "exe").removesuffix(" (deleted)")
+            argv = (proc / "cmdline").read_bytes().split(b"\0")
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            # Other UIDs cannot belong to this unprivileged deployment.
+            if proc.stat().st_uid == os.geteuid():
+                raise RuntimeError(f"Cannot inspect owned process {proc.name}")
+            continue
+        if executable in executables or any(
+            arg.startswith((str(root) + "/").encode()) for arg in argv[:2]
+        ):
+            raise RuntimeError(
+                f"Deployment process {proc.name} is still running; data retained"
+            )
+
+
+def teardown(request):
+    """Idempotent file-deployment removal; never follow mounts or erase raw/SPDK media."""
+    if request.get("phase") not in ("check", "stop", "delete"):
+        raise RuntimeError("Invalid teardown phase")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,39}", request["cluster"]):
+        raise RuntimeError("Invalid cluster name")
+    root = root_path(request)
+    if not root.exists():
+        # A previous delete may have succeeded before the SSH reply was lost.
+        return {"removed": True}
+    # A small sibling receipt survives the final marker unlink. It proves the
+    # empty directory left by a crash at that boundary belongs to this removal.
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", request["owner"]):
+        raise RuntimeError("Invalid deployment owner")
+    receipt = root.parent / (
+        ".lavik-removed-" + request["cluster"] + "-" + request["owner"] + ".json"
+    )
+    receipt_data = json.dumps({"owner": request["owner"], "root": str(root)})
+    if receipt.is_symlink():
+        raise RuntimeError("Refusing symlinked teardown receipt")
+    if (
+        not (root / "deployment.json").exists()
+        and receipt.is_file()
+        and receipt.read_text() == receipt_data
+        and not any(root.iterdir())
+    ):
+        if request["phase"] == "delete":
+            root.rmdir()
+        return {"removed": True}
+    root = owned(request)
+    if (root / "spdk-request.json").exists() or any(
+        n.get("spdk") for n in request["nodes"]
+    ):
+        raise RuntimeError("SPDK storage requires manual decommissioning")
+    for node in request["nodes"]:
+        if not re.fullmatch(r"(?:meta|data)-[0-9]+", node["name"]):
+            raise RuntimeError("Invalid retained node name")
+    # Refuse bind mounts and nested filesystems as well as symlinked metadata.
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        mount = line.split()[4]
+        mount = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), mount)
+        if mount == str(root) or mount.startswith(str(root) + "/"):
+            raise RuntimeError(f"Refusing mounted deployment path: {mount}")
+    for directory, names, files in os.walk(root, followlinks=False):
+        for name in names + files:
+            if (Path(directory) / name).is_symlink():
+                raise RuntimeError(
+                    "Refusing symlink inside deployment; inspect before teardown"
+                )
+    units = teardown_units(root, request)
+    monitor = root / "monitoring"
+    compose = monitor / "compose.yaml"
+    if compose.exists():
+        if not request.get("monitoring"):
+            raise RuntimeError("Monitoring is absent from the retained plan")
+        ids = checked(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                "label=com.docker.compose.project=lavik-" + request["cluster"],
+            ]
+        ).split()
+        if ids:
+            containers = json.loads(checked(["docker", "inspect", *ids]))
+            for container in containers:
+                labels = container["Config"].get("Labels") or {}
+                if labels.get("com.docker.compose.project.working_dir") != str(
+                    monitor
+                ) or labels.get("com.docker.compose.project.config_files") != str(
+                    compose
+                ):
+                    raise RuntimeError(
+                        "Monitoring project belongs to another directory"
+                    )
+    if request["phase"] == "check":
+        return {"ok": True}
+    for name, path in units:
+        checked(["systemctl", "--user", "disable", "--now", name], 90)
+        state = checked(
+            ["systemctl", "--user", "show", name, "--property=ActiveState", "--value"]
+        )
+        if state not in ("inactive", "failed"):
+            raise RuntimeError(f"Service did not stop: {name}")
+    if request["supervisor"] == "process":
+        for node in request["nodes"]:
+            stop_process(root / node["name"], root)
+    if compose.exists():
+        checked(
+            [
+                "docker",
+                "compose",
+                "--project-name",
+                "lavik-" + request["cluster"],
+                "--project-directory",
+                str(monitor),
+                "-f",
+                str(compose),
+                "down",
+                *(["--volumes"] if request["phase"] == "delete" else []),
+            ],
+            180,
+        )
+    check_no_processes(root)
+    if request["phase"] == "delete":
+        write_once(receipt, receipt_data)
+        for _, path in units:
+            path.unlink()
+        if units:
+            checked(["systemctl", "--user", "daemon-reload"])
+        # Keep the ownership marker until all other content is gone, so a
+        # interrupted recursive removal can still be retried with the nonce.
+        for child in root.iterdir():
+            if child.name == "deployment.json":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        (root / "deployment.json").unlink()
+        root.rmdir()
+    return {"ok": True, "phase": request["phase"]}
+
+
 def main(request):
     action = request["action"]
+    if action == "teardown":
+        return teardown(request)
     if action == "probe":
         return probe(request)
     if action == "prepare":

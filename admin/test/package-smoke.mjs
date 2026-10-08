@@ -32,6 +32,16 @@ try {
   assert.equal((await fetch(base + "/setup.js")).status, 200);
   assert.equal((await fetch(base + "/hosts.js")).status, 200);
   assert.equal((await fetch(base + "/placement.js")).status, 200);
+  for (const asset of [
+    "Dockerfile",
+    "download.sh",
+    "start.sh",
+    "cluster.toml",
+    "client.mjs",
+  ])
+    assert.ok(
+      (await readFile(join(bundle, "admin", "quickstart", asset))).length,
+    );
   const login = await fetch(base + "/api/login", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Lavik-Admin": "1" },
@@ -44,6 +54,10 @@ try {
     headers: { Cookie: login.headers.get("set-cookie").split(";")[0] },
   });
   assert.deepEqual(await clusters.json(), []);
+  const demo = await fetch(base + "/api/demo", {
+    headers: { Cookie: login.headers.get("set-cookie").split(";")[0] },
+  });
+  assert.deepEqual(await demo.json(), { state: "idle" });
   console.log(
     "Packaged Lavik Admin starts, serves setup assets, authenticates, and opens its catalog.",
   );

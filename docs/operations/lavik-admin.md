@@ -52,8 +52,9 @@ Admin computer needs HTTPS access to GitHub; hosts receive verified binaries
 over SSH and do not need to download releases themselves.
 
 Choose **Create cluster** to pick **Local demo**, **Set up machines**, or
-**Connect existing cluster**. The local path shows the single command
-`./admin/quickstart/setup.sh`; see the [Docker quick start](../../admin/quickstart/README.md).
+**Connect existing cluster**. The local button directly starts six Docker nodes, downloads the release, and
+creates a demo using this Admin. Its packaged assets need no source checkout;
+see the [local demo guide](../../admin/quickstart/README.md).
 Production setup follows three stages:
 
 1. **Prepare hosts.** Paste one `SSH_HOST[:PORT]` per line, optionally followed
@@ -227,10 +228,10 @@ BASE_DIR/CLUSTER/monitoring/compose.yaml ...`. Retain its named volumes for hist
 
 ## Run in Docker
 
-To start a new local cluster as well as Admin, follow the
-[three-node Docker quick start](../../admin/quickstart/README.md). It starts
-one primary, two replicas, three Meta voters, and Admin, with persistent
-volumes and browser-driven initialization. The commands below start the
+For a local demo, run `./lavik-admin` directly on the Docker host and choose
+**Try a demo cluster**; see the [local demo guide](../../admin/quickstart/README.md).
+It starts one primary, two replicas and three Meta voters with persistent volumes,
+using the Admin already running. The commands below start the
 standalone Admin service for connecting to separately deployed clusters.
 
 Initialize the repository submodules and follow the prerequisites in the
@@ -273,6 +274,42 @@ LAVIK_CTL=/path/to/lavik-ctl LAVIK_ADMIN_DATA=/private/path/admin \
 Use Node.js 24.15 or newer. The data directory must be mode 0700. Admin creates
 its SQLite database, mode-0600 token file, and mode-0600 `admin.sock` there.
 No npm installation is needed for the service itself.
+
+## Remove a cluster
+
+Choose **Remove cluster** on its card in **All clusters**, or beneath its
+navigation. Type the exact cluster ID shown in the confirmation dialog.
+
+- **Remove from Admin only** disconnects the catalog entry. Services and stored
+  data remain. Completed operations and deployment ownership are archived in
+  `cluster_archives` in the private `fleet.sqlite` database; keep the workspace
+  backup to retain those records. You can reconnect using **Connect existing
+  cluster**. Reconnection does not automatically restore SSH management from
+  the archive; the saved installation remains owned by its original deployment.
+- **Permanently tear down deployment** is available for file-storage clusters
+  deployed through this Admin workspace. Review hosts, directory and monitoring
+  scope and acknowledge permanent deletion. Admin checks every host, stops the
+  deployment, then removes its file data, Meta state, release installation and
+  monitoring volumes. Hosts/VMs, prepared SSH access, shared release cache and
+  Admin remain. Cloud machines continue to exist until separately deleted.
+  Progress appears in **Operations**. A partial failure retains the connection
+  and original ownership; repair the reported issue and choose **Retry original
+  request**. Restarting Admin never automatically resumes uncertain deletion.
+
+Resolve queued, running or uncertain operations before either removal mode.
+Imported clusters offer disconnect only because Admin has no retained host
+ownership. SPDK permanent teardown is unavailable: stop and disable its Data
+and SPDK setup services and follow the [SPDK guide](spdk-storage.md) for manual
+media decommissioning. Do not release controller claims while data remains owned.
+
+For a browser-created demo, permanent teardown removes only its node containers,
+volumes and network; the running Admin remains.
+
+For the legacy all-in-Docker quick start, run `./admin/quickstart/remove.sh` on the Docker host.
+It asks you to type the Compose project name, then removes the entire demo,
+including its Admin workspace, token, stored data and retained release. Use
+`--yes` only when intentionally automating that deletion. This command does not
+remove unrelated Docker projects. Run `setup.sh` again for a fresh demo.
 
 ## Shared command-line workspace
 

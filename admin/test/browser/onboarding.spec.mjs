@@ -34,17 +34,42 @@ test.beforeEach(async ({ page }) => {
   await page.getByLabel("Access token").fill(token);
   await page.getByRole("button", { name: /Open workspace/ }).click();
 });
-test("three onboarding paths and a one-command local demo fit desktop and mobile", async ({
+test("three onboarding paths start the demo in Admin and report progress on desktop and mobile", async ({
   page,
 }, testInfo) => {
   await page.getByRole("button", { name: /Create cluster/ }).click();
   await expect(
     page.getByRole("heading", { name: "Start with Lavik" }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Set up local demo" }).click();
+  let requests = 0;
+  let ready = false;
+  await page.route("**/api/demo", (route) => {
+    if (route.request().method() === "POST") requests++;
+    return route.fulfill({
+      json: {
+        id: "demo-cluster",
+        state: ready ? "completed" : "running",
+        step: "download",
+        detail: ready
+          ? "Demo ready"
+          : "Downloading and verifying the Linux release",
+        log: "Downloading Lavik nightly…",
+      },
+    });
+  });
+  await page
+    .getByRole("button", { name: "Try a demo cluster", exact: true })
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "Setting up demo-cluster" }),
+  ).toBeVisible();
+  await expect(page.getByRole("status")).toContainText(
+    "Downloading and verifying",
+  );
+  expect(requests).toBe(1);
   await expect(
     page.getByText("./admin/quickstart/setup.sh", { exact: true }),
-  ).toBeVisible();
+  ).toHaveCount(0);
   await page.screenshot({
     path: testInfo.outputPath("onboarding-desktop.png"),
     fullPage: true,
@@ -59,6 +84,13 @@ test("three onboarding paths and a one-command local demo fit desktop and mobile
     path: testInfo.outputPath("onboarding-mobile.png"),
     fullPage: true,
   });
+  ready = true;
+  await expect(
+    page.getByRole("heading", { name: "Your demo is ready" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /Open demo dashboard/ }),
+  ).toBeVisible();
 });
 test("connection discovery retains failed input and saves only reviewed settings", async ({
   page,

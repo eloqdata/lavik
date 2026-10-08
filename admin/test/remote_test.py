@@ -6,6 +6,8 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -135,6 +137,204 @@ class RemoteSafety(unittest.TestCase):
         self.assertIn("--initial-cluster-manifest", first)
         self.assertNotIn("--initial-cluster-manifest", second)
         self.assertFalse((root / "meta-1/state/launch.py").exists())
+
+
+class TeardownSafety(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name).resolve()
+        self.request = {
+            "baseDir": str(self.base),
+            "cluster": "test",
+            "owner": "original-owner",
+            "supervisor": "process",
+            "nodes": [{"name": "data-1", "kind": "data"}],
+            "phase": "delete",
+        }
+        self.root = remote.owned(self.request, create=True)
+        (self.root / "data-1").mkdir()
+        (self.root / "data-1/lavik.data").write_bytes(b"database")
+        self.mounts = patch.object(Path, "read_text", autospec=True)
+        self.real_read = Path.read_text
+        mock = self.mounts.start()
+        mock.side_effect = (
+            lambda path, *a, **kw: ""
+            if str(path) == "/proc/self/mountinfo"
+            else self.real_read(path, *a, **kw)
+        )
+        self.proc = patch.object(remote, "check_no_processes")
+        self.proc.start()
+
+    def tearDown(self):
+        patch.stopall()
+        self.temporary.cleanup()
+
+    def test_wrong_owner_and_symlinks_never_delete_files(self):
+        with self.assertRaisesRegex(RuntimeError, "unowned"):
+            remote.teardown({**self.request, "owner": "someone-else"})
+        (self.root / "escape").symlink_to(self.base)
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            remote.teardown(self.request)
+        self.assertEqual((self.root / "data-1/lavik.data").read_bytes(), b"database")
+
+    def test_raw_spdk_media_is_not_implicitly_erased(self):
+        (self.root / "spdk-request.json").write_text("{}")
+        with self.assertRaisesRegex(RuntimeError, "SPDK"):
+            remote.teardown(self.request)
+        self.assertTrue((self.root / "data-1/lavik.data").exists())
+
+    def test_check_and_stop_retain_data_delete_is_retryable_and_scoped(self):
+        sibling = self.base / "other"
+        sibling.mkdir()
+        (sibling / "keep").write_text("other cluster")
+        for phase in ("check", "stop"):
+            remote.teardown({**self.request, "phase": phase})
+            self.assertTrue((self.root / "data-1/lavik.data").exists())
+        remote.teardown(self.request)
+        self.assertFalse(self.root.exists())
+        remote.teardown(self.request)
+        self.assertEqual((sibling / "keep").read_text(), "other cluster")
+        # A replacement deployment cannot be deleted with the previous nonce.
+        remote.owned({**self.request, "owner": "replacement"}, create=True)
+        with self.assertRaisesRegex(RuntimeError, "unowned"):
+            remote.teardown(self.request)
+
+    def test_resume_after_final_marker_unlink_uses_retained_receipt(self):
+        real_rmdir = Path.rmdir
+
+        def interrupted(path):
+            if path == self.root:
+                raise OSError("interrupted before final directory removal")
+            return real_rmdir(path)
+
+        with patch.object(Path, "rmdir", autospec=True, side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                remote.teardown(self.request)
+        self.assertTrue(self.root.exists())
+        self.assertEqual(list(self.root.iterdir()), [])
+        remote.teardown(self.request)
+        self.assertFalse(self.root.exists())
+
+    def test_running_process_or_foreign_service_blocks_deletion(self):
+        with patch.object(
+            remote, "check_no_processes", side_effect=RuntimeError("still running")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "still running"):
+                remote.teardown(self.request)
+        units = self.base / ".config/systemd/user"
+        units.mkdir(parents=True)
+        unit = units / "lavik-test-data-1.service"
+        unit.write_text("ExecStart=/bin/sleep infinity\n")
+        with patch.object(Path, "home", return_value=self.base):
+            with self.assertRaisesRegex(RuntimeError, "foreign service"):
+                remote.teardown({**self.request, "supervisor": "systemd"})
+        self.assertTrue((self.root / "data-1/lavik.data").exists())
+
+    def test_systemd_stops_and_disables_exact_owned_unit_before_removing_it(self):
+        units = self.base / ".config/systemd/user"
+        units.mkdir(parents=True)
+        unit = units / "lavik-test-data-1.service"
+        unit.write_text(
+            "ExecStart=/usr/bin/python3 " + str(self.root / "data-1/launch.py") + "\n"
+        )
+
+        def output(argv, *args):
+            if "--property=LoadState,ActiveState,FragmentPath" in argv:
+                return {
+                    "code": 0,
+                    "stdout": f"LoadState=loaded\nActiveState=active\nFragmentPath={unit}",
+                    "stderr": "",
+                }
+            return {"code": 0, "stdout": "inactive", "stderr": ""}
+
+        with (
+            patch.object(Path, "home", return_value=self.base),
+            patch.object(remote, "run", side_effect=output) as runner,
+        ):
+            remote.teardown({**self.request, "supervisor": "systemd"})
+            self.assertIn(
+                ["systemctl", "--user", "disable", "--now", unit.name],
+                [c.args[0] for c in runner.call_args_list],
+            )
+        self.assertFalse(unit.exists())
+        self.assertFalse(self.root.exists())
+
+    def test_monitoring_project_collision_never_stops_containers(self):
+        monitor = self.root / "monitoring"
+        monitor.mkdir()
+        (monitor / "compose.yaml").write_text("services: {}")
+
+        def checked(argv, *args):
+            if argv[1] == "ps":
+                return "foreign-container"
+            return json.dumps(
+                [
+                    {
+                        "Config": {
+                            "Labels": {
+                                "com.docker.compose.project.working_dir": "/different"
+                            }
+                        }
+                    }
+                ]
+            )
+
+        with patch.object(remote, "checked", side_effect=checked) as runner:
+            with self.assertRaisesRegex(RuntimeError, "another directory"):
+                remote.teardown({**self.request, "monitoring": True})
+            self.assertTrue(
+                all(c.args[0][1] in ("ps", "inspect") for c in runner.call_args_list)
+            )
+        self.assertTrue(self.root.exists())
+
+
+@unittest.skipUnless(sys.platform == "linux", "process teardown requires Linux pidfds")
+class LinuxProcessTeardown(unittest.TestCase):
+    def test_real_process_stops_before_its_owned_files_are_removed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            request = {
+                "baseDir": temporary,
+                "cluster": "test",
+                "owner": "process-owner",
+                "supervisor": "process",
+                "nodes": [{"name": "data-1", "kind": "data", "args": ["300"]}],
+            }
+            root = remote.owned(request, create=True)
+            (root / "release").mkdir()
+            shutil.copyfile("/bin/sleep", root / "release/lavik")
+            (root / "release/lavik").chmod(0o700)
+            (root / "data-1").mkdir()
+            (root / "data-1/lavik.data").write_bytes(b"retained data")
+            identity = remote.start_node(
+                {**request, "node": request["nodes"][0], "manifest": "test"}
+            )
+            try:
+                remote.teardown({**request, "phase": "check"})
+                self.assertTrue(Path(f"/proc/{identity['pid']}").exists())
+                with self.assertRaisesRegex(RuntimeError, "still running"):
+                    remote.check_no_processes(root)
+                # PID start-time mismatch does not stop the actual process and
+                # the final live-process check must refuse to delete its data.
+                (root / "data-1/process.json").write_text(
+                    json.dumps({**identity, "start": "wrong"})
+                )
+                with self.assertRaisesRegex(RuntimeError, "still running"):
+                    remote.teardown({**request, "phase": "delete"})
+                self.assertTrue((root / "data-1/lavik.data").exists())
+                (root / "data-1/process.json").write_text(json.dumps(identity))
+                remote.teardown({**request, "phase": "stop"})
+                self.assertTrue(root.exists())
+                remote.teardown({**request, "phase": "delete"})
+                self.assertFalse(root.exists())
+            finally:
+                # Reap the stopped child without touching any unrelated process.
+                import os
+
+                try:
+                    os.kill(identity["pid"], 15)
+                    os.waitpid(identity["pid"], 0)
+                except (ProcessLookupError, ChildProcessError):
+                    pass
 
 
 class SpdkSafety(unittest.TestCase):

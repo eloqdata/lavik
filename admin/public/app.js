@@ -55,7 +55,9 @@ async function api(path, method = "GET", data) {
   const value = await response.json();
   if (!response.ok) {
     if (response.status === 401 && path !== "/login") login();
-    throw new Error(value.error || "Request failed");
+    const error = new Error(value.error || "Request failed");
+    error.status = response.status;
+    throw error;
   }
   return value;
 }
@@ -139,9 +141,11 @@ function shell() {
           !state.cluster ? "disabled" : ""
         }><span class="symbol" aria-hidden="true">${icon}</span>${label}</button>`,
     )
-    .join(
-      "",
-    )}</nav><div class="sidefooter">One workspace.<br>Browser and command line.<br><button class="small" id="signout">Sign out</button></div></aside><main><header class="topbar"><span>Workspace <span class="muted"> / </span> <strong>${escape(
+    .join("")}</nav>${
+    cluster
+      ? '<button class="small danger" id="remove-selected">Remove cluster</button>'
+      : ""
+  }<div class="sidefooter">One workspace.<br>Browser and command line.<br><button class="small" id="signout">Sign out</button></div></aside><main><header class="topbar"><span>Workspace <span class="muted"> / </span> <strong>${escape(
     state.page === "fleet" ? "All clusters" : cluster?.name || "Cluster",
   )}</strong></span><span class="live"><i class="dot"></i> <span id="updated">Live · every 5 seconds</span></span></header><div class="content" id="content"></div></main></div>`;
   document
@@ -153,6 +157,9 @@ function shell() {
     state.metrics = null;
     navigate(state.cluster ? "dashboard" : "fleet");
   };
+  if ($("#remove-selected"))
+    $("#remove-selected").onclick = () =>
+      removeDialog(cluster.id).catch(showError);
   $("#signout").onclick = async () => {
     await api("/logout", "POST", {});
     login();
@@ -196,16 +203,92 @@ function setupChoices() {
     "Choose the setup that matches where you want to run.",
   )}
   <div class="onboarding-options">
-    <article class="panel onboarding-card"><span class="eyebrow">LOCAL · DOCKER</span><h2>Try a demo cluster</h2><p>One command builds and starts everything, creates demo-cluster, and connects it to Admin.</p><ul><li>Three Meta voters, one primary, two followers</li><li>Persistent Docker volumes</li><li>Runs on a Mac or Linux Docker host</li></ul><button class="primary" id="show-demo">Set up local demo</button></article>
+    <article class="panel onboarding-card"><span class="eyebrow">LOCAL · DOCKER</span><h2>Try a demo cluster</h2><p>Start a local demo here. Admin prepares Lavik, starts six Docker nodes, and connects demo-cluster to this workspace.</p><ul><li>Three Meta voters, one primary, two followers</li><li>Persistent Docker volumes</li><li>Uses Docker on the computer running Admin</li></ul><button class="primary" id="show-demo">Try a demo cluster</button></article>
     <article class="panel onboarding-card"><span class="eyebrow">PRODUCTION · SSH</span><h2>Deploy on your machines</h2><p>Prepare SSH access, place your nodes, and review host checks before deployment.</p><ul><li>Verified software downloaded by Admin</li><li>Storage and monitoring configuration</li><li>Persistent services and resumable deployment</li></ul><button class="primary" id="setup-production">Set up machines</button></article>
     <article class="panel onboarding-card"><span class="eyebrow">EXISTING · LAVIK-CTL</span><h2>Connect your cluster</h2><p>Bring a cluster you already created with lavik-ctl into this workspace.</p><ul><li>Test Meta connectivity first</li><li>Discover current topology and health</li><li>Keep existing data and configuration</li></ul><button id="setup-connect">Connect existing cluster</button></article>
-  </div><section id="demo-instructions" class="panel" hidden><h2>One command to a running demo</h2><p>From your Lavik source checkout on a machine with Git and Docker running:</p><pre class="command-block"><code>./admin/quickstart/setup.sh</code></pre><p>The first run compiles Lavik inside Docker and can take several minutes. The command prints the Admin URL and sign-in token once demo-cluster is ready. Run it again to resume; existing volumes are retained.</p><p class="muted">This runs on the machine where you execute the command. All nodes share that machine, so this is a learning environment without host-failure redundancy.</p></section>`;
+  </div><div class="banner">The demo needs Docker Desktop (Mac) or Docker Engine with Compose v2 (Linux) on the computer running Admin. It uses about 3 GiB of storage and shares this Admin. No source checkout is needed.</div>`;
   $("#setup-production").onclick = () => navigate("setup-production");
   $("#setup-connect").onclick = connectDialog;
-  $("#show-demo").onclick = () => {
-    $("#demo-instructions").hidden = false;
-    $("#demo-instructions").scrollIntoView({ behavior: "smooth" });
-  };
+  $("#show-demo").onclick = startDemo;
+}
+async function startDemo() {
+  navigate("demo");
+  try {
+    renderDemo({
+      state: "queued",
+      step: "docker",
+      detail: "Checking Docker on the Admin machine",
+    });
+    await api("/demo", "POST", {});
+    state.clusters = await api("/clusters");
+    state.forceRefresh = true;
+    await refresh(true);
+  } catch (error) {
+    if (state.page === "demo")
+      renderDemo({ state: "failed", detail: error.message });
+  }
+}
+function renderDemo(value) {
+  const ready = value.state === "completed";
+  const retry = ["idle", "failed", "uncertain"].includes(value.state);
+  $("#content").innerHTML = `${heading(
+    "Try a demo cluster",
+    "Three Meta voters, one primary, two replicas. Your current Admin stays here.",
+  )}
+    <section class="panel"><h2>${
+      ready
+        ? "Your demo is ready"
+        : retry
+        ? "Demo needs attention"
+        : "Setting up demo-cluster"
+    }</h2>
+    <p role="status">${escape(value.detail || "Starting local demo…")}</p>
+    <div class="actions">${[
+      "docker",
+      "runtime",
+      "download",
+      "starting",
+      "creating",
+      "waiting",
+    ]
+      .map((step, i) =>
+        badge(
+          `${i + 1}. ${
+            {
+              docker: "Check Docker",
+              runtime: "Prepare runtime",
+              download: "Verify release",
+              starting: "Start nodes",
+              creating: "Create cluster",
+              waiting: "Check health",
+            }[step]
+          }`,
+          step === value.step ? "warn" : "",
+        ),
+      )
+      .join(" ")}</div>
+    ${
+      value.log
+        ? `<details><summary>Setup log</summary><pre class="command-block">${escape(
+            value.log,
+          )}</pre></details>`
+        : ""
+    }
+    <div class="actions">${
+      ready
+        ? '<button class="primary" id="open-demo">Open demo dashboard →</button>'
+        : retry
+        ? '<button class="primary" id="retry-demo">Retry demo setup</button>'
+        : '<span class="muted">You can leave this page; setup continues in Admin.</span>'
+    }
+    <button id="demo-back">All clusters</button></div></section>`;
+  if ($("#retry-demo")) $("#retry-demo").onclick = startDemo;
+  if ($("#open-demo"))
+    $("#open-demo").onclick = async () => {
+      state.clusters = await api("/clusters");
+      navigate("dashboard", value.id);
+    };
+  $("#demo-back").onclick = () => navigate("fleet");
 }
 function showError(error) {
   if ($("#content"))
@@ -237,22 +320,32 @@ async function refresh(force = false) {
   refresh.busy = true;
   const generation = state.generation;
   try {
+    if (state.page === "demo") {
+      const value = await api("/demo");
+      if (generation === state.generation) renderDemo(value);
+      return;
+    }
     if (state.page === "fleet") {
-      state.clusters = await api("/clusters");
-      // Connection failures remain visible independently; one unreachable
-      // cluster does not suppress healthy clusters in the fleet.
+      const clusters = await api("/clusters");
+      const views = {},
+        errors = {};
+      // Commit one refresh snapshot only while its page generation is current.
+      // A slow response from a removed connection cannot resurrect its card.
       await Promise.all(
-        state.clusters.map(async (cluster) => {
+        clusters.map(async (cluster) => {
           try {
-            state.views[cluster.id] = await api(`/clusters/${cluster.id}`);
-            delete state.errors[cluster.id];
+            views[cluster.id] = await api(`/clusters/${cluster.id}`);
           } catch (error) {
-            state.errors[cluster.id] = error.message;
-            delete state.views[cluster.id];
+            errors[cluster.id] = error.message;
           }
         }),
       );
-      if (generation === state.generation) renderFleet();
+      if (generation === state.generation) {
+        state.clusters = clusters;
+        state.views = views;
+        state.errors = errors;
+        renderFleet();
+      }
       return;
     }
     const clusterId = state.cluster;
@@ -286,6 +379,26 @@ async function refresh(force = false) {
     }
     if ($("#updated"))
       $("#updated").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (error) {
+    if (
+      error.status === 404 &&
+      generation === state.generation &&
+      state.cluster
+    ) {
+      state.clusters = await api("/clusters");
+      if (!state.clusters.some((c) => c.id === state.cluster)) {
+        delete state.views[state.cluster];
+        delete state.errors[state.cluster];
+        state.cluster = null;
+        state.metrics = null;
+        state.samples = [];
+        state.history = [];
+        navigate("fleet");
+        toast("Cluster removed from this workspace.");
+        return;
+      }
+    }
+    throw error;
   } finally {
     refresh.busy = false;
     if (state.forceRefresh)
@@ -344,7 +457,15 @@ function renderFleet() {
               c.profile,
             )} profile</small><button class="link" data-open="${escape(
               c.id,
-            )}">Open cluster →</button></footer></article>`;
+            )}">Open cluster →</button></footer>${
+              c.profile === "lavik-demo"
+                ? '<button class="small" data-demo>Demo setup progress</button>'
+                : ""
+            }<button class="small danger" data-remove="${escape(
+              c.id,
+            )}" aria-label="Remove ${escape(
+              c.name,
+            )}">Remove cluster</button></article>`;
           })
           .join("")}</div>`
       : `<div class="panel">${empty(
@@ -353,6 +474,12 @@ function renderFleet() {
           '<button class="primary" id="setup-empty">Create your first cluster</button>',
         )}</div>`
   }<div class="banner">Connections registered with <code>lavik-ctl fleet-add</code> appear here automatically. Use Connect existing cluster for deployments created with <code>cluster-create</code>. Cluster changes use the same Meta state and operation IDs.</div>`;
+  document.querySelectorAll("[data-demo]").forEach((button) => {
+    button.onclick = () => navigate("demo");
+  });
+  document.querySelectorAll("[data-remove]").forEach((button) => {
+    button.onclick = () => removeDialog(button.dataset.remove).catch(showError);
+  });
   $("#connect").onclick = connectDialog;
   $("#setup-new").onclick = () => navigate("setup");
   if ($("#setup-empty")) $("#setup-empty").onclick = () => navigate("setup");
@@ -687,7 +814,9 @@ function renderOperations(value) {
                   op.local?.step || op.phase || "",
                 )}</span>${
                   op.local?.state === "uncertain" && op.local.kind !== "create"
-                    ? `<div class="actions"><button class="small" data-resume="${escape(
+                    ? `<div class="actions"><button class="small" data-kind="${escape(
+                        op.local.kind,
+                      )}" data-resume="${escape(
                         op.local.id,
                       )}">Retry original request</button>${
                         op.local.kind.startsWith("replica-")
@@ -717,6 +846,8 @@ function renderOperations(value) {
           abandon ? "Abandon replica request" : "Retry original request",
           abandon
             ? "Committed membership changes remain in place. This stops this request without undoing them."
+            : button.dataset.kind === "teardown"
+            ? "Resume permanent teardown using the retained host ownership. Already removed hosts are skipped; remaining data will be deleted."
             : "The original operation ID, deadline, and reviewed membership revision are retained.",
           `<p class="mono">${escape(id)}</p>`,
           async () => {
@@ -918,6 +1049,83 @@ function dialog(title, description, content, submit, label = "Confirm") {
   };
   element.showModal();
 }
+async function removeDialog(id) {
+  const review = await api(`/clusters/${id}/removal`);
+  dialog(
+    "Remove cluster",
+    `Choose what to remove for ${review.name}.`,
+    `<label for="removal-mode">Removal type</label><select id="removal-mode"><option value="disconnect">Remove from Admin only</option><option value="teardown" ${
+      review.teardown ? "" : "disabled"
+    }>Permanently tear down deployment</option></select>
+    <p id="removal-impact">Disconnects this cluster from the workspace. Its services and data keep running. Admin archives its operation history and deployment records.</p>
+    ${
+      review.reason ? `<p class="banner warn">${escape(review.reason)}</p>` : ""
+    }
+    ${
+      review.id === "demo-cluster" && !review.teardown
+        ? '<p>For the local Docker quick start, run this on the Docker host to delete the entire demo, including its Admin workspace and sign-in token:</p><pre class="command-block"><code>./admin/quickstart/remove.sh</code></pre>'
+        : ""
+    }
+    ${
+      review.active.length
+        ? '<p class="banner warn">Resolve active or uncertain operations in Operations before removing this cluster.</p>'
+        : ""
+    }
+    <label for="remove-confirm">Type ${escape(
+      id,
+    )} to confirm</label><input id="remove-confirm" autocomplete="off" required>
+    <label id="erase-ack-label" hidden><input id="erase-ack" type="checkbox">I understand that this permanently deletes the deployment’s file data, Meta state, and monitoring history.</label>`,
+    async () => {
+      if ($("#remove-confirm").value !== id)
+        throw new Error("Type the exact cluster name to confirm removal");
+      const mode = $("#removal-mode").value;
+      if (mode === "teardown" && !$("#erase-ack").checked)
+        throw new Error("Confirm permanent data deletion");
+      const result = await api(`/clusters/${id}/removal`, "POST", {
+        token: review.token,
+        confirm: id,
+        mode,
+      });
+      if (result.removed) {
+        state.clusters = state.clusters.filter((c) => c.id !== id);
+        delete state.views[id];
+        delete state.errors[id];
+        if (state.cluster === id) {
+          state.cluster = null;
+          state.metrics = null;
+          state.samples = [];
+          state.history = [];
+        }
+        navigate("fleet");
+        toast("Cluster removed from Admin. Services and data retained.");
+      } else {
+        navigate("operations", id);
+        toast("Teardown queued. Progress is tracked in Operations.");
+      }
+    },
+    "Remove from Admin",
+  );
+  const button = $("#dialog-form button[type=submit]");
+  button.className = "danger";
+  button.disabled = review.active.length > 0;
+  $("#removal-mode").onchange = () => {
+    const teardown = $("#removal-mode").value === "teardown";
+    $("#erase-ack-label").hidden = !teardown;
+    $("#erase-ack").checked = false;
+    $("#removal-impact").textContent = teardown
+      ? `Stops and deletes ${
+          review.nodes
+        } owned nodes across ${review.hosts.join(", ")}, removes ${
+          review.directory
+        } on those hosts, and deletes ${
+          review.monitors
+        } monitoring stacks and their volumes. Machines, SSH access and Admin itself remain. This cannot be undone.`
+      : "Disconnects this cluster from the workspace. Its services and data keep running. Admin archives its operation history and deployment records.";
+    button.textContent = teardown
+      ? "Permanently tear down"
+      : "Remove from Admin";
+  };
+}
 function connectDialog() {
   let preview;
   dialog(
@@ -1015,7 +1223,8 @@ function operationDialog(kind, input, title, description) {
 function replicaDialog(group) {
   if (
     state.views[state.cluster]?.deployment &&
-    state.views[state.cluster].deployment.storage !== "spdk"
+    state.views[state.cluster].deployment.storage !== "spdk" &&
+    state.views[state.cluster].deployment.kind !== "docker-demo"
   ) {
     dialog(
       "Add a follower",

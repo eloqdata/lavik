@@ -14,142 +14,99 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Three-node Docker quick start
+# Local demo from Lavik Admin
 
-This example starts **three Lavik Data nodes: one primary and two replicas**.
-It also starts three Meta voters and Lavik Admin, for seven running containers
-on one machine. The setup command builds the Linux executables, starts the services,
-registers `demo-cluster` in Admin, and initializes it through a durable Admin
-job. Each Data node gets a persistent 1 GiB file.
-
-This is a local learning environment. All containers share one physical host,
-so it does not provide availability across machine failures. Meta/Data traffic
-uses plaintext inside a dedicated Docker network; the browser port and three
-Data client ports are published only on localhost. Meta/Data containers enable io_uring through
-`seccomp=unconfined`; Admin does not need that setting. The example uses the
-build-toolchain image to avoid a separate host compiler or Redis CLI install.
-Use the [standalone Admin deployment guide](../../docs/operations/lavik-admin.md)
-for remote access, credentials, and the production Admin image.
-
-## 1. Set up everything
-
-Install Git and Docker Desktop on macOS, or Docker Engine with Compose v2 on
-Linux. Linux needs kernel 6.1+ with io_uring enabled. From a Lavik source
-checkout, run:
+Extract a Lavik release and run its launcher:
 
 ```sh
-./admin/quickstart/setup.sh
+./lavik-admin
 ```
 
-This initializes the required source submodules, builds the toolchain and Linux
-binaries in Docker, starts Compose, creates **demo-cluster**, and waits for it
-to become ready. The first build can take several minutes; allow disk space for
-the toolchain, build cache, and three 1 GiB Data files. Subsequent builds reuse
-the cache. The command prints the Admin URL and sign-in token when ready.
+On Linux the archive includes Node.js; on macOS install Node.js 24.15+.
+From a source checkout the equivalent launcher is `./admin/lavik-admin`.
+A source checkout is not needed when using a release.
 
-Open **http://localhost:4173**, sign in, and select **demo-cluster**. There is
-no manifest to paste and no separate initialization step. The same command can
-be rerun: it retains volumes and observes existing creation jobs instead of
-replaying an uncertain creation. If initialization needs attention, inspect
-Admin’s Operations view and Compose logs before resuming.
+Open the printed URL (normally http://localhost:4173), sign in with the printed
+token, and choose **Create cluster → Try a demo cluster**.
 
-Set `LAVIK_QUICKSTART_PORT=4183` before running if the default Admin port is
-occupied. Keep it set for later Compose commands. The example reserves Docker
-subnet `172.29.91.0/24`; if it overlaps another network, change the addresses in
-`compose.yaml`, `start.sh`, and `cluster.toml` together before first startup.
-Bootstrap discovers Meta Admin seeds from the manifest.
+## What the button does
 
-The one-command entry point uses the same individual build and Compose
-operations as a manual run:
+1. Checks the local Docker Engine and Compose v2.
+2. Prepares a small Ubuntu runtime image with OS tools, without compiling Lavik.
+3. Installs the Linux executables included in the tarball when they match Docker’s
+   architecture. From a checkout or a different-architecture package, it downloads
+   the matching nightly minimal tarball and checks the published SHA-256 instead.
+   Runtime compatibility is checked in Docker; later runs retain the same bytes.
+4. Starts **three Meta voters and three Data nodes**: one primary and two replicas.
+5. Creates `demo-cluster` through its release's client and connects it to the
+   running Admin. Click **Open demo dashboard** when ready.
 
-```sh
-docker build -f admin/Dockerfile.toolchain -t lavik-admin-toolchain:local .
-docker compose -f admin/quickstart/compose.yaml run --rm build
-docker compose -f admin/quickstart/compose.yaml up -d
-docker compose -f admin/quickstart/compose.yaml exec -T admin node quickstart/bootstrap.mjs
-```
+The button does not start an Admin container. All setup assets ship in the release;
+there is no manifest to paste, command to copy, source tree to build, or npm install.
+The progress page shows the current step, a bounded setup log, and actionable
+errors. You can return through **Demo setup progress** on the cluster card.
+Closing the browser leaves setup running in Admin.
 
-## 2. Verify data and the shared CLI catalog
+## Requirements and boundaries
 
-In Admin's **Send command** view, run `SET greeting "hello from Lavik"`, confirm
-the write, then run `GET greeting`. The same operations work from Docker:
+Start Docker Desktop on macOS, or Docker Engine with Compose v2 on Linux, before
+clicking the button. The Docker engine must run Linux containers with kernel 6.1+
+and io_uring enabled. Allow at least 3 GiB for the data files plus runtime/release
+storage. The Admin process needs permission to run the Docker CLI. Run the
+launcher on the Docker host; do not mount a Docker socket into an Admin container.
+Remote Docker contexts are rejected.
 
-```sh
-docker compose -f admin/quickstart/compose.yaml exec data-1 \
-  redis-cli -c -h 172.29.91.21 -p 6379 SET greeting 'hello from Lavik'
-docker compose -f admin/quickstart/compose.yaml exec data-2 \
-  redis-cli -c -h 172.29.91.22 -p 6379 GET greeting
+Each Admin workspace owns a randomly named Compose project, six nodes, a release
+volume and a Docker-allocated private network. It does not reuse the legacy
+quick-start network or ports. All nodes run on one machine; this is a learning
+environment without host-failure redundancy. Meta/Data use plaintext on that
+isolated network, and node containers enable `seccomp=unconfined` for io_uring.
 
-docker compose -f admin/quickstart/compose.yaml exec admin \
-  /build/lavik-ctl --socket /data/lavik-admin/admin.sock fleet-list
-docker compose -f admin/quickstart/compose.yaml exec admin \
-  /build/lavik-ctl --socket /data/lavik-admin/admin.sock fleet-status demo-cluster
-```
+Admin runs the Linux client and bounded RESP requests through `docker exec`.
+The dashboard and **Send command** work from a Mac without routing into Docker's
+private IPs. The demo does not publish Data or Meta ports on the host. Use Admin's
+console to try `SET greeting "hello from Lavik"`, then `GET greeting`.
 
-`GET` should return `hello from Lavik`, and `fleet-list` should include `demo-cluster`.
-Client commands run inside the Docker network so cluster redirects can reach
-the advertised node IPs.
+## Retry, restart, and removal
 
-### Connecting from the Mac host
+Setup stores its job and Docker ownership in the private Admin workspace. Runtime
+assets are copied under `demos/OWNER` there so moving the extracted release does
+not break Docker bind mounts. Keep that workspace and the Docker volumes together.
+Stopping Admin leaves the node containers running. Restart the same launcher with
+the same `LAVIK_ADMIN_DATA` workspace to manage them again.
 
-Docker Desktop keeps `172.29.91.*` inside its Linux VM. A host command such as
-`redis-cli -h 172.29.91.21 -p 6379` cannot reach that private network. Use these
-published addresses for direct node access instead:
+After a download or Docker error, fix the reported prerequisite and click **Retry
+demo setup**. Later runs retain the original release and stored data. A completed
+demo can be restarted by choosing **Try a demo cluster** again. Once initialization
+has been submitted, retries only observe Meta; they never replay uncertain Genesis.
+If Meta state was lost after successful initialization, restore it or explicitly
+tear down the demo before creating a new one.
 
-| Node | Inside Docker | On the host |
-|---|---|---|
-| `data-1` | `172.29.91.21:6379` | `127.0.0.1:16379` |
-| `data-2` | `172.29.91.22:6379` | `127.0.0.1:16380` |
-| `data-3` | `172.29.91.23:6379` | `127.0.0.1:16381` |
+**Remove cluster → Permanently tear down deployment** deletes this demo's node
+containers, Meta/Data volumes, release volume and private network. Type the cluster
+name and confirm data deletion. This Admin and other Docker projects stay running.
+The Docker runtime image may remain cached. **Remove from Admin only** retains the
+containers/data and archives ownership; it does not reconnect or adopt them
+implicitly into a new demo.
 
-```sh
-redis-cli -h 127.0.0.1 -p 16379 PING
-```
+## Download connection failures
 
-For keyed reads and writes, choose the **current primary** shown in Admin's
-Topology view. Its host port follows the table above; failover can change
-which node is primary. For example, when `data-2` is primary:
+TLS handshake failures and connection resets are retried up to three times.
+Staging and checksum verification prevent failed transfers from publishing a
+release. For persistent `curl: (35) ... SSL_ERROR_SYSCALL`, check Docker Desktop's
+proxy/VPN settings and HTTPS access to `github.com` and
+`release-assets.githubusercontent.com`, then retry from the browser. TLS and
+checksum verification remain enabled.
 
-```sh
-redis-cli -h 127.0.0.1 -p 16380 GET greeting
-```
+## Legacy all-in-Docker quick start
 
-Use the Docker-based `redis-cli -c` commands above for automatic redirects.
-Host port publishing does not rewrite `MOVED` replies or `CLUSTER SLOTS`:
-they still contain the internal addresses required by Meta, Data, and Admin.
-Enabling `-c` in a Mac-hosted client can therefore hang after a redirect to
-another node. An application running on the host needs explicit endpoint
-mapping support in its cluster client, or should run inside this Docker
-network. The selected ports avoid an existing service on host port 6379.
+The checkout's `./admin/quickstart/setup.sh` remains available for the older flow
+that starts seven containers, including its own Admin. It is independent of the
+browser-created demo and is not used by the button. Its default Admin port is
+4173; set `LAVIK_QUICKSTART_PORT=4183` if needed. It retains its original fixed
+network `172.29.91.0/24` and Data ports 16379–16381.
 
-If updating an already-running quick start, applying these new port mappings
-recreates the Data containers. Retain their volumes and recreate replicas
-before the current primary, waiting for **Healthy** between changes:
-
-```sh
-docker compose -f admin/quickstart/compose.yaml up -d --no-deps data-1
-```
-
-Repeat for the other nodes in the appropriate order for their current roles.
-
-You can now use **Switch primary** to exercise controlled failover, browse
-keys, and inspect the shared Operations view.
-
-## 3. Stop and resume
-
-```sh
-docker compose -f admin/quickstart/compose.yaml down
-docker compose -f admin/quickstart/compose.yaml up -d
-```
-
-Volumes retain the cluster, data, Admin catalog, and token. Sign in again and
-wait for **Healthy**; do not initialize the cluster again. The launcher omits
-Meta's bootstrap-only manifest option when restarting existing state and
-never truncates existing Data files. Do not add `-v` to `down` if you want to
-keep the data; that flag deletes the named volumes.
-
-For diagnostics:
-
-```sh
-docker compose -f admin/quickstart/compose.yaml logs --tail=100 admin meta-1 data-1
-```
+For that legacy project only, run `./admin/quickstart/remove.sh` on the Docker host
+and type its project name to delete its containers and volumes, including its
+Admin catalog and token. Use the same `COMPOSE_PROJECT_NAME` if you selected one.
+The browser-created demo uses a separate project and is removed from Admin.

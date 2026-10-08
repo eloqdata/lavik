@@ -22,7 +22,7 @@ views use Lavik's own Meta and Redis interfaces. There are no production npm
 dependencies; Node.js 24.15 or newer is required.
 
 The workflow follows [Valkey Admin](https://valkey-admin.valkey.io/): connect
-a cluster, see its health and topology, browse keys, send commands, and inspect
+a cluster, see its health and topology, send commands, and inspect
 slow activity. Lavik-specific controls add initialization, replica sizing,
 controlled primary switching, and shared operation progress.
 
@@ -31,18 +31,23 @@ connection profiles, cluster creation, replica resizing, recovery, and Docker
 verification. The [architecture](../docs/architecture/11-admin.md) explains
 ownership and the shared database boundary.
 
-For a fresh machine, use the [three-node Docker quick start](quickstart/README.md)
-to launch one primary, two replicas, three Meta voters, and Admin with one command:
+Start the Admin already included in an extracted release:
 
 ```sh
-./admin/quickstart/setup.sh
+./lavik-admin
 ```
 
-The command builds the Linux binaries in Docker, starts Compose, initializes
-`demo-cluster`, and prints the Admin URL and token. In the UI, **Create cluster**
-offers local demo, production SSH deployment, and existing-cluster discovery.
-Production setup reviews node placement, optional automatic SPDK preparation,
-and monitoring hosts together. Existing connections are tested before saving.
+From this checkout, use `./admin/lavik-admin`. Open the printed URL and choose
+**Create cluster → Try a demo cluster**. With Docker Desktop or Docker Engine
+and Compose v2 running on the same computer, the button uses the packaged Linux binaries (or downloads a verified matching
+release), starts three Meta and three Data containers, creates
+`demo-cluster`, and connects it to this Admin. Progress, errors and retry appear
+in the browser. No source checkout, build tools, pasted manifest or second Admin
+container is needed. Linux releases bundle Node; macOS needs Node.js 24.15+.
+See the [local demo guide](quickstart/README.md) for prerequisites and recovery.
+
+Production setup reviews SSH host preparation, node placement, optional SPDK
+preparation, and monitoring. Existing connections are tested before saving.
 
 From a source checkout with initialized submodules:
 
@@ -69,3 +74,14 @@ Replica addition/removal changes redundancy within existing primary groups.
 Primary-group expansion/shrink and online key redistribution are not
 implemented. Hot-key tracking, `COMMANDLOG`, and per-key memory analysis also
 require server capabilities beyond the current Lavik interfaces.
+
+### Remove a cluster
+
+Use **Remove cluster** on the fleet card or cluster navigation. **Remove from
+Admin only** retains running services/data and archives completed history.
+**Permanently tear down deployment** deletes owned file-storage deployments and
+monitoring volumes after typed confirmation; interrupted teardown is resumable
+from Operations. Machines and shared SSH access remain. Imported clusters and
+SPDK deployments require manual teardown. Resolve active operations first.
+The browser-created Docker demo supports permanent teardown in the same dialog;
+its six nodes and volumes are removed while this Admin keeps running.

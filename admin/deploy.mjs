@@ -328,6 +328,7 @@ export class Deployments {
     this.releases = releases;
     this.hosts = hosts;
     this.previews = new Map();
+    this.removals = new Map();
   }
   async plan(id) {
     const row = await this.store.query(
@@ -336,6 +337,156 @@ export class Deployments {
       "get",
     );
     return row ? JSON.parse(row.plan) : null;
+  }
+  /** Review only retained ownership; an imported endpoint never grants host deletion. */
+  async reviewRemoval(id) {
+    const cluster = await this.fleet.cluster(id);
+    const plan = await this.plan(id);
+    const active = await this.store.query(
+      "SELECT id FROM jobs WHERE cluster_id=? AND state IN ('queued','running','uncertain')",
+      [id],
+    );
+    for (const [token, review] of this.removals)
+      if (review.expires < Date.now()) this.removals.delete(token);
+    if (this.removals.size >= 100)
+      throw new AdminError("Too many removal reviews; retry shortly", 503);
+    const token = randomBytes(24).toString("hex");
+    this.removals.set(token, {
+      id,
+      cluster: JSON.stringify(cluster),
+      plan: JSON.stringify(plan),
+      expires: Date.now() + 300000,
+    });
+    const spdk = plan?.storage === "spdk" || plan?.nodes.some((n) => n.spdk);
+    return {
+      token,
+      id,
+      name: cluster.name,
+      active: active.map((j) => j.id),
+      teardown: !!plan && !spdk,
+      reason: spdk
+        ? "SPDK media and host/controller claims require manual decommissioning. Automatic permanent teardown is unavailable for this storage type."
+        : !plan
+        ? "Admin has no retained host ownership for this connection. Tear down its services with the tool that deployed them."
+        : "",
+      hosts: plan?.hosts.map((h) => h.host) || [],
+      directory:
+        plan?.kind === "docker-demo"
+          ? plan.project
+          : plan
+          ? `${plan.baseDir}/${plan.id}`
+          : null,
+      impact:
+        plan?.kind === "docker-demo"
+          ? "Permanently deletes this demo’s six node containers, stored data and release volume. This Admin and other Docker projects remain running."
+          : null,
+      nodes: plan?.nodes.length || 0,
+      monitors: plan?.monitorHosts?.length || 0,
+    };
+  }
+  /** Confirm a reviewed snapshot and durably admit teardown before any SSH mutation. */
+  async remove(id, input) {
+    const review = this.removals.get(input.token);
+    if (!review || review.id !== id || review.expires < Date.now())
+      throw new AdminError(
+        "Review removal again; the confirmation expired",
+        409,
+      );
+    if (input.confirm !== id)
+      throw new AdminError("Type the exact cluster name to confirm removal");
+    if (!["disconnect", "teardown"].includes(input.mode))
+      throw new AdminError("Choose how to remove the cluster");
+    const cluster = await this.fleet.cluster(id);
+    const plan = await this.plan(id);
+    if (
+      JSON.stringify(cluster) !== review.cluster ||
+      JSON.stringify(plan) !== review.plan
+    )
+      throw new AdminError("Cluster changed; review removal again", 409);
+    if (input.mode === "disconnect") {
+      const result = await this.fleet.forget(id);
+      this.removals.delete(input.token);
+      return result;
+    }
+    if (!plan || plan.storage === "spdk" || plan.nodes.some((n) => n.spdk))
+      throw new AdminError(
+        "Automatic teardown requires an Admin-owned file-storage deployment",
+        409,
+      );
+    const jobId = randomBytes(16).toString("hex"),
+      time = stamp();
+    try {
+      await this.store.batch([
+        {
+          sql: "UPDATE deployments SET plan=plan WHERE cluster_id=? AND plan=?",
+          params: [id, review.plan],
+          expectedChanges: 1,
+        },
+        {
+          sql: "INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?)",
+          params: [
+            jobId,
+            id,
+            "teardown",
+            "{}",
+            "queued",
+            "checking",
+            "Checking all deployment hosts before teardown",
+            null,
+            time,
+            time,
+          ],
+        },
+      ]);
+    } catch (error) {
+      throw new AdminError(
+        error.message.includes("UNIQUE")
+          ? "Resolve active operations before tearing down this cluster"
+          : "Cluster changed; review removal again",
+        409,
+      );
+    }
+    this.removals.delete(input.token);
+    await this.fleet.audit("teardown-confirmed", id, jobId);
+    void this.fleet.tick().catch(() => {});
+    return this.store.query("SELECT * FROM jobs WHERE id=?", [jobId], "get");
+  }
+  /** Stop every owned host before deleting any data; interrupted work is resumable. */
+  async runTeardown(job) {
+    try {
+      const plan = await this.plan(job.cluster_id);
+      if (plan?.kind === "docker-demo")
+        return this.fleet.demo.teardown(plan, job);
+      if (!plan || plan.storage === "spdk" || plan.nodes.some((n) => n.spdk))
+        throw new AdminError(
+          "Automatic teardown requires an Admin-owned file-storage deployment",
+        );
+      for (const phase of ["check", "stop", "delete"]) {
+        for (let i = 0; i < plan.hosts.length; i++) {
+          await this.fleet.update(
+            job,
+            "running",
+            phase,
+            `${phase}: ${plan.hosts[i].host}`,
+          );
+          await this.ssh.call(
+            plan.hosts[i],
+            this.request(plan, "teardown", {
+              phase,
+              nodes: plan.nodes.filter((n) => n.host === i),
+              supervisor: plan.supervisor,
+              monitoring: (plan.monitorHosts || []).includes(i),
+            }),
+            300000,
+          );
+        }
+      }
+      // Completion and archival share one transaction; a crash cannot strand
+      // a completed deletion in the active fleet with no resumable request.
+      await this.fleet.forget(job.cluster_id, job.id);
+    } catch (error) {
+      await this.fleet.update(job, "uncertain", "teardown", error.message);
+    }
   }
   async save(plan) {
     await this.store.query(
@@ -545,6 +696,11 @@ export class Deployments {
     if (this.hosts)
       input = { ...input, host: await this.hosts.resolve(input.host) };
     const current = await this.plan(id);
+    if (current?.kind === "docker-demo")
+      throw new AdminError(
+        "The local demo has a fixed six-node layout. Use an existing demo replica or deploy a separate SSH cluster.",
+        409,
+      );
     if (!current)
       throw new AdminError(
         "Connect an already-running follower for a cluster not deployed by Admin",
@@ -788,6 +944,8 @@ export class Deployments {
   async ctl(cluster, args, read = false) {
     const plan = await this.plan(cluster.id);
     if (!plan) return null;
+    if (plan.kind === "docker-demo")
+      return this.fleet.demo.ctl(plan, args, read);
     let error;
     // A transport failure may be a submitted mutation. Only read commands can
     // try another SSH host; writes retain the original host and job identity.
@@ -813,6 +971,8 @@ export class Deployments {
   async data(cluster, target, args) {
     const plan = await this.plan(cluster.id);
     if (!plan) return null;
+    if (plan.kind === "docker-demo")
+      return this.fleet.demo.data(plan, target, args);
     const node = plan.nodes.find(
       (n) =>
         n.kind === "data" &&
