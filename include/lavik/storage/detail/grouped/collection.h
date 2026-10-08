@@ -480,7 +480,9 @@ class OrderedGroupDirectory {
   std::uint64_t total_group_bytes_ = 0;
   CowArray<RecoveredOrderedGroup> groups_;
   CowArray<RecoveredOrderedGroup> retired_;
-  using LinearIds = CowArray<std::pair<std::uint64_t, std::size_t>, 256>;
+  // A partially filled chunk still allocates its full capacity. Keep the
+  // default small chunks so a few pages do not require a 4 KiB ID array.
+  using LinearIds = CowArray<std::pair<std::uint64_t, std::size_t>>;
   struct PagePosition {
     std::size_t slot_;
     bool retired_;

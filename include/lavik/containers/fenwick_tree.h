@@ -145,7 +145,9 @@ class FenwickTree {
   std::size_t RetainedBytes() const noexcept { return cells_.RetainedBytes(); }
 
  private:
-  using Storage = CowArray<std::uint64_t, 256>;
+  // Small populations should not reserve hundreds of unused counters. The
+  // default chunks also bound the bytes copied by a sparse count update.
+  using Storage = CowArray<std::uint64_t>;
   Storage cells_;
 
   absl::Status ApplyPartialSums(std::span<const CountChange> count_changes,

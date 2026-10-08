@@ -1067,6 +1067,43 @@ TEST(GroupedCollectionTest, RecoveryFindsRetiredPagesFromUnorderedCandidates) {
   EXPECT_EQ(recovered->FindRecord(82), nullptr);
 }
 
+TEST(GroupedCollectionTest, SmallOrderedDirectoryKeepsRetainedMemoryBounded) {
+  struct ResetMemory {
+    unsigned shard_ = CurrentMemoryAccountingShard();
+    ~ResetMemory() {
+      (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      BindMemoryAccountingShard(shard_ == 0 ? kMaxMemoryWorkers : shard_ - 1);
+    }
+  } reset;
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  BindMemoryAccountingShard(0);
+  const auto baseline = GetWorkerMemoryStats(0).retained_bytes_;
+  for (const std::size_t count : {1, 2, 32}) {
+    std::vector<OrderedGroupSnapshot> pages;
+    for (std::size_t i = 0; i < count; ++i) {
+      auto page = Page(i + 1, 2, OrderedCollectionKind::kStream);
+      page.previous_ = i;
+      page.next_ = i + 1 == count ? 0 : i + 2;
+      pages.push_back(std::move(page));
+    }
+    auto root = Root(pages, count + 1);
+    root.stream_length_ = 0;
+    {
+      auto directory =
+          OrderedGroupDirectory::Recover(root, 1, Candidates(pages), {});
+      ASSERT_TRUE(directory.ok()) << directory.status();
+      // Count actual retained allocations, including metadata, ID lookup,
+      // Fenwick storage, pointer nodes and their shared-ownership blocks.
+      // The old 256-entry ID/count chunks alone consumed 6 KiB of payload.
+      EXPECT_LT(GetWorkerMemoryStats(0).retained_bytes_ - baseline, 8 * 1024);
+      EXPECT_EQ(directory->FindIndex(count), count - 1);
+      EXPECT_EQ(directory->CountBefore(count), 2 * count);
+      EXPECT_EQ(directory->FindRank(2 * count - 1)->group_index_, count - 1);
+    }
+    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, baseline);
+  }
+}
+
 TEST(GroupedCollectionTest, RetirementEvidenceCannotDisappearBeforeOlderPage) {
   auto split = SplitOrderedGroup(Page(1, 8), 2, 104);
   ASSERT_TRUE(split.ok());
