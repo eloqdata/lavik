@@ -19,6 +19,11 @@ export async function setup(root, api, created, options = {}) {
   });
   let draft = {
     id: "",
+    storage: "file",
+    hugepageMiB: 8192,
+    metricsPort: 9100,
+    grafanaPort: 3000,
+    prometheusPort: 9090,
     release: "nightly",
     followers: 2,
     groups: 1,
@@ -110,6 +115,35 @@ export async function setup(root, api, created, options = {}) {
       ? ""
       : '<h2>Node placement</h2><p class="muted">A host can run a Meta voter and a Data node. The default spreads both across your hosts; choose a different host for any node below.</p><div id="node-placement"></div><button type="button" class="small" id="reset-placement">Spread evenly across hosts</button>'
   }
+  ${
+    follower
+      ? ""
+      : `<h2>Storage</h2><label>Storage engine<select name="storage"><option value="file">io_uring · managed data files</option><option value="spdk">SPDK · dedicated NVMe controllers</option></select></label><div id="spdk-settings" hidden><p>Admin will configure VFIO, hugepages, and persistent boot services on every Data host, using the full SPDK release. Select fresh dedicated media: binding removes the controller from Linux block access.</p><p class="muted">Requires root SSH, IOMMU isolation, one namespace per controller, and one Data node per physical host. Mounted, partitioned, in-use, and nonempty devices are rejected. Unsafe no-IOMMU mode is unsupported.</p>${field(
+          "hugepageMiB",
+          "Hugepage memory MiB per Data host",
+          "number",
+        )}<div id="spdk-devices"></div></div>
+  <h2>Monitoring</h2><p>Choose hosts for Prometheus and Grafana. Each selected host collects every Data node’s metrics. Docker Engine and Compose v2 must already be available to its SSH account; monitoring hosts need registry access or cached images.</p><div id="monitor-hosts">${hosts
+    .map(
+      (h, i) =>
+        `<label class="prepared-host"><input type="checkbox" name="monitorHosts" value="${i}" ${
+          (draft.monitorHosts || []).map(Number).includes(i) ? "checked" : ""
+        }><span>Host ${i + 1} · ${escape(
+          h.host,
+        )}<small>Grafana: private IP · Prometheus: localhost</small></span></label>`,
+    )
+    .join(
+      "",
+    )}</div><p class="muted">Leave unchecked to use your own monitoring. Metrics listeners are enabled when a monitoring host is selected. Protect metrics ports with your private-network firewall.</p><details><summary>Monitoring ports</summary><div class="setup-grid">${field(
+    "metricsPort",
+    "Data metrics base port",
+    "number",
+  )}${field("grafanaPort", "Grafana port", "number")}${field(
+    "prometheusPort",
+    "Prometheus port",
+    "number",
+  )}</div></details>`
+  }
   <div class="error" id="setup-error" role="alert"></div><div class="actions"><button class="primary" type="submit">Check hosts & review</button></div></form><div id="setup-review"></div>`;
   const form = root.querySelector("#setup-form");
   let revision = 0;
@@ -119,6 +153,7 @@ export async function setup(root, api, created, options = {}) {
       .forEach((item, i) => item.classList.toggle("active", i === index));
   const invalidate = () => {
     revision++;
+    form.hidden = false;
     root.querySelector("#setup-review").innerHTML = "";
     step(1);
   };
@@ -134,7 +169,18 @@ export async function setup(root, api, created, options = {}) {
     void setup(root, api, created, {
       ...options,
       hosts: readHosts(),
-      draft: { ...Object.fromEntries(new FormData(form)), placement },
+      draft: {
+        ...Object.fromEntries(new FormData(form)),
+        placement,
+        monitorHosts: [
+          ...form.querySelectorAll('[name="monitorHosts"]:checked'),
+        ].map((e) => Number(e.value)),
+        spdkDevices: Object.fromEntries(
+          [...form.querySelectorAll("[data-spdk-host]")]
+            .filter((e) => e.value.trim())
+            .map((e) => [e.dataset.spdkHost, e.value.trim()]),
+        ),
+      },
     });
   };
   let placement = draft.placement;
@@ -154,6 +200,28 @@ export async function setup(root, api, created, options = {}) {
       if (reset || (shape && shape !== nextShape)) placement = undefined;
       const nodes = nodeLayout({ hosts: currentHosts, ...counts, placement });
       shape = nextShape;
+      const devices = root.querySelector("#spdk-devices");
+      const previous = {
+        ...draft.spdkDevices,
+        ...Object.fromEntries(
+          [...devices.querySelectorAll("input")].map((input) => [
+            input.dataset.spdkHost,
+            input.value,
+          ]),
+        ),
+      };
+      devices.innerHTML = [
+        ...new Set(nodes.filter((n) => n.kind === "data").map((n) => n.host)),
+      ]
+        .map(
+          (index) =>
+            `<label>Host ${
+              index + 1
+            } dedicated NVMe namespace<input data-spdk-host="${index}" placeholder="spdk://0000:01:00.0/1" value="${escape(
+              previous[index] || "",
+            )}"></label>`,
+        )
+        .join("");
       placement = Object.fromEntries(nodes.map((n) => [n.name, n.host]));
       target.innerHTML = `<div class="table-wrap"><table><thead><tr><th>Node</th><th>Role</th><th>Host</th></tr></thead><tbody>${nodes
         .map(
@@ -183,6 +251,7 @@ export async function setup(root, api, created, options = {}) {
           (select.onchange = () => {
             placement[select.dataset.placement] = Number(select.value);
             invalidate();
+            renderPlacement();
           }),
       );
     } catch (error) {
@@ -209,7 +278,7 @@ export async function setup(root, api, created, options = {}) {
       input.addEventListener("input", () => renderPlacement()),
     );
   if (!follower) {
-    for (const name of ["clientMode", "supervisor"])
+    for (const name of ["clientMode", "supervisor", "storage"])
       form.elements[name].value = draft[name];
     for (const name of ["groups", "followers", "metaCount"])
       form.elements[name].addEventListener("input", () => renderPlacement());
@@ -217,6 +286,12 @@ export async function setup(root, api, created, options = {}) {
       invalidate();
       renderPlacement(true);
     };
+    const storageChanged = () => {
+      root.querySelector("#spdk-settings").hidden =
+        form.elements.storage.value !== "spdk";
+    };
+    form.elements.storage.addEventListener("change", storageChanged);
+    storageChanged();
     renderPlacement();
   }
   let page = 0;
@@ -264,7 +339,19 @@ export async function setup(root, api, created, options = {}) {
           hostId: host.id,
           address: host.address,
         })),
-        ...(!follower ? { placement } : {}),
+        ...(!follower
+          ? {
+              placement,
+              monitorHosts: [
+                ...form.querySelectorAll('[name="monitorHosts"]:checked'),
+              ].map((e) => Number(e.value)),
+              spdkDevices: Object.fromEntries(
+                [...form.querySelectorAll("[data-spdk-host]")]
+                  .filter((e) => e.value.trim())
+                  .map((e) => [e.dataset.spdkHost, e.value.trim()]),
+              ),
+            }
+          : {}),
       };
       const preview = await api(
         follower ? `/clusters/${follower}/follower-preview` : "/setup/preview",
@@ -279,14 +366,16 @@ export async function setup(root, api, created, options = {}) {
           "Settings changed during host checks. Check the updated settings again.",
         );
       step(2);
+      form.hidden = true;
       const canUseProcesses =
         !follower &&
         preview.supervisor === "systemd" &&
+        preview.storage !== "spdk" &&
         preview.checks.some((check) => check.systemdAvailable === false);
       const review = root.querySelector("#setup-review");
-      review.innerHTML = `<section class="panel"><h2>${
+      review.innerHTML = `<section class="panel"><div class="title-row"><h2>${
         preview.ready ? "Ready to deploy" : "Host checks need attention"
-      }</h2>${preview.checks
+      }</h2><button type="button" id="edit-setup">Edit settings</button></div><div class="setup-checks">${preview.checks
         .map(
           (c) =>
             `<div class="banner ${c.ok ? "" : "warn"}"><strong>${escape(
@@ -301,12 +390,39 @@ export async function setup(root, api, created, options = {}) {
                     .join("")}</ul>`
             }</div>`,
         )
-        .join("")}${(preview.warnings || [])
+        .join("")}</div>${(preview.warnings || [])
         .map((w) => `<p class="muted">${escape(w)}</p>`)
         .join("")}
       ${
         canUseProcesses
           ? '<div class="banner warn"><p>These hosts cannot use systemd. For this lab, run all cluster nodes as development processes. Nodes will not restart automatically after a crash or host reboot.</p><button type="button" id="use-process-supervisor">Use development processes & recheck</button></div>'
+          : ""
+      }
+      ${
+        preview.storage === "spdk"
+          ? `<div class="banner warn"><strong>SPDK host configuration</strong><p>${
+              preview.hugepageMiB
+            } MiB hugepages per Data host. The selected controllers will be bound to VFIO:</p><ul>${preview.nodes
+              .filter((n) => n.spdk)
+              .map(
+                (n) =>
+                  `<li>${escape(preview.hosts[n.host].address)} · ${escape(
+                    n.spdk,
+                  )} · serial ${escape(
+                    preview.checks.find((c) => c.host === n.host)?.spdk
+                      ?.serial || "unavailable",
+                  )}</li>`,
+              )
+              .join("")}</ul></div>`
+          : ""
+      }
+      ${
+        preview.monitorHosts?.length
+          ? `<div class="banner"><strong>Monitoring hosts</strong><p>${preview.monitorHosts
+              .map((i) => escape(preview.hosts[i].address))
+              .join(", ")} · Grafana :${escape(
+              preview.grafanaPort || 3000,
+            )}</p><p>Grafana user: admin. A unique password is generated on each monitoring host and saved under the deployment’s monitoring/grafana-password file.</p></div>`
           : ""
       }
       <p>Service lifecycle: <strong>${
@@ -327,6 +443,7 @@ export async function setup(root, api, created, options = {}) {
               n.port,
               n.ctl,
               n.control,
+              n.metrics,
             ]
               .filter(Boolean)
               .join(", ")}</td></tr>`,
@@ -337,13 +454,21 @@ export async function setup(root, api, created, options = {}) {
               preview.baseDir,
             )}/${escape(
               preview.id,
-            )}</code>. Existing databases are never overwritten.</p><label>Type ${escape(
+            )}</code>. Existing databases are never overwritten.</p>${
+              preview.storage === "spdk"
+                ? '<label class="prepared-host"><input name="spdkConfirm" type="checkbox" required><span>I confirm these are dedicated controllers for this cluster and authorize VFIO binding and hugepage allocation.</span></label>'
+                : ""
+            }<label>Type ${escape(
               preview.id,
             )} to confirm<input name="confirm" autocomplete="off" required></label><div class="error" id="deploy-error" role="alert"></div><button class="primary" type="submit">${
               follower ? "Deploy follower" : "Deploy cluster"
             }</button></form>`
           : "<p>Resolve the reported prerequisite or adjust settings, then run the checks again.</p>"
       }</section>`;
+      review.querySelector("#edit-setup").onclick = () => {
+        invalidate();
+        form.scrollIntoView({ behavior: "smooth" });
+      };
       const useProcesses = review.querySelector("#use-process-supervisor");
       if (useProcesses)
         useProcesses.onclick = () => {
@@ -369,6 +494,7 @@ export async function setup(root, api, created, options = {}) {
               {
                 token: preview.token,
                 confirm: new FormData(confirm).get("confirm"),
+                spdkConfirm: new FormData(confirm).get("spdkConfirm") === "on",
               },
             );
             step(2);

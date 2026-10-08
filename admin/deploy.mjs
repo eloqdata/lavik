@@ -1,9 +1,11 @@
 // Copyright (C) 2026 EloqData Inc. Licensed under the Apache License, Version 2.0.
+import { readFile } from "node:fs/promises";
 import { randomBytes, createHash } from "node:crypto";
 import { AdminError, identifier, endpoint } from "./meta.mjs";
 import { nodeLayout } from "./public/placement.js";
 import { SSH, sshHost } from "./ssh.mjs";
 import { Releases } from "./releases.mjs";
+import { monitoringFiles } from "./monitoring.mjs";
 import { encode, decode, RedisError } from "./resp.mjs";
 
 const stamp = () => new Date().toISOString();
@@ -57,9 +59,74 @@ export function settings(input) {
     throw new AdminError("Choose 1, 3, or 5 Meta voters");
   const name = input.name?.trim() || id;
   if (name.length > 100) throw new AdminError("Display name is too long");
+  const storage = input.storage || "file";
+  if (!["file", "spdk"].includes(storage))
+    throw new AdminError("Choose file or SPDK storage");
+  const spdkDevices = {};
+  if (storage === "spdk") {
+    if (supervisor !== "systemd")
+      throw new AdminError("SPDK setup requires persistent systemd services");
+    for (const [host, uri] of Object.entries(input.spdkDevices || {})) {
+      if (
+        !/^spdk:\/\/[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\/[1-9][0-9]*$/.test(
+          uri,
+        )
+      )
+        throw new AdminError(
+          `Host ${
+            Number(host) + 1
+          }: use spdk://DOMAIN:BUS:DEVICE.FUNCTION/NAMESPACE_ID`,
+        );
+      spdkDevices[host] = uri;
+    }
+  }
+  const monitorHosts = input.monitorHosts || [];
+  if (!Array.isArray(monitorHosts))
+    throw new AdminError("Choose monitoring hosts");
+  const monitoring = [
+    ...new Set(
+      monitorHosts.map((i) =>
+        integer(i, undefined, 0, hosts.length - 1, "Monitoring host"),
+      ),
+    ),
+  ];
+  if (
+    new Set(monitoring.map((i) => hosts[i].address)).size !== monitoring.length
+  )
+    throw new AdminError("Select each monitoring IP only once");
+  if (
+    monitoring.length &&
+    Number(input.grafanaPort || 3000) === Number(input.prometheusPort || 9090)
+  )
+    throw new AdminError("Choose different Grafana and Prometheus ports");
   return {
     id,
     name,
+    storage,
+    spdkDevices,
+    hugepageMiB: integer(
+      input.hugepageMiB,
+      8192,
+      1024,
+      1048576,
+      "SPDK hugepage memory MiB",
+    ),
+    monitorHosts: monitoring,
+    grafanaPort: integer(input.grafanaPort, 3000, 1024, 65535, "Grafana port"),
+    prometheusPort: integer(
+      input.prometheusPort,
+      9090,
+      1024,
+      65535,
+      "Prometheus port",
+    ),
+    metricsPort: integer(
+      input.metricsPort,
+      9100,
+      1024,
+      65400,
+      "Metrics base port",
+    ),
     hosts,
     baseDir,
     supervisor,
@@ -107,14 +174,48 @@ export function topology(config) {
       ...node,
       id: node.kind === "meta" ? index + 1 : randomBytes(20).toString("hex"),
       port,
+      ...(node.kind === "data" && config.monitorHosts?.length
+        ? {
+            metrics:
+              config.metricsPort +
+              (dataCounts.get(config.hosts[node.host].address) - 1),
+          }
+        : {}),
       ...(node.kind === "meta"
         ? { ctl: config.ctlPort + index, control: config.controlPort + index }
         : {}),
     };
   });
+  if (config.storage === "spdk") {
+    const assigned = new Set();
+    for (const node of nodes.filter((n) => n.kind === "data")) {
+      const host = config.hosts[node.host];
+      if (assigned.has(host.address))
+        throw new AdminError(
+          "SPDK setup supports one Data node per physical host; spread Data placement across hosts",
+        );
+      assigned.add(host.address);
+      if (!config.spdkDevices[node.host])
+        throw new AdminError(
+          `Select a dedicated SPDK namespace for Data host ${node.host + 1}`,
+        );
+      if (host.user !== "root")
+        throw new AdminError(
+          `SPDK host ${
+            node.host + 1
+          } requires root SSH for VFIO, hugepages, and boot configuration`,
+        );
+      node.spdk = config.spdkDevices[node.host];
+    }
+  }
   const ports = new Set();
+  for (const index of config.monitorHosts || [])
+    for (const port of [config.grafanaPort, config.prometheusPort])
+      ports.add(address(config.hosts[index].address, port));
   for (const node of nodes)
-    for (const port of [node.port, node.ctl, node.control].filter(Boolean)) {
+    for (const port of [node.port, node.ctl, node.control, node.metrics].filter(
+      Boolean,
+    )) {
       const key = address(config.hosts[node.host].address, port);
       if (ports.has(key))
         throw new AdminError(`Port assignments overlap: ${key}`);
@@ -194,8 +295,10 @@ export function nodeArguments(plan, node) {
     "--threads",
     String(plan.threads),
     "--no-pin-workers",
-    "--data-file",
-    `${directory}/lavik.data`,
+    ...(node.spdk
+      ? ["--storage=spdk", "--data-file", node.spdk]
+      : ["--data-file", `${directory}/lavik.data`]),
+    ...(node.metrics ? ["--metrics-port", String(node.metrics)] : []),
     "--log-dir",
     `${directory}/logs`,
     "--alsologtostderr",
@@ -284,7 +387,10 @@ export class Deployments {
         ),
       };
     const config = settings(input);
-    const release = await this.releases.resolve(config.release);
+    const release = await this.releases.resolve(
+      config.release,
+      config.storage === "spdk" ? "standard" : "minimal",
+    );
     const nodes = topology(config);
     const checks = [];
     for (let i = 0; i < config.hosts.length; i++) {
@@ -295,11 +401,16 @@ export class Deployments {
           this.request(config, "probe", {
             address: config.hosts[i].address,
             supervisor: config.supervisor,
+            spdk: owned.find((n) => n.spdk)?.spdk,
+            hugepageMiB: config.hugepageMiB,
+            monitoring: config.monitorHosts.includes(i),
+            grafanaPort: config.grafanaPort,
+            prometheusPort: config.prometheusPort,
             ports: owned.flatMap((n) =>
-              [n.port, n.ctl, n.control].filter(Boolean),
+              [n.port, n.ctl, n.control, n.metrics].filter(Boolean),
             ),
             bytes:
-              owned.filter((n) => n.kind === "data").length *
+              owned.filter((n) => n.kind === "data" && !n.spdk).length *
               config.dataGiB *
               1024 ** 3,
           }),
@@ -373,6 +484,10 @@ export class Deployments {
       throw new AdminError("This review is for a follower addition");
     if (input.confirm !== plan.id)
       throw new AdminError("Confirm the cluster name to deploy");
+    if (plan.storage === "spdk" && input.spdkConfirm !== true)
+      throw new AdminError(
+        "Confirm dedicated-controller binding and hugepage allocation",
+      );
     if (!plan.checks.every((c) => c.ok))
       throw new AdminError("Resolve host prerequisites before deploying", 409);
     const existing = await this.store.query(
@@ -438,6 +553,10 @@ export class Deployments {
       throw new AdminError(
         "This older release lacks the membership APIs required for safe resizing; use a current release",
       );
+    if (current.storage === "spdk")
+      throw new AdminError(
+        "Prepare an SPDK follower with a dedicated controller, then use Connect running follower; automatic SPDK expansion is not supported",
+      );
     const view = await this.fleet.view(id, true);
     const group = identifier(input.group, "group");
     if (!view.status.groups.some((g) => g.group_id === group))
@@ -469,7 +588,7 @@ export class Deployments {
       plan.nodes.some(
         (n) =>
           plan.hosts[n.host].address === host.address &&
-          [n.port, n.ctl, n.control].includes(port),
+          [n.port, n.ctl, n.control, n.metrics].includes(port),
       )
     )
       throw new AdminError(
@@ -484,7 +603,31 @@ export class Deployments {
       group,
       role: "replica",
       added: true,
+      ...(plan.monitorHosts?.length
+        ? {
+            metrics:
+              Math.max(
+                plan.metricsPort - 1,
+                ...plan.nodes
+                  .filter((n) => plan.hosts[n.host].address === host.address)
+                  .map((n) => n.metrics || 0),
+              ) + 1,
+          }
+        : {}),
     };
+    if (
+      node.metrics &&
+      (node.metrics > 65535 ||
+        plan.nodes.some(
+          (n) =>
+            plan.hosts[n.host].address === host.address &&
+            [n.port, n.ctl, n.control, n.metrics].includes(node.metrics),
+        ) ||
+        node.metrics === port)
+    )
+      throw new AdminError(
+        "Follower metrics port conflicts with another listener",
+      );
     let check;
     try {
       check = await this.ssh.call(
@@ -493,7 +636,7 @@ export class Deployments {
           address: host.address,
           supervisor: plan.supervisor,
           allowOwned: true,
-          ports: [port],
+          ports: [port, node.metrics].filter(Boolean),
           bytes: plan.dataGiB * 1024 ** 3,
         }),
       );
@@ -623,6 +766,7 @@ export class Deployments {
         }),
         60000,
       );
+      await this.configureMonitoring(plan);
       input.deadline = Date.now() + 300000;
       await this.store.query(
         "UPDATE jobs SET kind='replica-add',input=?,state='queued',step='preflight' WHERE id=?",
@@ -697,6 +841,27 @@ export class Deployments {
     if (reply.value instanceof RedisError) throw reply.value;
     return { value: reply.value };
   }
+  /** Monitoring uses private listeners and remote-only generated Grafana credentials. */
+  async configureMonitoring(plan) {
+    if (!plan.monitorHosts?.length) return;
+    const files = await monitoringFiles();
+    const targets = plan.nodes
+      .filter((n) => n.metrics)
+      .map((n) => address(plan.hosts[n.host].address, n.metrics));
+    for (const index of plan.monitorHosts) {
+      await this.ssh.call(
+        plan.hosts[index],
+        this.request(plan, "monitoring", {
+          files,
+          targets,
+          address: plan.hosts[index].address,
+          grafanaPort: plan.grafanaPort,
+          prometheusPort: plan.prometheusPort,
+        }),
+        300000,
+      );
+    }
+  }
   async run(job) {
     const plan = await this.plan(job.cluster_id);
     const update = (step, detail) =>
@@ -726,6 +891,25 @@ export class Deployments {
             "This older release supports Cluster client mode only; choose a newer release for Single mode",
           );
         await this.save(plan);
+        for (const node of plan.nodes.filter((n) => n.spdk)) {
+          await update(
+            "storage",
+            `Configuring SPDK on ${plan.hosts[node.host].host}`,
+          );
+          await this.ssh.call(
+            plan.hosts[node.host],
+            this.request(plan, "spdk-setup", {
+              spdk: node.spdk,
+              hugepageMiB: plan.hugepageMiB,
+              expectedSerial: plan.checks[node.host].spdk.serial,
+              helperSource: await readFile(
+                new URL("./remote.py", import.meta.url),
+                "utf8",
+              ),
+            }),
+            60000,
+          );
+        }
         let checkedNetwork = false;
         for (const node of plan.nodes) {
           if (node.kind === "data" && !checkedNetwork) {
@@ -759,6 +943,7 @@ export class Deployments {
               node: { ...node, args: nodeArguments(plan, node) },
               manifest: manifest(plan),
               dataGiB: plan.dataGiB,
+              hugepageMiB: plan.hugepageMiB,
               supervisor: plan.supervisor,
             }),
             60000,
@@ -817,12 +1002,7 @@ export class Deployments {
       const cluster = await this.fleet.cluster(job.cluster_id);
       const status = await this.fleet.meta.status(cluster);
       if (status.cluster_state === "created" && status.cluster_ready)
-        await this.fleet.update(
-          job,
-          "completed",
-          "completed",
-          "Cluster ready. Open the dashboard to manage and observe it.",
-        );
+        await this.finish(job);
       else if (status.cluster_state === "provisioning-failed")
         await this.fleet.update(
           job,
@@ -834,7 +1014,54 @@ export class Deployments {
       await this.fleet.update(job, "uncertain", job.step, error.message);
     }
   }
+  /** Data listeners exist only after Genesis; verification must never replay creation. */
+  async finish(job) {
+    await this.fleet.update(
+      job,
+      "running",
+      "verifying",
+      "Checking Data connectivity and monitoring",
+    );
+    try {
+      const cluster = await this.fleet.cluster(job.cluster_id);
+      const status = await this.fleet.meta.status(cluster);
+      if (status.cluster_state !== "created" || !status.cluster_ready)
+        throw new AdminError(
+          "Cluster is not ready; inspect Meta before resuming verification",
+        );
+      const plan = await this.plan(job.cluster_id);
+      const endpoints = plan.nodes
+        .filter((n) => n.kind === "data")
+        .map((n) => ({ host: plan.hosts[n.host].address, port: n.port }));
+      for (const host of plan.hosts)
+        await this.ssh.call(
+          host,
+          this.request(plan, "connectivity", { endpoints }),
+          45000,
+        );
+      await this.configureMonitoring(plan);
+      await this.fleet.update(
+        job,
+        "completed",
+        "completed",
+        "Cluster ready. Open the dashboard to manage and observe it.",
+      );
+    } catch (error) {
+      // Explicit resume retries only post-creation checks. Periodic observation
+      // must not repeatedly mutate Compose after a partial monitoring failure.
+      await this.fleet.update(job, "uncertain", "verifying", error.message);
+    }
+  }
   async resume(job) {
+    if (job.step === "verifying") {
+      this.fleet.busy.add(job.id);
+      try {
+        await this.finish(job);
+      } finally {
+        this.fleet.busy.delete(job.id);
+      }
+      return { verifying: job.id };
+    }
     if (["creating", "waiting"].includes(job.step)) {
       await this.observe(job);
       return { observing: job.id };

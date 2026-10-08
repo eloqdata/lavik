@@ -17,7 +17,7 @@ limitations under the License.
 # Lavik Admin
 
 Lavik Admin provides a shared fleet workspace for a browser and `lavik-ctl`.
-The familiar dashboard, topology, key browser, command console, and activity
+The familiar dashboard, topology, command console, and activity
 views use Lavik's own Meta and Redis interfaces. There are no production npm
 dependencies; Node.js 24.15 or newer is required.
 
@@ -32,8 +32,17 @@ verification. The [architecture](../docs/architecture/11-admin.md) explains
 ownership and the shared database boundary.
 
 For a fresh machine, use the [three-node Docker quick start](quickstart/README.md)
-to launch one primary, two replicas, three Meta voters, and Admin, then
-initialize the cluster in the browser.
+to launch one primary, two replicas, three Meta voters, and Admin with one command:
+
+```sh
+./admin/quickstart/setup.sh
+```
+
+The command builds the Linux binaries in Docker, starts Compose, initializes
+`demo-cluster`, and prints the Admin URL and token. In the UI, **Create cluster**
+offers local demo, production SSH deployment, and existing-cluster discovery.
+Production setup reviews node placement, optional automatic SPDK preparation,
+and monitoring hosts together. Existing connections are tested before saving.
 
 From a source checkout with initialized submodules:
 

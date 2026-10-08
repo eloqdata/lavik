@@ -32,16 +32,12 @@ const state = {
   history: [],
   samples: [],
   profiles: [],
-  keys: [],
-  cursor: null,
-  keyPattern: "*",
   metrics: null,
   generation: 0,
 };
 const navigation = [
   ["dashboard", "◫", "Dashboard"],
   ["topology", "◇", "Topology"],
-  ["keys", "⌕", "Key browser"],
   ["console", "›_", "Send command"],
   ["activity", "≋", "Activity"],
   ["operations", "◷", "Operations"],
@@ -172,7 +168,11 @@ function navigate(page, cluster) {
   state.generation++;
   state.forceRefresh = true;
   shell();
-  if (page === "setup" || page === "setup-follower") {
+  if (page === "setup") {
+    setupChoices();
+    return;
+  }
+  if (page === "setup-production" || page === "setup-follower") {
     void setup(
       $("#content"),
       api,
@@ -189,6 +189,23 @@ function navigate(page, cluster) {
   $("#content").innerHTML =
     '<div class="spinner">Connecting to your cluster…</div>';
   refresh(true).catch((error) => showError(error));
+}
+function setupChoices() {
+  $("#content").innerHTML = `${heading(
+    "Start with Lavik",
+    "Choose the setup that matches where you want to run.",
+  )}
+  <div class="onboarding-options">
+    <article class="panel onboarding-card"><span class="eyebrow">LOCAL · DOCKER</span><h2>Try a demo cluster</h2><p>One command builds and starts everything, creates demo-cluster, and connects it to Admin.</p><ul><li>Three Meta voters, one primary, two followers</li><li>Persistent Docker volumes</li><li>Runs on a Mac or Linux Docker host</li></ul><button class="primary" id="show-demo">Set up local demo</button></article>
+    <article class="panel onboarding-card"><span class="eyebrow">PRODUCTION · SSH</span><h2>Deploy on your machines</h2><p>Prepare SSH access, place your nodes, and review host checks before deployment.</p><ul><li>Verified software downloaded by Admin</li><li>Storage and monitoring configuration</li><li>Persistent services and resumable deployment</li></ul><button class="primary" id="setup-production">Set up machines</button></article>
+    <article class="panel onboarding-card"><span class="eyebrow">EXISTING · LAVIK-CTL</span><h2>Connect your cluster</h2><p>Bring a cluster you already created with lavik-ctl into this workspace.</p><ul><li>Test Meta connectivity first</li><li>Discover current topology and health</li><li>Keep existing data and configuration</li></ul><button id="setup-connect">Connect existing cluster</button></article>
+  </div><section id="demo-instructions" class="panel" hidden><h2>One command to a running demo</h2><p>From your Lavik source checkout on a machine with Git and Docker running:</p><pre class="command-block"><code>./admin/quickstart/setup.sh</code></pre><p>The first run compiles Lavik inside Docker and can take several minutes. The command prints the Admin URL and sign-in token once demo-cluster is ready. Run it again to resume; existing volumes are retained.</p><p class="muted">This runs on the machine where you execute the command. All nodes share that machine, so this is a learning environment without host-failure redundancy.</p></section>`;
+  $("#setup-production").onclick = () => navigate("setup-production");
+  $("#setup-connect").onclick = connectDialog;
+  $("#show-demo").onclick = () => {
+    $("#demo-instructions").hidden = false;
+    $("#demo-instructions").scrollIntoView({ behavior: "smooth" });
+  };
 }
 function showError(error) {
   if ($("#content"))
@@ -208,7 +225,12 @@ function heading(title, subtitle, actions = "") {
   )}</p></div><div class="actions">${actions}</div></div>`;
 }
 async function refresh(force = false) {
-  if (["login", "setup", "setup-follower"].includes(state.page) || refresh.busy)
+  if (
+    ["login", "setup", "setup-production", "setup-follower"].includes(
+      state.page,
+    ) ||
+    refresh.busy
+  )
     return;
   force ||= state.forceRefresh;
   state.forceRefresh = false;
@@ -257,8 +279,7 @@ async function refresh(force = false) {
     else if (state.page === "operations") {
       const operations = await api(`/clusters/${clusterId}/operations`);
       if (generation === state.generation) renderOperations(operations);
-    } else if (force && state.page === "keys") renderKeys();
-    else if (force && state.page === "console") renderConsole(view);
+    } else if (force && state.page === "console") renderConsole(view);
     else if (force && state.page === "activity") {
       const activity = await api(`/clusters/${clusterId}/activity`);
       if (generation === state.generation) renderActivity(activity);
@@ -331,7 +352,7 @@ function renderFleet() {
           "Start with your Linux hosts. Choose a release and let Admin install and initialize your first cluster.",
           '<button class="primary" id="setup-empty">Create your first cluster</button>',
         )}</div>`
-  }<div class="banner">Connections registered from <code>lavik-ctl</code> appear here automatically. Cluster changes use the same Meta state and operation IDs.</div>`;
+  }<div class="banner">Connections registered with <code>lavik-ctl fleet-add</code> appear here automatically. Use Connect existing cluster for deployments created with <code>cluster-create</code>. Cluster changes use the same Meta state and operation IDs.</div>`;
   $("#connect").onclick = connectDialog;
   $("#setup-new").onclick = () => navigate("setup");
   if ($("#setup-empty")) $("#setup-empty").onclick = () => navigate("setup");
@@ -363,18 +384,39 @@ function chart(samples) {
       "Collecting throughput",
       "The chart starts after two samples.",
     );
-  const max = Math.max(1, ...valid);
+  const peak = Math.max(...valid);
+  // Use readable tick intervals and the same zero baseline for labels, line,
+  // and fill. HTML labels retain their size when the SVG narrows on mobile.
+  const rawStep = Math.max(1, peak) / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const step =
+    [1, 2, 2.5, 5, 10].find((n) => n * magnitude >= rawStep) * magnitude;
+  const max = step * 4;
+  const ticks = Array.from({ length: 5 }, (_, i) => ({
+    value: max - i * step,
+    y: 20 + (i / 4) * 135,
+  }));
+  const label = (value) =>
+    new Intl.NumberFormat("en", {
+      notation: value >= 1000 ? "compact" : "standard",
+      maximumFractionDigits: 2,
+    }).format(value);
   const points = valid
-    .map(
-      (n, i) =>
-        `${(i / Math.max(valid.length - 1, 1)) * 700},${155 - (n / max) * 135}`,
-    )
+    .map((n, i) => `${(i / (valid.length - 1)) * 700},${155 - (n / max) * 135}`)
     .join(" ");
-  return `<svg class="chart" viewBox="0 0 700 175" preserveAspectRatio="none" role="img" aria-label="Command throughput over recent samples"><path class="chart-grid" d="M0 20H700 M0 65H700 M0 110H700 M0 155H700"/><polygon class="chart-area" points="0,175 ${points} 700,175"/><polyline class="chart-line" points="${points}"/></svg><div class="chart-foot"><span>${
+  return `<div class="throughput-chart"><div class="chart-y-axis" aria-label="Throughput in QPS"><span class="chart-unit">QPS</span>${ticks
+    .map(({ value }) => `<span class="chart-tick">${label(value)}</span>`)
+    .join(
+      "",
+    )}</div><svg class="chart" viewBox="0 0 700 180" preserveAspectRatio="none" role="img" aria-label="Command throughput in QPS, zero to ${max}"><path class="chart-grid" d="${ticks
+    .map(({ y }) => `M0 ${y}H700`)
+    .join(
+      " ",
+    )}"/><path class="chart-axis" d="M0 20V155H700"/><polygon class="chart-area" points="0,155 ${points} 700,155"/><polyline class="chart-line" points="${points}"/></svg></div><div class="chart-foot"><span>${
     valid.length
   } live samples</span><span>Peak ${number(
-    max,
-  )} commands/s</span><span>Now</span></div>`;
+    peak,
+  )} QPS</span><span>Now</span></div>`;
 }
 function renderDashboard(view) {
   const valid = state.metrics.nodes.filter((n) => !n.error);
@@ -388,6 +430,26 @@ function renderDashboard(view) {
     "Cluster health and performance, at a glance.",
     `${health(view)}<button id="open-topology">Manage topology →</button>`,
   )}${readiness(view)}${
+    view.deployment?.monitorHosts?.length
+      ? `<section class="panel"><h2>Monitoring</h2><p>${view.deployment.monitorHosts
+          .map((index) => {
+            const host = view.deployment.hosts[index];
+            const ip = host.address.includes(":")
+              ? `[${host.address}]`
+              : host.address;
+            return `<a href="http://${escape(ip)}:${
+              view.deployment.grafanaPort || 3000
+            }/d/lavik-overview/lavik-overview" target="_blank" rel="noopener noreferrer">Grafana · ${escape(
+              host.host,
+            )} ↗</a>`;
+          })
+          .join(
+            " · ",
+          )}</p><small>Grafana user: admin. Read monitoring/grafana-password inside this cluster’s deployment directory on the monitoring host. Prometheus is available on that host at localhost:${
+          view.deployment.prometheusPort || 9090
+        }.</small></section>`
+      : ""
+  }${
     view.status.cluster_state === "uninitialized"
       ? '<div class="banner">This Meta cluster is ready for initialization. <button class="link" id="initialize">Create its data cluster →</button></div>'
       : ""
@@ -676,169 +738,6 @@ function renderOperations(value) {
         await api(`/clusters/${state.cluster}/operations?after=${value.next}`),
       );
 }
-function renderKeys() {
-  state.keys = [];
-  state.cursor = null;
-  $("#content").innerHTML = `${heading(
-    "Key browser",
-    "Search and inspect keys across every primary group.",
-  )}<form id="search-keys" class="search-row"><input aria-label="Key pattern" id="key-pattern" placeholder="Search with a pattern, e.g. user:*" value="${escape(
-    state.keyPattern,
-  )}"><button class="primary">Search keys</button><button type="button" id="new-key">＋ New string</button></form><div class="key-layout"><section class="panel"><div class="row"><h2>Keys</h2><small id="key-count">Ready to scan</small></div><div id="key-list">${empty(
-    "Explore your data",
-    "Enter a key pattern and start a cursor-based scan. Scans are incremental, not a consistent snapshot.",
-  )}</div><button id="more-keys" hidden>Load more</button></section><section class="panel" id="key-detail">${empty(
-    "Select a key",
-    "View its type, value, time to live, and owning node.",
-  )}</section></div>`;
-  $("#search-keys").onsubmit = async (event) => {
-    event.preventDefault();
-    state.keys = [];
-    state.cursor = null;
-    state.keyPattern = $("#key-pattern").value;
-    await scanKeys();
-  };
-  $("#more-keys").onclick = scanKeys;
-  $("#new-key").onclick = () => stringDialog();
-}
-async function scanKeys() {
-  const generation = state.generation;
-  try {
-    const result = await api(
-      `/clusters/${state.cluster}/keys?pattern=${encodeURIComponent(
-        state.keyPattern,
-      )}${state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : ""}`,
-    );
-    if (generation !== state.generation) return;
-    state.keys = [
-      ...new Map(
-        [...state.keys, ...result.keys].map((k) => [k.id, k]),
-      ).values(),
-    ];
-    state.cursor = result.cursor;
-    $("#key-count").textContent = `${state.keys.length} found${
-      result.cursor ? " · more to scan" : " · scan finished"
-    }`;
-    $("#key-list").innerHTML = state.keys.length
-      ? table(
-          ["Key", "Primary node"],
-          state.keys.map(
-            (k) =>
-              `<tr class="clickable" data-key="${escape(
-                k.id,
-              )}"><td><button class="link mono" data-key-button="${escape(
-                k.id,
-              )}">${escape(
-                typeof k.name === "string"
-                  ? k.name
-                  : `[binary · ${k.name.bytes} bytes]`,
-              )}</button></td><td class="mono">${escape(
-                short(k.node),
-              )}</td></tr>`,
-          ),
-        )
-      : empty(
-          "No matching keys in this page",
-          result.cursor
-            ? "Continue scanning to search the remaining keyspace."
-            : "Try a different pattern or create a string key.",
-        );
-    $("#more-keys").hidden = !result.cursor;
-    document
-      .querySelectorAll("[data-key]")
-      .forEach((row) => (row.onclick = () => inspectKey(row.dataset.key)));
-  } catch (error) {
-    toast(error.message);
-  }
-}
-async function inspectKey(id) {
-  const generation = state.generation;
-  try {
-    const key = await api(
-      `/clusters/${state.cluster}/key?id=${encodeURIComponent(id)}`,
-    );
-    if (generation !== state.generation) return;
-    const listed = state.keys.find((k) => k.id === id);
-    $("#key-detail").innerHTML = `<div class="row"><h2>Key details</h2>${badge(
-      key.type,
-      "neutral",
-    )}</div><h3 class="mono wrap">${escape(
-      typeof listed?.name === "string" ? listed.name : "Binary key",
-    )}</h3><p class="muted">Slot ${key.slot} · ${
-      key.ttl === "-1"
-        ? "No expiry"
-        : key.ttl === "-2"
-        ? "Key no longer exists"
-        : `${number(+key.ttl / 1000)} seconds to live`
-    }</p><pre class="key-value">${escape(
-      JSON.stringify(key.value, null, 2),
-    )}</pre>${
-      key.bounded
-        ? '<p class="muted">Collection preview is limited to the first page / 100 entries. Use Send command for another cursor or range.</p>'
-        : ""
-    }<div class="actions">${
-      key.type === "string" &&
-      typeof key.value === "string" &&
-      typeof listed?.name === "string"
-        ? '<button id="edit-key">Edit value</button>'
-        : ""
-    }${
-      typeof listed?.name === "string" && key.type !== "none"
-        ? '<button class="danger" id="delete-key">Delete key</button>'
-        : ""
-    }</div>`;
-    if ($("#edit-key"))
-      $("#edit-key").onclick = () => stringDialog(listed.name, key.value);
-    if ($("#delete-key"))
-      $("#delete-key").onclick = () =>
-        dialog(
-          "Delete key",
-          "This deletes the selected key from the cluster.",
-          `<p class="mono wrap">${escape(listed.name)}</p>`,
-          async () => {
-            await api(`/clusters/${state.cluster}/command`, "POST", {
-              args: ["DEL", listed.name],
-              node: key.node,
-              confirm: true,
-            });
-            await inspectKey(id);
-            toast("Key deleted");
-          },
-          "Delete key",
-        );
-  } catch (error) {
-    toast(error.message);
-  }
-}
-function stringDialog(name = "", value = "") {
-  const editing = !!name;
-  dialog(
-    editing ? "Edit string value" : "Create a string key",
-    editing
-      ? "The existing expiry is preserved."
-      : "The key will be stored without an expiry.",
-    `<label for="string-key">Key</label><input id="string-key" value="${escape(
-      name,
-    )}" ${
-      editing ? "readonly" : ""
-    } required><label for="string-value">Value</label><textarea id="string-value" rows="6">${escape(
-      value,
-    )}</textarea>`,
-    async () => {
-      const args = ["SET", $("#string-key").value, $("#string-value").value];
-      if (editing) args.push("KEEPTTL");
-      else args.push("NX");
-      const result = await api(`/clusters/${state.cluster}/command`, "POST", {
-        args,
-        confirm: true,
-      });
-      if (result.reply === null)
-        throw new Error("That key already exists; inspect it before editing");
-      toast("String saved");
-    },
-    "Save string",
-  );
-}
 function parseCommand(line) {
   const args = [];
   let token = "",
@@ -954,7 +853,7 @@ function renderConsole(view) {
         dialog(
           "Execute data write",
           "Review this command before changing data.",
-          `<pre class="key-value">${escape(line)}</pre>`,
+          `<pre class="response-value">${escape(line)}</pre>`,
           () => run(args, line),
           "Execute write",
         );
@@ -1010,8 +909,7 @@ function dialog(title, description, content, submit, label = "Confirm") {
     const button = element.querySelector("button[type=submit]");
     button.disabled = true;
     try {
-      await submit();
-      element.close();
+      if ((await submit()) !== false) element.close();
     } catch (error) {
       $("#dialog-error").textContent = error.message;
     } finally {
@@ -1021,26 +919,71 @@ function dialog(title, description, content, submit, label = "Confirm") {
   element.showModal();
 }
 function connectDialog() {
+  let preview;
   dialog(
-    "Connect a Lavik cluster",
-    "Use the Meta Admin endpoint. You can connect a running cluster or an uninitialized Meta deployment.",
-    `<label for="cluster-name">Cluster name</label><input id="cluster-name" placeholder="production-eu" required pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}"><label for="meta-seeds">Meta seed addresses</label><input id="meta-seeds" placeholder="10.0.0.11:7200, 10.0.0.12:7200" required><small>Numeric IP addresses, separated by commas.</small><label for="profile">Connection profile</label><select id="profile">${state.profiles
+    "Connect existing cluster",
+    "Created a cluster with lavik-ctl? Enter a Meta Admin address to discover its current topology and add it to this workspace.",
+    `<label for="cluster-name">Cluster name</label><input id="cluster-name" placeholder="production-eu" required pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]{0,99}"><small>A name for this workspace. Your existing cluster keeps its data and configuration.</small><label for="meta-seeds">Meta seed addresses</label><textarea id="meta-seeds" rows="3" placeholder="10.0.0.11:7200&#10;10.0.0.12:7200" required></textarea><small>Use the addresses passed to lavik-ctl --addr, or ctl_endpoint from cluster.toml. Separate numeric IP:port addresses with spaces, commas, or newlines. Use the Meta Admin port (usually 7200); Data clients usually use 6379.</small><label for="profile">Connection profile</label><select id="profile">${state.profiles
       .map((p) => `<option>${escape(p)}</option>`)
-      .join("")}</select>`,
+      .join(
+        "",
+      )}</select><small>Profiles and TLS files live on the Admin machine. Its network must reach the advertised Meta and Data addresses.</small><div id="connection-preview" aria-live="polite"></div>`,
     async () => {
-      const id = $("#cluster-name").value;
-      await api("/clusters", "POST", {
-        id,
-        seeds: $("#meta-seeds")
-          .value.split(",")
-          .map((s) => s.trim()),
-        profile: $("#profile").value,
+      if (!preview) {
+        const button = $("#dialog-form button[type=submit]");
+        button.textContent = "Discovering cluster…";
+        const revision = JSON.stringify(read());
+        try {
+          const result = await api("/connections/preview", "POST", read());
+          if (JSON.stringify(read()) !== revision)
+            throw new Error("Connection settings changed. Test them again.");
+          preview = result;
+          const status = result.status;
+          $(
+            "#connection-preview",
+          ).innerHTML = `<div class="banner"><strong>Meta connection verified</strong><p>${escape(
+            status.cluster_state,
+          )} · ${status.meta_members?.length || 0} Meta voters · ${
+            status.groups?.length || 0
+          } groups · ${status.data_nodes?.length || 0} Data nodes</p><p>${
+            status.cluster_state === "uninitialized"
+              ? "This Meta deployment has no cluster yet. After connecting, open Topology to initialize it with your manifest."
+              : status.cluster_ready
+              ? "The cluster is ready. Connect to open its dashboard."
+              : "The cluster is not ready. Connect to inspect its health and operations."
+          }</p></div>`;
+          $("#dialog-error").textContent = "";
+        } catch (error) {
+          throw new Error(
+            `${error.message}. Check the Meta Admin port, firewall, and connection profile from the Admin machine.`,
+          );
+        } finally {
+          button.textContent = preview ? "Connect cluster" : "Test connection";
+        }
+        return false;
+      }
+      const cluster = await api("/connections/connect", "POST", {
+        token: preview.token,
       });
       state.clusters = await api("/clusters");
-      navigate("dashboard", id);
+      navigate("dashboard", cluster.id);
     },
-    "Connect cluster",
+    "Test connection",
   );
+  const read = () => ({
+    id: $("#cluster-name").value.trim(),
+    seeds: $("#meta-seeds")
+      .value.trim()
+      .split(/[\s,]+/)
+      .filter(Boolean)
+      .map((seed) => seed.replace(/^(tcp|tls):\/\//, "")),
+    profile: $("#profile").value,
+  });
+  $("#dialog-form").addEventListener("input", () => {
+    preview = null;
+    $("#connection-preview").innerHTML = "";
+    $("#dialog-form button[type=submit]").textContent = "Test connection";
+  });
 }
 function requestId() {
   return [...crypto.getRandomValues(new Uint8Array(16))]
@@ -1070,7 +1013,10 @@ function operationDialog(kind, input, title, description) {
   );
 }
 function replicaDialog(group) {
-  if (state.views[state.cluster]?.deployment) {
+  if (
+    state.views[state.cluster]?.deployment &&
+    state.views[state.cluster].deployment.storage !== "spdk"
+  ) {
     dialog(
       "Add a follower",
       "Deploy a new follower over SSH, or attach a node you already started.",

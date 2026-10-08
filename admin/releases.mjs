@@ -177,7 +177,9 @@ export class Releases {
     };
   }
   /** Resolve only official listed assets with matching published SHA-256 files. */
-  async resolve(tag) {
+  async resolve(tag, variant = "minimal") {
+    if (!["minimal", "standard"].includes(variant))
+      throw new AdminError("Unsupported package variant");
     if (typeof tag !== "string" || !TAG.test(tag))
       throw new AdminError(
         "Choose nightly or a Lavik release tag such as v0.1.0-beta.1",
@@ -191,7 +193,9 @@ export class Releases {
     );
     const assets = {};
     for (const arch of ["x86_64", "aarch64"]) {
-      const name = `lavik-${tag}-linux-${arch}-minimal.tar.gz`;
+      const name = `lavik-${tag}-linux-${arch}${
+        variant === "minimal" ? "-minimal" : ""
+      }.tar.gz`;
       const url = `${RELEASES}/download/${tag}/${name}`;
       if (!urls.has(url) || !urls.has(`${url}.sha256`)) continue;
       const line = await this.request(`${url}.sha256`);
@@ -202,8 +206,8 @@ export class Releases {
     }
     if (!Object.keys(assets).length)
       throw new AdminError(
-        "This release has no checksummed Linux minimal packages",
+        `This release has no checksummed Linux ${variant} packages`,
       );
-    return { tag, source: `${RELEASES}/tag/${tag}`, assets };
+    return { tag, variant, source: `${RELEASES}/tag/${tag}`, assets };
   }
 }

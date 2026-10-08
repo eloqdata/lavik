@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import secrets
+import urllib.request
 import time
 
 LIMIT = 8 * 1024 * 1024
@@ -112,6 +114,28 @@ def probe(request):
     if free < request.get("bytes", 0) + 1024**3:
         errors.append("Insufficient disk space for the data files plus 1 GiB reserve")
     errors.extend(supervision_errors(request.get("supervisor")))
+    spdk = None
+    if request.get("spdk"):
+        try:
+            spdk = spdk_check(request)
+        except Exception as error:
+            errors.append(str(error))
+    if request.get("monitoring"):
+        try:
+            checked(["docker", "compose", "version"])
+            checked(["docker", "info", "--format", "{{.ServerVersion}}"])
+        except Exception as error:
+            errors.append(
+                f"Monitoring requires Docker Engine and Compose v2 accessible to the SSH user: {error}"
+            )
+        request["ports"] = [*request.get("ports", []), request.get("grafanaPort", 3000)]
+        try:
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", request.get("prometheusPort", 9090)))
+        except OSError as error:
+            errors.append(
+                f"Monitoring port 127.0.0.1:{request.get('prometheusPort', 9090)} unavailable: {error}"
+            )
     for port in request.get("ports", []):
         try:
             with socket.socket(
@@ -123,6 +147,7 @@ def probe(request):
                 f"Address/port {request['address']}:{port} is unavailable: {error}"
             )
     return {
+        "spdk": spdk,
         "ok": not errors,
         "errors": errors,
         "arch": arch,
@@ -266,12 +291,334 @@ def prepare(request):
     }
 
 
+def checked(argv, timeout=30):
+    """Stop a provisioning phase on command failure, including bounded diagnostics."""
+    result = run(argv, timeout)
+    if result["code"]:
+        raise RuntimeError(result["stderr"] or result["stdout"] or f"Failed: {argv[0]}")
+    return result["stdout"]
+
+
+def spdk_device(request):
+    match = re.fullmatch(
+        r"spdk://([0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])/([1-9][0-9]*)",
+        request["spdk"],
+    )
+    if not match:
+        raise RuntimeError("Select a full PCI address and namespace ID for SPDK")
+    return match[1], int(match[2])
+
+
+def spdk_check(request):
+    """Fail closed before unbinding: one dedicated NVMe namespace in its own IOMMU group.
+
+    An owned controller can contain Lavik data on resume/reboot. Unowned controllers
+    must still use the kernel driver so every namespace and open user can be checked.
+    No check or setup action erases media or enables unsafe no-IOMMU mode.
+    """
+    if os.geteuid() != 0:
+        raise RuntimeError("SPDK setup requires root SSH on each Data host")
+    bdf, nsid = spdk_device(request)
+    device = Path("/sys/bus/pci/devices") / bdf
+    if (
+        not device.is_dir()
+        or device.joinpath("class").read_text().strip() != "0x010802"
+    ):
+        raise RuntimeError(f"{bdf}: selected device is not an NVMe controller")
+    group = device / "iommu_group"
+    if not group.exists() or sorted(p.name for p in (group / "devices").iterdir()) != [
+        bdf
+    ]:
+        raise RuntimeError(
+            f"{bdf}: enable IOMMU; the controller must have an isolated IOMMU group"
+        )
+    unsafe = Path("/sys/module/vfio/parameters/enable_unsafe_noiommu_mode")
+    if unsafe.exists() and unsafe.read_text().strip() in ("Y", "1"):
+        raise RuntimeError(
+            "Disable unsafe VFIO no-IOMMU mode before production SPDK setup"
+        )
+    memory = int(request["hugepageMiB"])
+    if memory < 1024 or memory > 1048576 or memory % 2:
+        raise RuntimeError(
+            "SPDK memory must be an even MiB value between 1024 and 1048576"
+        )
+    if not Path("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages").exists():
+        raise RuntimeError("This host does not support 2 MiB hugepages")
+    host_claim = Path("/var/lib/lavik-admin/spdk/host.json")
+    if host_claim.exists() and json.loads(host_claim.read_text()) != {
+        "owner": request.get("owner"),
+        "spdk": request["spdk"],
+    }:
+        raise RuntimeError(
+            "Automated SPDK setup reserves one Data host per deployment; this host is already claimed"
+        )
+    claim = Path("/var/lib/lavik-admin/spdk") / (bdf + ".json")
+    retained = None
+    if claim.exists():
+        retained = json.loads(claim.read_text())
+        if (
+            retained["owner"] != request.get("owner")
+            or retained["spdk"] != request["spdk"]
+        ):
+            raise RuntimeError(f"{bdf}: controller belongs to another deployment")
+    driver = (device / "driver").resolve().name if (device / "driver").exists() else ""
+    if driver == "vfio-pci" and retained:
+        return retained
+    if not retained:
+        hugepages = Path("/sys/kernel/mm/hugepages/hugepages-2048kB")
+        free_pages = int((hugepages / "free_hugepages").read_text())
+        available = re.search(
+            r"^MemAvailable:\s+(\d+)", Path("/proc/meminfo").read_text(), re.M
+        )
+        if (
+            not available
+            or int(available[1]) < max(0, memory // 2 - free_pages) * 2048 + 1024**2
+        ):
+            raise RuntimeError(
+                "Insufficient memory for the SPDK hugepage reservation plus 1 GiB host reserve"
+            )
+    if driver != "nvme":
+        raise RuntimeError(
+            f"{bdf}: cannot inspect an unowned or unbound controller; restore its nvme driver before review"
+        )
+    controllers = list((device / "nvme").glob("nvme*"))
+    if len(controllers) != 1:
+        raise RuntimeError(f"{bdf}: cannot identify a unique NVMe controller")
+    controller = controllers[0]
+    serial = (controller / "serial").read_text().strip()
+    if (retained and retained["serial"] != serial) or (
+        request.get("expectedSerial") and request["expectedSerial"] != serial
+    ):
+        raise RuntimeError(f"{bdf}: controller serial changed since review")
+    namespaces = [p for p in controller.glob("nvme*n*") if (p / "nsid").exists()]
+    if len(namespaces) != 1 or int((namespaces[0] / "nsid").read_text()) != nsid:
+        raise RuntimeError(
+            f"{bdf}: automated setup requires exactly one namespace matching the selected ID"
+        )
+    block = "/dev/" + namespaces[0].name
+    for tool in ("lsblk", "wipefs", "fuser", "modprobe", "mount", "findmnt"):
+        if not shutil.which(tool):
+            raise RuntimeError(f"Install {tool} before SPDK setup")
+    checked(["modprobe", "--dry-run", "vfio-pci"])
+    disk = json.loads(
+        checked(["lsblk", "--json", "--output", "NAME,TYPE,FSTYPE,MOUNTPOINTS", block])
+    )["blockdevices"][0]
+    if disk.get("children") or any(disk.get("mountpoints") or []) or disk.get("fstype"):
+        raise RuntimeError(
+            f"{block}: partitions, filesystems, mounts, or swap make this device unsuitable"
+        )
+    if list((Path("/sys/class/block") / namespaces[0].name / "holders").iterdir()):
+        raise RuntimeError(f"{block}: device is held by another block device")
+    users = run(["fuser", block])
+    if users["code"] != 1 or users["stdout"] or users["stderr"]:
+        raise RuntimeError(f"{block}: device is open or its users cannot be checked")
+    signatures = json.loads(checked(["wipefs", "--json", "--no-act", block])).get(
+        "signatures", []
+    )
+    if signatures:
+        raise RuntimeError(
+            f"{block}: existing disk signatures found; choose dedicated empty media"
+        )
+    # The first storage block contains Lavik's durable format marker. Require
+    # fresh media for initial admission; never erase or adopt another storage set.
+    if not retained:
+        with open(block, "rb", buffering=0) as media:
+            if any(media.read(4096)):
+                raise RuntimeError(
+                    f"{block}: nonempty storage header; choose fresh dedicated media"
+                )
+    return {"owner": request.get("owner"), "spdk": request["spdk"], "serial": serial}
+
+
+def configure_spdk(request):
+    """Claim the reviewed controller before any kernel mutation; retries retain data."""
+    retained = spdk_check(request)
+    bdf, _ = spdk_device(request)
+    device = Path("/sys/bus/pci/devices") / bdf
+    claims = Path("/var/lib/lavik-admin/spdk")
+    claims.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_once(
+        claims / "host.json",
+        json.dumps({"owner": request["owner"], "spdk": request["spdk"]}),
+    )
+    write_once(claims / (bdf + ".json"), json.dumps(retained))
+    pages = Path("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
+    requested = int(request["hugepageMiB"]) // 2
+    # Never shrink a shared hugepage pool. A single Data process per host is the
+    # automated model; its boot service restores at least the reviewed reservation.
+    if int(pages.read_text()) < requested:
+        pages.write_text(str(requested))
+    free = pages.with_name("free_hugepages")
+    if int(pages.read_text()) < requested:
+        raise RuntimeError(
+            "Hugepage allocation failed; free memory or reserve hugepages at boot, then resume"
+        )
+    driver = (device / "driver").resolve().name if (device / "driver").exists() else ""
+    if driver != "vfio-pci" and int(free.read_text()) < requested:
+        raise RuntimeError("Insufficient free hugepages for SPDK")
+    mount = Path("/dev/hugepages")
+    mount.mkdir(exist_ok=True)
+    result = run(["findmnt", "-n", "-o", "FSTYPE", "--mountpoint", str(mount)])
+    if result["code"]:
+        checked(["mount", "-t", "hugetlbfs", "-o", "pagesize=2M", "none", str(mount)])
+    elif result["stdout"] != "hugetlbfs":
+        raise RuntimeError("/dev/hugepages must be a hugetlbfs mount")
+    options = checked(["findmnt", "-n", "-o", "OPTIONS", "--mountpoint", str(mount)])
+    if not re.search(r"(?:^|,)pagesize=(?:2M|2048K|2097152)(?:,|$)", options):
+        raise RuntimeError("/dev/hugepages must use 2 MiB pages")
+    checked(["modprobe", "vfio-pci"])
+    if driver != "vfio-pci":
+        (device / "driver_override").write_text("vfio-pci")
+        (device / "driver/unbind").write_text(bdf)
+        Path("/sys/bus/pci/drivers_probe").write_text(bdf)
+    if (device / "driver").resolve().name != "vfio-pci":
+        raise RuntimeError(
+            f"{bdf}: VFIO binding failed; inspect the host before resuming"
+        )
+    (device / "driver_override").write_text("\n")
+    return {"ok": True, "serial": retained["serial"]}
+
+
+def setup_spdk(request):
+    root = owned(request)
+    # Keep a root-owned, fixed helper and retained request for boot persistence.
+    # Configuration is installed before binding so an interrupted first run has
+    # the exact same reviewed inputs available for an explicit resume.
+    write_once(root / "spdk-helper.py", request["helperSource"], 0o700)
+    boot = {
+        k: request[k]
+        for k in (
+            "baseDir",
+            "cluster",
+            "owner",
+            "spdk",
+            "hugepageMiB",
+            "expectedSerial",
+        )
+    }
+    boot["action"] = "spdk-configure"
+    write_once(root / "spdk-request.json", json.dumps(boot))
+    result = configure_spdk(request)
+    unit_name = f"lavik-{request['cluster']}-spdk.service"
+    unit = (
+        "[Unit]\nDescription=Lavik SPDK host configuration\nAfter=systemd-udev-settle.service\nBefore=network-online.target\n"
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/bin/python3 "
+        + str(root / "spdk-helper.py")
+        + " "
+        + str(root / "spdk-request.json")
+        + "\n[Install]\nWantedBy=multi-user.target\n"
+    )
+    write_once(Path("/etc/systemd/system") / unit_name, unit)
+    checked(["systemctl", "daemon-reload"])
+    checked(["systemctl", "enable", "--now", unit_name])
+    return result
+
+
+def monitoring(request):
+    """Provision monitoring under deployment ownership, without returning credentials."""
+    root = owned(request) / "monitoring"
+    root.mkdir(mode=0o700, exist_ok=True)
+    for name, content in request["files"].items():
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("Invalid monitoring configuration path")
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for directory in path.parents:
+            if directory == root:
+                break
+            directory.chmod(0o755)
+        write_once(path, content, 0o644)
+    secret = root / "grafana-password"
+    if not secret.exists():
+        write_once(secret, secrets.token_hex(24))
+    # The service account owns the private parent directory. Container mounts
+    # require readable configuration; only this environment contains a secret.
+    env = root / ".env"
+    environment = "\n".join(
+        [
+            "GRAFANA_ADMIN_PASSWORD=" + secret.read_text(),
+            "GRAFANA_BIND_ADDRESS=" + request["address"],
+            "PROMETHEUS_BIND_ADDRESS=127.0.0.1",
+            "PROMETHEUS_PORT=" + str(request.get("prometheusPort", 9090)),
+            "GRAFANA_PORT=" + str(request.get("grafanaPort", 3000)),
+            "LAVIK_TARGETS=" + ",".join(request["targets"]),
+            "",
+        ]
+    )
+    # Atomic target changes survive a later manual Compose restart too.
+    temporary = root / ".env.next"
+    temporary.write_text(environment)
+    temporary.chmod(0o600)
+    temporary.replace(env)
+    # Targets are the only mutable configuration. Pass them to Compose without
+    # exposing the generated password in argv, logs, the plan, or the browser.
+    argv = [
+        "docker",
+        "compose",
+        "--project-name",
+        "lavik-" + request["cluster"],
+        "--project-directory",
+        str(root),
+        "-f",
+        str(root / "compose.yaml"),
+    ]
+    previous = os.environ.get("LAVIK_TARGETS")
+    os.environ["LAVIK_TARGETS"] = ",".join(request["targets"])
+    try:
+        checked([*argv, "up", "-d"], 180)
+        checked([*argv, "up", "-d", "--force-recreate", "target-config"], 30)
+    finally:
+        if previous is None:
+            os.environ.pop("LAVIK_TARGETS", None)
+        else:
+            os.environ["LAVIK_TARGETS"] = previous
+    prometheus_url = f"http://127.0.0.1:{request.get('prometheusPort', 9090)}"
+    deadline = time.monotonic() + 60
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while True:
+        try:
+            with opener.open(prometheus_url + "/-/ready", timeout=3) as response:
+                if response.status != 200:
+                    raise RuntimeError("Prometheus is not ready")
+            with opener.open(prometheus_url + "/api/v1/targets", timeout=3) as response:
+                targets = json.load(response).get("data", {}).get("activeTargets", [])
+                healthy = {
+                    target.get("labels", {}).get("instance")
+                    for target in targets
+                    if target.get("health") == "up"
+                }
+                missing = set(request["targets"]) - healthy
+                if missing:
+                    raise RuntimeError(
+                        "Prometheus cannot scrape: " + ", ".join(sorted(missing))
+                    )
+            address = request["address"]
+            host = "[" + address + "]" if ":" in address else address
+            with opener.open(
+                f"http://{host}:{request.get('grafanaPort', 3000)}/api/health",
+                timeout=3,
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError("Grafana is not ready")
+            break
+        except Exception as error:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Monitoring readiness failed: {error}") from error
+            time.sleep(1)
+    return {"ok": True}
+
+
 def start_node(request):
     root = owned(request)
     node = request["node"]
     directory = root / node["name"]
     directory.mkdir(mode=0o700, exist_ok=True)
-    if node["kind"] == "data" and not (directory / "lavik.data").exists():
+    if (
+        node["kind"] == "data"
+        and not node.get("spdk")
+        and not (directory / "lavik.data").exists()
+    ):
         # Exclusive allocation survives interruption without ever truncating a
         # previous population. Publish the file only after allocation succeeds.
         fd, temporary = tempfile.mkstemp(dir=directory, prefix="allocate-")
@@ -298,10 +645,26 @@ def start_node(request):
     )
     if node["kind"] == "meta":
         launch_source += f"if not any((Path({str(directory / 'state')!r}) / name).exists() for name in ('RAFT', 'cluster_config.dat')):\n    argv += ['--initial-cluster-manifest', {str(root / 'cluster.toml')!r}]\n"
+    if node.get("spdk"):
+        bdf, _ = spdk_device({"spdk": node["spdk"]})
+        launch_source += (
+            "os.environ.update("
+            + repr(
+                {
+                    "BYCORF_EAL_ARGS": f"-a {bdf} --huge-dir=/dev/hugepages",
+                    "BYCORF_DPDK_MEMORY_MB": str(request["hugepageMiB"]),
+                }
+            )
+            + ")\n"
+        )
     launch_source += "os.execv(argv[0], argv)\n"
     write_once(launch, launch_source, 0o700)
     if request["supervisor"] == "systemd":
-        units = Path.home() / ".config/systemd/user"
+        units = (
+            Path("/etc/systemd/system")
+            if node.get("spdk")
+            else Path.home() / ".config/systemd/user"
+        )
         units.mkdir(parents=True, exist_ok=True)
         unit_name = f"lavik-{request['cluster']}-{node['name']}.service"
         # Paths are validated by Admin; % is escaped for systemd specifiers.
@@ -315,9 +678,22 @@ def start_node(request):
             + "\nRestart=on-failure\nRestartSec=3\nTimeoutStopSec=60\nLimitNOFILE=65536\n"
             + "[Install]\nWantedBy=default.target\n"
         )
+        if node.get("spdk"):
+            unit = (
+                unit.replace(
+                    "After=network-online.target",
+                    f"After=network-online.target lavik-{request['cluster']}-spdk.service\nRequires=lavik-{request['cluster']}-spdk.service",
+                )
+                .replace(
+                    "LimitNOFILE=65536", "LimitNOFILE=65536\nLimitMEMLOCK=infinity"
+                )
+                .replace("WantedBy=default.target", "WantedBy=multi-user.target")
+            )
         write_once(units / unit_name, unit)
         for args in (["daemon-reload"], ["enable", "--now", unit_name]):
-            result = run(["systemctl", "--user", *args], 30)
+            result = run(
+                ["systemctl", *([] if node.get("spdk") else ["--user"]), *args], 30
+            )
             if result["code"]:
                 raise RuntimeError(result["stderr"])
         return {"service": unit_name}
@@ -363,6 +739,13 @@ def main(request):
         return prepare(request)
     if action == "reserve":
         return {"directory": str(owned(request, create=True))}
+    if action == "monitoring":
+        return monitoring(request)
+    if action == "spdk-setup":
+        return setup_spdk(request)
+    if action == "spdk-configure":
+        owned(request)
+        return configure_spdk(request)
     if action == "start":
         return start_node(request)
     root = owned(request)
@@ -436,6 +819,16 @@ def main(request):
 if __name__ == "__main__":
     os.umask(0o077)
     try:
-        print(json.dumps(main(json.load(sys.stdin))))
+        print(
+            json.dumps(
+                main(
+                    json.loads(Path(sys.argv[1]).read_text())
+                    if len(sys.argv) > 1
+                    else json.load(sys.stdin)
+                )
+            )
+        )
     except Exception as error:
         print(json.dumps({"error": str(error)}))
+        if len(sys.argv) > 1:
+            sys.exit(1)

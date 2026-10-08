@@ -42,7 +42,7 @@ or safety boundaries.
 | [Monitoring stack](../../deploy/monitoring/README.md) | Running the repository's Prometheus and Grafana deployment |
 | [Lavik Admin](lavik-admin.md) | Starting the bundled Admin, preparing SSH hosts, deploying releases, managing multiple clusters, resizing followers, and Docker verification |
 | [Lavik Admin 101 on Mac](lavik-admin-mac-101.md) | Start empty Docker SSH hosts, prepare passwordless access in Admin, choose Meta/primary/follower placement, and deploy from the browser |
-| [Three-node Admin quick start](../../admin/quickstart/README.md) | Starting one primary, two replicas, three Meta voters, and Admin in Docker, then initializing the cluster in the browser |
+| [Three-node Admin quick start](../../admin/quickstart/README.md) | Starting one primary, two replicas, three Meta voters, and Admin in Docker, automatically creating demo-cluster |
 
 ## Maintenance
 

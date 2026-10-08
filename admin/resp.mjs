@@ -137,16 +137,6 @@ export function jsonReply(value) {
   return value;
 }
 
-export function keyBytes(value) {
-  if (
-    typeof value !== "string" ||
-    value.length > 65536 ||
-    !/^[A-Za-z0-9+/]*={0,2}$/.test(value)
-  )
-    throw new AdminError("Invalid encoded key");
-  return Buffer.from(value, "base64");
-}
-
 export function slot(key) {
   const open = key.indexOf(123);
   const close = open >= 0 ? key.indexOf(125, open + 1) : -1;

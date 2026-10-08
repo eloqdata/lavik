@@ -24,7 +24,7 @@ test.beforeEach(async ({ page }) => {
   ).toBeVisible();
 });
 
-test("fleet created by CLI, familiar data tools, and escaped key values", async ({
+test("fleet created by CLI, command console, and topology", async ({
   page,
 }, testInfo) => {
   const errors = [];
@@ -55,35 +55,12 @@ test("fleet created by CLI, familiar data tools, and escaped key values", async 
   expect(docker("redis-cli", "-c", "-p", "6400", "GET", "admin:e2e:key")).toBe(
     "hello world",
   );
-  await page.getByRole("button", { name: "Key browser", exact: true }).click();
-  await page.getByLabel("Key pattern").fill("admin:e2e:*");
-  await page.getByRole("button", { name: "Search keys", exact: true }).click();
-  await expect(page.locator("#key-count")).toContainText("found");
-  while (
-    await page
-      .getByRole("button", { name: "Load more", exact: true })
-      .isVisible()
-  ) {
-    await page.getByRole("button", { name: "Load more", exact: true }).click();
-    await page.waitForTimeout(200);
-  }
-  await page
-    .getByRole("button", { name: "admin:e2e:key", exact: true })
-    .click();
-  await expect(page.locator("#key-detail")).toContainText("hello world");
-  await page.getByRole("button", { name: "Edit value", exact: true }).click();
-  await page
-    .getByLabel("Value", { exact: true })
-    .fill('<img src=x onerror="window.xss=true">');
-  await page.getByRole("button", { name: "Save string", exact: true }).click();
-  expect(
-    docker("redis-cli", "-c", "-p", "6400", "GET", "admin:e2e:key"),
-  ).toContain("<img");
-  await page
-    .getByRole("button", { name: "admin:e2e:key", exact: true })
-    .click();
-  await expect(page.locator("#key-detail")).toContainText("<img");
-  expect(await page.evaluate(() => window.xss)).toBeUndefined();
+  await expect(
+    page.getByRole("button", { name: "Key browser", exact: true }),
+  ).toHaveCount(0);
+  await page.getByLabel("Command", { exact: true }).fill('GET "admin:e2e:key"');
+  await page.getByRole("button", { name: "Run command" }).click();
+  await expect(page.locator("#command-output")).toContainText("hello world");
   await page.getByRole("button", { name: "Topology", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "group-2", exact: true }),
@@ -308,6 +285,9 @@ test("connect and initialize an already-running fresh deployment", async ({
   await page
     .getByLabel("Meta seed addresses", { exact: true })
     .fill("127.0.0.1:9000");
+  await page
+    .getByRole("button", { name: "Test connection", exact: true })
+    .click();
   await page
     .getByRole("dialog")
     .getByRole("button", { name: "Connect cluster", exact: true })

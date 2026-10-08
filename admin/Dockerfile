@@ -25,6 +25,11 @@ COPY --from=build /build/lavik-ctl /usr/local/bin/lavik-ctl
 COPY LICENSE NOTICE /opt/lavik-admin/
 COPY --from=build /usr/share/common-licenses/Apache-2.0 /opt/lavik-admin/OPENSSL-LICENSE.txt
 COPY --chown=lavik:lavik admin /opt/lavik-admin
+COPY --chown=lavik:lavik deploy/monitoring/compose.yaml /opt/lavik-admin/monitoring/compose.yaml
+COPY --chown=lavik:lavik deploy/monitoring/prometheus/prometheus.yml /opt/lavik-admin/monitoring/prometheus/prometheus.yml
+COPY --chown=lavik:lavik deploy/monitoring/grafana/dashboards/lavik-overview.json /opt/lavik-admin/monitoring/grafana/dashboards/lavik-overview.json
+COPY --chown=lavik:lavik deploy/monitoring/grafana/provisioning/dashboards/lavik.yaml /opt/lavik-admin/monitoring/grafana/provisioning/dashboards/lavik.yaml
+COPY --chown=lavik:lavik deploy/monitoring/grafana/provisioning/datasources/prometheus.yaml /opt/lavik-admin/monitoring/grafana/provisioning/datasources/prometheus.yaml
 ENV LAVIK_ADMIN_DATA=/data/lavik-admin LAVIK_ADMIN_BIND=0.0.0.0
 USER lavik
 WORKDIR /opt/lavik-admin

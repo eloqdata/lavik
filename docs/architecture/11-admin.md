@@ -79,8 +79,8 @@ retention/export procedures.
 ## Host deployment and release lifecycle
 
 The deployment coordinator discovers versions from the public GitHub releases
-page and resolves minimal packages through its public asset fragment and
-matching published SHA-256 files. Discovery does not depend on REST API quota.
+page and resolves minimal packages for file storage or standard packages for
+SPDK through its public asset fragment and matching published SHA-256 files. Discovery does not depend on REST API quota.
 Only same-repository release links are parsed; HTML is never served to the UI,
 and missing/changed metadata fails closed. Short-lived metadata requests are
 cached and coalesced; installed bytes remain pinned by digest.
@@ -127,8 +127,29 @@ before Data. Meta's state directory is separate from launch/configuration
 files; the launch wrapper supplies bootstrap membership only for a pristine
 state, including after a host reboot. The default lifecycle uses systemd user
 services with lingering; explicit development mode uses detached processes
-without automatic restart. Admin does not provision machines or require
-passwordless sudo. Stopping Admin leaves host services running.
+without automatic restart. Admin uses existing machines and does not change
+sudo policy. Optional SPDK setup requires root SSH on dedicated Data hosts: read-only preflight records the
+selected controller serial and rejects media in use or unsupported IOMMU/memory
+configurations. Explicit deployment confirmation authorizes a root-owned host
+and controller claim, hugepage reservation, and VFIO binding. Retained system
+services restore configuration before SPDK Data services at boot. Those Data
+services have unlimited memlock; Meta retains user-service ownership. Device
+claims survive interrupted deployment and prevent cross-deployment reuse; setup
+never erases media or enables unsafe no-IOMMU mode. Stopping Admin leaves host
+services running.
+
+Optional monitoring placement runs the repository’s Prometheus/Grafana Compose
+stack on prepared hosts with Docker access. Admin assigns Data metrics ports and
+uploads configuration; each monitor generates and retains its own Grafana password
+outside the fleet catalog and browser. Data connectivity and monitoring readiness
+are checked after Meta reports the created cluster ready: Data listeners do not
+open before Genesis. Interrupted verification requires explicit resume and never
+replays cluster creation. Private Grafana listeners, loopback
+Prometheus listeners, and network-restricted Data metrics share the deployment’s
+trusted-network boundary. Monitoring is ready only after its services and all
+scrape targets respond. Follower installation updates the retained target set;
+membership removal leaves the still-running process observable. Monitoring
+configuration and volumes survive Admin shutdown.
 
 Creation saves a durable checkpoint before submitting `cluster-create` with
 the retained manifest. After interruption, installation/start phases require
@@ -181,6 +202,14 @@ committed membership. Typed creation and failover remain Meta-owned workflows.
 
 ## Browser, data, and trust boundaries
 
+Browser onboarding distinguishes a local Docker demo, SSH deployment, and an
+existing cluster. Existing-cluster discovery is read-only and retains tested
+connection inputs behind an expiring server token before catalog registration;
+registration never initializes or replaces Meta state. The source-based Docker
+entry point builds and starts Compose, registers its manifest’s seeds, and uses
+an Admin creation job with a stable request identity. Reruns observe retained
+jobs and never replay uncertain creation.
+
 The browser uses HTTP-only, SameSite session cookies with finite lifetime.
 An access token in a private file establishes a session; sessions expire on
 process restart. Mutation requests require a same-origin custom header and
@@ -198,12 +227,8 @@ access to cluster-private IPs. Provisioned node traffic uses a trusted private
 network; this path does not automatically configure Meta/Data TLS.
 Redirects are followed only to endpoints in that cluster's topology. The
 console admits an explicit command set and requires write confirmation;
-Meta and native replication commands are excluded. Binary keys retain their
-bytes through base64 identifiers. Scans bind their cursor to the observed
-topology epoch, coalesce a bounded number of sparse pages, and provide neither
-snapshot consistency nor an unbounded keyspace traversal. Collection views
-are bounded previews. Metrics report partial node failures explicitly and
-derive throughput from successive counter samples. Slow logs use `SLOWLOG`;
+Meta and native replication commands are excluded. Metrics report partial node
+failures explicitly and derive throughput from successive counter samples. Slow logs use `SLOWLOG`;
 unsupported Valkey-specific observability is not simulated.
 
 ## Source map
@@ -214,7 +239,7 @@ unsupported Valkey-specific observability is not simulated.
 | Catalog, workflow admission and observation, data tools | `admin/fleet.mjs` |
 | Database owner and schema | `admin/store.mjs` |
 | Host inventory, managed SSH identity, transient initial authentication | `admin/hosts.mjs`, `admin/askpass.mjs` |
-| Reviewed deployment and follower installation | `admin/deploy.mjs` |
+| Reviewed deployment, storage and monitoring placement, follower installation | `admin/deploy.mjs`, `admin/monitoring.mjs`, `deploy/monitoring/` |
 | Official release resolution and immutable cache | `admin/releases.mjs` |
 | SSH transport and remote ownership/service lifecycle | `admin/ssh.mjs`, `admin/remote.py` |
 | Release launcher, portable fleet client, packaging | `admin/lavik-admin`, `admin/cli.mjs`, `scripts/package_admin.sh` |

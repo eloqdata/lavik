@@ -79,3 +79,22 @@ test("failed metadata is retried, while oversized pages and real HTTP failures s
     /metadata limit/,
   );
 });
+
+test("SPDK resolution selects the standard asset without falling back to minimal", async () => {
+  const fullName = name.replace("-minimal", "");
+  const fullURL = asset.replace("-minimal", "");
+  const releases = new Releases(
+    async (url) =>
+      new Response(
+        url.endsWith(".sha256")
+          ? `${"c".repeat(64)}  ${fullName}\n`
+          : `${assetLinks}<a href="${fullURL}">full</a><a href="${fullURL}.sha256">checksum</a>`,
+      ),
+  );
+  const resolved = await releases.resolve(tag, "standard");
+  assert.equal(resolved.assets.aarch64.name, fullName);
+  await assert.rejects(
+    new Releases(async () => new Response(assetLinks)).resolve(tag, "standard"),
+    /no checksummed Linux standard/,
+  );
+});

@@ -175,7 +175,9 @@ test("restart observes creation but never replays installation or an uncertain G
       ).state,
       "uncertain",
     );
-    assert.ok(f.calls.every((c) => c.action === "probe"));
+    assert.ok(
+      f.calls.every((c) => ["probe", "connectivity"].includes(c.action)),
+    );
   } finally {
     await f.close();
   }
@@ -438,4 +440,192 @@ test("Data ports start at the base on each IP and increment only for colocated n
       "6380",
     ),
   );
+});
+
+test("SPDK selects every Data host and requires dedicated placement and explicit acknowledgement", async () => {
+  const f = await fixture();
+  try {
+    const hosts = [1, 2, 3].map((i) => ({ host: `10.0.0.${i}`, user: "root" }));
+    const config = {
+      ...input,
+      hosts,
+      supervisor: "systemd",
+      storage: "spdk",
+      spdkDevices: Object.fromEntries(
+        hosts.map((_, i) => [i, "spdk://0000:01:00.0/1"]),
+      ),
+    };
+    let variant;
+    f.deployments.releases.resolve = async (_tag, selected) => {
+      variant = selected;
+      return release;
+    };
+    f.deployments.ssh.call = async (_host, request) => {
+      f.calls.push(request);
+      return {
+        ok: true,
+        errors: [],
+        arch: "aarch64",
+        spdk: { serial: "dedicated" },
+      };
+    };
+    const preview = await f.deployments.preview(config);
+    assert.equal(variant, "standard");
+    assert.equal(f.calls.filter((c) => c.spdk).length, 3);
+    assert.ok(f.calls.every((c) => c.bytes === 0));
+    assert.ok(
+      nodeArguments(preview, preview.nodes[3]).includes("--storage=spdk"),
+    );
+    await assert.rejects(
+      f.deployments.create({ token: preview.token, confirm: "test" }),
+      /Confirm dedicated/,
+    );
+    await f.deployments.create({
+      token: preview.token,
+      confirm: "test",
+      spdkConfirm: true,
+    });
+    assert.equal((await f.deployments.plan("test")).storage, "spdk");
+    assert.throws(
+      () => topology(settings({ ...config, spdkDevices: {} })),
+      /dedicated SPDK/,
+    );
+    assert.throws(
+      () => topology(settings({ ...config, hosts: hosts.slice(0, 1) })),
+      /one Data node/,
+    );
+    assert.throws(
+      () =>
+        topology(
+          settings({
+            ...config,
+            hosts: hosts.map((h) => ({ ...h, user: "ubuntu" })),
+          }),
+        ),
+      /root SSH/,
+    );
+    assert.throws(
+      () => settings({ ...config, supervisor: "process" }),
+      /persistent systemd/,
+    );
+    const retained = await f.deployments.plan("test");
+    retained.modern = true;
+    await f.deployments.save(retained);
+    await assert.rejects(
+      f.deployments.previewFollower("test", { host: hosts[0] }),
+      /SPDK follower/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("monitoring reserves ports, enables each Data exporter, and uploads all targets", async () => {
+  const f = await fixture();
+  try {
+    const preview = await f.deployments.preview({
+      ...input,
+      monitorHosts: [0],
+    });
+    assert.equal(f.calls[0].monitoring, true);
+    assert.deepEqual(
+      preview.nodes.filter((n) => n.metrics).map((n) => n.metrics),
+      [9100, 9101, 9102],
+    );
+    assert.ok(
+      nodeArguments(preview, preview.nodes[3]).includes("--metrics-port"),
+    );
+    await f.deployments.configureMonitoring(preview);
+    const request = f.calls.at(-1);
+    assert.equal(request.action, "monitoring");
+    assert.deepEqual(request.targets, [
+      "127.0.0.1:9100",
+      "127.0.0.1:9101",
+      "127.0.0.1:9102",
+    ]);
+    assert.ok(request.files["grafana/dashboards/lavik-overview.json"]);
+    assert.equal(request.password, undefined);
+    assert.throws(
+      () => topology(settings({ ...input, monitorHosts: [0], dataPort: 3000 })),
+      /overlap/,
+    );
+    assert.throws(
+      () =>
+        topology(settings({ ...input, monitorHosts: [0], metricsPort: 6379 })),
+      /overlap/,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("Data and monitoring verification follow Genesis and resume without replay", async () => {
+  const f = await fixture();
+  try {
+    const preview = await f.deployments.preview({
+      ...input,
+      monitorHosts: [0],
+    });
+    const job = await f.deployments.create({
+      token: preview.token,
+      confirm: "test",
+    });
+    f.deployments.install = async () => ({
+      modern: true,
+      revision: "pinned",
+      version: "test",
+    });
+    let created = false,
+      ready = false,
+      genesis = 0,
+      monitorAttempts = 0;
+    f.fleet.meta.status = async () => ({
+      cluster_state: created ? "created" : "uninitialized",
+      cluster_ready: ready,
+    });
+    f.fleet.meta.options = () => [];
+    f.deployments.ctl = async () => {
+      created = true;
+      genesis++;
+      return { code: 0 };
+    };
+    const call = f.deployments.ssh.call;
+    f.deployments.ssh.call = async (host, request) => {
+      if (
+        request.action === "connectivity" &&
+        request.endpoints.some((e) => e.port === 6379)
+      )
+        assert.ok(created && ready, "Data listeners open only after Genesis");
+      return call(host, request);
+    };
+    f.deployments.configureMonitoring = async () => {
+      assert.ok(created && ready);
+      if (++monitorAttempts === 1)
+        throw new Error("Prometheus cannot scrape 10.0.0.1:9100");
+    };
+    const retained = () =>
+      f.store.query("SELECT * FROM jobs WHERE id=?", [job.id], "get");
+    await f.deployments.run(job);
+    assert.equal(genesis, 1);
+    assert.equal((await retained()).step, "waiting");
+    await f.deployments.observe(await retained());
+    assert.equal(monitorAttempts, 0);
+    ready = true;
+    await f.deployments.observe(await retained());
+    assert.equal((await retained()).state, "uncertain");
+    assert.equal((await retained()).step, "verifying");
+    assert.match((await retained()).detail, /cannot scrape/);
+    await f.deployments.observe(await retained());
+    assert.equal(
+      monitorAttempts,
+      1,
+      "periodic observation does not mutate monitoring again",
+    );
+    await f.deployments.resume(await retained());
+    assert.equal((await retained()).state, "completed");
+    assert.equal(monitorAttempts, 2);
+    assert.equal(genesis, 1, "verification resume never replays Genesis");
+  } finally {
+    await f.close();
+  }
 });
