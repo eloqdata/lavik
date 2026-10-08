@@ -1405,7 +1405,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   // Group reconstruction no longer needs parked keys, roots or manifests.
   // Release them before allocating the final grouped directories.
-  std::vector<RecoveryPreparedRecord>{}.swap(store.recovery_tx_records_);
+  RecoveryVector<RecoveryPreparedRecord>{}.swap(store.recovery_tx_records_);
   // Top-level winners are final. Drop their physical-copy tie-breakers before
   // allocating grouped directories; auxiliary candidates carry their own LSN.
   store.recovery_lsns_.clear();
@@ -1760,7 +1760,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   }
   store.recovery_hash_groups_.clear();
-  store.recovery_live_groups_.clear();
+  RecoveryLiveGroups{}.swap(store.recovery_live_groups_);
   status = co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
   if (!status.ok()) {
     Fail(status);
@@ -1779,6 +1779,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // Every worker's live-reference pass has run, so no manifest still needs
   // to be matched against a recovered extent header.
   store.recovered_extents_.clear();
+  store.recovered_extents_.rehash(0);
   store.recovery_txids_.clear();
   store.recovery_txids_.rehash(0);
 
@@ -2002,6 +2003,12 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   store.recovery_external_keys_.rehash(0);
   store.indirect_keys_.ForEach(
       [](auto& entry) { entry.value_->recovery_key_.reset(); });
+  if (WouldExceedMemoryLimit(0)) {
+    status = absl::ResourceExhaustedError(
+        "recovery exceeds maxmemory including temporary metadata");
+    Fail(status);
+    co_return status;
+  }
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
   // The scheduler lives until shutdown, including OFF and incomplete FULL.

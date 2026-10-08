@@ -26,6 +26,9 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
+
+#include "../src/storage/engine/recovery_allocator.h"
 
 TEST(MemoryTest, RetainedAdmissionLeavesTenPercentOutsideRetainedState) {
   constexpr std::uint64_t kInitialLimit = 1024ULL * 1024 * 1024;
@@ -300,5 +303,76 @@ TEST(MemoryTest, SharedReservationIsDischargedBeforeCrossWorkerDestruction) {
   coordinator.join();
 
   EXPECT_EQ(lavik::GetMemoryStats().admission_pending_bytes_, before);
+  lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+}
+
+TEST(MemoryTest, RecoveryUsesFullShareAndMustFitSteadyBudgetBeforeServing) {
+  constexpr std::uint64_t kMaximum = 1024ULL * 1024 * 1024;
+  ASSERT_TRUE(lavik::InitMemoryLimit(kMaximum, 1).ok());
+  lavik::BindMemoryAccountingShard(0);
+  lavik::RefreshMemoryStats();
+  const auto baseline = lavik::GetMemoryStats().used_bytes_;
+  const auto steady = kMaximum - kMaximum / 10;
+  ASSERT_LT(baseline, steady);
+  EXPECT_FALSE(lavik::TryReserveMemory(steady - baseline + 1));
+  {
+    lavik::RecoveryMemoryBudget recovery;
+    EXPECT_EQ(lavik::GetWorkerMemoryStats(0).retained_limit_bytes_, kMaximum);
+    auto reservation = lavik::TryReserveMemory(kMaximum - baseline);
+    ASSERT_TRUE(reservation);
+    EXPECT_FALSE(lavik::WouldExceedMemoryLimit(0));
+    EXPECT_FALSE(lavik::TryReserveMemory(1));
+    // Pending construction credit counts too; a barrier must not promote an
+    // in-flight allocation by switching to a smaller policy underneath it.
+    EXPECT_TRUE(absl::IsResourceExhausted(recovery.Finish()));
+    lavik::RetainedMemoryCharge charge;
+    charge.Adopt(&*reservation, kMaximum - baseline);
+    EXPECT_TRUE(absl::IsResourceExhausted(recovery.Finish()));
+    charge.Reset();
+    ASSERT_TRUE(recovery.Finish().ok());
+    EXPECT_EQ(lavik::GetWorkerMemoryStats(0).retained_limit_bytes_, steady);
+    EXPECT_FALSE(lavik::TryReserveMemory(steady - baseline + 1));
+  }
+  lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+}
+
+TEST(MemoryTest, RecoveryScratchConsumesBudgetAndCreditsItsOriginAfterMove) {
+  constexpr std::uint64_t kMaximum = 1024ULL * 1024 * 1024;
+  ASSERT_TRUE(lavik::InitMemoryLimit(kMaximum, 2).ok());
+  lavik::BindMemoryAccountingShard(0);
+  const auto baseline = lavik::GetWorkerMemoryStats(0).retained_bytes_;
+  {
+    lavik::RecoveryMemoryBudget recovery;
+    using Scratch =
+        std::vector<std::byte, lavik::storage::RecoveryAllocator<std::byte>>;
+    Scratch batch;
+    batch.resize(1024 * 1024);
+    const auto used = lavik::GetWorkerMemoryStats(0).retained_bytes_;
+    EXPECT_GE(used - baseline, batch.capacity());
+    auto remaining = lavik::TryReserveMemory(kMaximum / 2 - used);
+    ASSERT_TRUE(remaining);
+    EXPECT_FALSE(lavik::TryReserveMemory(1));
+    remaining.reset();
+    std::thread target([batch = std::move(batch)]() mutable {
+      lavik::BindMemoryAccountingShard(1);
+      // Move assignment propagates the origin's allocator as well as its
+      // storage. Destruction on this worker must not debit worker 1.
+      Scratch received;
+      received = std::move(batch);
+    });
+    target.join();
+    EXPECT_EQ(lavik::GetWorkerMemoryStats(0).retained_bytes_, baseline);
+    // Global usage still fits 90%, but worker 0 cannot borrow worker 1's
+    // online headroom. Check the per-worker transition independently.
+    auto full_share = lavik::TryReserveMemory(kMaximum / 2 - baseline);
+    ASSERT_TRUE(full_share);
+    auto transition = recovery.Finish();
+    EXPECT_TRUE(absl::IsResourceExhausted(transition));
+    EXPECT_NE(transition.message().find("worker=0"), std::string::npos);
+    full_share.reset();
+    // Abandon startup: the owner's destructor must restore the normal limit.
+  }
+  EXPECT_EQ(lavik::GetWorkerMemoryStats(0).retained_limit_bytes_,
+            (kMaximum - kMaximum / 10) / 2);
   lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
 }

@@ -72,6 +72,7 @@
 #include "lavik/storage/format.h"
 #include "lavik/storage/scan_hash_map.h"
 #include "lavik/tx/tx_shard.h"
+#include "recovery_allocator.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::storage {
@@ -383,6 +384,14 @@ struct ExtentIdentity {
 using RecoveredGroupedRoot =
     std::variant<GroupedHashRoot, OrderedCollectionRoot>;
 
+template <typename T>
+using RecoveryVector = std::vector<T, RecoveryAllocator<T>>;
+template <typename K, typename V>
+using RecoveryMap =
+    absl::flat_hash_map<K, V, typename absl::flat_hash_map<K, V>::hasher,
+                        typename absl::flat_hash_map<K, V>::key_equal,
+                        RecoveryAllocator<std::pair<const K, V>>>;
+
 // The auxiliary record already owns identity, revision, decision tags and
 // counts. Retain only the ordered envelope that cannot be reconstructed from
 // that header; historical pages must not each allocate a second full header.
@@ -509,7 +518,9 @@ struct RecoveryAuxiliaryRecord {
 // boundary raises cold-recovery resident memory sharply on large histories.
 static_assert(sizeof(RecoveryAuxiliaryRecord) <= 112);
 
-using RecoveryAuxiliaryRecords = std::deque<RecoveryAuxiliaryRecord>;
+using RecoveryAuxiliaryRecords =
+    std::deque<RecoveryAuxiliaryRecord,
+               RecoveryAllocator<RecoveryAuxiliaryRecord>>;
 
 // A selected group has already been checked against its physical payload.
 // Only its location, manifest, and transaction identity survive until the
@@ -524,7 +535,8 @@ struct RecoveryLiveGroup {
 // Retain both transaction identities: batch decisions keep transaction blocks
 // live independently of the logical group transaction.
 static_assert(sizeof(RecoveryLiveGroup) <= 72);
-using RecoveryLiveGroups = std::deque<RecoveryLiveGroup>;
+using RecoveryLiveGroups =
+    std::deque<RecoveryLiveGroup, RecoveryAllocator<RecoveryLiveGroup>>;
 
 // Non-owning counterpart used while a validated checkpoint buffer remains
 // pinned. The caller owns both key bytes and the manifest for the duration of
@@ -599,8 +611,8 @@ struct RecoveryBlock {
 };
 
 struct RecoveryBatch {
-  std::vector<RecoveryRecord> records_;
-  std::vector<RecoveryBlock> blocks_;
+  RecoveryVector<RecoveryRecord> records_;
+  RecoveryVector<RecoveryBlock> blocks_;
   // Commit records are not indexed. Charge them to their transaction block;
   // whole-generation retirement removes them after promotion is durable.
   struct CommitRecord {
@@ -608,7 +620,7 @@ struct RecoveryBatch {
     std::uint64_t txid_ = 0;
     std::uint32_t bytes_ = 0;
   };
-  std::vector<CommitRecord> commit_records_;
+  RecoveryVector<CommitRecord> commit_records_;
 };
 
 struct RecoveryLiveReference {
@@ -1954,33 +1966,30 @@ class StorageEngine::Impl {
     // against the manifests that reference it, and the two arrive in separate
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
-    absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents_;
+    RecoveryMap<std::uint64_t, ExtentIdentity> recovered_extents_;
     // Recovery-only exact identities for indirect-key entries. Runtime index
     // entries deliberately omit the full key, but recovery already had to
     // materialize it for routing, so retain it until every version is merged.
-    absl::flat_hash_map<const RecordIndex::Entry*, std::string>
-        recovery_external_keys_;
+    RecoveryMap<const RecordIndex::Entry*, std::string> recovery_external_keys_;
     // Recovery-only physical LSN of the candidate installed in each index
     // entry. Cleared after all versions have been merged.
-    absl::flat_hash_map<const RecordIndex::Entry*, std::uint64_t>
-        recovery_lsns_;
+    RecoveryMap<const RecordIndex::Entry*, std::uint64_t> recovery_lsns_;
     // Recovery-only txid of the final winner in each entry. Physical blocks
     // can map to a different worker after a topology change, so the later
     // live-reference routing charges the transaction block owner.
-    absl::flat_hash_map<const RecordIndex::Entry*, std::uint64_t>
-        recovery_txids_;
+    RecoveryMap<const RecordIndex::Entry*, std::uint64_t> recovery_txids_;
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
-    std::vector<RecoveryPreparedRecord> recovery_tx_records_;
+    RecoveryVector<RecoveryPreparedRecord> recovery_tx_records_;
     // Group auxiliary versions repeatedly name the same user key. Intern
     // those names while cold recovery retains physical candidates; views
     // point into their shared values and are cleared after the candidates.
-    absl::flat_hash_map<std::string_view, std::shared_ptr<const std::string>>
+    RecoveryMap<std::string_view, std::shared_ptr<const std::string>>
         recovery_aux_keys_;
     // External manifests are uncommon relative to physical auxiliary
     // versions. Retain their shared ownership out of line so every candidate
     // does not reserve a shared_ptr-sized slot.
-    std::vector<ExtentManifest> recovery_aux_extents_;
+    RecoveryVector<ExtentManifest> recovery_aux_extents_;
     const ExtentManifest& AuxiliaryExtents(
         const RecoveryAuxiliaryRecord& record) const {
       static const ExtentManifest empty;
@@ -1998,7 +2007,7 @@ class StorageEngine::Impl {
     // discard its candidate headers. Keep only compact physical-accounting
     // records until the later live-byte pass.
     RecoveryLiveGroups recovery_live_groups_;
-    absl::flat_hash_map<const RecordIndex::Entry*, RecoveredGroupedRoot>
+    RecoveryMap<const RecordIndex::Entry*, RecoveredGroupedRoot>
         recovery_grouped_roots_;
     // Undo journals of in-flight multi-key writes on this shard, keyed by
     // txid; written and consumed under store_state_mutex.

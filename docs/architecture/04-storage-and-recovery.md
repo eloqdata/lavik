@@ -541,7 +541,19 @@ its in-memory invariants.
 
 `--max-memory` is divided into fixed worker shares; a worker does not borrow
 another worker's unused balance. Retained state is admitted up to 90 percent of
-each share. Its accounting ownership remains bound to the allocation's origin,
+each share during normal operation. Startup recovery can use 100 percent;
+its candidate deques, prepared-record vectors, winner maps, and grouped
+reconstruction vectors participate in the same accounting. Scan/apply batches
+check the accumulated footprint, and retained index growth continues to use
+admission. Temporary-container growth is checked at batch boundaries rather
+than throwing quota exceptions inside partially modified hash tables. Bounded
+I/O scratch, decoded payloads, and allocator overhead still require RSS
+headroom. After all storage recovery coroutines have returned and their heaps
+have been collected, every worker's remaining footprint must fit its normal
+90-percent share before the server permits startup import and serving. A
+failed transition stops startup. Recovery does not change the disk scan count.
+
+Accounting ownership remains bound to the allocation's origin,
 so destruction credits the same worker even when it occurs elsewhere. INFO and
 metrics aggregate those worker-owned counters without changing foreground
 ownership.

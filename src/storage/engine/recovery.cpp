@@ -1029,6 +1029,10 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
                         commit.txid_, commit.bytes_, true);
     }
   }
+  if (WouldExceedMemoryLimit(0)) {
+    return absl::ResourceExhaustedError(
+        "recovery batch exceeds maxmemory including candidate metadata");
+  }
   return absl::OkStatus();
 }
 
@@ -1239,7 +1243,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     std::string_view key_;
     std::uint8_t db_id_;
   };
-  std::vector<RootToRecover> roots;
+  RecoveryVector<RootToRecover> roots;
   roots.reserve(store.recovery_grouped_roots_.size());
   for (const auto& [entry, root] : store.recovery_grouped_roots_) {
     const RecordLocation location = MaterializeIndexLocation(*entry);
@@ -1412,7 +1416,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       retain_selected();
       continue;
     }
-    std::vector<RecoveredGroupedRecord> candidates;
+    RecoveryVector<RecoveredGroupedRecord> candidates;
     for (auto it = lower; it != end; ++it) {
       auto candidate = it->AuxiliaryGroup();
       candidate.record_token_ =
@@ -1428,7 +1432,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       retain_selected();
       continue;
     }
-    std::vector<GroupedRecordLocation> locations;
+    RecoveryVector<GroupedRecordLocation> locations;
     locations.reserve(directory->groups().size() +
                       directory->retired_groups().size());
     auto append_location = [&](const RecoveredGroupedRecord& selected) {
@@ -1485,8 +1489,10 @@ StorageEngine::Impl::RecoverOrderedObject(
     RecoveryAuxiliaryRecords::iterator last) {
   const auto revision =
       root.revision_ == 0 ? version.root_.mutation_sequence_ : root.revision_;
-  std::map<std::uint64_t, std::size_t> winners;
-  std::vector<RecoveredGroupedRecord> member_candidates;
+  std::map<std::uint64_t, std::size_t, std::less<std::uint64_t>,
+           RecoveryAllocator<std::pair<const std::uint64_t, std::size_t>>>
+      winners;
+  RecoveryVector<RecoveredGroupedRecord> member_candidates;
   for (std::size_t i = 0; i < static_cast<std::size_t>(last - first); ++i) {
     const auto candidate = first[i].AuxiliaryGroup();
     if (candidate.incarnation_ != root.incarnation_ ||
@@ -1522,7 +1528,7 @@ StorageEngine::Impl::RecoverOrderedObject(
       position->second = i;
     }
   }
-  std::vector<RecoveredOrderedGroup> candidates;
+  RecoveryVector<RecoveredOrderedGroup> candidates;
   candidates.reserve(winners.size());
   for (const auto& [id, token] : winners) {
     auto& physical = first[token];
@@ -1601,7 +1607,7 @@ StorageEngine::Impl::RecoverOrderedObject(
       root, revision, candidates, recovery_committed_txids_,
       version.root_.mutation_sequence_, std::move(members));
   if (!directory.ok()) co_return directory.status();
-  std::vector<GroupedRecordLocation> locations;
+  RecoveryVector<GroupedRecordLocation> locations;
   locations.reserve(candidates.size());
   const auto append = [&](const OrderedGroupEntry& candidate) {
     auto& physical = first[candidate.record_token_ - 1];
