@@ -147,6 +147,49 @@ TEST(HashGroupEdits, NxNoopsRepeatedRemovalAndEmptyLeaf) {
   EXPECT_TRUE(DecodeHashGroup(*empty).ok());
 }
 
+TEST(HashGroupEdits,
+     PointEditsMatchBatchEncodingAcrossEmptySplitAndBinaryData) {
+  for (const auto count : {0, 1, 7, 200}) {
+    auto value = Value(count, 128);
+    if (count != 0) value.entries_[0].field_.clear();
+    HashGroupSnapshot group{.incarnation_ = 17, .value_ = std::move(value)};
+    auto payload = EncodeHashGroup(group);
+    ASSERT_TRUE(payload.ok()) << payload.status();
+    for (const auto kind :
+         {HashGroupEditKind::kSet, HashGroupEditKind::kSetIfAbsent,
+          HashGroupEditKind::kDelete}) {
+      for (const auto& field : {std::string{}, std::string("field-3"),
+                                std::string("new\0field", 9)}) {
+        for (const auto& bytes :
+             {std::string{}, std::string("v\0", 2), std::string(128, 'd'),
+              std::string(9000, 'x')}) {
+          SCOPED_TRACE(testing::Message() << count << ":" << int(kind) << ":"
+                                          << field << ":" << bytes.size());
+          const std::array<HashEntryView, 2> edits{
+              {{field, bytes}, {field, bytes}}};
+          auto point = ApplyHashGroupEdits(*payload, Seed(), kind,
+                                           std::span(edits).first(1));
+          auto batch = ApplyHashGroupEdits(*payload, Seed(), kind, edits);
+          ASSERT_TRUE(point.ok()) << point.status();
+          ASSERT_TRUE(batch.ok()) << batch.status();
+          EXPECT_EQ(point->changed_, batch->changed_);
+          EXPECT_EQ(point->added_, batch->added_);
+          EXPECT_EQ(point->removed_, batch->removed_);
+          ASSERT_EQ(point->leaves_.size(), batch->leaves_.size());
+          for (std::size_t i = 0; i < point->leaves_.size(); ++i) {
+            auto encoded = EncodeHashGroup(point->leaves_[i]);
+            auto expected = EncodeHashGroup(batch->leaves_[i]);
+            ASSERT_TRUE(encoded.ok()) << encoded.status();
+            ASSERT_TRUE(expected.ok()) << expected.status();
+            EXPECT_EQ(*encoded, *expected);
+            EXPECT_TRUE(DecodeHashGroup(*encoded).ok());
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(HashGroupEdits, SplitsAndOversizedValuesKeepOwnedStreamingPath) {
   HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(64, 64)};
   auto payload = EncodeHashGroup(group);

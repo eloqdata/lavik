@@ -2288,13 +2288,26 @@ class StorageEngine::Impl {
       TxShardWrites* tx, ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition = nullptr,
       PreparedOrderedMutation* prepared = nullptr);
+  // Command-local checked ordered pages. Retain only pages containing requested
+  // members (or a destination boundary), with admission beside owned strings.
+  // Pop selection passes this cache into deletion under the same key intent;
+  // it is never stored in the resident object or reused by another command.
+  struct SortedSetOrderedProbe {
+    struct Page {
+      MemoryReservation admission_;
+      LoadedOrderedGroup page_;
+    };
+    GroupedObject::Handle source_;
+    std::map<std::size_t, Page> pages_;
+  };
   Task<absl::StatusOr<SortedSetResult>> ExecuteGroupedSortedSetLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, GroupedObject::Handle previous,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition = nullptr,
-      PreparedOrderedMutation* prepared = nullptr);
+      PreparedOrderedMutation* prepared = nullptr,
+      SortedSetOrderedProbe* ordered_probe = nullptr);
 
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 

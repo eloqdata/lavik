@@ -348,6 +348,129 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
   if (!metadata.ok()) return metadata.status();
   if (metadata->retired_)
     return absl::DataLossError("cannot edit a retired Hash leaf");
+  if (edits.size() == 1) {
+    const auto& edit = edits.front();
+    std::optional<HashEntryView> current;
+    auto valid =
+        VisitHashGroupFields(payload, metadata->field_count_, metadata->id_,
+                             seed, [&](const HashEntryView& entry) {
+                               if (entry.field_ == edit.field_) current = entry;
+                               return absl::OkStatus();
+                             });
+    if (!valid.ok()) return valid;
+    auto size = AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
+                                    edit.value_.size(), kHashGroupPayloadLimit);
+    if (!size.ok()) return size.status();
+    if (!metadata->id_.ContainsHash(ComputeDigest(edit.field_, seed).value_))
+      return absl::InvalidArgumentError("Hash edit outside its group route");
+    HashGroupEdit result;
+    const bool remove = kind == HashGroupEditKind::kDelete;
+    if ((remove && !current) ||
+        (current && (kind == HashGroupEditKind::kSetIfAbsent ||
+                     (!remove && current->value_ == edit.value_))))
+      return result;
+    result.changed_ = true;
+    result.added_ = !current;
+    result.removed_ = remove;
+    const auto count =
+        std::uint64_t{metadata->field_count_} + result.added_ - result.removed_;
+    if (count > UINT32_MAX)
+      return absl::OutOfRangeError("Hash edit cardinality overflow");
+    const auto old_bytes = payload.size() - kGroupHeaderBytes;
+    const auto removed_bytes =
+        current ? 8 + current->field_.size() + current->value_.size() : 0;
+    const auto added_bytes = remove ? 0 : *size - kCompactHeaderBytes;
+    const auto bytes =
+        count == 0 ? 0
+                   : (old_bytes == 0 ? kCompactHeaderBytes : old_bytes) -
+                         removed_bytes + added_bytes;
+    HashGroupSnapshot replacement{.incarnation_ = metadata->incarnation_,
+                                  .id_ = metadata->id_,
+                                  .value_ = {}};
+    if (bytes <= kCollectionGroupTargetBytes) {
+      // A point edit needs no field-to-position map or vector of every entry.
+      // Full route/duplicate validation above remains mandatory, even for a
+      // no-op. Copy unchanged encoded spans once, without rebuilding each
+      // field header. Views borrow the live read lease until this returns.
+      std::string encoded;
+      const auto total = kGroupHeaderBytes + bytes;
+      encoded.resize_and_overwrite(
+          total, [&](char* output, std::size_t) noexcept {
+            EncodeGroupHeader({output, kGroupHeaderBytes}, replacement, count,
+                              bytes);
+            if (count == 0) return total;
+            std::span<char> compact(output + kGroupHeaderBytes, bytes);
+            Store(compact, 0, kHashValueMagic, 8);
+            Store(compact, 8, kStorageFormatVersion, 4);
+            Store(compact, 12, kCompactHeaderBytes, 4);
+            Store(compact, 16, count, 4);
+            Store(compact, 20, 0, 4);
+            Store(compact, 24, bytes, 8);
+            const auto body = payload.substr(kGroupHeaderBytes);
+            const std::size_t at =
+                current ? static_cast<std::size_t>(current->field_.data() -
+                                                   body.data()) -
+                              8
+                        : old_bytes;
+            std::size_t offset = kCompactHeaderBytes;
+            if (at > kCompactHeaderBytes) {
+              const auto prefix = at - kCompactHeaderBytes;
+              std::memcpy(compact.data() + offset,
+                          body.data() + kCompactHeaderBytes, prefix);
+              offset += prefix;
+            }
+            if (!remove) {
+              Store(compact, offset, edit.field_.size(), 4);
+              Store(compact, offset + 4, edit.value_.size(), 4);
+              offset += 8;
+              if (!edit.field_.empty())
+                std::memcpy(compact.data() + offset, edit.field_.data(),
+                            edit.field_.size());
+              offset += edit.field_.size();
+              if (!edit.value_.empty())
+                std::memcpy(compact.data() + offset, edit.value_.data(),
+                            edit.value_.size());
+              offset += edit.value_.size();
+            }
+            const auto end = at + removed_bytes;
+            if (end < old_bytes)
+              std::memcpy(compact.data() + offset, body.data() + end,
+                          old_bytes - end);
+            return total;
+          });
+      replacement.prepared_ = PreparedHashGroupPayload(
+          std::move(encoded), count, metadata->id_, metadata->incarnation_);
+      result.leaves_.push_back(std::move(replacement));
+    } else {
+      // Splits and oversized values still use owned streaming snapshots. The
+      // checked reader needs no second route/duplicate index on this pass.
+      replacement.value_.entries_.reserve(count);
+      auto append = [&](const HashEntryView& entry) {
+        replacement.value_.entries_.push_back(
+            {.digest_ = ComputeDigest(entry.field_),
+             .field_ = std::string(entry.field_),
+             .value_ = std::string(entry.value_)});
+      };
+      if (metadata->field_count_ != 0) {
+        auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
+        if (!reader.ok()) return reader.status();
+        for (std::size_t i = 0; i < reader->size(); ++i) {
+          auto entry = reader->Next();
+          if (!entry.ok()) return entry.status();
+          if (entry->field_ == edit.field_) {
+            if (!remove) append(edit);
+          } else {
+            append(*entry);
+          }
+        }
+      }
+      if (!current) append(edit);
+      auto leaves = SplitHashGroup(std::move(replacement), seed);
+      if (!leaves.ok()) return leaves.status();
+      result.leaves_ = std::move(*leaves);
+    }
+    return result;
+  }
   struct Entry {
     HashEntryView view;
     bool removed = false;

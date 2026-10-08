@@ -34,7 +34,7 @@ namespace {
 constexpr std::string_view kRootMagic = "LOCROOT1";
 constexpr std::string_view kGroupMagic = "LOCGRUP1";
 constexpr std::size_t kRootBytes = kOrderedCollectionRootBytes;
-constexpr std::size_t kEntryHeaderBytes = 12;
+constexpr std::size_t kEntryHeaderBytes = kOrderedEntryHeaderBytes;
 
 template <typename Buffer>
 void Store(Buffer& bytes, std::size_t offset, std::uint64_t value,

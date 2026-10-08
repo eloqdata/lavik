@@ -139,6 +139,8 @@ inline std::size_t OrderedGroupSize(
 }
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
+// Each ordered item stores its byte length and score before its value.
+inline constexpr std::size_t kOrderedEntryHeaderBytes = 12;
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
 inline constexpr std::size_t kGroupedStreamRootBytes =
     kOrderedCollectionRootBytes + 8;
@@ -204,7 +206,7 @@ class OrderedGroupEncoder {
  private:
   const OrderedGroupSnapshot* group_ = nullptr;
   std::array<char, kOrderedGroupHeaderBytes> header_{};
-  std::array<char, 12> entry_header_{};
+  std::array<char, kOrderedEntryHeaderBytes> entry_header_{};
   std::size_t encoded_bytes_ = 0;
   std::size_t entry_ = 0;
   unsigned phase_ = 0;
