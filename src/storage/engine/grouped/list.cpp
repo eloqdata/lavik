@@ -309,10 +309,18 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   std::size_t begin_page = first->group_index_;
   std::size_t end_page = last->group_index_ + 1;
   if (!read_only) {
-    // Links belong to their complete page snapshots. A split/removal can
-    // change either neighbour, so pin its logical contents in the same plan.
-    if (begin_page != 0) --begin_page;
-    if (end_page != directory.groups().size()) ++end_page;
+    // Tail insertion retains the old tail's identity even when it splits, so
+    // its predecessor cannot change. A pop that leaves its one touched page
+    // nonempty also preserves both links. Avoid reading/decoding neighbours
+    // in these cases; page retirement still needs their complete snapshots.
+    const bool append = rank == count && erase_count == 0;
+    const bool partial_pop =
+        (operation.kind_ == ListOperationKind::kPopLeft ||
+         operation.kind_ == ListOperationKind::kPopRight) &&
+        begin_page + 1 == end_page &&
+        erase_count < directory.groups()[begin_page].item_count_;
+    if (!append && !partial_pop && begin_page != 0) --begin_page;
+    if (!partial_pop && end_page != directory.groups().size()) ++end_page;
   }
   GroupedScratchBudget page_budget;
   for (std::size_t i = begin_page; i < end_page; ++i) {

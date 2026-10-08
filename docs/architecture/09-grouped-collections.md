@@ -375,10 +375,11 @@ of read-buffer accounting. Indexed reads retain their direct single-page path.
 Read-only operations retain shared
 key intent and an immutable routing view, release worker store state before
 page I/O, and validate population and physical record lifetime in the page
-loader. Push, pop and indexed replacement load the affected interval and its
-immediate link neighbours; an equal-sized indexed replacement only needs its
-target page. Pivot and position searches consume one page at a time and retain
-only the result; insertion reloads the located interval.
+loader. Push, pop and indexed replacement load the affected interval, with
+neighbour payloads when their links may change. Tail pushes, pops that leave
+their single affected page nonempty, and equal-sized indexed replacements
+need only their target page. Pivot and position searches consume one page at a
+time and retain only the result; insertion reloads the located interval.
 Value removals, trimming and within-list moves retain the needed logical
 contents before forming a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.

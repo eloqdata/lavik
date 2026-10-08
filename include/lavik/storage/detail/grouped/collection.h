@@ -578,6 +578,9 @@ struct OrderedCollectionMutationPlan {
 // storage primitive for List push/pop/insert/remove and Sorted Set insertion,
 // deletion or score repositioning. The caller supplies all intersected pages
 // plus their immediate neighbours; only changed complete pages are returned.
+// List neighbours may be omitted when their links remain unchanged, including
+// tail pushes (even with a split) and pops that leave the touched page nonempty
+// without splitting it at a smaller target size.
 // Replacing one List item with the same byte length at the default page target
 // needs only its containing page, because its size and links stay unchanged.
 // Noncontiguous List removals or a Sorted Set reposition may be expressed as
