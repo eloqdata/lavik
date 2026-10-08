@@ -167,8 +167,7 @@ absl::StatusOr<std::size_t> ValidateGroup(const OrderedGroupSnapshot& group) {
   return bytes;
 }
 
-bool SameMetadata(const RecoveredOrderedGroup& left,
-                  const RecoveredOrderedGroup& right) {
+bool SameMetadata(const auto& left, const auto& right) {
   return left.previous_ == right.previous_ && left.next_ == right.next_ &&
          left.item_count_ == right.item_count_ &&
          left.encoded_bytes_ == right.encoded_bytes_ &&
@@ -771,13 +770,13 @@ std::optional<std::size_t> OrderedGroupDirectory::FindIndex(
              : std::nullopt;
 }
 
-const RecoveredOrderedGroup* OrderedGroupDirectory::Find(
+const OrderedGroupEntry* OrderedGroupDirectory::Find(
     std::uint64_t id) const noexcept {
   const auto index = FindIndex(id);
   return index ? &groups()[*index] : nullptr;
 }
 
-const RecoveredOrderedGroup* OrderedGroupDirectory::FindRecord(
+const OrderedGroupEntry* OrderedGroupDirectory::FindRecord(
     std::uint64_t id) const noexcept {
   if (const auto* list = std::get_if<ListSlots>(&ids_)) {
     const auto* found = list->positions_.Get(id);
@@ -824,7 +823,12 @@ absl::Status OrderedGroupDirectory::BuildListSlots(
   // Expansion is geometric and never accompanies a pop. Unused slots contain
   // no identity and contribute zero to the Fenwick tree. Recovery starts at
   // head zero; end edits may subsequently wrap without moving the middle.
-  if (capacity < groups.size())
+  // A newly recovered small List needs no spare metadata slots. Its first
+  // expansion is cheap; larger rings retain geometric slack for bounded end
+  // edits without rebuilding their middle chunks.
+  if (capacity == 0 && groups.size() <= 32)
+    capacity = groups.size();
+  else if (capacity < groups.size())
     capacity = std::min<std::size_t>(
         UINT32_MAX, std::bit_ceil(std::max<std::size_t>(32, groups.size())));
   auto scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
@@ -928,7 +932,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
   std::vector<RecoveredOrderedGroup> retirements;
   for (auto item : changed) {
     if (!item.retired_) continue;
-    item.txid_ = item.batch_txid_ = 0;
     const auto* position = list.positions_.Get(item.id_);
     if (position && position->retired_) {
       auto status = result.retired_.Set(position->slot_, item);
@@ -952,7 +955,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
       const auto slot = list.positions_.Get(item.id_)->slot_;
       count_changes.emplace_back(
           slot, absl::int128(item.item_count_) - groups_[slot].item_count_);
-      item.txid_ = item.batch_txid_ = 0;
       auto status = result.groups_.Set(slot, item);
       if (!status.ok()) return status;
     }
@@ -990,7 +992,14 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
     std::size_t visited_changes = 0;
     while (id != right) {
       const auto found = replacements.find(id);
-      const auto* item = found == replacements.end() ? Find(id) : found->second;
+      RecoveredOrderedGroup old;
+      const RecoveredOrderedGroup* item = nullptr;
+      if (found != replacements.end())
+        item = found->second;
+      else if (const auto* entry = Find(id)) {
+        old = *entry;
+        item = &old;
+      }
       const auto old_index = FindIndex(id);
       if (!item || item->retired_ || item->previous_ != previous ||
           (old_index && (*old_index < begin || *old_index >= end)) ||
@@ -999,7 +1008,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
       replacement.push_back(*item);
       if (found != replacements.end()) {
         ++visited_changes;
-        replacement.back().txid_ = replacement.back().batch_txid_ = 0;
       }
       previous = id;
       id = item->next_;
@@ -1102,8 +1110,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
           item.sequence_ != revision ||
           groups[item.id_ - 1].sequence_ == revision)
         return absl::DataLossError("invalid changed String segment");
-      item.txid_ = 0;
-      item.batch_txid_ = 0;
       groups[item.id_ - 1] = item;
     }
     for (std::size_t i = 0; i < groups.size(); ++i) {
@@ -1202,8 +1208,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       count += delta;
       bytes += absl::int128(item.encoded_bytes_) - old.encoded_bytes_;
       count_changes.emplace_back(index, delta);
-      item.txid_ = 0;
-      item.batch_txid_ = 0;
       auto status = result.groups_.Set(index, item);
       if (!status.ok()) return status;
     }
@@ -1285,15 +1289,23 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     }
     if (fresh_ids && first < groups_.size() && groups_.size() - first <= 256) {
       const auto suffix_size = root.group_count_ - first;
+      // Borrow either already adjudicated resident entries or new candidates;
+      // do not retain a second full metadata vector for the suffix.
+      using SuffixPage =
+          std::variant<const OrderedGroupEntry*, const RecoveredOrderedGroup*>;
+      const auto materialize = [](const SuffixPage& page) {
+        return std::visit(
+            [](const auto* entry) -> RecoveredOrderedGroup { return *entry; },
+            page);
+      };
       auto scratch = TryReserveMemory(AllocatorUsableSizeForRequest(
-          suffix_size * (sizeof(const RecoveredOrderedGroup*) +
-                         2 * sizeof(std::uint64_t)) +
+          suffix_size * (sizeof(SuffixPage) + 2 * sizeof(std::uint64_t)) +
           1024));
       if (!scratch) {
         RecordMemoryRejection();
         return absl::ResourceExhaustedError("OOM Stream suffix update scratch");
       }
-      std::vector<const RecoveredOrderedGroup*> suffix;
+      std::vector<SuffixPage> suffix;
       std::vector<std::uint64_t> prefixes;
       suffix.reserve(suffix_size);
       prefixes.reserve(suffix_size);
@@ -1318,10 +1330,14 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       while (id != 0) {
         const auto replacement = replacements.find(id);
         const auto old_index = FindIndex(id);
-        const auto* item = replacement == replacements.end()
-                               ? (old_index ? &groups_[*old_index] : nullptr)
-                               : replacement->second;
-        if (item == nullptr || item->retired_ || item->previous_ != previous ||
+        if (replacement == replacements.end() && !old_index)
+          return absl::DataLossError("missing Stream suffix page");
+        const auto page = replacement == replacements.end()
+                              ? SuffixPage(&groups_[*old_index])
+                              : SuffixPage(replacement->second);
+        const auto value = materialize(page);
+        const auto* item = &value;
+        if (item->retired_ || item->previous_ != previous ||
             (old_index && *old_index < first) || suffix.size() == suffix_size)
           return absl::DataLossError("broken Stream suffix chain");
         const auto index = first + suffix.size();
@@ -1330,7 +1346,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         if (count > root.item_count_)
           return absl::DataLossError("Stream suffix count overflow");
         prefixes.push_back(static_cast<std::uint64_t>(count));
-        suffix.push_back(item);
+        suffix.push_back(page);
         previous = id;
         id = item->next_;
       }
@@ -1345,9 +1361,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       const auto old_suffix_size = groups_.size() - first;
       absl::InlinedVector<RecoveredOrderedGroup, 8> extended;
       for (std::size_t i = old_suffix_size; i < suffix.size(); ++i) {
-        extended.push_back(*suffix[i]);
-        extended.back().txid_ = 0;
-        extended.back().batch_txid_ = 0;
+        extended.push_back(materialize(suffix[i]));
       }
       auto groups = groups_.Appended(extended);
       if (!groups.ok()) return groups.status();
@@ -1363,10 +1377,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       rebuilt.total_group_bytes_ = static_cast<std::uint64_t>(bytes);
       for (std::size_t i = 0; i < suffix.size(); ++i) {
         const auto index = first + i;
-        auto item = *suffix[i];
+        auto item = materialize(suffix[i]);
         if (i < old_suffix_size) {
-          item.txid_ = 0;
-          item.batch_txid_ = 0;
           auto status = rebuilt.groups_.Set(index, item);
           if (!status.ok()) return status;
         }
@@ -1382,8 +1394,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       }
       for (auto item : changed) {
         if (const auto index = FindIndex(item.id_); index && *index < first) {
-          item.txid_ = 0;
-          item.batch_txid_ = 0;
           auto status = rebuilt.groups_.Set(*index, item);
           if (!status.ok()) return status;
         }
@@ -1412,6 +1422,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   std::uint64_t id = root.first_group_, previous = 0, count = 0;
   std::size_t old_cursor = 0, visited_changes = 0;
   while (id != 0) {
+    RecoveredOrderedGroup old;
     const RecoveredOrderedGroup* item = nullptr;
     const auto replacement = replacements.find(id);
     if (replacement != replacements.end()) {
@@ -1433,7 +1444,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         old_cursor = *position;
       }
       positions[old_cursor] = groups.size();
-      item = &groups_[old_cursor++];
+      old = groups_[old_cursor++];
+      item = &old;
     }
     if (groups.size() == root.group_count_ || item->retired_ ||
         item->previous_ != previous ||
@@ -1446,8 +1458,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       return absl::DataLossError("ordered group byte total overflows");
     rebuilt.total_group_bytes_ += item->encoded_bytes_;
     groups.push_back(*item);
-    groups.back().txid_ = 0;
-    groups.back().batch_txid_ = 0;
     count += item->item_count_;
     ends.push_back(count);
     previous = id;
@@ -1462,18 +1472,13 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
   // never re-sort every historical retirement on each append/trim.
   std::sort(new_retired.begin(), new_retired.end(),
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
-  // Most append/split updates create no tombstones. Keep the adjudicated
-  // predecessor records shared, including their physical transaction tags;
-  // Apply never re-adjudicates those tags (as in the same-topology path).
+  // Most append/split updates create no tombstones. Keep the already
+  // adjudicated resident predecessor records shared.
   // Monotonically retired identities need only a persistent tail append.
   if (new_retired.empty()) {
     rebuilt.retired_ = retired_;
   } else if (retired_.empty() ||
              retired_.back().id_ < new_retired.front().id_) {
-    for (auto& item : new_retired) {
-      item.txid_ = 0;
-      item.batch_txid_ = 0;
-    }
     auto appended = retired_.Appended(new_retired);
     if (!appended.ok()) return appended.status();
     rebuilt.retired_ = std::move(*appended);
@@ -1485,8 +1490,6 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       for (; old != retired_.end() && old->id_ < item.id_; ++old)
         retired.push_back(*old);
       if (old != retired_.end() && old->id_ == item.id_) ++old;
-      item.txid_ = 0;
-      item.batch_txid_ = 0;
       retired.push_back(item);
     }
     retired.insert(retired.end(), old, retired_.end());

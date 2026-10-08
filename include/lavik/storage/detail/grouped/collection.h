@@ -297,6 +297,59 @@ struct RecoveredOrderedGroup {
   mutable StreamPageMaxKey stream_max_key_{};
 };
 
+// Recovery adjudicates transaction tags before constructing resident entries.
+// Keep those tags only in RecoveredOrderedGroup candidates; foreground
+// transaction publication/undo is tracked separately by the storage engine.
+// Incarnation, sequence, LSN and record token remain available for the existing
+// identity/version checks and for reconstructing candidate views.
+struct OrderedGroupEntry {
+  std::uint64_t incarnation_ = 0;
+  std::uint64_t id_ = 0;
+  std::uint64_t previous_ = 0;
+  std::uint64_t next_ = 0;
+  std::uint64_t sequence_ = 0;
+  std::uint64_t lsn_ = 0;
+  std::uint64_t item_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+  std::uint64_t record_token_ = 0;
+  bool retired_ = false;
+  double min_score_ = 0;
+  double max_score_ = 0;
+  mutable StreamPageMaxKey stream_max_key_{};
+
+  OrderedGroupEntry() = default;
+  OrderedGroupEntry(const RecoveredOrderedGroup& item)
+      : incarnation_(item.incarnation_),
+        id_(item.id_),
+        previous_(item.previous_),
+        next_(item.next_),
+        sequence_(item.sequence_),
+        lsn_(item.lsn_),
+        item_count_(item.item_count_),
+        encoded_bytes_(item.encoded_bytes_),
+        record_token_(item.record_token_),
+        retired_(item.retired_),
+        min_score_(item.min_score_),
+        max_score_(item.max_score_),
+        stream_max_key_(item.stream_max_key_) {}
+  // A published entry converted back into a candidate is already adjudicated.
+  operator RecoveredOrderedGroup() const {
+    return {.incarnation_ = incarnation_,
+            .id_ = id_,
+            .previous_ = previous_,
+            .next_ = next_,
+            .sequence_ = sequence_,
+            .lsn_ = lsn_,
+            .item_count_ = item_count_,
+            .encoded_bytes_ = encoded_bytes_,
+            .record_token_ = record_token_,
+            .retired_ = retired_,
+            .min_score_ = min_score_,
+            .max_score_ = max_score_,
+            .stream_max_key_ = stream_max_key_};
+  }
+};
+
 class OrderedGroupDirectory {
  public:
   // The caller first adjudicates the root's transaction. Only committed
@@ -355,15 +408,15 @@ class OrderedGroupDirectory {
   // Return an active page's position in logical chain order. This uses the
   // identity index; page identifiers need not increase along the chain.
   std::optional<std::size_t> FindIndex(std::uint64_t id) const noexcept;
-  const RecoveredOrderedGroup* Find(std::uint64_t id) const noexcept;
-  const RecoveredOrderedGroup* FindRecord(std::uint64_t id) const noexcept;
+  const OrderedGroupEntry* Find(std::uint64_t id) const noexcept;
+  const OrderedGroupEntry* FindRecord(std::uint64_t id) const noexcept;
   // Borrowed logical-order view. Iterators borrow the underlying array and
   // head coordinates, not this temporary view; the directory must outlive them.
   class Groups {
    public:
     class const_iterator {
      public:
-      using value_type = RecoveredOrderedGroup;
+      using value_type = OrderedGroupEntry;
       using reference = const value_type&;
       using pointer = const value_type*;
       using difference_type = std::ptrdiff_t;
@@ -419,29 +472,29 @@ class OrderedGroupDirectory {
 
      private:
       friend class Groups;
-      const_iterator(const CowArray<RecoveredOrderedGroup>* array,
-                     std::size_t head, std::size_t index)
+      const_iterator(const CowArray<OrderedGroupEntry>* array, std::size_t head,
+                     std::size_t index)
           : array_(array), head_(head), index_(index) {}
-      const CowArray<RecoveredOrderedGroup>* array_ = nullptr;
+      const CowArray<OrderedGroupEntry>* array_ = nullptr;
       std::size_t head_ = 0, index_ = 0;
     };
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
-    const RecoveredOrderedGroup& operator[](std::size_t index) const {
+    const OrderedGroupEntry& operator[](std::size_t index) const {
       assert(index < size_);
       return begin()[index];
     }
-    const RecoveredOrderedGroup& front() const { return (*this)[0]; }
-    const RecoveredOrderedGroup& back() const { return (*this)[size_ - 1]; }
+    const OrderedGroupEntry& front() const { return (*this)[0]; }
+    const OrderedGroupEntry& back() const { return (*this)[size_ - 1]; }
     const_iterator begin() const { return {array_, head_, 0}; }
     const_iterator end() const { return {array_, head_, size_}; }
 
    private:
     friend class OrderedGroupDirectory;
-    Groups(const CowArray<RecoveredOrderedGroup>* array, std::size_t head,
+    Groups(const CowArray<OrderedGroupEntry>* array, std::size_t head,
            std::size_t size)
         : array_(array), head_(head), size_(size) {}
-    const CowArray<RecoveredOrderedGroup>* array_;
+    const CowArray<OrderedGroupEntry>* array_;
     std::size_t head_, size_;
   };
   Groups groups() const noexcept {
@@ -450,7 +503,7 @@ class OrderedGroupDirectory {
   }
   // Retirement iteration order is unspecified; resolve identities with
   // FindRecord.
-  const CowArray<RecoveredOrderedGroup>& retired_groups() const noexcept {
+  const CowArray<OrderedGroupEntry>& retired_groups() const noexcept {
     return retired_;
   }
   // Only the key-owning worker may learn missing boundaries from decoded
@@ -478,10 +531,10 @@ class OrderedGroupDirectory {
   std::uint64_t sequence_ = 0;
   std::uint64_t command_sequence_ = 0;
   std::uint64_t total_group_bytes_ = 0;
-  CowArray<RecoveredOrderedGroup> groups_;
-  CowArray<RecoveredOrderedGroup> retired_;
-  // A partially filled chunk still allocates its full capacity. Keep the
-  // default small chunks so a few pages do not require a 4 KiB ID array.
+  CowArray<OrderedGroupEntry> groups_;
+  CowArray<OrderedGroupEntry> retired_;
+  // Small directories allocate only their live IDs; bounded chunks keep
+  // point updates to larger directories from copying the whole ID array.
   using LinearIds = CowArray<std::pair<std::uint64_t, std::size_t>>;
   struct PagePosition {
     std::size_t slot_;

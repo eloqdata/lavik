@@ -129,7 +129,9 @@ own historical root expiry. Immediate expiration uses the ordinary
 tombstone/graph retirement path.
 
 Views share unchanged physical index pages across mutations. Small updates to existing inline records retain a bounded immutable
-coordinate overlay before folding into the physical index. Lookup and graph
+coordinate overlay before folding into the physical index. Empty physical
+states allocate no overlay; live overrides occupy a shared, bounded block
+containing only the selected records. Lookup and graph
 lifecycle traversal resolve these overrides, including retirement state; they
 retain no payload data. Topology changes and external records fold pending
 overrides into the index, while positional String indexing retains its
@@ -141,7 +143,14 @@ buffer replacements of existing prefixes in a bounded immutable metadata
 overlay; lookup and iteration resolve it, and overflow folds pending replacements
 into the tree in one batch. It retains no payload or physical pins, and each
 snapshot owns its matching routing version. Ordered directories share
-owner-local metadata chunks across immutable views. Each allocation admits and
+owner-local metadata chunks across immutable views. Small arrays retain a
+single block directly, with exact capacity at construction; larger arrays add a
+persistent pointer tree, and appends can reserve bounded tail capacity. Small
+Lists also recover without spare ring slots; larger rings retain geometric
+slack for end edits. Recovery candidates keep
+transaction tags through adjudication, while resident ordered-page entries omit
+those tags. Pending foreground decisions and undo remain owned by the existing
+publication machinery. Each allocation admits and
 accounts its own lifetime, independently of the number of views retaining it.
 Local page replacements detach changed chunks. Lists, Sorted Sets and Streams
 share a persistent Fenwick rank index, updating logarithmic cells per changed

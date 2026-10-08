@@ -763,7 +763,7 @@ TEST(GroupedCollectionTest, RankUpdatesPreserveViewsAcrossOrderedKinds) {
     ASSERT_TRUE(original->FindRank(8));
     EXPECT_EQ(original->FindRank(8)->group_index_, 2);
 
-    auto changed = original->groups()[1];
+    RecoveredOrderedGroup changed = original->groups()[1];
     changed.sequence_ = changed.lsn_ = root.revision_ = 2;
     ++changed.item_count_;
     ++root.item_count_;
@@ -1067,6 +1067,40 @@ TEST(GroupedCollectionTest, RecoveryFindsRetiredPagesFromUnorderedCandidates) {
   EXPECT_EQ(recovered->FindRecord(82), nullptr);
 }
 
+TEST(GroupedCollectionTest, ResidentEntriesDropOnlyAdjudicatedTransactionTags) {
+  static_assert(sizeof(OrderedGroupEntry) + 2 * sizeof(std::uint64_t) <=
+                sizeof(RecoveredOrderedGroup));
+  const std::vector<OrderedGroupSnapshot> pages{Page()};
+  const auto root = Root(pages, 2);
+  auto records = Candidates(pages);
+  records[0].txid_ = 7;
+  records[0].batch_txid_ = 9;
+  EXPECT_FALSE(OrderedGroupDirectory::Recover(root, 1, records, {7}).ok());
+  auto later = records[0];
+  later.txid_ = 11;
+  later.batch_txid_ = 13;
+  later.lsn_ = later.record_token_ = 2;
+  records.push_back(later);
+  for (const auto committed_later : {false, true}) {
+    const absl::flat_hash_set<std::uint64_t> committed =
+        committed_later ? absl::flat_hash_set<std::uint64_t>{7, 9, 11, 13}
+                        : absl::flat_hash_set<std::uint64_t>{7, 9, 11};
+    auto directory =
+        OrderedGroupDirectory::Recover(root, 1, records, committed);
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    const auto* resident = directory->Find(1);
+    ASSERT_NE(resident, nullptr);
+    EXPECT_EQ(resident->record_token_, committed_later ? 2 : 1);
+    EXPECT_EQ(resident->lsn_, committed_later ? 2 : 1);
+    const RecoveredOrderedGroup selected = *resident;
+    EXPECT_EQ(selected.txid_, 0);
+    EXPECT_EQ(selected.batch_txid_, 0);
+    EXPECT_EQ(selected.incarnation_, root.incarnation_);
+    EXPECT_EQ(records[0].txid_, 7);
+    EXPECT_EQ(records[1].batch_txid_, 13);
+  }
+}
+
 TEST(GroupedCollectionTest, SmallOrderedDirectoryKeepsRetainedMemoryBounded) {
   struct ResetMemory {
     unsigned shard_ = CurrentMemoryAccountingShard();
@@ -1113,7 +1147,7 @@ TEST(GroupedCollectionTest, RetirementEvidenceCannotDisappearBeforeOlderPage) {
   ASSERT_TRUE(directory.ok());
   EXPECT_GE(directory->RetainedBytes(),
             directory->groups().size() *
-                (sizeof(RecoveredOrderedGroup) + sizeof(std::uint64_t)));
+                (sizeof(OrderedGroupEntry) + sizeof(std::uint64_t)));
   auto plan = PlanOrderedCollectionSplice(*directory, Loaded(split->groups_), 2,
                                           4, {}, 104);
   ASSERT_TRUE(plan.ok());
@@ -1237,7 +1271,7 @@ TEST(GroupedCollectionTest,
       std::vector<RecoveredOrderedGroup> changes;
       for (std::size_t n = 0; n < pages; ++n) {
         if (n != 0 && n != pages / 2 && n + 1 != pages) continue;
-        auto changed = directory->groups()[n];
+        RecoveredOrderedGroup changed = directory->groups()[n];
         changed.item_count_ = (revision + n) % 11 + 1;
         changed.sequence_ = changed.lsn_ = revision;
         root.item_count_ -= counts[n];
@@ -1367,7 +1401,7 @@ TEST(GroupedCollectionTest,
         --root.group_count_;
         --root.item_count_;
       } else {
-        auto tail = directory->groups().back();
+        RecoveredOrderedGroup tail = directory->groups().back();
         auto inserted = Candidates({Page(root.next_group_id_++, 1, kind)})[0];
         tail.next_ = inserted.id_;
         inserted.previous_ = tail.id_;
@@ -1429,7 +1463,7 @@ TEST(GroupedCollectionTest, StreamTailAppendRanksMatchRecoveryAndPinOldViews) {
     for (std::uint64_t revision = 2; revision <= 5; ++revision) {
       std::vector<RecoveredOrderedGroup> changed;
       auto head = directory->groups().front();
-      auto tail = directory->groups().back();
+      RecoveredOrderedGroup tail = directory->groups().back();
       // Shrink an old prefix as well as growing the tail. A one-page input
       // exercises both roles in the same changed identity.
       if (revision == 2) {
@@ -1501,7 +1535,7 @@ TEST(GroupedCollectionTest,
   const auto records = Candidates({first, last});
   auto directory = OrderedGroupDirectory::Recover(root, 1, records, {});
   ASSERT_TRUE(directory.ok());
-  auto tail = *directory->Find(2);
+  RecoveredOrderedGroup tail = *directory->Find(2);
   tail.next_ = 3;
   std::vector<RecoveredOrderedGroup> changed{tail};
   // Fresh ids are opaque; their logical order need not be monotonic.
@@ -1646,7 +1680,7 @@ TEST(GroupedCollectionTest, StructuralUpdatesRejectDisconnectedOrInvalidPages) {
   ASSERT_TRUE(directory.ok()) << directory.status();
   auto inserted = Candidates({Page(3, 1)}, 2).front();
   inserted.previous_ = 2;
-  auto tail = *directory->Find(2);
+  RecoveredOrderedGroup tail = *directory->Find(2);
   tail.next_ = 3;
   tail.sequence_ = tail.lsn_ = 2;
   root.revision_ = 2;

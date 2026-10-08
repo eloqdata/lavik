@@ -1257,6 +1257,58 @@ TEST(GroupedObjectIndexTest, CoordinateChangesPreserveSnapshotsAndTraversal) {
               group.location_.block_id());
 }
 
+TEST(GroupedObjectIndexTest,
+     CoordinateAllocationFailurePreservesPublishedView) {
+  GroupedMemoryScope memory;
+  auto input = Input(5, 1, 1);
+  ASSERT_EQ(input.locations_.size(), 1);
+  auto original = Create(input);
+  ASSERT_TRUE(original.ok()) << original.status();
+  const auto& group = input.locations_.front();
+  const auto replacement =
+      GroupLocation(10000, 5, group.location_.logical_size_);
+  auto current = *original;
+  // Exercise both the first overlay allocation and replacement of an existing
+  // shared overlay, including failures after earlier allocations succeeded.
+  for (unsigned step = 0; step < 2; ++step) {
+    const auto before = WorkerMemoryAccountingBytes(0);
+    std::size_t rejected = 0, admitted = 0;
+    const auto old = step == 0 ? group.location_ : replacement;
+    const auto next = GroupLocation(10001 + step, 5, old.logical_size_);
+    for (const auto headroom : {0, 64, 256, 512, 1024, 2048, 4096}) {
+      const auto steady = GetWorkerMemoryStats(0).retained_bytes_ + headroom;
+      ASSERT_TRUE(InitMemoryLimit((steady * 10 + 8) / 9, 1).ok());
+      {
+        auto moved =
+            GroupedObject::RelocateGroup(current, group.id_, old, next);
+        if (moved.ok()) {
+          ++admitted;
+          EXPECT_EQ((*moved)->FindRecord(group.id_)->block_id(),
+                    next.block_id());
+        } else {
+          ++rejected;
+          EXPECT_EQ(moved.status().code(),
+                    absl::StatusCode::kResourceExhausted);
+        }
+        EXPECT_EQ(current->FindRecord(group.id_)->block_id(), old.block_id());
+        EXPECT_EQ((*original)->FindRecord(group.id_)->block_id(),
+                  group.location_.block_id());
+      }
+      EXPECT_EQ(WorkerMemoryAccountingBytes(0), before);
+      EXPECT_EQ(GetMemoryStats().admission_pending_bytes_, 0);
+    }
+    EXPECT_GT(rejected, 1);
+    EXPECT_GT(admitted, 0);
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+    if (step == 0) {
+      auto moved =
+          GroupedObject::RelocateGroup(current, group.id_, old, replacement);
+      ASSERT_TRUE(moved.ok()) << moved.status();
+      current = std::move(*moved);
+    }
+  }
+}
+
 TEST(GroupedObjectIndexTest, ExternalReplacementFoldsPendingInlineCoordinates) {
   GroupedMemoryScope memory;
   auto input = Input(5, 1, 100, 256);

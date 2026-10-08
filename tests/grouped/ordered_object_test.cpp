@@ -457,7 +457,7 @@ TEST(GroupedOrderedObjectTest, UpdatesSameCommandRevisionAndPreservesOldView) {
   auto root = input.directory_.root();
   root.revision_ = 4;
   root.item_count_ = 5;
-  auto changed = *input.directory_.Find(3);
+  RecoveredOrderedGroup changed = *input.directory_.Find(3);
   changed.sequence_ = 4;
   changed.lsn_ = 4;
   changed.item_count_ = 3;

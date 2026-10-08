@@ -18,57 +18,128 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <compare>
 #include <cstddef>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <ranges>
 #include <span>
 #include <type_traits>
 #include <utility>
-#include <variant>
+#ifndef NDEBUG
+#include <thread>
+#endif
 
 #include "absl/status/statusor.h"
-#include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
 #include "lavik/retained_allocator.h"
 
 namespace lavik {
 
-// Owner-thread copy-on-write array with chunked storage and a radix pointer
-// tree. Copying shares the root; a point write detaches only its root-to-chunk
-// path. All copies, access and destruction stay on the allocating thread.
-// Each allocation admits/accounts itself once until its last view releases it.
+// Owner-thread copy-on-write array. A single variable-capacity chunk is the
+// root until the array exceeds ChunkEntries; larger arrays use a radix pointer
+// tree. From allocates exactly the used entries, including the final chunk.
+// Appends may reserve geometric tail capacity, bounded by ChunkEntries.
+// Point writes detach only shared nodes on their root-to-chunk path.
 //
-// T must be default/copy constructible, copy assignable and trivially
-// destructible. Elements are copied by value; any referenced resources remain
-// the caller's responsibility. This container does not validate element values.
+// T must be copy constructible, copy assignable and trivially
+// destructible. Elements are copied by value; referenced resources remain the
+// caller's responsibility. All access and final release stay on the owner
+// thread. Each allocation admits/accounts itself until its last view releases
+// it. Copies share one pointer and never allocate.
 template <typename T, std::size_t ChunkEntries = 32>
 class CowArray {
   static_assert(ChunkEntries != 0 && std::is_trivially_destructible_v<T>);
   static constexpr unsigned kBranchBits = 5;
   static constexpr std::size_t kBranchEntries = 1 << kBranchBits;
-  struct Chunk {
-    // Construct values in place. Value-initializing a full chunk first
-    // would clear every byte only to overwrite it immediately.
-    explicit Chunk(std::span<const T> values)
-        : Chunk(values, std::make_index_sequence<ChunkEntries>{}) {}
 
-    std::array<T, ChunkEntries> entries_;
+  // The intrusive header permits one allocation for a variable-size chunk
+  // and its ownership metadata. Capacity zero identifies a branch, so the
+  // array itself needs no additional pointer or representation discriminator.
+  struct Node {
+    std::size_t references_ = 1;
+    std::size_t capacity_;
+    RetainedAllocationDomain domain_;
+#ifndef NDEBUG
+    const std::thread::id owner_ = std::this_thread::get_id();
+#endif
+    Node(std::size_t capacity, RetainedAllocationDomain domain)
+        : capacity_(capacity), domain_(domain) {}
+    void AssertOwner() const noexcept {
+#ifndef NDEBUG
+      assert(owner_ == std::this_thread::get_id());
+#endif
+    }
+  };
+  class Link {
+   public:
+    Link() = default;
+    explicit Link(Node* node) : node_(node) {}
+    Link(const Link& other) : node_(other.get()) {
+      if (node_) {
+        assert(node_->references_ != std::numeric_limits<std::size_t>::max());
+        ++node_->references_;
+      }
+    }
+    Link(Link&& other) noexcept : node_(other.get()) { other.node_ = nullptr; }
+    Link& operator=(Link other) noexcept {
+      std::swap(node_, other.node_);
+      return *this;
+    }
+    ~Link() { Release(get()); }
+    Node* get() const noexcept {
+      if (node_) node_->AssertOwner();
+      return node_;
+    }
+    explicit operator bool() const noexcept { return get() != nullptr; }
+    std::size_t use_count() const noexcept {
+      return get() ? node_->references_ : 0;
+    }
 
    private:
-    template <std::size_t... Index>
-    Chunk(std::span<const T> values, std::index_sequence<Index...>)
-        : entries_{(Index < values.size() ? values[Index] : T{})...} {}
+    Node* node_ = nullptr;
   };
-  struct Branch {
-    using Chunks = std::array<LocalSharedPtr<Chunk>, kBranchEntries>;
-    using Children = std::array<LocalSharedPtr<Branch>, kBranchEntries>;
-    explicit Branch(bool leaf) {
-      if (!leaf) entries_.template emplace<Children>();
+  struct Branch : Node {
+    std::array<Link, kBranchEntries> children_;
+    explicit Branch(RetainedAllocationDomain domain, const Branch* old)
+        : Node(0, domain) {
+      if (old) children_ = old->children_;
     }
-    std::variant<Chunks, Children> entries_;
   };
+  struct Chunk : Node {
+    std::size_t size_ = 0;
+    Chunk(std::size_t capacity, RetainedAllocationDomain domain)
+        : Node(capacity, domain) {}
+    T* data() noexcept {
+      return reinterpret_cast<T*>(reinterpret_cast<std::byte*>(this) +
+                                  ChunkOffset());
+    }
+    const T* data() const noexcept {
+      return reinterpret_cast<const T*>(
+          reinterpret_cast<const std::byte*>(this) + ChunkOffset());
+    }
+  };
+  static constexpr std::size_t kChunkAlignment =
+      std::max(alignof(Chunk), alignof(T));
+  static constexpr std::size_t ChunkOffset() {
+    return (sizeof(Chunk) + alignof(T) - 1) / alignof(T) * alignof(T);
+  }
+  static void Release(Node* node) noexcept {
+    if (!node || --node->references_ != 0) return;
+    const auto domain = node->domain_;
+    const bool chunk = node->capacity_ != 0;
+    if (chunk)
+      std::destroy_at(static_cast<Chunk*>(node));
+    else
+      std::destroy_at(static_cast<Branch*>(node));
+    // T is trivially destructible; releasing its storage ends the lifetimes
+    // of the constructed entries without touching uninitialized spare slots.
+    DeallocateRetainedBytes(domain, node,
+                            chunk ? kChunkAlignment : alignof(Branch));
+  }
 
  public:
   class const_iterator {
@@ -131,36 +202,81 @@ class CowArray {
     std::size_t index_ = 0;
   };
 
-  // Copy values into a new array; admission failure releases partial storage.
+  // Copy values into exact-capacity chunks. Admission failure releases all
+  // partial storage; a single chunk needs no pointer-tree allocation.
   static absl::StatusOr<CowArray> From(std::span<const T> values) {
+    return FromSpan(values);
+  }
+  // Construct entries directly from a contiguous source range, avoiding a
+  // second full-size staging vector when the resident type drops input fields.
+  template <std::ranges::contiguous_range Range>
+    requires std::constructible_from<T,
+                                     const std::ranges::range_value_t<Range>&>
+  static absl::StatusOr<CowArray> From(const Range& values) {
+    using U = std::ranges::range_value_t<Range>;
+    return FromSpan(std::span<const U>(std::ranges::data(values),
+                                       std::ranges::size(values)));
+  }
+
+ private:
+  template <typename U>
+  static absl::StatusOr<CowArray> FromSpan(std::span<const U> values) {
     CowArray result;
     if (values.empty()) return result;
-    const auto chunks = 1 + (values.size() - 1) / ChunkEntries;
-    for (auto remaining = (chunks - 1) >> kBranchBits; remaining != 0;
-         remaining >>= kBranchBits)
-      result.root_shift_ += kBranchBits;
-    auto root = Build(values, result.root_shift_);
-    if (!root.ok()) return root.status();
-    result.root_ = std::move(*root);
+    if (values.size() <= ChunkEntries) {
+      auto chunk = AllocateChunk(values.size(), values);
+      if (!chunk.ok()) return chunk.status();
+      result.root_ = std::move(*chunk);
+    } else {
+      const auto chunks = 1 + (values.size() - 1) / ChunkEntries;
+      for (auto remaining = (chunks - 1) >> kBranchBits; remaining != 0;
+           remaining >>= kBranchBits)
+        result.root_shift_ += kBranchBits;
+      auto root = Build(values, result.root_shift_);
+      if (!root.ok()) return root.status();
+      result.root_ = std::move(*root);
+    }
     result.size_ = values.size();
     return result;
   }
 
-  // Return a longer immutable view, sharing the existing chunks except a
-  // partially filled tail. Admission failure leaves this view untouched.
+ public:
+  // Return a longer immutable view, sharing complete chunks. The partially
+  // filled tail is copied with geometric capacity for subsequent appends.
+  // Failure leaves the predecessor and its borrowed references untouched.
   absl::StatusOr<CowArray> Appended(std::span<const T> values) const {
+    return AppendSpan(values);
+  }
+  // Like From, append may convert input entries directly into resident ones.
+  template <std::ranges::contiguous_range Range>
+    requires std::constructible_from<T,
+                                     const std::ranges::range_value_t<Range>&>
+  absl::StatusOr<CowArray> Appended(const Range& values) const {
+    using U = std::ranges::range_value_t<Range>;
+    return AppendSpan(std::span<const U>(std::ranges::data(values),
+                                         std::ranges::size(values)));
+  }
+
+ private:
+  template <typename U>
+  absl::StatusOr<CowArray> AppendSpan(std::span<const U> values) const {
     if (empty()) return From(values);
     if (values.empty()) return *this;
     if (values.size() > std::numeric_limits<std::size_t>::max() - size_)
       return absl::ResourceExhaustedError("copy-on-write array size overflows");
     auto result = *this;
     const auto size = size_ + values.size();
+    if (size > ChunkEntries && result.root_.get()->capacity_ != 0) {
+      auto root = AllocateBranch(nullptr);
+      if (!root.ok()) return root.status();
+      static_cast<Branch*>(root->get())->children_[0] = std::move(result.root_);
+      result.root_ = std::move(*root);
+    }
     const auto last_chunk = (size - 1) / ChunkEntries;
     while ((last_chunk >> result.root_shift_) >= kBranchEntries) {
-      auto root = Allocate<Branch>(false);
+      auto root = AllocateBranch(nullptr);
       if (!root.ok()) return root.status();
-      std::get<typename Branch::Children>((*root)->entries_)[0] =
-          std::move(result.root_);
+      static_cast<Branch*>(root->get())->children_[0] = std::move(result.root_);
       result.root_ = std::move(*root);
       result.root_shift_ += kBranchBits;
     }
@@ -168,21 +284,23 @@ class CowArray {
     while (!values.empty()) {
       auto slot = result.MutableChunkSlot(index / ChunkEntries);
       if (!slot.ok()) return slot.status();
-      auto& chunk = **slot;
+      auto& link = **slot;
       const auto offset = index % ChunkEntries;
       const auto count = std::min(ChunkEntries - offset, values.size());
-      if (offset == 0) {
-        auto appended = Allocate<Chunk>(values.first(count));
-        if (!appended.ok()) return appended.status();
-        chunk = std::move(*appended);
-      } else {
-        // The predecessor can still expose this tail to a pinned reader.
-        auto detached = Allocate<Chunk>(*chunk);
+      const auto needed = offset + count;
+      auto* chunk = static_cast<Chunk*>(link.get());
+      if (!chunk || link.use_count() != 1 || chunk->capacity_ < needed) {
+        const auto capacity =
+            GrowthCapacity(chunk ? chunk->capacity_ : 0, needed);
+        auto detached = AllocateChunk(
+            capacity, chunk ? std::span<const T>(chunk->data(), chunk->size_)
+                            : std::span<const T>{});
         if (!detached.ok()) return detached.status();
-        std::copy_n(values.begin(), count,
-                    (*detached)->entries_.begin() + offset);
-        chunk = std::move(*detached);
+        link = std::move(*detached);
+        chunk = static_cast<Chunk*>(link.get());
       }
+      std::uninitialized_copy_n(values.begin(), count, chunk->data() + offset);
+      chunk->size_ = needed;
       index += count;
       values = values.subspan(count);
     }
@@ -190,47 +308,41 @@ class CowArray {
     return result;
   }
 
+ public:
   std::size_t size() const noexcept { return root_ ? size_ : 0; }
   bool empty() const noexcept { return size() == 0; }
   const T& operator[](std::size_t index) const noexcept {
     assert(index < size());
-    const auto chunk_index = index / ChunkEntries;
-    const auto* branch = root_.get();
-    for (auto shift = root_shift_; shift != 0; shift -= kBranchBits)
-      branch =
-          std::get<typename Branch::Children>(
-              branch->entries_)[(chunk_index >> shift) & (kBranchEntries - 1)]
-              .get();
-    return std::get<typename Branch::Chunks>(
-               branch->entries_)[chunk_index & (kBranchEntries - 1)]
-        ->entries_[index % ChunkEntries];
+    return FindChunk(index / ChunkEntries)->data()[index % ChunkEntries];
   }
   const T& front() const noexcept { return (*this)[0]; }
   const T& back() const noexcept { return (*this)[size() - 1]; }
   const_iterator begin() const noexcept { return {this, 0}; }
-  const_iterator end() const noexcept { return {this, size()}; }
+  const_iterator end() const { return {this, size()}; }
 
-  // Mutate this view, preserving copies of it. References into this view may
-  // be invalidated. Admission failure preserves all values, but may leave
-  // an identical, partially detached pointer path.
-  // That path remains valid and accounted; a retry can finish detaching it.
+  // Mutate this view, preserving snapshots. Only shared paths/chunks detach.
+  // Admission failure preserves values but may leave an identical, partially
+  // detached pointer path; that accounted path can be reused by a retry.
   absl::Status Set(std::size_t index, const T& value) {
     assert(index < size());
     auto slot = MutableChunkSlot(index / ChunkEntries);
     if (!slot.ok()) return slot.status();
-    auto& chunk = **slot;
-    if (chunk.use_count() != 1) {
-      auto replacement = Allocate<Chunk>(*chunk);
+    auto& link = **slot;
+    auto* chunk = static_cast<Chunk*>(link.get());
+    if (link.use_count() != 1) {
+      auto replacement = AllocateChunk(
+          chunk->capacity_, std::span<const T>(chunk->data(), chunk->size_));
       if (!replacement.ok()) return replacement.status();
-      chunk = std::move(*replacement);
+      link = std::move(*replacement);
+      chunk = static_cast<Chunk*>(link.get());
     }
-    chunk->entries_[index % ChunkEntries] = value;
+    chunk->data()[index % ChunkEntries] = value;
     return absl::OkStatus();
   }
 
-  // Conservative complete-view footprint for scratch planning, including
-  // shared chunks and every pointer-tree level. Ownership already accounts
-  // these bytes; do not charge this estimate again on publication.
+  // Conservative complete-view footprint, including shared nodes and reserved
+  // tail capacity. Allocations already own these charges; do not charge this
+  // estimate again. Only the last chunk can be partial, so this is O(height).
   std::size_t RetainedBytes() const noexcept {
     if (!root_) return 0;
     const auto chunks = 1 + (size_ - 1) / ChunkEntries;
@@ -239,83 +351,110 @@ class CowArray {
       const auto limit = std::numeric_limits<std::size_t>::max();
       bytes = count > (limit - bytes) / unit ? limit : bytes + count * unit;
     };
-    add(chunks, AllocatorUsableSizeForRequest(sizeof(Chunk) + 1024));
-    for (auto count = chunks;;) {
-      count = 1 + (count - 1) / kBranchEntries;
-      add(count, AllocatorUsableSizeForRequest(sizeof(Branch) + 1024));
-      if (count == 1) break;
+    add(chunks - 1, ChunkBytes(ChunkEntries));
+    add(1, ChunkBytes(FindChunk(chunks - 1)->capacity_));
+    if (chunks > 1) {
+      for (auto count = chunks;;) {
+        count = 1 + (count - 1) / kBranchEntries;
+        add(count, AllocationBytes(sizeof(Branch), alignof(Branch)));
+        if (count == 1) break;
+      }
     }
     return bytes;
   }
 
  private:
-  // Detach a path in an unpublished view, creating missing branches for an
-  // append. Partially detached paths remain valid if admission fails.
-  absl::StatusOr<LocalSharedPtr<Chunk>*> MutableChunkSlot(
-      std::size_t chunk_index) {
+  static std::size_t AllocationBytes(std::size_t bytes,
+                                     std::size_t alignment) noexcept {
+    const auto usable = AllocatorUsableSizeForRequest(bytes);
+    const auto limit = std::numeric_limits<std::size_t>::max();
+    if (alignment <= __STDCPP_DEFAULT_NEW_ALIGNMENT__) return usable;
+    return usable > limit - alignment ? limit : usable + alignment;
+  }
+  static std::size_t ChunkBytes(std::size_t capacity) noexcept {
+    if (capacity >
+        (std::numeric_limits<std::size_t>::max() - ChunkOffset()) / sizeof(T))
+      return std::numeric_limits<std::size_t>::max();
+    return AllocationBytes(ChunkOffset() + capacity * sizeof(T),
+                           kChunkAlignment);
+  }
+  static absl::Status Oom() {
+    return absl::ResourceExhaustedError(
+        "OOM copy-on-write array exceeds maxmemory");
+  }
+  template <typename U>
+  static absl::StatusOr<Link> AllocateChunk(std::size_t capacity,
+                                            std::span<const U> values) {
+    assert(capacity != 0 && capacity <= ChunkEntries &&
+           values.size() <= capacity);
+    if (capacity >
+        (std::numeric_limits<std::size_t>::max() - ChunkOffset()) / sizeof(T))
+      return Oom();
+    RetainedAllocationDomain domain;
+    auto* storage = TryAllocateRetainedBytes(
+        domain, ChunkOffset() + capacity * sizeof(T), kChunkAlignment);
+    if (!storage) return Oom();
+    auto* chunk =
+        std::construct_at(static_cast<Chunk*>(storage), capacity, domain);
+    Link result(chunk);
+    std::uninitialized_copy(values.begin(), values.end(), chunk->data());
+    chunk->size_ = values.size();
+    return result;
+  }
+  static absl::StatusOr<Link> AllocateBranch(const Branch* old) {
+    RetainedAllocationDomain domain;
+    auto* storage =
+        TryAllocateRetainedBytes(domain, sizeof(Branch), alignof(Branch));
+    if (!storage) return Oom();
+    return Link(std::construct_at(static_cast<Branch*>(storage), domain, old));
+  }
+  static std::size_t GrowthCapacity(std::size_t old, std::size_t needed) {
+    const auto doubled = old > ChunkEntries / 2 ? ChunkEntries : old * 2;
+    return std::max(needed, std::max<std::size_t>(1, doubled));
+  }
+  const Chunk* FindChunk(std::size_t index) const noexcept {
+    auto* node = root_.get();
+    if (node->capacity_ != 0) return static_cast<const Chunk*>(node);
+    for (auto shift = root_shift_;; shift -= kBranchBits) {
+      node = static_cast<const Branch*>(node)
+                 ->children_[(index >> shift) & (kBranchEntries - 1)]
+                 .get();
+      if (shift == 0) return static_cast<const Chunk*>(node);
+    }
+  }
+  absl::StatusOr<Link*> MutableChunkSlot(std::size_t index) {
     auto* link = &root_;
+    if (link->get()->capacity_ != 0) return link;
     for (auto shift = root_shift_;; shift -= kBranchBits) {
       if (!*link || link->use_count() != 1) {
         auto replacement =
-            *link ? Allocate<Branch>(**link) : Allocate<Branch>(shift == 0);
+            AllocateBranch(static_cast<const Branch*>(link->get()));
         if (!replacement.ok()) return replacement.status();
         *link = std::move(*replacement);
       }
-      if (shift == 0) break;
-      link = &std::get<typename Branch::Children>(
-          (*link)->entries_)[(chunk_index >> shift) & (kBranchEntries - 1)];
+      link = &static_cast<Branch*>(link->get())
+                  ->children_[(index >> shift) & (kBranchEntries - 1)];
+      if (shift == 0) return link;
     }
-    return &std::get<typename Branch::Chunks>(
-        (*link)->entries_)[chunk_index & (kBranchEntries - 1)];
+  }
+  template <typename U>
+  static absl::StatusOr<Link> Build(std::span<const U> values, unsigned shift) {
+    auto root = AllocateBranch(nullptr);
+    if (!root.ok()) return root.status();
+    auto& children = static_cast<Branch*>(root->get())->children_;
+    const auto child_entries = (std::size_t{1} << shift) * ChunkEntries;
+    for (std::size_t slot = 0; !values.empty(); ++slot) {
+      const auto count = std::min(child_entries, values.size());
+      auto child = shift == 0 ? AllocateChunk(count, values.first(count))
+                              : Build(values.first(count), shift - kBranchBits);
+      if (!child.ok()) return child.status();
+      children[slot] = std::move(*child);
+      values = values.subspan(count);
+    }
+    return root;
   }
 
-  template <typename U, typename... Args>
-  static absl::StatusOr<LocalSharedPtr<U>> Allocate(Args&&... args) {
-    auto reservation =
-        TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(U) + 1024));
-    if (!reservation) {
-      RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM copy-on-write array exceeds maxmemory");
-    }
-    RetainedAllocationDomain domain{
-        .owner_shard_ = CurrentMemoryAccountingShard(),
-        .externally_admitted_ = true,
-        .externally_accounted_ = false};
-    return AllocateLocalShared<U>(RetainedAllocator<U>(domain),
-                                  std::forward<Args>(args)...);
-  }
-
-  static absl::StatusOr<LocalSharedPtr<Branch>> Build(std::span<const T> values,
-                                                      unsigned shift) {
-    auto branch = Allocate<Branch>(shift == 0);
-    if (!branch.ok()) return branch.status();
-    if (shift == 0) {
-      auto& chunks = std::get<typename Branch::Chunks>((*branch)->entries_);
-      for (std::size_t slot = 0; !values.empty(); ++slot) {
-        const auto count = std::min(ChunkEntries, values.size());
-        auto chunk = Allocate<Chunk>(values.first(count));
-        if (!chunk.ok()) return chunk.status();
-        chunks[slot] = std::move(*chunk);
-        values = values.subspan(count);
-      }
-    } else {
-      auto& children = std::get<typename Branch::Children>((*branch)->entries_);
-      // From derives the height from the number of complete chunks preceding
-      // the last element, so this product cannot exceed the original span.
-      const auto child_entries = (std::size_t{1} << shift) * ChunkEntries;
-      for (std::size_t slot = 0; !values.empty(); ++slot) {
-        const auto count = std::min(child_entries, values.size());
-        auto child = Build(values.first(count), shift - kBranchBits);
-        if (!child.ok()) return child.status();
-        children[slot] = std::move(*child);
-        values = values.subspan(count);
-      }
-    }
-    return branch;
-  }
-
-  LocalSharedPtr<Branch> root_;
+  Link root_;
   std::size_t size_ = 0;
   unsigned root_shift_ = 0;
 };

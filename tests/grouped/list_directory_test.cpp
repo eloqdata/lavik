@@ -160,6 +160,29 @@ class ListRingTest : public testing::Test {
   unsigned shard_;
 };
 
+TEST_F(ListRingTest, SmallRecoveryStaysCompactThroughFirstGrowthAndWrap) {
+  for (const std::size_t count : {1, 22}) {
+    const auto baseline = WorkerMemoryAccountingBytes(0);
+    auto directory = Create(count);
+    ASSERT_TRUE(directory.ok());
+    // Include the ID map as well as page metadata and rank cells. Reserving
+    // 32 page slots up front would exceed this bound for either small input.
+    EXPECT_LT(WorkerMemoryAccountingBytes(0) - baseline, count * 256 + 256);
+    const auto original = *directory;
+    const std::vector<RecoveredOrderedGroup> expected(original.groups().begin(),
+                                                      original.groups().end());
+    for (std::size_t step = 0; step < 8; ++step) {
+      const auto begin = step % 2 == 0 ? 0 : directory->groups().size() - 1;
+      auto edit = Splice(*directory, begin, 1, {2, 3});
+      auto updated = Apply(*directory, edit);
+      ASSERT_TRUE(updated.ok()) << updated.status();
+      Check(*updated, edit.expected_);
+      Check(original, expected);
+      directory = std::move(updated);
+    }
+  }
+}
+
 TEST_F(ListRingTest,
        WrapGrowthMiddleSplicesAndSnapshotsMatchVectorAndRecovery) {
   auto directory = Create(31);
