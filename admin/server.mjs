@@ -140,8 +140,18 @@ export async function start(options = {}) {
             );
           }
           value = await deployments.preview(input);
-        } else if (verb === "fleet-deploy" && id && a && !b)
-          value = await deployments.create({ token: id, confirm: a });
+        } else if (
+          verb === "fleet-deploy" &&
+          id &&
+          a &&
+          (!b || b === "confirm-spdk") &&
+          !c
+        )
+          value = await deployments.create({
+            token: id,
+            confirm: a,
+            spdkConfirm: b === "confirm-spdk",
+          });
         else if (verb === "fleet-follower-plan" && id && a && !b)
           value = await deployments.previewFollower(
             id,
@@ -306,6 +316,13 @@ export async function start(options = {}) {
       }
       const parts = url.pathname.split("/").filter(Boolean);
       const [_, resource, id, subresource] = parts;
+      if (resource === "connections" && request.method === "POST") {
+        const input = await body(request);
+        if (id === "preview") send(200, await fleet.previewConnection(input));
+        else if (id === "connect") send(200, await fleet.connect(input));
+        else throw new AdminError("Not found", 404);
+        return;
+      }
       if (resource === "hosts") {
         if (!id && request.method === "GET") send(200, await hosts.list());
         else if (id === "prepare" && request.method === "POST")
@@ -377,14 +394,10 @@ export async function start(options = {}) {
           input.input || {},
           input.requestId,
         );
-      } else if (subresource === "keys" && request.method === "GET")
-        value = await fleet.keys(id, Object.fromEntries(url.searchParams));
-      else if (subresource === "resume" && request.method === "POST")
+      } else if (subresource === "resume" && request.method === "POST")
         value = await fleet.resume(id, (await body(request)).id);
       else if (subresource === "abandon" && request.method === "POST")
         value = await fleet.abandon(id, (await body(request)).id);
-      else if (subresource === "key" && request.method === "GET")
-        value = await fleet.key(id, url.searchParams.get("id"));
       else if (subresource === "command" && request.method === "POST")
         value = await fleet.send(id, await body(request));
       else if (subresource === "activity" && request.method === "GET")

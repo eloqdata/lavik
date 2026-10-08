@@ -10,8 +10,13 @@ case "${LAVIK_PACKAGE_ARCH:-$(uname -m)}" in
   *) echo 'Unsupported Admin runtime architecture' >&2; exit 1 ;;
 esac
 mkdir -p "$stage/admin/public" "$stage/runtime/bin"
-for module in askpass cli deploy fleet hosts meta releases resp server ssh store; do
+for module in askpass cli deploy fleet hosts meta monitoring releases resp server ssh store; do
   install -m 0644 "$repo/admin/$module.mjs" "$stage/admin/"
+done
+# Only runtime assets: a developer's ignored monitoring .env may contain secrets.
+for asset in compose.yaml prometheus/prometheus.yml grafana/dashboards/lavik-overview.json grafana/provisioning/dashboards/lavik.yaml grafana/provisioning/datasources/prometheus.yaml; do
+  mkdir -p "$stage/admin/monitoring/$(dirname "$asset")"
+  install -m 0644 "$repo/deploy/monitoring/$asset" "$stage/admin/monitoring/$asset"
 done
 install -m 0644 "$repo/admin/remote.py" "$stage/admin/"
 install -m 0644 "$repo"/admin/public/* "$stage/admin/public/"

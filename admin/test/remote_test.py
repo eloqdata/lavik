@@ -137,5 +137,133 @@ class RemoteSafety(unittest.TestCase):
         self.assertFalse((root / "meta-1/state/launch.py").exists())
 
 
+class SpdkSafety(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.request = {
+            "owner": "deployment",
+            "spdk": "spdk://0000:01:00.0/1",
+            "hugepageMiB": 8192,
+        }
+        self.bdf = "0000:01:00.0"
+        self.device = self.root / "sys/bus/pci/devices" / self.bdf
+        self.device.mkdir(parents=True)
+        (self.device / "class").write_text("0x010802")
+        (self.device / "iommu_group/devices" / self.bdf).mkdir(parents=True)
+        (self.device / "nvme/nvme0/nvme0n1").mkdir(parents=True)
+        (self.device / "nvme/nvme0/serial").write_text("SERIAL-001")
+        (self.device / "nvme/nvme0/nvme0n1/nsid").write_text("1")
+        (self.root / "sys/class/block/nvme0n1/holders").mkdir(parents=True)
+        (self.root / "sys/bus/pci/drivers/nvme").mkdir(parents=True)
+        (self.device / "driver").symlink_to(self.root / "sys/bus/pci/drivers/nvme")
+        huge = self.root / "sys/kernel/mm/hugepages/hugepages-2048kB"
+        huge.mkdir(parents=True)
+        (huge / "nr_hugepages").write_text("0")
+        (huge / "free_hugepages").write_text("0")
+        (self.root / "proc").mkdir()
+        (self.root / "proc/meminfo").write_text("MemAvailable: 16777216 kB\n")
+        self.block = {
+            "name": "nvme0n1",
+            "type": "disk",
+            "fstype": None,
+            "mountpoints": [None],
+        }
+        self.signatures = []
+        self.users = {"code": 1, "stdout": "", "stderr": ""}
+        self.path_patch = patch.object(
+            remote, "Path", side_effect=lambda path: self.root / str(path).lstrip("/")
+        )
+        self.path_patch.start()
+        self.uid_patch = patch.object(remote.os, "geteuid", return_value=0)
+        self.uid_patch.start()
+        self.tools_patch = patch.object(
+            remote.shutil, "which", return_value="/usr/bin/tool"
+        )
+        self.tools_patch.start()
+        self.runner_patch = patch.object(remote, "run", side_effect=self.run_command)
+        self.runner = self.runner_patch.start()
+        self.media_patch = patch(
+            "builtins.open", unittest.mock.mock_open(read_data=b"\0" * 4096)
+        )
+        self.media_patch.start()
+
+    def tearDown(self):
+        patch.stopall()
+        self.temporary.cleanup()
+
+    def run_command(self, argv, *args):
+        if argv[0] == "fuser":
+            return self.users
+        payload = (
+            {"blockdevices": [self.block]}
+            if argv[0] == "lsblk"
+            else {"signatures": self.signatures}
+        )
+        return {"code": 0, "stdout": json.dumps(payload), "stderr": ""}
+
+    def test_preview_records_identity_without_mutating_device(self):
+        result = remote.spdk_check(self.request)
+        self.assertEqual(result["serial"], "SERIAL-001")
+        self.assertEqual((self.device / "driver").resolve().name, "nvme")
+        self.assertFalse((self.root / "var").exists())
+        self.assertTrue(
+            all(
+                call.args[0][0] in ("lsblk", "wipefs", "fuser")
+                or call.args[0] == ["modprobe", "--dry-run", "vfio-pci"]
+                for call in self.runner.call_args_list
+            )
+        )
+
+    def test_rejects_mounts_partitions_signatures_open_users_and_serial_changes(self):
+        for field, value in (
+            ("mountpoints", ["/"]),
+            ("children", [{}]),
+            ("fstype", "swap"),
+        ):
+            with self.subTest(field=field):
+                original = self.block.copy()
+                self.block[field] = value
+                with self.assertRaisesRegex(RuntimeError, "unsuitable"):
+                    remote.spdk_check(self.request)
+                self.block = original
+        self.signatures = [{"type": "gpt"}]
+        with self.assertRaisesRegex(RuntimeError, "signatures"):
+            remote.spdk_check(self.request)
+        self.signatures = []
+        self.users = {"code": 0, "stdout": "123", "stderr": ""}
+        with self.assertRaisesRegex(RuntimeError, "open"):
+            remote.spdk_check(self.request)
+        self.users = {"code": 1, "stdout": "", "stderr": ""}
+        with self.assertRaisesRegex(RuntimeError, "serial changed"):
+            remote.spdk_check({**self.request, "expectedSerial": "OTHER"})
+        with patch(
+            "builtins.open", unittest.mock.mock_open(read_data=b"existing database")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "nonempty"):
+                remote.spdk_check(self.request)
+
+    def test_unsupported_iommu_privilege_memory_and_foreign_claim_fail_closed(self):
+        with patch.object(remote.os, "geteuid", return_value=1000):
+            with self.assertRaisesRegex(RuntimeError, "root SSH"):
+                remote.spdk_check(self.request)
+        sibling = self.device / "iommu_group/devices/0000:02:00.0"
+        sibling.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "isolated IOMMU"):
+            remote.spdk_check(self.request)
+        sibling.rmdir()
+        (self.root / "proc/meminfo").write_text("MemAvailable: 1000 kB\n")
+        with self.assertRaisesRegex(RuntimeError, "Insufficient memory"):
+            remote.spdk_check(self.request)
+        claims = self.root / "var/lib/lavik-admin/spdk"
+        claims.mkdir(parents=True)
+        (claims / "host.json").write_text(
+            json.dumps({"owner": "someone-else", "spdk": self.request["spdk"]})
+        )
+        with self.assertRaisesRegex(RuntimeError, "already claimed"):
+            remote.spdk_check(self.request)
+        self.assertEqual((self.device / "driver").resolve().name, "nvme")
+
+
 if __name__ == "__main__":
     unittest.main()

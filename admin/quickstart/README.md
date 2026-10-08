@@ -18,8 +18,9 @@ limitations under the License.
 
 This example starts **three Lavik Data nodes: one primary and two replicas**.
 It also starts three Meta voters and Lavik Admin, for seven running containers
-on one machine. Docker starts the processes; you initialize their cluster in
-the Admin UI. Each Data node gets a persistent 1 GiB file.
+on one machine. The setup command builds the Linux executables, starts the services,
+registers `demo-cluster` in Admin, and initializes it through a durable Admin
+job. Each Data node gets a persistent 1 GiB file.
 
 This is a local learning environment. All containers share one physical host,
 so it does not provide availability across machine failures. Meta/Data traffic
@@ -30,71 +31,45 @@ build-toolchain image to avoid a separate host compiler or Redis CLI install.
 Use the [standalone Admin deployment guide](../../docs/operations/lavik-admin.md)
 for remote access, credentials, and the production Admin image.
 
-## 1. Prepare the new machine
+## 1. Set up everything
 
-Install Git and [Docker Desktop](https://docs.docker.com/desktop/) on a Mac,
-or Docker Engine with the Compose plugin on Linux. Linux hosts need kernel
-6.1 or newer with io_uring enabled. Allow space for the toolchain, native build,
-and three 1 GiB Data files. The build uses two compiler processes at a time.
-
-Obtain the Lavik source checkout **containing these Admin quick-start files**.
-An older checkout or release will not contain this example; locally added
-files must be copied or included in the branch checked out on the new machine.
-The images below are built locally, not pulled from a published Lavik registry.
-
-From the repository root:
+Install Git and Docker Desktop on macOS, or Docker Engine with Compose v2 on
+Linux. Linux needs kernel 6.1+ with io_uring enabled. From a Lavik source
+checkout, run:
 
 ```sh
-git submodule update --init bycorf third_party/mimalloc
-git -C bycorf submodule update --init third_party/liburing third_party/abseil
+./admin/quickstart/setup.sh
+```
 
+This initializes the required source submodules, builds the toolchain and Linux
+binaries in Docker, starts Compose, creates **demo-cluster**, and waits for it
+to become ready. The first build can take several minutes; allow disk space for
+the toolchain, build cache, and three 1 GiB Data files. Subsequent builds reuse
+the cache. The command prints the Admin URL and sign-in token when ready.
+
+Open **http://localhost:4173**, sign in, and select **demo-cluster**. There is
+no manifest to paste and no separate initialization step. The same command can
+be rerun: it retains volumes and observes existing creation jobs instead of
+replaying an uncertain creation. If initialization needs attention, inspect
+Admin’s Operations view and Compose logs before resuming.
+
+Set `LAVIK_QUICKSTART_PORT=4183` before running if the default Admin port is
+occupied. Keep it set for later Compose commands. The example reserves Docker
+subnet `172.29.91.0/24`; if it overlaps another network, change the addresses in
+`compose.yaml`, `start.sh`, and `cluster.toml` together before first startup.
+Bootstrap discovers Meta Admin seeds from the manifest.
+
+The one-command entry point uses the same individual build and Compose
+operations as a manual run:
+
+```sh
 docker build -f admin/Dockerfile.toolchain -t lavik-admin-toolchain:local .
 docker compose -f admin/quickstart/compose.yaml run --rm build
-```
-
-The first build downloads dependencies and compiles all three Linux binaries
-inside Docker. It can take several minutes. Later builds reuse the build
-volume. Finish this step before starting the services.
-
-## 2. Start Admin and the nodes
-
-```sh
 docker compose -f admin/quickstart/compose.yaml up -d
-docker compose -f admin/quickstart/compose.yaml ps
-docker compose -f admin/quickstart/compose.yaml exec admin \
-  cat /data/lavik-admin/token
+docker compose -f admin/quickstart/compose.yaml exec -T admin node quickstart/bootstrap.mjs
 ```
 
-If the token file is not ready immediately, wait a moment and repeat the last
-command. Open **http://localhost:4173** and sign in with that token.
-
-If port 4173 is occupied, run `export LAVIK_QUICKSTART_PORT=4183` before `up`
-and use http://localhost:4183. Keep this variable set for subsequent Compose
-commands. The example reserves Docker subnet `172.29.91.0/24`. If it overlaps
-an existing network, choose another private subnet and change the addresses
-together in `compose.yaml`, `start.sh`, and `cluster.toml` before first startup.
-
-## 3. Initialize the cluster in the UI
-
-1. Click **Connect existing cluster**.
-2. Enter cluster name **demo**.
-3. Enter Meta seeds **172.29.91.11:7200,172.29.91.12:7200,172.29.91.13:7200**.
-4. Select the **default** profile and click **Connect cluster**.
-5. Open **Topology → Initialize cluster**.
-6. Paste the contents of [`cluster.toml`](cluster.toml). To print them:
-
-   ```sh
-   cat admin/quickstart/cluster.toml
-   ```
-
-7. Type **demo** in the confirmation field and click **Initialize cluster**.
-8. Wait for the creation operation to complete and the Dashboard to report
-   **Healthy**. Topology shows `group-1`, one primary, and two replicas.
-
-Use the numeric Meta addresses above, not `localhost`: Admin runs inside
-Docker. Port 7200 is the Meta Admin endpoint; port 6379 is the Data endpoint.
-
-## 4. Verify data and the shared CLI catalog
+## 2. Verify data and the shared CLI catalog
 
 In Admin's **Send command** view, run `SET greeting "hello from Lavik"`, confirm
 the write, then run `GET greeting`. The same operations work from Docker:
@@ -108,10 +83,10 @@ docker compose -f admin/quickstart/compose.yaml exec data-2 \
 docker compose -f admin/quickstart/compose.yaml exec admin \
   /build/lavik-ctl --socket /data/lavik-admin/admin.sock fleet-list
 docker compose -f admin/quickstart/compose.yaml exec admin \
-  /build/lavik-ctl --socket /data/lavik-admin/admin.sock fleet-status demo
+  /build/lavik-ctl --socket /data/lavik-admin/admin.sock fleet-status demo-cluster
 ```
 
-`GET` should return `hello from Lavik`, and `fleet-list` should include `demo`.
+`GET` should return `hello from Lavik`, and `fleet-list` should include `demo-cluster`.
 Client commands run inside the Docker network so cluster redirects can reach
 the advertised node IPs.
 
@@ -160,7 +135,7 @@ Repeat for the other nodes in the appropriate order for their current roles.
 You can now use **Switch primary** to exercise controlled failover, browse
 keys, and inspect the shared Operations view.
 
-## 5. Stop and resume
+## 3. Stop and resume
 
 ```sh
 docker compose -f admin/quickstart/compose.yaml down

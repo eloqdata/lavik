@@ -27,7 +27,7 @@ The ctl helper speaks the same private socket protocol as lavik-ctl:
   ./lavik-admin ctl fleet-hosts
   ./lavik-admin ctl fleet-list
   ./lavik-admin ctl fleet-plan ./setup.json
-  ./lavik-admin ctl fleet-deploy REVIEW_TOKEN CLUSTER_NAME
+  ./lavik-admin ctl fleet-deploy REVIEW_TOKEN CLUSTER_NAME [confirm-spdk]
 EOF
     exit 0 ;;
   --version)

@@ -51,7 +51,10 @@ and io_uring enabled. Ubuntu 24.04 satisfies the userspace requirement. The
 Admin computer needs HTTPS access to GitHub; hosts receive verified binaries
 over SSH and do not need to download releases themselves.
 
-Choose **Create cluster** and follow three stages:
+Choose **Create cluster** to pick **Local demo**, **Set up machines**, or
+**Connect existing cluster**. The local path shows the single command
+`./admin/quickstart/setup.sh`; see the [Docker quick start](../../admin/quickstart/README.md).
+Production setup follows three stages:
 
 1. **Prepare hosts.** Paste one `SSH_HOST[:PORT]` per line, optionally followed
    by its private cluster IP. Set the SSH user and choose **Password** or
@@ -80,13 +83,13 @@ Choose **Create cluster** and follow three stages:
    io_uring, service management, storage, and ports. Resolve reported issues,
    inspect placement and ports, type the cluster name, and choose **Deploy
    cluster**. **Operations** tracks installation, initialization, and readiness.
-   The dashboard provides metrics, key browsing, commands, topology, and slow
+   The dashboard provides metrics, commands, topology, and slow
    logs. Repeat setup for additional independent clusters in this workspace.
 
 The version field lists releases and accepts exact tags. Discovery uses the
-public `github.com/eloqdata/lavik/releases` page and checksummed minimal
-packages, with a short metadata cache; it does not use the rate-limited REST
-API. GitHub page/asset access is still required.
+public `github.com/eloqdata/lavik/releases` page and checksummed Linux
+packages (minimal for files, standard for SPDK), with a short metadata cache.
+It does not use the rate-limited REST API. GitHub page/asset access is still required.
 
 For ordinary Docker lab containers, select **Node placement → Service
 lifecycle → Development processes (no automatic restart)** and run **Check
@@ -125,8 +128,9 @@ Meta's three port ranges increment by voter index. Open reviewed ports between
 hosts. Existing deployment plans retain their original ports.
 Multiple clusters on the same hosts need nonoverlapping ports and names.
 
-Provisioning uses minimal packages, kernel networking, io_uring, and plaintext
-cluster traffic on the private network. SSH protects management access; it
+Provisioning uses kernel networking and plaintext cluster traffic on the
+private network. File storage uses io_uring and minimal packages; SPDK uses
+standard packages and the dedicated-host setup below. SSH protects management access; it
 does not automatically configure cluster TLS, firewall rules, cloud machines,
 or OS packages. Use the connection-profile flow below for existing TLS clusters.
 Admin data tools for SSH deployments reach private Data addresses through SSH;
@@ -154,6 +158,72 @@ Released clients run with their matching Meta/Data binaries. Older releases
 such as `v0.1.0-beta.1` can be created and inspected; their older APIs do not
 support Admin's safe follower resizing and controlled failover. Those controls
 are disabled. Select a current release for the full management workflow.
+
+### SPDK on dedicated Data hosts
+
+In Node placement, choose **SPDK · dedicated NVMe controllers** and enter one
+`spdk://DOMAIN:BUS:DEVICE.FUNCTION/NAMESPACE_ID` URI for every host assigned a
+Data node. Admin resolves the standard release; minimal packages cannot provide
+SPDK. Use one Data node and one dedicated, single-namespace NVMe controller per
+physical host. Automated setup requires root SSH, systemd, an isolated IOMMU
+group, 2 MiB hugepages, `lsblk`, `wipefs`, `fuser`, `modprobe`, `mount`, and
+`findmnt`. Root accounts hosting Meta still need the systemd user manager and
+lingering required by ordinary Meta services. Standard release runtime libraries
+must be installed; executable compatibility is checked before device binding.
+
+Read [SPDK storage](spdk-storage.md) when choosing media. Host checks reject
+partitions, filesystems, mounts, swap, holders, open users, nonempty storage
+headers, missing IOMMU isolation, insufficient memory, and unsafe no-IOMMU mode.
+Admin does not erase media. The review shows each controller and serial number;
+confirm dedicated-controller binding as well as the cluster name to deploy.
+The serial is rechecked immediately before configuration. Existing controllers
+already bound outside this deployment cannot be adopted automatically.
+
+Admin claims the host/controller under `/var/lib/lavik-admin/spdk/`, reserves
+hugepages without reducing an existing pool, mounts `/dev/hugepages`, and binds
+only the selected controller to `vfio-pci`. The retained
+`lavik-CLUSTER-spdk.service` reapplies configuration at boot. SPDK Data nodes use
+system services with unlimited memlock and a dependency on that setup service;
+Meta keeps its normal user service. The EAL allowlist and memory budget are
+written into each Data launcher. Other instances must not share this host’s
+SPDK resources. This automated path supports new clusters; add later SPDK
+followers through **Use an already-running node** after preparing their hosts.
+
+If setup stops, inspect the reported host error and use Admin’s resume action.
+Claims, configurations, and existing populations are retained. A partial driver
+transition can require host repair before resume; Admin never resets drivers
+or releases hugepages automatically. Before manual decommissioning, stop Data
+and disable both the Data and SPDK setup services, then follow the storage
+runbook to restore drivers. Keep controller claims until the storage is no
+longer owned by this cluster. Hardware replacement requires a new review.
+
+### Monitoring hosts
+
+Select one or more prepared hosts in **Monitoring**. Each runs an independent
+Prometheus/Grafana stack scraping every Data node. Install Docker Engine and
+Compose v2, enable Docker startup at boot, and grant the SSH account Docker
+access. Images must be cached or reachable from those hosts. Admin uploads the
+repository’s pinned monitoring Compose configuration and dashboard. Data metrics
+ports start at 9100 on each IP and increment for colocated nodes; the review
+checks for conflicts. **Monitoring ports** lets you change the metrics base port,
+Grafana port, and Prometheus port. Restrict unauthenticated metrics ports to monitoring hosts.
+
+Grafana binds to the selected private IP, defaulting to port 3000. The Dashboard links to
+it after deployment. Sign in as `admin`; read the unique generated password
+from `BASE_DIR/CLUSTER/monitoring/grafana-password` on that host. This password
+is not returned to the browser or stored in the fleet database. Prometheus
+defaults to `127.0.0.1:9090` on the monitoring host. For access outside the private
+network, provide your own TLS reverse proxy and access controls.
+
+Deployment waits for Grafana and Prometheus and verifies all Prometheus scrape
+targets after Meta reports the created cluster ready, because Data listeners
+open only after Genesis. A monitoring failure leaves post-creation verification
+resumable; resuming never submits cluster creation again. Automatic file-backed
+follower additions update all monitoring target lists. Membership removal leaves the running process in the scrape list, matching
+Admin’s existing behavior of retaining its service and storage. Inspect and
+manage the generated stack with `docker compose --project-name lavik-CLUSTER
+--project-directory BASE_DIR/CLUSTER/monitoring -f
+BASE_DIR/CLUSTER/monitoring/compose.yaml ...`. Retain its named volumes for history.
 
 ## Run in Docker
 
@@ -185,6 +255,13 @@ addresses, and select a connection profile. These are the `--ctl-addr`
 endpoints, not the Data client or Meta Raft ports. Every advertised Meta and
 Data endpoint must be reachable from inside Admin. A loopback address names
 the Admin container itself unless the processes share its network namespace.
+Click **Test connection** to discover lifecycle, topology counts, and readiness;
+then **Connect cluster** to save the tested connection. Commas, whitespace,
+newlines, and `tcp://`/`tls://` endpoint prefixes are accepted by the form.
+Changing an input requires another test. An unreachable endpoint leaves the
+form intact and does not create a catalog entry. An initialized cluster is
+never initialized again by this connection flow. `lavik-ctl cluster-create`
+does not register a fleet entry automatically; `lavik-ctl fleet-add` does.
 
 For a source run alongside an installed `lavik-ctl`:
 
@@ -238,7 +315,9 @@ Then review and submit:
 ```
 
 `fleet-plan` checks hosts without installing files and returns a 15-minute
-review token. A restart expires previews; accepted operations and plans remain
+review token. SPDK plans additionally require the explicit acknowledgement
+`fleet-deploy REVIEW_TOKEN production confirm-spdk` after reviewing controllers
+and serials. A restart expires previews; accepted operations and plans remain
 durable. Native `lavik-ctl` accepts the same commands, with base64url-encoded
 JSON as the `fleet-plan` argument instead of a filename. The launcher helper
 performs that encoding. Use `fleet-follower-plan NAME ./follower.json` with
@@ -481,7 +560,7 @@ LAVIK_ADMIN_TEST_DATA=/data/admin-workspace npm run test:browser
 ```
 
 The suite exercises two cluster sizes, browser/CLI catalog sharing,
-key inspection, escaped string editing, repeated replica addition/removal,
+command execution, repeated replica addition/removal,
 primary-removal protection, controlled failover through both interfaces, data
 preservation, and mobile navigation. It uses real Meta and Data processes.
 

@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AdminError, endpoint, identifier } from "./meta.mjs";
-import { command, text, jsonReply, keyBytes, slot } from "./resp.mjs";
+import { command, text, jsonReply } from "./resp.mjs";
 
 const now = () => new Date().toISOString();
 const fields = (line) =>
@@ -37,6 +37,7 @@ export class Fleet {
     this.pendingViews = new Map();
     this.busy = new Set();
     this.samples = new Map();
+    this.connections = new Map();
   }
   async start() {
     // A process can disappear after sending a mutation but before recording
@@ -71,7 +72,7 @@ export class Fleet {
     if (!cluster) throw new AdminError("Cluster not found", 404);
     return cluster;
   }
-  async add(input) {
+  connection(input) {
     const id = identifier(input.id, "cluster name");
     const name = typeof input.name === "string" ? input.name.trim() : id;
     if (!name || name.length > 100)
@@ -82,6 +83,41 @@ export class Fleet {
     seeds.forEach(endpoint);
     const profile = input.profile || "default";
     this.meta.profile({ profile });
+    return { id, name, seeds: [...new Set(seeds)], profile };
+  }
+  /** Discover a CLI-created cluster without writing its catalog or Meta state. */
+  async previewConnection(input) {
+    const connection = this.connection(input);
+    if ((await this.clusters()).some((c) => c.id === connection.id))
+      throw new AdminError("That cluster name already exists", 409);
+    // A temporary identity cannot accidentally route through a retained SSH plan.
+    const status = await this.meta.status({
+      ...connection,
+      id: `preview-${randomBytes(16).toString("hex")}`,
+      seeds: JSON.stringify(connection.seeds),
+    });
+    for (const [token, preview] of this.connections)
+      if (preview.expires < Date.now()) this.connections.delete(token);
+    if (this.connections.size >= 100)
+      throw new AdminError("Too many connection previews; retry shortly", 503);
+    const token = randomBytes(24).toString("hex");
+    this.connections.set(token, { connection, expires: Date.now() + 300000 });
+    return { token, connection, status };
+  }
+  /** Register only the connection the operator tested; never initialize Meta. */
+  async connect(input) {
+    const preview = this.connections.get(input.token);
+    if (!preview || preview.expires < Date.now())
+      throw new AdminError(
+        "Test the connection again; the preview expired",
+        409,
+      );
+    const result = await this.add(preview.connection);
+    this.connections.delete(input.token);
+    return result;
+  }
+  async add(input) {
+    const { id, name, seeds, profile } = this.connection(input);
     try {
       await this.store.query(
         "INSERT INTO clusters VALUES(?,?,?,?,?)",
@@ -759,105 +795,6 @@ export class Fleet {
     } finally {
       this.busy.delete(jobId);
     }
-  }
-  async keys(id, query) {
-    const view = await this.view(id);
-    const cluster = await this.cluster(id);
-    const owners = view.status.groups
-      .map((g) => g.owner_node_id)
-      .filter(Boolean)
-      .sort();
-    let position = 0,
-      cursor = "0",
-      epoch = view.status.capture.topology_epoch;
-    if (query.cursor) {
-      try {
-        ({ position, cursor, epoch } = JSON.parse(
-          Buffer.from(query.cursor, "base64url").toString(),
-        ));
-      } catch {
-        throw new AdminError("Invalid scan cursor");
-      }
-    }
-    if (
-      !Number.isInteger(position) ||
-      position < 0 ||
-      position >= owners.length ||
-      !/^\d+$/.test(cursor) ||
-      epoch !== view.status.capture.topology_epoch
-    )
-      throw new AdminError("Scan topology changed; restart the scan");
-    const pattern = query.pattern || "*";
-    if (pattern.length > 1024)
-      throw new AdminError("Search pattern is too long");
-    const keys = [];
-    // Lavik bounds SCAN by examined partitions, so sparse databases produce
-    // empty pages. Coalesce a bounded 16 pages without blocking the event loop
-    // or asking a DBA to click through every empty partition range.
-    for (
-      let page = 0;
-      page < 16 && position < owners.length && !keys.length;
-      page++
-    ) {
-      const result = await this.nodeRequest(
-        cluster,
-        view.nodes,
-        owners[position],
-        ["SCAN", cursor, "MATCH", pattern, "COUNT", "256"],
-      );
-      cursor = text(result[0]);
-      keys.push(
-        ...result[1].map((key) => ({
-          id: key.toString("base64"),
-          name: jsonReply(key),
-          node: owners[position],
-        })),
-      );
-      if (cursor === "0") position++;
-    }
-    return {
-      keys,
-      cursor:
-        position < owners.length
-          ? Buffer.from(JSON.stringify({ position, cursor, epoch })).toString(
-              "base64url",
-            )
-          : null,
-    };
-  }
-  async key(id, encoded) {
-    const bytes = keyBytes(encoded);
-    const view = await this.view(id);
-    const cluster = await this.cluster(id);
-    const keySlot = slot(bytes);
-    const range = view.status.slot_ranges.find(
-      (r) => +r.first <= keySlot && +r.last >= keySlot,
-    );
-    const owner = view.status.groups.find(
-      (g) => g.group_id === range?.group_id,
-    )?.owner_node_id;
-    if (!owner) throw new AdminError("No primary owns this key slot", 503);
-    const send = (args) => this.nodeRequest(cluster, view.nodes, owner, args);
-    const type = text(await send(["TYPE", bytes]));
-    const ttl = text(await send(["PTTL", bytes]));
-    const reads = {
-      string: ["GET", bytes],
-      hash: ["HSCAN", bytes, "0", "COUNT", "100"],
-      list: ["LRANGE", bytes, "0", "99"],
-      set: ["SSCAN", bytes, "0", "COUNT", "100"],
-      zset: ["ZRANGE", bytes, "0", "99", "WITHSCORES"],
-      stream: ["XRANGE", bytes, "-", "+", "COUNT", "100"],
-    };
-    const value = reads[type] ? jsonReply(await send(reads[type])) : null;
-    return {
-      id: encoded,
-      type,
-      ttl,
-      value,
-      slot: keySlot,
-      node: owner,
-      bounded: type !== "string",
-    };
   }
   async send(id, input) {
     const args = input.args;

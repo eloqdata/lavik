@@ -24,9 +24,9 @@ Use existing AMD64 or ARM64 Linux hosts with Python 3, glibc 2.39 or newer
 (Ubuntu 24.04), Linux 6.1 or newer, and io_uring enabled. Admin needs outbound
 HTTPS to GitHub and node hosts need SSH access from the Admin computer.
 Cluster IPs and the ports shown at review must be reachable between hosts on
-a trusted private network. Provisioning uses kernel networking and io_uring.
+a trusted private network. Provisioning uses kernel networking, with io_uring file storage or SPDK.
 
-In **Create cluster → Prepare hosts**, paste the host list, set the SSH user,
+In **Create cluster → Set up machines → Prepare hosts**, paste the host list, set the SSH user,
 and provide a login password or a private-key path on the Admin computer
 (optionally its passphrase). Admin installs its own public key and verifies a
 fresh passwordless login. Use separate batches for different credentials.
@@ -59,7 +59,7 @@ Use an existing key when the host does not allow password login.
    is visible in Node placement; use **Development processes** for Docker labs.
 4. **Check hosts & review**, resolve any prerequisites, inspect ports, type the
    cluster name, and deploy. **Operations** tracks progress to readiness.
-5. Use **Dashboard**, **Topology**, **Key browser**, and **Send command**.
+5. Use **Dashboard**, **Topology**, and **Send command**.
    Repeat setup to create additional independent clusters.
 
 In **Topology**, **Add replica → Deploy on a host** installs the cluster's
@@ -100,3 +100,24 @@ each cluster's separate Meta and Data files.
 
 For connection profiles, automation, recovery, and Docker verification, see
 [the operations guide](https://github.com/eloqdata/lavik/blob/main/docs/operations/lavik-admin.md).
+
+
+## Storage, monitoring, and existing clusters
+
+Production node placement offers file storage or automatic SPDK preparation of
+explicitly selected dedicated NVMe controllers. SPDK requires root SSH, IOMMU
+isolation, fresh single-namespace media, and one Data node per physical host.
+Host checks report unsupported configurations before deployment; the review
+requires explicit controller confirmation. Follow the repository’s
+[SPDK setup instructions](https://github.com/eloqdata/lavik/blob/main/docs/operations/lavik-admin.md#spdk-on-dedicated-data-hosts)
+for prerequisites and resource ownership.
+
+Select prepared monitoring hosts to provision Prometheus and Grafana with the
+Lavik dashboard. They need Docker Engine, Compose v2, and image registry access
+or cached images. Grafana defaults to the private IP at port 3000; its generated
+password is in `monitoring/grafana-password` under the remote deployment
+folder. Prometheus defaults to localhost:9090. Monitoring ports are configurable.
+
+For a cluster created with `lavik-ctl`, choose **Connect existing cluster**,
+enter Meta Admin addresses, and click **Test connection**. Review the discovered
+state, then **Connect cluster**. This flow leaves cluster state and storage intact.
