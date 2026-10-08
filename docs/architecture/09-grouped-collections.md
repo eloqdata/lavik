@@ -540,18 +540,18 @@ under `src/storage/engine/grouped/` and internal model/codec headers under
 `include/lavik/storage/detail/grouped/`. It shares the engine's `Impl`, append
 and recovery services; the directory is not an independent public engine API.
 The generic `lavik::MapIndex`, `OrderedIndex` and `CowArray` containers live
-under `include/lavik/`; grouped routing directories compose them with collection
-invariants. `GroupedObjectIndex` is the storage-level user-key side table whose
-views own those directories and physical metadata.
+under `include/lavik/containers/`; grouped routing directories compose them
+with collection invariants. `GroupedObjectIndex` is the storage-level user-key
+side table whose views own those directories and physical metadata.
 Grouped unit, command, recovery and fault tests live under `tests/grouped/`;
-the reusable containers have independent tests under `tests/`.
+the reusable containers have independent tests under `tests/containers/`.
 
 | Responsibility | Source |
 |---|---|
 | Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
 | Logical collection encodings and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
 | Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped/hash_random.cpp`, `hash_tree.cpp` |
-| Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/map_index.h`, `include/lavik/ordered_index.h`, `include/lavik/cow_array.h` |
+| Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/containers/map_index.h`, `include/lavik/containers/ordered_index.h`, `include/lavik/containers/cow_array.h` |
 | Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped/object_index.h`, `src/storage/engine/grouped/object_index.cpp` |
 | Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/write.cpp`, `src/storage/engine/grouped/mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `include/lavik/storage/detail/grouped/commit.h` |
 | Root-only expiration/persistence publication | `src/storage/engine/grouped/metadata.cpp`, `src/storage/engine/grouped/object_index.cpp`, `write.cpp` |

@@ -23,9 +23,9 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "lavik/map_index.h"
+#include "lavik/containers/map_index.h"
+#include "lavik/containers/ordered_index.h"
 #include "lavik/memory.h"
-#include "lavik/ordered_index.h"
 
 namespace lavik {
 namespace {

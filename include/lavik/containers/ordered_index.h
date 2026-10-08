@@ -27,7 +27,7 @@
 
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
-#include "lavik/cow_array.h"
+#include "lavik/containers/cow_array.h"
 
 namespace lavik {
 

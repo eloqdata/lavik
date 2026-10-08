@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "lavik/cow_array.h"
+#include "lavik/containers/cow_array.h"
 
 #include <algorithm>
 #include <array>

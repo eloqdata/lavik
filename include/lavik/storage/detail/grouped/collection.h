@@ -27,8 +27,8 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/status/statusor.h"
-#include "lavik/cow_array.h"
-#include "lavik/ordered_index.h"
+#include "lavik/containers/cow_array.h"
+#include "lavik/containers/ordered_index.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/format.h"
