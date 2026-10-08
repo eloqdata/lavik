@@ -17,6 +17,7 @@ import { Meta, AdminError } from "./meta.mjs";
 import { Fleet } from "./fleet.mjs";
 import { Deployments } from "./deploy.mjs";
 import { Hosts } from "./hosts.mjs";
+import { Demo } from "./demo.mjs";
 import { Releases } from "./releases.mjs";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -105,6 +106,8 @@ export async function start(options = {}) {
     ...options.deploymentOptions,
   });
   fleet.deployments = deployments;
+  fleet.demo = new Demo(fleet, directory, options.demoOptions);
+  meta.profiles["lavik-demo"] ||= { allowPlaintext: true };
   meta.deployments = deployments;
   const sessions = new Map();
   const loginAttempts = new Map();
@@ -341,6 +344,14 @@ export async function start(options = {}) {
         );
         return;
       }
+      if (resource === "demo" && !id) {
+        if (request.method === "GET") send(200, await fleet.demo.status());
+        else if (request.method === "POST") {
+          await body(request);
+          send(202, await fleet.demo.start());
+        } else throw new AdminError("Not found", 404);
+        return;
+      }
       if (resource === "setup" && request.method === "POST") {
         const input = await body(request);
         if (id === "preview") send(200, await deployments.preview(input));
@@ -377,9 +388,18 @@ export async function start(options = {}) {
         value = await fleet.add(await body(request));
       else if (id && !subresource && request.method === "GET")
         value = await fleet.view(id, url.searchParams.has("fresh"));
-      else if (id && !subresource && request.method === "DELETE")
+      else if (subresource === "removal" && request.method === "GET")
+        value = await deployments.reviewRemoval(id);
+      else if (subresource === "removal" && request.method === "POST")
+        value = await deployments.remove(id, await body(request));
+      else if (id && !subresource && request.method === "DELETE") {
+        const input = await body(request);
+        if (input.confirm !== id)
+          throw new AdminError(
+            "Type the exact cluster name to confirm removal",
+          );
         value = await fleet.forget(id);
-      else if (subresource === "metrics" && request.method === "GET")
+      } else if (subresource === "metrics" && request.method === "GET")
         value = await fleet.metrics(id);
       else if (subresource === "operations" && request.method === "GET")
         value = await fleet.operations(

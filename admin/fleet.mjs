@@ -52,6 +52,7 @@ export class Fleet {
   }
   async stop() {
     clearInterval(this.timer);
+    this.demo?.stop();
   }
   async audit(action, cluster, detail = "") {
     await this.store.query(
@@ -132,39 +133,35 @@ export class Fleet {
     await this.audit("cluster-added", id);
     return this.cluster(id);
   }
-  async forget(id) {
-    await this.cluster(id);
-    const active = await this.store.query(
-      "SELECT id FROM jobs WHERE cluster_id=? AND state IN ('queued','running','uncertain')",
-      [id],
-    );
-    if (active.length)
-      throw new AdminError(
-        "Resolve active operations before removing the connection",
-        409,
+  /** Archive the connection and completed history without contacting any host. */
+  async forget(id, completedTeardown = null) {
+    identifier(id);
+    let result;
+    try {
+      result = await this.store.query(
+        "",
+        [id, now(), completedTeardown],
+        "forget",
       );
-    // Retain operation history; forgetting is only allowed for unused entries.
-    const history = await this.store.query(
-      "SELECT id FROM jobs WHERE cluster_id=? LIMIT 1",
-      [id],
-    );
-    if (history.length)
+    } catch (error) {
       throw new AdminError(
-        "This connection has operation history and must be retained",
-        409,
+        error.message,
+        error.message === "Cluster not found" ? 404 : 409,
       );
-    await this.store.query("DELETE FROM clusters WHERE id=?", [id], "run");
+    }
     this.views.delete(id);
-    await this.audit("cluster-forgotten", id);
-    return { removed: id };
+    this.pendingViews.delete(id);
+    for (const key of this.samples.keys())
+      if (key.startsWith(`${id}/`)) this.samples.delete(key);
+    return result;
   }
   async view(id, fresh = false) {
+    const cluster = await this.cluster(id);
     const cached = this.views.get(id);
     if (!fresh && cached && Date.now() - cached.time < 3000)
       return cached.value;
     if (this.pendingViews.has(id)) return this.pendingViews.get(id);
     const promise = (async () => {
-      const cluster = await this.cluster(id);
       const status = await this.meta.status(cluster);
       const nodes = await this.meta.nodes(cluster, status);
       const value = {
@@ -175,14 +172,17 @@ export class Fleet {
         observed_at: now(),
         deployment: this.deployments ? await this.deployments.plan(id) : null,
       };
-      this.views.set(id, { value, time: Date.now() });
+      // A removal invalidates the pending read; it must not repopulate a cache
+      // belonging to a later connection that reuses this name.
+      if (this.pendingViews.get(id) === promise)
+        this.views.set(id, { value, time: Date.now() });
       return value;
     })();
     this.pendingViews.set(id, promise);
     try {
       return await promise;
     } finally {
-      this.pendingViews.delete(id);
+      if (this.pendingViews.get(id) === promise) this.pendingViews.delete(id);
     }
   }
   async nodeRequest(cluster, nodes, nodeId, args) {
@@ -465,6 +465,8 @@ export class Fleet {
     );
   }
   async execute(job) {
+    if (job.kind === "demo") return this.demo.execute(job);
+    if (job.kind === "teardown") return this.deployments.runTeardown(job);
     if (job.kind === "deploy") return this.deployments.run(job);
     if (job.kind === "deploy-follower")
       return this.deployments.runFollower(job);
@@ -629,6 +631,8 @@ export class Fleet {
     }
   }
   async observe(job) {
+    if (job.kind === "demo") return this.demo.observe(job);
+    if (job.kind === "teardown") return; // Interrupted deletion requires explicit resume.
     if (job.kind === "deploy") return this.deployments.observe(job);
     if (job.kind === "deploy-follower") return;
     const cluster = await this.cluster(job.cluster_id);
@@ -719,7 +723,9 @@ export class Fleet {
         "Only an idle uncertain operation can be resumed",
         409,
       );
-    if (job.kind.startsWith("deploy")) return this.deployments.resume(job);
+    if (job.kind === "demo") return this.demo.resume(job);
+    if (job.kind === "teardown" || job.kind.startsWith("deploy"))
+      return this.deployments.resume(job);
     if (job.kind === "create")
       throw new AdminError(
         "Creation recovery is owned by Meta; inspect the root operation and cluster lifecycle",

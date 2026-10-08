@@ -47,9 +47,10 @@ lavik-ctl -- private Unix socket --+--> Fleet application
 
 A dedicated worker exclusively owns the SQLite connection. WAL with full
 synchronization stores the versioned cluster catalog, request records, and
-administrative audit metadata. Schema version 3 stores a reusable prepared-host
-inventory alongside per-cluster deployment plans; version-1 and version-2
-catalogs migrate without changing connections or requests. Inventory entries
+administrative audit metadata. Schema version 4 also retains removal archives
+containing the former connection, completed requests, and deployment plan. Earlier
+catalogs migrate without changing connections or requests. A reusable prepared-host
+inventory sits alongside per-cluster deployment plans. Inventory entries
 retain SSH endpoints, managed key/trust paths, and the last successful key-only
 verification time. They carry no node role or cluster ownership. Plans retain official release URLs and SHA-256 digests, host addresses
 and SSH file paths, node identities, placement, storage settings, and an
@@ -200,15 +201,72 @@ expired or stale removal intent requires a new review. Abandoning an uncertain
 replica request terminalizes its generic Meta operation without undoing
 committed membership. Typed creation and failover remain Meta-owned workflows.
 
+## Cluster removal
+
+Removing a connection atomically archives its catalog entry, terminal jobs, and
+SSH plan before deleting active catalog rows. Queued, running, and uncertain
+requests block removal. Archives remain in the private SQLite workspace;
+reconnecting creates a new connection without automatically adopting archived
+SSH ownership. Removal is local and works when Meta is unreachable.
+
+Permanent teardown requires an expiring server-side review of an Admin-owned
+file-storage plan and exact-name confirmation. A durable teardown job excludes
+new cluster mutations. It checks all hosts, stops all owned services, then
+deletes file data, Meta state, installations and monitoring volumes. Host
+machines, shared SSH credentials, inventory and the Admin service remain.
+Remote deletion checks the ownership nonce, exact service launchers, process
+identities and monitoring project paths, and refuses symlinks and mounts. A small
+sibling ownership receipt permits recovery after the final directory-marker unlink.
+Interrupted work stays uncertain and requires explicit resume; retries use the
+same ownership and accept already-removed host directories. Completion archives
+the connection and request together. Imported clusters have no deletion authority.
+SPDK teardown is unavailable: controller claims, raw media and host configuration
+require separate operator decommissioning.
+
+## Local Docker demo lifecycle
+
+A `kind: docker-demo` variant in the deployment-plan store retains the workspace's
+unique Docker project, ownership nonce, local Docker socket, private network,
+node identities and staged asset directory. One durable `demo` job drives the
+browser's check/build/download/start/create/readiness flow through the shared
+executor. Docker chooses a nonoverlapping network; runtime assets ship with Admin
+and are retained in its private workspace. The package has no dependency on the
+repository, and only six node containers remain after setup. The running Admin
+is neither copied nor started in Docker by this flow.
+
+The installer prefers an allowlisted copy of the extracted package’s Linux
+executables when their ELF architecture matches the Docker engine. Otherwise it
+downloads and verifies an architecture-matched nightly archive. Runtime
+compatibility is checked inside Docker; the chosen bytes remain in a read-only
+runtime volume and later setup does not switch their source. Meta commands execute its `lavik-ctl`
+inside a Meta container; bounded RESP requests execute inside the selected Data
+container. This avoids requiring host routes into Docker Desktop or executing
+Linux binaries on macOS. Published node ports are unnecessary. The retained local
+Docker socket pins these calls; setup rejects remote contexts and requires the
+original context when resuming or removing an existing demo.
+
+Creation is checkpointed before submission. Interrupted installation can be
+explicitly retried; an uncertain Genesis is only observed. Completion retains an
+initialized marker so loss of Meta state cannot silently initialize another
+cluster against existing Data volumes. The job and bounded log feed browser
+progress independently of Meta availability. Browser closure does not cancel
+setup, and Admin shutdown leaves Docker nodes running.
+
+Demo teardown uses the same reviewed removal job as SSH deployments but verifies
+Docker resource ownership labels before removing its Compose project, volumes and
+network. It leaves the active Admin and unrelated projects running. The older
+all-in-Docker quick-start scripts remain a separate, explicit checkout workflow;
+the browser does not invoke them or give an Admin container Docker socket access.
+
 ## Browser, data, and trust boundaries
 
 Browser onboarding distinguishes a local Docker demo, SSH deployment, and an
 existing cluster. Existing-cluster discovery is read-only and retains tested
 connection inputs behind an expiring server token before catalog registration;
-registration never initializes or replaces Meta state. The source-based Docker
-entry point builds and starts Compose, registers its manifest’s seeds, and uses
-an Admin creation job with a stable request identity. Reruns observe retained
-jobs and never replay uncertain creation.
+registration never initializes or replaces Meta state. The local-demo button starts
+the retained Docker workflow directly and displays progress, errors and explicit
+retry. Release packages include its Dockerfile, launcher scripts, manifest template,
+and container-side RESP client alongside the browser assets.
 
 The browser uses HTTP-only, SameSite session cookies with finite lifetime.
 An access token in a private file establishes a session; sessions expire on
@@ -239,6 +297,7 @@ unsupported Valkey-specific observability is not simulated.
 | Catalog, workflow admission and observation, data tools | `admin/fleet.mjs` |
 | Database owner and schema | `admin/store.mjs` |
 | Host inventory, managed SSH identity, transient initial authentication | `admin/hosts.mjs`, `admin/askpass.mjs` |
+| Local Docker demo setup, progress and container client transport | `admin/demo.mjs`, `admin/quickstart/` |
 | Reviewed deployment, storage and monitoring placement, follower installation | `admin/deploy.mjs`, `admin/monitoring.mjs`, `deploy/monitoring/` |
 | Official release resolution and immutable cache | `admin/releases.mjs` |
 | SSH transport and remote ownership/service lifecycle | `admin/ssh.mjs`, `admin/remote.py` |

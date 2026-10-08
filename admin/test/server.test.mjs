@@ -232,8 +232,8 @@ test("CLI-reviewed setup deploys through HTTP into the same catalog and operatio
   }
 });
 
-for (const version of [1, 2])
-  test(`version-${version} catalogs retain clusters and history when host storage is added`, async () => {
+for (const version of [1, 2, 3])
+  test(`version-${version} catalogs retain clusters and history when removal archives are added`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "lavik-catalog-migration-"));
     let app;
     try {
@@ -245,7 +245,7 @@ for (const version of [1, 2])
       old.exec(
         `${
           version === 1 ? "DROP TABLE deployments;" : ""
-        } DROP TABLE hosts; PRAGMA user_version=${version}`,
+        } DROP TABLE hosts; DROP TABLE cluster_archives; PRAGMA user_version=${version}`,
       );
       old
         .prepare("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?)")
@@ -278,7 +278,7 @@ for (const version of [1, 2])
       assert.deepEqual(await app.store.query("SELECT * FROM hosts"), []);
       assert.equal(
         (await app.store.query("PRAGMA user_version", [], "get")).user_version,
-        3,
+        4,
       );
     } finally {
       if (app) await app.close();
