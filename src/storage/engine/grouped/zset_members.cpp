@@ -81,7 +81,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     }
     auto groups = GroupHashValue(std::move(value), plan.root_.incarnation_,
                                  plan.root_.seed_);
-    LAVIK_CO_RETURN_IF_ERROR(groups.status());
+    LAVIK_CO_RETURN_IF_ERROR(groups);
     if (groups->size() > std::numeric_limits<std::uint32_t>::max())
       co_return absl::OutOfRangeError("too many member-index groups");
     plan.root_.group_count_ = groups->size();
@@ -129,7 +129,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     }
   }
   auto metadata_admission = metadata_budget.Reserve(1);
-  LAVIK_CO_RETURN_IF_ERROR(metadata_admission.status());
+  LAVIK_CO_RETURN_IF_ERROR(metadata_admission);
 
   struct Change {
     std::optional<double> before_;
@@ -181,14 +181,14 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       status = add_group(read_budget, {page.id_, 0});
       LAVIK_CO_RETURN_IF_ERROR(status);
       auto read_admission = read_budget.Reserve(2);
-      LAVIK_CO_RETURN_IF_ERROR(read_admission.status());
+      LAVIK_CO_RETURN_IF_ERROR(read_admission);
       LAVIK_FAULT_INJECT(
           if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY",
                                   key)) co_return absl::
               UnavailableError("injected member diff read failure"););
       auto loaded = co_await LoadOrderedGroupSnapshot(
           store, partition, db_id, key, digest, previous, page.id_);
-      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+      LAVIK_CO_RETURN_IF_ERROR(loaded);
       for (auto& entry : loaded->snapshot_.entries_) {
         auto found = changes.find(entry.value_);
         if (found == changes.end()) {
@@ -265,14 +265,14 @@ StorageEngine::Impl::PrepareSortedSetMembers(
               UnavailableError("injected member-index leaf read failure"););
       auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                    digest, previous, id);
-      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+      LAVIK_CO_RETURN_IF_ERROR(loaded);
       leaf = std::move(loaded->snapshot_);
     }
     for (const auto& entry : leaf.value_.entries_) {
       const auto found = changes.find(entry.field_);
       if (found == changes.end()) continue;
       auto score = DecodeSortedSetMemberScore(entry.value_);
-      LAVIK_CO_RETURN_IF_ERROR(score.status());
+      LAVIK_CO_RETURN_IF_ERROR(score);
       if (!found->second.before_ || *score != *found->second.before_)
         co_return absl::DataLossError("ordered/member-index score mismatch");
       found->second.found_before_ = true;
@@ -310,7 +310,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   plan.changed_ = true;
   for (auto& [id, leaf] : leaves) {
     auto split = SplitHashGroup(std::move(leaf), plan.root_.seed_);
-    LAVIK_CO_RETURN_IF_ERROR(split.status());
+    LAVIK_CO_RETURN_IF_ERROR(split);
     if (split->size() > 1) {
       if (split->size() - 1 >
           std::numeric_limits<std::uint32_t>::max() - plan.root_.group_count_)

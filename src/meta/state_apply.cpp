@@ -2835,11 +2835,11 @@ absl::StatusOr<std::string> MetaStores::Serialize() const {
   w.WriteString(topology_.Serialize());
   w.WriteString(policy_.Serialize());
   const auto operation = operation_.Serialize();
-  LAVIK_RETURN_IF_ERROR(operation.status());
+  LAVIK_RETURN_IF_ERROR(operation);
   w.WriteString(*operation);
   w.WriteString(population_manifest_.Serialize());
   const auto audit = audit_.Serialize();
-  LAVIK_RETURN_IF_ERROR(audit.status());
+  LAVIK_RETURN_IF_ERROR(audit);
   w.WriteString(*audit);
   std::string out = w.TakeBuffer();
   if (out.size() > kMaxMetaSnapshotBytes) {
@@ -2856,7 +2856,7 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   }
   MetaReader r(bytes);
   const auto version = r.ReadU16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported meta stores schema version");
   }
@@ -2865,17 +2865,17 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   constexpr std::uint32_t kBlobCap =
       static_cast<std::uint32_t>(kMaxMetaSnapshotBytes);
   const auto identity = r.ReadString(kBlobCap);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   const auto topology = r.ReadString(kBlobCap);
-  LAVIK_RETURN_IF_ERROR(topology.status());
+  LAVIK_RETURN_IF_ERROR(topology);
   const auto policy = r.ReadString(kBlobCap);
-  LAVIK_RETURN_IF_ERROR(policy.status());
+  LAVIK_RETURN_IF_ERROR(policy);
   const auto operation = r.ReadString(kBlobCap);
-  LAVIK_RETURN_IF_ERROR(operation.status());
+  LAVIK_RETURN_IF_ERROR(operation);
   const auto population_manifest = r.ReadString(kBlobCap);
-  LAVIK_RETURN_IF_ERROR(population_manifest.status());
+  LAVIK_RETURN_IF_ERROR(population_manifest);
   const auto audit = r.ReadString(kBlobCap);
-  LAVIK_RETURN_IF_ERROR(audit.status());
+  LAVIK_RETURN_IF_ERROR(audit);
   LAVIK_RETURN_IF_ERROR(r.Finish());
 
   MetaStores stores;
@@ -2983,20 +2983,20 @@ std::string EncodeMetaApplyResult(const MetaApplyResult& result) {
 absl::StatusOr<MetaApplyResult> DecodeMetaApplyResult(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU8();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != 1) {
     return MetaFailStopError("unknown apply-result payload version");
   }
   auto verdict = r.ReadU8();
-  LAVIK_RETURN_IF_ERROR(verdict.status());
+  LAVIK_RETURN_IF_ERROR(verdict);
   if (*verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kAccepted) &&
       *verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kRejected)) {
     return MetaFailStopError("unknown apply-result verdict");
   }
   auto log_index = r.ReadU64();
-  LAVIK_RETURN_IF_ERROR(log_index.status());
+  LAVIK_RETURN_IF_ERROR(log_index);
   auto command_tag = r.ReadU16();
-  LAVIK_RETURN_IF_ERROR(command_tag.status());
+  LAVIK_RETURN_IF_ERROR(command_tag);
   if (*command_tag <
           static_cast<std::uint16_t>(MetaCommandTag::kRegisterNode) ||
       *command_tag >
@@ -3004,7 +3004,7 @@ absl::StatusOr<MetaApplyResult> DecodeMetaApplyResult(std::string_view bytes) {
     return MetaFailStopError("unknown apply-result command tag");
   }
   auto detail = r.ReadString(kMaxMetaAuditDetailBytes);
-  LAVIK_RETURN_IF_ERROR(detail.status());
+  LAVIK_RETURN_IF_ERROR(detail);
   LAVIK_RETURN_IF_ERROR(r.Finish());
   return MetaApplyResult{static_cast<MetaAuditVerdict>(*verdict),
                          std::string(*detail), *log_index,

@@ -243,16 +243,16 @@ absl::StatusOr<FailoverAdminRequestV1> DecodeFailoverAdminRequest(
   }
   request.remove_prefix(kRequestPrefix.size());
   auto bytes = Unhex(request);
-  LAVIK_RETURN_IF_ERROR(bytes.status());
+  LAVIK_RETURN_IF_ERROR(bytes);
 
   Reader reader(*bytes);
   FailoverAdminRequestV1 result;
   auto operation = reader.Raw(result.operation_id_.size());
-  LAVIK_RETURN_IF_ERROR(operation.status());
+  LAVIK_RETURN_IF_ERROR(operation);
   std::copy(operation->begin(), operation->end(),
             reinterpret_cast<char*>(result.operation_id_.data()));
   auto group_size = reader.U16();
-  LAVIK_RETURN_IF_ERROR(group_size.status());
+  LAVIK_RETURN_IF_ERROR(group_size);
   if (*group_size > kMaxMetaGroupIdBytes) {
     return Invalid("failover group id exceeds cap");
   }
@@ -296,7 +296,7 @@ absl::StatusOr<FailoverOutcome> ClusterOperator::Failover(
 
   MetaAdminTarget leader;
   auto initial = CaptureStatus(seed, options, &leader);
-  LAVIK_RETURN_IF_ERROR(initial.status());
+  LAVIK_RETURN_IF_ERROR(initial);
   if (!initial->status_.has_value()) {
     return absl::UnavailableError(initial->retry_reason_);
   }
@@ -348,7 +348,7 @@ absl::StatusOr<FailoverOutcome> ClusterOperator::Failover(
       {.operation_id_ = operation_id,
        .group_id_ = request.group_id_,
        .absolute_deadline_unix_ms_ = absolute_deadline});
-  LAVIK_RETURN_IF_ERROR(encoded.status());
+  LAVIK_RETURN_IF_ERROR(encoded);
 
   auto reply = round_trip_(leader, *encoded, options.deadline_);
   if (!reply.ok()) {

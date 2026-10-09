@@ -71,7 +71,7 @@ SelectCommonSystemStateRoot(const std::vector<std::string>& paths) {
   bool saw_any = false;
   for (const std::string& path : paths) {
     auto loaded = ReadSystemStateRootCandidates(path);
-    LAVIK_RETURN_IF_ERROR(loaded.status());
+    LAVIK_RETURN_IF_ERROR(loaded);
     saw_any |= !loaded->empty();
     candidates.push_back(std::move(*loaded));
   }
@@ -256,7 +256,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   std::vector<std::optional<DeviceLabel>> labels;
   for (const std::string& path : options_.data_files_) {
     auto probed = ProbeStoragePath(path);
-    LAVIK_RETURN_IF_ERROR(probed.status());
+    LAVIK_RETURN_IF_ERROR(probed);
     if (probed->size_bytes_ < 2 * kStorageBlockBytes) {
       return absl::Status(
           absl::StatusCode::kOutOfRange,
@@ -555,7 +555,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
             options_.data_files_[i], kEpochMetadataOffset,
             MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index),
             payload_bytes);
-        LAVIK_RETURN_IF_ERROR(loaded.status());
+        LAVIK_RETURN_IF_ERROR(loaded);
         const std::size_t first_value = byte_offset / sizeof(std::uint64_t);
         const std::size_t value_count = payload_bytes / sizeof(std::uint64_t);
         for (std::size_t value_index = 0; value_index < value_count;
@@ -573,7 +573,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       }
     }
     auto inherited_system_state = SelectCommonSystemStateRoot(existing_paths);
-    LAVIK_RETURN_IF_ERROR(inherited_system_state.status());
+    LAVIK_RETURN_IF_ERROR(inherited_system_state);
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (labels[i].has_value()) {
         continue;
@@ -2143,7 +2143,7 @@ absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
       });
     }
     auto planned = PlanControllerAffinity(inputs, worker_count_);
-    LAVIK_RETURN_IF_ERROR(planned.status());
+    LAVIK_RETURN_IF_ERROR(planned);
 
     device_owners_.assign(devices_.size(), {});
     auto assign_controller = [this](ControllerPlan& controller,

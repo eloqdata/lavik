@@ -76,7 +76,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
                      page_indexes.end());
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -432,7 +432,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
       kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -557,7 +557,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
 
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;

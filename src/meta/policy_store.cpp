@@ -52,10 +52,10 @@ class CompactJsonObjectParser {
 
     while (true) {
       auto name = ParseString();
-      LAVIK_RETURN_IF_ERROR(name.status());
+      LAVIK_RETURN_IF_ERROR(name);
       if (!Consume(':')) return Error("expected ':' after policy field");
       auto value = ParseValue();
-      LAVIK_RETURN_IF_ERROR(value.status());
+      LAVIK_RETURN_IF_ERROR(value);
       if (!result.emplace(std::move(*name), std::move(*value)).second) {
         return Error("duplicate policy field");
       }
@@ -98,7 +98,7 @@ class CompactJsonObjectParser {
   absl::StatusOr<JsonValue> ParseValue() {
     if (!AtEnd() && raw_[offset_] == '"') {
       auto string = ParseString();
-      LAVIK_RETURN_IF_ERROR(string.status());
+      LAVIK_RETURN_IF_ERROR(string);
       return JsonValue(std::in_place_type<std::string>, std::move(*string));
     }
     if (raw_.substr(offset_).starts_with("true")) {
@@ -182,7 +182,7 @@ absl::Status SnapshotFailure(const absl::Status& status) {
 absl::StatusOr<MetaAutomaticUncontrolledFailoverPolicy>
 DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw) {
   auto object = CompactJsonObjectParser(raw).Parse();
-  LAVIK_RETURN_IF_ERROR(object.status());
+  LAVIK_RETURN_IF_ERROR(object);
   LAVIK_RETURN_IF_ERROR(
       RequireExactFields(*object, {"kind", "suspect_after_ms"}));
   LAVIK_RETURN_IF_ERROR(
@@ -205,7 +205,7 @@ DecodeAutomaticUncontrolledFailoverPolicy(std::string_view raw) {
 absl::StatusOr<MetaAuthorityLeasePolicy> DecodeAuthorityLeasePolicy(
     std::string_view raw) {
   auto object = CompactJsonObjectParser(raw).Parse();
-  LAVIK_RETURN_IF_ERROR(object.status());
+  LAVIK_RETURN_IF_ERROR(object);
   LAVIK_RETURN_IF_ERROR(RequireExactFields(*object, {"kind", "duration_ms"}));
   LAVIK_RETURN_IF_ERROR(RequireKind(*object, "authority-lease-v1"));
   const JsonValue& duration = object->at("duration_ms");
@@ -223,7 +223,7 @@ absl::StatusOr<MetaAuthorityLeasePolicy> DecodeAuthorityLeasePolicy(
 absl::StatusOr<MetaCandidateRecoveryPolicy> DecodeCandidateRecoveryPolicy(
     std::string_view raw) {
   auto object = CompactJsonObjectParser(raw).Parse();
-  LAVIK_RETURN_IF_ERROR(object.status());
+  LAVIK_RETURN_IF_ERROR(object);
   LAVIK_RETURN_IF_ERROR(RequireExactFields(*object, {"kind", "budget_ms"}));
   LAVIK_RETURN_IF_ERROR(RequireKind(*object, "candidate-recovery-v1"));
   const auto* budget = std::get_if<std::uint64_t>(&object->at("budget_ms"));
@@ -379,17 +379,17 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
     std::string_view bytes) {
   MetaReader reader(bytes);
   auto schema = reader.ReadU16();
-  LAVIK_RETURN_IF_ERROR(schema.status());
+  LAVIK_RETURN_IF_ERROR(schema);
   if (*schema != kMetaFormatVersion) {
     return MetaFailStopError("unknown policy snapshot schema_version");
   }
   auto policy_count = reader.ReadCount(3);
-  LAVIK_RETURN_IF_ERROR(policy_count.status());
+  LAVIK_RETURN_IF_ERROR(policy_count);
 
   MetaPolicyStore store;
   for (std::uint32_t i = 0; i < *policy_count; ++i) {
     auto policy_id = reader.ReadString(kMaxMetaPolicyIdBytes);
-    LAVIK_RETURN_IF_ERROR(policy_id.status());
+    LAVIK_RETURN_IF_ERROR(policy_id);
     if (*policy_id != kAutomaticUncontrolledFailoverPolicyId &&
         *policy_id != kAuthorityLeasePolicyId &&
         *policy_id != kCandidateRecoveryPolicyId) {
@@ -399,7 +399,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
       return MetaFailStopError("duplicate policy family in snapshot");
     }
     auto version_count = reader.ReadCount(kMaxMetaPolicyVersionsPerPolicy);
-    LAVIK_RETURN_IF_ERROR(version_count.status());
+    LAVIK_RETURN_IF_ERROR(version_count);
     if (*version_count == 0) {
       return MetaFailStopError("policy family has no versions in snapshot");
     }
@@ -409,9 +409,9 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
     std::uint64_t first = 0;
     for (std::uint32_t v = 0; v < *version_count; ++v) {
       auto version = reader.ReadU64();
-      LAVIK_RETURN_IF_ERROR(version.status());
+      LAVIK_RETURN_IF_ERROR(version);
       auto content = reader.ReadString(kMaxMetaPayloadBytes);
-      LAVIK_RETURN_IF_ERROR(content.status());
+      LAVIK_RETURN_IF_ERROR(content);
       if (v == 0) {
         first = *version;
         if (first == 0) {

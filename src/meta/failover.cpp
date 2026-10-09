@@ -55,12 +55,12 @@ void WriteHeader(MetaWriter& writer) {
 
 absl::Status ReadHeader(MetaReader& reader) {
   auto magic = reader.ReadRaw(kOperationIntentMagic.size());
-  LAVIK_RETURN_IF_ERROR(magic.status());
+  LAVIK_RETURN_IF_ERROR(magic);
   if (*magic != kOperationIntentMagic) {
     return Corrupt("unknown failover blob magic");
   }
   auto version = reader.ReadU16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kFailoverSchemaVersion) {
     return Corrupt("unknown failover blob version");
   }
@@ -266,7 +266,7 @@ absl::Status ValidateCommitProposal(
   }
   auto prepared = ExactCandidatePrepared(*transition, action, facts,
                                          observations, proposal_now_unix_ms);
-  LAVIK_RETURN_IF_ERROR(prepared.status());
+  LAVIK_RETURN_IF_ERROR(prepared);
   return absl::OkStatus();
 }
 
@@ -501,7 +501,7 @@ absl::Status ValidateFailoverTransition(
     auto progress = ExactCandidateProgress(authorize->group_id_, action, facts,
                                            observations, proposal_now_unix_ms,
                                            /*action_is_committed=*/true);
-    LAVIK_RETURN_IF_ERROR(progress.status());
+    LAVIK_RETURN_IF_ERROR(progress);
 
     if (transition->mode_ == MetaFailoverMode::kUncontrolled &&
         !action.operator_recovery_) {

@@ -123,7 +123,7 @@ absl::StatusOr<MetaMemberRecord> ReadBinding(MetaReader& r) {
   auto ctl =
       r.ReadOptional<std::string>([](auto& in) -> absl::StatusOr<std::string> {
         auto s = in.ReadString(kMaxMetaEndpointBytes);
-        LAVIK_RETURN_IF_ERROR(s.status());
+        LAVIK_RETURN_IF_ERROR(s);
         return std::string(*s);
       });
   auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
@@ -222,7 +222,7 @@ absl::StatusOr<std::string> EncodeMembershipIntent(
   if (w.buffer().size() > kMaxMetaPayloadBytes)
     return Conflict("membership intent too large");
   auto checked = DecodeMembershipIntent(w.buffer());
-  LAVIK_RETURN_IF_ERROR(checked.status());
+  LAVIK_RETURN_IF_ERROR(checked);
   if (*checked != plan) return Conflict("membership intent is not canonical");
   return w.TakeBuffer();
 }
@@ -298,7 +298,7 @@ Plan PlanMembershipStep(const MetaMembershipView& view,
   if (op.kind_ != kMetaMembershipOperationKind || Terminal(op))
     return std::nullopt;
   auto intent = DecodeMembershipIntent(op.intent_);
-  LAVIK_RETURN_IF_ERROR(intent.status());
+  LAVIK_RETURN_IF_ERROR(intent);
   const auto& p = *intent;
   auto after = p.before_;
   if (p.add_)

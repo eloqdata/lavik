@@ -448,7 +448,7 @@ absl::StatusOr<PreparedFullState> PrepareNodeControlState(
   }
   auto prepared =
       PrepareMetaFullState(local, local_node_id, request_worker_count);
-  LAVIK_RETURN_IF_ERROR(prepared.status());
+  LAVIK_RETURN_IF_ERROR(prepared);
   ServingStateBuilder builder;
   builder.SetInFlightStripeCount(request_worker_count);
   builder.SetTopologyEpoch(state.routing.revision);

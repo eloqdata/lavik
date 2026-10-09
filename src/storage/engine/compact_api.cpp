@@ -27,14 +27,14 @@ absl::StatusOr<OrderedCollectionMutationPlan> PrepareOrderedGroups(
     std::string_view encoded, std::uint64_t count,
     OrderedCollectionKind collection_kind = OrderedCollectionKind::kSortedSet) {
   auto entries = DecodeOrderedCompactValue(collection_kind, encoded, count);
-  LAVIK_RETURN_IF_ERROR(entries.status());
+  LAVIK_RETURN_IF_ERROR(entries);
   const auto record_count = entries->size();
   OrderedGroupSnapshot initial{.kind_ = collection_kind,
                                .incarnation_ = 1,
                                .id_ = 1,
                                .entries_ = std::move(*entries)};
   auto split = SplitOrderedGroup(std::move(initial), 2);
-  LAVIK_RETURN_IF_ERROR(split.status());
+  LAVIK_RETURN_IF_ERROR(split);
   return OrderedCollectionMutationPlan{
       .root_ = {.kind_ = collection_kind,
                 .incarnation_ = 1,
@@ -124,7 +124,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     // A tentative failed root must not hide behind its uncommitted TTL in
     // whole-value callbacks either.
     const auto readable = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    LAVIK_CO_RETURN_IF_ERROR(readable.status());
+    LAVIK_CO_RETURN_IF_ERROR(readable);
   }
   if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
@@ -178,7 +178,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                                   .logical_size_ = location.logical_size_,
                                   .expire_at_ms_ = location.expire_at_ms_};
     auto update = callback(metadata);
-    LAVIK_CO_RETURN_IF_ERROR(update.status());
+    LAVIK_CO_RETURN_IF_ERROR(update);
     if (update->changed_)
       co_return absl::InvalidArgumentError("metadata callback mutated");
     co_return absl::OkStatus();
@@ -287,7 +287,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     // Keep conservative headroom through publication, not just through load.
     // Replies with multiplicity (ZRANDMEMBER) admit their separate output.
     auto admitted = budget.Reserve(6);
-    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+    LAVIK_CO_RETURN_IF_ERROR(admitted);
     callback_admission.emplace(std::move(*admitted));
   }
   std::optional<LoadedValue> loaded;
@@ -327,7 +327,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   }
 
   auto update = callback(view);
-  LAVIK_CO_RETURN_IF_ERROR(update.status());
+  LAVIK_CO_RETURN_IF_ERROR(update);
   // A missing key may be created directly as a large graph. Keep both
   // indexes private/admitted until absence and population are revalidated;
   // the commit adapter stamps their placeholder incarnations together.
@@ -343,10 +343,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
           "Sorted Set creation count overflow");
     LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(update->logical_size_ * 256));
     auto admitted = budget.Reserve(1);
-    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+    LAVIK_CO_RETURN_IF_ERROR(admitted);
     create_admission.emplace(std::move(*admitted));
     auto plan = PrepareOrderedGroups(update->encoded_, update->logical_size_);
-    LAVIK_CO_RETURN_IF_ERROR(plan.status());
+    LAVIK_CO_RETURN_IF_ERROR(plan);
     created_groups.emplace(std::move(*plan));
     LAVIK_FAULT_INJECT({
       LAVIK_CO_RETURN_IF_ERROR(co_await PauseGroupedWriteForTest(
@@ -441,7 +441,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         GroupedScratchBudget budget;
         LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(encoded.size()));
         auto admitted = budget.Reserve(6);
-        LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+        LAVIK_CO_RETURN_IF_ERROR(admitted);
         stream_promotion_admission.emplace(std::move(*admitted));
       }
       LAVIK_ASSIGN_OR_CO_RETURN(
@@ -449,7 +449,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     } else {
       auto after =
           DecodeOrderedCompactValue(collection_kind, encoded, logical_size);
-      LAVIK_CO_RETURN_IF_ERROR(after.status());
+      LAVIK_CO_RETURN_IF_ERROR(after);
       if (!grouped->is_ordered() ||
           grouped->ordered_directory().root().kind_ != collection_kind ||
           !view.has_value()) {
@@ -457,7 +457,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       }
       auto before = DecodeOrderedCompactValue(collection_kind, view->encoded_,
                                               location.logical_size_);
-      LAVIK_CO_RETURN_IF_ERROR(before.status());
+      LAVIK_CO_RETURN_IF_ERROR(before);
       const auto& directory = grouped->ordered_directory();
       // Legacy collection callbacks still compute a complete logical
       // result. Route it against old page boundaries so a score moving across

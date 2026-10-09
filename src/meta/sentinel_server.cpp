@@ -552,7 +552,7 @@ SessionAction ExecuteConnectionCommand(
 // let the accept coroutine retire the listener, then join its frame.
 absl::StatusOr<int> OpenAcceptWake(const NumericEndpoint& endpoint) {
   auto addresses = bycorf::ResolveTcpAddresses(endpoint.host_, endpoint.port_);
-  LAVIK_RETURN_IF_ERROR(addresses.status());
+  LAVIK_RETURN_IF_ERROR(addresses);
   const auto& address = addresses->front();
   const int fd = ::socket(address.address_.ss_family,
                           SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

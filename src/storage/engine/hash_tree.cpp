@@ -119,7 +119,7 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
                                                  HashOperationKind kind,
                                                  std::uint64_t count) {
   auto reader = HashValueReader::Open(payload);
-  LAVIK_RETURN_IF_ERROR(reader.status());
+  LAVIK_RETURN_IF_ERROR(reader);
   if (reader->size() != count) {
     return absl::InternalError(
         "Hash element count does not match record metadata");
@@ -143,7 +143,7 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
   auto inspect = *reader;
   for (std::size_t i = 0; i < count; ++i) {
     auto entry = inspect.Next();
-    LAVIK_RETURN_IF_ERROR(entry.status());
+    LAVIK_RETURN_IF_ERROR(entry);
     if (!add_bytes(width * sizeof(std::optional<std::string>)) ||
         (fields &&
          !add_bytes(std::max(entry->field_.size(), inline_capacity) + 1)) ||
@@ -164,7 +164,7 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
   result.values_.reserve(count * width);
   for (std::size_t i = 0; i < count; ++i) {
     auto entry = reader->Next();
-    LAVIK_RETURN_IF_ERROR(entry.status());
+    LAVIK_RETURN_IF_ERROR(entry);
     if (fields) result.values_.emplace_back(std::in_place, entry->field_);
     if (values) result.values_.emplace_back(std::in_place, entry->value_);
   }
@@ -453,7 +453,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const bool exists = stored_value && !IsExpired(*found, now_ms);
   if (!exists && stored_value && found->value_.grouped()) {
     auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    LAVIK_CO_RETURN_IF_ERROR(metadata.status());
+    LAVIK_CO_RETURN_IF_ERROR(metadata);
   }
   if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
@@ -665,7 +665,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     // Matching strings move into the reply; no second payload copy is made.
     // The physical read buffer has its own independent admission.
     auto scratch = budget.Reserve(1);
-    LAVIK_CO_RETURN_IF_ERROR(scratch.status());
+    LAVIK_CO_RETURN_IF_ERROR(scratch);
     auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                  digest, grouped, route->id_);
     if (!loaded.ok()) {
@@ -743,7 +743,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     // operands. Request strings themselves remain client-owned.
     LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(operation.fields_.size() * 256));
     auto admitted = budget.Reserve(1);
-    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+    LAVIK_CO_RETURN_IF_ERROR(admitted);
     operand_scratch.emplace(std::move(*admitted));
     leaf_edits.reserve(operation.fields_.size());
   }
@@ -764,7 +764,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       }
     }
     auto admitted = budget.Reserve(unlocked_create ? 2 : 4);
-    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+    LAVIK_CO_RETURN_IF_ERROR(admitted);
     grouped_scratch.emplace(std::move(*admitted));
   } else if (grouped != nullptr) {
     GroupedScratchBudget budget;
@@ -826,7 +826,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(value.size()));
     }
     auto admitted = budget.Reserve(4);
-    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+    LAVIK_CO_RETURN_IF_ERROR(admitted);
     grouped_scratch.emplace(std::move(*admitted));
   }
   HashValue compact;
@@ -854,12 +854,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       } while (begin < leaf_edits.size() && leaf_edits[begin].id_ == id);
       auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                                   digest, grouped, id);
-      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+      LAVIK_CO_RETURN_IF_ERROR(loaded);
       const auto bytes = loaded->loaded_.value();
       auto edited = ApplyHashGroupEdits(
           {reinterpret_cast<const char*>(bytes.data()), bytes.size()},
           plan.root_.seed_, kind, edits);
-      LAVIK_CO_RETURN_IF_ERROR(edited.status());
+      LAVIK_CO_RETURN_IF_ERROR(edited);
       if (!edited->changed_) continue;
       result.changed_ = plan.changed_ = true;
       edited_length += edited->added_;
@@ -1028,7 +1028,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   auto append_random = [&]() -> absl::Status {
     if (compact.entries_.empty()) return absl::OkStatus();
     auto requested = requested_samples();
-    LAVIK_RETURN_IF_ERROR(requested.status());
+    LAVIK_RETURN_IF_ERROR(requested);
     if (operation.count_provided_ && operation.count_ < 0) {
       for (std::uint64_t i = 0; i < *requested; ++i) {
         const HashEntry& entry = compact.entries_[RandomRank(
@@ -1115,7 +1115,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             (compact.entries_.size() + operation.fields_.size()) *
             kPositionBytes));
         auto admitted = budget.Reserve(1);
-        LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+        LAVIK_CO_RETURN_IF_ERROR(admitted);
         lookup_scratch.emplace(std::move(*admitted));
         field_positions.reserve(compact.entries_.size() +
                                 operation.fields_.size());
@@ -1180,7 +1180,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           current == nullptr
               ? std::optional<std::string_view>{}
               : std::optional<std::string_view>{current->value_});
-      LAVIK_CO_RETURN_IF_ERROR(updated.status());
+      LAVIK_CO_RETURN_IF_ERROR(updated);
       mark_group_changed(field);
       if (current == nullptr) {
         compact.entries_.push_back(HashEntry{.digest_ = ComputeDigest(field),
@@ -1280,7 +1280,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
     case HashOperationKind::kPopRandom: {
       auto requested = requested_samples();
-      LAVIK_CO_RETURN_IF_ERROR(requested.status());
+      LAVIK_CO_RETURN_IF_ERROR(requested);
       auto ranks = SampleUniqueRandomRanks(compact.entries_.size(), *requested,
                                            false, RandomSampleGenerator());
       std::sort(ranks.begin(), ranks.end());
@@ -1349,7 +1349,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       auto prepared =
           PrepareGroupedHashMutation(grouped, std::move(compact), changed,
                                      result.length_, grouped->revision());
-      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+      LAVIK_CO_RETURN_IF_ERROR(prepared);
       grouped_plan.emplace(std::move(*prepared));
     }
     co_await store.store_state_mutex_.Lock();
@@ -1368,11 +1368,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       if (unlocked_create && compact_write_promotes) {
         auto prepared = PrepareGroupedHashMutation(nullptr, std::move(compact),
                                                    {}, result.length_, 1);
-        LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+        LAVIK_CO_RETURN_IF_ERROR(prepared);
         grouped_plan.emplace(std::move(*prepared));
       } else if (!compact_write_promotes) {
         auto encoded = EncodeHashValue(compact);
-        LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+        LAVIK_CO_RETURN_IF_ERROR(encoded);
         prepared_compact_payload.emplace(std::move(*encoded));
       }
     }

@@ -153,7 +153,7 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
   for (std::size_t i = 0; i < page.size(); ++i) {
     if (type == ValueType::kStream) {
       auto payload = StreamRecordPayload(page.elements_[i]);
-      LAVIK_RETURN_IF_ERROR(payload.status());
+      LAVIK_RETURN_IF_ERROR(payload);
       const auto bytes = page.elements_[i].size();
       if (bytes > kMaxStringBytes || bytes > UINT64_MAX - result - 4)
         return absl::OutOfRangeError("Stream page size overflow");
@@ -185,7 +185,7 @@ absl::Status CollectionCompactEncoder::StartPage(const CollectionPage& page) {
     return absl::InvalidArgumentError(
         "compact page type does not match stream");
   auto measured = MeasurePage(page);
-  LAVIK_RETURN_IF_ERROR(measured.status());
+  LAVIK_RETURN_IF_ERROR(measured);
   const auto count = type_ == ValueType::kString ? *measured : page.size();
   if (count > total_count_ - supplied_count_ ||
       *measured > total_bytes_ - supplied_bytes_)
@@ -357,7 +357,7 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
     // Validator identity survives TakePage. Keep its admission separate from
     // the page receipt, which the caller releases after ingesting that page.
     auto key = StreamRecordKey(first_);
-    LAVIK_RETURN_IF_ERROR(key.status());
+    LAVIK_RETURN_IF_ERROR(key);
     if (key->size() > (SIZE_MAX - 128) / 4)
       return absl::ResourceExhaustedError("Stream validator size overflow");
     const auto needed = key->size() * 4 + 128;

@@ -455,7 +455,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     auto encoder = rdb::CollectionFileEncoder::Create(
         value.db_id_, value.key_, value.value_.value_type_,
         value.value_.logical_size_, value.value_.expire_at_ms_);
-    LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoder);
     auto drain = [&]() -> Task<absl::Status> {
       while (auto span = encoder->Next()) {
         LAVIK_CO_RETURN_IF_ERROR(co_await PushEntrySpan(worker_id, *span));
@@ -468,7 +468,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     for (;;) {
       auto page = co_await storage_->ReadRdbCollectionPage(
           session_id_, value.collection_token_, cursor);
-      LAVIK_CO_RETURN_IF_ERROR(page.status());
+      LAVIK_CO_RETURN_IF_ERROR(page);
       status = encoder->StartPage(*page);
       LAVIK_CO_RETURN_IF_ERROR(status);
       status = co_await drain();

@@ -203,9 +203,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      MaterializeIndexLocation(*found),
                                      ExtentsFor(store, found));
-    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+    LAVIK_CO_RETURN_IF_ERROR(loaded);
     auto encoded = EncodeDiskValue(std::move(*loaded));
-    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoded);
     result.old_value_.emplace(std::move(*encoded));
   }
 
@@ -314,7 +314,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
                  .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                  .replication_epoch_ = partition.replication_epoch_,
                  .index_generation_ = partition.grouped_generations_[db_id]});
-    LAVIK_CO_RETURN_IF_ERROR(view.status());
+    LAVIK_CO_RETURN_IF_ERROR(view);
     LAVIK_CO_RETURN_IF_ERROR(co_await UpdateGroupedExpirationLocked(
         store, partition, db_id, key, digest, *view, expire_at_ms, tx,
         replication, mutation_precondition));
@@ -322,7 +322,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    previous, ExtentsFor(store, found));
-  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+  LAVIK_CO_RETURN_IF_ERROR(loaded);
   const std::span<const std::byte> value_bytes = loaded->value();
   std::string_view value(reinterpret_cast<const char*>(value_bytes.data()),
                          value_bytes.size());
@@ -419,7 +419,7 @@ StorageEngine::Impl::RestoreRawValueLocked(
     if (!exists) co_return RestoreRawResult{};
     auto deleted = co_await DeleteLocked(db_id, key, digest, tx, replication,
                                          mutation_precondition);
-    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
+    LAVIK_CO_RETURN_IF_ERROR(deleted);
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
   LAVIK_CO_RETURN_IF_ERROR(co_await WriteRawValueLocked(
@@ -1955,7 +1955,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
     auto extents =
         co_await WriteExtentValueLocked(store, std::string_view{}, value);
-    LAVIK_CO_RETURN_IF_ERROR(extents.status());
+    LAVIK_CO_RETURN_IF_ERROR(extents);
     if (value_type == ValueType::kHash) {
       LAVIK_MAYBE_CRASH_AT("hash-extents-durable-before-root");
     }
@@ -2733,7 +2733,7 @@ acquire_active_stream:
       allocated = co_await AcquireWriteBlock(
           store, request.for_defrag_, request.unlock_writer_while_waiting_);
     }
-    LAVIK_CO_RETURN_IF_ERROR(allocated.status());
+    LAVIK_CO_RETURN_IF_ERROR(allocated);
     // Recheck after allocation released the store lock: a maintenance path
     // may have installed a successor, or another writer consumed the tail.
     if (active_stream().has_value() &&
@@ -2952,7 +2952,7 @@ acquire_active_stream:
                 partition_ptr->grouped_generations_[request.db_id_],
         },
         /*allow_failed=*/request.replacement_undo_ != nullptr);
-    LAVIK_CO_RETURN_IF_ERROR(old_view.status());
+    LAVIK_CO_RETURN_IF_ERROR(old_view);
     auto pinned = co_await PrepinGroupedRetirementsLocked(
         store, *old_view,
         grouped_root &&
@@ -3133,14 +3133,14 @@ acquire_active_stream:
       // Replacing a grouped graph also needs a shared failure decision: the
       // top-level root may be compact, but its old graph is still atomic.
       auto decision = PrepareGroupedDecision(*request.tx_);
-      LAVIK_CO_RETURN_IF_ERROR(decision.status());
+      LAVIK_CO_RETURN_IF_ERROR(decision);
     }
     if (replacement_grouped != nullptr &&
         previous_grouped->incarnation() != replacement_grouped->incarnation())
       touched_groups.reset();
     auto retired = CollectGroupedRetirements(
         previous_grouped, replacement_grouped, touched_groups);
-    LAVIK_CO_RETURN_IF_ERROR(retired.status());
+    LAVIK_CO_RETURN_IF_ERROR(retired);
     for (const auto& child : *retired) {
       if (child.tx_tagged_ && (grouped_dependency_pins == nullptr ||
                                !grouped_dependency_pins->Contains(child))) {
@@ -3158,7 +3158,7 @@ acquire_active_stream:
       request.tx_->collect_undo_ && replacement_grouped != nullptr) {
     auto discarded = CollectGroupedRetirements(
         replacement_grouped, previous_grouped, touched_groups);
-    LAVIK_CO_RETURN_IF_ERROR(discarded.status());
+    LAVIK_CO_RETURN_IF_ERROR(discarded);
     if (!discarded->empty())
       grouped_abort_retirements =
           std::make_shared<std::vector<RetiredRecord>>(std::move(*discarded));
@@ -3185,7 +3185,7 @@ acquire_active_stream:
   // the old GC copy outrank the later publication at the same command seq.
   // From here through index/side publication the owner never yields.
   auto allocated_lsn = AllocateLsn(store);
-  LAVIK_CO_RETURN_IF_ERROR(allocated_lsn.status());
+  LAVIK_CO_RETURN_IF_ERROR(allocated_lsn);
   const std::uint64_t lsn = *allocated_lsn;
   updated.max_lsn_ = std::max(updated.max_lsn_, lsn);
   LAVIK_FAULT_INJECT(

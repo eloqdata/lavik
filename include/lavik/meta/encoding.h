@@ -213,12 +213,12 @@ class MetaReader {
   absl::StatusOr<std::vector<T>> ReadList(std::uint32_t max_count,
                                           ReadElem read_elem) {
     auto count = ReadCount(max_count);
-    LAVIK_RETURN_IF_ERROR(count.status());
+    LAVIK_RETURN_IF_ERROR(count);
     std::vector<T> items;
     items.reserve(*count);
     for (std::uint32_t i = 0; i < *count; ++i) {
       auto item = read_elem(*this);
-      LAVIK_RETURN_IF_ERROR(item.status());
+      LAVIK_RETURN_IF_ERROR(item);
       items.push_back(std::move(*item));
     }
     return items;
@@ -227,13 +227,13 @@ class MetaReader {
   template <typename T, typename ReadElem>
   absl::StatusOr<std::optional<T>> ReadOptional(ReadElem read_elem) {
     auto present = ReadU8();
-    LAVIK_RETURN_IF_ERROR(present.status());
+    LAVIK_RETURN_IF_ERROR(present);
     if (*present == 0) return std::optional<T>{};
     if (*present != 1) {
       return MetaFailStopError("optional presence tag must be 0 or 1");
     }
     auto value = read_elem(*this);
-    LAVIK_RETURN_IF_ERROR(value.status());
+    LAVIK_RETURN_IF_ERROR(value);
     return std::optional<T>{std::move(*value)};
   }
 
@@ -251,7 +251,7 @@ void WriteFixedArray(MetaWriter& w, const std::array<std::uint8_t, N>& a) {
 template <std::size_t N>
 absl::StatusOr<std::array<std::uint8_t, N>> ReadFixedArray(MetaReader& r) {
   auto raw = r.ReadRaw(N);
-  LAVIK_RETURN_IF_ERROR(raw.status());
+  LAVIK_RETURN_IF_ERROR(raw);
   std::array<std::uint8_t, N> out{};
   std::copy_n(raw->data(), N, reinterpret_cast<char*>(out.data()));
   return out;

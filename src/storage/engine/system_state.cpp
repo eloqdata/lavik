@@ -441,12 +441,12 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
   };
 
   auto manifest = read_extent(selected->root_.manifest_, 0);
-  LAVIK_RETURN_IF_ERROR(manifest.status());
+  LAVIK_RETURN_IF_ERROR(manifest);
   if (manifest->size() != selected->root_.manifest_bytes_) {
     return absl::InternalError("system-state root manifest length mismatch");
   }
   auto decoded = DecodeSystemStateManifest(*manifest);
-  LAVIK_RETURN_IF_ERROR(decoded.status());
+  LAVIK_RETURN_IF_ERROR(decoded);
   if (decoded->generation_ != selected->generation_) {
     return absl::InternalError("system-state root and manifest disagree");
   }
@@ -461,7 +461,7 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
          ++index) {
       auto part = read_extent(decoded->catalog_extents_->at(index),
                               static_cast<std::uint32_t>(index));
-      LAVIK_RETURN_IF_ERROR(part.status());
+      LAVIK_RETURN_IF_ERROR(part);
       catalog->append(*part);
     }
     if (catalog->size() != decoded->catalog_bytes_ ||
@@ -526,7 +526,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
       });
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -895,7 +895,7 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
         0, [this, session_id]() { return BeginReplicaFullSync(session_id); });
   }
   auto paused = co_await BeginPopulationChange(session_id);
-  LAVIK_CO_RETURN_IF_ERROR(paused.status());
+  LAVIK_CO_RETURN_IF_ERROR(paused);
   const auto generation = paused->generation_;
   co_await system_state_mutex_.Lock();
   UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);

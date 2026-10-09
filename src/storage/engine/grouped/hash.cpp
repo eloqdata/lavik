@@ -201,7 +201,7 @@ absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
     return cursor;
   }
   auto size = PayloadBytes(group.value_);
-  LAVIK_RETURN_IF_ERROR(size.status());
+  LAVIK_RETURN_IF_ERROR(size);
   cursor.encoded_bytes_ = kGroupHeaderBytes + *size;
   auto& bytes = cursor.header_;
   EncodeGroupHeader(bytes, group, group.field_count(), *size);
@@ -249,7 +249,7 @@ std::optional<std::string_view> HashGroupEncoder::Next() noexcept {
 
 absl::StatusOr<std::string> EncodeHashGroup(const HashGroupSnapshot& group) {
   auto cursor = HashGroupEncoder::Create(group);
-  LAVIK_RETURN_IF_ERROR(cursor.status());
+  LAVIK_RETURN_IF_ERROR(cursor);
   std::string bytes;
   bytes.reserve(cursor->encoded_bytes());
   while (auto span = cursor->Next()) bytes.append(*span);
@@ -287,7 +287,7 @@ absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
 
 absl::StatusOr<HashGroupSnapshot> DecodeHashGroup(std::string_view bytes) {
   auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
-  LAVIK_RETURN_IF_ERROR(metadata.status());
+  LAVIK_RETURN_IF_ERROR(metadata);
   HashGroupSnapshot group{
       .incarnation_ = metadata->incarnation_,
       .id_ = metadata->id_,
@@ -343,7 +343,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
     std::span<const HashEntryView> edits) {
   auto metadata = DecodeHashGroupMetadata(payload, payload.size());
-  LAVIK_RETURN_IF_ERROR(metadata.status());
+  LAVIK_RETURN_IF_ERROR(metadata);
   if (metadata->retired_)
     return absl::DataLossError("cannot edit a retired Hash leaf");
   if (edits.size() == 1) {
@@ -357,7 +357,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
                              }));
     auto size = AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
                                     edit.value_.size(), kHashGroupPayloadLimit);
-    LAVIK_RETURN_IF_ERROR(size.status());
+    LAVIK_RETURN_IF_ERROR(size);
     if (!metadata->id_.ContainsHash(ComputeDigest(edit.field_, seed).value_))
       return absl::InvalidArgumentError("Hash edit outside its group route");
     HashGroupEdit result;
@@ -450,10 +450,10 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
       };
       if (metadata->field_count_ != 0) {
         auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
-        LAVIK_RETURN_IF_ERROR(reader.status());
+        LAVIK_RETURN_IF_ERROR(reader);
         for (std::size_t i = 0; i < reader->size(); ++i) {
           auto entry = reader->Next();
-          LAVIK_RETURN_IF_ERROR(entry.status());
+          LAVIK_RETURN_IF_ERROR(entry);
           if (entry->field_ == edit.field_) {
             if (!remove) append(edit);
           } else {
@@ -499,7 +499,7 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
   for (const auto& edit : edits) {
     auto size = AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
                                     edit.value_.size(), kHashGroupPayloadLimit);
-    LAVIK_RETURN_IF_ERROR(size.status());
+    LAVIK_RETURN_IF_ERROR(size);
     const FieldKey key{edit.field_, ComputeDigest(edit.field_, seed).value_};
     if (!metadata->id_.ContainsHash(key.hash))
       return absl::InvalidArgumentError("Hash edit outside its group route");
@@ -602,12 +602,12 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
     auto size =
         AppendHashEntrySize(kCompactHeaderBytes, entry.field_.size(),
                             entry.value_.size(), kHashGroupPayloadLimit);
-    LAVIK_RETURN_IF_ERROR(size.status());
+    LAVIK_RETURN_IF_ERROR(size);
   }
   const auto bytes = PayloadBytes(group.value_);
   if ((bytes.ok() && *bytes <= target_bytes) ||
       group.value_.entries_.size() <= 1 || group.id_.bits_ == 64) {
-    LAVIK_RETURN_IF_ERROR(bytes.status());
+    LAVIK_RETURN_IF_ERROR(bytes);
     std::vector<HashGroupSnapshot> leaves;
     leaves.push_back(std::move(group));
     return leaves;
@@ -969,7 +969,7 @@ absl::StatusOr<HashGroupMutationPlan> PlanHashGroupMutation(
     auto replacements =
         SplitHashGroup(std::move(loaded_by_id.at(id)->snapshot_),
                        directory.root().seed_, target_bytes);
-    LAVIK_RETURN_IF_ERROR(replacements.status());
+    LAVIK_RETURN_IF_ERROR(replacements);
     if (replacements->size() > 1) {
       if (replacements->size() - 1 >
           std::numeric_limits<std::uint32_t>::max() - plan.root_.group_count_) {

@@ -715,7 +715,7 @@ namespace {
 
 absl::Status ReadStoreSchemaVersion(MetaReader& r, std::uint16_t expected) {
   auto version = r.ReadU16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != expected) {
     return MetaFailStopError("unsupported operation store schema version");
   }
@@ -724,7 +724,7 @@ absl::Status ReadStoreSchemaVersion(MetaReader& r, std::uint16_t expected) {
 
 absl::Status ReadLifecycle(MetaReader& r, MetaOperationLifecycle& out) {
   auto tag = r.ReadU8();
-  LAVIK_RETURN_IF_ERROR(tag.status());
+  LAVIK_RETURN_IF_ERROR(tag);
   if (*tag < static_cast<std::uint8_t>(MetaOperationLifecycle::kSubmitted) ||
       *tag > static_cast<std::uint8_t>(MetaOperationLifecycle::kAborted)) {
     return MetaFailStopError("unknown operation lifecycle tag");
@@ -758,7 +758,7 @@ absl::StatusOr<MetaTerminalReceipt> ReadTerminalReceipt(MetaReader& r) {
                          ReadFixedArray<kMetaBootIncarnationBytes>(r));
   LAVIK_ASSIGN_OR_RETURN(receipt.assignment_id_, ReadFixedArray<16>(r));
   auto status = r.ReadU8();
-  LAVIK_RETURN_IF_ERROR(status.status());
+  LAVIK_RETURN_IF_ERROR(status);
   receipt.status_ = static_cast<MetaDirectiveResultStatus>(*status);
   if (!ValidResultStatus(receipt.status_)) {
     return MetaFailStopError("unknown terminal receipt status");
@@ -808,9 +808,9 @@ absl::StatusOr<MetaOperationRecord> ReadRecord(MetaReader& r) {
           kMaxMetaDirectivesPerOperation,
           [](MetaReader& reader) -> absl::StatusOr<MetaCurrentDirective> {
             auto spec = ReadMetaDirectiveSpec(reader);
-            LAVIK_RETURN_IF_ERROR(spec.status());
+            LAVIK_RETURN_IF_ERROR(spec);
             auto revision = reader.ReadU64();
-            LAVIK_RETURN_IF_ERROR(revision.status());
+            LAVIK_RETURN_IF_ERROR(revision);
             return MetaCurrentDirective{std::move(*spec), *revision};
           }));
   LAVIK_ASSIGN_OR_RETURN(
@@ -938,10 +938,10 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
   auto live_records = r.ReadList<MetaOperationRecord>(
       static_cast<std::uint32_t>(max_live),
       [](MetaReader& rr) { return ReadRecord(rr); });
-  LAVIK_RETURN_IF_ERROR(live_records.status());
+  LAVIK_RETURN_IF_ERROR(live_records);
   auto summaries = r.ReadList<MetaOperationArchiveSummary>(
       max_archived, [](MetaReader& rr) { return ReadSummary(rr); });
-  LAVIK_RETURN_IF_ERROR(summaries.status());
+  LAVIK_RETURN_IF_ERROR(summaries);
   LAVIK_RETURN_IF_ERROR(r.Finish());
 
   MetaOperationStore store(max_active, max_archived,
@@ -1038,7 +1038,7 @@ absl::StatusOr<MetaOperationArchiveExport> DecodeMetaOperationArchiveExport(
   auto summaries = r.ReadList<MetaOperationArchiveSummary>(
       kMaxMetaArchivedOperationSummaries,
       [](MetaReader& rr) { return ReadSummary(rr); });
-  LAVIK_RETURN_IF_ERROR(summaries.status());
+  LAVIK_RETURN_IF_ERROR(summaries);
   LAVIK_RETURN_IF_ERROR(r.Finish());
   MetaOperationArchiveExport out;
   out.summaries_ = std::move(*summaries);

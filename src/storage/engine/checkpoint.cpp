@@ -402,7 +402,7 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
       h.key_bytes > MaxKeyBytes() || !reader.ReadBytes(h.key_bytes, result.key))
     return absl::DataLossError("invalid checkpoint object header");
   auto location = LoadLocation(h.location, workers);
-  LAVIK_RETURN_IF_ERROR(location.status());
+  LAVIK_RETURN_IF_ERROR(location);
   result.location = *location;
   // Unlike the hot inline checkpoint path, complex keys pay this validation
   // once per object. A malformed fragment must not publish a cross-shard view.
@@ -410,7 +410,7 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
       ComputeDigest(result.key) != h.digest)
     return absl::DataLossError("checkpoint object key identity mismatch");
   auto extents = reader.ReadExtents(h.extent_count, location->external());
-  LAVIK_RETURN_IF_ERROR(extents.status());
+  LAVIK_RETURN_IF_ERROR(extents);
   result.extents = std::move(*extents);
   std::string_view root_bytes;
   if (!reader.ReadBytes(h.root_bytes, root_bytes) ||
@@ -427,12 +427,12 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
   std::uint64_t incarnation;
   if (ordered) {
     auto root = DecodeOrderedCollectionRoot(root_bytes);
-    LAVIK_RETURN_IF_ERROR(root.status());
+    LAVIK_RETURN_IF_ERROR(root);
     incarnation = root->incarnation_;
     result.root = *root;
   } else {
     auto root = DecodeGroupedHashRoot(root_bytes);
-    LAVIK_RETURN_IF_ERROR(root.status());
+    LAVIK_RETURN_IF_ERROR(root);
     incarnation = root->incarnation_;
     result.root = *root;
   }
@@ -447,9 +447,9 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
         !identities.emplace(g.id, g.bits).second)
       return absl::DataLossError("invalid or duplicate checkpoint group");
     auto physical = LoadLocation(g.location, workers);
-    LAVIK_RETURN_IF_ERROR(physical.status());
+    LAVIK_RETURN_IF_ERROR(physical);
     auto manifest = reader.ReadExtents(g.extent_count, physical->external());
-    LAVIK_RETURN_IF_ERROR(manifest.status());
+    LAVIK_RETURN_IF_ERROR(manifest);
     GroupedRecordId id{.prefix_ = g.id, .bits_ = g.bits};
     locations.push_back({.id_ = id,
                          .location_ = *physical,
@@ -504,18 +504,18 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
     auto directory = OrderedGroupDirectory::Recover(
         root, root.revision_, ordered_records, committed,
         location->mutation_sequence_, std::move(member_directory));
-    LAVIK_RETURN_IF_ERROR(directory.status());
+    LAVIK_RETURN_IF_ERROR(directory);
     object = GroupedObject::CreateOrdered(object_version, std::move(*directory),
                                           locations, arena);
   } else {
     auto directory = HashGroupDirectory::Recover(
         std::get<GroupedHashRoot>(*result.root), location->mutation_sequence_,
         hash_records, committed);
-    LAVIK_RETURN_IF_ERROR(directory.status());
+    LAVIK_RETURN_IF_ERROR(directory);
     object = GroupedObject::Create(object_version, std::move(*directory),
                                    locations, arena);
   }
-  LAVIK_RETURN_IF_ERROR(object.status());
+  LAVIK_RETURN_IF_ERROR(object);
   result.object = std::move(*object);
   return result;
 }
@@ -1030,7 +1030,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRootOnDeviceLocal(
       kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -1118,7 +1118,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
        &payload](std::uint32_t record_count) -> Task<absl::Status> {
     auto reserved =
         co_await AllocateBlock(store, AllocationPurpose::kShutdownMetadata);
-    LAVIK_CO_RETURN_IF_ERROR(reserved.status());
+    LAVIK_CO_RETURN_IF_ERROR(reserved);
     const std::size_t write_bytes = payload->Finalize(
         reserved->block_id_, reserved->allocation_epoch_, generation,
         store.worker_->id(), record_count, worker_count_);
@@ -1680,7 +1680,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
   }
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -1872,7 +1872,7 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
   for (std::size_t index = 0; index < candidates.size(); ++index) {
     CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
     auto candidate = co_await current.Wait();
-    LAVIK_CO_RETURN_IF_ERROR(candidate.status());
+    LAVIK_CO_RETURN_IF_ERROR(candidate);
     if (index + 1 < candidates.size()) {
       start_prefetch(prefetch[(index + 1) % prefetch.size()],
                      candidates[index + 1], true);
@@ -1881,7 +1881,7 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
     auto chunk = ValidateCheckpointChunk(
         candidates[index], current.data(), **candidate,
         checkpoint_root_.generation_, worker_count_, false);
-    LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+    LAVIK_CO_RETURN_IF_ERROR(chunk);
     if (!result->digest_seed_.has_value()) {
       result->digest_seed_ = chunk->digest_seed_;
     } else if (*result->digest_seed_ != chunk->digest_seed_) {
@@ -1905,7 +1905,7 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
   for (std::size_t index = 0; index < capacity_blocks.size(); ++index) {
     CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
     auto candidate = co_await current.Wait();
-    LAVIK_CO_RETURN_IF_ERROR(candidate.status());
+    LAVIK_CO_RETURN_IF_ERROR(candidate);
     if (index + 1 < capacity_blocks.size()) {
       start_prefetch(prefetch[(index + 1) % prefetch.size()],
                      capacity_blocks[index + 1], false);
@@ -1918,7 +1918,7 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
     auto chunk = ValidateCheckpointChunk(capacity_blocks[index], current.data(),
                                          block, checkpoint_root_.generation_,
                                          worker_count_, true);
-    LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+    LAVIK_CO_RETURN_IF_ERROR(chunk);
     if (chunk->kind_ != CheckpointChunkKind::kIndexCapacity) {
       co_return absl::InternalError(
           "checkpoint capacity chunk changed kind after discovery");
@@ -2150,7 +2150,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
               .index_generation_ = partition.grouped_generations_[db]};
         },
         store.record_index_entry_arena_);
-    LAVIK_RETURN_IF_ERROR(decoded.status());
+    LAVIK_RETURN_IF_ERROR(decoded);
     auto& object = *decoded;
     auto& partition = PartitionFor(store, object.header.partition);
     // Keep root metadata until the global validation barrier: on fallback
@@ -2185,7 +2185,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     auto decoded_chunk = ValidateCheckpointChunk(block_id, data, block,
                                                  checkpoint_root_.generation_,
                                                  worker_count_, true);
-    LAVIK_CO_RETURN_IF_ERROR(decoded_chunk.status());
+    LAVIK_CO_RETURN_IF_ERROR(decoded_chunk);
     if (decoded_chunk->digest_seed_ != CurrentDigestSeed()) {
       co_return absl::InternalError(
           "checkpoint digest seed changed after discovery");
@@ -2508,7 +2508,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             co_return co_await current.Wait();
           });
     }
-    LAVIK_CO_RETURN_IF_ERROR(candidate.status());
+    LAVIK_CO_RETURN_IF_ERROR(candidate);
     if (index + 1 < result->body_blocks_.size()) {
       start_prefetch(prefetch[(index + 1) % prefetch.size()],
                      result->body_blocks_[index + 1]);

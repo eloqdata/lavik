@@ -121,14 +121,14 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
        *expected_items > std::numeric_limits<std::uint32_t>::max()))
     co_return absl::InvalidArgumentError("invalid collection restore input");
   const auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
-  LAVIK_CO_RETURN_IF_ERROR(metadata.status());
+  LAVIK_CO_RETURN_IF_ERROR(metadata);
   const bool exists = metadata->exists_;
   if (exists && !replace) co_return RestoreRawResult{.busy_ = true};
   if (expire_at_ms != 0 && expire_at_ms <= UnixTimeMillis()) {
     if (!exists) co_return RestoreRawResult{};
     auto deleted = co_await DeleteLocked(db_id, key, digest, outer, replication,
                                          mutation_precondition);
-    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
+    LAVIK_CO_RETURN_IF_ERROR(deleted);
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
 
@@ -165,7 +165,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     if (outer->grouped_ingest_batch_ != nullptr)
       co_return absl::FailedPreconditionError("nested collection restore");
     const auto decision = PrepareGroupedDecision(*outer);
-    LAVIK_CO_RETURN_IF_ERROR(decision.status());
+    LAVIK_CO_RETURN_IF_ERROR(decision);
     // Transaction callbacks are serial on each owner. Temporarily owning the
     // whole accumulator preserves its prefix/capacity and permits noexcept
     // return on abort; no vector merge may allocate on an OOM rollback path.
@@ -245,7 +245,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     auto found = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                             digest, key);
-    LAVIK_CO_RETURN_IF_ERROR(found.status());
+    LAVIK_CO_RETURN_IF_ERROR(found);
     prefix_address = *found;
     const auto old = partition.grouped_objects_[db_id].CurrentForMutation(key);
     const auto old_records = old ? old->record_count() : 0;
@@ -499,16 +499,16 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     bool done = false;
     while (!done) {
       auto page = co_await reader();
-      LAVIK_CO_RETURN_IF_ERROR(page.status());
+      LAVIK_CO_RETURN_IF_ERROR(page);
       if (page->value_type_ != type)
         co_return absl::DataLossError("collection input changes type");
       auto bytes = CollectionCompactEncoder::MeasurePage(*page);
-      LAVIK_CO_RETURN_IF_ERROR(bytes.status());
+      LAVIK_CO_RETURN_IF_ERROR(bytes);
       if (type == ValueType::kStream) {
         std::size_t largest = stream_validator.RetainedBytes();
         for (const auto& record : page->elements_) {
           auto key = StreamRecordKey(record);
-          LAVIK_CO_RETURN_IF_ERROR(key.status());
+          LAVIK_CO_RETURN_IF_ERROR(key);
           largest = std::max(largest, key->size());
         }
         if (largest > (SIZE_MAX - 512) / 4)
@@ -579,7 +579,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       const auto location = current->version().root_;
       auto compact = co_await LoadGroupedValue(store, partition, db_id, key,
                                                digest, location, nullptr);
-      LAVIK_CO_RETURN_IF_ERROR(compact.status());
+      LAVIK_CO_RETURN_IF_ERROR(compact);
       const auto bytes = compact->value();
       if (bytes.size() >= kCollectionGroupTargetBytes)
         co_return absl::InternalError("collection demotion byte bound failed");

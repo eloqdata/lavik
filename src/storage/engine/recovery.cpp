@@ -77,14 +77,14 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer io = lease.io_buffer();
   io.size_ = read_bytes;
   const auto [file_id, block_offset] = FileOffset(ref.block_id_);
   auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
                                          io, lease.registered(), block_offset);
-  LAVIK_CO_RETURN_IF_ERROR(read.status());
+  LAVIK_CO_RETURN_IF_ERROR(read);
   if (*read != read_bytes) {
     co_return absl::InternalError("short recovered extent read");
   }
@@ -281,7 +281,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     absl::flat_hash_set<std::uint64_t>* committed_txids,
     bool indirect_key_pass) {
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer header_buffer = lease.io_buffer();
   header_buffer.size_ = kBlockHeaderBytes;
@@ -388,7 +388,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       auto read = co_await ReadStorageBuffer(
           *store.worker_, store.files_[file_id], header_buffer,
           lease.registered(), block_offset);
-      LAVIK_CO_RETURN_IF_ERROR(read.status());
+      LAVIK_CO_RETURN_IF_ERROR(read);
       if (*read != kBlockHeaderBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short read while scanning block header");
@@ -495,7 +495,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
                                         recovery.buffer_, recovery.registered(),
                                         block_offset);
-      LAVIK_CO_RETURN_IF_ERROR(read.status());
+      LAVIK_CO_RETURN_IF_ERROR(read);
       if (*read != kStorageBlockBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short read while scanning committed block");
@@ -680,7 +680,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         Digest indirect_digest{};
         if (record.key_indirect_) [[unlikely]] {
           auto handle = co_await FindIndirectKey(record.key_id_);
-          LAVIK_CO_RETURN_IF_ERROR(handle.status());
+          LAVIK_CO_RETURN_IF_ERROR(handle);
           loaded_key = (*handle)->recovery_key_;
           indirect_digest = (*handle)->digest_;
           if (loaded_key == nullptr || loaded_key->size() != record.key_bytes_)
@@ -765,7 +765,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 reinterpret_cast<const char*>(payload), record.payload_bytes_);
             if (ordered && IsOrderedPageId(auxiliary_group->id_)) {
               auto decoded = DecodeOrderedGroup(encoded);
-              LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+              LAVIK_CO_RETURN_IF_ERROR(decoded);
               if (decoded->kind_ != ordered_kind ||
                   decoded->incarnation_ != auxiliary_group->incarnation_ ||
                   decoded->id_ != auxiliary_group->id_.prefix_ ||
@@ -783,7 +783,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 if (!decoded->retired_) {
                   auto max_key =
                       StreamRecordKey(decoded->entries_.back().value_);
-                  LAVIK_CO_RETURN_IF_ERROR(max_key.status());
+                  LAVIK_CO_RETURN_IF_ERROR(max_key);
                   ordered_group->stream_max_key_.Set(*max_key);
                 }
               } else if (!decoded->entries_.empty()) {
@@ -793,7 +793,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               }
             } else {
               auto decoded = DecodeHashGroup(encoded);
-              LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+              LAVIK_CO_RETURN_IF_ERROR(decoded);
               if (decoded->incarnation_ != auxiliary_group->incarnation_ ||
                   decoded->id_ != auxiliary_group->id_ ||
                   decoded->retired_ != auxiliary_group->retired_ ||
@@ -835,7 +835,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
           if (ordered) {
             auto decoded = DecodeOrderedCollectionRoot(encoded);
-            LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+            LAVIK_CO_RETURN_IF_ERROR(decoded);
             if (decoded->revision_ == 0) {
               decoded->revision_ = record.mutation_sequence_;
             }
@@ -849,7 +849,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             AtomicMax(&recovery_max_txid_, decoded->incarnation_);
           } else {
             auto decoded = DecodeGroupedHashRoot(encoded);
-            LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+            LAVIK_CO_RETURN_IF_ERROR(decoded);
             if (decoded->field_count_ != record.logical_size_) {
               co_return absl::DataLossError(
                   "grouped root count disagrees with its record header");
@@ -1433,7 +1433,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     auto object =
         GroupedObject::Create(version, std::move(*directory), locations,
                               store.record_index_entry_arena_);
-    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_CO_RETURN_IF_ERROR(object);
     LAVIK_CO_RETURN_IF_ERROR(partition.grouped_objects_[root_db].Publish(
         key, nullptr, std::move(*object)));
     retain_selected();
@@ -1535,9 +1535,9 @@ StorageEngine::Impl::RecoverOrderedObject(
       OrderedGroupMetadataDecoder decoder(bytes);
       auto prefix = co_await LoadRecoveryPayloadPrefix(
           store, extents, kOrderedGroupHeaderBytes, &decoder);
-      LAVIK_CO_RETURN_IF_ERROR(prefix.status());
+      LAVIK_CO_RETURN_IF_ERROR(prefix);
       auto metadata = decoder.Finish();
-      LAVIK_CO_RETURN_IF_ERROR(metadata.status());
+      LAVIK_CO_RETURN_IF_ERROR(metadata);
       if (metadata->kind_ != root.kind_ ||
           metadata->incarnation_ != candidate.incarnation_ ||
           metadata->id_ != candidate.id_ ||
@@ -1574,7 +1574,7 @@ StorageEngine::Impl::RecoverOrderedObject(
   auto directory = OrderedGroupDirectory::Recover(
       root, revision, candidates, recovery_committed_txids_,
       version.root_.mutation_sequence_, std::move(members));
-  LAVIK_CO_RETURN_IF_ERROR(directory.status());
+  LAVIK_CO_RETURN_IF_ERROR(directory);
   RecoveryVector<GroupedRecordLocation> locations;
   locations.reserve(candidates.size());
   const auto append = [&](const OrderedGroupEntry& candidate) {
@@ -1637,9 +1637,9 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
   // reused obsolete extent cannot make an otherwise valid startup fail.
   auto prefix =
       co_await LoadRecoveryPayloadPrefix(store, extents, kHashGroupHeaderBytes);
-  LAVIK_CO_RETURN_IF_ERROR(prefix.status());
+  LAVIK_CO_RETURN_IF_ERROR(prefix);
   auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
-  LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(decoded);
   const auto expected = record.AuxiliaryGroup();
   if (decoded->incarnation_ != expected.incarnation_ ||
       decoded->id_ != expected.id_ ||

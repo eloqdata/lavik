@@ -340,7 +340,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   auto resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                  candidate.digest_, candidate.key_);
-  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+  LAVIK_CO_RETURN_IF_ERROR(resolved);
   auto* current = *resolved;
   const auto matches_candidate = [&candidate](const RecordIndex::Entry* entry) {
     return entry != nullptr && entry->value_.kind() == RecordKind::kValue &&
@@ -384,7 +384,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                  candidate.digest_, candidate.key_);
-  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+  LAVIK_CO_RETURN_IF_ERROR(resolved);
   current = *resolved;
   if (!matches_candidate(current)) co_return absl::OkStatus();
   if (current->value_.shielding()) co_return durable;
@@ -403,7 +403,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
             .replication_epoch_ = partition.replication_epoch_,
             .index_generation_ =
                 partition.grouped_generations_[candidate.db_id_]});
-    LAVIK_CO_RETURN_IF_ERROR(view.status());
+    LAVIK_CO_RETURN_IF_ERROR(view);
     if (*view == nullptr)
       co_return absl::DataLossError("missing expired grouped view");
     grouped = std::move(*view);
@@ -591,7 +591,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         for (const ExternalExpired& candidate : external_expired) {
           auto key = co_await LoadOutOfIndexKey(*store, candidate.location_,
                                                 candidate.key_bytes_);
-          LAVIK_CO_RETURN_IF_ERROR(key.status());
+          LAVIK_CO_RETURN_IF_ERROR(key);
           RecordIndex::Entry* current =
               index.FindAddress(candidate.entry_address_, candidate.hash_);
           if (current == nullptr) continue;

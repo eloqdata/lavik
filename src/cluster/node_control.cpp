@@ -497,7 +497,7 @@ NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
   }
 
   auto desired = DesiredLocalClusterControl();
-  LAVIK_RETURN_IF_ERROR(desired.status());
+  LAVIK_RETURN_IF_ERROR(desired);
   // Static and older in-process test adapters have no desired-control layer.
   // Meta-managed projections always populate it and therefore take the
   // stronger committed owner/action validation below.
@@ -1402,7 +1402,7 @@ absl::Status NodeControlInstaller::ApplyAuthority(
 
   if (message.kind_ == AuthorityMessage::Kind::kLeaseGrant) {
     auto desired = ValidateLeaseGrantContext(message, now);
-    LAVIK_RETURN_IF_ERROR(desired.status());
+    LAVIK_RETURN_IF_ERROR(desired);
     const MonotonicTime deadline = SaturatingLeaseDeadline(message);
     return authority_.RenewLease(message.session_, message.anchor_, deadline,
                                  now);
@@ -1415,7 +1415,7 @@ absl::Status NodeControlInstaller::ApplyAuthority(
   }
   InvalidateDirectiveAdmissions();
   auto transitioned = ApplyFenceLocal(message);
-  LAVIK_RETURN_IF_ERROR(transitioned.status());
+  LAVIK_RETURN_IF_ERROR(transitioned);
   absl::Status result = actions_.RevokeSourceAuthorizations();
   if (*transitioned) {
     result = FirstFailure(std::move(result),
@@ -1486,7 +1486,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
   MonotonicTime now = LeaseClockNow();
   auto initial = ValidateLeaseGrantContext(message, now);
-  LAVIK_CO_RETURN_IF_ERROR(initial.status());
+  LAVIK_CO_RETURN_IF_ERROR(initial);
 
   // A CLOCK_MONOTONIC-backed worker timer may still be asleep after host
   // suspend even though CLOCK_BOOTTIME says the lease is already due. Finish
@@ -1500,7 +1500,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
         co_await FinishExpiredLeaseTransition(existing->second, now));
     now = LeaseClockNow();
     initial = ValidateLeaseGrantContext(message, now);
-    LAVIK_CO_RETURN_IF_ERROR(initial.status());
+    LAVIK_CO_RETURN_IF_ERROR(initial);
   }
 
   auto lease = std::make_shared<LeaseDeadline>(deadline.time_since_epoch());
@@ -1789,7 +1789,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
   InvalidateDirectiveAdmissions();
   RetireLeaseSchedule(message.anchor_.group_id_);
   auto transitioned = ApplyFenceLocal(message);
-  LAVIK_CO_RETURN_IF_ERROR(transitioned.status());
+  LAVIK_CO_RETURN_IF_ERROR(transitioned);
   absl::Status result = co_await WaitForDirectiveAdmissions();
   result = FirstFailure(std::move(result),
                         co_await actions_.RevokeExpirationAuthority());

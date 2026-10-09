@@ -1358,7 +1358,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
     const std::string& path) {
   if (bycorf::IsSpdkStoragePath(path)) {
     auto device = bycorf::ProbeSpdkStorage(path);
-    LAVIK_RETURN_IF_ERROR(device.status());
+    LAVIK_RETURN_IF_ERROR(device);
     return StoragePathInfo{.is_block_device_ = true,
                            .io_alignment_ = device->io_alignment_,
                            .size_bytes_ = device->size_bytes_,
@@ -1373,7 +1373,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
   }
   if (S_ISBLK(file_info.st_mode)) {
     auto device = ProbeBlockDevice(path);
-    LAVIK_RETURN_IF_ERROR(device.status());
+    LAVIK_RETURN_IF_ERROR(device);
     return StoragePathInfo{
         .is_block_device_ = true,
         .io_alignment_ = device->io_alignment_,

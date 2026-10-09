@@ -280,7 +280,7 @@ bycorf::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
   const std::string_view header(
       reinterpret_cast<const char*>(header_bytes.data()), header_bytes.size());
   auto parsed = ParseFrameHeader(header);
-  LAVIK_CO_RETURN_IF_ERROR(parsed.status());
+  LAVIK_CO_RETURN_IF_ERROR(parsed);
 
   std::string encoded(kFrameHeaderBytes + parsed->payload_length, '\0');
   std::memcpy(encoded.data(), header.data(), header.size());
@@ -295,7 +295,7 @@ bycorf::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
 
 bycorf::Task<absl::StatusOr<WireMessage>> ControlFrameStream::ReadMessage() {
   auto frame = co_await ReadFrame();
-  LAVIK_CO_RETURN_IF_ERROR(frame.status());
+  LAVIK_CO_RETURN_IF_ERROR(frame);
   co_return DecodeMessage(frame->type, frame->payload);
 }
 
@@ -314,7 +314,7 @@ bycorf::Task<absl::Status> ControlFrameStream::WriteEncoded(
       co_return absl::DeadlineExceededError(
           "control write made no progress before its deadline");
     }
-    LAVIK_CO_RETURN_IF_ERROR(result.status());
+    LAVIK_CO_RETURN_IF_ERROR(result);
     if (*result == 0) {
       co_return absl::InternalError("control write made zero progress");
     }
@@ -326,7 +326,7 @@ bycorf::Task<absl::Status> ControlFrameStream::WriteEncoded(
 bycorf::Task<absl::Status> ControlFrameStream::WriteMessage(
     EncodedMessage message, std::function<void()> before_write) {
   auto encoded = encoder_.Encode(message.type, message.payload);
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
   co_return co_await WriteEncoded(std::move(*encoded), std::move(before_write));
 }
 
@@ -440,7 +440,7 @@ struct ControlSessionWriter::Impl {
                                const WireMessage& message,
                                const std::shared_ptr<Request>& request) {
     auto encoded = EncodeMessage(message);
-    LAVIK_RETURN_IF_ERROR(encoded.status());
+    LAVIK_RETURN_IF_ERROR(encoded);
     return QueueFrame(priority, std::move(*encoded), request);
   }
 
@@ -606,7 +606,7 @@ bycorf::Task<absl::Status> ControlSessionWriter::Write(
     co_return *impl_->terminal_error_;
   }
   auto encoded = EncodeMessage(message);
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
   co_return co_await Write(priority, std::move(*encoded),
                            std::move(before_write));
 }
@@ -658,14 +658,14 @@ bycorf::Task<absl::Status> ControlSessionWriter::WriteFullDesiredState(
     // Validation decode only: the canonical bytes are already the exact
     // kFullDesiredState payload, so the write path forwards them unchanged.
     auto desired = DecodeFullDesiredState(*encoded);
-    LAVIK_CO_RETURN_IF_ERROR(desired.status());
+    LAVIK_CO_RETURN_IF_ERROR(desired);
     co_return co_await Write(
         MessagePriority::kReliable,
         EncodedMessage{MessageType::kFullDesiredState, *encoded});
   }
 
   auto object_id = GenerateId128();
-  LAVIK_CO_RETURN_IF_ERROR(object_id.status());
+  LAVIK_CO_RETURN_IF_ERROR(object_id);
   co_return co_await WriteTransfer(TransferKind::kFullDesiredState, *object_id,
                                    std::move(encoded));
 }

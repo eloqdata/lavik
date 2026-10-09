@@ -178,7 +178,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     auto decoded = co_await LoadOrderedGroupSnapshot(
         store, partition, stream->db_id_, stream->key_, stream->digest_, object,
         id.prefix_, true);
-    LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(decoded);
     if (page.value_type_ == ValueType::kStream ||
         page.value_type_ == ValueType::kString ||
         page.value_type_ == ValueType::kList) {
@@ -196,7 +196,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     auto decoded = co_await LoadHashGroupSnapshot(
         store, partition, stream->db_id_, stream->key_, stream->digest_, object,
         id, true);
-    LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(decoded);
     if (page.value_type_ == ValueType::kHash)
       page.fields_.reserve(count);
     else
@@ -254,7 +254,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
                .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                .replication_epoch_ = partition.replication_epoch_,
                .index_generation_ = partition.grouped_generations_[db_id]});
-  LAVIK_CO_RETURN_IF_ERROR(object.status());
+  LAVIK_CO_RETURN_IF_ERROR(object);
   if (*object == nullptr)
     co_return absl::DataLossError("missing full-sync collection view");
   auto capture = partition.fullsync_subscribers_.find(session_id);
@@ -325,9 +325,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
                             : 8;
   while (!stream->pages_done_) {
     auto page = co_await NextFullSyncCollectionPage(stream);
-    LAVIK_CO_RETURN_IF_ERROR(page.status());
+    LAVIK_CO_RETURN_IF_ERROR(page);
     auto measured = CollectionCompactEncoder::MeasurePage(*page);
-    LAVIK_CO_RETURN_IF_ERROR(measured.status());
+    LAVIK_CO_RETURN_IF_ERROR(measured);
     if (*measured > std::numeric_limits<std::uint64_t>::max() - bytes)
       co_return absl::OutOfRangeError(
           "full-sync collection wire length overflow");
@@ -339,7 +339,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
           ? stream->saved_.grouped_->ordered_directory().root().item_count_
           : location.logical_size_,
       bytes);
-  LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoder);
   stream->encoder_.emplace(std::move(*encoder));
   stream->encoded_bytes_ = bytes;
   stream->ResetCursor();

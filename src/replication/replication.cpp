@@ -344,7 +344,7 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
   const std::string service = std::to_string(port);
   if (cancellable_dns) {
     auto resolved = co_await ResolveRecoveryAddress(host, port, sockets);
-    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+    LAVIK_CO_RETURN_IF_ERROR(resolved);
     addresses = std::exchange((*resolved)->addresses_, nullptr);
   } else {
     const int resolved = ::getaddrinfo(std::string(host).c_str(),
@@ -545,7 +545,7 @@ Task<absl::Status> AuthenticateUpstream(TcpStream& stream,
   const std::string encoded = EncodeRespCommand(args);
   LAVIK_CO_RETURN_IF_ERROR(co_await WriteText(stream, encoded));
   auto response = co_await ReadLine(stream);
-  LAVIK_CO_RETURN_IF_ERROR(response.status());
+  LAVIK_CO_RETURN_IF_ERROR(response);
   if (*response != "+OK") {
     co_return absl::PermissionDeniedError(
         absl::StrCat("replication AUTH failed: ", *response));
@@ -589,7 +589,7 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
       co_return line;
     }
     auto read = co_await stream.ReadSome(input);
-    LAVIK_CO_RETURN_IF_ERROR(read.status());
+    LAVIK_CO_RETURN_IF_ERROR(read);
     if (*read == 0) {
       co_return absl::UnavailableError("replication peer closed connection");
     }
@@ -602,7 +602,7 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     TcpStream& stream) {
   auto header = co_await ReadExact(stream, kDataFrameHeaderBytes);
-  LAVIK_CO_RETURN_IF_ERROR(header.status());
+  LAVIK_CO_RETURN_IF_ERROR(header);
   DataReader reader(*header);
   std::uint32_t magic = 0;
   std::uint8_t version = 0, kind = 0;
@@ -617,7 +617,7 @@ Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     co_return absl::InvalidArgumentError("malformed replication frame header");
   }
   auto payload = co_await ReadExact(stream, payload_bytes);
-  LAVIK_CO_RETURN_IF_ERROR(payload.status());
+  LAVIK_CO_RETURN_IF_ERROR(payload);
   if (DataFrameCrc32c(*payload) != payload_crc32c) {
     co_return absl::DataLossError("replication frame CRC32C mismatch");
   }
@@ -634,7 +634,7 @@ Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
   while (offset < size) {
     auto read = co_await stream.ReadSome(std::span<std::byte>(
         reinterpret_cast<std::byte*>(result.data() + offset), size - offset));
-    LAVIK_CO_RETURN_IF_ERROR(read.status());
+    LAVIK_CO_RETURN_IF_ERROR(read);
     if (*read == 0) co_return absl::UnavailableError("replication peer closed");
     offset += *read;
   }
@@ -1254,7 +1254,7 @@ auto ReplicationManager::ReplicationGroup::ApplyClusterRebuildDirective(
     PopulationManifest manifest) -> Task<absl::Status> {
   auto started = co_await StartClusterRebuildDirective(
       std::move(upstream), std::move(directive), std::move(manifest));
-  LAVIK_CO_RETURN_IF_ERROR(started.status());
+  LAVIK_CO_RETURN_IF_ERROR(started);
   co_return co_await (*started)->Await();
 }
 
@@ -1397,7 +1397,7 @@ auto ReplicationManager::ReplicationGroup::
     if (cluster_rebuild_ != nullptr) co_return absl::OkStatus();
   }
   auto manifest = PopulationManifest::Create({});
-  LAVIK_CO_RETURN_IF_ERROR(manifest.status());
+  LAVIK_CO_RETURN_IF_ERROR(manifest);
   if (manifest->id() != directive.identity_.manifest_id_) {
     co_return absl::InvalidArgumentError(
         "fault-seeded promotion requires the empty population manifest");
@@ -1452,7 +1452,7 @@ auto ReplicationManager::ReplicationGroup::
       .safe_source_active_ = true,
   };
   auto authorization = cluster_group_->BeginRebuild(rebuild, *manifest);
-  LAVIK_CO_RETURN_IF_ERROR(authorization.status());
+  LAVIK_CO_RETURN_IF_ERROR(authorization);
   auto population = std::make_shared<ClusterRebuildContext>(
       rebuild, *manifest, std::move(*authorization));
   for (std::uint32_t partition = 0; partition < kReplicationPartitionCount;
@@ -1477,7 +1477,7 @@ auto ReplicationManager::ReplicationGroup::
   }
   LAVIK_CO_RETURN_IF_ERROR(proof);
   auto ready = cluster_group_->PublishReady(rebuild.identity_);
-  LAVIK_CO_RETURN_IF_ERROR(ready.status());
+  LAVIK_CO_RETURN_IF_ERROR(ready);
 
   auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
       directive.required_applied_next_lsns_.size(), storage_->worker_count());
@@ -1598,7 +1598,7 @@ auto ReplicationManager::ReplicationGroup::AdoptLocalOwnerHistory()
   const auto& bridge = *history_bridge_;
   auto revision =
       cluster_group_->NextDirectiveRevision(bridge.child_.source_group_term_);
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   RebuildDirective child = cluster_rebuild_->directive_;
   auto& identity = child.identity_;
   identity.term_ = bridge.child_.source_group_term_;
@@ -1971,7 +1971,7 @@ auto ReplicationManager::ReplicationGroup::
           "promotion-prepare does not match the ready candidate anchors");
     }
     auto current = applied_frontier_->TrySnapshot();
-    LAVIK_CO_RETURN_IF_ERROR(current.status());
+    LAVIK_CO_RETURN_IF_ERROR(current);
     for (std::size_t flow = 0; flow < current->size(); ++flow) {
       if ((*current)[flow] < directive.required_applied_next_lsns_[flow]) {
         co_return absl::FailedPreconditionError(
@@ -2458,7 +2458,7 @@ auto ReplicationManager::ReplicationGroup::ReadRecoveryFrame(TcpStream& stream,
                                                              std::size_t bound)
     -> Task<absl::StatusOr<std::string>> {
   auto line = co_await ReadLine(stream);
-  LAVIK_CO_RETURN_IF_ERROR(line.status());
+  LAVIK_CO_RETURN_IF_ERROR(line);
   const auto words = SplitWords(*line);
   std::uint64_t size = 0;
   std::uint32_t crc = 0;
@@ -2469,7 +2469,7 @@ auto ReplicationManager::ReplicationGroup::ReadRecoveryFrame(TcpStream& stream,
         "invalid recovery frame header or byte bound");
   }
   auto payload = co_await ReadExact(stream, size);
-  LAVIK_CO_RETURN_IF_ERROR(payload.status());
+  LAVIK_CO_RETURN_IF_ERROR(payload);
   if (DataFrameCrc32c(*payload) != crc)
     co_return absl::DataLossError("recovery frame checksum mismatch");
   co_return std::move(*payload);
@@ -2637,14 +2637,14 @@ auto ReplicationManager::ReplicationGroup::SendRetainedEffect(
       co_return absl::CancelledError("retained export was revoked");
     if (effect.ok()) break;
   }
-  LAVIK_CO_RETURN_IF_ERROR(effect.status());
+  LAVIK_CO_RETURN_IF_ERROR(effect);
   for (const auto& record : *effect) {
     if (!detail::RecoveryCovers(report, record.flow_id_, record.lsn_))
       co_return absl::NotFoundError(
           "recovery effect has unavailable participants");
   }
   auto manifest = detail::EncodeRecoveryEffectManifest(*effect);
-  LAVIK_CO_RETURN_IF_ERROR(manifest.status());
+  LAVIK_CO_RETURN_IF_ERROR(manifest);
   auto status = co_await WriteRecoveryFrame(stream, *manifest);
   LAVIK_CO_RETURN_IF_ERROR(status);
   for (const auto& record : *effect) {
@@ -2658,7 +2658,7 @@ auto ReplicationManager::ReplicationGroup::SendRetainedEffect(
           });
       if (!current())
         co_return absl::CancelledError("retained export was revoked");
-      LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+      LAVIK_CO_RETURN_IF_ERROR(chunk);
       if (chunk->total_bytes_ != record.bytes_)
         co_return absl::DataLossError("retained event changed during copy-out");
       status = co_await WriteRecoveryFrame(stream, chunk->bytes_);
@@ -2814,12 +2814,12 @@ auto ReplicationManager::ReplicationGroup::RunParentExport(
   auto status = co_await WriteText(stream, hello);
   LAVIK_CO_RETURN_IF_ERROR(status);
   auto encoded = detail::EncodeRecoveryAdvertisement(report);
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
   status = co_await WriteRecoveryFrame(stream, *encoded);
   LAVIK_CO_RETURN_IF_ERROR(status);
   while (current() && history_bridge_ == bridge) {
     auto line = co_await ReadLine(stream);
-    LAVIK_CO_RETURN_IF_ERROR(line.status());
+    LAVIK_CO_RETURN_IF_ERROR(line);
     const auto words = SplitWords(*line);
     if (words.size() == 2 && words[0] == "SWITCH") {
       auto final = DecodeAppliedVector(words[1]);
@@ -2846,7 +2846,7 @@ auto ReplicationManager::ReplicationGroup::RunParentExport(
       status = co_await WriteText(stream, reply);
       LAVIK_CO_RETURN_IF_ERROR(status);
       auto ack = co_await ReadLine(stream);
-      LAVIK_CO_RETURN_IF_ERROR(ack.status());
+      LAVIK_CO_RETURN_IF_ERROR(ack);
       co_return *ack == "ACK"
           ? absl::OkStatus()
           : absl::InvalidArgumentError("invalid HistorySwitch ACK");
@@ -2977,7 +2977,7 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
     co_return absl::FailedPreconditionError(
         "donor has no complete same-domain replica population");
   auto cut = applied_frontier_->TrySnapshot();
-  LAVIK_CO_RETURN_IF_ERROR(cut.status());
+  LAVIK_CO_RETURN_IF_ERROR(cut);
   detail::NativeRecoveryAdvertisement report{
       boot_id_, std::move(*cut),
       co_await RetainedCoverage(local.domain_.source_history_id_)};
@@ -2995,7 +2995,7 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
     });
   }
   auto encoded = detail::EncodeRecoveryAdvertisement(report);
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
   auto status = co_await WriteRecoveryFrame(stream, *encoded);
   LAVIK_CO_RETURN_IF_ERROR(status);
 #if LAVIK_FAULTS_ENABLED
@@ -3004,7 +3004,7 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
   while (cluster_recovery_ == scope && !scope->sockets_.cancelled() &&
          !scope->Expired()) {
     auto request = co_await ReadLine(stream);
-    LAVIK_CO_RETURN_IF_ERROR(request.status());
+    LAVIK_CO_RETURN_IF_ERROR(request);
     const auto words = SplitWords(*request);
     unsigned flow = 0;
     std::uint64_t lsn = 0;
@@ -3065,9 +3065,9 @@ auto ReplicationManager::ReplicationGroup::FetchRetainedEffect(
   LAVIK_CO_RETURN_IF_ERROR(status);
   auto response =
       co_await ReadRecoveryFrame(stream, detail::kRecoveryMetadataBytes);
-  LAVIK_CO_RETURN_IF_ERROR(response.status());
+  LAVIK_CO_RETURN_IF_ERROR(response);
   auto manifest = detail::DecodeRecoveryEffectManifest(*response);
-  LAVIK_CO_RETURN_IF_ERROR(manifest.status());
+  LAVIK_CO_RETURN_IF_ERROR(manifest);
   if (!std::ranges::any_of(*manifest, [&](const auto& record) {
         return record.flow_id_ == flow && record.lsn_ == lsn;
       }))
@@ -3100,7 +3100,7 @@ auto ReplicationManager::ReplicationGroup::FetchRetainedEffect(
       response = co_await ReadRecoveryFrame(
           stream, std::min<std::uint64_t>(
                       64 * 1024, record.bytes_ - value.canonical_.size()));
-      LAVIK_CO_RETURN_IF_ERROR(response.status());
+      LAVIK_CO_RETURN_IF_ERROR(response);
       value.canonical_.append(*response);
     }
     received->records_.push_back(std::move(value));
@@ -3155,7 +3155,7 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
   auto connected = co_await ConnectTcp(
       peer->peer_.endpoint_.host_, peer->peer_.endpoint_.port_, tls_context_,
       &peer->sockets_, /*cancellable_dns=*/true);
-  LAVIK_CO_RETURN_IF_ERROR(connected.status());
+  LAVIK_CO_RETURN_IF_ERROR(connected);
   TcpStream stream = std::move(*connected);
   // TcpStream is a non-owning handle. Close even on authentication/decoding
   // errors before retrying discovery. The membership declared after this
@@ -3174,9 +3174,9 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
   LAVIK_CO_RETURN_IF_ERROR(status);
   auto response =
       co_await ReadRecoveryFrame(stream, detail::kRecoveryMetadataBytes);
-  LAVIK_CO_RETURN_IF_ERROR(response.status());
+  LAVIK_CO_RETURN_IF_ERROR(response);
   auto report = detail::DecodeRecoveryAdvertisement(*response);
-  LAVIK_CO_RETURN_IF_ERROR(report.status());
+  LAVIK_CO_RETURN_IF_ERROR(report);
   if (report->applied_.size() != scope->desired_.action_.domain_.flow_count_)
     co_return absl::InvalidArgumentError(
         "donor report has a different origin layout");
@@ -3193,7 +3193,7 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
     const auto [flow, lsn] = *peer->request_;
     auto received =
         co_await FetchRetainedEffect(stream, *peer->report_, budget, flow, lsn);
-    LAVIK_CO_RETURN_IF_ERROR(received.status());
+    LAVIK_CO_RETURN_IF_ERROR(received);
     // A fully received bundle no longer depends on donor liveness. Only the
     // coordinator admits it into NativeReplay under the current population.
     peer->received_ = std::move(*received);
@@ -3294,7 +3294,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
       }
       if (current() && FailoverReplicaDomainMatches(action->desired_)) {
         auto cut = applied_frontier_->TrySnapshot();
-        LAVIK_CO_RETURN_IF_ERROR(cut.status());
+        LAVIK_CO_RETURN_IF_ERROR(cut);
         action->recovery_ = ClusterCandidateRecoveryResult{
             std::move(*cut), "coverage-unavailable"};
         action->state_ = ClusterFailoverActionState::kRecoveryComplete;
@@ -3309,7 +3309,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
   }
   const auto applied = applied_frontier_;
   auto initial = applied->TrySnapshot();
-  LAVIK_CO_RETURN_IF_ERROR(initial.status());
+  LAVIK_CO_RETURN_IF_ERROR(initial);
   detail::NativeReplay replay(applied, retained_histories_,
                               action->desired_.domain_.source_history_id_);
   std::vector<std::shared_ptr<RecoveryPeerSession>> peers;
@@ -3469,7 +3469,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
     co_return absl::FailedPreconditionError(action->failure_detail_);
   }
   auto final = applied->TrySnapshot();
-  LAVIK_CO_RETURN_IF_ERROR(final.status());
+  LAVIK_CO_RETURN_IF_ERROR(final);
   action->recovery_ =
       ClusterCandidateRecoveryResult{std::move(*final), std::move(reason)};
   action->state_ = ClusterFailoverActionState::kRecoveryComplete;
@@ -4341,7 +4341,7 @@ auto ReplicationManager::ReplicationGroup::NormalizeClusterFollowOwner(
               return left.partition_id_ < right.partition_id_;
             });
   auto manifest = PopulationManifest::Create(desired.manifest_entries_);
-  LAVIK_RETURN_IF_ERROR(manifest.status());
+  LAVIK_RETURN_IF_ERROR(manifest);
   if (manifest->id() != desired.manifest_id_) {
     return absl::FailedPreconditionError(
         "follow-owner manifest entries do not match their FDS digest");
@@ -4450,7 +4450,7 @@ auto ReplicationManager::ReplicationGroup::BeginClusterFollowFullPopulation(
   // next revision from that owner prevents every FULL retry from being
   // rejected forever as stale after the transient context disappears.
   auto revision = cluster_group_->NextDirectiveRevision(desired.group_term_);
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
 
   RebuildDirective directive{
       .identity_ =
@@ -4495,7 +4495,7 @@ auto ReplicationManager::ReplicationGroup::BeginClusterFollowFullPopulation(
   }
   auto authorization = cluster_group_->BeginRebuild(
       directive, session->cluster_follow_->manifest_);
-  LAVIK_RETURN_IF_ERROR(authorization.status());
+  LAVIK_RETURN_IF_ERROR(authorization);
   auto population = std::make_shared<ClusterRebuildContext>(
       std::move(directive), session->cluster_follow_->manifest_,
       std::move(*authorization));
@@ -4550,7 +4550,7 @@ auto ReplicationManager::ReplicationGroup::FreezeFormerOwnerPopulation(
     ~ExpiryGuard() { storage_->ResumeExpiration(); }
   } expiry{storage_};
   auto watermark = co_await CaptureNativeReplicationWatermark();
-  LAVIK_CO_RETURN_IF_ERROR(watermark.status());
+  LAVIK_CO_RETURN_IF_ERROR(watermark);
   if (!watermark->has_value()) {
     // An idle source has no retained events or reconnectable downstreams.
     // Establish its current publisher boundary only after the drain; this
@@ -4565,13 +4565,13 @@ auto ReplicationManager::ReplicationGroup::FreezeFormerOwnerPopulation(
           }));
     }
     watermark = co_await CaptureNativeReplicationWatermark();
-    LAVIK_CO_RETURN_IF_ERROR(watermark.status());
+    LAVIK_CO_RETURN_IF_ERROR(watermark);
     if (!watermark->has_value())
       co_return absl::FailedPreconditionError(
           "former Owner has no complete source boundary");
   }
   auto revision = cluster_group_->NextDirectiveRevision(source_term);
-  LAVIK_CO_RETURN_IF_ERROR(revision.status());
+  LAVIK_CO_RETURN_IF_ERROR(revision);
   RebuildDirective source = cluster_rebuild_->directive_;
   auto& identity = source.identity_;
   identity.term_ = source_term;
@@ -4636,7 +4636,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
   std::shared_ptr<ClusterFollowOwnerContext> next;
   if (desired.has_value()) {
     auto normalized = NormalizeClusterFollowOwner(std::move(*desired));
-    LAVIK_CO_RETURN_IF_ERROR(normalized.status());
+    LAVIK_CO_RETURN_IF_ERROR(normalized);
     if (cluster_rebuild_ != nullptr &&
         !cluster_rebuild_->manifest_.has_value() &&
         cluster_rebuild_->directive_.identity_.manifest_id_ ==
@@ -5025,7 +5025,7 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
     std::vector<std::uint64_t> frozen;
     if (shutdown_native) {
       auto watermark = co_await CaptureNativeReplicationWatermark();
-      LAVIK_CO_RETURN_IF_ERROR(watermark.status());
+      LAVIK_CO_RETURN_IF_ERROR(watermark);
       if (watermark->has_value()) {
         shutdown_identity->term_ = owner_source_term_;
         shutdown_identity->source_node_id_ = node_id_;
@@ -5137,7 +5137,7 @@ auto ReplicationManager::ReplicationGroup::InstallRecoveredPopulation(
     co_return absl::CancelledError("recovered population install superseded");
   auto ready =
       cluster_group_->RecoverPopulation(identity, population.frontier_);
-  LAVIK_CO_RETURN_IF_ERROR(ready.status());
+  LAVIK_CO_RETURN_IF_ERROR(ready);
   auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
       population.frontier_.size(), storage_->worker_count());
   LAVIK_CO_RETURN_IF_ERROR(frontier->InstallNextLsns(population.frontier_));
@@ -5157,10 +5157,10 @@ auto ReplicationManager::ReplicationGroup::RecoverClusterPopulation()
     -> Task<absl::Status> {
   AssertStateOwner();
   auto record = co_await storage_->ConsumePopulationRecovery();
-  LAVIK_CO_RETURN_IF_ERROR(record.status());
+  LAVIK_CO_RETURN_IF_ERROR(record);
   if (!meta_managed_ || !record->has_value()) co_return absl::OkStatus();
   auto scope = detail::DecodeRecoveredPopulation((**record).identity_);
-  LAVIK_CO_RETURN_IF_ERROR(scope.status());
+  LAVIK_CO_RETURN_IF_ERROR(scope);
   if (scope->identity_.target_node_id_ != node_id_) {
     co_return absl::FailedPreconditionError(
         "recovered storage belongs to another Data node");
@@ -5174,7 +5174,7 @@ auto ReplicationManager::ReplicationGroup::RecoverClusterPopulation()
     co_return absl::OkStatus();
   }
   auto proof = detail::DecodeRecoveredPopulation((**record).clean_proof_);
-  LAVIK_CO_RETURN_IF_ERROR(proof.status());
+  LAVIK_CO_RETURN_IF_ERROR(proof);
   if (proof->frontier_.empty() || !detail::SameRecoveredPopulationScope(
                                       scope->identity_, proof->identity_)) {
     co_return absl::DataLossError(
@@ -7088,11 +7088,11 @@ auto ReplicationManager::ReplicationGroup::ReplayAndSwitchParent(
       identity.source_history_id_,
       static_cast<unsigned>(applied->size())};
   auto cursor = applied->TrySnapshot();
-  LAVIK_CO_RETURN_IF_ERROR(cursor.status());
+  LAVIK_CO_RETURN_IF_ERROR(cursor);
   auto connected = co_await ConnectTcp(
       desired.owner_endpoint_->host_, desired.owner_endpoint_->port_,
       tls_context_, &transfer->sockets_, /*cancellable_dns=*/true);
-  LAVIK_CO_RETURN_IF_ERROR(connected.status());
+  LAVIK_CO_RETURN_IF_ERROR(connected);
   TcpStream stream = std::move(*connected);
   ScopedSocketSetMembership membership(&transfer->sockets_, stream.NativeFd());
   auto status = co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
@@ -7102,7 +7102,7 @@ auto ReplicationManager::ReplicationGroup::ReplayAndSwitchParent(
   status = co_await WriteText(stream, request);
   LAVIK_CO_RETURN_IF_ERROR(status);
   auto line = co_await ReadLine(stream);
-  LAVIK_CO_RETURN_IF_ERROR(line.status());
+  LAVIK_CO_RETURN_IF_ERROR(line);
   const auto words = SplitWords(*line);
   if (words.size() == 4 && words[0] == "-LVPARENTFULL" &&
       words[1] == desired.owner_node_id_ && IsReplicationId(words[2]) &&
@@ -7315,7 +7315,7 @@ auto ReplicationManager::ReplicationGroup::TryPartialReparent(
     LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
         *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
-  LAVIK_CO_RETURN_IF_ERROR(result.status());
+  LAVIK_CO_RETURN_IF_ERROR(result);
   if (!*result && active_replica_session_ == session &&
       cluster_follow_owner_ == relationship && !session->cancelled()) {
     relationship->force_full_.store(true, std::memory_order_release);
@@ -7341,7 +7341,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   LAVIK_CO_RETURN_IF_ERROR(co_await TryPartialReparent(session));
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
                                        tls_context_, &session->sockets_, true);
-  LAVIK_CO_RETURN_IF_ERROR(connected.status());
+  LAVIK_CO_RETURN_IF_ERROR(connected);
   TcpStream control = std::move(*connected);
   const int control_fd = control.NativeFd();
   ReplicationConnectionMetricGuard connection_metric(
@@ -7708,7 +7708,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   if (meta_managed_ && session->cluster_rebuild_ != nullptr &&
       session->cluster_rebuild_->ready_token_.has_value()) {
     auto cut = session->applied_frontier_->TrySnapshot();
-    LAVIK_CO_RETURN_IF_ERROR(cut.status());
+    LAVIK_CO_RETURN_IF_ERROR(cut);
     upstream_continuation_proof_ = NativeContinuationProof{
         node_id_,
         session->cluster_rebuild_->ready_token_->identity().assignment_id_,
@@ -8123,7 +8123,7 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaTransactionArrival(
     -> absl::StatusOr<PreparedReplicaTransactionArrival> {
   auto record = detail::DecodeNativeTransactionRecord(
       std::move(envelope), flow_id, session->source_worker_count_);
-  LAVIK_RETURN_IF_ERROR(record.status());
+  LAVIK_RETURN_IF_ERROR(record);
   const bool has_payload = !record->payload_.args_.empty();
   return PreparedReplicaTransactionArrival{
       .id_ = record->envelope_.id_,
@@ -8220,7 +8220,7 @@ auto ReplicationManager::ReplicationGroup::RegisterReplicaTransaction(
     -> Task<absl::StatusOr<std::shared_ptr<ReplicaTransactionArrival>>> {
   auto prepared = PrepareReplicaTransactionArrival(
       session, flow_id, lsn, std::move(envelope), std::move(predecessor));
-  LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+  LAVIK_CO_RETURN_IF_ERROR(prepared);
   prepared->canonical_ = std::move(canonical);
   prepared->canonical_charge_ = std::move(canonical_charge);
   if (session->transaction_owners_.empty()) {
@@ -8242,7 +8242,7 @@ auto ReplicationManager::ReplicationGroup::ApplyReplicaControl(
     std::uint64_t lsn, ReplicatedCommand command, std::string canonical)
     -> Task<absl::Status> {
   auto parsed = detail::NativeControlBarrierId(command);
-  LAVIK_CO_RETURN_IF_ERROR(parsed.status());
+  LAVIK_CO_RETURN_IF_ERROR(parsed);
   if (flow_id >= session->source_worker_count_)
     co_return absl::InvalidArgumentError("invalid replicated control flow");
   const std::uint64_t barrier_id = *parsed;
@@ -8944,7 +8944,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
   };
   while (stream.IsOpen()) {
     auto frame = co_await ReadDataFrame(stream);
-    LAVIK_CO_RETURN_IF_ERROR(frame.status());
+    LAVIK_CO_RETURN_IF_ERROR(frame);
     LAVIK_CO_RETURN_IF_ERROR(state->status_);
     LAVIK_CO_RETURN_IF_ERROR(
         session->ValidateDataFramePhase(flow_id, frame->first));
@@ -8992,7 +8992,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         if (owner == bycorf::ThisWorker().id_) {
           auto reset = co_await storage_->ResetReplicaPartitions(
               session->session_id_, by_owner[owner]);
-          LAVIK_CO_RETURN_IF_ERROR(reset.status());
+          LAVIK_CO_RETURN_IF_ERROR(reset);
           for (const storage::ReplicaPartitionEpoch& result : *reset) {
             epochs[result.partition_id_] = result.replication_epoch_;
             reset_proof.push_back(result);
@@ -9004,7 +9004,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
                 return storage_->ResetReplicaPartitions(session->session_id_,
                                                         resets);
               });
-          LAVIK_CO_RETURN_IF_ERROR(reset.status());
+          LAVIK_CO_RETURN_IF_ERROR(reset);
           for (const storage::ReplicaPartitionEpoch& result : *reset) {
             epochs[result.partition_id_] = result.replication_epoch_;
             reset_proof.push_back(result);
@@ -9434,7 +9434,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       }
       auto records = DecodeRecords(
           std::string_view(frame->second).substr(sizeof(sequence)));
-      LAVIK_CO_RETURN_IF_ERROR(records.status());
+      LAVIK_CO_RETURN_IF_ERROR(records);
       const auto found = epochs.find(records->first);
       if (found == epochs.end()) {
         co_return absl::FailedPreconditionError(
@@ -9880,7 +9880,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
   if (!cursor.ok()) (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
   while (!state->receiver_done_) co_await state->changed_.Wait();
   LAVIK_CO_RETURN_IF_ERROR(state->status_);
-  LAVIK_CO_RETURN_IF_ERROR(cursor.status());
+  LAVIK_CO_RETURN_IF_ERROR(cursor);
   state.reset();
   LAVIK_FAULT_INJECT({
     const char* hold = std::getenv("LAVIK_FULL_AFTER_PROMOTION_ACK_HOLD_FILE");
@@ -9905,7 +9905,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     -> Task<absl::StatusOr<std::uint64_t>> {
   const std::uint8_t db_count = storage_->database_count();
   auto fullsync_start = storage_->BeginFullSyncSession(session->id_);
-  LAVIK_CO_RETURN_IF_ERROR(fullsync_start.status());
+  LAVIK_CO_RETURN_IF_ERROR(fullsync_start);
   const auto source_db_epochs = fullsync_start->db_epochs_;
   bool fullsync_session_active = true;
   const auto initial_log = storage_->LocalReplicationLogInfo();
@@ -10065,7 +10065,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       const std::size_t remaining_items = max_items - drained_items;
       auto pending = storage_->PeekFullSyncPublishItems(
           session->id_, std::min(remaining_items, kBacklogBatchFrames));
-      LAVIK_CO_RETURN_IF_ERROR(pending.status());
+      LAVIK_CO_RETURN_IF_ERROR(pending);
       if (pending->empty()) co_return absl::OkStatus();
 
       if (pending->front().record_.has_value()) {
@@ -10078,7 +10078,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
             storage::RedisSlot(item.record_->key_);
         auto materialized = co_await storage_->MaterializeFullSyncPublishRecord(
             session->id_, partition_id, *item.record_);
-        LAVIK_CO_RETURN_IF_ERROR(materialized.status());
+        LAVIK_CO_RETURN_IF_ERROR(materialized);
         LAVIK_CO_RETURN_IF_ERROR(
             co_await send_records(partition_id, std::span(&*materialized, 1)));
         storage_->ReleaseFullSyncValue(session->id_, partition_id,
@@ -10110,7 +10110,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         }
         auto source = ReplicationCommandPayloadSource::Create(
             item.command_->db_id_, args);
-        LAVIK_CO_RETURN_IF_ERROR(source.status());
+        LAVIK_CO_RETURN_IF_ERROR(source);
         if (source->size() > std::numeric_limits<std::size_t>::max()) {
           co_return absl::ResourceExhaustedError(
               "full-sync command is too large for this process");
@@ -10274,7 +10274,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     views.reserve(args.size());
     for (const std::string& arg : args) views.push_back(arg);
     auto source = ReplicationCommandPayloadSource::Create(0, views);
-    LAVIK_CO_RETURN_IF_ERROR(source.status());
+    LAVIK_CO_RETURN_IF_ERROR(source);
     if (source->size() > std::numeric_limits<std::size_t>::max()) {
       co_return absl::ResourceExhaustedError(
           "function catalog is too large for this process");
@@ -10341,7 +10341,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         co_await drain_fullsync_publish_queue(kFullSyncInterleaveCommands));
 
     auto info = storage_->GetFullSyncPublishQueueInfo(session->id_);
-    LAVIK_CO_RETURN_IF_ERROR(info.status());
+    LAVIK_CO_RETURN_IF_ERROR(info);
     const std::size_t high_watermark =
         std::max<std::size_t>(1, info->capacity_bytes_ / 8);
     if (info->queued_bytes_ + info->admitted_bytes_ <= high_watermark) {
@@ -10353,7 +10353,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       LAVIK_CO_RETURN_IF_ERROR(
           co_await drain_fullsync_publish_queue(kBacklogBatchFrames));
       info = storage_->GetFullSyncPublishQueueInfo(session->id_);
-      LAVIK_CO_RETURN_IF_ERROR(info.status());
+      LAVIK_CO_RETURN_IF_ERROR(info);
       // Admitted bytes have reserved capacity but are not dequeueable until
       // their writes commit. Do not spin this worker waiting for those
       // writes.
@@ -10366,7 +10366,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     while (true) {
       auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
           session->id_, partition_id, kOverrideRecordsPerBatch);
-      LAVIK_CO_RETURN_IF_ERROR(batch.status());
+      LAVIK_CO_RETURN_IF_ERROR(batch);
       if (batch->records_.empty()) co_return absl::OkStatus();
       LAVIK_CO_RETURN_IF_ERROR(
           co_await send_records(partition_id, batch->records_));
@@ -10386,7 +10386,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       for (const CapturedPartition& partition : captured) {
         auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
             session->id_, partition.partition_id_, kOverrideRecordsPerBatch);
-        LAVIK_CO_RETURN_IF_ERROR(batch.status());
+        LAVIK_CO_RETURN_IF_ERROR(batch);
         if (batch->records_.empty()) continue;
         LAVIK_CO_RETURN_IF_ERROR(
             co_await send_records(partition.partition_id_, batch->records_));
@@ -10977,7 +10977,7 @@ auto ReplicationManager::ReplicationGroup::EnterMasterFlowBacklog(
   LAVIK_CO_RETURN_IF_ERROR(
       co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload));
   auto cursor_ack = co_await ReadDataFrame(stream);
-  LAVIK_CO_RETURN_IF_ERROR(cursor_ack.status());
+  LAVIK_CO_RETURN_IF_ERROR(cursor_ack);
   DataReader ack_reader(cursor_ack->second);
   std::uint16_t ignored_partition = 0;
   std::uint64_t acknowledged_lsn = 0;
@@ -11012,7 +11012,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveMasterFlowBacklogAcks(
 
     const std::uint64_t expected_lsn = duplex->expected_acks_.front();
     auto ack = co_await ReadDataFrame(stream);
-    LAVIK_CO_RETURN_IF_ERROR(ack.status());
+    LAVIK_CO_RETURN_IF_ERROR(ack);
     DataReader ack_reader(ack->second);
     std::uint64_t first_lsn = 0;
     std::uint64_t last_lsn = 0;
@@ -11478,7 +11478,7 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
   std::string source_group_id;
   std::shared_ptr<MasterSession> session;
   auto applied = DecodeAppliedVector(args[7]);
-  LAVIK_CO_RETURN_IF_ERROR(applied.status());
+  LAVIK_CO_RETURN_IF_ERROR(applied);
 #if LAVIK_FAULTS_ENABLED
   if (population_handshake) {
     // Deterministically exercise the only suspension cut between optimistic
@@ -12427,7 +12427,7 @@ ReplicationManager::StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                                  PopulationManifest manifest) {
   auto started = co_await group_->StartClusterRebuildDirective(
       std::move(upstream), std::move(directive), std::move(manifest));
-  LAVIK_CO_RETURN_IF_ERROR(started.status());
+  LAVIK_CO_RETURN_IF_ERROR(started);
   co_return ClusterRebuildCompletion(std::move(*started));
 }
 
@@ -12436,7 +12436,7 @@ ReplicationManager::StartEmptyPopulationInitialization(
     RebuildIdentity identity, PopulationManifest manifest) {
   auto started = co_await group_->StartEmptyPopulationInitialization(
       std::move(identity), std::move(manifest));
-  LAVIK_CO_RETURN_IF_ERROR(started.status());
+  LAVIK_CO_RETURN_IF_ERROR(started);
   co_return ClusterRebuildCompletion(std::move(*started));
 }
 
@@ -12445,7 +12445,7 @@ ReplicationManager::StartClusterPromotionPrepareDirective(
     ClusterPromotionPrepareDirective directive) {
   auto started = co_await group_->StartClusterPromotionPrepareDirective(
       std::move(directive));
-  LAVIK_CO_RETURN_IF_ERROR(started.status());
+  LAVIK_CO_RETURN_IF_ERROR(started);
   co_return ClusterPromotionPrepareCompletion(std::move(*started));
 }
 

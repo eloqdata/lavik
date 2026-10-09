@@ -511,7 +511,7 @@ class RedisCommandStream {
           std::min(input.size(), kMaxPendingBytes - pending_.size());
       auto read =
           co_await stream_->ReadSome(std::span<std::byte>(input).first(wanted));
-      LAVIK_CO_RETURN_IF_ERROR(read.status());
+      LAVIK_CO_RETURN_IF_ERROR(read);
       if (*read == 0) {
         co_return absl::UnavailableError("Redis replication connection closed");
       }

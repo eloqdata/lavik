@@ -711,7 +711,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
     if (!reservation || !token.ok()) {
       store.rdb_snapshot_->invalidated_ = true;
       (void)co_await ReleaseRdbSnapshotValue(&saved->value_);
-      LAVIK_CO_RETURN_IF_ERROR(token.status());
+      LAVIK_CO_RETURN_IF_ERROR(token);
       RecordMemoryRejection();
       co_return absl::ResourceExhaustedError(
           "OOM RDB collection stream admission failed");
@@ -838,13 +838,13 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
             partition.id_, result.cursor_.db_id_, result.cursor_.index_cursor_,
             std::max<std::size_t>(remaining, 1), capture->snapshot_time_ms_,
             max_bytes - logical_bytes);
-        LAVIK_CO_RETURN_IF_ERROR(scanned.status());
+        LAVIK_CO_RETURN_IF_ERROR(scanned);
         result.cursor_.index_cursor_ = scanned->cursor_;
         for (std::string& key : scanned->keys_) {
           auto value = co_await MaterializeRdbSnapshotKey(
               store, partition, session_id, result.cursor_.db_id_,
               std::move(key));
-          LAVIK_CO_RETURN_IF_ERROR(value.status());
+          LAVIK_CO_RETURN_IF_ERROR(value);
           if (value->has_value()) {
             logical_bytes += (**value).key_.size();
             logical_bytes += (**value).value_.encoded_.size();
@@ -903,7 +903,7 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
     for (DirtyKey& key : old_keys) {
       auto value = co_await MaterializeRdbSnapshotKey(
           store, partition, session_id, key.db_id_, std::move(key.key_));
-      LAVIK_CO_RETURN_IF_ERROR(value.status());
+      LAVIK_CO_RETURN_IF_ERROR(value);
       if (value->has_value()) {
         logical_bytes += (**value).key_.size();
         logical_bytes += (**value).value_.encoded_.size();

@@ -147,7 +147,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       // A distinct decision forces its own durable fence without marking the
       // still-uncommitted outer transaction durable prematurely.
       const auto child_decision = PrepareGroupedDecision(batch);
-      LAVIK_CO_RETURN_IF_ERROR(child_decision.status());
+      LAVIK_CO_RETURN_IF_ERROR(child_decision);
     }
   }
   const auto revision = outer_transaction ? batch.txid_ : tx->txid_;
@@ -178,7 +178,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   else
     member_mutation = co_await PrepareSortedSetMembers(
         store, partition, db_id, key, digest, previous, plan);
-  LAVIK_CO_RETURN_IF_ERROR(member_mutation.status());
+  LAVIK_CO_RETURN_IF_ERROR(member_mutation);
   auto& member_plan = member_mutation->plan_;
   if (value_type == ValueType::kSortedSet) {
     if (!previous && prepared_members != nullptr) {
@@ -198,7 +198,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     plan.root_.member_index_ = member_plan.root_;
   }
   auto root_payload = EncodeOrderedCollectionRoot(plan.root_);
-  LAVIK_CO_RETURN_IF_ERROR(root_payload.status());
+  LAVIK_CO_RETURN_IF_ERROR(root_payload);
   // Validate every indivisible field/envelope before the first disk write.
   // Keep both graphs' checked encoders until writing so each page is validated
   // only once at this boundary. Both plans stay unmoved and immutable while
@@ -212,7 +212,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     LAVIK_CO_RETURN_IF_ERROR(encoder_budget.AddBytes(sizeof(HashGroupEncoder)));
   }
   auto encoder_admission = encoder_budget.Reserve(1);
-  LAVIK_CO_RETURN_IF_ERROR(encoder_admission.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoder_admission);
   std::vector<OrderedGroupEncoder> ordered_encoders;
   std::vector<HashGroupEncoder> member_encoders;
   std::vector<std::uint64_t> ordered_sizes;
@@ -229,7 +229,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     member_sizes.reserve(member_plan.writes_.size());
     for (const auto& snapshot : plan.writes_) {
       auto encoder = OrderedGroupEncoder::Create(snapshot);
-      LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+      LAVIK_CO_RETURN_IF_ERROR(encoder);
       if (encoder->encoded_bytes() > kMaxRecordPayloadBytes) {
         co_return absl::OutOfRangeError(
             "group snapshot and parent key exceed payload limit");
@@ -239,7 +239,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     }
     for (const auto& snapshot : member_plan.writes_) {
       auto encoder = HashGroupEncoder::Create(snapshot);
-      LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+      LAVIK_CO_RETURN_IF_ERROR(encoder);
       if (encoder->encoded_bytes() > kMaxRecordPayloadBytes)
         co_return absl::OutOfRangeError(
             "member snapshot and parent key exceed payload limit");
@@ -285,7 +285,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             2 * kCollectionGroupTargetBytes +
             plan.root_.item_count_ * sizeof(OrderedCollectionEntry)));
         auto scratch = budget.Reserve(2);
-        LAVIK_CO_RETURN_IF_ERROR(scratch.status());
+        LAVIK_CO_RETURN_IF_ERROR(scratch);
         std::map<std::uint64_t, const OrderedGroupSnapshot*> changed_pages;
         for (const auto& page : plan.writes_)
           changed_pages.emplace(page.id_, &page);
@@ -311,7 +311,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
               co_return absl::DataLossError("missing demotion page route");
             auto loaded = co_await LoadOrderedGroupSnapshot(
                 store, partition, db_id, key, digest, previous, id, false);
-            LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+            LAVIK_CO_RETURN_IF_ERROR(loaded);
             for (auto& entry : loaded->snapshot_.entries_)
               compact.push_back(std::move(entry));
             id = route->next_;
@@ -322,7 +322,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
              compact.size() != plan.root_.item_count_))
           co_return absl::DataLossError("ordered demotion count mismatch");
         auto encoded = EncodeOrderedCompactValue(plan.root_.kind_, compact);
-        LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+        LAVIK_CO_RETURN_IF_ERROR(encoded);
         if (encoded->size() >= kCollectionGroupTargetBytes)
           co_return absl::InternalError("ordered demotion byte bound failed");
         compact_payload = std::move(*encoded);
@@ -351,19 +351,19 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     co_return demoted;
   }
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
-  LAVIK_CO_RETURN_IF_ERROR(decision.status());
+  LAVIK_CO_RETURN_IF_ERROR(decision);
   if (outer_transaction) {
     // Auxiliary records retain the outer transaction tag AND this command's
     // independent batch tag. An errored EXEC command never commits its batch,
     // even if the surrounding EXEC later commits all its successful commands.
     auto batch_decision = PrepareGroupedDecision(batch);
-    LAVIK_CO_RETURN_IF_ERROR(batch_decision.status());
+    LAVIK_CO_RETURN_IF_ERROR(batch_decision);
   }
   if (!SameLogicalView(source_side, side.CurrentForMutation(key)))
     co_return absl::AbortedError("member-index source changed during prepare");
   source_side = side.CurrentForMutation(key);
   auto reserved = side.PreparePublish(key, source_side);
-  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
+  LAVIK_CO_RETURN_IF_ERROR(reserved);
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   std::vector<GroupedRecordLocation> written;
@@ -468,7 +468,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         command_batch};
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {
       auto max_key = StreamRecordKey(page.entries_.back().value_);
-      LAVIK_CO_RETURN_IF_ERROR(max_key.status());
+      LAVIK_CO_RETURN_IF_ERROR(max_key);
       candidate.stream_max_key_.Set(*max_key);
     }
     candidates.push_back(std::move(candidate));
@@ -511,12 +511,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                            absl::flat_hash_set<std::uint64_t>{tx->txid_,
                                                               command_batch},
                            sequence, std::move(members));
-        LAVIK_RETURN_IF_ERROR(directory.status());
+        LAVIK_RETURN_IF_ERROR(directory);
         if (plan.root_.kind_ == OrderedCollectionKind::kStream) {
           for (const auto& page : plan.writes_) {
             if (page.id_ != plan.root_.first_group_ || page.retired_) continue;
             auto header = StreamRecordPayload(page.entries_.front().value_);
-            LAVIK_RETURN_IF_ERROR(header.status());
+            LAVIK_RETURN_IF_ERROR(header);
             LAVIK_RETURN_IF_ERROR(directory->RememberStreamHeader(*header));
             break;
           }
@@ -533,7 +533,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           // individual groups. Existing side entries need no new capacity.
           publication.reset();
           auto refreshed = side.PreparePublish(key, current);
-          LAVIK_RETURN_IF_ERROR(refreshed.status());
+          LAVIK_RETURN_IF_ERROR(refreshed);
           publication.emplace(std::move(*refreshed));
         }
         return absl::OkStatus();

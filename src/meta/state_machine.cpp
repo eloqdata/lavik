@@ -577,7 +577,7 @@ void MetaStateMachine::SetCommitEventSink(MetaCommitEventSink sink) {
 absl::StatusOr<std::shared_ptr<MetaRaftBuffer>> MetaStateMachine::EncodeCommand(
     const MetaCommand& command) {
   absl::StatusOr<std::string> encoded = EncodeMetaCommand(command);
-  LAVIK_RETURN_IF_ERROR(encoded.status());
+  LAVIK_RETURN_IF_ERROR(encoded);
   std::shared_ptr<MetaRaftBuffer> out = MetaRaftBuffer::alloc(encoded->size());
   std::memcpy(out->data_begin(), encoded->data(), encoded->size());
   return out;
@@ -671,7 +671,7 @@ absl::StatusOr<std::string> MetaStateMachine::Capture(
 absl::Status MetaStateMachine::Install(std::uint64_t index,
                                        std::string_view image) {
   auto stores = MetaStores::Deserialize(image);
-  LAVIK_RETURN_IF_ERROR(stores.status());
+  LAVIK_RETURN_IF_ERROR(stores);
   std::lock_guard lock(mutex_);
   if (index < last_committed_idx_.load()) {
     return absl::FailedPreconditionError(

@@ -140,12 +140,12 @@ absl::StatusOr<HashEntryView> HashValueReader::Next() {
 
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
   auto reader = HashValueReader::Open(payload);
-  LAVIK_RETURN_IF_ERROR(reader.status());
+  LAVIK_RETURN_IF_ERROR(reader);
   HashValue value;
   value.entries_.reserve(reader->size());
   for (std::size_t index = 0; index < reader->size(); ++index) {
     auto view = reader->Next();
-    LAVIK_RETURN_IF_ERROR(view.status());
+    LAVIK_RETURN_IF_ERROR(view);
     HashEntry entry;
     entry.field_.assign(view->field_);
     entry.value_.assign(view->value_);

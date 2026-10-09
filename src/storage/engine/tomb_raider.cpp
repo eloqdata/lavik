@@ -460,7 +460,7 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
           store, partition.indexes_[claim.db_id_], claim.digest_, claim.key_);
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
-        LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+        LAVIK_CO_RETURN_IF_ERROR(resolved);
         LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
             TombRaiderTestPoint::kAfterClaimLookup));
         // A fault hook is itself an async boundary. Ordinary writes need not
@@ -639,7 +639,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
     bool retired = false;
     while (!present(snapshot)) {
       auto available = co_await await_block(snapshot);
-      LAVIK_CO_RETURN_IF_ERROR(available.status());
+      LAVIK_CO_RETURN_IF_ERROR(available);
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
       if (!*available) {
         retired = true;
@@ -675,7 +675,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       auto read = co_await ReadStorageBuffer(
           *store.worker_, store.files_[file_id], sweep.buffer_,
           sweep.registered(), block_offset);
-      LAVIK_CO_RETURN_IF_ERROR(read.status());
+      LAVIK_CO_RETURN_IF_ERROR(read);
       if (*read != kStorageBlockBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short block read during tomb raider sweep");
@@ -700,7 +700,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       // lookup. Its UUID registry may already be gone after reclamation.
       if (!present(snapshot)) {
         auto available = co_await await_block(snapshot);
-        LAVIK_CO_RETURN_IF_ERROR(available.status());
+        LAVIK_CO_RETURN_IF_ERROR(available);
         if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
         // Already issued prefix claims only keep tombstones alive. Retaining
         // them after durable block retirement is conservative; the unscanned
@@ -926,7 +926,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
     auto resolved =
         co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                    candidate.digest_, candidate.key_);
-    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+    LAVIK_CO_RETURN_IF_ERROR(resolved);
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
     if (partition.replication_epoch_ != candidate.replication_epoch_) {
       round.cancelled_.store(true, std::memory_order_release);

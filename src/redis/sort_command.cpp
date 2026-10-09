@@ -209,7 +209,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       operation.second_ = -1;
       auto result = co_await g_storage->ExecuteListLocked(
           db_id, key.name_, key.digest_, operation);
-      LAVIK_CO_RETURN_IF_ERROR(result.status());
+      LAVIK_CO_RETURN_IF_ERROR(result);
       source.elements_ = std::move(result->values_);
       co_return source;
     }
@@ -218,7 +218,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       operation.kind_ = storage::HashOperationKind::kKeys;
       auto result = co_await g_storage->ExecuteSetLocked(
           db_id, key.name_, key.digest_, operation);
-      LAVIK_CO_RETURN_IF_ERROR(result.status());
+      LAVIK_CO_RETURN_IF_ERROR(result);
       source.elements_.reserve(result->values_.size());
       for (auto& member : result->values_) {
         if (!member.has_value()) {
@@ -332,7 +332,7 @@ Task<absl::StatusOr<std::optional<std::string>>> LookupPatternValue(
     co_return cached->second;
   }
   auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys);
-  LAVIK_CO_RETURN_IF_ERROR(value.status());
+  LAVIK_CO_RETURN_IF_ERROR(value);
   cache->emplace(std::move(cache_key), *value);
   co_return *value;
 }
@@ -435,7 +435,7 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
       }
       auto value = co_await LookupPatternValue(request.db_id_, pattern,
                                                items[i].value_, keys, &cache);
-      LAVIK_CO_RETURN_IF_ERROR(value.status());
+      LAVIK_CO_RETURN_IF_ERROR(value);
       product.reply_values_.push_back(std::move(*value));
     }
   }
@@ -458,7 +458,7 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     LAVIK_CO_RETURN_IF_ERROR(RecheckClusterRequestAuthority(request));
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, destination.name_, destination.digest_, writes);
-    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
+    LAVIK_CO_RETURN_IF_ERROR(deleted);
     if (values.empty()) co_return *deleted;
     storage::ListOperation push;
     push.kind_ = storage::ListOperationKind::kPushRight;
@@ -466,7 +466,7 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     for (const std::string& value : values) push.values_.push_back(value);
     auto pushed = co_await g_storage->ExecuteListLocked(
         request.db_id_, destination.name_, destination.digest_, push, writes);
-    LAVIK_CO_RETURN_IF_ERROR(pushed.status());
+    LAVIK_CO_RETURN_IF_ERROR(pushed);
     co_return true;
   };
   if (destination.owner_ == ThisWorker().id_) co_return co_await replace();

@@ -142,7 +142,7 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaCollection(
         owner->decoded_charge_.Resize(owner->decoded_charge_.bytes() + bytes);
         return absl::OkStatus();
       });
-  LAVIK_CO_RETURN_IF_ERROR(decoder.status());
+  LAVIK_CO_RETURN_IF_ERROR(decoder);
   state->decoder_.emplace(std::move(*decoder));
   const auto digest = ComputeDigest(stage.key_);
   state->key_hold_ = co_await tx::CurrentTxShard().AcquireKey(
@@ -151,7 +151,7 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaCollection(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   auto current = co_await FindVerifiedEntry(
       store, partition.indexes_[stage.db_id_], digest, stage.key_);
-  LAVIK_CO_RETURN_IF_ERROR(current.status());
+  LAVIK_CO_RETURN_IF_ERROR(current);
   state->skip_ = *current != nullptr && (*current)->value_.mutation_sequence_ >=
                                             stage.mutation_sequence_;
   // A superseded snapshot still passes full wire framing/count/length checks,
@@ -230,7 +230,7 @@ Task<absl::Status> StorageEngine::Impl::ConsumeReplicaCollection(
     while (state->decoder_->page_ready()) {
       std::size_t admission = 0;
       auto page = state->decoder_->TakePage(&admission);
-      LAVIK_CO_RETURN_IF_ERROR(page.status());
+      LAVIK_CO_RETURN_IF_ERROR(page);
       const auto count = page->size();
       if (state->skip_) {
         page = absl::CancelledError("page has been discarded");
@@ -240,7 +240,7 @@ Task<absl::Status> StorageEngine::Impl::ConsumeReplicaCollection(
         continue;
       }
       auto measured = CollectionCompactEncoder::MeasurePage(*page);
-      LAVIK_CO_RETURN_IF_ERROR(measured.status());
+      LAVIK_CO_RETURN_IF_ERROR(measured);
       if (batch.size() != 0 && *measured > kWriteBatchBytes - batch_bytes) {
         LAVIK_CO_RETURN_IF_ERROR(co_await flush_batch());
       }
@@ -265,7 +265,7 @@ Task<absl::Status> StorageEngine::Impl::ConsumeReplicaCollection(
   };
   while (!input.empty()) {
     auto consumed = state->decoder_->Consume(input);
-    LAVIK_CO_RETURN_IF_ERROR(consumed.status());
+    LAVIK_CO_RETURN_IF_ERROR(consumed);
     if (*consumed == 0 && !state->decoder_->page_ready())
       co_return absl::InternalError(
           "replica collection decoder made no progress");
@@ -378,7 +378,7 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
         auto group = co_await LoadHashGroupSnapshot(
             store, partition, stage.db_id_, stage.key_, digest, previous,
             route->id_);
-        LAVIK_CO_RETURN_IF_ERROR(group.status());
+        LAVIK_CO_RETURN_IF_ERROR(group);
         for (auto& field : group->snapshot_.value_.entries_)
           after.entries_.push_back(std::move(field));
       }
@@ -426,7 +426,7 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
                                  .id_ = 1,
                                  .entries_ = std::move(entries)};
     auto split = SplitOrderedGroup(std::move(initial), 2);
-    LAVIK_CO_RETURN_IF_ERROR(split.status());
+    LAVIK_CO_RETURN_IF_ERROR(split);
     plan.root_ = {
         .kind_ = kind,
         .incarnation_ = 1,
@@ -456,7 +456,7 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
       auto old = co_await LoadOrderedGroupSnapshot(
           store, partition, stage.db_id_, stage.key_, digest, previous,
           directory.groups()[i].id_);
-      LAVIK_CO_RETURN_IF_ERROR(old.status());
+      LAVIK_CO_RETURN_IF_ERROR(old);
       loaded.push_back(std::move(*old));
     }
     LAVIK_ASSIGN_OR_CO_RETURN(

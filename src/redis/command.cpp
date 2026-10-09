@@ -2695,7 +2695,7 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                 auto token =
                     co_await g_storage->AcquireReplicationPublisherAdmission(
                         admission.logical_bytes_, scope.target_);
-                LAVIK_CO_RETURN_IF_ERROR(token.status());
+                LAVIK_CO_RETURN_IF_ERROR(token);
                 admission.worker_tokens_[index] =
                     ReplicationPublisherAdmission::WorkerToken{
                         .worker_ = scope.worker_,
@@ -3669,7 +3669,7 @@ Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
       snapshot = co_await g_storage->ExecuteSetLocked(
           state->db_, state->key_, state->digest_, operation, nullptr);
     }
-    LAVIK_CO_RETURN_IF_ERROR(snapshot.status());
+    LAVIK_CO_RETURN_IF_ERROR(snapshot);
     if (snapshot->length_ == 0) co_return std::uint64_t{0};
     LAVIK_CO_RETURN_IF_ERROR(
         AdoptRandomStreamSnapshot(*state, std::move(*snapshot)));
@@ -3792,7 +3792,7 @@ PrepareTransactionalNegativeRandomStreamLocked(
     snapshot = co_await g_storage->ExecuteSetLocked(
         request.db_id_, request.args_[1], digest, operation, tx);
   }
-  LAVIK_CO_RETURN_IF_ERROR(snapshot.status());
+  LAVIK_CO_RETURN_IF_ERROR(snapshot);
   if (snapshot->length_ == 0) {
     co_return OwnedStreamReply{.encoded_ = "*0\r\n", .chunks_ = {}};
   }
@@ -4036,11 +4036,11 @@ struct PreparedRestoreValue {
 absl::StatusOr<PreparedRestoreValue> PrepareRestoreValue(
     std::string_view payload) {
   auto reader = rdb::DumpReader::Open(payload);
-  LAVIK_RETURN_IF_ERROR(reader.status());
+  LAVIK_RETURN_IF_ERROR(reader);
   PreparedRestoreValue value;
   if (!reader->collection()) {
     auto raw = reader->ReadRawValue();
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     value.value_type_ = raw->value_type_;
     value.raw_ = std::move(*raw);
   } else {
@@ -4049,7 +4049,7 @@ absl::StatusOr<PreparedRestoreValue> PrepareRestoreValue(
     // replacing a live key. The second pass feeds the atomic ingest directly.
     for (;;) {
       auto page = reader->ReadCollectionPage();
-      LAVIK_RETURN_IF_ERROR(page.status());
+      LAVIK_RETURN_IF_ERROR(page);
       if (page->done_) break;
     }
     LAVIK_RETURN_IF_ERROR(reader->Rewind());
@@ -4154,10 +4154,10 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
         db, tx::FingerprintOf(digest), tx::LockMode::kShared);
   auto value = co_await g_storage->ReadValueForTransferLocked(db, key, digest);
   guard = {};
-  LAVIK_CO_RETURN_IF_ERROR(value.status());
+  LAVIK_CO_RETURN_IF_ERROR(value);
   if (!value->reader_) {
     auto payload = rdb::EncodeDump(value->metadata_);
-    LAVIK_CO_RETURN_IF_ERROR(payload.status());
+    LAVIK_CO_RETURN_IF_ERROR(payload);
     co_return PrepareDumpReply(std::move(*payload));
   }
   struct State {
@@ -4200,7 +4200,7 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
     co_return absl::InternalError("cannot protect DUMP scratch descriptor");
   auto encoder = rdb::CollectionFileEncoder::CreateDump(
       value->metadata_.value_type_, value->metadata_.logical_size_);
-  LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoder);
   rdb::DumpEncoder checksum;
   const auto drain = [&]() -> absl::Status {
     while (auto fragment = encoder->Next()) {
@@ -4213,7 +4213,7 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
   LAVIK_CO_RETURN_IF_ERROR(status);
   for (;;) {
     auto page = co_await value->reader_();
-    LAVIK_CO_RETURN_IF_ERROR(page.status());
+    LAVIK_CO_RETURN_IF_ERROR(page);
     status = encoder->StartPage(*page);
     LAVIK_CO_RETURN_IF_ERROR(status);
     status = drain();
@@ -5683,7 +5683,7 @@ Task<absl::Status> RenameWriteCallback(void* opaque,
     if (key.arg_index_ == 1) {
       auto deleted = co_await g_storage->DeleteLocked(
           context->request_->db_id_, name, key.digest_, writes);
-      LAVIK_CO_RETURN_IF_ERROR(deleted.status());
+      LAVIK_CO_RETURN_IF_ERROR(deleted);
       if (!*deleted) co_return absl::NotFoundError("no such key");
     } else if (key.arg_index_ == 2) {
       LAVIK_CO_RETURN_IF_ERROR(co_await g_storage->WriteValueForTransferLocked(
@@ -6067,7 +6067,7 @@ Task<absl::Status> MSetNxWriteLocal(MSetNxContext* context) {
     auto result = co_await g_storage->SetLocked(
         context->request_->db_id_, args[argument], digest, args[argument + 1],
         {}, &context->writes_[owner]);
-    LAVIK_CO_RETURN_IF_ERROR(result.status());
+    LAVIK_CO_RETURN_IF_ERROR(result);
   }
   co_return absl::OkStatus();
 }
@@ -6162,7 +6162,7 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
     auto values =
         co_await g_storage->BatchGetLocked(ctx->request_->db_id_, reads);
     for (std::size_t i = 0; i < values.size(); ++i) {
-      LAVIK_CO_RETURN_IF_ERROR(values[i].status());
+      LAVIK_CO_RETURN_IF_ERROR(values[i]);
       if (values[i]->has_value()) {
         const std::size_t slot = slice.keys_[i].arg_index_ - 1;
         ctx->frames_[slot] = EncodeBulkString(**values[i]);
@@ -6224,7 +6224,7 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
       default: {
         auto metadata = co_await g_storage->ReadKeyMetadataLocked(
             ctx->request_->db_id_, name, key.digest_);
-        LAVIK_CO_RETURN_IF_ERROR(metadata.status());
+        LAVIK_CO_RETURN_IF_ERROR(metadata);
         if (metadata->exists_) {
           ctx->hits_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -6945,7 +6945,7 @@ Task<std::string> ExecuteExecSequentialSetMulti(
         auto result = co_await g_storage->ExecuteSetLocked(
             command.db_id_, args[key.arg_], key.digest_, operation,
             write ? &tx_writes[key.owner_] : nullptr);
-        LAVIK_CO_RETURN_IF_ERROR(result.status());
+        LAVIK_CO_RETURN_IF_ERROR(result);
         // Full kKeys can still use an uncharged legacy result. Establish the
         // retained owner before transferring its strings to the coordinator.
         if (operation.kind_ == storage::HashOperationKind::kKeys &&
@@ -6976,7 +6976,7 @@ Task<std::string> ExecuteExecSequentialSetMulti(
       storage::HashOperation operation;
       operation.kind_ = storage::HashOperationKind::kKeys;
       auto result = co_await run_set(*key, std::move(operation), false);
-      LAVIK_CO_RETURN_IF_ERROR(result.status());
+      LAVIK_CO_RETURN_IF_ERROR(result);
       std::size_t bytes = 0;
       if (!add_bytes(&bytes, result->values_.size(), sizeof(std::string)))
         co_return oom();
@@ -8077,7 +8077,7 @@ PrepareFunctionMutationPublication(const CommandRequest& request) {
     auto publication = g_storage->PrepareAdmittedReplicationCommand(
         admission, storage::ReplicationEventKind::kCatalogMutation, 0,
         std::move(args), std::vector<std::string>{});
-    LAVIK_CO_RETURN_IF_ERROR(publication.status());
+    LAVIK_CO_RETURN_IF_ERROR(publication);
     co_return PreparedFunctionMutationPublication{
         .admission_ = std::move(admission),
         .publication_ = std::move(*publication),
@@ -8091,7 +8091,7 @@ PrepareFunctionMutationPublication(const CommandRequest& request) {
         auto publication = g_storage->PrepareAdmittedReplicationCommand(
             admission, storage::ReplicationEventKind::kCatalogMutation, 0,
             std::move(args), std::vector<std::string>{});
-        LAVIK_CO_RETURN_IF_ERROR(publication.status());
+        LAVIK_CO_RETURN_IF_ERROR(publication);
         co_return PreparedFunctionMutationPublication{
             .admission_ = std::move(admission),
             .publication_ = std::move(*publication),
@@ -8549,7 +8549,7 @@ Task<absl::Status> ApplyFunctionCatalogTarget(
   LAVIK_CO_RETURN_IF_ERROR(RecheckClusterRequestAuthority(request));
   auto staged =
       co_await GlobalFunctionCatalog().StageCompleteCatalog(std::move(target));
-  LAVIK_CO_RETURN_IF_ERROR(staged.status());
+  LAVIK_CO_RETURN_IF_ERROR(staged);
   auto publication = co_await PrepareFunctionMutationPublication(request);
   if (!publication.ok()) {
     co_await GlobalFunctionCatalog().AbortStagedCatalog(&*staged);
@@ -9213,7 +9213,7 @@ Task<absl::StatusOr<std::string>> NextExecReplyChunk(
     ReplyChunkSource& source = state->chunks_[state->index_];
     if (source) {
       absl::StatusOr<std::string> chunk = co_await source();
-      LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+      LAVIK_CO_RETURN_IF_ERROR(chunk);
       if (!chunk->empty()) co_return chunk;
       source = {};
     }
@@ -13354,7 +13354,7 @@ Task<absl::Status> RunReplicationAdmittedAttempt(
   }
   auto admission = co_await AcquireReplicationPublisherAdmission(
       RequestArgumentBytes(request), &request);
-  LAVIK_CO_RETURN_IF_ERROR(admission.status());
+  LAVIK_CO_RETURN_IF_ERROR(admission);
   absl::Status result = co_await attempt();
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
@@ -13450,7 +13450,7 @@ absl::StatusOr<std::vector<CommandRequest>> ParseReplicatedExec(
     offset += static_cast<std::size_t>(argc);
     auto request =
         BuildCommandRequest(std::move(wire), static_cast<std::uint8_t>(db_id));
-    LAVIK_RETURN_IF_ERROR(request.status());
+    LAVIK_RETURN_IF_ERROR(request);
     if (request->spec_ == nullptr ||
         (request->spec_->flags_ & kCmdGlobal) != 0 ||
         request->kind_ == CommandKind::kMulti ||
@@ -13474,7 +13474,7 @@ absl::StatusOr<std::vector<CommandRequest>> ParseReplicatedExec(
 
 Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
   auto commands = ParseReplicatedExec(args);
-  LAVIK_CO_RETURN_IF_ERROR(commands.status());
+  LAVIK_CO_RETURN_IF_ERROR(commands);
   ConnectionContext context;
   context.strict_replication_apply_ = true;
   context.queued_ = std::move(*commands);
@@ -13499,7 +13499,7 @@ Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
   } else {
     auto request = BuildCommandRequest(RespCommand{.args_ = command.args_},
                                        command.db_id_);
-    LAVIK_CO_RETURN_IF_ERROR(request.status());
+    LAVIK_CO_RETURN_IF_ERROR(request);
     request->replication_origin_ = true;
     commands.push_back(std::move(*request));
   }
@@ -13522,7 +13522,7 @@ Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
       co_return absl::InvalidArgumentError("unsupported FULL mutation");
     }
     auto keys = DetermineKeys(*request.spec_, request.args_);
-    LAVIK_CO_RETURN_IF_ERROR(keys.status());
+    LAVIK_CO_RETURN_IF_ERROR(keys);
     if (keys->empty()) {
       co_return absl::InvalidArgumentError("FULL mutation has no key");
     }
@@ -13550,7 +13550,7 @@ Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
         } else {
           result = co_await bycorf::SubmitTaskTo(owner, check);
         }
-        LAVIK_CO_RETURN_IF_ERROR(result.status());
+        LAVIK_CO_RETURN_IF_ERROR(result);
         needs_apply = *result;
         coverage.push_back({request.db_id_, key, needs_apply});
       }
@@ -13649,7 +13649,7 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
 
   RespCommand wire{.args_ = command.args_};
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
-  LAVIK_CO_RETURN_IF_ERROR(request.status());
+  LAVIK_CO_RETURN_IF_ERROR(request);
   request->replication_origin_ = true;
   if (request->kind_ == CommandKind::kPublish) {
     (void)co_await PublishChannel(request->args_[1], request->args_[2]);
@@ -13690,7 +13690,7 @@ Task<absl::Status> ApplyRedisReplicatedCommand(
   }
   RespCommand wire{.args_ = command.args_};
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
-  LAVIK_CO_RETURN_IF_ERROR(request.status());
+  LAVIK_CO_RETURN_IF_ERROR(request);
   request->replication_origin_ = true;
 
   // Redis includes PUBLISH in its replication stream even though it does not
@@ -13744,7 +13744,7 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
     }
     RespCommand wire{.args_ = command.args_};
     auto request = BuildCommandRequest(std::move(wire), command.db_id_);
-    LAVIK_CO_RETURN_IF_ERROR(request.status());
+    LAVIK_CO_RETURN_IF_ERROR(request);
     const bool function_mutation = request->kind_ == CommandKind::kFunction;
     if (request->spec_ == nullptr ||
         (!function_mutation &&

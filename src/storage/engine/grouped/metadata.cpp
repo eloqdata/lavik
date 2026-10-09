@@ -96,11 +96,11 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
   } else {
     payload = EncodeGroupedHashRoot(previous->directory().root());
   }
-  LAVIK_CO_RETURN_IF_ERROR(payload.status());
+  LAVIK_CO_RETURN_IF_ERROR(payload);
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
-  LAVIK_CO_RETURN_IF_ERROR(decision.status());
+  LAVIK_CO_RETURN_IF_ERROR(decision);
   auto reserved = side.PreparePublish(key, side.CurrentForMutation(key));
-  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
+  LAVIK_CO_RETURN_IF_ERROR(reserved);
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   GroupedObject::PreparedHandle builder;
@@ -124,7 +124,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
             builder, GroupedObject::PrepareMetadataUpdate(current, version));
         publication.reset();
         auto refreshed = side.PreparePublish(key, current);
-        LAVIK_RETURN_IF_ERROR(refreshed.status());
+        LAVIK_RETURN_IF_ERROR(refreshed);
         publication.emplace(std::move(*refreshed));
         return absl::OkStatus();
       },

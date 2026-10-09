@@ -48,7 +48,7 @@ class RecordSpool {
     if (finished_)
       return absl::FailedPreconditionError("RDB spool already sealed");
     auto record = Allocate(key.size(), value.size());
-    LAVIK_RETURN_IF_ERROR(record.status());
+    LAVIK_RETURN_IF_ERROR(record);
     record->key_.assign(key);
     record->value_.assign(value);
     buffered_bytes_ += key.size() + value.size() + 128;
@@ -86,7 +86,7 @@ class RecordSpool {
     std::uint64_t count = 0;
     for (;;) {
       auto row = Read(result_.get());
-      LAVIK_RETURN_IF_ERROR(row.status());
+      LAVIK_RETURN_IF_ERROR(row);
       if (!*row || !(**row).key_.starts_with(prefix)) break;
       ++count;
     }
@@ -164,7 +164,7 @@ class RecordSpool {
       value |= std::uint64_t(header[8 + i]) << (8 * i);
     }
     auto record = Allocate(key, value);
-    LAVIK_RETURN_IF_ERROR(record.status());
+    LAVIK_RETURN_IF_ERROR(record);
     record->key_.resize(key);
     record->value_.resize(value);
     if (std::fread(record->key_.data(), 1, key, file) != key ||
@@ -181,7 +181,7 @@ class RecordSpool {
   }
   static absl::StatusOr<File> Merge(File a, File b) {
     auto output = Open();
-    LAVIK_RETURN_IF_ERROR(output.status());
+    LAVIK_RETURN_IF_ERROR(output);
     auto left = Read(a.get()), right = Read(b.get());
     while (left.ok() && right.ok() && (*left || *right)) {
       const bool take_left =
@@ -196,8 +196,8 @@ class RecordSpool {
         right = Read(b.get());
       }
     }
-    LAVIK_RETURN_IF_ERROR(left.status());
-    LAVIK_RETURN_IF_ERROR(right.status());
+    LAVIK_RETURN_IF_ERROR(left);
+    LAVIK_RETURN_IF_ERROR(right);
     LAVIK_RETURN_IF_ERROR(Seal(output->get()));
     return std::move(*output);
   }
@@ -206,7 +206,7 @@ class RecordSpool {
     std::sort(buffered_.begin(), buffered_.end(),
               [](const auto& a, const auto& b) { return a.key_ < b.key_; });
     auto run = Open();
-    LAVIK_RETURN_IF_ERROR(run.status());
+    LAVIK_RETURN_IF_ERROR(run);
     for (const auto& record : buffered_) {
       LAVIK_RETURN_IF_ERROR(Write(run->get(), record));
     }
@@ -220,7 +220,7 @@ class RecordSpool {
         return absl::OkStatus();
       }
       run = Merge(std::move(slot), std::move(*run));
-      LAVIK_RETURN_IF_ERROR(run.status());
+      LAVIK_RETURN_IF_ERROR(run);
     }
     return absl::ResourceExhaustedError("RDB scratch merge level overflow");
   }

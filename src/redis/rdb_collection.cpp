@@ -101,7 +101,7 @@ absl::StatusOr<CollectionFileEncoder> CollectionFileEncoder::Create(
 absl::StatusOr<CollectionFileEncoder> CollectionFileEncoder::CreateDump(
     storage::ValueType type, std::uint64_t item_count) {
   auto result = Create(0, {}, type, item_count, 0);
-  LAVIK_RETURN_IF_ERROR(result.status());
+  LAVIK_RETURN_IF_ERROR(result);
   // SELECTDB and empty key framing belong to files, not DUMP values.
   result->header_[0] = result->header_[2];
   result->header_bytes_ = 1;

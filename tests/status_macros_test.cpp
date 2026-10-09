@@ -61,6 +61,32 @@ TEST(StatusMacrosTest, ReturnEvaluatesOnceAndPreservesErrorAndCleanup) {
     EXPECT_EQ(result.status(), status);
     EXPECT_EQ(status, fail ? Error() : absl::OkStatus());
     if (result.ok()) EXPECT_EQ(*result, 7);
+
+    // A named move-only StatusOr must be borrowed, preserving both its value
+    // on success and its original error after propagation.
+    absl::StatusOr<std::unique_ptr<int>> stream =
+        fail ? absl::StatusOr<std::unique_ptr<int>>(Error())
+             : absl::StatusOr<std::unique_ptr<int>>(std::make_unique<int>(42));
+    const auto* original = fail ? nullptr : stream->get();
+    calls = 0;
+    const auto check = [&]() -> absl::Status {
+      LAVIK_RETURN_IF_ERROR((++calls, stream));
+      return absl::OkStatus();
+    };
+    EXPECT_EQ(check(), status);
+    EXPECT_EQ(calls, 1);
+    const auto check_coro = [&]() -> bycorf::Task<absl::Status> {
+      LAVIK_CO_RETURN_IF_ERROR((++calls, stream));
+      co_return absl::OkStatus();
+    };
+    auto handle = check_coro().ReleaseHandle();
+    handle.resume();
+    EXPECT_TRUE(handle.done());
+    EXPECT_EQ(handle.promise().value_, status);
+    handle.destroy();
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(stream.status(), status);
+    if (stream.ok()) EXPECT_EQ(stream->get(), original);
   }
 }
 

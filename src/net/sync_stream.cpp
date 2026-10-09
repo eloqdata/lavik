@@ -426,14 +426,14 @@ absl::StatusOr<std::unique_ptr<SyncStream>> SyncStream::Connect(
                         endpoint->length_, io_deadline);
   };
   auto fd = connect();
-  LAVIK_RETURN_IF_ERROR(fd.status());
+  LAVIK_RETURN_IF_ERROR(fd);
   auto impl = std::make_unique<Impl>(Impl{std::move(*fd), {}, {}, io_deadline});
   if (target.transport_ == SyncTarget::Transport::kTcpMtls) {
     auto context = MakeTlsContext(target.tls_);
-    LAVIK_RETURN_IF_ERROR(context.status());
+    LAVIK_RETURN_IF_ERROR(context);
     auto session = StartTls(context->get(), impl->fd_.get(), *endpoint,
                             target.tls_, io_deadline);
-    LAVIK_RETURN_IF_ERROR(session.status());
+    LAVIK_RETURN_IF_ERROR(session);
     impl->tls_context_.emplace(std::move(*context));
     impl->tls_.emplace(std::move(*session));
   }

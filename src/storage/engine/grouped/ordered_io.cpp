@@ -41,7 +41,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     if (!pinned) {
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[db_id], digest, key, original.root_);
-      LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+      LAVIK_CO_RETURN_IF_ERROR(resolved);
       if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
           (*resolved)->value_.mutation_sequence_ !=
               original.root_.mutation_sequence_) {
@@ -54,7 +54,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
               .db_epoch_ = original.db_epoch_,
               .replication_epoch_ = original.replication_epoch_,
               .index_generation_ = original.index_generation_});
-      LAVIK_CO_RETURN_IF_ERROR(current.status());
+      LAVIK_CO_RETURN_IF_ERROR(current);
       if (*current == nullptr || !(*current)->is_ordered() ||
           (*current)->ordered_directory().root() != root) {
         co_return absl::NotFoundError("ordered logical version changed");
@@ -102,7 +102,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
       const auto envelope = DecodeOrderedGroupMetadata(payload, payload.size());
-      LAVIK_CO_RETURN_IF_ERROR(envelope.status());
+      LAVIK_CO_RETURN_IF_ERROR(envelope);
       // The external page admission uses the captured count; validate it
       // before decoding can reserve storage from untrusted payload metadata.
       const auto* route = object->ordered_directory().Find(page_id);
@@ -142,7 +142,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
          const OrderedGroupEntry& route,
          LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
         auto decoded = DecodeOrderedGroup(payload);
-        LAVIK_RETURN_IF_ERROR(decoded.status());
+        LAVIK_RETURN_IF_ERROR(decoded);
         if (decoded->kind_ == OrderedCollectionKind::kSortedSet &&
             (decoded->entries_.front().score_ != route.min_score_ ||
              decoded->entries_.back().score_ != route.max_score_))
@@ -179,7 +179,7 @@ StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
          const OrderedGroupEntry& route,
          LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
         auto entries = DecodeSortedSetGroupViews(payload);
-        LAVIK_RETURN_IF_ERROR(entries.status());
+        LAVIK_RETURN_IF_ERROR(entries);
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)
           return absl::DataLossError("ordered page score bounds mismatch");
@@ -200,7 +200,7 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
   for (const auto& metadata : object->ordered_directory().groups()) {
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object, metadata.id_, pinned);
-    LAVIK_CO_RETURN_IF_ERROR(page.status());
+    LAVIK_CO_RETURN_IF_ERROR(page);
     if (page->snapshot_.previous_ != metadata.previous_ ||
         page->snapshot_.next_ != metadata.next_ ||
         OrderedGroupSize(page->snapshot_) != metadata.item_count_) {

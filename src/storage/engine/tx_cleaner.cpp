@@ -634,7 +634,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   absl::flat_hash_set<std::uint64_t> settled_txids;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto local = co_await inspect_owner(owner, true);
-    LAVIK_CO_RETURN_IF_ERROR(local.status());
+    LAVIK_CO_RETURN_IF_ERROR(local);
     for (const TxCleanerBlock& block : *local)
       if (!block.active_transaction_)
         settled_txids.insert(block.txids_.begin(), block.txids_.end());
@@ -647,7 +647,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
       commit_fences;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto local = co_await inspect_owner(owner, false);
-    LAVIK_CO_RETURN_IF_ERROR(local.status());
+    LAVIK_CO_RETURN_IF_ERROR(local);
     for (const TxCleanerBlock& block : *local)
       for (const auto& [txid, record_end] : block.commit_decisions_) {
         committed->insert(txid);
@@ -714,7 +714,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   absl::flat_hash_set<std::uint64_t> decisions_needed;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto current = co_await inspect_owner(owner, false);
-    LAVIK_CO_RETURN_IF_ERROR(current.status());
+    LAVIK_CO_RETURN_IF_ERROR(current);
     for (const TxCleanerBlock& block : *current)
       if (block.live_tagged_bytes_ != 0 || block.dependency_pins_ != 0 ||
           block.pending_relocation_)
@@ -795,7 +795,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCleanerForShutdown() {
             return InspectTxBlocksLocal(*stores_[owner], false);
           });
         }
-        LAVIK_CO_RETURN_IF_ERROR(state.status());
+        LAVIK_CO_RETURN_IF_ERROR(state);
         if (!state->empty())
           co_return absl::FailedPreconditionError(
               "transaction blocks remain at shutdown checkpoint");

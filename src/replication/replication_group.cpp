@@ -188,7 +188,7 @@ absl::StatusOr<PopulationManifest> PopulationManifest::Create(
   }
 
   auto id = HashManifest(entries);
-  LAVIK_RETURN_IF_ERROR(id.status());
+  LAVIK_RETURN_IF_ERROR(id);
   std::array<std::uint64_t, kReplicationPartitionCount> logical_epochs{};
   for (const PopulationManifestEntry& entry : entries) {
     logical_epochs[entry.partition_id_] = entry.logical_epoch_;

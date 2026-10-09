@@ -176,7 +176,7 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
       continue;
     auto handle = found->value_;
     auto actual = co_await LoadIndirectKey(handle);
-    LAVIK_CO_RETURN_IF_ERROR(actual.status());
+    LAVIK_CO_RETURN_IF_ERROR(actual);
     if (*actual != key) continue;
     if (tx != nullptr) tx->indirect_keys_.push_back({std::string(key), id});
     co_return handle;
@@ -190,8 +190,8 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
   do {
     auto hi = RandomStorageSetId();
     auto lo = RandomStorageSetId();
-    LAVIK_CO_RETURN_IF_ERROR(hi.status());
-    LAVIK_CO_RETURN_IF_ERROR(lo.status());
+    LAVIK_CO_RETURN_IF_ERROR(hi);
+    LAVIK_CO_RETURN_IF_ERROR(lo);
     handle->id_ = {(*hi & ~std::uint64_t{0x3fff}) | RedisSlot(key), *lo};
     // RFC 4122 variant/version bits; the slot occupies two different bytes.
     auto* bytes = reinterpret_cast<unsigned char*>(handle->id_.data());

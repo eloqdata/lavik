@@ -221,14 +221,14 @@ absl::StatusOr<std::string_view> StreamRecordKey(std::string_view record) {
 
 absl::StatusOr<std::string_view> StreamRecordPayload(std::string_view record) {
   auto key = StreamRecordKey(record);
-  LAVIK_RETURN_IF_ERROR(key.status());
+  LAVIK_RETURN_IF_ERROR(key);
   return record.substr(key->size(), record.size() - key->size() - 4);
 }
 
 absl::StatusOr<std::string_view> StreamGroupHeaderPayload(
     std::string_view record) {
   auto payload = StreamRecordPayload(record);
-  LAVIK_RETURN_IF_ERROR(payload.status());
+  LAVIK_RETURN_IF_ERROR(payload);
   if (payload->size() < 32 || Get(*payload, 0, 4) != payload->size() - 32)
     return absl::DataLossError("invalid Stream group header size");
   return *payload;
@@ -350,7 +350,7 @@ absl::StatusOr<std::string> EncodeStreamRecords(
   std::string output;
   for (const auto& record : records) {
     auto payload = StreamRecordPayload(record.value_);
-    LAVIK_RETURN_IF_ERROR(payload.status());
+    LAVIK_RETURN_IF_ERROR(payload);
     if (payload->size() > output.max_size() - output.size())
       return absl::ResourceExhaustedError("Stream image size overflow");
     output.append(*payload);
@@ -379,7 +379,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
         page.entries_.size() != metadata->item_count_)
       return absl::AbortedError("stale Stream mutation page");
     auto valid = OrderedGroupEncoder::Create(page);
-    LAVIK_RETURN_IF_ERROR(valid.status());
+    LAVIK_RETURN_IF_ERROR(valid);
     if (!pages.emplace(page.id_, std::move(page)).second)
       return absl::InvalidArgumentError("duplicate Stream mutation page");
   }
@@ -410,13 +410,13 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
          !retired.contains(source.next_)))
       return absl::InvalidArgumentError("Stream mutation needs adjacent pages");
     auto last = StreamRecordKey(source.entries_.back().value_);
-    LAVIK_RETURN_IF_ERROR(last.status());
+    LAVIK_RETURN_IF_ERROR(last);
     if (source.next_ && change.key_ > *last)
       return absl::InvalidArgumentError("Stream mutation exceeds page bound");
     if (source.previous_ && !retired.contains(source.previous_)) {
       auto lower =
           StreamRecordKey(pages.at(source.previous_).entries_.back().value_);
-      LAVIK_RETURN_IF_ERROR(lower.status());
+      LAVIK_RETURN_IF_ERROR(lower);
       if (change.key_ <= *lower)
         return absl::InvalidArgumentError(
             "Stream mutation precedes page bound");
@@ -442,14 +442,14 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
     for (auto* change : updates) {
       while (entry != original.end()) {
         auto key = StreamRecordKey(entry->value_);
-        LAVIK_RETURN_IF_ERROR(key.status());
+        LAVIK_RETURN_IF_ERROR(key);
         if (*key >= change->key_) break;
         merged.push_back(std::move(*entry++));
       }
       bool exists = false;
       if (entry != original.end()) {
         auto key = StreamRecordKey(entry->value_);
-        LAVIK_RETURN_IF_ERROR(key.status());
+        LAVIK_RETURN_IF_ERROR(key);
         exists = *key == change->key_;
       }
       if (exists && change->record_ && entry->value_ == *change->record_) {
@@ -531,7 +531,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanStreamRecordChanges(
       }
       auto split =
           SplitOrderedGroup(std::move(page), plan.root_.next_group_id_);
-      LAVIK_RETURN_IF_ERROR(split.status());
+      LAVIK_RETURN_IF_ERROR(split);
       plan.root_.next_group_id_ = split->next_group_id_;
       for (auto& part : split->groups_) {
         chain.push_back(part.id_);

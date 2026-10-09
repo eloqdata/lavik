@@ -127,7 +127,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   auto resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
-  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+  LAVIK_CO_RETURN_IF_ERROR(resolved);
   auto* found = *resolved;
   GroupedObject::Handle grouped;
   if (found && found->value_.grouped()) {
@@ -226,7 +226,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     if (exists) {
       auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                        location, ExtentsFor(store, found));
-      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+      LAVIK_CO_RETURN_IF_ERROR(loaded);
       auto data = loaded->value();
       bytes.assign(reinterpret_cast<const char*>(data.data()), data.size());
     }
@@ -260,7 +260,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       if (id <= grouped->group_count()) {
         auto loaded = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, grouped, id);
-        LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+        LAVIK_CO_RETURN_IF_ERROR(loaded);
         bytes = std::move(loaded->snapshot_.entries_.front().value_);
       }
       if (!read_only)

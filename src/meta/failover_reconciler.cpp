@@ -120,7 +120,7 @@ absl::StatusOr<MetaRequestId> NextId(
         "failover planner has no id generator");
   }
   auto id = context.next_id_();
-  LAVIK_RETURN_IF_ERROR(id.status());
+  LAVIK_RETURN_IF_ERROR(id);
   if (IsZero(*id)) {
     return absl::FailedPreconditionError(
         "failover planner generated a zero id");
@@ -368,7 +368,7 @@ absl::StatusOr<std::optional<MetaCommand>> AbortControlled(
     std::optional<MetaFailoverTransitionRef> transition,
     std::string_view reason, const MetaFailoverPlannerContext& context) {
   auto request_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(request_id.status());
+  LAVIK_RETURN_IF_ERROR(request_id);
   AbortControlledFailover command;
   command.request_id_ = *request_id;
   command.operation_id_ = operation.operation_id_;
@@ -383,7 +383,7 @@ absl::StatusOr<std::optional<MetaCommand>> Authorize(
     std::string_view group_id, const MetaFailoverTransition& transition,
     MetaFailoverLoss loss, const MetaFailoverPlannerContext& context) {
   auto request_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(request_id.status());
+  LAVIK_RETURN_IF_ERROR(request_id);
   AuthorizeFailoverPrepare command;
   command.request_id_ = *request_id;
   command.group_id_ = std::string(group_id);
@@ -409,9 +409,9 @@ absl::StatusOr<std::optional<MetaCommand>> CommitControlled(
         "controlled commit owner assignment is absent");
   }
   auto topology = Increment(view.topology_epoch_, "topology epoch");
-  LAVIK_RETURN_IF_ERROR(topology.status());
+  LAVIK_RETURN_IF_ERROR(topology);
   auto request_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(request_id.status());
+  LAVIK_RETURN_IF_ERROR(request_id);
 
   CommitControlledFailover command;
   command.request_id_ = *request_id;
@@ -441,9 +441,9 @@ absl::StatusOr<std::optional<MetaCommand>> CommitUncontrolled(
         "uncontrolled commit owner assignment is absent");
   }
   auto topology = Increment(view.topology_epoch_, "topology epoch");
-  LAVIK_RETURN_IF_ERROR(topology.status());
+  LAVIK_RETURN_IF_ERROR(topology);
   auto request_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(request_id.status());
+  LAVIK_RETURN_IF_ERROR(request_id);
 
   CommitUncontrolledFailover command;
   command.request_id_ = *request_id;
@@ -494,7 +494,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
         transition.candidate_action_->authorization_->loss_if_cutover_ ==
             MetaFailoverLoss::kNone;
     auto request_id = NextId(context);
-    LAVIK_RETURN_IF_ERROR(request_id.status());
+    LAVIK_RETURN_IF_ERROR(request_id);
     DegradeControlledFailover command;
     command.request_id_ = *request_id;
     command.operation_id_ = operation->operation_id_;
@@ -558,14 +558,14 @@ absl::StatusOr<std::optional<MetaCommand>> SetUncontrolledAction(
     std::optional<MetaCandidateProgressObs> candidate,
     const MetaFailoverPlannerContext& context) {
   auto request_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(request_id.status());
+  LAVIK_RETURN_IF_ERROR(request_id);
   SetUncontrolledCandidate command;
   command.request_id_ = *request_id;
   command.group_id_ = std::string(group_id);
   command.expected_transition_ = TransitionRef(transition);
   if (candidate.has_value()) {
     auto action_id = NextId(context);
-    LAVIK_RETURN_IF_ERROR(action_id.status());
+    LAVIK_RETURN_IF_ERROR(action_id);
     command.candidate_action_ = CandidateActionFrom(*candidate, *action_id);
   }
   return MetaCommand{std::move(command)};
@@ -627,7 +627,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanUncontrolledTransition(
             "recovery deadline overflows Unix milliseconds");
       }
       auto id = NextId(context);
-      LAVIK_RETURN_IF_ERROR(id.status());
+      LAVIK_RETURN_IF_ERROR(id);
       StartCandidateRecovery start;
       start.request_id_ = *id;
       start.group_id_ = group.group_id_;
@@ -760,11 +760,11 @@ absl::StatusOr<std::optional<MetaCommand>> PlanSubmittedControlled(
   }
 
   auto request_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(request_id.status());
+  LAVIK_RETURN_IF_ERROR(request_id);
   auto transition_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(transition_id.status());
+  LAVIK_RETURN_IF_ERROR(transition_id);
   auto action_id = NextId(context);
-  LAVIK_RETURN_IF_ERROR(action_id.status());
+  LAVIK_RETURN_IF_ERROR(action_id);
 
   BeginControlledFailover command;
   command.request_id_ = *request_id;
@@ -805,7 +805,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanFailoverStep(
           "active failover operation is not a pristine submitted request");
     }
     const auto intent = DecodeFailoverOperationIntent(operation.intent_);
-    LAVIK_RETURN_IF_ERROR(intent.status());
+    LAVIK_RETURN_IF_ERROR(intent);
     if (context.group_in_flight_ && context.group_in_flight_(intent->group_id_))
       continue;
     const auto view = capture(intent->group_id_, operation.operation_id_);

@@ -204,7 +204,7 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
     std::unique_ptr<GroupedRetirementPins>* pins) {
   if (previous == nullptr) co_return absl::OkStatus();
   auto records = CollectGroupedRetirements(previous, nullptr, touched);
-  LAVIK_CO_RETURN_IF_ERROR(records.status());
+  LAVIK_CO_RETURN_IF_ERROR(records);
   if (include_root && previous->version().root_.tx_tagged()) {
     // TTL-only writes have an empty child set, but still supersede a tagged
     // root. Its transaction block can belong to another physical owner after

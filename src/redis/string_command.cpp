@@ -292,9 +292,9 @@ absl::StatusOr<BitFieldPlan> ParseBitFieldPlan(const CommandRequest& request) {
     if (args.size() - i < required)
       return absl::InvalidArgumentError("syntax error");
     auto type = ParseBitFieldType(args[i + 1]);
-    LAVIK_RETURN_IF_ERROR(type.status());
+    LAVIK_RETURN_IF_ERROR(type);
     auto offset = ParseBitOffset(args[i + 2], true, type->second);
-    LAVIK_RETURN_IF_ERROR(offset.status());
+    LAVIK_RETURN_IF_ERROR(offset);
 
     BitFieldOperation operation{
         .opcode_ = opcode,
@@ -1264,7 +1264,7 @@ bycorf::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
     auto value = co_await ReadOptionalStringLocked(
         context->request_->db_id_, context->request_->args_[key.arg_index_],
         key.digest_);
-    LAVIK_CO_RETURN_IF_ERROR(value.status());
+    LAVIK_CO_RETURN_IF_ERROR(value);
     context->inputs_[key.arg_index_] =
         value->has_value() ? std::move((**value).encoded_) : std::string{};
   }

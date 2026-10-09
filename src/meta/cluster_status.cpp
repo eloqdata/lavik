@@ -95,15 +95,15 @@ class Reader {
   }
   absl::StatusOr<bool> Bool() {
     auto value = U8();
-    LAVIK_RETURN_IF_ERROR(value.status());
+    LAVIK_RETURN_IF_ERROR(value);
     if (*value > 1) return absl::DataLossError("invalid boolean");
     return *value == 1;
   }
   absl::StatusOr<std::uint16_t> U16() {
     auto high = U8();
-    LAVIK_RETURN_IF_ERROR(high.status());
+    LAVIK_RETURN_IF_ERROR(high);
     auto low = U8();
-    LAVIK_RETURN_IF_ERROR(low.status());
+    LAVIK_RETURN_IF_ERROR(low);
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(*high) << 8) |
                                       *low);
   }
@@ -111,7 +111,7 @@ class Reader {
     std::uint32_t value = 0;
     for (int ii = 0; ii < 4; ++ii) {
       auto byte = U8();
-      LAVIK_RETURN_IF_ERROR(byte.status());
+      LAVIK_RETURN_IF_ERROR(byte);
       value = (value << 8) | *byte;
     }
     return value;
@@ -120,14 +120,14 @@ class Reader {
     std::uint64_t value = 0;
     for (int ii = 0; ii < 8; ++ii) {
       auto byte = U8();
-      LAVIK_RETURN_IF_ERROR(byte.status());
+      LAVIK_RETURN_IF_ERROR(byte);
       value = (value << 8) | *byte;
     }
     return value;
   }
   absl::StatusOr<std::string> String() {
     auto size = U32();
-    LAVIK_RETURN_IF_ERROR(size.status());
+    LAVIK_RETURN_IF_ERROR(size);
     if (*size > kMaxString || *size > bytes_.size() - offset_) {
       return absl::DataLossError("invalid cluster status string length");
     }
@@ -157,7 +157,7 @@ absl::Status Count(Writer& writer, std::size_t count) {
 
 absl::StatusOr<std::size_t> Count(Reader& reader) {
   auto count = reader.U32();
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   if (*count > kMaxItems) {
     return absl::DataLossError("cluster status item count exceeds cap");
   }
@@ -172,10 +172,10 @@ absl::Status OptionalString(Writer& writer,
 
 absl::StatusOr<std::optional<std::string>> OptionalString(Reader& reader) {
   auto present = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(present.status());
+  LAVIK_RETURN_IF_ERROR(present);
   if (!*present) return std::optional<std::string>{};
   auto value = reader.String();
-  LAVIK_RETURN_IF_ERROR(value.status());
+  LAVIK_RETURN_IF_ERROR(value);
   return std::optional<std::string>(std::move(*value));
 }
 
@@ -186,10 +186,10 @@ void OptionalU64(Writer& writer, const std::optional<std::uint64_t>& value) {
 
 absl::StatusOr<std::optional<std::uint64_t>> OptionalU64(Reader& reader) {
   auto present = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(present.status());
+  LAVIK_RETURN_IF_ERROR(present);
   if (!*present) return std::optional<std::uint64_t>{};
   auto value = reader.U64();
-  LAVIK_RETURN_IF_ERROR(value.status());
+  LAVIK_RETURN_IF_ERROR(value);
   return std::optional<std::uint64_t>(*value);
 }
 
@@ -329,7 +329,7 @@ absl::Status WriteMember(Writer& writer,
 absl::StatusOr<ClusterMetaMemberWireV1> ReadMember(Reader& reader) {
   ClusterMetaMemberWireV1 member;
   auto id = reader.U32();
-  LAVIK_RETURN_IF_ERROR(id.status());
+  LAVIK_RETURN_IF_ERROR(id);
   if (*id == 0) return absl::DataLossError("Meta member id is zero");
   member.server_id_ = *id;
   LAVIK_ASSIGN_OR_RETURN(member.ctl_endpoint_, OptionalString(reader));
@@ -840,37 +840,37 @@ absl::StatusOr<std::string> EncodeClusterHeadReply(
 absl::StatusOr<ClusterHeadWireV1> DecodeClusterHeadReply(
     std::string_view reply) {
   auto payload = Payload(reply, "OK clusterhead 1");
-  LAVIK_RETURN_IF_ERROR(payload.status());
+  LAVIK_RETURN_IF_ERROR(payload);
   Reader reader(*payload);
   auto version = reader.U16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kHeadWireVersion) {
     return absl::DataLossError("unsupported clusterhead payload version");
   }
   ClusterHeadWireV1 head;
   LAVIK_ASSIGN_OR_RETURN(head.responder_id_, reader.U32());
   auto role = reader.U8();
-  LAVIK_RETURN_IF_ERROR(role.status());
+  LAVIK_RETURN_IF_ERROR(role);
   if (*role > static_cast<std::uint8_t>(ClusterMetaRole::kLeader)) {
     return absl::DataLossError("invalid Meta role");
   }
   head.role_ = static_cast<ClusterMetaRole>(*role);
   LAVIK_ASSIGN_OR_RETURN(head.term_, reader.U64());
   auto has_leader = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_leader.status());
+  LAVIK_RETURN_IF_ERROR(has_leader);
   if (*has_leader) {
     auto leader = reader.U32();
-    LAVIK_RETURN_IF_ERROR(leader.status());
+    LAVIK_RETURN_IF_ERROR(leader);
     if (*leader == 0) return absl::DataLossError("leader id is zero");
     head.leader_id_ = *leader;
   }
   LAVIK_ASSIGN_OR_RETURN(head.config_index_, reader.U64());
   auto count = Count(reader);
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   head.meta_members_.reserve(*count);
   for (std::size_t ii = 0; ii < *count; ++ii) {
     auto member = ReadMember(reader);
-    LAVIK_RETURN_IF_ERROR(member.status());
+    LAVIK_RETURN_IF_ERROR(member);
     head.meta_members_.push_back(std::move(*member));
   }
   if (!reader.done()) return absl::DataLossError("trailing clusterhead data");
@@ -985,10 +985,10 @@ absl::StatusOr<std::string> EncodeClusterStatusReply(
 absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     std::string_view reply) {
   auto payload = Payload(reply, "OK clusterstatus 1");
-  LAVIK_RETURN_IF_ERROR(payload.status());
+  LAVIK_RETURN_IF_ERROR(payload);
   Reader reader(*payload);
   auto version = reader.U16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kStatusWireVersion) {
     return absl::DataLossError("unsupported clusterstatus payload version");
   }
@@ -999,14 +999,14 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
   LAVIK_ASSIGN_OR_RETURN(status.capture_.committed_index_, reader.U64());
   LAVIK_ASSIGN_OR_RETURN(status.capture_.topology_epoch_, reader.U64());
   auto cluster_state = reader.U8();
-  LAVIK_RETURN_IF_ERROR(cluster_state.status());
+  LAVIK_RETURN_IF_ERROR(cluster_state);
   if (*cluster_state >
       static_cast<std::uint8_t>(ClusterStateWireV1::kNonPristine)) {
     return absl::DataLossError("invalid cluster lifecycle state");
   }
   status.cluster_state_ = static_cast<ClusterStateWireV1>(*cluster_state);
   auto client_mode = reader.U8();
-  LAVIK_RETURN_IF_ERROR(client_mode.status());
+  LAVIK_RETURN_IF_ERROR(client_mode);
   if (*client_mode > 2)
     return absl::DataLossError("invalid cluster client mode");
   if (*client_mode != 0)
@@ -1027,21 +1027,21 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     LAVIK_RETURN_IF_ERROR(read_bool(value));
   }
   auto member_count = Count(reader);
-  LAVIK_RETURN_IF_ERROR(member_count.status());
+  LAVIK_RETURN_IF_ERROR(member_count);
   status.meta_members_.reserve(*member_count);
   for (std::size_t ii = 0; ii < *member_count; ++ii) {
     auto member = ReadMember(reader);
-    LAVIK_RETURN_IF_ERROR(member.status());
+    LAVIK_RETURN_IF_ERROR(member);
     status.meta_members_.push_back(std::move(*member));
   }
   auto node_count = Count(reader);
-  LAVIK_RETURN_IF_ERROR(node_count.status());
+  LAVIK_RETURN_IF_ERROR(node_count);
   status.data_nodes_.reserve(*node_count);
   for (std::size_t ii = 0; ii < *node_count; ++ii) {
     ClusterDataNodeWireV1 node;
     LAVIK_ASSIGN_OR_RETURN(node.node_id_, reader.String());
     auto role = reader.U8();
-    LAVIK_RETURN_IF_ERROR(role.status());
+    LAVIK_RETURN_IF_ERROR(role);
     if (*role > static_cast<std::uint8_t>(ClusterDataNodeRole::kReplica)) {
       return absl::DataLossError("invalid data node role");
     }
@@ -1053,7 +1053,7 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
       LAVIK_RETURN_IF_ERROR(read_bool(value));
     }
     auto lease = reader.U8();
-    LAVIK_RETURN_IF_ERROR(lease.status());
+    LAVIK_RETURN_IF_ERROR(lease);
     if (*lease > static_cast<std::uint8_t>(ClusterLeaseStatus::kUnknown)) {
       return absl::DataLossError("invalid lease status");
     }
@@ -1061,7 +1061,7 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     status.data_nodes_.push_back(std::move(node));
   }
   auto group_count = Count(reader);
-  LAVIK_RETURN_IF_ERROR(group_count.status());
+  LAVIK_RETURN_IF_ERROR(group_count);
   status.groups_.reserve(*group_count);
   for (std::size_t ii = 0; ii < *group_count; ++ii) {
     ClusterGroupWireV1 group;
@@ -1071,7 +1071,7 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     LAVIK_RETURN_IF_ERROR(read_bool(&group.serving_ready_));
     LAVIK_RETURN_IF_ERROR(read_bool(&group.topology_converged_));
     auto automatic_failover_state = reader.U8();
-    LAVIK_RETURN_IF_ERROR(automatic_failover_state.status());
+    LAVIK_RETURN_IF_ERROR(automatic_failover_state);
     if (*automatic_failover_state >
         static_cast<std::uint8_t>(ClusterAutomaticFailoverState::kTriggering)) {
       return absl::DataLossError("invalid automatic failover state");
@@ -1085,14 +1085,14 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     status.groups_.push_back(std::move(group));
   }
   auto range_count = Count(reader);
-  LAVIK_RETURN_IF_ERROR(range_count.status());
+  LAVIK_RETURN_IF_ERROR(range_count);
   status.slot_ranges_.reserve(*range_count);
   for (std::size_t ii = 0; ii < *range_count; ++ii) {
     ClusterSlotRangeWireV1 range;
     auto first = reader.U32();
-    LAVIK_RETURN_IF_ERROR(first.status());
+    LAVIK_RETURN_IF_ERROR(first);
     auto last = reader.U32();
-    LAVIK_RETURN_IF_ERROR(last.status());
+    LAVIK_RETURN_IF_ERROR(last);
     range.first_ = *first;
     range.last_ = *last;
     if (range.first_ > range.last_ || range.last_ >= 16'384) {
@@ -1102,7 +1102,7 @@ absl::StatusOr<ClusterStatusWireV1> DecodeClusterStatusReply(
     status.slot_ranges_.push_back(std::move(range));
   }
   auto blocker_count = Count(reader);
-  LAVIK_RETURN_IF_ERROR(blocker_count.status());
+  LAVIK_RETURN_IF_ERROR(blocker_count);
   status.blockers_.reserve(*blocker_count);
   for (std::size_t ii = 0; ii < *blocker_count; ++ii) {
     ClusterBlockerWireV1 blocker;
@@ -1200,7 +1200,7 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
       continue;
     }
     auto head = DecodeClusterHeadReply(*head_reply);
-    LAVIK_RETURN_IF_ERROR(head.status());
+    LAVIK_RETURN_IF_ERROR(head);
     LAVIK_RETURN_IF_ERROR(ValidateHeadTarget(*head, discovery));
     if (!head->leader_id_.has_value()) {
       last_retry = "leader_unknown";
@@ -1239,7 +1239,7 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
       last_retry = *status_reply;
     } else {
       auto status = DecodeClusterStatusReply(*status_reply);
-      LAVIK_RETURN_IF_ERROR(status.status());
+      LAVIK_RETURN_IF_ERROR(status);
       if (status->capture_.responder_id_ != *head->leader_id_) {
         return absl::DataLossError("clusterstatus responder id mismatch");
       }
@@ -1271,7 +1271,7 @@ absl::StatusOr<ClusterStatusOutcome> ClusterOperator::CaptureStatus(
       for (const auto& known_member : head->meta_members_) {
         if (!known_member.ctl_endpoint_.has_value()) continue;
         auto target = LearnedTarget(*known_member.ctl_endpoint_, options);
-        LAVIK_RETURN_IF_ERROR(target.status());
+        LAVIK_RETURN_IF_ERROR(target);
         known_targets.push_back(std::move(*target));
       }
     }

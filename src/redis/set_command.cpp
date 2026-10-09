@@ -479,7 +479,7 @@ Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
     const storage::Digest digest = storage::ComputeDigest(destination);
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, destination, digest, LocalWrites(*context));
-    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
+    LAVIK_CO_RETURN_IF_ERROR(deleted);
     if (context->output_.empty()) {
       context->changed_ = *deleted;
       co_return absl::OkStatus();
@@ -487,7 +487,7 @@ Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
     auto added = co_await g_storage->ExecuteSetLocked(
         request.db_id_, destination, digest, context->add_,
         LocalWrites(*context));
-    LAVIK_CO_RETURN_IF_ERROR(added.status());
+    LAVIK_CO_RETURN_IF_ERROR(added);
     context->changed_ = true;
     co_return absl::OkStatus();
   } catch (const std::length_error&) {
@@ -513,7 +513,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
           length.kind_ = storage::HashOperationKind::kLength;
           auto result = co_await g_storage->ExecuteSetLocked(
               request.db_id_, request.args_[2], key.digest_, length);
-          LAVIK_CO_RETURN_IF_ERROR(result.status());
+          LAVIK_CO_RETURN_IF_ERROR(result);
           continue;
         }
         if (key.arg_index_ != 1) continue;
@@ -522,7 +522,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
         contains.fields_.push_back(context->move_member_);
         auto result = co_await g_storage->ExecuteSetLocked(
             request.db_id_, request.args_[1], key.digest_, contains);
-        LAVIK_CO_RETURN_IF_ERROR(result.status());
+        LAVIK_CO_RETURN_IF_ERROR(result);
         context->source_exists_ = result->key_exists_;
         context->source_contains_ =
             !result->values_.empty() && result->values_.front().has_value();
@@ -532,7 +532,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
       read.kind_ = storage::HashOperationKind::kKeys;
       auto result = co_await g_storage->ExecuteSetLocked(
           request.db_id_, request.args_[key.arg_index_], key.digest_, read);
-      LAVIK_CO_RETURN_IF_ERROR(result.status());
+      LAVIK_CO_RETURN_IF_ERROR(result);
       std::size_t bytes = 0;
       if (!AddWorkingBytes(&bytes, result->values_.size(),
                            sizeof(std::string))) {
@@ -602,7 +602,7 @@ Task<absl::Status> SetWriteShardCallback(void* opaque,
       auto result = co_await g_storage->ExecuteSetLocked(
           request.db_id_, request.args_[key.arg_index_], key.digest_, operation,
           LocalWrites(*context));
-      LAVIK_CO_RETURN_IF_ERROR(result.status());
+      LAVIK_CO_RETURN_IF_ERROR(result);
       context->changed_ = true;
     }
     co_return absl::OkStatus();

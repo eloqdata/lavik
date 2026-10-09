@@ -350,7 +350,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   auto& index = partition.indexes_[requested.db_id_];
   auto resolved =
       co_await FindVerifiedEntry(store, index, digest, requested.key_);
-  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+  LAVIK_CO_RETURN_IF_ERROR(resolved);
 
   const RecordIndex::Entry* current = *resolved;
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
@@ -388,7 +388,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
       source_id = co_await PinFullSyncValue(store, session_id, partition,
                                             location, extents);
     }
-    LAVIK_CO_RETURN_IF_ERROR(source_id.status());
+    LAVIK_CO_RETURN_IF_ERROR(source_id);
     key_lock.Reset();
     co_return SnapshotRecord{
         .kind_ = SnapshotRecord::Kind::kValue,
@@ -407,7 +407,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   }
   auto loaded = co_await LoadValue(store, partition, requested.db_id_,
                                    requested.key_, digest, location, extents);
-  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+  LAVIK_CO_RETURN_IF_ERROR(loaded);
   const std::span<const std::byte> value = loaded->value();
   SnapshotRecord result{
       .kind_ = SnapshotRecord::Kind::kValue,
@@ -531,7 +531,7 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
           std::move(state.external_[index]);
       auto key = co_await LoadOutOfIndexKey(CurrentStore(), candidate.location_,
                                             candidate.key_bytes_);
-      LAVIK_CO_RETURN_IF_ERROR(key.status());
+      LAVIK_CO_RETURN_IF_ERROR(key);
       const RecordIndex::Entry* current =
           state.index_->FindAddress(candidate.entry_address_, candidate.hash_);
       if (current == nullptr) continue;
@@ -849,7 +849,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
   if (capture->second.pending_snapshot_keys_.empty()) {
     auto scanned = co_await ScanPartition(partition_id, db_id, cursor, count,
                                           now_ms, max_bytes);
-    LAVIK_CO_RETURN_IF_ERROR(scanned.status());
+    LAVIK_CO_RETURN_IF_ERROR(scanned);
     capture = partition.fullsync_subscribers_.find(session_id);
     if (capture == partition.fullsync_subscribers_.end()) {
       co_return absl::FailedPreconditionError(
@@ -987,7 +987,7 @@ StorageEngine::Impl::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
   for (const SnapshotRecord& record : requested) {
     auto loaded = co_await ReadFullSyncOverrideRecord(store, partition,
                                                       session_id, record);
-    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+    LAVIK_CO_RETURN_IF_ERROR(loaded);
     constexpr std::size_t kRecordMetadataBytes = 128;
     const bool streamed = loaded->source_id_ != 0;
     const std::uint64_t effective_value_bytes =
@@ -1436,7 +1436,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     for (const ExternalKey& external : external_keys) {
       auto key = co_await LoadOutOfIndexKey(store, external.location_,
                                             external.key_bytes_);
-      LAVIK_CO_RETURN_IF_ERROR(key.status());
+      LAVIK_CO_RETURN_IF_ERROR(key);
       old_keys.push_back(OldKey{.db_id_ = db_id, .key_ = std::move(*key)});
     }
   }
@@ -1795,7 +1795,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReplicaCommandNeedsApply(
   }
   auto found =
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
-  LAVIK_CO_RETURN_IF_ERROR(found.status());
+  LAVIK_CO_RETURN_IF_ERROR(found);
   if (!context_current()) {
     co_return absl::FailedPreconditionError(
         "FULL command context changed during coverage lookup");
@@ -2021,7 +2021,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     auto& index = partition.indexes_[applied.db_id_];
     auto resolved =
         co_await FindVerifiedEntry(store, index, digest, applied.key_);
-    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+    LAVIK_CO_RETURN_IF_ERROR(resolved);
     auto* current = *resolved;
     if (current != nullptr &&
         current->value_.mutation_sequence_ >= applied.mutation_sequence_) {
@@ -2087,7 +2087,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
       auto extents = co_await WriteExtentValueLocked(store, std::string_view{},
                                                      applied.value_);
-      LAVIK_CO_RETURN_IF_ERROR(extents.status());
+      LAVIK_CO_RETURN_IF_ERROR(extents);
       const std::string manifest = EncodeManifest(**extents);
       const RecordWriteRequest record_write{
           .key_ = applied.key_,

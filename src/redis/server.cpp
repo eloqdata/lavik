@@ -604,7 +604,7 @@ bool RedisService::AdmitConnection(int fd, bool tls_endpoint) noexcept {
 
 absl::Status RedisService::SetMaxClients(std::uint64_t value) {
   auto allowed = MaxClientsAllowedByFileLimit(value);
-  LAVIK_RETURN_IF_ERROR(allowed.status());
+  LAVIK_RETURN_IF_ERROR(allowed);
   if (*allowed < value) {
     return absl::ResourceExhaustedError(absl::StrCat(
         "maxclients ", value, " cannot preserve ",
@@ -692,7 +692,7 @@ Task<absl::Status> RedisService::ImportRdb() {
   }
 
   auto reader = rdb::FileReader::Open(load_rdb_file_);
-  LAVIK_CO_RETURN_IF_ERROR(reader.status());
+  LAVIK_CO_RETURN_IF_ERROR(reader);
 
   // Validate every object before mutating storage. The open file is then
   // rewound and decoded a second time through bounded reads during application.
@@ -701,7 +701,7 @@ Task<absl::Status> RedisService::ImportRdb() {
   std::vector<std::string> function_libraries;
   while (true) {
     auto entry = reader->NextStreaming();
-    LAVIK_CO_RETURN_IF_ERROR(entry.status());
+    LAVIK_CO_RETURN_IF_ERROR(entry);
     if (!entry->has_value()) break;
     LAVIK_CO_RETURN_IF_ERROR(reader->DrainCollection());
     if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
@@ -720,7 +720,7 @@ Task<absl::Status> RedisService::ImportRdb() {
   std::uint64_t expired = 0;
   while (true) {
     auto next = reader->NextStreaming();
-    LAVIK_CO_RETURN_IF_ERROR(next.status());
+    LAVIK_CO_RETURN_IF_ERROR(next);
     if (!next->has_value()) break;
     rdb::FileEntry entry = std::move(**next);
     if (entry.kind_ != rdb::FileEntryKind::kValue) {
@@ -1463,7 +1463,7 @@ Task<absl::Status> WriteReplyContinuation(TcpStream& stream,
   // order and send each chunk before asking for the next one.
   while (continuation.source_) {
     auto chunk = co_await continuation.source_();
-    LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+    LAVIK_CO_RETURN_IF_ERROR(chunk);
     if (chunk->empty()) break;
     std::span<const std::byte> remaining(
         reinterpret_cast<const std::byte*>(chunk->data()), chunk->size());
@@ -1509,7 +1509,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     while (reply.continuation_ && reply.continuation_->source_) {
       auto chunk = co_await reply.continuation_->source_();
-      LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+      LAVIK_CO_RETURN_IF_ERROR(chunk);
       if (chunk->empty()) break;
       EnqueuePubSubReply(session, std::move(*chunk));
     }

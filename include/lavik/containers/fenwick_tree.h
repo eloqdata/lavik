@@ -60,7 +60,7 @@ class FenwickTree {
       if (parent < ends.size()) ends[parent] += ends[i];
     }
     auto cells = Storage::From(ends);
-    LAVIK_RETURN_IF_ERROR(cells.status());
+    LAVIK_RETURN_IF_ERROR(cells);
     FenwickTree result;
     result.cells_ = std::move(*cells);
     return result;
@@ -130,7 +130,7 @@ class FenwickTree {
     }
     const auto old_suffix = cells_.size() - first;
     auto appended = cells_.Appended(std::span(encoded).subspan(old_suffix));
-    LAVIK_RETURN_IF_ERROR(appended.status());
+    LAVIK_RETURN_IF_ERROR(appended);
     FenwickTree result;
     result.cells_ = std::move(*appended);
     for (std::size_t i = 0; i < old_suffix; ++i) {

@@ -42,14 +42,14 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
   if (options.tls) target.tls_ = *options.tls;
   auto stream = net::SyncStream::Connect(
       target, std::chrono::steady_clock::now() + 2s, options.cancel_fd);
-  LAVIK_RETURN_IF_ERROR(stream.status());
+  LAVIK_RETURN_IF_ERROR(stream);
   auto payload = control::EncodeMessage(control::BootstrapHello{
       .node_id = options.node_id, .capabilities = options.capabilities});
-  LAVIK_RETURN_IF_ERROR(payload.status());
+  LAVIK_RETURN_IF_ERROR(payload);
   control::FrameEncoder encoder;
   auto request =
       encoder.Encode(control::MessageType::kBootstrapHello, payload->payload);
-  LAVIK_RETURN_IF_ERROR(request.status());
+  LAVIK_RETURN_IF_ERROR(request);
   LAVIK_RETURN_IF_ERROR((*stream)->WriteAll(*request));
   auto header_bytes = (*stream)->ReadExact(control::kFrameHeaderBytes);
   if (!header_bytes.ok())
@@ -57,7 +57,7 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
                ? absl::UnavailableError(header_bytes.status().message())
                : header_bytes.status();
   auto header = control::ParseFrameHeader(*header_bytes);
-  LAVIK_RETURN_IF_ERROR(header.status());
+  LAVIK_RETURN_IF_ERROR(header);
   if (header->type != control::MessageType::kBootstrapReply) {
     return absl::InvalidArgumentError("expected Meta BootstrapReply");
   }
@@ -68,9 +68,9 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
                : body.status();
   control::FrameDecoder decoder;
   auto frame = decoder.Decode(*header_bytes + *body);
-  LAVIK_RETURN_IF_ERROR(frame.status());
+  LAVIK_RETURN_IF_ERROR(frame);
   auto decoded = control::DecodeMessage(frame->type, frame->payload);
-  LAVIK_RETURN_IF_ERROR(decoded.status());
+  LAVIK_RETURN_IF_ERROR(decoded);
   auto reply = std::get<control::BootstrapReply>(std::move(*decoded));
   const auto& hello = reply.server;
   if (hello.negotiated_version != control::kProtocolVersion ||
@@ -93,7 +93,7 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
   }
   if (options.tls) {
     auto sans = (*stream)->PeerUriSans();
-    LAVIK_RETURN_IF_ERROR(sans.status());
+    LAVIK_RETURN_IF_ERROR(sans);
     // Before Genesis, an unresolved configured seed has no committed
     // directory to return. Authenticate its canonical Meta role/IP identity,
     // but learn no endpoint or mode from that retry-only response.
@@ -142,7 +142,7 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
   std::vector<MetaControlEndpoint> seeds;
   for (const auto& seed : options.seeds) {
     auto endpoint = ParseNumericControlEndpoint(seed);
-    LAVIK_RETURN_IF_ERROR(endpoint.status());
+    LAVIK_RETURN_IF_ERROR(endpoint);
     seeds.push_back(std::move(*endpoint));
   }
   MetaEndpointDirectory directory(std::move(seeds));

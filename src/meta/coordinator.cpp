@@ -1337,7 +1337,7 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
       command);
 
   auto encoded = MetaStateMachine::EncodeCommand(command);
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
 
   auto waiter = std::make_shared<ProposeWaiter>();
   waiter->foreign_executor_ = options_.foreign_executor_;

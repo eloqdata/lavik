@@ -259,7 +259,7 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   // maxmemory cannot cover the successor, enabling replication fails cleanly
   // instead of letting the first rollover discover the missing reservation.
   auto standby = AllocateReplicationLogBlock();
-  LAVIK_CO_RETURN_IF_ERROR(standby.status());
+  LAVIK_CO_RETURN_IF_ERROR(standby);
   log.publisher_staging_charge_.Adopt(&*staging, staging_bytes);
   log.state_ = ReplicationLogState::kActive;
   log.log_epoch_ = log_epoch;
@@ -742,7 +742,7 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
 
   auto admission = co_await AcquireReplicationPublisherAdmission(*staging_bytes,
                                                                  std::nullopt);
-  LAVIK_CO_RETURN_IF_ERROR(admission.status());
+  LAVIK_CO_RETURN_IF_ERROR(admission);
 
   auto publication = PrepareAdmittedReplicationCommand(
       *admission, ReplicationEventKind::kEphemeral, partition_id,
@@ -1491,7 +1491,7 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     log.standby_block_.reset();
   } else {
     auto allocated = AllocateReplicationLogBlock();
-    LAVIK_CO_RETURN_IF_ERROR(allocated.status());
+    LAVIK_CO_RETURN_IF_ERROR(allocated);
     log.blocks_.push_back(std::move(*allocated));
   }
   log.blocks_.back().history_charge_ = std::move(history_charge);

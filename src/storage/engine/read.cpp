@@ -138,7 +138,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     const std::uint64_t db_epoch = DbEpoch(db_id);
     const std::uint64_t replication_epoch = partition.replication_epoch_;
     auto loaded = co_await LoadOutOfIndexKey(store, location, key_bytes);
-    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+    LAVIK_CO_RETURN_IF_ERROR(loaded);
     RecordIndex::Entry* current = index.FindAddress(identity, hash);
     if (store.index_generations_[db_id] != index_generation ||
         DbEpoch(db_id) != db_epoch ||
@@ -193,7 +193,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
       continue;
     }
     auto key = co_await materialize(*selected_partition, index, selected);
-    LAVIK_CO_RETURN_IF_ERROR(key.status());
+    LAVIK_CO_RETURN_IF_ERROR(key);
     if (key->has_value()) co_return std::move(*key);
     revalidation_failed = true;
   }
@@ -217,7 +217,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     });
     if (selected == nullptr) continue;
     auto key = co_await materialize(partition, index, selected);
-    LAVIK_CO_RETURN_IF_ERROR(key.status());
+    LAVIK_CO_RETURN_IF_ERROR(key);
     if (key->has_value()) co_return std::move(*key);
     revalidation_failed = true;
   }
@@ -317,7 +317,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       optimistic_read = false;
       continue;
     }
-    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+    LAVIK_CO_RETURN_IF_ERROR(loaded);
 
     co_return EncodeDiskValue(std::move(*loaded));
   }
@@ -667,7 +667,7 @@ Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadataLocked(
                  .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                  .replication_epoch_ = partition.replication_epoch_,
                  .index_generation_ = partition.grouped_generations_[db_id]});
-    LAVIK_CO_RETURN_IF_ERROR(readable.status());
+    LAVIK_CO_RETURN_IF_ERROR(readable);
   }
   if (IsExpiredNow(*found)) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
@@ -731,7 +731,7 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   }
   if (found != nullptr && found->value_.grouped() && IsExpiredNow(*found)) {
     auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    LAVIK_CO_RETURN_IF_ERROR(metadata.status());
+    LAVIK_CO_RETURN_IF_ERROR(metadata);
   }
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
       IsExpiredNow(*found)) {
@@ -750,7 +750,7 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
 
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    location, extents);
-  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+  LAVIK_CO_RETURN_IF_ERROR(loaded);
   if (store.index_generations_[db_id] != index_generation ||
       DbEpoch(db_id) != db_epoch ||
       partition.replication_epoch_ != replication_epoch) {
@@ -945,7 +945,7 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
     // relocation of the same mutation is retryable.
     auto& index = partition.indexes_[db_id];
     auto resolved = co_await FindVerifiedEntry(key_store, index, digest, key);
-    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+    LAVIK_CO_RETURN_IF_ERROR(resolved);
     auto* current = *resolved;
     if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
         current->value_.mutation_sequence_ != location.mutation_sequence_) {
@@ -984,14 +984,14 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   auto temp_acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  LAVIK_CO_RETURN_IF_ERROR(temp_acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(temp_acquired);
   ReadBufferLease temp = std::move(*temp_acquired);
   FixedBuffer io = temp.io_buffer();
   io.size_ = read_bytes;
   const auto [file_id, block_offset] = FileOffset(ref.block_id_);
   auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
                                          io, temp.registered(), block_offset);
-  LAVIK_CO_RETURN_IF_ERROR(read.status());
+  LAVIK_CO_RETURN_IF_ERROR(read);
   if (*read != read_bytes) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "short extent block read");
@@ -1056,14 +1056,14 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentSlice(
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease buffer = std::move(*acquired);
   FixedBuffer io = buffer.io_buffer();
   io.size_ = read_bytes;
   const auto [file_id, block_offset] = FileOffset(ref.block_id_);
   auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
                                          io, buffer.registered(), block_offset);
-  LAVIK_CO_RETURN_IF_ERROR(read.status());
+  LAVIK_CO_RETURN_IF_ERROR(read);
   if (*read != read_bytes) {
     co_return absl::InternalError("short extent block read");
   }
@@ -1115,7 +1115,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadOutOfIndexKey(
     found = find();
   else
     found = co_await bycorf::SubmitTo(owner, std::move(find));
-  LAVIK_CO_RETURN_IF_ERROR(found.status());
+  LAVIK_CO_RETURN_IF_ERROR(found);
   auto key = co_await LoadIndirectKey(std::move(*found));
   if (key.ok() && key->size() != key_bytes)
     co_return absl::DataLossError("indirect key length mismatch");
@@ -1235,7 +1235,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   }
   auto acquired = co_await store.buffers_.AcquireReadBuffer(
       static_cast<std::size_t>(value_bytes));
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease output = std::move(*acquired);
   FixedBuffer destination = output.io_buffer();
   if (destination.size_ < value_bytes) {
@@ -1325,7 +1325,7 @@ StorageEngine::Impl::LoadValueLocal(
     trace->buffer_acquire_start_ns_ = ReadTraceNowNanos();
   }
   auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+  LAVIK_CO_RETURN_IF_ERROR(acquired);
   ReadBufferLease lease = std::move(*acquired);
   if (trace != nullptr) {
     trace->buffer_acquired_ns_ = ReadTraceNowNanos();
@@ -1443,7 +1443,7 @@ StorageEngine::Impl::LoadValueLocal(
   if (trace != nullptr) {
     trace->io_complete_ns_ = ReadTraceNowNanos();
   }
-  LAVIK_CO_RETURN_IF_ERROR(read.status());
+  LAVIK_CO_RETURN_IF_ERROR(read);
   if (*read != read_bytes) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "short compact record read");

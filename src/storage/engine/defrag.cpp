@@ -126,7 +126,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtents(
             co_return co_await ReclaimExtentLocal(*stores_[owner], ref);
           });
     }
-    LAVIK_CO_RETURN_IF_ERROR(freed.status());
+    LAVIK_CO_RETURN_IF_ERROR(freed);
     if (*freed) {
       released.push_back(ref.block_id_);
     }
@@ -415,7 +415,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     // Rehashing a multi-megabyte key for every small group dominates GC and
     // the shutdown that joins it, especially in unoptimized builds.
     auto handle = co_await FindIndirectKey(record.key_id_);
-    LAVIK_CO_RETURN_IF_ERROR(handle.status());
+    LAVIK_CO_RETURN_IF_ERROR(handle);
     digest = (*handle)->digest_;
   } else {
     digest = ComputeDigest(key);
@@ -446,14 +446,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
               .index_generation_ =
                   partition.grouped_generations_[record.db_id_],
           });
-      LAVIK_CO_RETURN_IF_ERROR(found.status());
+      LAVIK_CO_RETURN_IF_ERROR(found);
       if ((*found)->incarnation() != record.group_incarnation_) {
         co_return GroupedObject::Handle{};
       }
       co_return *found;
     };
     auto object = co_await lookup_object();
-    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_CO_RETURN_IF_ERROR(object);
     if (*object == nullptr) {
       co_return std::optional<RelocationDurabilityFence>{};
     }
@@ -515,7 +515,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         !MaterializeIndexLocation(*group).SamePhysicalRecord(source_location)) {
       LAVIK_CO_RETURN_IF_ERROR(
           co_await MarkRecordDead(RetiredRecordOf(relocated)));
-      LAVIK_CO_RETURN_IF_ERROR(object.status());
+      LAVIK_CO_RETURN_IF_ERROR(object);
       co_return std::optional<RelocationDurabilityFence>{};
     }
     auto replacement = GroupedObject::RelocateGroup(
@@ -596,12 +596,12 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
             .replication_epoch_ = partition.replication_epoch_,
             .index_generation_ = partition.grouped_generations_[record.db_id_],
         });
-    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_CO_RETURN_IF_ERROR(object);
     LAVIK_ASSIGN_OR_CO_RETURN(grouped_builder,
                               GroupedObject::PrepareRootRelocation(*object));
     auto publication =
         partition.grouped_objects_[record.db_id_].PreparePublish(key, *object);
-    LAVIK_CO_RETURN_IF_ERROR(publication.status());
+    LAVIK_CO_RETURN_IF_ERROR(publication);
     grouped_publication.emplace(std::move(*publication));
     grouped_descriptor.prepared_root_ = &grouped_builder;
     grouped_descriptor.publication_ = &*grouped_publication;
@@ -977,7 +977,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     std::string loaded_key;
     if (record.key_indirect_) [[unlikely]] {
       auto handle = co_await FindIndirectKey(record.key_id_);
-      LAVIK_CO_RETURN_IF_ERROR(handle.status());
+      LAVIK_CO_RETURN_IF_ERROR(handle);
       LAVIK_ASSIGN_OR_CO_RETURN(loaded_key,
                                 co_await LoadIndirectKey(std::move(*handle)));
       if (loaded_key.size() != record.key_bytes_)

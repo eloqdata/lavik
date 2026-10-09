@@ -907,29 +907,29 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kMetaTopologyStoreFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto lifecycle_state = r.ReadU8();
-  LAVIK_RETURN_IF_ERROR(lifecycle_state.status());
+  LAVIK_RETURN_IF_ERROR(lifecycle_state);
   auto client_mode = r.ReadU8();
-  LAVIK_RETURN_IF_ERROR(client_mode.status());
+  LAVIK_RETURN_IF_ERROR(client_mode);
   if (*client_mode > 2) return MetaFailStopError("unknown cluster client mode");
   auto root_operation_id = ReadFixedArray<16>(r);
-  LAVIK_RETURN_IF_ERROR(root_operation_id.status());
+  LAVIK_RETURN_IF_ERROR(root_operation_id);
   auto genesis_commit_index = r.ReadU64();
-  LAVIK_RETURN_IF_ERROR(genesis_commit_index.status());
+  LAVIK_RETURN_IF_ERROR(genesis_commit_index);
   auto failure_summary = r.ReadString(kMaxMetaClusterFailureSummaryBytes);
-  LAVIK_RETURN_IF_ERROR(failure_summary.status());
+  LAVIK_RETURN_IF_ERROR(failure_summary);
   if (*lifecycle_state >
       static_cast<std::uint8_t>(MetaClusterLifecycle::kProvisioningFailed)) {
     return MetaFailStopError("unknown cluster lifecycle tag");
   }
   auto topology_epoch = r.ReadU64();
-  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
+  LAVIK_RETURN_IF_ERROR(topology_epoch);
   auto group_count = r.ReadCount(kMaxMetaGroups);
-  LAVIK_RETURN_IF_ERROR(group_count.status());
+  LAVIK_RETURN_IF_ERROR(group_count);
 
   MetaTopologyStore store;
   store.cluster_lifecycle_.state_ =
@@ -946,39 +946,39 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   store.topology_epoch_ = *topology_epoch;
   for (std::uint32_t i = 0; i < *group_count; ++i) {
     auto group_id = r.ReadString(kMaxMetaGroupIdBytes);
-    LAVIK_RETURN_IF_ERROR(group_id.status());
+    LAVIK_RETURN_IF_ERROR(group_id);
     auto owner = r.ReadString(kMetaNodeIdBytes);
-    LAVIK_RETURN_IF_ERROR(owner.status());
+    LAVIK_RETURN_IF_ERROR(owner);
     auto group_term = r.ReadU64();
-    LAVIK_RETURN_IF_ERROR(group_term.status());
+    LAVIK_RETURN_IF_ERROR(group_term);
     auto active = r.ReadBool("invalid authority state");
-    LAVIK_RETURN_IF_ERROR(active.status());
+    LAVIK_RETURN_IF_ERROR(active);
     auto action = r.ReadOptional<MetaFailoverActionId>(
         [](MetaReader& nested) { return ReadFixedArray<16>(nested); });
-    LAVIK_RETURN_IF_ERROR(action.status());
+    LAVIK_RETURN_IF_ERROR(action);
     if ((*active && (*group_term == 0 || owner->empty())) ||
         (action->has_value() && (!*active || IsZero(**action)))) {
       return MetaFailStopError("invalid group authority");
     }
     auto manifest_revision = r.ReadU64();
-    LAVIK_RETURN_IF_ERROR(manifest_revision.status());
+    LAVIK_RETURN_IF_ERROR(manifest_revision);
     auto manifest_digest = ReadFixedArray<32>(r);
-    LAVIK_RETURN_IF_ERROR(manifest_digest.status());
+    LAVIK_RETURN_IF_ERROR(manifest_digest);
     auto partition_epoch = r.ReadU64();
-    LAVIK_RETURN_IF_ERROR(partition_epoch.status());
+    LAVIK_RETURN_IF_ERROR(partition_epoch);
     auto revision = r.ReadU64();
-    LAVIK_RETURN_IF_ERROR(revision.status());
+    LAVIK_RETURN_IF_ERROR(revision);
     auto failover_transition = r.ReadOptional<MetaFailoverTransition>(
         [](MetaReader& nested) { return ReadMetaFailoverTransition(nested); });
-    LAVIK_RETURN_IF_ERROR(failover_transition.status());
+    LAVIK_RETURN_IF_ERROR(failover_transition);
     auto members = r.ReadList<MetaGroupMember>(
         kMaxMetaNodes, [](MetaReader& rr) -> absl::StatusOr<MetaGroupMember> {
           auto node_id = rr.ReadString(kMetaNodeIdBytes);
-          LAVIK_RETURN_IF_ERROR(node_id.status());
+          LAVIK_RETURN_IF_ERROR(node_id);
           auto assignment_id = ReadFixedArray<16>(rr);
-          LAVIK_RETURN_IF_ERROR(assignment_id.status());
+          LAVIK_RETURN_IF_ERROR(assignment_id);
           auto role = rr.ReadU8();
-          LAVIK_RETURN_IF_ERROR(role.status());
+          LAVIK_RETURN_IF_ERROR(role);
           if (*role != static_cast<std::uint8_t>(MetaNodeRole::kPrimary) &&
               *role != static_cast<std::uint8_t>(MetaNodeRole::kReplica)) {
             return MetaFailStopError("unknown node role");
@@ -986,7 +986,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
           return MetaGroupMember{std::string(*node_id), *assignment_id,
                                  static_cast<MetaNodeRole>(*role)};
         });
-    LAVIK_RETURN_IF_ERROR(members.status());
+    LAVIK_RETURN_IF_ERROR(members);
 
     // Invariant enforcement (fail-stop): a corrupt snapshot fails
     // identically on every node.
@@ -1041,13 +1041,13 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
           [](MetaReader& rr)
               -> absl::StatusOr<std::pair<std::string, MetaAssignmentId>> {
             auto node_id = rr.ReadString(kMetaNodeIdBytes);
-            LAVIK_RETURN_IF_ERROR(node_id.status());
+            LAVIK_RETURN_IF_ERROR(node_id);
             auto assignment_id = ReadFixedArray<16>(rr);
-            LAVIK_RETURN_IF_ERROR(assignment_id.status());
+            LAVIK_RETURN_IF_ERROR(assignment_id);
             return std::pair<std::string, MetaAssignmentId>{
                 std::string(*node_id), *assignment_id};
           });
-  LAVIK_RETURN_IF_ERROR(assignment_history.status());
+  LAVIK_RETURN_IF_ERROR(assignment_history);
   for (const auto& [node_id, assignment_id] : *assignment_history) {
     if (node_id.empty() || IsZero(assignment_id) ||
         !store.last_assignment_by_node_.emplace(node_id, assignment_id)
@@ -1069,11 +1069,11 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   auto runs = r.ReadList<MetaSlotAssignment>(
       kMetaSlotCount, [](MetaReader& rr) -> absl::StatusOr<MetaSlotAssignment> {
         auto first = rr.ReadU16();
-        LAVIK_RETURN_IF_ERROR(first.status());
+        LAVIK_RETURN_IF_ERROR(first);
         auto last = rr.ReadU16();
-        LAVIK_RETURN_IF_ERROR(last.status());
+        LAVIK_RETURN_IF_ERROR(last);
         auto group_id = rr.ReadString(kMaxMetaGroupIdBytes);
-        LAVIK_RETURN_IF_ERROR(group_id.status());
+        LAVIK_RETURN_IF_ERROR(group_id);
         if (*first > *last || *last >= kMetaSlotCount) {
           return MetaFailStopError("slot run out of bounds");
         }
@@ -1081,7 +1081,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
                                   static_cast<std::uint16_t>(*last),
                                   std::string(*group_id)};
       });
-  LAVIK_RETURN_IF_ERROR(runs.status());
+  LAVIK_RETURN_IF_ERROR(runs);
   std::uint32_t previous_last = 0;
   for (std::size_t i = 0; i < runs->size(); ++i) {
     const MetaSlotAssignment& run = (*runs)[i];

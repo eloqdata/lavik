@@ -58,7 +58,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
       // fails: otherwise a reused block could lend an old entry a new epoch.
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[db_id], digest, key, original.root_);
-      LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+      LAVIK_CO_RETURN_IF_ERROR(resolved);
       if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
           (*resolved)->value_.mutation_sequence_ !=
               original.root_.mutation_sequence_) {
@@ -71,7 +71,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
                    .replication_epoch_ = original.replication_epoch_,
                    .index_generation_ = original.index_generation_,
                });
-      LAVIK_CO_RETURN_IF_ERROR(current.status());
+      LAVIK_CO_RETURN_IF_ERROR(current);
       if (*current == nullptr ||
           ((*current)->is_ordered() && !(*current)->has_member_index()) ||
           (*current)->directory().root() != root_identity) {
@@ -133,7 +133,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
       const auto envelope = DecodeHashGroupMetadata(payload, payload.size());
-      LAVIK_CO_RETURN_IF_ERROR(envelope.status());
+      LAVIK_CO_RETURN_IF_ERROR(envelope);
       // Streaming readers admit a page from its captured physical metadata.
       // Reject corrupt counts before any decoder allocates its vectors.
       if (envelope->incarnation_ != incarnation || envelope->id_ != id ||
@@ -150,7 +150,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
     }
     auto resolved = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                                digest, key);
-    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+    LAVIK_CO_RETURN_IF_ERROR(resolved);
     if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
         (*resolved)->value_.mutation_sequence_ !=
             original.root_.mutation_sequence_) {
@@ -164,7 +164,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
                  .replication_epoch_ = original.replication_epoch_,
                  .index_generation_ = original.index_generation_,
              });
-    LAVIK_CO_RETURN_IF_ERROR(current.status());
+    LAVIK_CO_RETURN_IF_ERROR(current);
     if (*current == nullptr ||
         ((*current)->is_ordered() && !(*current)->has_member_index()) ||
         (*current)->directory().root() != root_identity) {
@@ -187,12 +187,12 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
   auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                               digest, object, id, pinned);
-  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+  LAVIK_CO_RETURN_IF_ERROR(loaded);
   const auto bytes = loaded->loaded_.value();
   const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                  bytes.size());
   auto decoded = DecodeHashGroup(payload);
-  LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(decoded);
   for (const auto& field : decoded->value_.entries_) {
     if (!id.ContainsHash(
             ComputeDigest(field.field_, object->directory().root().seed_)
@@ -214,7 +214,7 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
     (void)prefix;
     auto loaded = co_await LoadHashGroupSnapshot(
         store, partition, db_id, key, digest, object, metadata.id_, pinned);
-    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+    LAVIK_CO_RETURN_IF_ERROR(loaded);
     for (auto& field : loaded->snapshot_.value_.entries_) {
       result.entries_.push_back(std::move(field));
     }
@@ -268,23 +268,23 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
   // image. Reserve before the first page, not after constructing that image.
   // The returned read buffer has its own independent admitted lifetime.
   auto scratch = budget.Reserve(2);
-  LAVIK_CO_RETURN_IF_ERROR(scratch.status());
+  LAVIK_CO_RETURN_IF_ERROR(scratch);
   absl::StatusOr<std::string> encoded;
   if (snapshot != nullptr && snapshot->is_ordered()) {
     auto value = co_await LoadGroupedOrderedValue(store, partition, db_id, key,
                                                   digest, snapshot, pinned);
-    LAVIK_CO_RETURN_IF_ERROR(value.status());
+    LAVIK_CO_RETURN_IF_ERROR(value);
     encoded = EncodeOrderedCompactValue(
         snapshot->ordered_directory().root().kind_, *value);
   } else {
     auto value = co_await LoadGroupedHashValue(store, partition, db_id, key,
                                                digest, snapshot, pinned);
-    LAVIK_CO_RETURN_IF_ERROR(value.status());
+    LAVIK_CO_RETURN_IF_ERROR(value);
     encoded = EncodeHashValue(*value);
   }
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
   auto buffer = co_await store.buffers_.AcquireReadBuffer(encoded->size());
-  LAVIK_CO_RETURN_IF_ERROR(buffer.status());
+  LAVIK_CO_RETURN_IF_ERROR(buffer);
   const auto output = buffer->io_buffer();
   if (output.size_ < encoded->size()) {
     co_return absl::ResourceExhaustedError("grouped output buffer too small");

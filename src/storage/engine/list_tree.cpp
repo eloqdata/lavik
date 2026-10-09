@@ -212,7 +212,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PrepareListGroups(
   for (auto& element : elements)
     initial.entries_.push_back({.value_ = std::move(element)});
   auto split = SplitOrderedGroup(std::move(initial), 2);
-  LAVIK_RETURN_IF_ERROR(split.status());
+  LAVIK_RETURN_IF_ERROR(split);
   return OrderedCollectionMutationPlan{
       .root_ = {.kind_ = OrderedCollectionKind::kList,
                 .incarnation_ = 1,
@@ -254,7 +254,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   const bool exists = stored_value && !IsExpired(*found, now_ms);
   if (!exists && stored_value && found->value_.grouped()) {
     auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    LAVIK_CO_RETURN_IF_ERROR(metadata.status());
+    LAVIK_CO_RETURN_IF_ERROR(metadata);
   }
   if (exists && found->value_.value_type() != ValueType::kList) {
     co_return absl::InvalidArgumentError(
@@ -288,7 +288,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
                  .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                  .replication_epoch_ = observed_replication_epoch,
                  .index_generation_ = partition.grouped_generations_[db_id]});
-    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_CO_RETURN_IF_ERROR(object);
     if (operation.kind_ == ListOperationKind::kLength) co_return result;
     if (!read_only && CanPrepareGroupedWriteUnlocked(partition)) {
       const auto snapshot =
@@ -304,7 +304,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       auto prepared = co_await ExecuteGroupedListLocked(
           store, partition, db_id, key, digest, operation, *object, tx,
           replication, mutation_precondition, &mutation);
-      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+      LAVIK_CO_RETURN_IF_ERROR(prepared);
       co_await store.store_state_mutex_.Lock();
       unlock.Adopt();
       LAVIK_CO_RETURN_IF_ERROR(ValidateGroupedWriteSnapshot(
@@ -404,7 +404,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(value.size() + 256));
     }
     auto admitted = budget.Reserve(2);
-    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
+    LAVIK_CO_RETURN_IF_ERROR(admitted);
     create_admission.emplace(std::move(*admitted));
   }
   std::vector<std::string> elements;
@@ -592,11 +592,11 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       compact_write_promotes = NeedsGroupedList(elements);
       if (unlocked_create && compact_write_promotes) {
         auto plan = PrepareListGroups(std::move(elements));
-        LAVIK_CO_RETURN_IF_ERROR(plan.status());
+        LAVIK_CO_RETURN_IF_ERROR(plan);
         prepared_groups.emplace(std::move(*plan));
       } else if (!compact_write_promotes) {
         auto encoded = EncodeList(elements);
-        LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+        LAVIK_CO_RETURN_IF_ERROR(encoded);
         prepared_compact_payload.emplace(std::move(*encoded));
       }
     }
@@ -635,7 +635,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     auto plan = prepared_groups ? absl::StatusOr<OrderedCollectionMutationPlan>(
                                       std::move(*prepared_groups))
                                 : PrepareListGroups(std::move(elements));
-    LAVIK_CO_RETURN_IF_ERROR(plan.status());
+    LAVIK_CO_RETURN_IF_ERROR(plan);
     LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, nullptr, std::move(*plan),
         expire_at_ms, tx, replication, mutation_precondition));

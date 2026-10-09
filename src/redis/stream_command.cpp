@@ -680,7 +680,7 @@ absl::StatusOr<std::string> EncodeGroupDelta(const Group& before,
     }
   }
   auto upserts = EncodeGroupState(delta.upserts_);
-  LAVIK_RETURN_IF_ERROR(upserts.status());
+  LAVIK_RETURN_IF_ERROR(upserts);
   std::string out("LXD1");
   PutString(&out, *upserts);
   Put32(&out, delta.removed_consumers_.size());
@@ -700,7 +700,7 @@ absl::StatusOr<GroupDelta> DecodeGroupDelta(std::string_view bytes) {
   if (!GetString(bytes, &at, &payload))
     return absl::InvalidArgumentError("truncated Stream group delta");
   auto group = DecodeGroupState(payload);
-  LAVIK_RETURN_IF_ERROR(group.status());
+  LAVIK_RETURN_IF_ERROR(group);
   GroupDelta delta{.upserts_ = std::move(*group)};
   std::uint32_t count = 0;
   if (!Get32(bytes, &at, &count) || count > (bytes.size() - at) / 4)
@@ -773,7 +773,7 @@ absl::StatusOr<std::vector<std::string>> RestoreGroupArgs(
     // the existing PEL even though the durable update is page-local.
     auto encoded =
         before ? EncodeGroupDelta(*before, *group) : EncodeGroupState(*group);
-    LAVIK_RETURN_IF_ERROR(encoded.status());
+    LAVIK_RETURN_IF_ERROR(encoded);
     args.push_back(std::move(*encoded));
   }
   return args;
@@ -782,7 +782,7 @@ absl::StatusOr<std::vector<std::string>> RestoreGroupArgs(
 storage::CompactValueUpdate NoChange() { return {}; }
 absl::StatusOr<storage::CompactValueUpdate> Changed(Stream stream) {
   auto encoded = Encode(stream);
-  LAVIK_RETURN_IF_ERROR(encoded.status());
+  LAVIK_RETURN_IF_ERROR(encoded);
   return storage::CompactValueUpdate{.changed_ = true,
                                      .encoded_ = std::move(*encoded),
                                      .logical_size_ = stream.entries_.size(),
@@ -950,7 +950,7 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
     storage::StreamDeleteAccess selected;
     for (std::size_t i = 2; i < request.args_.size(); ++i) {
       auto id = ParseId(request.args_[i]);
-      LAVIK_CO_RETURN_IF_ERROR(id.status());
+      LAVIK_CO_RETURN_IF_ERROR(id);
       selected.ids_.push_back({id->ms_, id->seq_});
     }
     access.stream_delete_ = std::move(selected);
@@ -973,7 +973,7 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
       EqualCi(request.args_[1], kRestoreGroupSubcommand) &&
       request.args_[4] == "2") {
     auto delta = DecodeGroupDelta(request.args_[5]);
-    LAVIK_CO_RETURN_IF_ERROR(delta.status());
+    LAVIK_CO_RETURN_IF_ERROR(delta);
     storage::StreamGroupAccess group{.group_ = request.args_[3]};
     group.consumers_ = delta->removed_consumers_;
     for (const auto& consumer : delta->upserts_.consumers_)
@@ -1025,8 +1025,8 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
     if (scan.range_.first_exclusive_) low.remove_prefix(1);
     if (scan.range_.last_exclusive_) high.remove_prefix(1);
     auto first = ParseId(low, false, true), last = ParseId(high, true, true);
-    LAVIK_CO_RETURN_IF_ERROR(first.status());
-    LAVIK_CO_RETURN_IF_ERROR(last.status());
+    LAVIK_CO_RETURN_IF_ERROR(first);
+    LAVIK_CO_RETURN_IF_ERROR(last);
     std::int64_t count = 0;
     if (!ParseInt(a[at + 2], &count))
       co_return absl::InvalidArgumentError(
@@ -1044,7 +1044,7 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
     const bool exclusive = start.starts_with('(');
     if (exclusive) start.remove_prefix(1);
     auto first = ParseId(start, false, !exclusive);
-    LAVIK_CO_RETURN_IF_ERROR(first.status());
+    LAVIK_CO_RETURN_IF_ERROR(first);
     std::uint64_t count = 100;
     for (std::size_t at = 6; at < a.size();) {
       if (EqualCi(a[at], "count") && at + 1 < a.size()) {
@@ -1215,8 +1215,8 @@ struct StreamRangeReplyState {
         const auto& row = page_->elements_[index_++];
         auto key = storage::StreamRecordKey(row);
         auto payload = storage::StreamRecordPayload(row);
-        LAVIK_CO_RETURN_IF_ERROR(key.status());
-        LAVIK_CO_RETURN_IF_ERROR(payload.status());
+        LAVIK_CO_RETURN_IF_ERROR(key);
+        LAVIK_CO_RETURN_IF_ERROR(payload);
         if ((*key)[0] != '\1') continue;
         Id id;
         std::size_t at = 0;
@@ -1276,7 +1276,7 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
         db, tx::FingerprintOf(digest), tx::LockMode::kShared);
   auto source =
       co_await g_storage->ReadValueForTransferLocked(db, key, digest, range);
-  LAVIK_CO_RETURN_IF_ERROR(source.status());
+  LAVIK_CO_RETURN_IF_ERROR(source);
   if (source->metadata_.value_type_ != storage::ValueType::kStream)
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -1296,7 +1296,7 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
     auto decoded = Decode(storage::CompactValueView{
         .encoded_ = source->metadata_.encoded_,
         .logical_size_ = source->metadata_.logical_size_});
-    LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(decoded);
     state->compact_ = std::move(decoded->entries_);
     if (range.reverse_)
       std::reverse(state->compact_.begin(), state->compact_.end());
@@ -1411,7 +1411,7 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
     auto decoded = Decode(value);
-    LAVIK_RETURN_IF_ERROR(decoded.status());
+    LAVIK_RETURN_IF_ERROR(decoded);
     Stream stream = std::move(*decoded);
     if (!value && group_read)
       return absl::NotFoundError("NOGROUP No such key or consumer group");
@@ -1493,7 +1493,7 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     if (successful_delivery) consumer->active_ms_ = now;
     if (!changed) return NoChange();
     auto canonical = RestoreGroupArgs(key, group_name, group, &before_group);
-    LAVIK_RETURN_IF_ERROR(canonical.status());
+    LAVIK_RETURN_IF_ERROR(canonical);
     if (replication.has_value()) replication->args_ = *canonical;
     captured_group_args = std::move(*canonical);
     return Changed(std::move(stream));
@@ -1799,7 +1799,7 @@ Task<CommandReply> ExecuteRead(
                     local_tx, request_ptr);
               });
         }
-        LAVIK_CO_RETURN_IF_ERROR(one.status());
+        LAVIK_CO_RETURN_IF_ERROR(one);
         LAVIK_FAULT_INJECT(if (group_read && owns_attempt_gate && k == 0) {
           LAVIK_CO_RETURN_IF_ERROR(
               co_await fault_injection::PauseWhileFileExists(
@@ -1864,7 +1864,7 @@ Task<CommandReply> ExecuteRead(
               }
               if (result.stream_) {
                 auto chunk = co_await result.stream_->Next();
-                LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+                LAVIK_CO_RETURN_IF_ERROR(chunk);
                 if (!chunk->empty()) co_return std::move(*chunk);
                 result.stream_.reset();
               } else if (entry_ < result.entries_.size()) {
@@ -1993,7 +1993,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     auto restore = [&](std::optional<storage::CompactValueView> value)
         -> absl::StatusOr<storage::CompactValueUpdate> {
       auto decoded = Decode(value);
-      LAVIK_RETURN_IF_ERROR(decoded.status());
+      LAVIK_RETURN_IF_ERROR(decoded);
       if (!value && !restored.has_value()) {
         return absl::NotFoundError("NOGROUP No such key or consumer group");
       }
@@ -2173,7 +2173,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       return NoChange();
     }
     auto decoded = Decode(value);
-    LAVIK_RETURN_IF_ERROR(decoded.status());
+    LAVIK_RETURN_IF_ERROR(decoded);
     Stream stream = std::move(*decoded);
     const std::string_view group_name =
         group_state_write
@@ -2212,7 +2212,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             RestoreGroupArgs(a[KeyIndex(request.kind_)], group_name,
                              FindGroup(&after, group_name),
                              before_group ? &*before_group : nullptr);
-        LAVIK_RETURN_IF_ERROR(canonical.status());
+        LAVIK_RETURN_IF_ERROR(canonical);
         if (replication) replication->args_ = *canonical;
         captured_group_args = std::move(*canonical);
       }
@@ -2354,7 +2354,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                 : 0;
         if (value && value->stream_incremental_trim_) {
           auto update = Changed(std::move(stream));
-          LAVIK_RETURN_IF_ERROR(update.status());
+          LAVIK_RETURN_IF_ERROR(update);
           if (trim != Trim::kNone) {
             update->stream_trim_ = storage::StreamTrimRequest{
                 .max_length_ = trim == Trim::kMaxLen ? std::optional(maxlen)
@@ -2417,7 +2417,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         std::vector<Id> ids;
         for (std::size_t i = 2; i < a.size(); ++i) {
           auto id = ParseId(a[i]);
-          LAVIK_RETURN_IF_ERROR(id.status());
+          LAVIK_RETURN_IF_ERROR(id);
           ids.push_back(*id);
         }
         std::sort(ids.begin(), ids.end());
@@ -2467,8 +2467,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         }
         auto start = ParseId(start_text, false, true);
         auto end = ParseId(end_text, true, true);
-        LAVIK_RETURN_IF_ERROR(start.status());
-        LAVIK_RETURN_IF_ERROR(end.status());
+        LAVIK_RETURN_IF_ERROR(start);
+        LAVIK_RETURN_IF_ERROR(end);
         if ((start_exclusive &&
              *start == Id{.ms_ = UINT64_MAX, .seq_ = UINT64_MAX}) ||
             (end_exclusive && *end == Id{})) {
@@ -2537,7 +2537,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                 : 0;
         if (value && value->stream_incremental_trim_) {
           auto update = Changed(std::move(stream));
-          LAVIK_RETURN_IF_ERROR(update.status());
+          LAVIK_RETURN_IF_ERROR(update);
           update->stream_trim_ = storage::StreamTrimRequest{
               .max_length_ = maxlen_mode ? std::optional(maxlen) : std::nullopt,
               .min_id_ = {minid.ms_, minid.seq_},
@@ -2589,7 +2589,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       }
       case CommandKind::kXSetId: {
         auto id = ParseId(a[2]);
-        LAVIK_RETURN_IF_ERROR(id.status());
+        LAVIK_RETURN_IF_ERROR(id);
         std::optional<std::uint64_t> entries_added;
         std::optional<Id> max_deleted_id;
         for (std::size_t i = 3; i < a.size(); i += 2) {
@@ -2606,7 +2606,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             entries_added = static_cast<std::uint64_t>(parsed_entries);
           } else if (EqualCi(a[i], "maxdeletedid")) {
             auto parsed = ParseId(a[i + 1]);
-            LAVIK_RETURN_IF_ERROR(parsed.status());
+            LAVIK_RETURN_IF_ERROR(parsed);
             if (*id < *parsed)
               return absl::InvalidArgumentError(
                   "The ID specified in XSETID is smaller than the provided "
@@ -2743,7 +2743,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         if (!group) return NoChange();
         for (std::size_t i = 3; i < a.size(); ++i) {
           auto id = ParseId(a[i]);
-          LAVIK_RETURN_IF_ERROR(id.status());
+          LAVIK_RETURN_IF_ERROR(id);
           const std::size_t old = group->pending_.size();
           std::erase_if(group->pending_,
                         [&](const Pending& p) { return p.id_ == *id; });
@@ -2781,8 +2781,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         auto start = ParseId(start_text, false, true),
              end = ParseId(end_text, true, true);
         std::int64_t parsed_count = 0;
-        LAVIK_RETURN_IF_ERROR(start.status());
-        LAVIK_RETURN_IF_ERROR(end.status());
+        LAVIK_RETURN_IF_ERROR(start);
+        LAVIK_RETURN_IF_ERROR(end);
         if (!ParseInt(a[option + 2], &parsed_count))
           return absl::InvalidArgumentError(
               "value is not an integer or out of range");
@@ -2823,7 +2823,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                  !EqualCi(a[i], "force") && !EqualCi(a[i], "justid") &&
                  !EqualCi(a[i], "lastid")) {
             auto id = ParseId(a[i]);
-            LAVIK_RETURN_IF_ERROR(id.status());
+            LAVIK_RETURN_IF_ERROR(id);
             ids.push_back(*id);
             ++i;
           }
@@ -2876,7 +2876,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                 "Invalid stream ID specified as stream command argument");
           }
           auto start = ParseId(start_text, false, !start_exclusive);
-          LAVIK_RETURN_IF_ERROR(start.status());
+          LAVIK_RETURN_IF_ERROR(start);
           if (start_exclusive &&
               *start == Id{std::numeric_limits<std::uint64_t>::max(),
                            std::numeric_limits<std::uint64_t>::max()}) {
@@ -3224,7 +3224,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             Task<absl::StatusOr<std::string>> Next() {
               if (entries_) {
                 auto chunk = co_await entries_->Next();
-                LAVIK_CO_RETURN_IF_ERROR(chunk.status());
+                LAVIK_CO_RETURN_IF_ERROR(chunk);
                 if (!chunk->empty()) co_return std::move(*chunk);
                 entries_.reset();
               }

@@ -350,7 +350,7 @@ absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
   }
 
   auto bytes = ParseMemorySize(text);
-  LAVIK_RETURN_IF_ERROR(bytes.status());
+  LAVIK_RETURN_IF_ERROR(bytes);
   return ClientBufferLimit{.value_ = *bytes, .percentage_ = false};
 }
 
@@ -362,7 +362,7 @@ std::string FormatClientBufferLimit(ClientBufferLimit limit) {
 
 absl::StatusOr<std::size_t> ParseClientQueryBufferLimit(std::string_view text) {
   auto bytes = ParseMemorySize(text);
-  LAVIK_RETURN_IF_ERROR(bytes.status());
+  LAVIK_RETURN_IF_ERROR(bytes);
   if (*bytes < kMinimumClientQueryBufferLimit ||
       *bytes > static_cast<std::size_t>(std::numeric_limits<long>::max())) {
     return absl::InvalidArgumentError(
@@ -596,7 +596,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "redis-export-disk-backlog-size") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto bytes = ParseMemorySize(directive[1]);
-    LAVIK_RETURN_IF_ERROR(bytes.status());
+    LAVIK_RETURN_IF_ERROR(bytes);
     constexpr std::size_t block = 8ULL * 1024 * 1024;
     if (*bytes < block)
       return absl::InvalidArgumentError(
@@ -608,7 +608,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "repl-backlog-size") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto bytes = ParseMemorySize(directive[1]);
-    LAVIK_RETURN_IF_ERROR(bytes.status());
+    LAVIK_RETURN_IF_ERROR(bytes);
     if (*bytes == 0) {
       return absl::InvalidArgumentError("repl-backlog-size must be nonzero");
     }
@@ -840,7 +840,7 @@ absl::StatusOr<std::vector<unsigned>> SelectedWorkerCpus(
 absl::Status ResolveAutomaticShardCount(ServerOptions* options) {
   if (options->shard_count_ != 0) return absl::OkStatus();
   auto cpus = SelectedWorkerCpus(*options);
-  LAVIK_RETURN_IF_ERROR(cpus.status());
+  LAVIK_RETURN_IF_ERROR(cpus);
   options->shard_count_ = static_cast<unsigned>(cpus->size()) -
                           static_cast<unsigned>(options->meta_exclusive_cpu_);
   return absl::OkStatus();
@@ -851,7 +851,7 @@ absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
   if (!options.pin_workers_ && !options.meta_exclusive_cpu_)
     return std::vector<unsigned>{};
   auto selected = SelectedWorkerCpus(options);
-  LAVIK_RETURN_IF_ERROR(selected.status());
+  LAVIK_RETURN_IF_ERROR(selected);
   const auto& cpus = *selected;
   const auto data_cpu_count = cpus.size() - options.meta_exclusive_cpu_;
   std::vector<unsigned> result;

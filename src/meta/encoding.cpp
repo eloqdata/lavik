@@ -83,20 +83,20 @@ void MetaWriter::WriteCount(std::uint32_t count) { WriteU32(count); }
 
 absl::StatusOr<std::uint8_t> MetaReader::ReadU8() {
   auto raw = ReadRaw(1);
-  LAVIK_RETURN_IF_ERROR(raw.status());
+  LAVIK_RETURN_IF_ERROR(raw);
   return static_cast<std::uint8_t>((*raw)[0]);
 }
 
 absl::StatusOr<std::uint16_t> MetaReader::ReadU16() {
   auto raw = ReadRaw(2);
-  LAVIK_RETURN_IF_ERROR(raw.status());
+  LAVIK_RETURN_IF_ERROR(raw);
   const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
   return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
 }
 
 absl::StatusOr<std::uint32_t> MetaReader::ReadU32() {
   auto raw = ReadRaw(4);
-  LAVIK_RETURN_IF_ERROR(raw.status());
+  LAVIK_RETURN_IF_ERROR(raw);
   const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
   std::uint32_t v = 0;
   for (unsigned i = 0; i < 4; ++i) {
@@ -107,7 +107,7 @@ absl::StatusOr<std::uint32_t> MetaReader::ReadU32() {
 
 absl::StatusOr<std::uint64_t> MetaReader::ReadU64() {
   auto raw = ReadRaw(8);
-  LAVIK_RETURN_IF_ERROR(raw.status());
+  LAVIK_RETURN_IF_ERROR(raw);
   const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
   std::uint64_t v = 0;
   for (unsigned i = 0; i < 8; ++i) {
@@ -119,7 +119,7 @@ absl::StatusOr<std::uint64_t> MetaReader::ReadU64() {
 absl::StatusOr<bool> MetaReader::ReadBool(
     std::string_view invalid_tag_message) {
   auto tag = ReadU8();
-  LAVIK_RETURN_IF_ERROR(tag.status());
+  LAVIK_RETURN_IF_ERROR(tag);
   if (*tag > 1) return MetaFailStopError(invalid_tag_message);
   return *tag == 1;
 }
@@ -136,7 +136,7 @@ absl::StatusOr<std::string_view> MetaReader::ReadRaw(std::size_t bytes) {
 absl::StatusOr<std::string_view> MetaReader::ReadString(
     std::uint32_t max_bytes) {
   auto len = ReadU32();
-  LAVIK_RETURN_IF_ERROR(len.status());
+  LAVIK_RETURN_IF_ERROR(len);
   // Cap first: an over-cap prefix is a hard failure even when the body is
   // also truncated: over-limit input fails safely and is never truncated.
   if (*len > max_bytes) {
@@ -147,7 +147,7 @@ absl::StatusOr<std::string_view> MetaReader::ReadString(
 
 absl::StatusOr<std::uint32_t> MetaReader::ReadCount(std::uint32_t max_count) {
   auto count = ReadU32();
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   if (*count > max_count) {
     return MetaFailStopError("list count exceeds the field cap");
   }

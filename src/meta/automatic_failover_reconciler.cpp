@@ -448,7 +448,7 @@ MetaAutomaticFailoverReason CommandReason(
 absl::StatusOr<MetaRequestId> NextId(
     const MetaAutomaticFailoverReconcilerOptions& options) {
   auto id = options.next_id_();
-  LAVIK_RETURN_IF_ERROR(id.status());
+  LAVIK_RETURN_IF_ERROR(id);
   if (IsZero(*id)) {
     return absl::FailedPreconditionError(
         "automatic failover generated a zero identity");
@@ -634,7 +634,7 @@ absl::Status ValidateAutomaticProposal(
       DetectionFacts(*group), *automatic, *lease, runtime, observations,
       core->options_.now_steady_ms_(), core->options_.observation_ttl_ms_,
       /*warmup_complete=*/true);
-  LAVIK_RETURN_IF_ERROR(input.status());
+  LAVIK_RETURN_IF_ERROR(input);
   // The command records the exact reason observed at the threshold edge, but
   // moving between exact failure reasons does not interrupt unserviceability.
   // Requiring equality here would discard a completed debounce interval just

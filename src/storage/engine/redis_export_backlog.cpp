@@ -323,7 +323,7 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
     }
     const std::size_t read_bytes = AlignDirect(block.committed_bytes_);
     auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-    LAVIK_CO_RETURN_IF_ERROR(acquired.status());
+    LAVIK_CO_RETURN_IF_ERROR(acquired);
     ReadBufferLease lease = std::move(*acquired);
     FixedBuffer buffer = lease.io_buffer();
     if (buffer.size_ < read_bytes) {

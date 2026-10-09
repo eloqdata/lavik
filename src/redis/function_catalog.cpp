@@ -119,7 +119,7 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
                                                      dump, "FLUSH"};
   auto encoded_restore =
       ReplicationCommandPayloadSource::Create(0, restore_args);
-  LAVIK_CO_RETURN_IF_ERROR(encoded_restore.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded_restore);
 
   std::optional<std::vector<LuaFunctionLibrary>> canonical;
   unsigned staged_workers = 0;
@@ -231,7 +231,7 @@ bycorf::Task<absl::Status> FunctionCatalog::AbortStagedCatalog(
 
 bycorf::Task<absl::Status> FunctionCatalog::RecoverAtStartup() {
   auto recovered = storage_->RecoverFunctionCatalog();
-  LAVIK_CO_RETURN_IF_ERROR(recovered.status());
+  LAVIK_CO_RETURN_IF_ERROR(recovered);
   if (!recovered->has_value()) {
     // A fresh device set already starts with empty worker runtimes and global
     // metadata. Do not consume storage merely to persist that absence; the
@@ -244,7 +244,7 @@ bycorf::Task<absl::Status> FunctionCatalog::RecoverAtStartup() {
         "durable Function catalog is not a valid FUNCTION DUMP");
   }
   auto staged = co_await StageCompleteCatalog(LibrariesFromCodes(*decoded));
-  LAVIK_CO_RETURN_IF_ERROR(staged.status());
+  LAVIK_CO_RETURN_IF_ERROR(staged);
   co_return co_await CommitStagedCatalog(std::move(*staged),
                                          (**recovered).token_, false);
 }
@@ -253,7 +253,7 @@ bycorf::Task<absl::Status> FunctionCatalog::ReplaceFromLibraryCodes(
     const std::vector<std::string>& library_codes) {
   auto staged =
       co_await StageCompleteCatalog(LibrariesFromCodes(library_codes));
-  LAVIK_CO_RETURN_IF_ERROR(staged.status());
+  LAVIK_CO_RETURN_IF_ERROR(staged);
   auto token = co_await MakeStagedCatalogDurable(*staged);
   if (!token.ok()) {
     co_await AbortStagedCatalog(&*staged);
@@ -266,7 +266,7 @@ bycorf::Task<absl::Status> FunctionCatalog::ValidateLibraryCodes(
     const std::vector<std::string>& library_codes) {
   auto staged =
       co_await StageCompleteCatalog(LibrariesFromCodes(library_codes));
-  LAVIK_CO_RETURN_IF_ERROR(staged.status());
+  LAVIK_CO_RETURN_IF_ERROR(staged);
   co_await AbortStagedCatalog(&*staged);
   co_return absl::OkStatus();
 }

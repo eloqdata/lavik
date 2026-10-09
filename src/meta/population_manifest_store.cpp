@@ -148,28 +148,28 @@ MetaPopulationManifestStore::Deserialize(std::string_view bytes) {
   }
   MetaReader reader(bytes);
   auto version = reader.ReadU16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown population manifest schema version");
   }
   auto documents = reader.ReadCount(kMaxMetaPopulationManifestsInSnapshot);
-  LAVIK_RETURN_IF_ERROR(documents.status());
+  LAVIK_RETURN_IF_ERROR(documents);
 
   MetaPopulationManifestStore store;
   for (std::uint32_t i = 0; i < *documents; ++i) {
     auto digest = ReadFixedArray<32>(reader);
-    LAVIK_RETURN_IF_ERROR(digest.status());
+    LAVIK_RETURN_IF_ERROR(digest);
     auto entries = reader.ReadList<MetaPopulationManifestEntry>(
         kMaxMetaPopulationManifestEntries,
         [](MetaReader& item_reader)
             -> absl::StatusOr<MetaPopulationManifestEntry> {
           auto partition_id = item_reader.ReadU32();
-          LAVIK_RETURN_IF_ERROR(partition_id.status());
+          LAVIK_RETURN_IF_ERROR(partition_id);
           auto logical_epoch = item_reader.ReadU64();
-          LAVIK_RETURN_IF_ERROR(logical_epoch.status());
+          LAVIK_RETURN_IF_ERROR(logical_epoch);
           return MetaPopulationManifestEntry{*partition_id, *logical_epoch};
         });
-    LAVIK_RETURN_IF_ERROR(entries.status());
+    LAVIK_RETURN_IF_ERROR(entries);
     if (!IsCanonical(*entries) || !EntriesInDomain(*entries) ||
         CanonicalDigest(*entries) != *digest ||
         !store.documents_

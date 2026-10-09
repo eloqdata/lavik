@@ -142,13 +142,13 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         auto status = budget.AddGroup(*physical, object->ExtentsFor(id));
         LAVIK_CO_RETURN_IF_ERROR(status);
         auto admission = budget.Reserve(1);
-        LAVIK_CO_RETURN_IF_ERROR(admission.status());
+        LAVIK_CO_RETURN_IF_ERROR(admission);
         auto page = co_await engine->LoadOrderedGroupSnapshot(
             *source.store_, *source.partition_, source.db_id_, source.key_,
             source.digest_, object, id.prefix_);
-        LAVIK_CO_RETURN_IF_ERROR(page.status());
+        LAVIK_CO_RETURN_IF_ERROR(page);
         auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
-        LAVIK_CO_RETURN_IF_ERROR(max_key.status());
+        LAVIK_CO_RETURN_IF_ERROR(max_key);
         LAVIK_CO_RETURN_IF_ERROR(
             directory.RememberStreamPageMaxKey(index, *max_key));
         // Retain one admitted probe. Exact-ID ranges use the same page for
@@ -164,10 +164,10 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                           : groups[mid].stream_max_key_.LessThan(key);
         if (!less) {
           auto page = co_await load(mid);
-          LAVIK_CO_RETURN_IF_ERROR(page.status());
+          LAVIK_CO_RETURN_IF_ERROR(page);
           auto max_key =
               StreamRecordKey((*page)->snapshot_.entries_.back().value_);
-          LAVIK_CO_RETURN_IF_ERROR(max_key.status());
+          LAVIK_CO_RETURN_IF_ERROR(max_key);
           less = upper ? *max_key <= key : *max_key < key;
         }
         if (*less)
@@ -178,11 +178,11 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       if (lo == groups.size())
         co_return std::pair{lo, directory.root().item_count_};
       auto page = co_await load(lo);
-      LAVIK_CO_RETURN_IF_ERROR(page.status());
+      LAVIK_CO_RETURN_IF_ERROR(page);
       std::size_t at = 0;
       for (const auto& entry : (*page)->snapshot_.entries_) {
         auto entry_key = StreamRecordKey(entry.value_);
-        LAVIK_CO_RETURN_IF_ERROR(entry_key.status());
+        LAVIK_CO_RETURN_IF_ERROR(entry_key);
         if (upper ? *entry_key > key : *entry_key >= key) break;
         ++at;
       }
@@ -338,7 +338,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
             for (unsigned i = 8; i != 0; --i)
               wanted.push_back(part >> ((i - 1) * 8));
           auto bound = co_await Bound(engine, *source, wanted, false);
-          LAVIK_CO_RETURN_IF_ERROR(bound.status());
+          LAVIK_CO_RETURN_IF_ERROR(bound);
           index = bound->first;
           if (index >= groups.size())
             co_return absl::DataLossError("missing selected Stream message");
@@ -382,7 +382,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
               *source->store_, *source->partition_, source->db_id_,
               source->key_, source->digest_, object, id.prefix_, true);
-          LAVIK_CO_RETURN_IF_ERROR(from_disk.status());
+          LAVIK_CO_RETURN_IF_ERROR(from_disk);
           loaded.emplace(std::move(*from_disk));
         }
         std::size_t count = 0;
@@ -409,7 +409,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
             for (auto& entry : entries) {
               if (source->range_) {
                 auto key = StreamRecordKey(entry.value_);
-                LAVIK_CO_RETURN_IF_ERROR(key.status());
+                LAVIK_CO_RETURN_IF_ERROR(key);
                 const auto& range = *source->range_;
                 if ((range.first_exclusive_ ? *key <= source->first_
                                             : *key < source->first_) ||
@@ -452,7 +452,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         auto loaded = co_await engine->LoadHashGroupSnapshot(
             *source->store_, *source->partition_, source->db_id_, source->key_,
             source->digest_, object, id, true);
-        LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+        LAVIK_CO_RETURN_IF_ERROR(loaded);
         const auto count = loaded->snapshot_.value_.entries_.size();
         if (page.value_type_ == ValueType::kHash)
           page.fields_.reserve(count);
@@ -505,7 +505,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     auto found = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                             digest, key);
-    LAVIK_CO_RETURN_IF_ERROR(found.status());
+    LAVIK_CO_RETURN_IF_ERROR(found);
     if (*found == nullptr || (*found)->value_.kind() != RecordKind::kValue)
       co_return absl::NotFoundError("key not found");
     const auto location = MaterializeIndexLocation(**found);
@@ -513,7 +513,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       if (IsExpiredNow(**found)) co_return absl::NotFoundError("key not found");
       unlock.Unlock();
       auto raw = co_await ReadRawValueLocked(db_id, key, digest);
-      LAVIK_CO_RETURN_IF_ERROR(raw.status());
+      LAVIK_CO_RETURN_IF_ERROR(raw);
       co_return TransferValue{.metadata_ = std::move(*raw), .reader_ = {}};
     }
     auto object = partition.grouped_objects_[db_id].Lookup(
@@ -522,7 +522,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                  .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                  .replication_epoch_ = partition.replication_epoch_,
                  .index_generation_ = partition.grouped_generations_[db_id]});
-    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_CO_RETURN_IF_ERROR(object);
     // A failed publication is an error even if its uncommitted TTL would
     // make the key appear expired. Never disguise an uncertain root as nil.
     if (IsExpiredNow(**found)) co_return absl::NotFoundError("key not found");
@@ -584,10 +584,10 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       if (range.count_ && range.first_ <= range.last_) {
         auto first = co_await Source::Bound(this, *source, source->first_,
                                             range.first_exclusive_);
-        LAVIK_CO_RETURN_IF_ERROR(first.status());
+        LAVIK_CO_RETURN_IF_ERROR(first);
         auto end = co_await Source::Bound(this, *source, source->last_,
                                           !range.last_exclusive_);
-        LAVIK_CO_RETURN_IF_ERROR(end.status());
+        LAVIK_CO_RETURN_IF_ERROR(end);
         source->first_page_ = first->first;
         const auto& directory = source->saved_.grouped_->ordered_directory();
         // Bound returns an exclusive record rank. A bound at the start of

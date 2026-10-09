@@ -193,10 +193,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         LAVIK_CO_RETURN_IF_ERROR(
             budget.AddGroup(*physical, object->ExtentsFor(id)));
         auto scratch = budget.Reserve(1);
-        LAVIK_CO_RETURN_IF_ERROR(scratch.status());
+        LAVIK_CO_RETURN_IF_ERROR(scratch);
         auto page = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object, id.prefix_);
-        LAVIK_CO_RETURN_IF_ERROR(page.status());
+        LAVIK_CO_RETURN_IF_ERROR(page);
         const auto& entries = page->snapshot_.entries_;
         for (std::size_t item = 0; item < entries.size() && visited < inspect;
              ++item, ++visited) {
@@ -233,7 +233,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   }
   LAVIK_CO_RETURN_IF_ERROR(incoming_budget.AddBytes(operation.value_.size()));
   auto incoming_scratch = incoming_budget.Reserve(4);
-  LAVIK_CO_RETURN_IF_ERROR(incoming_scratch.status());
+  LAVIK_CO_RETURN_IF_ERROR(incoming_scratch);
   std::uint64_t rank = 0;
   std::uint64_t erase_count = 0;
   std::vector<OrderedCollectionEntry> insertions;
@@ -372,7 +372,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   // read buffers have independent accounting, including oversized pages.
   // No mutation/encoding copies are needed, even with a wave in flight.
   auto page_scratch = page_budget.Reserve(read_only ? 1 : 4);
-  LAVIK_CO_RETURN_IF_ERROR(page_scratch.status());
+  LAVIK_CO_RETURN_IF_ERROR(page_scratch);
   auto retain_output = [&]() -> absl::Status {
     std::size_t bytes = result.values_.capacity() * sizeof(std::string);
     for (const auto& value : result.values_) {
@@ -396,7 +396,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     std::size_t offset = first->offset_;
     if (end_page - begin_page > 1) result.values_.reserve(erase_count);
     auto append = [&](ListReadBatch::Result values) -> absl::Status {
-      LAVIK_RETURN_IF_ERROR(values.status());
+      LAVIK_RETURN_IF_ERROR(values);
       if (end_page - begin_page == 1)
         result.values_ = std::move(*values);
       else
@@ -466,7 +466,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object,
         directory.groups()[first->group_index_].id_);
-    LAVIK_CO_RETURN_IF_ERROR(page.status());
+    LAVIK_CO_RETURN_IF_ERROR(page);
     if (first->offset_ >= page->snapshot_.entries_.size())
       co_return absl::DataLossError("List replacement rank exceeds page");
     const auto old_size =
@@ -497,7 +497,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     auto page =
         co_await LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
                                           object, directory.groups()[i].id_);
-    LAVIK_CO_RETURN_IF_ERROR(page.status());
+    LAVIK_CO_RETURN_IF_ERROR(page);
     loaded.push_back(std::move(*page));
   }
   // The mutation's page reservation now covers reused payloads too. A pivot
@@ -613,7 +613,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   }
   auto plan = PlanOrderedCollectionSplice(directory, std::move(loaded), rank,
                                           erase_count, std::move(insertions));
-  LAVIK_CO_RETURN_IF_ERROR(plan.status());
+  LAVIK_CO_RETURN_IF_ERROR(plan);
   result.changed_ = plan->changed_;
   result.length_ = plan->root_.item_count_;
   if (!result.changed_) co_return result;

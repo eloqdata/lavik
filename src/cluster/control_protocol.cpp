@@ -166,13 +166,13 @@ class Reader {
 
   absl::StatusOr<std::uint8_t> U8() {
     auto raw = Raw(1);
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     return static_cast<std::uint8_t>((*raw)[0]);
   }
 
   absl::StatusOr<std::uint16_t> U16() {
     auto raw = Raw(2);
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
                                       p[1]);
@@ -180,7 +180,7 @@ class Reader {
 
   absl::StatusOr<std::uint32_t> U32() {
     auto raw = Raw(4);
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
     std::uint32_t value = 0;
     for (unsigned i = 0; i < 4; ++i) value = (value << 8) | p[i];
@@ -189,7 +189,7 @@ class Reader {
 
   absl::StatusOr<std::uint64_t> U64() {
     auto raw = Raw(8);
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
     std::uint64_t value = 0;
     for (unsigned i = 0; i < 8; ++i) value = (value << 8) | p[i];
@@ -198,7 +198,7 @@ class Reader {
 
   absl::StatusOr<bool> Bool() {
     auto tag = U8();
-    LAVIK_RETURN_IF_ERROR(tag.status());
+    LAVIK_RETURN_IF_ERROR(tag);
     if (*tag > 1) return ProtocolError("boolean tag must be 0 or 1");
     return *tag == 1;
   }
@@ -206,7 +206,7 @@ class Reader {
   template <std::size_t N>
   absl::StatusOr<std::array<std::uint8_t, N>> Fixed() {
     auto raw = Raw(N);
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     std::array<std::uint8_t, N> value{};
     std::memcpy(value.data(), raw->data(), N);
     return value;
@@ -214,12 +214,12 @@ class Reader {
 
   absl::StatusOr<std::string> String(std::size_t cap) {
     auto length = U32();
-    LAVIK_RETURN_IF_ERROR(length.status());
+    LAVIK_RETURN_IF_ERROR(length);
     // Check the declared length before checking whether the body is present.
     // Over-limit input is never partially accepted as a truncation case.
     if (*length > cap) return ResourceLimit("message field exceeds its cap");
     auto raw = Raw(*length);
-    LAVIK_RETURN_IF_ERROR(raw.status());
+    LAVIK_RETURN_IF_ERROR(raw);
     return std::string(*raw);
   }
 
@@ -307,11 +307,11 @@ absl::Status WriteSchemaHeader(Writer& writer, std::string_view magic) {
 
 absl::Status ReadSchemaHeader(Reader& reader, std::string_view magic) {
   auto encoded_magic = reader.Raw(4);
-  LAVIK_RETURN_IF_ERROR(encoded_magic.status());
+  LAVIK_RETURN_IF_ERROR(encoded_magic);
   if (*encoded_magic != magic)
     return ProtocolError("unknown directive body schema");
   auto version = reader.U16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kDirectiveBodySchemaVersion) {
     return ProtocolError("unknown directive body schema version");
   }
@@ -353,7 +353,7 @@ absl::Status WriteIdentity(Writer& writer, std::string_view value,
 absl::StatusOr<std::string> ReadIdentity(Reader& reader,
                                          std::string_view field) {
   auto raw = reader.Raw(40);
-  LAVIK_RETURN_IF_ERROR(raw.status());
+  LAVIK_RETURN_IF_ERROR(raw);
   LAVIK_RETURN_IF_ERROR(ValidateIdentity(*raw, field));
   return std::string(*raw);
 }
@@ -380,10 +380,10 @@ absl::Status WriteAuthorityAnchor(Writer& writer,
 absl::StatusOr<WireAuthorityAnchor> ReadAuthorityAnchor(Reader& reader) {
   WireAuthorityAnchor anchor;
   auto group_id = reader.String(kMaxIdentifierBytes);
-  LAVIK_RETURN_IF_ERROR(group_id.status());
+  LAVIK_RETURN_IF_ERROR(group_id);
   anchor.group_id = std::move(*group_id);
   auto assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(assignment_id);
   anchor.assignment_id = *assignment_id;
   LAVIK_ASSIGN_OR_RETURN(anchor.group_term, reader.U64());
   return anchor;
@@ -454,7 +454,7 @@ absl::StatusOr<RebuildRequest> DecodeRebuildRequest(std::string_view encoded) {
   Reader reader(encoded);
   LAVIK_RETURN_IF_ERROR(ReadSchemaHeader(reader, kRebuildRequestMagic));
   auto count = reader.U32();
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   if (*count == 0 || *count > kMaxCandidateFlows) {
     return ProtocolError("invalid rebuild source flow count");
   }
@@ -602,7 +602,7 @@ absl::Status LargeObjectReassembler::Accept(const TransferStart& start) {
     return ProtocolError("unknown transfer kind");
   }
   auto cap = TransferCap(start.kind);
-  LAVIK_RETURN_IF_ERROR(cap.status());
+  LAVIK_RETURN_IF_ERROR(cap);
   if (start.total_length > *cap) {
     return ResourceLimit("large object exceeds its type-specific cap");
   }
@@ -784,7 +784,7 @@ absl::StatusOr<WireMetaEndpoint> ReadEndpoint(Reader& reader) {
   LAVIK_ASSIGN_OR_RETURN(endpoint.host, reader.String(kMaxIdentifierBytes));
   LAVIK_ASSIGN_OR_RETURN(endpoint.port, reader.U16());
   auto has_principal = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_principal.status());
+  LAVIK_RETURN_IF_ERROR(has_principal);
   if (*has_principal) {
     LAVIK_ASSIGN_OR_RETURN(endpoint.principal,
                            reader.String(kMaxIdentifierBytes));
@@ -806,16 +806,16 @@ absl::Status WriteLeaseChallenge(Writer& writer,
 absl::StatusOr<LeaseChallenge> ReadLeaseChallenge(Reader& reader) {
   LeaseChallenge challenge;
   auto nonce = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(nonce.status());
+  LAVIK_RETURN_IF_ERROR(nonce);
   challenge.nonce = *nonce;
   auto control_revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(control_revision.status());
+  LAVIK_RETURN_IF_ERROR(control_revision);
   challenge.control_revision = *control_revision;
   auto group_id = reader.String(kMaxIdentifierBytes);
-  LAVIK_RETURN_IF_ERROR(group_id.status());
+  LAVIK_RETURN_IF_ERROR(group_id);
   challenge.group_id = std::move(*group_id);
   auto assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(assignment_id);
   challenge.assignment_id = *assignment_id;
   LAVIK_ASSIGN_OR_RETURN(challenge.group_term, reader.U64());
   return challenge;
@@ -841,7 +841,7 @@ absl::Status WriteHeartbeatFlowVector(Writer& writer,
 absl::StatusOr<std::vector<std::uint64_t>> ReadHeartbeatFlowVector(
     Reader& reader, std::string_view field) {
   auto count = reader.U16();
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   if (*count == 0 || *count > kMaxCandidateFlows) {
     return ResourceLimit(std::string(field) +
                          " count is outside its protocol cap");
@@ -850,7 +850,7 @@ absl::StatusOr<std::vector<std::uint64_t>> ReadHeartbeatFlowVector(
   next_lsns.reserve(*count);
   for (std::uint16_t flow = 0; flow < *count; ++flow) {
     auto next_lsn = reader.U64();
-    LAVIK_RETURN_IF_ERROR(next_lsn.status());
+    LAVIK_RETURN_IF_ERROR(next_lsn);
     if (*next_lsn == 0) {
       return ProtocolError(std::string(field) + " contains a zero next LSN");
     }
@@ -960,15 +960,15 @@ absl::Status WriteFailoverObservation(Writer& writer,
 
 absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
   auto kind = reader.U8();
-  LAVIK_RETURN_IF_ERROR(kind.status());
+  LAVIK_RETURN_IF_ERROR(kind);
   if (*kind ==
       static_cast<std::uint8_t>(FailoverObservationKind::kSourcePaused)) {
     SourcePaused paused;
     auto transition_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(transition_id.status());
+    LAVIK_RETURN_IF_ERROR(transition_id);
     paused.transition_id = *transition_id;
     auto source_node_id = ReadIdentity(reader, "paused source node id");
-    LAVIK_RETURN_IF_ERROR(source_node_id.status());
+    LAVIK_RETURN_IF_ERROR(source_node_id);
     paused.source_node_id = std::move(*source_node_id);
     LAVIK_ASSIGN_OR_RETURN(paused.source_assignment_id, reader.Fixed<16>());
     LAVIK_ASSIGN_OR_RETURN(paused.source_boot_id,
@@ -976,7 +976,7 @@ absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
     LAVIK_ASSIGN_OR_RETURN(paused.source_history_id,
                            ReadIdentity(reader, "paused source history id"));
     auto source_group_term = reader.U64();
-    LAVIK_RETURN_IF_ERROR(source_group_term.status());
+    LAVIK_RETURN_IF_ERROR(source_group_term);
     paused.source_group_term = *source_group_term;
     LAVIK_ASSIGN_OR_RETURN(
         paused.stable_next_lsns,
@@ -993,10 +993,10 @@ absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
       static_cast<std::uint8_t>(FailoverObservationKind::kCandidatePrepared)) {
     CandidatePrepared prepared;
     auto transition_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(transition_id.status());
+    LAVIK_RETURN_IF_ERROR(transition_id);
     prepared.transition_id = *transition_id;
     auto action_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(action_id.status());
+    LAVIK_RETURN_IF_ERROR(action_id);
     prepared.action_id = *action_id;
     LAVIK_ASSIGN_OR_RETURN(prepared.candidate_node_id,
                            ReadIdentity(reader, "prepared candidate node id"));
@@ -1018,10 +1018,10 @@ absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
                    FailoverObservationKind::kCandidateRecoveryComplete)) {
     CandidateRecoveryComplete complete;
     auto transition_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(transition_id.status());
+    LAVIK_RETURN_IF_ERROR(transition_id);
     complete.transition_id = *transition_id;
     auto action_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(action_id.status());
+    LAVIK_RETURN_IF_ERROR(action_id);
     complete.action_id = *action_id;
     LAVIK_ASSIGN_OR_RETURN(complete.candidate_node_id,
                            ReadIdentity(reader, "complete candidate node id"));
@@ -1052,10 +1052,10 @@ absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
       static_cast<std::uint8_t>(FailoverObservationKind::kActionFailed)) {
     ActionFailed failed;
     auto transition_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(transition_id.status());
+    LAVIK_RETURN_IF_ERROR(transition_id);
     failed.transition_id = *transition_id;
     auto action_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(action_id.status());
+    LAVIK_RETURN_IF_ERROR(action_id);
     failed.action_id = *action_id;
     LAVIK_ASSIGN_OR_RETURN(failed.candidate_node_id,
                            ReadIdentity(reader, "failed candidate node id"));
@@ -1067,10 +1067,10 @@ absl::StatusOr<FailoverObservation> ReadFailoverObservation(Reader& reader) {
                            reader.Fixed<32>());
     LAVIK_ASSIGN_OR_RETURN(failed.partition_replication_epoch, reader.U64());
     auto failure_class = reader.String(kMaxFailoverFailureClassBytes);
-    LAVIK_RETURN_IF_ERROR(failure_class.status());
+    LAVIK_RETURN_IF_ERROR(failure_class);
     failed.failure_class = std::move(*failure_class);
     auto failure_detail = reader.String(kMaxFailoverFailureDetailBytes);
-    LAVIK_RETURN_IF_ERROR(failure_detail.status());
+    LAVIK_RETURN_IF_ERROR(failure_detail);
     failed.failure_detail = std::move(*failure_detail);
     if (IsZeroId(failed.transition_id) || IsZeroId(failed.action_id) ||
         IsZeroId(failed.candidate_assignment_id) ||
@@ -1103,24 +1103,24 @@ absl::Status WriteLeaseGranted(Writer& writer, const LeaseGranted& grant) {
 absl::StatusOr<LeaseGranted> ReadLeaseGranted(Reader& reader) {
   LeaseGranted grant;
   auto nonce = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(nonce.status());
+  LAVIK_RETURN_IF_ERROR(nonce);
   grant.nonce = *nonce;
   auto leader_id = reader.U32();
-  LAVIK_RETURN_IF_ERROR(leader_id.status());
+  LAVIK_RETURN_IF_ERROR(leader_id);
   grant.leader_id = *leader_id;
   auto raft_term = reader.U64();
-  LAVIK_RETURN_IF_ERROR(raft_term.status());
+  LAVIK_RETURN_IF_ERROR(raft_term);
   grant.raft_term = *raft_term;
   LAVIK_ASSIGN_OR_RETURN(grant.data_boot_id,
                          ReadIdentity(reader, "data boot id"));
   auto control_revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(control_revision.status());
+  LAVIK_RETURN_IF_ERROR(control_revision);
   grant.control_revision = *control_revision;
   auto group_id = reader.String(kMaxIdentifierBytes);
-  LAVIK_RETURN_IF_ERROR(group_id.status());
+  LAVIK_RETURN_IF_ERROR(group_id);
   grant.group_id = std::move(*group_id);
   auto assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(assignment_id);
   grant.assignment_id = *assignment_id;
   LAVIK_ASSIGN_OR_RETURN(grant.group_term, reader.U64());
   LAVIK_ASSIGN_OR_RETURN(grant.granted_duration_ms, reader.U32());
@@ -1136,7 +1136,7 @@ std::uint8_t ModeTag(std::optional<ClientMode> mode) {
 
 absl::StatusOr<std::optional<ClientMode>> ReadMode(Reader& reader) {
   auto tag = reader.U8();
-  LAVIK_RETURN_IF_ERROR(tag.status());
+  LAVIK_RETURN_IF_ERROR(tag);
   if (*tag > 2) return ProtocolError("invalid client mode");
   if (*tag == 0) return std::optional<ClientMode>{};
   return std::optional<ClientMode>{static_cast<ClientMode>(*tag - 1)};
@@ -1150,11 +1150,11 @@ void WriteService(Writer& writer, const ServiceDeclaration& service) {
 
 absl::StatusOr<ServiceDeclaration> ReadService(Reader& reader) {
   auto mode = ReadMode(reader);
-  LAVIK_RETURN_IF_ERROR(mode.status());
+  LAVIK_RETURN_IF_ERROR(mode);
   auto id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(id.status());
+  LAVIK_RETURN_IF_ERROR(id);
   auto index = reader.U64();
-  LAVIK_RETURN_IF_ERROR(index.status());
+  LAVIK_RETURN_IF_ERROR(index);
   return ServiceDeclaration{*mode, *id, *index};
 }
 
@@ -1167,13 +1167,13 @@ void WriteCapabilities(Writer& writer, const ClientServiceCapabilities& caps) {
 
 absl::StatusOr<ClientServiceCapabilities> ReadCapabilities(Reader& reader) {
   auto modes = reader.U32();
-  LAVIK_RETURN_IF_ERROR(modes.status());
+  LAVIK_RETURN_IF_ERROR(modes);
   auto services = reader.U32();
-  LAVIK_RETURN_IF_ERROR(services.status());
+  LAVIK_RETURN_IF_ERROR(services);
   auto mode = ReadMode(reader);
-  LAVIK_RETURN_IF_ERROR(mode.status());
+  LAVIK_RETURN_IF_ERROR(mode);
   auto databases = reader.U32();
-  LAVIK_RETURN_IF_ERROR(databases.status());
+  LAVIK_RETURN_IF_ERROR(databases);
   return ClientServiceCapabilities{*modes, *services, *mode, *databases};
 }
 
@@ -1195,9 +1195,9 @@ absl::StatusOr<WireMessage> DecodeBootstrapHello(std::string_view bytes) {
   Reader reader(bytes);
   BootstrapHello hello;
   auto minimum = reader.U16();
-  LAVIK_RETURN_IF_ERROR(minimum.status());
+  LAVIK_RETURN_IF_ERROR(minimum);
   auto maximum = reader.U16();
-  LAVIK_RETURN_IF_ERROR(maximum.status());
+  LAVIK_RETURN_IF_ERROR(maximum);
   if (*minimum == 0 || *minimum > *maximum)
     return ProtocolError("invalid BootstrapHello version range");
   hello.minimum_version = *minimum;
@@ -1241,21 +1241,21 @@ absl::StatusOr<WireMessage> DecodeClientHello(std::string_view bytes) {
     return ProtocolError("invalid ClientHello version range");
   }
   auto node_id = ReadIdentity(reader, "node id");
-  LAVIK_RETURN_IF_ERROR(node_id.status());
+  LAVIK_RETURN_IF_ERROR(node_id);
   hello.node_id = std::move(*node_id);
   auto boot_id = ReadIdentity(reader, "boot id");
-  LAVIK_RETURN_IF_ERROR(boot_id.status());
+  LAVIK_RETURN_IF_ERROR(boot_id);
   hello.boot_id = std::move(*boot_id);
   LAVIK_ASSIGN_OR_RETURN(hello.replication_history_id,
                          ReadIdentity(reader, "replication history id"));
   auto count = reader.U32();
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   if (*count == 0 || *count > kMaxCandidateFlows) {
     return ProtocolError("invalid ClientHello replication flow count");
   }
   hello.replication_flow_count = *count;
   auto service = ReadService(reader);
-  LAVIK_RETURN_IF_ERROR(service.status());
+  LAVIK_RETURN_IF_ERROR(service);
   hello.service = *service;
   LAVIK_ASSIGN_OR_RETURN(hello.capabilities, ReadCapabilities(reader));
   LAVIK_RETURN_IF_ERROR(Finish(reader));
@@ -1295,7 +1295,7 @@ absl::StatusOr<WireMessage> DecodeServerHello(std::string_view bytes) {
   Reader reader(bytes);
   ServerHello hello;
   auto disposition = reader.U8();
-  LAVIK_RETURN_IF_ERROR(disposition.status());
+  LAVIK_RETURN_IF_ERROR(disposition);
   if (*disposition < 1 || *disposition > 4) {
     return ProtocolError("unknown ServerHello disposition");
   }
@@ -1303,34 +1303,34 @@ absl::StatusOr<WireMessage> DecodeServerHello(std::string_view bytes) {
   LAVIK_ASSIGN_OR_RETURN(hello.negotiated_version, reader.U16());
   LAVIK_ASSIGN_OR_RETURN(hello.meta_server_id, reader.U32());
   auto raft_term = reader.U64();
-  LAVIK_RETURN_IF_ERROR(raft_term.status());
+  LAVIK_RETURN_IF_ERROR(raft_term);
   hello.raft_term = *raft_term;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   hello.session_id = *session_id;
   LAVIK_ASSIGN_OR_RETURN(hello.session_generation, reader.U64());
   auto has_leader = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_leader.status());
+  LAVIK_RETURN_IF_ERROR(has_leader);
   if (*has_leader) {
     auto leader_id = reader.U32();
-    LAVIK_RETURN_IF_ERROR(leader_id.status());
+    LAVIK_RETURN_IF_ERROR(leader_id);
     hello.leader_id = *leader_id;
   }
   auto directory_count = reader.U32();
-  LAVIK_RETURN_IF_ERROR(directory_count.status());
+  LAVIK_RETURN_IF_ERROR(directory_count);
   if (*directory_count > kMaxDirectoryEntries) {
     return ResourceLimit("Meta directory exceeds its entry cap");
   }
   hello.directory.reserve(*directory_count);
   for (std::uint32_t i = 0; i < *directory_count; ++i) {
     auto endpoint = ReadEndpoint(reader);
-    LAVIK_RETURN_IF_ERROR(endpoint.status());
+    LAVIK_RETURN_IF_ERROR(endpoint);
     hello.directory.push_back(std::move(*endpoint));
   }
   LAVIK_ASSIGN_OR_RETURN(hello.observation_ttl_ms, reader.U32());
   LAVIK_ASSIGN_OR_RETURN(hello.session_progress_timeout_ms, reader.U32());
   auto service = ReadService(reader);
-  LAVIK_RETURN_IF_ERROR(service.status());
+  LAVIK_RETURN_IF_ERROR(service);
   hello.service = *service;
   LAVIK_ASSIGN_OR_RETURN(hello.rejection_reason,
                          reader.String(kMaxIdentifierBytes));
@@ -1350,7 +1350,7 @@ absl::Status ValidateBootstrapReply(const BootstrapReply& reply) {
 absl::StatusOr<std::string> Encode(const BootstrapReply& reply) {
   LAVIK_RETURN_IF_ERROR(ValidateBootstrapReply(reply));
   auto server = Encode(reply.server);
-  LAVIK_RETURN_IF_ERROR(server.status());
+  LAVIK_RETURN_IF_ERROR(server);
   Writer writer;
   writer.U8(static_cast<std::uint8_t>(reply.disposition));
   writer.Raw(*server);
@@ -1360,11 +1360,11 @@ absl::StatusOr<std::string> Encode(const BootstrapReply& reply) {
 absl::StatusOr<WireMessage> DecodeBootstrapReply(std::string_view bytes) {
   Reader reader(bytes);
   auto disposition = reader.U8();
-  LAVIK_RETURN_IF_ERROR(disposition.status());
+  LAVIK_RETURN_IF_ERROR(disposition);
   auto remaining = reader.Raw(reader.remaining());
-  LAVIK_RETURN_IF_ERROR(remaining.status());
+  LAVIK_RETURN_IF_ERROR(remaining);
   auto server = DecodeServerHello(*remaining);
-  LAVIK_RETURN_IF_ERROR(server.status());
+  LAVIK_RETURN_IF_ERROR(server);
   BootstrapReply reply{static_cast<BootstrapDisposition>(*disposition),
                        std::get<ServerHello>(std::move(*server))};
   LAVIK_RETURN_IF_ERROR(ValidateBootstrapReply(reply));
@@ -1375,7 +1375,7 @@ absl::StatusOr<std::string> Encode(const TransferStart& start) {
   const auto kind = static_cast<std::uint16_t>(start.kind);
   if (kind < 1 || kind > 5) return ProtocolError("unknown transfer kind");
   auto cap = TransferCap(start.kind);
-  LAVIK_RETURN_IF_ERROR(cap.status());
+  LAVIK_RETURN_IF_ERROR(cap);
   if (start.total_length > *cap) {
     return ResourceLimit("large object exceeds its type-specific cap");
   }
@@ -1390,17 +1390,17 @@ absl::StatusOr<WireMessage> DecodeTransferStart(std::string_view bytes) {
   Reader reader(bytes);
   TransferStart start;
   auto kind = reader.U16();
-  LAVIK_RETURN_IF_ERROR(kind.status());
+  LAVIK_RETURN_IF_ERROR(kind);
   if (*kind < 1 || *kind > 5) return ProtocolError("unknown transfer kind");
   start.kind = static_cast<TransferKind>(*kind);
   auto object_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(object_id.status());
+  LAVIK_RETURN_IF_ERROR(object_id);
   start.object_id = *object_id;
   auto total_length = reader.U64();
-  LAVIK_RETURN_IF_ERROR(total_length.status());
+  LAVIK_RETURN_IF_ERROR(total_length);
   start.total_length = *total_length;
   auto cap = TransferCap(start.kind);
-  LAVIK_RETURN_IF_ERROR(cap.status());
+  LAVIK_RETURN_IF_ERROR(cap);
   if (start.total_length > *cap) {
     return ResourceLimit("large object exceeds its type-specific cap");
   }
@@ -1424,10 +1424,10 @@ absl::StatusOr<WireMessage> DecodeTransferChunk(std::string_view bytes) {
   Reader reader(bytes);
   TransferChunk chunk;
   auto object_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(object_id.status());
+  LAVIK_RETURN_IF_ERROR(object_id);
   chunk.object_id = *object_id;
   auto offset = reader.U64();
-  LAVIK_RETURN_IF_ERROR(offset.status());
+  LAVIK_RETURN_IF_ERROR(offset);
   chunk.offset = *offset;
   LAVIK_ASSIGN_OR_RETURN(chunk.bytes, reader.String(kMaxTransferChunkBytes));
   LAVIK_RETURN_IF_ERROR(Finish(reader));
@@ -1448,7 +1448,7 @@ absl::StatusOr<std::string> Encode(const TransferEnd& end) {
 absl::StatusOr<WireMessage> DecodeTransferEnd(std::string_view bytes) {
   Reader reader(bytes);
   auto object_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(object_id.status());
+  LAVIK_RETURN_IF_ERROR(object_id);
   LAVIK_RETURN_IF_ERROR(Finish(reader));
   return WireMessage{TransferEnd{.object_id = *object_id}};
 }
@@ -1464,10 +1464,10 @@ absl::StatusOr<WireMessage> DecodeTransferAbort(std::string_view bytes) {
   Reader reader(bytes);
   TransferAbort abort;
   auto object_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(object_id.status());
+  LAVIK_RETURN_IF_ERROR(object_id);
   abort.object_id = *object_id;
   auto reason = reader.U16();
-  LAVIK_RETURN_IF_ERROR(reason.status());
+  LAVIK_RETURN_IF_ERROR(reason);
   abort.reason = static_cast<TransferAbortReason>(*reason);
   LAVIK_RETURN_IF_ERROR(Finish(reader));
   return WireMessage{abort};
@@ -1572,54 +1572,54 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
   Reader reader(bytes);
   Heartbeat heartbeat;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   heartbeat.session_id = *session_id;
   LAVIK_ASSIGN_OR_RETURN(heartbeat.heartbeat_sequence, reader.U64());
   auto storage_ready = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(storage_ready.status());
+  LAVIK_RETURN_IF_ERROR(storage_ready);
   heartbeat.health.storage_ready = *storage_ready;
   auto population_ready = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(population_ready.status());
+  LAVIK_RETURN_IF_ERROR(population_ready);
   heartbeat.health.population_ready = *population_ready;
   auto draining = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(draining.status());
+  LAVIK_RETURN_IF_ERROR(draining);
   heartbeat.health.draining = *draining;
   auto active_groups = reader.U32();
-  LAVIK_RETURN_IF_ERROR(active_groups.status());
+  LAVIK_RETURN_IF_ERROR(active_groups);
   heartbeat.health.active_groups = *active_groups;
   auto summary = reader.String(kMaxOpaqueFieldBytes);
-  LAVIK_RETURN_IF_ERROR(summary.status());
+  LAVIK_RETURN_IF_ERROR(summary);
   heartbeat.health.summary = std::move(*summary);
   auto role_kind = reader.U8();
-  LAVIK_RETURN_IF_ERROR(role_kind.status());
+  LAVIK_RETURN_IF_ERROR(role_kind);
   if (*role_kind ==
       static_cast<std::uint8_t>(HeartbeatRoleKind::kAuthorityLeaseRequest)) {
     auto challenge = ReadLeaseChallenge(reader);
-    LAVIK_RETURN_IF_ERROR(challenge.status());
+    LAVIK_RETURN_IF_ERROR(challenge);
     heartbeat.role_information =
         AuthorityLeaseRequest{.challenge = std::move(*challenge)};
   } else if (*role_kind ==
              static_cast<std::uint8_t>(HeartbeatRoleKind::kReplicaCandidate)) {
     CandidateProgress candidate;
     auto recovered = reader.Bool();
-    LAVIK_RETURN_IF_ERROR(recovered.status());
+    LAVIK_RETURN_IF_ERROR(recovered);
     candidate.recovered = *recovered;
     auto operator_recovery = reader.Bool();
-    LAVIK_RETURN_IF_ERROR(operator_recovery.status());
+    LAVIK_RETURN_IF_ERROR(operator_recovery);
     candidate.operator_recovery = *operator_recovery;
     if (candidate.operator_recovery && candidate.recovered)
       return ProtocolError("conflicting recovery kinds");
     auto group_id = reader.String(kMaxIdentifierBytes);
-    LAVIK_RETURN_IF_ERROR(group_id.status());
+    LAVIK_RETURN_IF_ERROR(group_id);
     candidate.group_id = std::move(*group_id);
     auto assignment_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(assignment_id.status());
+    LAVIK_RETURN_IF_ERROR(assignment_id);
     candidate.assignment_id = *assignment_id;
     auto group_term = reader.U64();
-    LAVIK_RETURN_IF_ERROR(group_term.status());
+    LAVIK_RETURN_IF_ERROR(group_term);
     candidate.group_term = *group_term;
     auto source_group_term = reader.U64();
-    LAVIK_RETURN_IF_ERROR(source_group_term.status());
+    LAVIK_RETURN_IF_ERROR(source_group_term);
     candidate.source_group_term = *source_group_term;
     if (candidate.operator_recovery && candidate.source_group_term != 0) {
       return ProtocolError("operator recovery cannot claim a source term");
@@ -1631,24 +1631,24 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
           "candidate source term must be nonzero and not exceed group term");
     }
     auto manifest_revision = reader.U64();
-    LAVIK_RETURN_IF_ERROR(manifest_revision.status());
+    LAVIK_RETURN_IF_ERROR(manifest_revision);
     candidate.manifest_revision = *manifest_revision;
     auto manifest_digest = reader.Fixed<32>();
-    LAVIK_RETURN_IF_ERROR(manifest_digest.status());
+    LAVIK_RETURN_IF_ERROR(manifest_digest);
     candidate.manifest_digest = *manifest_digest;
     auto partition_replication_epoch = reader.U64();
-    LAVIK_RETURN_IF_ERROR(partition_replication_epoch.status());
+    LAVIK_RETURN_IF_ERROR(partition_replication_epoch);
     candidate.partition_replication_epoch = *partition_replication_epoch;
     if (!candidate.operator_recovery) {
       auto source_node_id = reader.String(kMaxIdentifierBytes);
-      LAVIK_RETURN_IF_ERROR(source_node_id.status());
+      LAVIK_RETURN_IF_ERROR(source_node_id);
       auto source_assignment_id = reader.Fixed<16>();
-      LAVIK_RETURN_IF_ERROR(source_assignment_id.status());
+      LAVIK_RETURN_IF_ERROR(source_assignment_id);
       candidate.source_assignment_id = *source_assignment_id;
       auto source_boot_id = reader.String(kMaxIdentifierBytes);
-      LAVIK_RETURN_IF_ERROR(source_boot_id.status());
+      LAVIK_RETURN_IF_ERROR(source_boot_id);
       auto source_history_id = reader.String(kMaxIdentifierBytes);
-      LAVIK_RETURN_IF_ERROR(source_history_id.status());
+      LAVIK_RETURN_IF_ERROR(source_history_id);
       if (!IsCanonicalIdentity160(*source_node_id) ||
           !IsCanonicalIdentity160(*source_boot_id) ||
           !IsCanonicalIdentity160(*source_history_id)) {
@@ -1668,7 +1668,7 @@ absl::StatusOr<WireMessage> DecodeHeartbeat(std::string_view bytes) {
     return ProtocolError("unknown heartbeat role-information kind");
   }
   auto has_failover_observation = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_failover_observation.status());
+  LAVIK_RETURN_IF_ERROR(has_failover_observation);
   if (*has_failover_observation) {
     LAVIK_ASSIGN_OR_RETURN(heartbeat.failover_observation,
                            ReadFailoverObservation(reader));
@@ -1710,17 +1710,17 @@ absl::StatusOr<WireMessage> DecodeHeartbeatAck(std::string_view bytes) {
   Reader reader(bytes);
   HeartbeatAck ack;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   ack.session_id = *session_id;
   LAVIK_ASSIGN_OR_RETURN(ack.heartbeat_sequence, reader.U64());
   auto observation = reader.U8();
-  LAVIK_RETURN_IF_ERROR(observation.status());
+  LAVIK_RETURN_IF_ERROR(observation);
   if (*observation > 3) return ProtocolError("unknown observation status");
   ack.observation_status = static_cast<ObservationStatus>(*observation);
   LAVIK_ASSIGN_OR_RETURN(ack.observation_detail,
                          reader.String(kMaxOpaqueFieldBytes));
   auto decision = reader.U8();
-  LAVIK_RETURN_IF_ERROR(decision.status());
+  LAVIK_RETURN_IF_ERROR(decision);
   switch (*decision) {
     case 0:
       ack.lease_decision = NoChallenge{};
@@ -1732,10 +1732,10 @@ absl::StatusOr<WireMessage> DecodeHeartbeatAck(std::string_view bytes) {
     case 2: {
       LeaseDenied denied;
       auto nonce = reader.Fixed<16>();
-      LAVIK_RETURN_IF_ERROR(nonce.status());
+      LAVIK_RETURN_IF_ERROR(nonce);
       denied.nonce = *nonce;
       auto reason = reader.U16();
-      LAVIK_RETURN_IF_ERROR(reason.status());
+      LAVIK_RETURN_IF_ERROR(reason);
       if (*reason < 1 || *reason > 6) {
         return ProtocolError("unknown lease denial reason");
       }
@@ -1747,7 +1747,7 @@ absl::StatusOr<WireMessage> DecodeHeartbeatAck(std::string_view bytes) {
     case 3: {
       LeaseStateOutOfDate stale;
       auto nonce = reader.Fixed<16>();
-      LAVIK_RETURN_IF_ERROR(nonce.status());
+      LAVIK_RETURN_IF_ERROR(nonce);
       stale.nonce = *nonce;
       LAVIK_ASSIGN_OR_RETURN(stale.current_control_revision, reader.U64());
       ack.lease_decision = stale;
@@ -1774,12 +1774,12 @@ absl::StatusOr<WireMessage> DecodeFence(std::string_view bytes) {
   Reader reader(bytes);
   Fence fence;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   fence.session_id = *session_id;
   LAVIK_ASSIGN_OR_RETURN(fence.target_boot_id,
                          ReadIdentity(reader, "target boot id"));
   auto basis = ReadProjectionBasis(reader);
-  LAVIK_RETURN_IF_ERROR(basis.status());
+  LAVIK_RETURN_IF_ERROR(basis);
   fence.basis = *basis;
   LAVIK_ASSIGN_OR_RETURN(fence.reject_through, ReadAuthorityAnchor(reader));
   LAVIK_RETURN_IF_ERROR(Finish(reader));
@@ -1799,7 +1799,7 @@ absl::StatusOr<WireMessage> DecodeFenceAck(std::string_view bytes) {
   Reader reader(bytes);
   FenceAck ack;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   ack.session_id = *session_id;
   LAVIK_ASSIGN_OR_RETURN(ack.target_boot_id,
                          ReadIdentity(reader, "target boot id"));
@@ -1849,59 +1849,59 @@ absl::StatusOr<WireMessage> DecodeDirective(std::string_view bytes) {
   Reader reader(bytes);
   Directive directive;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   directive.session_id = *session_id;
   auto basis = ReadProjectionBasis(reader);
-  LAVIK_RETURN_IF_ERROR(basis.status());
+  LAVIK_RETURN_IF_ERROR(basis);
   directive.basis = *basis;
   auto authority = ReadAuthorityAnchor(reader);
-  LAVIK_RETURN_IF_ERROR(authority.status());
+  LAVIK_RETURN_IF_ERROR(authority);
   directive.authority = std::move(*authority);
   auto identity = ReadDirectiveIdentity(reader);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   directive.identity = *identity;
   auto recipient_node_id = ReadIdentity(reader, "directive recipient node id");
-  LAVIK_RETURN_IF_ERROR(recipient_node_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_node_id);
   directive.recipient_node_id = std::move(*recipient_node_id);
   auto recipient_boot_id = ReadIdentity(reader, "directive recipient boot id");
-  LAVIK_RETURN_IF_ERROR(recipient_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_boot_id);
   directive.recipient_boot_id = std::move(*recipient_boot_id);
   auto target_node_id = ReadIdentity(reader, "directive target node id");
-  LAVIK_RETURN_IF_ERROR(target_node_id.status());
+  LAVIK_RETURN_IF_ERROR(target_node_id);
   directive.target_node_id = std::move(*target_node_id);
   auto target_boot_id = ReadIdentity(reader, "directive target boot id");
-  LAVIK_RETURN_IF_ERROR(target_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(target_boot_id);
   directive.target_boot_id = std::move(*target_boot_id);
   auto source_node_id = ReadIdentity(reader, "directive source node id");
-  LAVIK_RETURN_IF_ERROR(source_node_id.status());
+  LAVIK_RETURN_IF_ERROR(source_node_id);
   directive.source_node_id = std::move(*source_node_id);
   auto source_assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(source_assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(source_assignment_id);
   directive.source_assignment_id = *source_assignment_id;
   auto source_boot_id = ReadIdentity(reader, "directive source boot id");
-  LAVIK_RETURN_IF_ERROR(source_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(source_boot_id);
   directive.source_boot_id = std::move(*source_boot_id);
   LAVIK_ASSIGN_OR_RETURN(
       directive.source_replication_history_id,
       ReadIdentity(reader, "directive source replication history id"));
   auto manifest_revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(manifest_revision.status());
+  LAVIK_RETURN_IF_ERROR(manifest_revision);
   directive.manifest_revision = *manifest_revision;
   auto manifest_digest = reader.Fixed<32>();
-  LAVIK_RETURN_IF_ERROR(manifest_digest.status());
+  LAVIK_RETURN_IF_ERROR(manifest_digest);
   directive.manifest_digest = *manifest_digest;
   auto partition_replication_epoch = reader.U64();
-  LAVIK_RETURN_IF_ERROR(partition_replication_epoch.status());
+  LAVIK_RETURN_IF_ERROR(partition_replication_epoch);
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
-  LAVIK_RETURN_IF_ERROR(kind.status());
+  LAVIK_RETURN_IF_ERROR(kind);
   if (*kind < 1 || *kind > static_cast<std::uint8_t>(
                                WireDirectiveKind::kInitializeEmptyPopulation)) {
     return ProtocolError("unknown directive kind");
   }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
   auto payload = reader.String(kMaxOpaqueFieldBytes);
-  LAVIK_RETURN_IF_ERROR(payload.status());
+  LAVIK_RETURN_IF_ERROR(payload);
   directive.payload = std::move(*payload);
 
   LAVIK_RETURN_IF_ERROR(Finish(reader));
@@ -1922,16 +1922,16 @@ absl::StatusOr<WireMessage> DecodeDirectiveResponse(std::string_view bytes) {
   Reader reader(bytes);
   DirectiveResponse receipt;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   receipt.session_id = *session_id;
   auto recipient_boot_id = ReadIdentity(reader, "recipient boot id");
-  LAVIK_RETURN_IF_ERROR(recipient_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_boot_id);
   receipt.recipient_boot_id = std::move(*recipient_boot_id);
   auto identity = ReadDirectiveIdentity(reader);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   receipt.identity = *identity;
   auto started = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(started.status());
+  LAVIK_RETURN_IF_ERROR(started);
   receipt.started = *started;
   LAVIK_RETURN_IF_ERROR(Finish(reader));
   return WireMessage{std::move(receipt)};
@@ -1958,19 +1958,19 @@ absl::StatusOr<WireMessage> DecodeDirectiveResult(std::string_view bytes) {
   Reader reader(bytes);
   DirectiveResult result;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   result.session_id = *session_id;
   auto recipient_boot_id = ReadIdentity(reader, "recipient boot id");
-  LAVIK_RETURN_IF_ERROR(recipient_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_boot_id);
   result.recipient_boot_id = std::move(*recipient_boot_id);
   auto assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(assignment_id);
   result.assignment_id = *assignment_id;
   auto identity = ReadDirectiveIdentity(reader);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   result.identity = *identity;
   auto status_tag = reader.U8();
-  LAVIK_RETURN_IF_ERROR(status_tag.status());
+  LAVIK_RETURN_IF_ERROR(status_tag);
   if (*status_tag < 1 || *status_tag > 3) {
     return ProtocolError("unknown directive result status");
   }
@@ -1994,16 +1994,16 @@ absl::StatusOr<WireMessage> DecodeResultCommitted(std::string_view bytes) {
   Reader reader(bytes);
   ResultCommitted committed;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   committed.session_id = *session_id;
   auto recipient_boot_id = ReadIdentity(reader, "recipient boot id");
-  LAVIK_RETURN_IF_ERROR(recipient_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_boot_id);
   committed.recipient_boot_id = std::move(*recipient_boot_id);
   auto identity = ReadDirectiveIdentity(reader);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   committed.identity = *identity;
   auto committed_index = reader.U64();
-  LAVIK_RETURN_IF_ERROR(committed_index.status());
+  LAVIK_RETURN_IF_ERROR(committed_index);
   committed.committed_index = *committed_index;
   LAVIK_RETURN_IF_ERROR(Finish(reader));
   return WireMessage{std::move(committed)};
@@ -2023,13 +2023,13 @@ absl::StatusOr<WireMessage> DecodeResultNoLongerTracked(
   Reader reader(bytes);
   ResultNoLongerTracked result;
   auto session_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(session_id.status());
+  LAVIK_RETURN_IF_ERROR(session_id);
   result.session_id = *session_id;
   auto recipient_boot_id = ReadIdentity(reader, "recipient boot id");
-  LAVIK_RETURN_IF_ERROR(recipient_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_boot_id);
   result.recipient_boot_id = std::move(*recipient_boot_id);
   auto identity = ReadDirectiveIdentity(reader);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   result.identity = *identity;
   LAVIK_RETURN_IF_ERROR(Finish(reader));
   return WireMessage{std::move(result)};
@@ -2132,7 +2132,7 @@ absl::StatusOr<EncodedMessage> EncodeMessage(const WireMessage& message) {
         }
       },
       message);
-  LAVIK_RETURN_IF_ERROR(encoded.status());
+  LAVIK_RETURN_IF_ERROR(encoded);
   const MessageType type = MessageTypeOf(message);
   if (RequiresSingleFrame(type) && encoded->size() > kMaxFramePayloadBytes) {
     return ResourceLimit("non-fragmentable control message exceeds one frame");
@@ -2148,7 +2148,7 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
   switch (type) {
     case MessageType::kNodeControlUpdate: {
       auto update = DecodeNodeControlUpdate(payload);
-      LAVIK_RETURN_IF_ERROR(update.status());
+      LAVIK_RETURN_IF_ERROR(update);
       return WireMessage{std::move(*update)};
     }
     case MessageType::kBootstrapHello:
@@ -2189,7 +2189,7 @@ absl::StatusOr<WireMessage> DecodeMessage(MessageType type,
       return DecodeResultNoLongerTracked(payload);
     case MessageType::kFullDesiredState: {
       auto desired = DecodeFullDesiredState(payload);
-      LAVIK_RETURN_IF_ERROR(desired.status());
+      LAVIK_RETURN_IF_ERROR(desired);
       return WireMessage(std::move(*desired));
     }
   }
@@ -2225,7 +2225,7 @@ absl::Status WriteCount(Writer& writer, std::size_t count, std::size_t cap,
 absl::StatusOr<std::uint32_t> ReadCount(Reader& reader, std::size_t cap,
                                         std::string_view field) {
   auto count = reader.U32();
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   if (*count > cap) {
     return ResourceLimit(std::string(field) + " exceeds its entry cap");
   }
@@ -2246,16 +2246,16 @@ absl::Status WriteDataEndpoint(Writer& writer,
 absl::StatusOr<WireDataEndpoint> ReadDataEndpoint(Reader& reader) {
   WireDataEndpoint endpoint;
   auto node_id = ReadIdentity(reader, "data node id");
-  LAVIK_RETURN_IF_ERROR(node_id.status());
+  LAVIK_RETURN_IF_ERROR(node_id);
   endpoint.node_id = std::move(*node_id);
   auto host = reader.String(kMaxIdentifierBytes);
-  LAVIK_RETURN_IF_ERROR(host.status());
+  LAVIK_RETURN_IF_ERROR(host);
   endpoint.host = std::move(*host);
   auto port = reader.U16();
-  LAVIK_RETURN_IF_ERROR(port.status());
+  LAVIK_RETURN_IF_ERROR(port);
   endpoint.port = *port;
   auto tls_port = reader.U16();
-  LAVIK_RETURN_IF_ERROR(tls_port.status());
+  LAVIK_RETURN_IF_ERROR(tls_port);
   endpoint.tls_port = *tls_port;
   return endpoint;
 }
@@ -2271,10 +2271,10 @@ absl::Status WriteDesiredMember(Writer& writer,
 absl::StatusOr<WireDesiredMember> ReadDesiredMember(Reader& reader) {
   WireDesiredMember member;
   auto node_id = ReadIdentity(reader, "group member node id");
-  LAVIK_RETURN_IF_ERROR(node_id.status());
+  LAVIK_RETURN_IF_ERROR(node_id);
   member.node_id = std::move(*node_id);
   auto assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(assignment_id);
   member.assignment_id = *assignment_id;
   return member;
 }
@@ -2421,23 +2421,23 @@ absl::StatusOr<WireFailoverTransition> ReadFailoverTransition(
     Reader& reader, const WireDesiredGroup& group) {
   WireFailoverTransition transition;
   auto transition_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(transition_id.status());
+  LAVIK_RETURN_IF_ERROR(transition_id);
   transition.transition_id = *transition_id;
   auto revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   transition.revision = *revision;
   auto mode = reader.U8();
-  LAVIK_RETURN_IF_ERROR(mode.status());
+  LAVIK_RETURN_IF_ERROR(mode);
   transition.mode = static_cast<WireFailoverMode>(*mode);
   auto target_term = reader.U64();
-  LAVIK_RETURN_IF_ERROR(target_term.status());
+  LAVIK_RETURN_IF_ERROR(target_term);
   transition.target_term = *target_term;
   auto has_action = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_action.status());
+  LAVIK_RETURN_IF_ERROR(has_action);
   if (*has_action) {
     WireFailoverCandidateAction action;
     auto action_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(action_id.status());
+    LAVIK_RETURN_IF_ERROR(action_id);
     action.action_id = *action_id;
     LAVIK_ASSIGN_OR_RETURN(action.candidate.node_id,
                            ReadIdentity(reader, "failover candidate node id"));
@@ -2445,11 +2445,11 @@ absl::StatusOr<WireFailoverTransition> ReadFailoverTransition(
     LAVIK_ASSIGN_OR_RETURN(action.candidate.boot_id,
                            ReadIdentity(reader, "failover candidate boot id"));
     auto operator_recovery = reader.Bool();
-    LAVIK_RETURN_IF_ERROR(operator_recovery.status());
+    LAVIK_RETURN_IF_ERROR(operator_recovery);
     action.operator_recovery = *operator_recovery;
     if (!action.operator_recovery) {
       auto source_group_term = reader.U64();
-      LAVIK_RETURN_IF_ERROR(source_group_term.status());
+      LAVIK_RETURN_IF_ERROR(source_group_term);
       action.domain.source_group_term = *source_group_term;
       LAVIK_ASSIGN_OR_RETURN(action.domain.source_node_id,
                              ReadIdentity(reader, "failover source node id"));
@@ -2461,25 +2461,25 @@ absl::StatusOr<WireFailoverTransition> ReadFailoverTransition(
           action.domain.source_history_id,
           ReadIdentity(reader, "failover source history id"));
       auto flow_count = reader.U32();
-      LAVIK_RETURN_IF_ERROR(flow_count.status());
+      LAVIK_RETURN_IF_ERROR(flow_count);
       action.domain.flow_count = *flow_count;
     }
     auto has_authorization = reader.Bool();
-    LAVIK_RETURN_IF_ERROR(has_authorization.status());
+    LAVIK_RETURN_IF_ERROR(has_authorization);
     if (*has_authorization) {
       WireFailoverAuthorization authorization;
       auto authorized_revision = reader.U64();
-      LAVIK_RETURN_IF_ERROR(authorized_revision.status());
+      LAVIK_RETURN_IF_ERROR(authorized_revision);
       authorization.authorized_revision = *authorized_revision;
       auto loss = reader.U8();
-      LAVIK_RETURN_IF_ERROR(loss.status());
+      LAVIK_RETURN_IF_ERROR(loss);
       authorization.loss_if_cutover = static_cast<WireFailoverLoss>(*loss);
       action.authorization = authorization;
     }
     transition.candidate_action = std::move(action);
   }
   auto has_deadline = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_deadline.status());
+  LAVIK_RETURN_IF_ERROR(has_deadline);
   if (*has_deadline) {
     LAVIK_ASSIGN_OR_RETURN(transition.recovery_deadline_unix_ms, reader.U64());
   }
@@ -2542,37 +2542,37 @@ absl::Status WriteDesiredGroup(Writer& writer, const WireDesiredGroup& group) {
 absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
   WireDesiredGroup group;
   auto group_id = reader.String(kMaxIdentifierBytes);
-  LAVIK_RETURN_IF_ERROR(group_id.status());
+  LAVIK_RETURN_IF_ERROR(group_id);
   group.group_id = std::move(*group_id);
   auto member_count = ReadCount(reader, kMaxProjectedNodes, "group members");
-  LAVIK_RETURN_IF_ERROR(member_count.status());
+  LAVIK_RETURN_IF_ERROR(member_count);
   group.members.reserve(*member_count);
   for (std::uint32_t i = 0; i < *member_count; ++i) {
     auto member = ReadDesiredMember(reader);
-    LAVIK_RETURN_IF_ERROR(member.status());
+    LAVIK_RETURN_IF_ERROR(member);
     group.members.push_back(std::move(*member));
   }
   auto has_owner = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_owner.status());
+  LAVIK_RETURN_IF_ERROR(has_owner);
   if (*has_owner) {
     LAVIK_ASSIGN_OR_RETURN(group.owner_node_id,
                            ReadIdentity(reader, "group owner node id"));
     LAVIK_ASSIGN_OR_RETURN(group.owner_assignment_id, reader.Fixed<16>());
   }
   auto group_term = reader.U64();
-  LAVIK_RETURN_IF_ERROR(group_term.status());
+  LAVIK_RETURN_IF_ERROR(group_term);
   group.group_term = *group_term;
   auto grant_active = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(grant_active.status());
+  LAVIK_RETURN_IF_ERROR(grant_active);
   group.grant_active = *grant_active;
   if (!group.owner_node_id.has_value() && group.grant_active) {
     return ProtocolError("grantless group cannot carry an active grant");
   }
   auto has_activation_action = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_activation_action.status());
+  LAVIK_RETURN_IF_ERROR(has_activation_action);
   if (*has_activation_action) {
     auto action_id = reader.Fixed<16>();
-    LAVIK_RETURN_IF_ERROR(action_id.status());
+    LAVIK_RETURN_IF_ERROR(action_id);
     if (!group.grant_active || IsZeroId(*action_id)) {
       return ProtocolError(
           "grant activation action requires a nonzero active grant");
@@ -2581,32 +2581,32 @@ absl::StatusOr<WireDesiredGroup> ReadDesiredGroup(Reader& reader) {
   }
   auto range_count =
       ReadCount(reader, kMaxManifestEntries, "group slot ranges");
-  LAVIK_RETURN_IF_ERROR(range_count.status());
+  LAVIK_RETURN_IF_ERROR(range_count);
   group.slot_ranges.reserve(*range_count);
   for (std::uint32_t i = 0; i < *range_count; ++i) {
     auto first = reader.U16();
-    LAVIK_RETURN_IF_ERROR(first.status());
+    LAVIK_RETURN_IF_ERROR(first);
     auto last = reader.U16();
-    LAVIK_RETURN_IF_ERROR(last.status());
+    LAVIK_RETURN_IF_ERROR(last);
     if (*first > *last || *last >= 16384) {
       return ProtocolError("group slot range is invalid");
     }
     group.slot_ranges.push_back({.first = *first, .last = *last});
   }
   auto manifest_revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(manifest_revision.status());
+  LAVIK_RETURN_IF_ERROR(manifest_revision);
   group.manifest_revision = *manifest_revision;
   auto manifest_digest = reader.Fixed<32>();
-  LAVIK_RETURN_IF_ERROR(manifest_digest.status());
+  LAVIK_RETURN_IF_ERROR(manifest_digest);
   group.manifest_digest = *manifest_digest;
   auto partition_replication_epoch = reader.U64();
-  LAVIK_RETURN_IF_ERROR(partition_replication_epoch.status());
+  LAVIK_RETURN_IF_ERROR(partition_replication_epoch);
   group.partition_replication_epoch = *partition_replication_epoch;
   auto steady_replication_enabled = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(steady_replication_enabled.status());
+  LAVIK_RETURN_IF_ERROR(steady_replication_enabled);
   group.steady_replication_enabled = *steady_replication_enabled;
   auto has_failover_transition = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_failover_transition.status());
+  LAVIK_RETURN_IF_ERROR(has_failover_transition);
   if (*has_failover_transition) {
     LAVIK_ASSIGN_OR_RETURN(group.failover_transition,
                            ReadFailoverTransition(reader, group));
@@ -2645,22 +2645,22 @@ absl::Status WriteManifest(Writer& writer,
 absl::StatusOr<WireManifestDocument> ReadManifest(Reader& reader) {
   WireManifestDocument manifest;
   auto revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   manifest.revision = *revision;
   auto digest = reader.Fixed<32>();
-  LAVIK_RETURN_IF_ERROR(digest.status());
+  LAVIK_RETURN_IF_ERROR(digest);
   manifest.digest = *digest;
   auto entry_count = ReadCount(reader, kMaxManifestEntries, "manifest entries");
-  LAVIK_RETURN_IF_ERROR(entry_count.status());
+  LAVIK_RETURN_IF_ERROR(entry_count);
   manifest.entries.reserve(*entry_count);
   for (std::uint32_t i = 0; i < *entry_count; ++i) {
     auto partition_id = reader.U16();
-    LAVIK_RETURN_IF_ERROR(partition_id.status());
+    LAVIK_RETURN_IF_ERROR(partition_id);
     if (*partition_id >= 16384) {
       return ProtocolError("manifest partition id is out of range");
     }
     auto logical_epoch = reader.U64();
-    LAVIK_RETURN_IF_ERROR(logical_epoch.status());
+    LAVIK_RETURN_IF_ERROR(logical_epoch);
     manifest.entries.push_back(
         {.partition_id = *partition_id, .logical_epoch = *logical_epoch});
   }
@@ -2709,52 +2709,52 @@ absl::Status WriteProjectedDirective(Writer& writer,
 absl::StatusOr<WireProjectedDirective> ReadProjectedDirective(Reader& reader) {
   WireProjectedDirective directive;
   auto authority = ReadAuthorityAnchor(reader);
-  LAVIK_RETURN_IF_ERROR(authority.status());
+  LAVIK_RETURN_IF_ERROR(authority);
   directive.authority = std::move(*authority);
   auto identity = ReadDirectiveIdentity(reader);
-  LAVIK_RETURN_IF_ERROR(identity.status());
+  LAVIK_RETURN_IF_ERROR(identity);
   directive.identity = *identity;
   auto recipient_node_id = ReadIdentity(reader, "recipient node id");
-  LAVIK_RETURN_IF_ERROR(recipient_node_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_node_id);
   directive.recipient_node_id = std::move(*recipient_node_id);
   auto recipient_boot_id = ReadIdentity(reader, "recipient boot id");
-  LAVIK_RETURN_IF_ERROR(recipient_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(recipient_boot_id);
   directive.recipient_boot_id = std::move(*recipient_boot_id);
   auto target_node_id = ReadIdentity(reader, "target node id");
-  LAVIK_RETURN_IF_ERROR(target_node_id.status());
+  LAVIK_RETURN_IF_ERROR(target_node_id);
   directive.target_node_id = std::move(*target_node_id);
   auto target_boot_id = ReadIdentity(reader, "target boot id");
-  LAVIK_RETURN_IF_ERROR(target_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(target_boot_id);
   directive.target_boot_id = std::move(*target_boot_id);
   auto source_node_id = ReadIdentity(reader, "source node id");
-  LAVIK_RETURN_IF_ERROR(source_node_id.status());
+  LAVIK_RETURN_IF_ERROR(source_node_id);
   directive.source_node_id = std::move(*source_node_id);
   auto source_assignment_id = reader.Fixed<16>();
-  LAVIK_RETURN_IF_ERROR(source_assignment_id.status());
+  LAVIK_RETURN_IF_ERROR(source_assignment_id);
   directive.source_assignment_id = *source_assignment_id;
   auto source_boot_id = ReadIdentity(reader, "source boot id");
-  LAVIK_RETURN_IF_ERROR(source_boot_id.status());
+  LAVIK_RETURN_IF_ERROR(source_boot_id);
   directive.source_boot_id = std::move(*source_boot_id);
   LAVIK_ASSIGN_OR_RETURN(directive.source_replication_history_id,
                          ReadIdentity(reader, "source replication history id"));
   auto manifest_revision = reader.U64();
-  LAVIK_RETURN_IF_ERROR(manifest_revision.status());
+  LAVIK_RETURN_IF_ERROR(manifest_revision);
   directive.manifest_revision = *manifest_revision;
   auto manifest_digest = reader.Fixed<32>();
-  LAVIK_RETURN_IF_ERROR(manifest_digest.status());
+  LAVIK_RETURN_IF_ERROR(manifest_digest);
   directive.manifest_digest = *manifest_digest;
   auto partition_replication_epoch = reader.U64();
-  LAVIK_RETURN_IF_ERROR(partition_replication_epoch.status());
+  LAVIK_RETURN_IF_ERROR(partition_replication_epoch);
   directive.partition_replication_epoch = *partition_replication_epoch;
   auto kind = reader.U8();
-  LAVIK_RETURN_IF_ERROR(kind.status());
+  LAVIK_RETURN_IF_ERROR(kind);
   if (*kind < 1 || *kind > static_cast<std::uint8_t>(
                                WireDirectiveKind::kInitializeEmptyPopulation)) {
     return ProtocolError("unknown directive kind");
   }
   directive.kind = static_cast<WireDirectiveKind>(*kind);
   auto payload = reader.String(kMaxOpaqueFieldBytes);
-  LAVIK_RETURN_IF_ERROR(payload.status());
+  LAVIK_RETURN_IF_ERROR(payload);
   directive.payload = std::move(*payload);
 
   return directive;
@@ -2774,12 +2774,12 @@ template <class T, class Read>
 absl::StatusOr<std::vector<T>> ReadStateList(Reader& r, std::size_t cap,
                                              Read read) {
   auto count = ReadCount(r, cap, "state entries");
-  LAVIK_RETURN_IF_ERROR(count.status());
+  LAVIK_RETURN_IF_ERROR(count);
   std::vector<T> values;
   values.reserve(*count);
   for (std::uint32_t i = 0; i < *count; ++i) {
     auto value = read(r);
-    LAVIK_RETURN_IF_ERROR(value.status());
+    LAVIK_RETURN_IF_ERROR(value);
     values.push_back(std::move(*value));
   }
   return values;
@@ -2811,36 +2811,36 @@ absl::Status WriteRoute(Writer& w, const WireRoutingGroup& g) {
 absl::StatusOr<WireRoutingGroup> ReadRoute(Reader& r) {
   WireRoutingGroup g;
   auto id = r.String(kMaxIdentifierBytes);
-  LAVIK_RETURN_IF_ERROR(id.status());
+  LAVIK_RETURN_IF_ERROR(id);
   g.group_id = std::move(*id);
   auto term = r.U64();
-  LAVIK_RETURN_IF_ERROR(term.status());
+  LAVIK_RETURN_IF_ERROR(term);
   g.term = *term;
   auto owner = r.Bool();
-  LAVIK_RETURN_IF_ERROR(owner.status());
+  LAVIK_RETURN_IF_ERROR(owner);
   if (*owner) {
     LAVIK_ASSIGN_OR_RETURN(g.owner, ReadIdentity(r, "owner"));
     LAVIK_ASSIGN_OR_RETURN(g.owner_assignment, r.Fixed<16>());
   }
   auto available = r.Bool();
-  LAVIK_RETURN_IF_ERROR(available.status());
+  LAVIK_RETURN_IF_ERROR(available);
   g.available = *available;
   auto members = ReadStateList<std::string>(
       r, kMaxProjectedNodes,
       [](Reader& in) { return ReadIdentity(in, "member"); });
-  LAVIK_RETURN_IF_ERROR(members.status());
+  LAVIK_RETURN_IF_ERROR(members);
   g.members = std::move(*members);
   auto slots = ReadStateList<WireSlotRange>(
       r, kMaxManifestEntries, [](Reader& in) -> absl::StatusOr<WireSlotRange> {
         auto first = in.U16();
-        LAVIK_RETURN_IF_ERROR(first.status());
+        LAVIK_RETURN_IF_ERROR(first);
         auto last = in.U16();
-        LAVIK_RETURN_IF_ERROR(last.status());
+        LAVIK_RETURN_IF_ERROR(last);
         if (*first > *last || *last >= 16384)
           return ProtocolError("invalid route slots");
         return WireSlotRange{*first, *last};
       });
-  LAVIK_RETURN_IF_ERROR(slots.status());
+  LAVIK_RETURN_IF_ERROR(slots);
   g.slots = std::move(*slots);
   if (g.available && (!g.owner || g.term == 0 || IsZeroId(g.owner_assignment)))
     return ProtocolError("invalid available route");
@@ -2858,15 +2858,15 @@ absl::Status WriteState(Writer& w, const RoutingState& v) {
 absl::StatusOr<RoutingState> ReadRoutingState(Reader& r) {
   RoutingState v;
   auto revision = r.U64();
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   v.revision = std::move(*revision);
   auto nodes =
       ReadStateList<WireDataEndpoint>(r, kMaxProjectedNodes, ReadDataEndpoint);
-  LAVIK_RETURN_IF_ERROR(nodes.status());
+  LAVIK_RETURN_IF_ERROR(nodes);
   v.nodes = std::move(*nodes);
   auto groups =
       ReadStateList<WireRoutingGroup>(r, kMaxProjectedGroups, ReadRoute);
-  LAVIK_RETURN_IF_ERROR(groups.status());
+  LAVIK_RETURN_IF_ERROR(groups);
   v.groups = std::move(*groups);
   return v;
 }
@@ -2881,16 +2881,16 @@ absl::Status WriteState(Writer& w, const LocalGroupState& v) {
 absl::StatusOr<LocalGroupState> ReadLocalGroupState(Reader& r) {
   LocalGroupState v;
   auto revision = r.U64();
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   v.revision = std::move(*revision);
   auto lease_duration_ms = r.U32();
-  LAVIK_RETURN_IF_ERROR(lease_duration_ms.status());
+  LAVIK_RETURN_IF_ERROR(lease_duration_ms);
   v.lease_duration_ms = std::move(*lease_duration_ms);
   auto groups = ReadStateList<WireDesiredGroup>(r, 1, ReadDesiredGroup);
-  LAVIK_RETURN_IF_ERROR(groups.status());
+  LAVIK_RETURN_IF_ERROR(groups);
   v.groups = std::move(*groups);
   auto manifests = ReadStateList<WireManifestDocument>(r, 1, ReadManifest);
-  LAVIK_RETURN_IF_ERROR(manifests.status());
+  LAVIK_RETURN_IF_ERROR(manifests);
   v.manifests = std::move(*manifests);
   return v;
 }
@@ -2904,11 +2904,11 @@ absl::Status WriteState(Writer& w, const MetaDirectoryState& v) {
 absl::StatusOr<MetaDirectoryState> ReadMetaDirectoryState(Reader& r) {
   MetaDirectoryState v;
   auto revision = r.U64();
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   v.revision = std::move(*revision);
   auto endpoints =
       ReadStateList<WireMetaEndpoint>(r, kMaxDirectoryEntries, ReadEndpoint);
-  LAVIK_RETURN_IF_ERROR(endpoints.status());
+  LAVIK_RETURN_IF_ERROR(endpoints);
   v.endpoints = std::move(*endpoints);
   return v;
 }
@@ -2929,18 +2929,18 @@ absl::Status WriteState(Writer& w, const TaskChanges& v) {
 absl::StatusOr<TaskChanges> ReadTaskChanges(Reader& r) {
   TaskChanges v;
   auto base_revision = r.U64();
-  LAVIK_RETURN_IF_ERROR(base_revision.status());
+  LAVIK_RETURN_IF_ERROR(base_revision);
   v.base_revision = std::move(*base_revision);
   auto revision = r.U64();
-  LAVIK_RETURN_IF_ERROR(revision.status());
+  LAVIK_RETURN_IF_ERROR(revision);
   v.revision = std::move(*revision);
   auto upserts = ReadStateList<WireProjectedDirective>(
       r, kMaxProjectedDirectives, ReadProjectedDirective);
-  LAVIK_RETURN_IF_ERROR(upserts.status());
+  LAVIK_RETURN_IF_ERROR(upserts);
   v.upserts = std::move(*upserts);
   auto removed = ReadStateList<WireDirectiveIdentity>(
       r, kMaxProjectedDirectives, ReadDirectiveIdentity);
-  LAVIK_RETURN_IF_ERROR(removed.status());
+  LAVIK_RETURN_IF_ERROR(removed);
   v.removed = std::move(*removed);
   return v;
 }
@@ -3029,65 +3029,65 @@ absl::StatusOr<FullDesiredState> DecodeFullDesiredState(
   Reader reader(encoded);
   FullDesiredState state;
   auto version = reader.U16();
-  LAVIK_RETURN_IF_ERROR(version.status());
+  LAVIK_RETURN_IF_ERROR(version);
   if (*version != kProtocolVersion) {
     return ProtocolError("unsupported FullDesiredState version");
   }
   auto service = ReadService(reader);
-  LAVIK_RETURN_IF_ERROR(service.status());
+  LAVIK_RETURN_IF_ERROR(service);
   state.service = *service;
   LAVIK_ASSIGN_OR_RETURN(state.control_revision, reader.U64());
   auto topology_epoch = reader.U64();
-  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
+  LAVIK_RETURN_IF_ERROR(topology_epoch);
   state.topology_epoch = *topology_epoch;
   auto authority_lease_duration_ms = reader.U32();
-  LAVIK_RETURN_IF_ERROR(authority_lease_duration_ms.status());
+  LAVIK_RETURN_IF_ERROR(authority_lease_duration_ms);
   state.authority_lease_duration_ms = *authority_lease_duration_ms;
 
   auto directory_count =
       ReadCount(reader, kMaxDirectoryEntries, "Meta directory");
-  LAVIK_RETURN_IF_ERROR(directory_count.status());
+  LAVIK_RETURN_IF_ERROR(directory_count);
   state.meta_directory.reserve(*directory_count);
   for (std::uint32_t i = 0; i < *directory_count; ++i) {
     auto endpoint = ReadEndpoint(reader);
-    LAVIK_RETURN_IF_ERROR(endpoint.status());
+    LAVIK_RETURN_IF_ERROR(endpoint);
     state.meta_directory.push_back(std::move(*endpoint));
   }
 
   auto node_count = ReadCount(reader, kMaxProjectedNodes, "projected nodes");
-  LAVIK_RETURN_IF_ERROR(node_count.status());
+  LAVIK_RETURN_IF_ERROR(node_count);
   state.nodes.reserve(*node_count);
   for (std::uint32_t i = 0; i < *node_count; ++i) {
     auto endpoint = ReadDataEndpoint(reader);
-    LAVIK_RETURN_IF_ERROR(endpoint.status());
+    LAVIK_RETURN_IF_ERROR(endpoint);
     state.nodes.push_back(std::move(*endpoint));
   }
 
   auto group_count = ReadCount(reader, kMaxProjectedGroups, "projected groups");
-  LAVIK_RETURN_IF_ERROR(group_count.status());
+  LAVIK_RETURN_IF_ERROR(group_count);
   state.groups.reserve(*group_count);
   for (std::uint32_t i = 0; i < *group_count; ++i) {
     auto group = ReadDesiredGroup(reader);
-    LAVIK_RETURN_IF_ERROR(group.status());
+    LAVIK_RETURN_IF_ERROR(group);
     state.groups.push_back(std::move(*group));
   }
 
   auto manifest_count = ReadCount(reader, kMaxProjectedGroups, "manifests");
-  LAVIK_RETURN_IF_ERROR(manifest_count.status());
+  LAVIK_RETURN_IF_ERROR(manifest_count);
   state.manifests.reserve(*manifest_count);
   for (std::uint32_t i = 0; i < *manifest_count; ++i) {
     auto manifest = ReadManifest(reader);
-    LAVIK_RETURN_IF_ERROR(manifest.status());
+    LAVIK_RETURN_IF_ERROR(manifest);
     state.manifests.push_back(std::move(*manifest));
   }
 
   auto directive_count =
       ReadCount(reader, kMaxProjectedDirectives, "current directives");
-  LAVIK_RETURN_IF_ERROR(directive_count.status());
+  LAVIK_RETURN_IF_ERROR(directive_count);
   state.current_directives.reserve(*directive_count);
   for (std::uint32_t i = 0; i < *directive_count; ++i) {
     auto directive = ReadProjectedDirective(reader);
-    LAVIK_RETURN_IF_ERROR(directive.status());
+    LAVIK_RETURN_IF_ERROR(directive);
     state.current_directives.push_back(std::move(*directive));
   }
   LAVIK_RETURN_IF_ERROR(Finish(reader));
@@ -3153,26 +3153,26 @@ absl::StatusOr<NodeControlUpdate> DecodeNodeControlUpdate(
   Reader reader(bytes);
   NodeControlUpdate update;
   auto service = ReadService(reader);
-  LAVIK_RETURN_IF_ERROR(service.status());
+  LAVIK_RETURN_IF_ERROR(service);
   update.service = *service;
   LAVIK_ASSIGN_OR_RETURN(update.request_id, reader.Fixed<16>());
   auto has_tasks = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_tasks.status());
+  LAVIK_RETURN_IF_ERROR(has_tasks);
   if (*has_tasks) {
     LAVIK_ASSIGN_OR_RETURN(update.tasks, ReadTaskChanges(reader));
   }
   auto has_routing = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_routing.status());
+  LAVIK_RETURN_IF_ERROR(has_routing);
   if (*has_routing) {
     LAVIK_ASSIGN_OR_RETURN(update.routing, ReadRoutingState(reader));
   }
   auto has_local = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_local.status());
+  LAVIK_RETURN_IF_ERROR(has_local);
   if (*has_local) {
     LAVIK_ASSIGN_OR_RETURN(update.local, ReadLocalGroupState(reader));
   }
   auto has_directory = reader.Bool();
-  LAVIK_RETURN_IF_ERROR(has_directory.status());
+  LAVIK_RETURN_IF_ERROR(has_directory);
   if (*has_directory) {
     LAVIK_ASSIGN_OR_RETURN(update.directory, ReadMetaDirectoryState(reader));
   }

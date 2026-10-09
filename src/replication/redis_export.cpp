@@ -184,7 +184,7 @@ class RedisRdbStreamQueue
     auto encoder = rdb::CollectionFileEncoder::Create(
         value.db_id_, value.key_, value.value_.value_type_,
         value.value_.logical_size_, value.value_.expire_at_ms_);
-    LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoder);
     auto drain = [&]() -> Task<absl::Status> {
       while (auto span = encoder->Next()) {
         LAVIK_CO_RETURN_IF_ERROR(co_await PushEntrySpan(owner, *span));
@@ -199,7 +199,7 @@ class RedisRdbStreamQueue
         co_return absl::CancelledError("Redis RDB export cancelled");
       auto page = co_await storage_->ReadRdbCollectionPage(
           session_id_, value.collection_token_, cursor);
-      LAVIK_CO_RETURN_IF_ERROR(page.status());
+      LAVIK_CO_RETURN_IF_ERROR(page);
       status = encoder->StartPage(*page);
       LAVIK_CO_RETURN_IF_ERROR(status);
       // The admitted page owns all borrowed strings until network queue
@@ -443,7 +443,7 @@ Task<absl::StatusOr<std::optional<RedisExportEvent>>> ReadLocalRedisExportEvent(
     ++next_fragment;
     if (!last) continue;
     auto command = DecodeReplicationCommand(encoded);
-    LAVIK_CO_RETURN_IF_ERROR(command.status());
+    LAVIK_CO_RETURN_IF_ERROR(command);
     co_return std::optional<RedisExportEvent>(RedisExportEvent{
         .worker_ = worker,
         .kind_ = kind,
@@ -461,7 +461,7 @@ absl::StatusOr<RedisExportTransaction> ParseRedisExportTransaction(
         "malformed Redis export transaction envelope");
   }
   auto metadata = DecodeReplicationTransactionEnvelope(args[0]);
-  LAVIK_RETURN_IF_ERROR(metadata.status());
+  LAVIK_RETURN_IF_ERROR(metadata);
   RedisExportTransaction transaction;
   transaction.id_ = metadata->id_;
   transaction.command_.db_id_ = event.command_.db_id_;
@@ -526,7 +526,7 @@ absl::StatusOr<std::string> EncodeRedisExportCommand(
   std::vector<Child> expanded;
   for (const auto& child : children) {
     auto commands = RedisExportStreamGroup(child.args_);
-    LAVIK_RETURN_IF_ERROR(commands.status());
+    LAVIK_RETURN_IF_ERROR(commands);
     if (commands->size() > 1) transactional = true;
     for (auto& args : *commands)
       expanded.push_back({.db_ = child.db_, .args_ = std::move(args)});
@@ -589,7 +589,7 @@ Task<absl::Status> FillRedisExportHeads(storage::StorageEngine* storage,
         worker, [storage, worker, cursor = state->cursors_[worker]] {
           return ReadLocalRedisExportEvent(storage, worker, cursor);
         });
-    LAVIK_CO_RETURN_IF_ERROR(event.status());
+    LAVIK_CO_RETURN_IF_ERROR(event);
     if (event->has_value()) state->heads_[worker] = std::move(**event);
   }
   // Ready cross-worker barriers take priority over unrelated local mutations;
@@ -636,7 +636,7 @@ Task<absl::Status> SendRedisExportMutation(RedisExportSink& sink,
     }
     auto encoded = EncodeRedisExportCommand(state->heads_[worker]->command_,
                                             false, &state->selected_db_);
-    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoded);
     LAVIK_CO_RETURN_IF_ERROR(co_await sink.Write(*encoded));
     state->last_write_ = std::chrono::steady_clock::now();
     state->cursors_[worker] = state->heads_[worker]->next_;
@@ -666,7 +666,7 @@ Task<absl::Status> SendRedisExportTransaction(RedisExportSink& sink,
       continue;
     }
     auto transaction = ParseRedisExportTransaction(*state->heads_[worker]);
-    LAVIK_CO_RETURN_IF_ERROR(transaction.status());
+    LAVIK_CO_RETURN_IF_ERROR(transaction);
     bool ready = true;
     std::vector<std::uint8_t> included(workers, 0);
     std::optional<ReplicatedCommand> payload;
@@ -683,7 +683,7 @@ Task<absl::Status> SendRedisExportTransaction(RedisExportSink& sink,
         continue;
       }
       auto peer = ParseRedisExportTransaction(*state->heads_[participant]);
-      LAVIK_CO_RETURN_IF_ERROR(peer.status());
+      LAVIK_CO_RETURN_IF_ERROR(peer);
       if (peer->id_ != transaction->id_) {
         ready = false;
         continue;
@@ -713,7 +713,7 @@ Task<absl::Status> SendRedisExportTransaction(RedisExportSink& sink,
     }
     auto encoded =
         EncodeRedisExportCommand(*payload, true, &state->selected_db_);
-    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoded);
     LAVIK_CO_RETURN_IF_ERROR(co_await sink.Write(*encoded));
     state->last_write_ = std::chrono::steady_clock::now();
     for (unsigned participant : transaction->participants_) {
@@ -765,7 +765,7 @@ Task<absl::Status> SendRedisExportControl(RedisExportSink& sink,
                               .args_ = {args[0]}};
     auto encoded =
         EncodeRedisExportCommand(control, false, &state->selected_db_);
-    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoded);
     LAVIK_CO_RETURN_IF_ERROR(co_await sink.Write(*encoded));
     state->last_write_ = std::chrono::steady_clock::now();
     for (unsigned peer = 0; peer < workers; ++peer) {

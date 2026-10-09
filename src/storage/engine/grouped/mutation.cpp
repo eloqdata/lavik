@@ -60,7 +60,7 @@ StorageEngine::Impl::PrepareGroupedHashMutation(
     plan.root_.seed_ = CurrentDigestSeed();
     auto groups =
         GroupHashValue(std::move(after_image), sequence, plan.root_.seed_);
-    LAVIK_RETURN_IF_ERROR(groups.status());
+    LAVIK_RETURN_IF_ERROR(groups);
     if (groups->size() > std::numeric_limits<std::uint32_t>::max()) {
       return absl::OutOfRangeError(
           "grouped Hash directory exceeds storage limit");
@@ -106,7 +106,7 @@ StorageEngine::Impl::PrepareGroupedHashMutation(
   }
   for (auto& [id, snapshot] : changed) {
     auto replacements = SplitHashGroup(std::move(snapshot), plan.root_.seed_);
-    LAVIK_RETURN_IF_ERROR(replacements.status());
+    LAVIK_RETURN_IF_ERROR(replacements);
     if (replacements->size() > 1) {
       if (replacements->size() - 1 >
           std::numeric_limits<std::uint32_t>::max() - plan.root_.group_count_) {
@@ -221,7 +221,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       // A distinct decision forces its own durable fence without marking the
       // still-uncommitted outer transaction durable prematurely.
       const auto child_decision = PrepareGroupedDecision(batch);
-      LAVIK_CO_RETURN_IF_ERROR(child_decision.status());
+      LAVIK_CO_RETURN_IF_ERROR(child_decision);
     }
   }
   const auto revision = outer_transaction ? batch.txid_ : tx->txid_;
@@ -241,7 +241,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           ? absl::StatusOr<HashGroupMutationPlan>(std::move(*prepared))
           : PrepareGroupedHashMutation(previous, std::move(after_image),
                                        changed_groups, field_count, revision);
-  LAVIK_CO_RETURN_IF_ERROR(plan.status());
+  LAVIK_CO_RETURN_IF_ERROR(plan);
   if (prepared != nullptr) {
     if (plan->root_.field_count_ != field_count ||
         (previous
@@ -258,7 +258,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   }
   plan->root_.revision_ = revision;
   auto root_payload = EncodeGroupedHashRoot(plan->root_);
-  LAVIK_CO_RETURN_IF_ERROR(root_payload.status());
+  LAVIK_CO_RETURN_IF_ERROR(root_payload);
   // Validate every indivisible field/envelope before the first disk write.
   // Retain the checked encoders so writing does not rebuild each page's
   // duplicate-field set. Their pointers borrow plan->writes_, which stays
@@ -268,7 +268,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     LAVIK_CO_RETURN_IF_ERROR(encoder_budget.AddBytes(sizeof(HashGroupEncoder)));
   }
   auto encoder_admission = encoder_budget.Reserve(1);
-  LAVIK_CO_RETURN_IF_ERROR(encoder_admission.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoder_admission);
   // Point writes normally produce one page. Keep its preflight and publication
   // metadata inside this coroutine frame; multi-page commands retain the same
   // admitted spill capacity and lifetime through all asynchronous writes.
@@ -284,7 +284,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     encoded_sizes.reserve(plan->writes_.size());
     for (const auto& snapshot : plan->writes_) {
       auto encoder = HashGroupEncoder::Create(snapshot);
-      LAVIK_CO_RETURN_IF_ERROR(encoder.status());
+      LAVIK_CO_RETURN_IF_ERROR(encoder);
       if (encoder->encoded_bytes() > kMaxRecordPayloadBytes) {
         co_return absl::OutOfRangeError(
             "group snapshot and parent key exceed payload limit");
@@ -331,7 +331,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(
             2 * kCollectionGroupTargetBytes + field_count * sizeof(HashEntry)));
         auto scratch = budget.Reserve(2);
-        LAVIK_CO_RETURN_IF_ERROR(scratch.status());
+        LAVIK_CO_RETURN_IF_ERROR(scratch);
         HashValue compact;
         compact.entries_.reserve(field_count);
         for (const auto& [prefix, metadata] : previous->directory().groups()) {
@@ -343,7 +343,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id,
                                                        key, digest, previous,
                                                        metadata.id_, false);
-          LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+          LAVIK_CO_RETURN_IF_ERROR(loaded);
           for (auto& entry : loaded->snapshot_.value_.entries_)
             compact.entries_.push_back(std::move(entry));
         }
@@ -352,7 +352,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           if (page.prepared_) {
             if (page.field_count() == 0) continue;
             auto decoded = DecodeHashValue(page.prepared_->bytes());
-            LAVIK_CO_RETURN_IF_ERROR(decoded.status());
+            LAVIK_CO_RETURN_IF_ERROR(decoded);
             for (auto& entry : decoded->entries_)
               compact.entries_.push_back(std::move(entry));
           } else {
@@ -364,7 +364,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         if (compact.entries_.size() != field_count)
           co_return absl::DataLossError("Hash demotion cardinality mismatch");
         auto encoded = EncodeHashValue(compact);
-        LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+        LAVIK_CO_RETURN_IF_ERROR(encoded);
         if (encoded->size() >= kCollectionGroupTargetBytes)
           co_return absl::InternalError("Hash demotion byte bound failed");
         compact_payload = std::move(*encoded);
@@ -393,16 +393,16 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     co_return demoted;
   }
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
-  LAVIK_CO_RETURN_IF_ERROR(decision.status());
+  LAVIK_CO_RETURN_IF_ERROR(decision);
   if (outer_transaction) {
     // Auxiliary records retain the outer transaction tag AND this command's
     // independent batch tag. An errored EXEC command never commits its batch,
     // even if the surrounding EXEC later commits all its successful commands.
     auto batch_decision = PrepareGroupedDecision(batch);
-    LAVIK_CO_RETURN_IF_ERROR(batch_decision.status());
+    LAVIK_CO_RETURN_IF_ERROR(batch_decision);
   }
   auto reserved = side.PreparePublish(key, source_side);
-  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
+  LAVIK_CO_RETURN_IF_ERROR(reserved);
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   absl::InlinedVector<GroupedRecordLocation, 1> written;
@@ -502,7 +502,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                       plan->root_, sequence, candidates,
                       absl::flat_hash_set<std::uint64_t>{tx->txid_,
                                                          command_batch});
-        LAVIK_RETURN_IF_ERROR(directory.status());
+        LAVIK_RETURN_IF_ERROR(directory);
         LAVIK_ASSIGN_OR_RETURN(
             builder, previous
                          ? GroupedObject::PrepareUpdate(
@@ -515,7 +515,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           // individual groups. Existing side entries need no new capacity.
           publication.reset();
           auto refreshed = side.PreparePublish(key, current);
-          LAVIK_RETURN_IF_ERROR(refreshed.status());
+          LAVIK_RETURN_IF_ERROR(refreshed);
           publication.emplace(std::move(*refreshed));
         }
         return absl::OkStatus();

@@ -831,7 +831,7 @@ class LuaWorkerRuntime {
           "another function library is already staged");
     }
     auto metadata = ParseLibraryMetadata(code);
-    LAVIK_RETURN_IF_ERROR(metadata.status());
+    LAVIK_RETURN_IF_ERROR(metadata);
     const std::string& library_name = metadata->first;
     const auto existing_library = libraries_.find(library_name);
     if (existing_library != libraries_.end()) {
@@ -994,7 +994,7 @@ absl::Status ReadBulkPayload(std::string_view encoded, std::size_t* position,
   absl::Status status = ReadLine(encoded, position, &line);
   LAVIK_RETURN_IF_ERROR(status);
   auto length = ParseLength(line);
-  LAVIK_RETURN_IF_ERROR(length.status());
+  LAVIK_RETURN_IF_ERROR(length);
   if (*length < 0 ||
       static_cast<std::uint64_t>(*length) > encoded.size() - *position) {
     return absl::InvalidArgumentError("invalid RESP bulk length");
@@ -1025,7 +1025,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto value = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(value.status());
+      LAVIK_RETURN_IF_ERROR(value);
       lua_pushnumber(state, static_cast<lua_Number>(*value));
       return absl::OkStatus();
     }
@@ -1033,7 +1033,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(length.status());
+      LAVIK_RETURN_IF_ERROR(length);
       if (*length == -1) {
         lua_pushboolean(state, 0);
         return absl::OkStatus();
@@ -1112,7 +1112,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(length.status());
+      LAVIK_RETURN_IF_ERROR(length);
       if (*length == -1) {
         lua_pushboolean(state, 0);
         return absl::OkStatus();
@@ -1132,7 +1132,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(length.status());
+      LAVIK_RETURN_IF_ERROR(length);
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP map length");
       }
@@ -1152,7 +1152,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(length.status());
+      LAVIK_RETURN_IF_ERROR(length);
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP set length");
       }
@@ -1171,7 +1171,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(length.status());
+      LAVIK_RETURN_IF_ERROR(length);
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP push length");
       }
@@ -1187,7 +1187,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       absl::Status status = ReadLine(encoded, position, &line);
       LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      LAVIK_RETURN_IF_ERROR(length.status());
+      LAVIK_RETURN_IF_ERROR(length);
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP attribute length");
       }
@@ -1533,7 +1533,7 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::Create(
     std::string_view script, std::span<const std::string> keys,
     std::span<const std::string> argv, RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
-  LAVIK_RETURN_IF_ERROR(runtime.status());
+  LAVIK_RETURN_IF_ERROR(runtime);
   auto impl = std::make_unique<Impl>();
   impl->client_resp_version_ = client_resp_version;
   impl->runtime_ = *runtime;
@@ -1556,7 +1556,7 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
     std::string_view sha, std::span<const std::string> keys,
     std::span<const std::string> argv, RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
-  LAVIK_RETURN_IF_ERROR(runtime.status());
+  LAVIK_RETURN_IF_ERROR(runtime);
   auto impl = std::make_unique<Impl>();
   impl->client_resp_version_ = client_resp_version;
   impl->runtime_ = *runtime;
@@ -1575,7 +1575,7 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFunction(
     std::string_view name, std::span<const std::string> keys,
     std::span<const std::string> argv, RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
-  LAVIK_RETURN_IF_ERROR(runtime.status());
+  LAVIK_RETURN_IF_ERROR(runtime);
   auto impl = std::make_unique<Impl>();
   impl->client_resp_version_ = client_resp_version;
   impl->runtime_ = *runtime;
@@ -1734,16 +1734,16 @@ StageCompleteLuaFunctionCatalogLocally(
         "another complete Function catalog is already staged");
   }
   auto current = WorkerLuaRuntime();
-  LAVIK_RETURN_IF_ERROR(current.status());
+  LAVIK_RETURN_IF_ERROR(current);
   auto staged = LuaWorkerRuntime::Create();
-  LAVIK_RETURN_IF_ERROR(staged.status());
+  LAVIK_RETURN_IF_ERROR(staged);
   LAVIK_RETURN_IF_ERROR((*current)->CopyScriptsTo(staged->get()));
 
   std::vector<LuaFunctionLibrary> libraries;
   libraries.reserve(library_codes.size());
   for (const std::string& code : library_codes) {
     auto library = (*staged)->StageFunctionLibrary(code);
-    LAVIK_RETURN_IF_ERROR(library.status());
+    LAVIK_RETURN_IF_ERROR(library);
     (*staged)->CommitStagedFunctionLibrary();
     libraries.push_back(std::move(*library));
   }

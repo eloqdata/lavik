@@ -239,7 +239,7 @@ class CowMap {
         return absl::OkStatus();
       }
       auto overlay = MakeOverlay(overlay_.get());
-      LAVIK_RETURN_IF_ERROR(overlay.status());
+      LAVIK_RETURN_IF_ERROR(overlay);
       auto& updated = **overlay;
       std::size_t slot;
       if (current) {
@@ -258,10 +258,10 @@ class CowMap {
   // retain their original nodes; allocation failure leaves this map intact.
   absl::Status Erase(Key key) {
     auto next = EraseNode(root_, key);
-    LAVIK_RETURN_IF_ERROR(next.status());
+    LAVIK_RETURN_IF_ERROR(next);
     if (overlay_ && overlay_->Find(key)) {
       auto overlay = MakeOverlay(overlay_.get());
-      LAVIK_RETURN_IF_ERROR(overlay.status());
+      LAVIK_RETURN_IF_ERROR(overlay);
       auto& updated = **overlay;
       std::size_t slot = 0;
       while (updated.entries_[slot]->first != key) ++slot;
@@ -290,9 +290,9 @@ class CowMap {
     const bool replaces =
         pivot != writes.end() && (*pivot)->first == node->entry_.first;
     auto left = ReplaceNodes(node->left_, writes.first(before));
-    LAVIK_RETURN_IF_ERROR(left.status());
+    LAVIK_RETURN_IF_ERROR(left);
     auto right = ReplaceNodes(node->right_, writes.subspan(before + replaces));
-    LAVIK_RETURN_IF_ERROR(right.status());
+    LAVIK_RETURN_IF_ERROR(right);
     return Make(node->entry_.first,
                 replaces ? (*pivot)->second : node->entry_.second,
                 std::move(*left), std::move(*right));
@@ -350,31 +350,31 @@ class CowMap {
     if (Height(left) > Height(right) + 1) {
       if (Height(left->left_) >= Height(left->right_)) {
         auto next = Make(key, value, left->right_, right);
-        LAVIK_RETURN_IF_ERROR(next.status());
+        LAVIK_RETURN_IF_ERROR(next);
         return Make(left->entry_.first, left->entry_.second, left->left_,
                     *next);
       }
       const auto pivot = left->right_;
       auto a = Make(left->entry_.first, left->entry_.second, left->left_,
                     pivot->left_);
-      LAVIK_RETURN_IF_ERROR(a.status());
+      LAVIK_RETURN_IF_ERROR(a);
       auto b = Make(key, value, pivot->right_, right);
-      LAVIK_RETURN_IF_ERROR(b.status());
+      LAVIK_RETURN_IF_ERROR(b);
       return Make(pivot->entry_.first, pivot->entry_.second, *a, *b);
     }
     if (Height(right) > Height(left) + 1) {
       if (Height(right->right_) >= Height(right->left_)) {
         auto next = Make(key, value, left, right->left_);
-        LAVIK_RETURN_IF_ERROR(next.status());
+        LAVIK_RETURN_IF_ERROR(next);
         return Make(right->entry_.first, right->entry_.second, *next,
                     right->right_);
       }
       const auto pivot = right->left_;
       auto a = Make(key, value, left, pivot->left_);
-      LAVIK_RETURN_IF_ERROR(a.status());
+      LAVIK_RETURN_IF_ERROR(a);
       auto b = Make(right->entry_.first, right->entry_.second, pivot->right_,
                     right->right_);
-      LAVIK_RETURN_IF_ERROR(b.status());
+      LAVIK_RETURN_IF_ERROR(b);
       return Make(pivot->entry_.first, pivot->entry_.second, *a, *b);
     }
     return Make(key, value, std::move(left), std::move(right));
@@ -386,7 +386,7 @@ class CowMap {
     }
     const bool left = key < node->entry_.first;
     auto child = SetNode(left ? node->left_ : node->right_, key, value);
-    LAVIK_RETURN_IF_ERROR(child.status());
+    LAVIK_RETURN_IF_ERROR(child);
     return Balance(node->entry_.first, node->entry_.second,
                    left ? *child : node->left_, left ? node->right_ : *child);
   }
@@ -398,13 +398,13 @@ class CowMap {
       auto* successor = node->right_.get();
       while (successor->left_) successor = successor->left_.get();
       auto right = EraseNode(node->right_, successor->entry_.first);
-      LAVIK_RETURN_IF_ERROR(right.status());
+      LAVIK_RETURN_IF_ERROR(right);
       return Balance(successor->entry_.first, successor->entry_.second,
                      node->left_, *right);
     }
     const bool left = key < node->entry_.first;
     auto child = EraseNode(left ? node->left_ : node->right_, key);
-    LAVIK_RETURN_IF_ERROR(child.status());
+    LAVIK_RETURN_IF_ERROR(child);
     return Balance(node->entry_.first, node->entry_.second,
                    left ? *child : node->left_, left ? node->right_ : *child);
   }

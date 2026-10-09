@@ -533,7 +533,7 @@ detail::RefreshAcceptedDataPublication(
     const control::ServiceDeclaration& expected_service,
     const MetaPrincipalIdentity* tls_identity) {
   auto captured = cache.Get(minimum_state_change_index);
-  LAVIK_RETURN_IF_ERROR(captured.status());
+  LAVIK_RETURN_IF_ERROR(captured);
   const auto& view = **captured;
   const auto& lifecycle = view.lifecycle();
   const control::ServiceDeclaration service{lifecycle.client_mode_,
@@ -630,7 +630,7 @@ detail::FailoverProjectionForHeartbeat(
     if (action.candidate.node_id != node_id) continue;
     auto candidate_boot = ParseIdentity<20>(
         action.candidate.boot_id, "installed failover candidate boot id");
-    LAVIK_RETURN_IF_ERROR(candidate_boot.status());
+    LAVIK_RETURN_IF_ERROR(candidate_boot);
     if (*candidate_boot != boot) continue;
     if (result.has_value()) {
       return absl::FailedPreconditionError(
@@ -1035,7 +1035,7 @@ BuildCommittedMetaDirectory(const MetaDataPublicationView& view) {
   for (const MetaMemberRecord& member : view.meta_members()) {
     if (member.retired_) continue;
     auto endpoint = ParseMetaEndpoint(member);
-    LAVIK_RETURN_IF_ERROR(endpoint.status());
+    LAVIK_RETURN_IF_ERROR(endpoint);
     directory.push_back(std::move(*endpoint));
   }
   std::sort(directory.begin(), directory.end(),
@@ -1076,7 +1076,7 @@ BuildCommittedMetaDirectory(const MetaDataPublicationView& view) {
   };
   control::WireMessage probe_message(std::move(probe));
   auto encoded = control::EncodeMessage(probe_message);
-  LAVIK_RETURN_IF_ERROR(encoded.status());
+  LAVIK_RETURN_IF_ERROR(encoded);
   if (encoded->payload.size() > control::kMaxFramePayloadBytes) {
     return absl::ResourceExhaustedError(
         "committed Meta directory cannot fit in ServerHello");
@@ -1616,7 +1616,7 @@ absl::StatusOr<BudgetedNodeControlBatch> ProjectNodeBounded(
         "Meta retained-projection byte budget cannot admit another build");
   }
   auto projected = MetaControlProjector::ProjectNode(view, node_id);
-  LAVIK_RETURN_IF_ERROR(projected.status());
+  LAVIK_RETURN_IF_ERROR(projected);
   LAVIK_RETURN_IF_ERROR(detail::ApplyLeadershipValidityLimit(
       *projected, core.options_.leadership_validity_ms_));
   LAVIK_RETURN_IF_ERROR(
@@ -1666,7 +1666,7 @@ absl::StatusOr<MetaMemberIdentity> LocalConfiguredIdentity(
       continue;
     }
     auto identity = MetaMemberIdentity::DecodeAux(member->get_aux());
-    LAVIK_RETURN_IF_ERROR(identity.status());
+    LAVIK_RETURN_IF_ERROR(identity);
     if (identity->server_id_ != member->get_id()) {
       return absl::FailedPreconditionError(
           "local Raft member aux identity has a mismatched server id");
@@ -1846,7 +1846,7 @@ bycorf::Task<absl::Status> AwaitApplied(
     std::size_t max_deferred_messages = 0) {
   while (true) {
     auto incoming = co_await io.Read();
-    LAVIK_CO_RETURN_IF_ERROR(incoming.status());
+    LAVIK_CO_RETURN_IF_ERROR(incoming);
     if (const auto* applied =
             std::get_if<control::FullStateApplied>(&*incoming)) {
       if (!SameApplied(*applied, batch)) {
@@ -1880,9 +1880,9 @@ bycorf::Task<absl::Status> SendFullState(
     const auto high_water = core->coordinator_->CommittedHighWater();
     if (high_water <= validated_index) return absl::OkStatus();
     auto view = PublicationViewAtLeast(*core, high_water);
-    LAVIK_RETURN_IF_ERROR(view.status());
+    LAVIK_RETURN_IF_ERROR(view);
     auto latest = ProjectNodeBounded(*core, **view, node_id);
-    LAVIK_RETURN_IF_ERROR(latest.status());
+    LAVIK_RETURN_IF_ERROR(latest);
     if (EvaluateNodeReplacement(batch->full_state, latest->full_state,
                                 node_id) !=
         MetaReplacementDisposition::kContinue)
@@ -1902,7 +1902,7 @@ bycorf::Task<absl::Status> SendFullState(
         control::EncodedMessage{control::MessageType::kFullDesiredState,
                                 std::string(bytes)});
   auto object_id = control::GenerateId128();
-  LAVIK_CO_RETURN_IF_ERROR(object_id.status());
+  LAVIK_CO_RETURN_IF_ERROR(object_id);
   LAVIK_CO_RETURN_IF_ERROR(
       co_await io.Send(control::MessagePriority::kReliable,
                        control::WireMessage(control::TransferStart{
@@ -1967,7 +1967,7 @@ bycorf::Task<absl::Status> ValidateBootstrapApplied(
   // before it can receive new authority.
   const std::uint64_t high_water = core->coordinator_->CommittedHighWater();
   auto cached_view = PublicationViewAtLeast(*core, high_water);
-  LAVIK_CO_RETURN_IF_ERROR(cached_view.status());
+  LAVIK_CO_RETURN_IF_ERROR(cached_view);
   const MetaDataPublicationView& view = **cached_view;
   auto latest = ProjectNodeBounded(*core, view, node_id);
   const control::FullDesiredState* latest_state =
@@ -1978,7 +1978,7 @@ bycorf::Task<absl::Status> ValidateBootstrapApplied(
       io, installed, latest_state, node_id, boot_id, session_id, deferred,
       max_deferred_messages, fenced, fence_ack_deadline,
       std::chrono::milliseconds(core->options_.session_progress_timeout_ms_)));
-  LAVIK_CO_RETURN_IF_ERROR(latest.status());
+  LAVIK_CO_RETURN_IF_ERROR(latest);
   if (EvaluateNodeReplacement(installed.full_state, latest->full_state,
                               node_id) ==
       MetaReplacementDisposition::kAbortSuperseded) {
@@ -2145,7 +2145,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
   }
 
   auto cached_view = PublicationViewAtLeast(*state->core_, high_water);
-  LAVIK_CO_RETURN_IF_ERROR(cached_view.status());
+  LAVIK_CO_RETURN_IF_ERROR(cached_view);
   const MetaDataPublicationView& view = **cached_view;
   auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
   const control::FullDesiredState* latest_state =
@@ -2158,7 +2158,7 @@ CheckLiveTransferBoundary(const std::shared_ptr<LiveSessionState>& state,
           : 0;
   LAVIK_CO_RETURN_IF_ERROR(
       co_await FenceSupersededAuthorityLive(state, installed, latest_state));
-  LAVIK_CO_RETURN_IF_ERROR(latest.status());
+  LAVIK_CO_RETURN_IF_ERROR(latest);
   const MetaReplacementDisposition disposition = EvaluateNodeReplacement(
       replacement.full_state, latest->full_state, state->node_id_);
   if (disposition == MetaReplacementDisposition::kContinue) {
@@ -2177,7 +2177,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
                       const control::NodeControlUpdate& update,
                       MetaCommittedCursor* publication_cut) {
   auto encoded = control::EncodeNodeControlUpdate(update);
-  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+  LAVIK_CO_RETURN_IF_ERROR(encoded);
   const std::string_view bytes = *encoded;
   if (bytes.size() > control::kMaxFullDesiredStateBytes) {
     co_return absl::ResourceExhaustedError(
@@ -2191,7 +2191,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
   if (bytes.size() <= control::kMaxFramePayloadBytes) {
     auto boundary = co_await CheckLiveTransferBoundary(
         state, installed, replacement, publication_cut);
-    LAVIK_CO_RETURN_IF_ERROR(boundary.status());
+    LAVIK_CO_RETURN_IF_ERROR(boundary);
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
       co_return detail::ClassifyPublisherSupersession(
           /*receiver_can_apply=*/false);
@@ -2236,7 +2236,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
   }
 
   auto object_id = control::GenerateId128();
-  LAVIK_CO_RETURN_IF_ERROR(object_id.status());
+  LAVIK_CO_RETURN_IF_ERROR(object_id);
   const control::TransferStart start{
       .kind = control::TransferKind::kNodeControlUpdate,
       .object_id = *object_id,
@@ -2247,7 +2247,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
 
   auto boundary = co_await CheckLiveTransferBoundary(
       state, installed, replacement, publication_cut);
-  LAVIK_CO_RETURN_IF_ERROR(boundary.status());
+  LAVIK_CO_RETURN_IF_ERROR(boundary);
   if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
     LAVIK_CO_RETURN_IF_ERROR(co_await AbortSupersededReplacement(
         *state->io_, *object_id, /*transfer_active=*/true));
@@ -2274,7 +2274,7 @@ SendControlUpdateLive(const std::shared_ptr<LiveSessionState>& state,
     });
     boundary = co_await CheckLiveTransferBoundary(state, installed, replacement,
                                                   publication_cut);
-    LAVIK_CO_RETURN_IF_ERROR(boundary.status());
+    LAVIK_CO_RETURN_IF_ERROR(boundary);
     if (*boundary == MetaReplacementDisposition::kAbortSuperseded) {
       LAVIK_CO_RETURN_IF_ERROR(co_await AbortSupersededReplacement(
           *state->io_, *object_id, /*transfer_active=*/true));
@@ -2342,7 +2342,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     }
 
     auto cached_view = PublicationViewAtLeast(*state->core_, high_water);
-    LAVIK_CO_RETURN_IF_ERROR(cached_view.status());
+    LAVIK_CO_RETURN_IF_ERROR(cached_view);
     const MetaDataPublicationView& view = **cached_view;
     auto latest = ProjectNodeBounded(*state->core_, view, state->node_id_);
     std::shared_ptr<const NodeControlBatch> installed = state->installed_;
@@ -2362,7 +2362,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
     }
     LAVIK_CO_RETURN_IF_ERROR(
         co_await FenceSupersededAuthorityLive(state, *installed, latest_state));
-    LAVIK_CO_RETURN_IF_ERROR(latest.status());
+    LAVIK_CO_RETURN_IF_ERROR(latest);
     if (EvaluateNodeReplacement(installed->full_state, latest->full_state,
                                 state->node_id_) ==
         MetaReplacementDisposition::kContinue) {
@@ -2381,7 +2381,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
         control::SelectNodeControlState(latest->full_state, state->node_id_);
     auto update = control::DiffNodeControlState(state->selected_, next);
     auto request_id = control::GenerateId128();
-    LAVIK_CO_RETURN_IF_ERROR(request_id.status());
+    LAVIK_CO_RETURN_IF_ERROR(request_id);
     update.request_id = *request_id;
     latest->full_state.control_revision = next.local.revision;
     // This exact committed view was just projected and compared. Neither
@@ -2391,7 +2391,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
                                         view.state_change_index()};
     auto published = co_await SendControlUpdateLive(state, *installed, *latest,
                                                     update, &publication_cut);
-    LAVIK_CO_RETURN_IF_ERROR(published.status());
+    LAVIK_CO_RETURN_IF_ERROR(published);
     if (*published ==
         detail::MetaPublisherTransferDisposition::kRetryBeforeApplyInSession) {
       // A started transfer was reset with an object-local TransferAbort. If no
@@ -2431,7 +2431,7 @@ bycorf::Task<absl::Status> SessionPublisherBody(
             stable_high_water, publication_cut.state_change_index())) {
       auto cached_stable_view =
           PublicationViewAtLeast(*state->core_, stable_high_water);
-      LAVIK_CO_RETURN_IF_ERROR(cached_stable_view.status());
+      LAVIK_CO_RETURN_IF_ERROR(cached_stable_view);
       const MetaDataPublicationView& stable_view = **cached_stable_view;
       auto stable =
           ProjectNodeBounded(*state->core_, stable_view, state->node_id_);
@@ -2542,7 +2542,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
         "Meta authority is unavailable before directive result proposal");
   }
   auto request_id = control::GenerateId128();
-  LAVIK_CO_RETURN_IF_ERROR(request_id.status());
+  LAVIK_CO_RETURN_IF_ERROR(request_id);
   MetaDirectiveResultStatus status;
   switch (result.status) {
     case control::DirectiveResultStatus::kSucceeded:
@@ -2580,7 +2580,7 @@ bycorf::Task<absl::Status> HandleDirectiveResult(
   });
   MetaLeaderContext* context = core->leader_context_;
   auto proposed = co_await context->Propose(MetaCommand(std::move(command)));
-  LAVIK_CO_RETURN_IF_ERROR(proposed.status());
+  LAVIK_CO_RETURN_IF_ERROR(proposed);
   // Closing cannot cancel an accepted append: its exact receipt may become
   // durable even after an uncertain outcome. Drain the proposal, but never
   // acknowledge it through a retired session or a different leader term.
@@ -2641,7 +2641,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
             ? co_await state->io_->Read()
             : absl::StatusOr<control::WireMessage>(std::move(deferred.front()));
     if (!deferred.empty()) deferred.pop_front();
-    LAVIK_CO_RETURN_IF_ERROR(incoming.status());
+    LAVIK_CO_RETURN_IF_ERROR(incoming);
     // The read may have spanned host suspend. Recheck before replaying a
     // cached lease Ack or consuming any authority-bearing client message.
     if (!AuthoritySessionsAllowed(*state->core_, state->leader_term_)) {
@@ -2656,7 +2656,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
     }
 
     auto publisher_response = HandlePublisherResponse(state, *incoming);
-    LAVIK_CO_RETURN_IF_ERROR(publisher_response.status());
+    LAVIK_CO_RETURN_IF_ERROR(publisher_response);
     if (*publisher_response) {
       // FullStateApplied wakes the publisher but does not itself change the
       // projection used below. Do not read a buffered heartbeat until the
@@ -2732,10 +2732,10 @@ bycorf::Task<absl::Status> RunEstablishedSession(
           state->installed_;
       auto failover_projection = detail::FailoverProjectionForHeartbeat(
           installed->full_state, state->node_id_, boot_id);
-      LAVIK_CO_RETURN_IF_ERROR(failover_projection.status());
+      LAVIK_CO_RETURN_IF_ERROR(failover_projection);
       auto owner_projection = detail::OwnerProjectionForHeartbeat(
           installed->full_state, state->node_id_);
-      LAVIK_CO_RETURN_IF_ERROR(owner_projection.status());
+      LAVIK_CO_RETURN_IF_ERROR(owner_projection);
       std::optional<std::uint64_t> confirmed_grant_sequence =
           detail::ConfirmedLeaseForHeartbeat(
               cached_ack, heartbeat->heartbeat_sequence, state->boot_id_,
@@ -2752,7 +2752,7 @@ bycorf::Task<absl::Status> RunEstablishedSession(
       }
       auto cached_view =
           PublicationViewAtLeast(*state->core_, committed_high_water);
-      LAVIK_CO_RETURN_IF_ERROR(cached_view.status());
+      LAVIK_CO_RETURN_IF_ERROR(cached_view);
       const MetaDataPublicationView& latest_view = **cached_view;
       const MetaCommittedFacts& facts = latest_view;
       const std::int64_t heartbeat_received_unix_ms = NowUnixMillis();

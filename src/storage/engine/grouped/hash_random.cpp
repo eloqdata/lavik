@@ -114,7 +114,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       LAVIK_CO_RETURN_IF_ERROR(add_page(&budget, selection.id_));
     }
     auto admission = budget.Reserve(4);
-    LAVIK_CO_RETURN_IF_ERROR(admission.status());
+    LAVIK_CO_RETURN_IF_ERROR(admission);
     write_scratch.emplace(std::move(*admission));
   }
   HashValue remaining;
@@ -130,12 +130,12 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       GroupedScratchBudget budget;
       LAVIK_CO_RETURN_IF_ERROR(add_page(&budget, selection.id_));
       auto admission = budget.Reserve(1);
-      LAVIK_CO_RETURN_IF_ERROR(admission.status());
+      LAVIK_CO_RETURN_IF_ERROR(admission);
       page_scratch.emplace(std::move(*admission));
     }
     auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                  digest, object, selection.id_);
-    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
+    LAVIK_CO_RETURN_IF_ERROR(loaded);
     auto& entries = loaded->snapshot_.value_.entries_;
     std::size_t duplicate_bytes = 0;
     for (auto i = selection.begin_; i < selection.end_; ++i) {

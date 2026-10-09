@@ -35,7 +35,7 @@ absl::StatusOr<NativeTransactionRecord> DecodeNativeTransactionRecord(
         "malformed replicated transaction envelope");
   }
   auto metadata = DecodeReplicationTransactionEnvelope(command.args_[0]);
-  LAVIK_RETURN_IF_ERROR(metadata.status());
+  LAVIK_RETURN_IF_ERROR(metadata);
   if (metadata->payload_flow_ >= origin_flow_count ||
       metadata->participants_.size() > origin_flow_count ||
       std::ranges::any_of(metadata->participants_,
@@ -103,7 +103,7 @@ absl::StatusOr<NativeReplayEffect> NativeReplay::PrepareEffect(
     }
     bytes += record.canonical_.size();
     auto command = DecodeReplicationCommand(record.canonical_);
-    LAVIK_RETURN_IF_ERROR(command.status());
+    LAVIK_RETURN_IF_ERROR(command);
     decoded.push_back(std::move(*command));
   }
   NativeReplayEffect effect;
@@ -118,7 +118,7 @@ absl::StatusOr<NativeReplayEffect> NativeReplay::PrepareEffect(
     for (std::size_t index = 0; index < records.size(); ++index) {
       auto record = DecodeNativeTransactionRecord(
           std::move(decoded[index]), records[index].flow_id_, applied_->size());
-      LAVIK_RETURN_IF_ERROR(record.status());
+      LAVIK_RETURN_IF_ERROR(record);
       if (!expected.has_value()) {
         expected = record->envelope_;
         db = record->payload_.db_id_;
@@ -144,7 +144,7 @@ absl::StatusOr<NativeReplayEffect> NativeReplay::PrepareEffect(
     }
   } else if (control) {
     auto barrier = NativeControlBarrierId(decoded.front());
-    LAVIK_RETURN_IF_ERROR(barrier.status());
+    LAVIK_RETURN_IF_ERROR(barrier);
     if (records.size() != applied_->size())
       return absl::InvalidArgumentError(
           "retained control barrier is incomplete");
@@ -163,7 +163,7 @@ absl::StatusOr<NativeReplayEffect> NativeReplay::PrepareEffect(
     effect.command_ = std::move(decoded.front());
   }
   auto applied = applied_->TrySnapshot();
-  LAVIK_RETURN_IF_ERROR(applied.status());
+  LAVIK_RETURN_IF_ERROR(applied);
   bool any_applied = false;
   bool all_applied = true;
   bool missing_predecessor = false;

@@ -89,7 +89,7 @@ bool IsZero(const control::WireId128& value) {
 
 absl::StatusOr<std::uint64_t> Entropy64() {
   auto generated = control::GenerateId128();
-  LAVIK_RETURN_IF_ERROR(generated.status());
+  LAVIK_RETURN_IF_ERROR(generated);
   std::uint64_t value = 0;
   std::memcpy(&value, generated->data(), sizeof(value));
   return value;
@@ -382,7 +382,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         co_await replication_.ObserveIdentity();
     auto translated = detail::TranslateClusterFailoverControl(
         *desired, local_identity, use_tls_);
-    LAVIK_CO_RETURN_IF_ERROR(translated.status());
+    LAVIK_CO_RETURN_IF_ERROR(translated);
     absl::Status result = absl::OkStatus();
     // Always attempt every applicable level-triggered intent so replacement
     // or removal cannot strand cleanup behind another subsystem's failure.
@@ -1159,7 +1159,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
   };
   std::string fitted;
   auto initial = fits(&fitted);
-  LAVIK_RETURN_IF_ERROR(initial.status());
+  LAVIK_RETURN_IF_ERROR(initial);
   if (*initial) return fitted;
 
   const auto shorten_summary =
@@ -1169,7 +1169,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
     heartbeat.health.summary.clear();
     std::string candidate_bytes;
     auto base = fits(&candidate_bytes);
-    LAVIK_RETURN_IF_ERROR(base.status());
+    LAVIK_RETURN_IF_ERROR(base);
     if (!*base) {
       heartbeat.health.summary = original;
       return false;
@@ -1186,7 +1186,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
       heartbeat.health.summary.assign(original.data(), prefix);
       if (prefix < original.size()) heartbeat.health.summary.append(kSuffix);
       auto candidate = fits(&candidate_bytes);
-      LAVIK_RETURN_IF_ERROR(candidate.status());
+      LAVIK_RETURN_IF_ERROR(candidate);
       if (*candidate) {
         best = heartbeat.health.summary;
         best_bytes = std::move(candidate_bytes);
@@ -1202,7 +1202,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
   };
 
   auto summary_fit = shorten_summary(&fitted);
-  LAVIK_RETURN_IF_ERROR(summary_fit.status());
+  LAVIK_RETURN_IF_ERROR(summary_fit);
   if (*summary_fit) return fitted;
 
   if (!std::holds_alternative<control::ReplicaCandidate>(
@@ -1215,7 +1215,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
       "candidate progress omitted: single-frame limit",
       heartbeat.health.summary.empty() ? "" : "; ", heartbeat.health.summary);
   summary_fit = shorten_summary(&fitted);
-  LAVIK_RETURN_IF_ERROR(summary_fit.status());
+  LAVIK_RETURN_IF_ERROR(summary_fit);
   if (*summary_fit) return fitted;
   return absl::ResourceExhaustedError(
       "heartbeat fixed fields exceed the single-frame protocol limit");
@@ -1265,7 +1265,7 @@ absl::Status MetaEndpointDirectory::Update(
     }
     auto value =
         ParseNumericControlEndpoint(EndpointText(endpoint.host, endpoint.port));
-    LAVIK_RETURN_IF_ERROR(value.status());
+    LAVIK_RETURN_IF_ERROR(value);
     value->server_id_ = endpoint.server_id;
     value->principal_ = endpoint.principal;
     const auto duplicate = std::find_if(
@@ -1790,7 +1790,7 @@ struct MetaControlClientService::Impl {
     }
     auto transfer = co_await ReceiveTransfer(frames, deadline, progress_timeout,
                                              std::move(first));
-    LAVIK_CO_RETURN_IF_ERROR(transfer.status());
+    LAVIK_CO_RETURN_IF_ERROR(transfer);
     if (transfer->kind_ != control::TransferKind::kFullDesiredState) {
       co_return absl::InvalidArgumentError(
           "expected initial FullDesiredState transfer");
@@ -1802,7 +1802,7 @@ struct MetaControlClientService::Impl {
                                      std::string_view local_boot_id) {
     auto prepared = PrepareNodeControlState(desired, options_.node_id_,
                                             options_.request_worker_count_);
-    LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+    LAVIK_CO_RETURN_IF_ERROR(prepared);
     // Directory parsing is part of the all-or-nothing local control boundary.
     // Validate into a private copy before publishing topology; committing the
     // copy after the awaited installer transition cannot fail.
@@ -1853,7 +1853,7 @@ struct MetaControlClientService::Impl {
       control::ControlSessionWriter& writer,
       const control::DirectiveResult& result) {
     auto encoded = control::EncodeMessage(control::WireMessage(result));
-    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(encoded);
     // The size probe's encoding is reused for the send itself on both paths.
     if (encoded->payload.size() <= control::kMaxFramePayloadBytes) {
       co_return co_await writer.Write(control::MessagePriority::kReliable,
@@ -1865,7 +1865,7 @@ struct MetaControlClientService::Impl {
     // There is no per-chunk acknowledgement; ResultCommitted remains the
     // application-level acknowledgement for the completed result.
     auto object_id = control::GenerateId128();
-    LAVIK_CO_RETURN_IF_ERROR(object_id.status());
+    LAVIK_CO_RETURN_IF_ERROR(object_id);
     auto owned =
         std::make_shared<const std::string>(std::move(encoded->payload));
     co_return co_await writer.WriteTransfer(
@@ -1923,7 +1923,7 @@ struct MetaControlClientService::Impl {
     std::uint32_t flow_count = 0;
     if (rebuild) {
       auto request = control::DecodeRebuildRequest(directive.payload);
-      LAVIK_RETURN_IF_ERROR(request.status());
+      LAVIK_RETURN_IF_ERROR(request);
       flow_count = request->source_flow_count;
     }
     const auto target_node = NodeId::Parse(directive.target_node_id);
@@ -2147,7 +2147,7 @@ struct MetaControlClientService::Impl {
     auto normalized = NormalizeDirective(
         directive, state->session_, state->boot_id_,
         state->replication_identity_.local_history_id_, *state->desired_);
-    LAVIK_CO_RETURN_IF_ERROR(normalized.status());
+    LAVIK_CO_RETURN_IF_ERROR(normalized);
     state->accepted_directives_.push_back(directive.identity);
     state->directive_queue_.push_back(DirectiveWork{
         .wire_ = directive, .normalized_ = std::move(*normalized)});
@@ -2247,7 +2247,7 @@ struct MetaControlClientService::Impl {
     } else if (routing_changed) {
       auto prepared = PrepareNodeControlState(*next, options_.node_id_,
                                               options_.request_worker_count_);
-      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+      LAVIK_CO_RETURN_IF_ERROR(prepared);
       LAVIK_CO_RETURN_IF_ERROR(installer_.InstallRouting(std::move(*prepared)));
     }
     directory_ = std::move(directory);
@@ -2741,7 +2741,7 @@ struct MetaControlClientService::Impl {
       // it as causal proof that Data installed Ack N. Session invalidation
       // revokes any older retained authority before reauthentication starts a
       // new causal sequence whose first valid Grant can safely restore service.
-      LAVIK_CO_RETURN_IF_ERROR(deadline_ms.status());
+      LAVIK_CO_RETURN_IF_ERROR(deadline_ms);
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
           MonotonicTime(std::chrono::milliseconds(*deadline_ms - grant_ms));
@@ -2904,7 +2904,7 @@ struct MetaControlClientService::Impl {
       co_return absl::DeadlineExceededError(
           "Meta control ServerHello timed out");
     }
-    LAVIK_CO_RETURN_IF_ERROR(hello_message.status());
+    LAVIK_CO_RETURN_IF_ERROR(hello_message);
     const auto* hello = std::get_if<control::ServerHello>(&*hello_message);
     if (hello == nullptr) {
       co_return absl::InvalidArgumentError("expected ServerHello");
@@ -2943,7 +2943,7 @@ struct MetaControlClientService::Impl {
     }
     if (options_.tls_context_ != nullptr) {
       auto sans = stream.PeerCertificateUriSans();
-      LAVIK_CO_RETURN_IF_ERROR(sans.status());
+      LAVIK_CO_RETURN_IF_ERROR(sans);
       const std::string& expected_principal = endpoint.principal_.has_value()
                                                   ? *endpoint.principal_
                                                   : *hello_member->principal;
@@ -2987,7 +2987,7 @@ struct MetaControlClientService::Impl {
     auto run_established = [&]() -> bycorf::Task<absl::Status> {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
-      LAVIK_CO_RETURN_IF_ERROR(initial.status());
+      LAVIK_CO_RETURN_IF_ERROR(initial);
       LAVIK_CO_RETURN_IF_ERROR(CheckClientService(initial->service));
       if (control::DataHeartbeatIntervalMs(
               initial->authority_lease_duration_ms) >
@@ -3134,7 +3134,7 @@ struct MetaControlClientService::Impl {
           if (transfer.kind_ == control::TransferKind::kNodeControlUpdate) {
             auto replacement =
                 control::DecodeNodeControlUpdate(std::move(transfer.bytes_));
-            LAVIK_CO_RETURN_IF_ERROR(replacement.status());
+            LAVIK_CO_RETURN_IF_ERROR(replacement);
             LAVIK_CO_RETURN_IF_ERROR(co_await ApplyControlUpdate(
                 state, writer, std::move(*replacement)));
             continue;
@@ -3275,7 +3275,7 @@ MetaControlClientService::Create(MetaControlClientOptions options,
   seeds.reserve(options.seeds_.size());
   for (const std::string& seed : options.seeds_) {
     auto parsed = ParseNumericControlEndpoint(seed);
-    LAVIK_RETURN_IF_ERROR(parsed.status());
+    LAVIK_RETURN_IF_ERROR(parsed);
     if (std::none_of(seeds.begin(), seeds.end(), [&](const auto& existing) {
           return SameEndpoint(existing, *parsed);
         })) {

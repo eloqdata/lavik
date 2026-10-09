@@ -97,7 +97,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     root.revision_ = revision;
     auto rebuilt =
         previous->ordered_directory().Apply(root, revision, {}, sequence);
-    LAVIK_CO_RETURN_IF_ERROR(rebuilt.status());
+    LAVIK_CO_RETURN_IF_ERROR(rebuilt);
     ordered_directory.emplace(std::move(*rebuilt));
     payload = EncodeOrderedCollectionRoot(root);
   } else {
@@ -117,11 +117,11 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     for (const auto& [id, record] : previous->directory().retired_groups())
       append(record);
     auto rebuilt = HashGroupDirectory::Recover(root, sequence, candidates, {});
-    LAVIK_CO_RETURN_IF_ERROR(rebuilt.status());
+    LAVIK_CO_RETURN_IF_ERROR(rebuilt);
     hash_directory.emplace(std::move(*rebuilt));
     payload = EncodeGroupedHashRoot(root);
   }
-  LAVIK_CO_RETURN_IF_ERROR(payload.status());
+  LAVIK_CO_RETURN_IF_ERROR(payload);
   std::vector<GroupedRecordId> changed;
   changed.reserve(replaced_count);
   if (replaced_count != 0) {
@@ -131,9 +131,9 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
                                 bool) { changed.push_back(id); });
   }
   auto decision = PrepareGroupedDecision(*compensation);
-  LAVIK_CO_RETURN_IF_ERROR(decision.status());
+  LAVIK_CO_RETURN_IF_ERROR(decision);
   auto reserved = side.PreparePublish(key, replaced);
-  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
+  LAVIK_CO_RETURN_IF_ERROR(reserved);
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   GroupedObject::PreparedHandle builder;
@@ -163,7 +163,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
                                                         *hash_directory, {}));
         publication.reset();
         auto refreshed = side.PreparePublish(key, current);
-        LAVIK_RETURN_IF_ERROR(refreshed.status());
+        LAVIK_RETURN_IF_ERROR(refreshed);
         publication.emplace(std::move(*refreshed));
         return absl::OkStatus();
       },
