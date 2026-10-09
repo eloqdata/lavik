@@ -288,6 +288,75 @@ class TeardownSafety(unittest.TestCase):
         self.assertTrue(self.root.exists())
 
 
+class ProcessScanSafety(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "deployment"
+        self.proc = Path(temporary.name) / "proc"
+        self.process = self.proc / "123"
+        self.process.mkdir(parents=True)
+        (self.process / "exe").symlink_to("/usr/bin/sleep")
+        (self.process / "cmdline").write_bytes(b"sleep\0infinity\0")
+        # Model the process inventory without depending on host UIDs, ptrace
+        # policy, or runner agents. All reads still exercise the real scanner.
+        self.enterContext(
+            patch.object(
+                remote,
+                "Path",
+                side_effect=lambda path: self.proc if path == "/proc" else Path(path),
+            )
+        )
+
+    def test_unrelated_process_is_allowed(self):
+        remote.check_no_processes(self.root)
+
+    def test_owned_executable_blocks_even_with_unrelated_argv(self):
+        for name in ("lavik", "lavik-meta", "lavik (deleted)"):
+            with self.subTest(name=name):
+                (self.process / "exe").unlink()
+                (self.process / "exe").symlink_to(self.root / "release" / name)
+                with self.assertRaisesRegex(
+                    RuntimeError, "still running; data retained"
+                ):
+                    remote.check_no_processes(self.root)
+
+    def test_launcher_blocks_before_exec(self):
+        (self.process / "cmdline").write_bytes(
+            b"python3\0" + str(self.root / "data-1/launch.py").encode() + b"\0"
+        )
+        with self.assertRaisesRegex(RuntimeError, "still running; data retained"):
+            remote.check_no_processes(self.root)
+
+    def test_uninspectable_same_uid_process_fails_closed(self):
+        for method, target in (("readlink", remote.os), ("read_bytes", Path)):
+            with (
+                self.subTest(method=method),
+                patch.object(target, method, side_effect=PermissionError),
+                self.assertRaisesRegex(
+                    RuntimeError, "Cannot inspect owned process 123"
+                ),
+            ):
+                remote.check_no_processes(self.root)
+
+    def test_uninspectable_other_uid_process_is_allowed(self):
+        with (
+            patch.object(remote.os, "readlink", side_effect=PermissionError),
+            patch.object(
+                remote.os, "geteuid", return_value=self.process.stat().st_uid + 1
+            ),
+        ):
+            remote.check_no_processes(self.root)
+
+    def test_exited_process_is_allowed(self):
+        for error in (FileNotFoundError, ProcessLookupError):
+            with (
+                self.subTest(error=error),
+                patch.object(remote.os, "readlink", side_effect=error),
+            ):
+                remote.check_no_processes(self.root)
+
+
 @unittest.skipUnless(sys.platform == "linux", "process teardown requires Linux pidfds")
 class LinuxProcessTeardown(unittest.TestCase):
     def test_real_process_stops_before_its_owned_files_are_removed(self):
@@ -307,6 +376,20 @@ class LinuxProcessTeardown(unittest.TestCase):
             (root / "data-1/lavik.data").write_bytes(b"retained data")
             identity = remote.start_node(
                 {**request, "node": request["nodes"][0], "manifest": "test"}
+            )
+            # Exercise real procfs reads and pidfd signals for our child only.
+            # A host process with our UID may deny /proc/PID/exe access; that
+            # fail-closed policy is covered separately by ProcessScanSafety.
+            real_iterdir = Path.iterdir
+            self.enterContext(
+                patch.object(
+                    Path,
+                    "iterdir",
+                    autospec=True,
+                    side_effect=lambda path: iter([Path(f"/proc/{identity['pid']}")])
+                    if path == Path("/proc")
+                    else real_iterdir(path),
+                )
             )
             try:
                 remote.teardown({**request, "phase": "check"})

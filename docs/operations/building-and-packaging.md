@@ -468,6 +468,17 @@ once, then distribute it to six isolated runners of the same architecture.
 All registered CTest, native large-List/Hash, >1 GiB RDB, and vendored Valkey TCL
 coverage runs on both architectures; there is no separate reduced PR tier.
 
+Independent `Admin tests (amd64)` and `Admin tests (arm64)` jobs run the
+JavaScript and Python remote-helper suites with Node 24.15.0 and Python 3.12,
+without building Lavik. Release packaging checks the archived Admin assets,
+launcher and runtime, and runs the packaged-service smoke test; it does not
+run the source functional suites. To run those locally with the same tools:
+
+```bash
+node --test admin/test/*.test.mjs
+python3 admin/test/remote_test.py
+```
+
 The shared Meta failover and recovery fault matrices run in Cluster mode.
 Single keeps representative multi-database handoff, rebuild, recovery, and
 fencing cases, plus its distinct client-command coverage; hostname cases also
@@ -541,8 +552,8 @@ Logs, JUnit, and plans are under `<build>/test-results/`, with
 `shard-N-of-M/` subdirectories for partitioned runs. Per-architecture/shard
 artifacts are retained for seven days; build bundles for one day.
 The existing required check names `Tests (amd64)` and `Tests (arm64)` are
-preserved as completion gates. Both require every build and shard to succeed;
-failure, cancellation, or skipped work cannot report a passing test gate.
+preserved as completion gates. Both require every build, shard and Admin job
+to succeed; failure, cancellation, or skipped work cannot report a passing test gate.
 
 The RedisShake ScanReader integration test additionally needs RedisShake on
 PATH (or `-DLAVIK_REDIS_SHAKE_EXECUTABLE=/path/to/redis-shake`) and Meta enabled.
