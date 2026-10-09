@@ -795,7 +795,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
   if (!update->changed_) co_return absl::OkStatus();
   if (update->erase_ || update->reuse_encoded_ ||
       update->encoded_.size() != partial.size() ||
-      update->encoded_.substr(44) != partial.substr(44))
+      std::string_view(update->encoded_).substr(44) !=
+          std::string_view(partial).substr(44))
     co_return absl::InvalidArgumentError(
         "Stream metadata callback changed entries");
   std::string bytes = update->encoded_.substr(0, 48);
@@ -1097,12 +1098,16 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
                        .expire_at_ms_ = object->version().root_.expire_at_ms_});
   if (!update.ok()) co_return update.status();
   if (!update->changed_) co_return absl::OkStatus();
-  if (deleted.empty() || update->erase_ || update->reuse_encoded_ ||
-      update->logical_size_ != 0 || update->encoded_.size() != 56 ||
-      update->encoded_.substr(0, 20) != partial.substr(0, 20) ||
-      update->encoded_.substr(36, 8) != partial.substr(36, 8) ||
-      update->encoded_.substr(44) != std::string(12, '\0'))
-    co_return absl::InvalidArgumentError("invalid partial Stream deletion");
+  {
+    const std::string_view encoded = update->encoded_;
+    const std::string_view original = partial;
+    if (deleted.empty() || update->erase_ || update->reuse_encoded_ ||
+        update->logical_size_ != 0 || encoded.size() != 56 ||
+        encoded.substr(0, 20) != original.substr(0, 20) ||
+        encoded.substr(36, 8) != original.substr(36, 8) ||
+        encoded.substr(44) != std::string(12, '\0'))
+      co_return absl::InvalidArgumentError("invalid partial Stream deletion");
+  }
   auto node_count = co_await cache.Required(std::string_view("\2", 1));
   if (!node_count.ok()) co_return node_count.status();
   auto count_payload = StreamRecordPayload(*node_count);
