@@ -312,6 +312,9 @@ absl::Status RegisteredBufferPool::Init(
 
   absl::Status status = worker.RegisterBuffers(iovecs);
   bool buffers_registered = status.ok();
+  std::size_t registered_reads = buffers_registered ? read_count : 0;
+  std::size_t registered_writes =
+      buffers_registered ? registered_write_count : 0;
   if (!status.ok()) {
     if (bycorf::SpdkStorageEnabled()) {
       // SPDK registration is a DMA-addressability check; memory that fails it
@@ -326,21 +329,72 @@ absl::Status RegisteredBufferPool::Init(
       }
       return status;
     } else {
-      // The buffers themselves are fine; only the fixed-IO fast path is lost.
-      // Keep the pool and submit plain (non-fixed) reads and writes instead.
       rlimit memlock{};
       if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
-        spdlog::warn(
-            "worker {}: io_uring buffer registration failed ({}); requested "
-            "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling back "
-            "to the same reusable buffers with unregistered IO",
-            worker.id(), status.message(), options.registered_bytes_,
-            memlock.rlim_cur == RLIM_INFINITY
-                ? std::numeric_limits<std::uint64_t>::max()
-                : static_cast<std::uint64_t>(memlock.rlim_cur),
-            memlock.rlim_max == RLIM_INFINITY
-                ? std::numeric_limits<std::uint64_t>::max()
-                : static_cast<std::uint64_t>(memlock.rlim_max));
+        if (memlock.rlim_cur != RLIM_INFINITY) {
+          // Divide the allowance across runtime workers (including Meta is
+          // conservative). This is an estimate, not a reservation: other
+          // rings/registrations can consume it before this worker gets here.
+          const auto* cross_core = bycorf::ThisWorker().cross_core_;
+          const unsigned workers =
+              cross_core == nullptr ? 1 : cross_core->size();
+          std::uint64_t budget = memlock.rlim_cur / std::max(workers, 1U);
+          std::vector<iovec> partial(iovecs.size());
+          while (budget > sentinel_bytes) {
+            std::uint64_t remaining = budget - sentinel_bytes;
+            const std::size_t reads = std::min<std::uint64_t>(
+                read_count, remaining / read_slot_bytes);
+            remaining -= reads * read_slot_bytes;
+            const std::size_t writes = std::min<std::uint64_t>(
+                registered_write_count,
+                remaining / options.write_buffer_bytes_);
+            if (reads == 0 && writes == 0) break;
+            if (reads == read_count && writes == registered_write_count) {
+              budget /= 2;  // The full registration already failed.
+              continue;
+            }
+            // Null, zero-length entries keep unregistered slots' indices
+            // stable. Leases use those same ids for pool release and fixed
+            // I/O; compacting this table would silently change their meaning.
+            std::fill(partial.begin(), partial.end(), iovec{});
+            partial[0] = iovecs[0];
+            std::copy_n(iovecs.begin() + read_base, reads,
+                        partial.begin() + read_base);
+            std::copy_n(iovecs.begin() + 1, writes, partial.begin() + 1);
+            status = worker.RegisterBuffers(partial);
+            if (status.ok()) {
+              registered_reads = reads;
+              registered_writes = writes;
+              spdlog::warn(
+                  "worker {}: io_uring buffer registration retried with "
+                  "RLIMIT_MEMLOCK soft={}; registered read slots={}/{} "
+                  "write slots={}/{} bytes={}; pool capacity unchanged, "
+                  "remaining slots use unregistered IO",
+                  worker.id(), static_cast<std::uint64_t>(memlock.rlim_cur),
+                  reads, read_count, writes, registered_write_count,
+                  sentinel_bytes + reads * read_slot_bytes +
+                      writes * options.write_buffer_bytes_);
+              break;
+            }
+            // Existing registrations may leave less than the estimated
+            // share. Retry geometrically, with no cross-worker lock or wait.
+            budget /= 2;
+          }
+        }
+        if (!status.ok()) {
+          spdlog::warn(
+              "worker {}: io_uring buffer registration failed ({}); requested "
+              "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling "
+              "back "
+              "to the same reusable buffers with unregistered IO",
+              worker.id(), status.message(), options.registered_bytes_,
+              memlock.rlim_cur == RLIM_INFINITY
+                  ? std::numeric_limits<std::uint64_t>::max()
+                  : static_cast<std::uint64_t>(memlock.rlim_cur),
+              memlock.rlim_max == RLIM_INFINITY
+                  ? std::numeric_limits<std::uint64_t>::max()
+                  : static_cast<std::uint64_t>(memlock.rlim_max));
+        }
       } else {
         spdlog::warn(
             "worker {}: io_uring buffer registration failed ({}); requested "
@@ -355,6 +409,8 @@ absl::Status RegisteredBufferPool::Init(
   cross_core_ = bycorf::ThisWorker().cross_core_;
   owner_worker_ = worker.id();
   buffers_registered_ = buffers_registered;
+  registered_read_count_ = registered_reads;
+  registered_write_count_ = registered_writes;
   options_ = options;
   sentinel_buffer_ = sentinel;
   sentinel_buffer_bytes_ = sentinel_bytes;

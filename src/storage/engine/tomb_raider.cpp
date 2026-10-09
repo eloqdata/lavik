@@ -524,7 +524,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
     }
 
     bool registered() const noexcept {
-      return buffer_id_ != 0 && pool_->buffers_registered();
+      return pool_ != nullptr && pool_->buffer_registered(buffer_id_);
     }
   } sweep{.pool_ = &store.buffers_};
   if (store.buffers_.TryAcquireWriteBuffer(&sweep.buffer_id_)) {

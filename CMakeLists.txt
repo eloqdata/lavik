@@ -1801,9 +1801,9 @@ if (BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/replication
   )
   gtest_discover_tests(lavik_unit_tests)
-  # Each large codec regression retains roughly 2 GiB of payload. Apply these
-  # properties after discovery, so parallel CTest runs keep other tests parallel
-  # but never overlap a large codec case with another test.
+  # Apply resource-sensitive test properties after discovery. Large codec
+  # cases retain roughly 2 GiB; memlock cases need isolation from other rings.
+  # Other tests can still run in parallel.
   file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/lavik_large_codec_properties.cmake"
     CONTENT [[
@@ -1811,6 +1811,11 @@ foreach(test_name IN LISTS lavik_unit_tests_TESTS)
   if(test_name MATCHES "[.]Large.*RoundTripsBeyondRecordLimit$")
     set_tests_properties("${test_name}" PROPERTIES
       LABELS large-codec RUN_SERIAL TRUE TIMEOUT 300)
+  elseif(test_name MATCHES "^BufferPoolMemlockTest[.]")
+    # io_uring lock accounting can be shared by processes with the same uid.
+    # Do not let another test's registered pool consume these small limits.
+    set_tests_properties("${test_name}" PROPERTIES
+      LABELS memlock RUN_SERIAL TRUE TIMEOUT 30)
   endif()
 endforeach()
 ]])

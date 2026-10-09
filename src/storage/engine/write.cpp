@@ -1811,8 +1811,8 @@ StorageEngine::Impl::WriteExtentValueLocked(
         auto written = co_await WriteStorageBuffer(
             *store.worker_, store.files_[file_id],
             std::span<const std::byte>(staging.data_ + offset, chunk),
-            write_buffer_id != 0 && store.buffers_.buffers_registered(),
-            staging, block_offset + offset);
+            store.buffers_.buffer_registered(write_buffer_id), staging,
+            block_offset + offset);
         if (!written.ok() || *written != chunk) {
           write_ok = false;
           write_status = written.ok()
@@ -1831,8 +1831,8 @@ StorageEngine::Impl::WriteExtentValueLocked(
         auto written = co_await WriteStorageBuffer(
             *store.worker_, store.files_[file_id],
             std::span<const std::byte>(staging.data_, kBlockHeaderSlotBytes),
-            write_buffer_id != 0 && store.buffers_.buffers_registered(),
-            staging, block_offset);
+            store.buffers_.buffer_registered(write_buffer_id), staging,
+            block_offset);
         if (!written.ok() || *written != kBlockHeaderSlotBytes) {
           write_status = written.ok()
                              ? absl::Status(absl::StatusCode::kInternal,
