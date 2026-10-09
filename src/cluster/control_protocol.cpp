@@ -36,6 +36,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::cluster::control {
 namespace {
@@ -801,11 +802,8 @@ namespace {
 
 absl::Status WriteEndpoint(Writer& writer, const WireMetaEndpoint& endpoint) {
   writer.U32(endpoint.server_id);
-  if (absl::Status status =
-          writer.String(endpoint.host, kMaxIdentifierBytes, "endpoint host");
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      writer.String(endpoint.host, kMaxIdentifierBytes, "endpoint host"));
   writer.U16(endpoint.port);
   writer.Bool(endpoint.principal.has_value());
   if (endpoint.principal.has_value()) {
@@ -817,21 +815,14 @@ absl::Status WriteEndpoint(Writer& writer, const WireMetaEndpoint& endpoint) {
 
 absl::StatusOr<WireMetaEndpoint> ReadEndpoint(Reader& reader) {
   WireMetaEndpoint endpoint;
-  auto server_id = reader.U32();
-  if (!server_id.ok()) return server_id.status();
-  endpoint.server_id = *server_id;
-  auto host = reader.String(kMaxIdentifierBytes);
-  if (!host.ok()) return host.status();
-  endpoint.host = std::move(*host);
-  auto port = reader.U16();
-  if (!port.ok()) return port.status();
-  endpoint.port = *port;
+  LAVIK_ASSIGN_OR_RETURN(endpoint.server_id, reader.U32());
+  LAVIK_ASSIGN_OR_RETURN(endpoint.host, reader.String(kMaxIdentifierBytes));
+  LAVIK_ASSIGN_OR_RETURN(endpoint.port, reader.U16());
   auto has_principal = reader.Bool();
   if (!has_principal.ok()) return has_principal.status();
   if (*has_principal) {
-    auto principal = reader.String(kMaxIdentifierBytes);
-    if (!principal.ok()) return principal.status();
-    endpoint.principal = std::move(*principal);
+    LAVIK_ASSIGN_OR_RETURN(endpoint.principal,
+                           reader.String(kMaxIdentifierBytes));
   }
   return endpoint;
 }

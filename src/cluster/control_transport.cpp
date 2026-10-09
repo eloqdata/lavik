@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::cluster::control {
 namespace {
@@ -262,21 +263,20 @@ bycorf::Task<absl::Status> ControlFrameStream::ReadExactly(
     std::span<std::byte> destination) {
   std::size_t read_bytes = 0;
   while (read_bytes < destination.size()) {
-    auto read = co_await stream_.ReadSome(destination.subspan(read_bytes));
-    if (!read.ok()) co_return read.status();
-    if (*read == 0) {
+    std::size_t read;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        read, co_await stream_.ReadSome(destination.subspan(read_bytes)));
+    if (read == 0) {
       co_return absl::UnavailableError("control peer closed the connection");
     }
-    read_bytes += *read;
+    read_bytes += read;
   }
   co_return absl::OkStatus();
 }
 
 bycorf::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
   std::array<std::byte, kFrameHeaderBytes> header_bytes{};
-  if (absl::Status read = co_await ReadExactly(header_bytes); !read.ok()) {
-    co_return read;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await ReadExactly(header_bytes));
   const std::string_view header(
       reinterpret_cast<const char*>(header_bytes.data()), header_bytes.size());
   auto parsed = ParseFrameHeader(header);
@@ -288,9 +288,7 @@ bycorf::Task<absl::StatusOr<Frame>> ControlFrameStream::ReadFrame() {
     std::span<std::byte> payload(
         reinterpret_cast<std::byte*>(encoded.data() + kFrameHeaderBytes),
         parsed->payload_length);
-    if (absl::Status read = co_await ReadExactly(payload); !read.ok()) {
-      co_return read;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await ReadExactly(payload));
   }
   co_return decoder_.Decode(encoded);
 }
@@ -307,9 +305,7 @@ bycorf::Task<absl::Status> ControlFrameStream::WriteEncoded(
   std::size_t written = 0;
   bool first_write = true;
   while (written < bytes.size()) {
-    if (absl::Status armed = ArmWriteDeadline(); !armed.ok()) {
-      co_return armed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(ArmWriteDeadline());
     if (first_write && before_write) before_write();
     first_write = false;
     auto result = co_await stream_.WriteSome(bytes.subspan(written));

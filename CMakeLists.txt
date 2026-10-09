@@ -1761,6 +1761,7 @@ if (BUILD_TESTING)
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
     tests/source_authorization_test.cpp
+    tests/status_macros_test.cpp
     tests/command_table_test.cpp
     tests/random_sample_test.cpp
     tests/rdb_test.cpp
