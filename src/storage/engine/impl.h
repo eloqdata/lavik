@@ -632,10 +632,6 @@ struct RecoveryLiveReference {
   // the same physical payload more than once, so this may exceed the block's
   // committed payload size after checkpoint aggregation.
   std::uint32_t bytes_ = 0;
-  // Checkpoint decoding happens before block headers establish runtime
-  // ownership. Root records retain the owner serialized in their location;
-  // extents leave this unowned and resolve it after the header scan.
-  std::uint16_t expected_owner_ = kUnownedBlock;
   bool extent_ = false;
   // A checkpoint accounting entry is an already-aggregated absolute value.
   // Recovery must install it once, rather than add it like a cold-scan key

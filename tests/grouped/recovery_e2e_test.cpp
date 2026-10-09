@@ -89,6 +89,34 @@ class RecordImage {
   }
   const std::string& path() const { return path_; }
 
+  // Model a different physical-owner assignment without changing the logical
+  // checkpoint shard, allocation identity, or any record bytes. Two-worker
+  // foreground blocks have writer IDs 0/1; the next scan must choose the other
+  // worker while restoring the existing checkpoint's accounting.
+  void ReassignForegroundBlockOwners() {
+    std::size_t changed = 0;
+    std::array<std::byte, kBlockHeaderBytes> bytes{};
+    for (std::uint64_t id = DataBlockBegin(kBlocks); id < kBlocks; ++id) {
+      Check(::pread(fd_, bytes.data(), bytes.size(), id * kStorageBlockBytes) ==
+                static_cast<ssize_t>(bytes.size()),
+            "block header read failed");
+      BlockHeader header;
+      if (!DecodeBlockHeaderPages(bytes, &header) ||
+          header.kind_ != BlockKind::kRecords ||
+          header.layout_worker_count_ != 2)
+        continue;
+      header.writer_id_ = 1 - header.writer_id_;
+      ++header.header_sequence_;
+      std::array<std::byte, kDirectIoAlignment> page{};
+      EncodeBlockHeader(header, page);
+      WriteAt(fd_, page, id * kStorageBlockBytes);
+      WriteAt(fd_, page, id * kStorageBlockBytes + kDirectIoAlignment);
+      ++changed;
+    }
+    Check(changed != 0, "no foreground blocks to reassign");
+    Check(::fsync(fd_) == 0, "block owner reassignment sync failed");
+  }
+
   void CorruptLastCheckpointObjectChunk() {
     std::uint64_t selected = 0, sequence = 0;
     std::uint32_t payload_bytes = 0;
@@ -1119,6 +1147,36 @@ TEST(GroupedRecoveryE2e, CheckpointRestoresGroupedGraphAndExternalPayload) {
       << recovered.Log();
   EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}),
             std::string(9 * 1024 * 1024, 'v'));
+}
+
+TEST(GroupedRecoveryE2e, CheckpointAccountsForReassignedPhysicalOwners) {
+  RecordImage image(128);
+  image.Finish();
+  const std::string value(24000, 'v');
+  {
+    ChildServer server(image, true);
+    ASSERT_EQ(server.Command({"SET", "string", value}), "+OK");
+    ASSERT_EQ(server.Command({"HSET", "hash", "field", value}), ":1");
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    ASSERT_NE(server.Log().find("published shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+  }
+  image.ReassignForegroundBlockOwners();
+  // Repeat once to also exercise publishing a checkpoint after the remap.
+  for (int restart = 0; restart != 2; ++restart) {
+    ChildServer recovered(image, true);
+    EXPECT_EQ(recovered.Command({"GET", "string"}), value);
+    EXPECT_NE(recovered.Log().find("loaded shutdown checkpoint generation="),
+              std::string::npos)
+        << recovered.Log();
+    EXPECT_EQ(recovered.Log().find("falling back"), std::string::npos)
+        << recovered.Log();
+    EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}), value);
+    EXPECT_EQ(recovered.Command({"SET", "string", value}), "+OK");
+    EXPECT_EQ(recovered.Command({"HSET", "hash", "field", value}), ":0");
+    EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
 }
 
 TEST(GroupedRecoveryE2e, CheckpointRestoresAllGroupedTypesWithIndirectKeys) {

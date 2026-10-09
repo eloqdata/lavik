@@ -1559,8 +1559,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           live_by_owner[location.block_owner()].push_back(RecoveryLiveReference{
               .block_id_ = location.block_id(),
               .allocation_epoch_ = location.allocation_epoch(),
-              .bytes_ = location.total_disk_bytes(),
-              .expected_owner_ = location.block_owner()});
+              .bytes_ = location.total_disk_bytes()});
           buffered_bytes += sizeof(RecoveryLiveReference);
           if (handle->extents_ != nullptr) {
             for (std::size_t i = 0; i < handle->extents_->size(); ++i) {
@@ -1575,7 +1574,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                   .block_id_ = extent.block_id_,
                   .allocation_epoch_ = extent.allocation_epoch_,
                   .bytes_ = extent.payload_bytes_,
-                  .expected_owner_ = owner,
                   .extent_ = true,
                   .extent_payload_bytes_ = extent.payload_bytes_,
                   .extent_index_ = static_cast<std::uint32_t>(i),
@@ -1616,7 +1614,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             .block_id_ = extent.block_id_,
             .allocation_epoch_ = extent.allocation_epoch_,
             .bytes_ = extent.payload_bytes_,
-            .expected_owner_ = owner,
             .extent_ = true,
             .extent_payload_bytes_ = extent.payload_bytes_,
             .extent_index_ = static_cast<std::uint32_t>(extent_index),
@@ -1643,11 +1640,13 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     // walk over the rebuilt index.
     for (auto& [block_id, reference] : checkpoint_load.live_by_block_) {
       const std::uint16_t owner = BlockOwner(block_id);
-      if (owner >= worker_count_ ||
-          (reference.expected_owner_ != kUnownedBlock &&
-           reference.expected_owner_ != owner)) {
+      // Persisted ownership describes the previous runtime. Backend or qpair
+      // topology changes can reassign the physical block during the header
+      // scan; allocation epoch and extent identity still validate the target
+      // when ApplyRecoveryLiveReferenceBatches installs its accounting.
+      if (owner >= worker_count_) {
         status = absl::InternalError(
-            "checkpoint live reference has no matching scanned block owner");
+            "checkpoint live reference has no scanned block owner");
         Fail(status);
         co_return status;
       }
@@ -1692,7 +1691,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                                      ? store.recovery_txids_.at(&entry)
                                      : 0,
                         .bytes_ = location.total_disk_bytes(),
-                        .expected_owner_ = location.block_owner(),
                     });
                 buffered_bytes += sizeof(RecoveryLiveReference);
                 const ExtentManifest extents = ExtentsFor(store, &entry);
@@ -1711,7 +1709,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                         .block_id_ = extent.block_id_,
                         .allocation_epoch_ = extent.allocation_epoch_,
                         .bytes_ = extent.payload_bytes_,
-                        .expected_owner_ = extent_owner,
                         .extent_ = true,
                         .extent_payload_bytes_ = extent.payload_bytes_,
                         .extent_index_ =
@@ -1759,7 +1756,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         .txid_ = recovered.txid_,
         .batch_txid_ = recovered.batch_txid_,
         .bytes_ = location.total_disk_bytes(),
-        .expected_owner_ = location.block_owner(),
     });
     buffered_bytes += sizeof(RecoveryLiveReference);
     const ExtentManifest& extents = recovered.extents_;
@@ -1776,7 +1772,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             .block_id_ = extent.block_id_,
             .allocation_epoch_ = extent.allocation_epoch_,
             .bytes_ = extent.payload_bytes_,
-            .expected_owner_ = owner,
             .extent_ = true,
             .extent_payload_bytes_ = extent.payload_bytes_,
             .extent_index_ = static_cast<std::uint32_t>(index),

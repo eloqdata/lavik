@@ -138,8 +138,10 @@ is the authority for ordinary-block aggregates. While performing the required
 index serialization pass, the builder aggregates the sparse extent manifests
 because extent identity deliberately does not occupy every runtime
 `BlockState`, and an extent's recovery owner can differ from its key-index
-shard. The restored extent entry therefore resolves its physical owner only
-after the block-header scan.
+shard. Restored accounting entries resolve their current physical owner after
+the block-header scan, which can reassign ordinary blocks as well as extents when
+the storage backend or controller affinity changes. Persisted owners identify
+the checkpoint shard, not authority over the new runtime's I/O placement.
 KeyRecord blocks and key extents retain the accounting produced by UUID
 recovery and are excluded from the checkpoint accounting table.
 All chunk types share the checkpoint block kind,
@@ -222,14 +224,14 @@ After that allocation barrier, each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
 checksums. Before those body reads, the prefix results redistribute every body
 block to its durable shard and order object fragments by their stream sequence.
-That owner reads, decodes, and installs the block locally, avoiding a
-cross-worker decoded batch. This is
-always accessible on io_uring because every worker opens every path. On SPDK,
-checkpoint preparation verifies that the unchanged topology still gives the
-shard owner a qpair for the block's controller; otherwise the checkpoint falls
-back instead of silently restoring the old cross-worker path. Each owner
-double-buffers checkpoint reads: after a block completes I/O it submits the
-next block before decoding and installing the current one. I/O, decoding, and
+That owner decodes and installs the block locally, avoiding a cross-worker
+decoded batch. On io_uring every worker opens every path. On SPDK, a shard
+without a qpair for a checkpoint block's controller delegates that read to an
+eligible worker and awaits completion before accessing the shared DMA buffer.
+The original shard retains the ordered fragment stream and index ownership,
+so changing storage backend or controller affinity does not invalidate an
+otherwise usable checkpoint. Reads issued by the shard remain double-buffered:
+after a block completes I/O it submits the next block before decoding and installing the current one. I/O, decoding, and
 index construction therefore proceed concurrently across owners. After the
 whole payload passes CRC32C, each inline-key index entry is bounds- and semantics-checked,
 its stored partition is checked against the chunk shard, and it is installed
