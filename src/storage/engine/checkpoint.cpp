@@ -2014,18 +2014,6 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
         co_return absl::InternalError(
             "checkpoint body block has an invalid owner");
       }
-      if (bycorf::SpdkStorageEnabled()) {
-        const auto& device_owners =
-            device_owners_[DeviceIndexForBlock(body.block_id_)];
-        if (!std::binary_search(device_owners.begin(), device_owners.end(),
-                                body.shard_id_)) {
-          // The checkpoint requires the original worker topology. A shard that
-          // cannot open the controller it used at shutdown cannot safely take
-          // over this read merely to avoid a cross-core installation hop.
-          co_return absl::InternalError(
-              "checkpoint owner has no qpair for its body block");
-        }
-      }
       body_blocks_by_owner[body.shard_id_].push_back(body);
     }
     for (unsigned shard = 0; shard < worker_count_; ++shard) {
@@ -2331,7 +2319,6 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             .block_id_ = entry.block_id_,
             .allocation_epoch_ = entry.allocation_epoch_,
             .bytes_ = entry.live_bytes_,
-            .expected_owner_ = entry.owner_,
             .extent_ = entry.extent_ != 0,
             .replace_live_bytes_ = true,
             .extent_payload_bytes_ = entry.extent_payload_bytes_,
@@ -2499,8 +2486,21 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     co_return absl::OkStatus();
   };
 
-  auto start_prefetch = [this, &store](CheckpointPrefetchSlot& slot,
-                                       std::uint64_t block_id) {
+  auto reader_for = [this, &store](std::uint64_t block_id) {
+    const auto shard = static_cast<std::uint16_t>(store.worker_->id());
+    if (!bycorf::SpdkStorageEnabled()) return shard;
+    const auto& owners = device_owners_[DeviceIndexForBlock(block_id)];
+    if (std::binary_search(owners.begin(), owners.end(), shard)) return shard;
+    return owners[block_id % owners.size()];
+  };
+  auto start_prefetch = [this, &store, &reader_for](
+                            CheckpointPrefetchSlot& slot,
+                            std::uint64_t block_id) {
+    // Preserve the local double-buffered path. A changed controller topology
+    // needs a remote read, which is awaited below before the slot is decoded
+    // or reused. Only the I/O worker accesses its completion state until the
+    // awaited handoff back to the shard.
+    if (reader_for(block_id) != store.worker_->id()) return;
     const auto [file_id, offset] = FileOffset(block_id);
     slot.Start(*store.worker_, store.files_[file_id], offset, block_id,
                checkpoint_root_.generation_, worker_count_);
@@ -2508,9 +2508,32 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   if (!result->body_blocks_.empty()) {
     start_prefetch(prefetch[0], result->body_blocks_[0]);
   }
+  std::size_t remote_reads = 0;
   for (std::size_t index = 0; index < result->body_blocks_.size(); ++index) {
     CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
-    auto candidate = co_await current.Wait();
+    const std::uint64_t block_id = result->body_blocks_[index];
+    const auto reader = reader_for(block_id);
+    CheckpointPrefetchSlot::Result candidate;
+    if (reader == store.worker_->id()) {
+      candidate = co_await current.Wait();
+    } else {
+      ++remote_reads;
+      // Only I/O moves to a worker with a qpair. The original shard retains
+      // its index and fragment stream, and SubmitTaskTo returns before it
+      // touches the DMA buffer or completion state again. No decoded keys
+      // cross workers and the durable checkpoint format is unchanged.
+      candidate = co_await bycorf::SubmitTaskTo(
+          reader,
+          [this, reader, block_id,
+           &current]() -> Task<CheckpointPrefetchSlot::Result> {
+            auto& io_store = *stores_[reader];
+            const auto [file_id, offset] = FileOffset(block_id);
+            current.Start(*io_store.worker_, io_store.files_[file_id], offset,
+                          block_id, checkpoint_root_.generation_,
+                          worker_count_);
+            co_return co_await current.Wait();
+          });
+    }
     if (!candidate.ok()) co_return candidate.status();
     if (index + 1 < result->body_blocks_.size()) {
       start_prefetch(prefetch[(index + 1) % prefetch.size()],
@@ -2526,6 +2549,12 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   }
   if (object_size != 0 || !object_bytes.empty())
     co_return absl::DataLossError("incomplete checkpoint object stream");
+  if (remote_reads != 0) {
+    spdlog::info(
+        "checkpoint shard={} delegated {} body reads to current SPDK "
+        "qpair owners",
+        store.worker_->id(), remote_reads);
+  }
   co_return absl::OkStatus();
 }
 
