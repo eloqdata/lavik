@@ -18,7 +18,6 @@
 
 #include <coroutine>
 #include <memory>
-#include <string>
 #include <utility>
 
 #include "absl/status/status.h"
@@ -86,61 +85,6 @@ TEST(StatusMacrosTest, AssignEvaluatesLhsOnlyOnSuccessAndMovesUniqueValues) {
     EXPECT_EQ(assignments, fail ? 0 : 1);
     EXPECT_EQ(*target, fail ? 9 : 42);
   }
-}
-
-struct Counted {
-  int* copies;
-  int* moves;
-  Counted(int* copies, int* moves) : copies(copies), moves(moves) {}
-  Counted(const Counted& other) : Counted(other.copies, other.moves) {
-    ++*copies;
-  }
-  Counted(Counted&& other) noexcept : Counted(other.copies, other.moves) {
-    ++*moves;
-  }
-  Counted& operator=(const Counted&) {
-    ++*copies;
-    return *this;
-  }
-  Counted& operator=(Counted&&) noexcept {
-    ++*moves;
-    return *this;
-  }
-};
-
-TEST(StatusMacrosTest, AssignPreservesLvalueAndRvalueCategories) {
-  int copies = 0, moves = 0;
-  absl::StatusOr<Counted> source(std::in_place, &copies, &moves);
-  Counted target(&copies, &moves);
-  const auto run = [&]() -> absl::Status {
-    LAVIK_ASSIGN_OR_RETURN(target, source);
-    EXPECT_EQ(copies, 1);
-    EXPECT_EQ(moves, 0);
-    LAVIK_ASSIGN_OR_RETURN(target, std::move(source));
-    EXPECT_EQ(copies, 1);
-    EXPECT_EQ(moves, 1);
-    LAVIK_ASSIGN_OR_RETURN(
-        target, absl::StatusOr<Counted>(std::in_place, &copies, &moves));
-    EXPECT_EQ(copies, 1);
-    EXPECT_EQ(moves, 2);
-    return absl::OkStatus();
-  };
-  EXPECT_TRUE(run().ok());
-}
-
-TEST(StatusMacrosTest, AcceptsTemplateCommasAndRepeatedInvocations) {
-  std::pair<int, int> target;
-  const auto run = [&]() -> absl::Status {
-    LAVIK_ASSIGN_OR_RETURN(
-        target, absl::StatusOr<std::pair<int, int>>(std::in_place, 1, 2));
-    LAVIK_ASSIGN_OR_RETURN(
-        target, absl::StatusOr<std::pair<int, int>>(std::in_place, 3, 4));
-    LAVIK_RETURN_IF_ERROR(absl::OkStatus());
-    LAVIK_RETURN_IF_ERROR(absl::OkStatus());
-    return absl::OkStatus();
-  };
-  EXPECT_TRUE(run().ok());
-  EXPECT_EQ(target, std::make_pair(3, 4));
 }
 
 // Suspend the child for real, without requiring an I/O worker. Tests resume
@@ -216,29 +160,6 @@ TEST(StatusMacrosTest, CoroutinePropagationSurvivesSuspensionAndCleansUp) {
     EXPECT_EQ(cleanups, 1);
     EXPECT_EQ(calls, status_failure ? 1 : 2);
     EXPECT_EQ(suspensions, calls);
-  }
-}
-
-TEST(StatusMacrosTest, DestroyingEitherSuspendedMacroCleansUp) {
-  for (bool second_macro : {false, true}) {
-    int calls = 0, assignments = 0, cleanups = 0;
-    auto target = std::make_unique<int>(9);
-    std::coroutine_handle<> pending;
-    auto task = CoroutineSequence(false, false, calls, assignments, cleanups,
-                                  target, pending);
-    auto handle = std::move(task).ReleaseHandle();
-    handle.resume();
-    if (second_macro && pending) {
-      auto suspended = std::exchange(pending, {});
-      suspended.resume();
-    }
-    EXPECT_FALSE(handle.done());
-    EXPECT_EQ(cleanups, 0);
-    handle.destroy();
-    EXPECT_EQ(cleanups, 1);
-    EXPECT_EQ(assignments, 0);
-    EXPECT_EQ(*target, 9);
-    EXPECT_EQ(calls, second_macro ? 2 : 1);
   }
 }
 

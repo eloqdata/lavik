@@ -18,64 +18,49 @@
 
 #include <utility>
 
-// Evaluate an absl::Status expression once and return its error unchanged.
-// The containing function must accept absl::Status as its return value.
-#define LAVIK_RETURN_IF_ERROR(...)                                          \
-  LAVIK_INTERNAL_STATUS_RETURN(                                             \
-      LAVIK_INTERNAL_STATUS_CONCAT(lavik_status_result_, __LINE__), return, \
-      auto&&, __VA_ARGS__)
+// These macros expand the usual `auto result = expr; check; return/assign`
+// sequence. Each expression runs once. Owning the result also keeps co_await
+// safe when a temporary Bycorf Task releases its frame after the initializer.
+// Passing an existing result copies it; use std::move to consume it instead.
 
-// Coroutine counterpart of LAVIK_RETURN_IF_ERROR. The promise must accept
-// absl::Status through co_return; expr may itself contain co_await. Own the
-// result: Bycorf await_resume returns a reference into a temporary Task frame,
-// which is destroyed at the end of the initializer's full expression.
-#define LAVIK_CO_RETURN_IF_ERROR(...)                                          \
-  LAVIK_INTERNAL_STATUS_RETURN(                                                \
-      LAVIK_INTERNAL_STATUS_CONCAT(lavik_status_result_, __LINE__), co_return, \
-      auto, __VA_ARGS__)
-
-// Evaluate an absl::StatusOr expression once, returning its error or assigning
-// its value to an existing lhs. Declarations are not supported: the macro is
-// one scoped statement. lhs is evaluated only on success. Rvalue results move
-// their value; lvalues retain their value category (use std::move explicitly
-// to consume them). Parenthesize lhs if it contains a preprocessor comma.
-// A reference/view in lhs must not outlive the result object it borrows from.
-#define LAVIK_ASSIGN_OR_RETURN(lhs, ...)                                    \
-  LAVIK_INTERNAL_STATUS_ASSIGN(                                             \
-      LAVIK_INTERNAL_STATUS_CONCAT(lavik_status_result_, __LINE__), return, \
-      auto&&, lhs, __VA_ARGS__)
-
-// Coroutine counterpart of LAVIK_ASSIGN_OR_RETURN. Own the StatusOr result
-// before a temporary Task can destroy its frame, just like `auto r = co_await
-// task`. Explicitly move an existing move-only StatusOr lvalue to consume it.
-// The promise must accept the propagated absl::Status.
-#define LAVIK_ASSIGN_OR_CO_RETURN(lhs, ...)                                    \
-  LAVIK_INTERNAL_STATUS_ASSIGN(                                                \
-      LAVIK_INTERNAL_STATUS_CONCAT(lavik_status_result_, __LINE__), co_return, \
-      auto, lhs, __VA_ARGS__)
-
-#define LAVIK_INTERNAL_STATUS_CONCAT_INNER(a, b) a##b
-#define LAVIK_INTERNAL_STATUS_CONCAT(a, b) \
-  LAVIK_INTERNAL_STATUS_CONCAT_INNER(a, b)
-
-// Ordinary expressions borrow lvalues and extend prvalue lifetimes; reference
-// results must have an owner that outlives the statement. Coroutine expressions
-// instead materialize the result before their awaitable owner is destroyed.
-// Forwarding preserves the selected ownership and the original error payload.
-#define LAVIK_INTERNAL_STATUS_RETURN(result, return_keyword, binding, ...) \
-  do {                                                                     \
-    binding result = (__VA_ARGS__);                                        \
-    if (!result.ok()) {                                                    \
-      return_keyword std::forward<decltype(result)>(result);               \
-    }                                                                      \
+// Propagate an absl::Status error from an ordinary function.
+#define LAVIK_RETURN_IF_ERROR(...)                     \
+  do {                                                 \
+    auto lavik_internal_status_result = (__VA_ARGS__); \
+    if (!lavik_internal_status_result.ok()) {          \
+      return lavik_internal_status_result;             \
+    }                                                  \
   } while (false)
 
-#define LAVIK_INTERNAL_STATUS_ASSIGN(result, return_keyword, binding, lhs, \
-                                     ...)                                  \
-  do {                                                                     \
-    binding result = (__VA_ARGS__);                                        \
-    if (!result.ok()) {                                                    \
-      return_keyword std::forward<decltype(result)>(result).status();      \
-    }                                                                      \
-    (lhs) = *std::forward<decltype(result)>(result);                       \
+// Propagate an absl::Status error from a coroutine whose promise accepts it.
+#define LAVIK_CO_RETURN_IF_ERROR(...)                  \
+  do {                                                 \
+    auto lavik_internal_status_result = (__VA_ARGS__); \
+    if (!lavik_internal_status_result.ok()) {          \
+      co_return lavik_internal_status_result;          \
+    }                                                  \
+  } while (false)
+
+// Propagate a StatusOr error or move its value into an existing lhs. lhs is
+// evaluated only on success; declarations are not supported. A borrowed view
+// assigned to lhs must not outlive its owner. Parenthesize lhs if it has
+// commas.
+#define LAVIK_ASSIGN_OR_RETURN(lhs, ...)                       \
+  do {                                                         \
+    auto lavik_internal_status_result = (__VA_ARGS__);         \
+    if (!lavik_internal_status_result.ok()) {                  \
+      return std::move(lavik_internal_status_result).status(); \
+    }                                                          \
+    (lhs) = *std::move(lavik_internal_status_result);          \
+  } while (false)
+
+// Coroutine counterpart of LAVIK_ASSIGN_OR_RETURN; the promise must accept
+// the propagated absl::Status. The expression may contain co_await.
+#define LAVIK_ASSIGN_OR_CO_RETURN(lhs, ...)                       \
+  do {                                                            \
+    auto lavik_internal_status_result = (__VA_ARGS__);            \
+    if (!lavik_internal_status_result.ok()) {                     \
+      co_return std::move(lavik_internal_status_result).status(); \
+    }                                                             \
+    (lhs) = *std::move(lavik_internal_status_result);             \
   } while (false)
