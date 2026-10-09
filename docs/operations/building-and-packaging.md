@@ -57,16 +57,18 @@ CPU instruction-set and glibc requirements remain separate constraints.
 `--registered-buffer-mb-per-worker` sets each data worker's storage-buffer pool
 budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
 8 MiB write buffers by default; the remaining budget supplies read slots.
-`--storage-read-buffer-kb` defaults to a 32 KiB read payload, plus 4 KiB each
-of headroom and tailroom. These startup options also work as Redis-style
+`--storage-read-buffer-kb` is the total slot size, including framing space.
+The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
+4 KiB of tailroom. Values must be multiples of 4 KiB and greater than 8 KiB.
+These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
 at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
 Registration covers these existing allocations; a retry does not move slots
-or allocate a second pool. The configured read size still excludes framing
-headroom and tailroom.
+or allocate a second pool. The default pool uses one registered region shared
+by 1024 read slots and four write slots; no sentinel entry is reserved.
 
 The pool first attempts full registration. If io_uring rejects it, Lavik uses
 the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in KiB) divided

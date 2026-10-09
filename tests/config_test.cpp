@@ -880,6 +880,19 @@ TEST(RedisConfigTest, RequiresNodeIdAndMetaSeedWhenManaged) {
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 }
 
+TEST(RedisConfigTest, ReadSlotSizeIncludesFraming) {
+  ServerOptions options;
+  EXPECT_EQ(options.storage_read_buffer_bytes_, 32 * 1024);
+  for (const std::size_t kib : {0, 4, 8, 9, 13}) {
+    options.storage_read_buffer_bytes_ = kib * 1024;
+    EXPECT_FALSE(ValidateServerOptions(options).ok()) << kib;
+  }
+  for (const std::size_t kib : {12, 32, 2048}) {
+    options.storage_read_buffer_bytes_ = kib * 1024;
+    EXPECT_TRUE(ValidateServerOptions(options).ok()) << kib;
+  }
+}
+
 TEST(RedisConfigTest, RejectsClusterWithReplicationUpstream) {
   ServerOptions options;
   options.node_id_ = "0123456789abcdef0123456789abcdef01234567";

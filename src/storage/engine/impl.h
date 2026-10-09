@@ -1429,8 +1429,9 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
         .size_ = buffer.size(),
         .index_ = registered_buffer.index_,
     };
-    if (target.index_ == 0 || target.data_ == nullptr ||
-        target.size_ > registered_buffer.size_) {
+    // Registration state is explicit; index zero is a valid arena, independent
+    // of the pool's zero release-id sentinel for overflow buffers.
+    if (target.data_ == nullptr || target.size_ > registered_buffer.size_) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "invalid registered write buffer");
     }

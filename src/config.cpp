@@ -41,6 +41,7 @@
 #include "absl/strings/str_split.h"
 #include "bycorf/runtime/cross_core.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/storage/buffer_pool.h"
 
 namespace lavik {
 namespace {
@@ -795,6 +796,15 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   if (options.storage_write_buffer_count_ == 0) {
     return absl::InvalidArgumentError(
         "storage write buffer count must be nonzero");
+  }
+  storage::RegisteredBufferPoolOptions buffers;
+  buffers.read_slot_bytes_ = options.storage_read_buffer_bytes_;
+  if (buffers.read_payload_bytes() == 0 ||
+      buffers.read_slot_bytes_ % buffers.alignment_ != 0 ||
+      buffers.read_slot_bytes_ > std::numeric_limits<std::uint32_t>::max()) {
+    return absl::InvalidArgumentError(
+        "storage-read-buffer-kb must be a 4 KiB multiple greater than 8 KiB "
+        "and fit the 32-bit slot size");
   }
   if (options.shard_count_ > std::numeric_limits<std::size_t>::max() /
                                  storage::kStorageBlockBytes ||

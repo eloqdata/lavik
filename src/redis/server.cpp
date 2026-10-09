@@ -2301,7 +2301,7 @@ int RunServer(ServerOptions options) {
   storage_options.buffers_.registered_bytes_ = options.registered_buffer_bytes_;
   storage_options.buffers_.storage_write_buffer_count_ =
       options.storage_write_buffer_count_;
-  storage_options.buffers_.read_payload_bytes_ =
+  storage_options.buffers_.read_slot_bytes_ =
       options.storage_read_buffer_bytes_;
   RecoveryMemoryBudget recovery_memory;
   storage::StorageEngine storage(std::move(storage_options));

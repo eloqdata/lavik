@@ -47,10 +47,20 @@ struct RegisteredBufferPoolOptions {
   // and direct-I/O alignment, without reserving a large slot for every small
   // read. Oversized records and whole-value assembly use reusable overflow
   // buffers; the group target is not a hard allocation limit.
-  std::size_t read_payload_bytes_ = 32 * kKiB;
+  // Total slot size includes both framing margins.
+  std::size_t read_slot_bytes_ = 32 * kKiB;
   std::size_t read_headroom_bytes_ = 4 * kKiB;
   std::size_t read_tailroom_bytes_ = 4 * kKiB;
   std::size_t alignment_ = 4 * kKiB;
+
+  // Capacity available to disk I/O; zero means the slot cannot fit framing.
+  std::size_t read_payload_bytes() const noexcept {
+    if (read_slot_bytes_ <= read_headroom_bytes_ ||
+        read_slot_bytes_ - read_headroom_bytes_ <= read_tailroom_bytes_) {
+      return 0;
+    }
+    return read_slot_bytes_ - read_headroom_bytes_ - read_tailroom_bytes_;
+  }
 };
 
 class RegisteredBufferPool;
@@ -75,6 +85,7 @@ class ReadBufferLease {
   // Pool ownership is immutable after Init; do not duplicate it in every
   // lease moved through the direct-GET coroutine chain.
   unsigned owner_worker() const noexcept;
+  // Pool release id; fixed I/O uses io_buffer().index_, which can be zero.
   std::uint16_t buffer_id() const noexcept {
     return (release_token_ & kOverflowTokenBit) == 0
                ? static_cast<std::uint16_t>(release_token_)
@@ -237,8 +248,6 @@ class RegisteredBufferPool {
   std::size_t registered_read_count_ = 0;
   std::size_t registered_write_count_ = 0;
   RegisteredBufferPoolOptions options_{};
-  std::byte* sentinel_buffer_ = nullptr;
-  std::size_t sentinel_buffer_bytes_ = 0;
   std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;
@@ -261,7 +270,10 @@ class RegisteredBufferPool {
 };
 
 inline bool ReadBufferLease::registered() const noexcept {
-  return pool_ != nullptr && pool_->buffer_registered(buffer_id());
+  // Full registration is the common case. Overflow leases have no fixed slot
+  // even then; only partial registration needs the per-slot prefix check.
+  return pool_ != nullptr && buffer_id() != 0 &&
+         (pool_->buffers_registered() || pool_->buffer_registered(buffer_id()));
 }
 
 inline unsigned ReadBufferLease::owner_worker() const noexcept {
