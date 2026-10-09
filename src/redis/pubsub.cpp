@@ -796,10 +796,15 @@ bool PubSubSession::Unsubscribe(std::string_view channel) {
 }
 
 void PubSubSession::UnsubscribeAll() {
-  const std::vector<std::string> channels = channel_order_;
-  for (const std::string& channel : channels) {
-    (void)Unsubscribe(channel);
+  if (channels_.empty()) return;
+  // Clear the order vector once; retain set capacity for later subscriptions.
+  for (const std::string& channel : channel_order_) {
+    RemoveFromChannel(channel);
+    channels_.erase(channel);
   }
+  channel_order_.clear();
+  if (subscription_count() == 0)
+    SubscriberCount(version_).fetch_sub(1, std::memory_order_relaxed);
 }
 
 bool PubSubSession::PSubscribe(std::string_view pattern) {
@@ -833,10 +838,15 @@ bool PubSubSession::PUnsubscribe(std::string_view pattern) {
 }
 
 void PubSubSession::PUnsubscribeAll() {
-  const std::vector<std::string> patterns = pattern_order_;
-  for (const std::string& pattern : patterns) {
-    (void)PUnsubscribe(pattern);
+  if (patterns_.empty()) return;
+  // Clear the order vector once; retain set capacity for later subscriptions.
+  for (const std::string& pattern : pattern_order_) {
+    RemoveFromPattern(pattern);
+    patterns_.erase(pattern);
   }
+  pattern_order_.clear();
+  if (subscription_count() == 0)
+    SubscriberCount(version_).fetch_sub(1, std::memory_order_relaxed);
 }
 
 bool PubSubSession::Enqueue(const std::shared_ptr<const std::string>& encoded) {
