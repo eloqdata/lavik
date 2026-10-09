@@ -938,6 +938,13 @@ if (BUILD_TESTING)
   find_program(LAVIK_PYTHON3_EXECUTABLE NAMES python3)
   if (LAVIK_PYTHON3_EXECUTABLE)
     add_test(
+      NAME meta_integration.startup_probes
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_startup_probes.py)
+    set_tests_properties(meta_integration.startup_probes PROPERTIES
+      LABELS meta-integration TIMEOUT 15)
+
+    add_test(
       NAME meta_integration.sentinel_recovery_probe
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_sentinel_recovery_probe.py)

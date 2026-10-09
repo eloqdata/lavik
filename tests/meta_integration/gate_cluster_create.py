@@ -148,17 +148,25 @@ def cluster_status(meta, admin=None):
     # These fixtures publish loopback TCP endpoints. A UDS seed can become a
     # follower during creation, so authorize the CLI to follow its leader.
     # Explicit transport/TLS cases keep their own admin arguments.
-    result = subprocess.run(
-        [CTL, "cluster-status", "--json"]
-        + (
-            admin
-            if admin is not None
-            else ["--socket", meta.ctl_path, "--allow-plaintext-admin"]
-        ),
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    # Give the CLI time to report an unavailable cluster before the process
+    # watchdog fires. Equal five-second deadlines race during initial identity
+    # reconciliation, when the CLI legitimately retries leader_not_caught_up.
+    try:
+        result = subprocess.run(
+            [CTL, "cluster-status", "--json", "--timeout-ms", "4000"]
+            + (
+                admin
+                if admin is not None
+                else ["--socket", meta.ctl_path, "--allow-plaintext-admin"]
+            ),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as error:
+        # A delayed process is a failed probe, so bounded fixture polling and
+        # alternate-seed discovery can retry it just like other ctl failures.
+        raise H.Failure(f"cluster-status process timed out: {error}") from error
     if result.returncode not in (0, 2):
         raise H.Failure(f"cluster-status failed: {result}")
     return json.loads(result.stdout)
