@@ -19,6 +19,7 @@
 
 #include "../impl.h"
 #include "lavik/random_sample.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 
 namespace lavik::storage {
@@ -110,11 +111,10 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
   if (pop) {
     GroupedScratchBudget budget;
     for (const auto& selection : selected) {
-      const auto added = add_page(&budget, selection.id_);
-      if (!added.ok()) co_return added;
+      LAVIK_CO_RETURN_IF_ERROR(add_page(&budget, selection.id_));
     }
     auto admission = budget.Reserve(4);
-    if (!admission.ok()) co_return admission.status();
+    LAVIK_CO_RETURN_IF_ERROR(admission.status());
     write_scratch.emplace(std::move(*admission));
   }
   HashValue remaining;
@@ -128,15 +128,14 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     std::optional<MemoryReservation> page_scratch;
     if (!pop) {
       GroupedScratchBudget budget;
-      const auto added = add_page(&budget, selection.id_);
-      if (!added.ok()) co_return added;
+      LAVIK_CO_RETURN_IF_ERROR(add_page(&budget, selection.id_));
       auto admission = budget.Reserve(1);
-      if (!admission.ok()) co_return admission.status();
+      LAVIK_CO_RETURN_IF_ERROR(admission.status());
       page_scratch.emplace(std::move(*admission));
     }
     auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                  digest, object, selection.id_);
-    if (!loaded.ok()) co_return loaded.status();
+    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
     auto& entries = loaded->snapshot_.value_.entries_;
     std::size_t duplicate_bytes = 0;
     for (auto i = selection.begin_; i < selection.end_; ++i) {
@@ -226,7 +225,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
                                    tx, 0, nullptr, nullptr, replication, true,
                                    nullptr, mutation_precondition);
   }
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   co_return result;
 }
 

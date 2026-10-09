@@ -25,6 +25,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/status_macros.h"
 #include "spdlog/sinks/rotating_file_sink.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
@@ -60,8 +61,7 @@ absl::Status ValidateLoggingOptions(const LoggingOptions& options) {
 }
 
 absl::Status InitializeLogging(const LoggingOptions& options) {
-  const absl::Status validated = ValidateLoggingOptions(options);
-  if (!validated.ok()) return validated;
+  LAVIK_RETURN_IF_ERROR(ValidateLoggingOptions(options));
 
   try {
     std::vector<spdlog::sink_ptr> sinks;

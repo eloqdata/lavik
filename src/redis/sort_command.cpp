@@ -37,6 +37,7 @@
 #include "lavik/cluster/runtime.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/transaction.h"
@@ -208,7 +209,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       operation.second_ = -1;
       auto result = co_await g_storage->ExecuteListLocked(
           db_id, key.name_, key.digest_, operation);
-      if (!result.ok()) co_return result.status();
+      LAVIK_CO_RETURN_IF_ERROR(result.status());
       source.elements_ = std::move(result->values_);
       co_return source;
     }
@@ -217,7 +218,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       operation.kind_ = storage::HashOperationKind::kKeys;
       auto result = co_await g_storage->ExecuteSetLocked(
           db_id, key.name_, key.digest_, operation);
-      if (!result.ok()) co_return result.status();
+      LAVIK_CO_RETURN_IF_ERROR(result.status());
       source.elements_.reserve(result->values_.size());
       for (auto& member : result->values_) {
         if (!member.has_value()) {
@@ -228,10 +229,9 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       co_return source;
     }
     if (info.value_type_ == storage::ValueType::kSortedSet) {
-      auto members =
-          co_await ZSetMembersSnapshotLocked(db_id, key.name_, key.digest_);
-      if (!members.ok()) co_return members.status();
-      source.elements_ = std::move(*members);
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          source.elements_,
+          co_await ZSetMembersSnapshotLocked(db_id, key.name_, key.digest_));
       co_return source;
     }
     co_return absl::FailedPreconditionError(
@@ -332,7 +332,7 @@ Task<absl::StatusOr<std::optional<std::string>>> LookupPatternValue(
     co_return cached->second;
   }
   auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys);
-  if (!value.ok()) co_return value.status();
+  LAVIK_CO_RETURN_IF_ERROR(value.status());
   cache->emplace(std::move(cache_key), *value);
   co_return *value;
 }
@@ -349,10 +349,10 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
         .value_ = std::move(element), .comparison_ = std::nullopt, .score_ = 0};
     if (!options.dont_sort_) {
       if (options.by_.has_value()) {
-        auto comparison = co_await LookupPatternValue(
-            request.db_id_, *options.by_, item.value_, keys, &cache);
-        if (!comparison.ok()) co_return comparison.status();
-        item.comparison_ = std::move(*comparison);
+        LAVIK_ASSIGN_OR_CO_RETURN(
+            item.comparison_,
+            co_await LookupPatternValue(request.db_id_, *options.by_,
+                                        item.value_, keys, &cache));
       } else {
         item.comparison_ = item.value_;
       }
@@ -435,7 +435,7 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
       }
       auto value = co_await LookupPatternValue(request.db_id_, pattern,
                                                items[i].value_, keys, &cache);
-      if (!value.ok()) co_return value.status();
+      LAVIK_CO_RETURN_IF_ERROR(value.status());
       product.reply_values_.push_back(std::move(*value));
     }
   }
@@ -455,11 +455,10 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     // Reject obviously stale work before decoding/rebuilding the destination.
     // The storage precondition inherited through `writes` performs the
     // authoritative final check after every possible suspension.
-    const absl::Status authority = RecheckClusterRequestAuthority(request);
-    if (!authority.ok()) co_return authority;
+    LAVIK_CO_RETURN_IF_ERROR(RecheckClusterRequestAuthority(request));
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, destination.name_, destination.digest_, writes);
-    if (!deleted.ok()) co_return deleted.status();
+    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
     if (values.empty()) co_return *deleted;
     storage::ListOperation push;
     push.kind_ = storage::ListOperationKind::kPushRight;
@@ -467,7 +466,7 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     for (const std::string& value : values) push.values_.push_back(value);
     auto pushed = co_await g_storage->ExecuteListLocked(
         request.db_id_, destination.name_, destination.digest_, push, writes);
-    if (!pushed.ok()) co_return pushed.status();
+    LAVIK_CO_RETURN_IF_ERROR(pushed.status());
     co_return true;
   };
   if (destination.owner_ == ThisWorker().id_) co_return co_await replace();

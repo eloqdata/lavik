@@ -44,6 +44,7 @@
 #include "lavik/glob.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 
 namespace lavik {
 using namespace bycorf;
@@ -474,7 +475,7 @@ class CapturePubSubOperation
     absl::StatusOr<std::shared_ptr<CapturedPubSubPublication>> await_resume()
         const {
       for (const absl::Status& error : operation_->errors_) {
-        if (!error.ok()) return error;
+        LAVIK_RETURN_IF_ERROR(error);
       }
       return operation_->publication_;
     }

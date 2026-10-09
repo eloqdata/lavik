@@ -16,6 +16,7 @@
 
 #include "impl.h"
 #include "lavik/metrics.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -77,11 +78,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
     state->live_bytes_ = 0;
     if (state->pins_ != 0 || state->freeing_) {
       store.store_state_mutex_.Unlock(*store.worker_);
-      absl::Status waited = co_await bycorf::SleepFor(
-          *store.worker_, std::chrono::milliseconds(1));
-      if (!waited.ok()) {
-        co_return waited;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
       continue;
     }
     state->freeing_ = true;
@@ -128,17 +126,12 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtents(
             co_return co_await ReclaimExtentLocal(*stores_[owner], ref);
           });
     }
-    if (!freed.ok()) {
-      co_return freed.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(freed.status());
     if (*freed) {
       released.push_back(ref.block_id_);
     }
   }
-  absl::Status returned = co_await ReturnColdBlocks(std::move(released));
-  if (!returned.ok()) {
-    co_return returned;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await ReturnColdBlocks(std::move(released)));
   space_reclaim_generation_.fetch_add(1, std::memory_order_release);
   co_return absl::OkStatus();
 }
@@ -422,7 +415,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     // Rehashing a multi-megabyte key for every small group dominates GC and
     // the shutdown that joins it, especially in unoptimized builds.
     auto handle = co_await FindIndirectKey(record.key_id_);
-    if (!handle.ok()) co_return handle.status();
+    LAVIK_CO_RETURN_IF_ERROR(handle.status());
     digest = (*handle)->digest_;
   } else {
     digest = ComputeDigest(key);
@@ -438,10 +431,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       }
       auto* root = index.Find(digest, key);
       if (root != nullptr && !root->key_complete()) {
-        auto verified =
-            co_await FindVerifiedEntry(key_store, index, digest, key);
-        if (!verified.ok()) co_return verified.status();
-        root = *verified;
+        LAVIK_ASSIGN_OR_CO_RETURN(
+            root, co_await FindVerifiedEntry(key_store, index, digest, key));
       }
       if (root == nullptr || !root->value_.grouped()) {
         co_return GroupedObject::Handle{};
@@ -455,14 +446,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
               .index_generation_ =
                   partition.grouped_generations_[record.db_id_],
           });
-      if (!found.ok()) co_return found.status();
+      LAVIK_CO_RETURN_IF_ERROR(found.status());
       if ((*found)->incarnation() != record.group_incarnation_) {
         co_return GroupedObject::Handle{};
       }
       co_return *found;
     };
     auto object = co_await lookup_object();
-    if (!object.ok()) co_return object.status();
+    LAVIK_CO_RETURN_IF_ERROR(object.status());
     if (*object == nullptr) {
       co_return std::optional<RelocationDurabilityFence>{};
     }
@@ -513,9 +504,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
         .external_ = record.external_,
         .key_indirect_ = record.key_indirect_,
     };
-    absl::Status written =
-        co_await WriteRecordLocked(key_store, record_write, extents);
-    if (!written.ok()) co_return written;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await WriteRecordLocked(key_store, record_write, extents));
     // Physical allocation can suspend owner serialization. Re-resolve the
     // incarnation and exact group address afterward; a client update, another
     // relocation or FLUSHDB must not be overwritten by this staged copy.
@@ -523,9 +513,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     if (!object.ok() || *object == nullptr ||
         (group = (*object)->FindRecord(id)) == nullptr ||
         !MaterializeIndexLocation(*group).SamePhysicalRecord(source_location)) {
-      absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
-      if (!dead.ok()) co_return dead;
-      if (!object.ok()) co_return object.status();
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await MarkRecordDead(RetiredRecordOf(relocated)));
+      LAVIK_CO_RETURN_IF_ERROR(object.status());
       co_return std::optional<RelocationDurabilityFence>{};
     }
     auto replacement = GroupedObject::RelocateGroup(
@@ -534,24 +524,23 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       // A failed metadata admission owns only the new physical record, not
       // another reference to the shared value extents. Leave the old graph
       // current and release that unreachable record without reclaiming data.
-      absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
-      if (!dead.ok()) co_return dead;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await MarkRecordDead(RetiredRecordOf(relocated)));
       co_return replacement.status();
     }
     absl::Status published = partition.grouped_objects_[record.db_id_].Publish(
         digest, key, *object, std::move(*replacement));
     if (!published.ok()) {
-      absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(relocated));
-      if (!dead.ok()) co_return dead;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await MarkRecordDead(RetiredRecordOf(relocated)));
       co_return published;
     }
     LAVIK_MAYBE_CRASH_AT("hash-group-defrag-copy-staged");
     // The salvage caller retains the source block and owes this destination
     // fence before clearing its bitmap bit, just as for a top-level record.
     // Unchanged extent ownership transfers to the new group record.
-    absl::Status dead =
-        co_await MarkRecordDead(RetiredRecordOf(source_location));
-    if (!dead.ok()) co_return dead;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await MarkRecordDead(RetiredRecordOf(source_location)));
     co_return std::optional<RelocationDurabilityFence>(
         RelocationDurabilityFence{
             .block_id_ = relocated.block_id(),
@@ -607,13 +596,12 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
             .replication_epoch_ = partition.replication_epoch_,
             .index_generation_ = partition.grouped_generations_[record.db_id_],
         });
-    if (!object.ok()) co_return object.status();
-    auto prepared = GroupedObject::PrepareRootRelocation(*object);
-    if (!prepared.ok()) co_return prepared.status();
-    grouped_builder = std::move(*prepared);
+    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_ASSIGN_OR_CO_RETURN(grouped_builder,
+                              GroupedObject::PrepareRootRelocation(*object));
     auto publication =
         partition.grouped_objects_[record.db_id_].PreparePublish(key, *object);
-    if (!publication.ok()) co_return publication.status();
+    LAVIK_CO_RETURN_IF_ERROR(publication.status());
     grouped_publication.emplace(std::move(*publication));
     grouped_descriptor.prepared_root_ = &grouped_builder;
     grouped_descriptor.publication_ = &*grouped_publication;
@@ -650,9 +638,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     // source stays uncleaned this pass rather than resurrecting stale state.
     co_return std::optional<RelocationDurabilityFence>{};
   }
-  if (!written.ok()) {
-    co_return written;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(written);
   // The index now names the copied record, but its relocation fence has
   // not been awaited. A crash here must still find a complete durable source.
   if (record.grouped_) {
@@ -991,10 +977,9 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     std::string loaded_key;
     if (record.key_indirect_) [[unlikely]] {
       auto handle = co_await FindIndirectKey(record.key_id_);
-      if (!handle.ok()) co_return handle.status();
-      auto original = co_await LoadIndirectKey(std::move(*handle));
-      if (!original.ok()) co_return original.status();
-      loaded_key = std::move(*original);
+      LAVIK_CO_RETURN_IF_ERROR(handle.status());
+      LAVIK_ASSIGN_OR_CO_RETURN(loaded_key,
+                                co_await LoadIndirectKey(std::move(*handle)));
       if (loaded_key.size() != record.key_bytes_)
         co_return absl::DataLossError("indirect key length mismatch");
       disk_key = loaded_key;

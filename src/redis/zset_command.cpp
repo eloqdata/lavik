@@ -41,6 +41,7 @@
 #include "lavik/memory.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 #include "lavik/tx/transaction.h"
 
@@ -320,11 +321,10 @@ absl::StatusOr<std::string> Encode(const ZSet& set) {
   std::string out;
   std::size_t bytes = 8;
   for (const auto& element : set) {
-    auto next = storage::AppendOrderedEntrySize(
-        storage::OrderedCollectionKind::kSortedSet, bytes,
-        element.member_.size(), out.max_size());
-    if (!next.ok()) return next.status();
-    bytes = *next;
+    LAVIK_ASSIGN_OR_RETURN(
+        bytes, storage::AppendOrderedEntrySize(
+                   storage::OrderedCollectionKind::kSortedSet, bytes,
+                   element.member_.size(), out.max_size()));
   }
   out.reserve(bytes);
   out.append(kMagic);
@@ -555,7 +555,7 @@ Task<absl::StatusOr<storage::SortedSetResult>> PopZSetLocked(
           .reverse_ = maximum,
           .pop_count_ = count},
       tx, nullptr, mutation_precondition_ptr);
-  if (!popped.ok()) co_return popped.status();
+  LAVIK_CO_RETURN_IF_ERROR(popped.status());
   if (!popped->members_.empty() && popped->length_ != 0) {
     if (request != nullptr) {
       NotifyZSetBlockingKey(*request, key);
@@ -595,7 +595,7 @@ Task<absl::Status> SingleShardPopCallback(void* opaque,
         context->request_->db_id_, context->request_->args_[argument],
         locked->digest_, context->shape_->maximum_, context->shape_->count_,
         nullptr, context->request_);
-    if (!popped.ok()) co_return popped.status();
+    LAVIK_CO_RETURN_IF_ERROR(popped.status());
     if (!popped->members_.empty()) {
       context->selected_arg_ = argument;
       context->popped_ = std::move(*popped);
@@ -921,8 +921,7 @@ absl::Status ValidateRangeSyntax(
       else if (EqualCi(args[i], "withscores"))
         options.with_scores_ = true;
       else if (EqualCi(args[i], "limit")) {
-        absl::Status parsed = ParseRangeLimit(args, i, &options);
-        if (!parsed.ok()) return parsed;
+        LAVIK_RETURN_IF_ERROR(ParseRangeLimit(args, i, &options));
         i += 3;
         continue;
       } else {
@@ -950,8 +949,7 @@ absl::Status ValidateRangeSyntax(
         options.with_scores_ = true;
         ++i;
       } else if (EqualCi(args[i], "limit")) {
-        absl::Status parsed = ParseRangeLimit(args, i, &options);
-        if (!parsed.ok()) return parsed;
+        LAVIK_RETURN_IF_ERROR(ParseRangeLimit(args, i, &options));
         i += 3;
       } else {
         return absl::InvalidArgumentError("syntax error");
@@ -986,8 +984,8 @@ absl::Status ValidateRangeSyntax(
     }
   } else if (options.mode_ == RangeOptions::Mode::kScore) {
     auto min = ParseScoreBound(min_text), max = ParseScoreBound(max_text);
-    if (!min.ok()) return min.status();
-    if (!max.ok()) return max.status();
+    LAVIK_RETURN_IF_ERROR(min.status());
+    LAVIK_RETURN_IF_ERROR(max.status());
     if (normalized) {
       normalized->range_mode_ = storage::SortedSetRangeMode::kScore;
       normalized->minimum_score_ = {min->value_, min->exclusive_};
@@ -995,8 +993,8 @@ absl::Status ValidateRangeSyntax(
     }
   } else {
     auto min = ParseLexBound(min_text), max = ParseLexBound(max_text);
-    if (!min.ok()) return min.status();
-    if (!max.ok()) return max.status();
+    LAVIK_RETURN_IF_ERROR(min.status());
+    LAVIK_RETURN_IF_ERROR(max.status());
     if (normalized) {
       normalized->range_mode_ = storage::SortedSetRangeMode::kLex;
       normalized->minimum_lex_ = {min->value_, min->infinity_, min->exclusive_};
@@ -1011,12 +1009,12 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
   if (IsRangeCommand(request.kind_)) return ValidateRangeSyntax(request);
   if (request.kind_ == CommandKind::kZCount) {
     auto min = ParseScoreBound(args[2]), max = ParseScoreBound(args[3]);
-    if (!min.ok()) return min.status();
+    LAVIK_RETURN_IF_ERROR(min.status());
     return max.ok() ? absl::OkStatus() : max.status();
   }
   if (request.kind_ == CommandKind::kZLexCount) {
     auto min = ParseLexBound(args[2]), max = ParseLexBound(args[3]);
-    if (!min.ok()) return min.status();
+    LAVIK_RETURN_IF_ERROR(min.status());
     return max.ok() ? absl::OkStatus() : max.status();
   }
   if (request.kind_ == CommandKind::kZPopMin ||
@@ -1063,7 +1061,7 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
     return absl::InvalidArgumentError("syntax error");
   } else if (request.kind_ == CommandKind::kGeoDist && args.size() == 5) {
     auto unit = UnitMeters(args[4]);
-    if (!unit.ok()) return unit.status();
+    LAVIK_RETURN_IF_ERROR(unit.status());
   }
   return absl::OkStatus();
 }
@@ -1339,7 +1337,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     auto callback = [&](std::optional<storage::CompactValueView> value)
         -> absl::StatusOr<storage::CompactValueUpdate> {
       auto decoded = Decode(value);
-      if (!decoded.ok()) return decoded.status();
+      LAVIK_RETURN_IF_ERROR(decoded.status());
       const ZSet& set = *decoded;
       if (center_by_member) {
         const Element* center = Find(set, center_member);
@@ -1709,8 +1707,7 @@ absl::Status ComputeRangeStore(const CommandRequest& request,
       options.reverse_ = true;
       ++i;
     } else if (EqualCi(args[i], "limit")) {
-      absl::Status parsed = ParseRangeLimit(args, i, &options);
-      if (!parsed.ok()) return parsed;
+      LAVIK_RETURN_IF_ERROR(ParseRangeLimit(args, i, &options));
       i += 3;
     } else {
       return absl::InvalidArgumentError("syntax error");
@@ -1734,16 +1731,16 @@ absl::Status ComputeRangeStore(const CommandRequest& request,
       selected.push_back(options.reverse_ ? source.size() - 1 - i : i);
   } else if (options.mode_ == RangeOptions::Mode::kScore) {
     auto min = ParseScoreBound(min_text), max = ParseScoreBound(max_text);
-    if (!min.ok()) return min.status();
-    if (!max.ok()) return max.status();
+    LAVIK_RETURN_IF_ERROR(min.status());
+    LAVIK_RETURN_IF_ERROR(max.status());
     for (std::size_t i = 0; i < source.size(); ++i)
       if (AboveMin(source[i].score_, *min) && BelowMax(source[i].score_, *max))
         selected.push_back(i);
     if (options.reverse_) std::reverse(selected.begin(), selected.end());
   } else {
     auto min = ParseLexBound(min_text), max = ParseLexBound(max_text);
-    if (!min.ok()) return min.status();
-    if (!max.ok()) return max.status();
+    LAVIK_RETURN_IF_ERROR(min.status());
+    LAVIK_RETURN_IF_ERROR(max.status());
     selected.resize(source.size());
     std::iota(selected.begin(), selected.end(), 0);
     std::sort(selected.begin(), selected.end(),
@@ -2027,7 +2024,7 @@ absl::Status PrepareMultiContext(MultiContext* context, std::size_t arguments) {
     return absl::ResourceExhaustedError("OOM Sorted Set context size overflow");
   auto admission = ReserveZSetScratch(
       arguments * slot_bytes + workers * sizeof(storage::TxShardWrites), 0, 2);
-  if (!admission.ok()) return admission.status();
+  LAVIK_RETURN_IF_ERROR(admission.status());
   context->inputs_.resize(arguments);
   context->input_charges_.resize(arguments);
   context->weights_.reserve(arguments);
@@ -2114,7 +2111,7 @@ absl::Status ComputeMultiUnchecked(MultiContext* context) {
     if (!context->store_shape_)
       return absl::InternalError("missing GEO STORE destination");
     auto query = ParseGeoStoreQuery(*context->request_, *context->store_shape_);
-    if (!query.ok()) return query.status();
+    LAVIK_RETURN_IF_ERROR(query.status());
     return ComputeGeoStore(context->inputs_[context->first_source_], *query,
                            &context->output_);
   }
@@ -2195,7 +2192,7 @@ absl::Status ComputeMulti(MultiContext* context) {
   constexpr auto limit = std::numeric_limits<std::size_t>::max();
   for (const auto& input : context->inputs_) {
     const auto retained = ZSetRetainedBytes(input);
-    if (!retained.ok()) return retained.status();
+    LAVIK_RETURN_IF_ERROR(retained.status());
     if (*retained > limit - bytes || input.size() > limit - count)
       return absl::ResourceExhaustedError(
           "OOM Sorted Set aggregate size overflow");
@@ -2205,7 +2202,7 @@ absl::Status ComputeMulti(MultiContext* context) {
   // Covers score-map keys/nodes, selection indexes, output copies and
   // canonical replication effects before any destination is deleted.
   auto admission = ReserveZSetScratch(bytes, count, 4);
-  if (!admission.ok()) return admission.status();
+  LAVIK_RETURN_IF_ERROR(admission.status());
   struct ClearOnFailure {
     MultiContext* context_;
     bool published_ = false;
@@ -2217,8 +2214,7 @@ absl::Status ComputeMulti(MultiContext* context) {
       std::vector<std::string>{}.swap(context_->replacement_args_);
     }
   } cleanup{context};
-  auto computed = ComputeMultiUnchecked(context);
-  if (!computed.ok()) return computed;
+  LAVIK_RETURN_IF_ERROR(ComputeMultiUnchecked(context));
   if (context->store_) {
     auto effects = BuildZSetReplacement(*context->request_,
                                         context->store_shape_->destination_arg_,
@@ -2230,7 +2226,7 @@ absl::Status ComputeMulti(MultiContext* context) {
           EncodeReplicationCommandEffects(std::move(effects));
   }
   auto retained = ZSetRetainedBytes(context->output_);
-  if (!retained.ok()) return retained.status();
+  LAVIK_RETURN_IF_ERROR(retained.status());
   auto add_strings = [&](const std::vector<std::string>& strings) {
     if (strings.capacity() > (limit - *retained) / sizeof(std::string))
       return false;
@@ -2271,16 +2267,16 @@ Task<absl::Status> ReplaceMultiDestination(
   const std::string& destination = request.args_[destination_arg];
   if (writes == nullptr) writes = LocalWrites(*context);
   const auto bytes = ZSetRetainedBytes(context->output_);
-  if (!bytes.ok()) co_return bytes.status();
+  LAVIK_CO_RETURN_IF_ERROR(bytes.status());
   auto admission = ReserveZSetScratch(*bytes, context->output_.size(), 6);
-  if (!admission.ok()) co_return admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(admission.status());
   // Encode and admit destination-local decode/planner headroom before DEL.
   // Errors after DEL are returned to the existing transaction undo owner.
   auto encoded = Encode(context->output_);
-  if (!encoded.ok()) co_return encoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
   auto deleted = co_await g_storage->DeleteLocked(request.db_id_, destination,
                                                   digest, writes);
-  if (!deleted.ok()) co_return deleted.status();
+  LAVIK_CO_RETURN_IF_ERROR(deleted.status());
   if (context->output_.empty()) co_return absl::OkStatus();
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
@@ -2302,11 +2298,11 @@ absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
                                  ZSet* input, ZSetInputCharge* charge) {
   auto admission = ReserveZSetScratch(value ? value->encoded_.size() : 0,
                                       value ? value->logical_size_ : 0);
-  if (!admission.ok()) return admission.status();
+  LAVIK_RETURN_IF_ERROR(admission.status());
   auto decoded = Decode(value);
-  if (!decoded.ok()) return decoded.status();
+  LAVIK_RETURN_IF_ERROR(decoded.status());
   const auto retained = ZSetRetainedBytes(*decoded);
-  if (!retained.ok()) return retained.status();
+  LAVIK_RETURN_IF_ERROR(retained.status());
   if (admission->bytes() && *retained > admission->bytes())
     return absl::ResourceExhaustedError(
         "OOM Sorted Set input exceeds admission");
@@ -2321,8 +2317,7 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
   ZSet input;
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = DecodeRetainedInput(value, &input, charge);
-    if (!decoded.ok()) return decoded;
+    LAVIK_RETURN_IF_ERROR(DecodeRetainedInput(value, &input, charge));
     return NoChange();
   };
   absl::Status status = co_await g_storage->ExecuteCompactLocked(
@@ -2336,7 +2331,7 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
   operation.kind_ = storage::HashOperationKind::kKeys;
   auto members =
       co_await g_storage->ExecuteSetLocked(db_id, key, digest, operation);
-  if (!members.ok()) co_return members.status();
+  LAVIK_CO_RETURN_IF_ERROR(members.status());
   std::size_t string_bytes = 0;
   for (const auto& member : members->values_) {
     if (!member)
@@ -2349,7 +2344,7 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
   const bool transfer = members->retained_charge_.bytes() >= string_bytes;
   auto admission =
       ReserveZSetScratch(transfer ? 0 : string_bytes, members->values_.size());
-  if (!admission.ok()) co_return admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(admission.status());
   input.reserve(members->values_.size());
   for (auto& member : members->values_) {
     if (!member.has_value())
@@ -2370,13 +2365,11 @@ Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(
   ZSet input;
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
-    auto decoded = DecodeRetainedInput(value, &input, charge);
-    if (!decoded.ok()) return decoded;
+    LAVIK_RETURN_IF_ERROR(DecodeRetainedInput(value, &input, charge));
     return NoChange();
   };
-  absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(co_await g_storage->ExecuteCompactLocked(
+      db_id, key, digest, storage::ValueType::kSortedSet, true, callback));
   co_return input;
 }
 
@@ -2401,12 +2394,11 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
           request.db_id_, request.args_[key.arg_index_], key.digest_,
           &context->input_charges_[key.arg_index_]);
     }
-    if (!input.ok()) co_return input.status();
+    LAVIK_CO_RETURN_IF_ERROR(input.status());
     context->inputs_[key.arg_index_] = std::move(*input);
   }
   if (context->single_shard_ && context->store_) {
-    absl::Status computed = ComputeMulti(context);
-    if (!computed.ok()) co_return computed;
+    LAVIK_CO_RETURN_IF_ERROR(ComputeMulti(context));
     const storage::Digest destination = storage::ComputeDigest(
         request.args_[context->store_shape_->destination_arg_]);
     absl::Status replaced =
@@ -2475,9 +2467,9 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
       -> absl::StatusOr<storage::CompactValueUpdate> {
     auto admission = ReserveZSetScratch(value ? value->encoded_.size() : 0,
                                         value ? value->logical_size_ : 0, 2);
-    if (!admission.ok()) return admission.status();
+    LAVIK_RETURN_IF_ERROR(admission.status());
     auto decoded = Decode(value);
-    if (!decoded.ok()) return decoded.status();
+    LAVIK_RETURN_IF_ERROR(decoded.status());
     result.key_exists_ = value.has_value();
     result.length_ = decoded->size();
     result.values_.reserve(decoded->size() * (with_scores ? 2 : 1));
@@ -2503,10 +2495,9 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
     result.retained_charge_.Adopt(&*admission, retained);
     return NoChange();
   };
-  absl::Status status = co_await g_storage->ExecuteCompactLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await g_storage->ExecuteCompactLocked(
       db_id, key, digest, storage::ValueType::kSortedSet, true, callback, tx,
-      now_ms);
-  if (!status.ok()) co_return status;
+      now_ms));
   co_return result;
 }
 
@@ -2518,7 +2509,7 @@ Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest) {
   auto elements = co_await ReadZSetOnlyLocked(db_id, key, digest);
-  if (!elements.ok()) co_return elements.status();
+  LAVIK_CO_RETURN_IF_ERROR(elements.status());
   Sort(&*elements);
   std::vector<std::string> members;
   members.reserve(elements->size());
@@ -2927,7 +2918,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
             request.db_id_, args[argument], key->digest_,
             &context.input_charges_[argument]);
       }
-      if (!input.ok()) co_return input.status();
+      LAVIK_CO_RETURN_IF_ERROR(input.status());
       context.inputs_[argument] = std::move(*input);
       co_return absl::OkStatus();
     };

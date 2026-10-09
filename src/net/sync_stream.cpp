@@ -37,6 +37,7 @@
 #include <utility>
 
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::net {
 namespace {
@@ -182,10 +183,7 @@ absl::StatusOr<FileDescriptor> Connect(int family, const sockaddr* address,
   if (fd.get() < 0) return ErrnoStatus("socket");
   if (::connect(fd.get(), address, length) == 0) return fd;
   if (errno != EINPROGRESS) return ErrnoStatus("connect");
-  if (absl::Status ready = WaitFor(fd.get(), POLLOUT, deadline, "connect");
-      !ready.ok()) {
-    return ready;
-  }
+  LAVIK_RETURN_IF_ERROR(WaitFor(fd.get(), POLLOUT, deadline, "connect"));
   int error = 0;
   socklen_t error_size = sizeof(error);
   if (::getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &error, &error_size) != 0) {
@@ -240,7 +238,7 @@ absl::StatusOr<SocketEndpoint> ParseEndpoint(std::string_view text) {
 absl::Status PlainWriteAll(int fd, std::string_view bytes,
                            IoDeadline deadline) {
   while (!bytes.empty()) {
-    if (auto status = CheckDeadline(deadline); !status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(CheckDeadline(deadline));
     const ssize_t written =
         ::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
     if (written > 0) {
@@ -249,10 +247,7 @@ absl::Status PlainWriteAll(int fd, std::string_view bytes,
     }
     if (written < 0 && errno == EINTR) continue;
     if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      if (absl::Status ready = WaitFor(fd, POLLOUT, deadline, "write");
-          !ready.ok()) {
-        return ready;
-      }
+      LAVIK_RETURN_IF_ERROR(WaitFor(fd, POLLOUT, deadline, "write"));
       continue;
     }
     return ErrnoStatus("write");
@@ -333,14 +328,11 @@ absl::StatusOr<SslSession> StartTls(SSL_CTX* context, int fd,
     return OpenSslStatus("configure TLS server IP");
   }
   while (true) {
-    if (auto status = CheckDeadline(deadline); !status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(CheckDeadline(deadline));
     errno = 0;
     const int result = SSL_connect(raw);
     if (result == 1) break;
-    if (absl::Status ready = WaitForSsl(raw, result, deadline, "TLS handshake");
-        !ready.ok()) {
-      return ready;
-    }
+    LAVIK_RETURN_IF_ERROR(WaitForSsl(raw, result, deadline, "TLS handshake"));
   }
   if (SSL_get_verify_result(raw) != X509_V_OK) {
     return absl::PermissionDeniedError(
@@ -352,7 +344,7 @@ absl::StatusOr<SslSession> StartTls(SSL_CTX* context, int fd,
 absl::Status TlsWriteAll(SSL* ssl, std::string_view bytes,
                          IoDeadline deadline) {
   while (!bytes.empty()) {
-    if (auto status = CheckDeadline(deadline); !status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(CheckDeadline(deadline));
     const int amount = static_cast<int>(std::min<std::size_t>(
         bytes.size(),
         static_cast<std::size_t>(std::numeric_limits<int>::max())));
@@ -362,10 +354,7 @@ absl::Status TlsWriteAll(SSL* ssl, std::string_view bytes,
       bytes.remove_prefix(static_cast<std::size_t>(written));
       continue;
     }
-    if (absl::Status ready = WaitForSsl(ssl, written, deadline, "TLS write");
-        !ready.ok()) {
-      return ready;
-    }
+    LAVIK_RETURN_IF_ERROR(WaitForSsl(ssl, written, deadline, "TLS write"));
   }
   return absl::OkStatus();
 }
@@ -389,7 +378,7 @@ struct SyncStream::Impl {
       return count;
     }
     while (true) {
-      if (auto status = CheckDeadline(deadline_); !status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(CheckDeadline(deadline_));
       errno = 0;
       const auto received =
           tls_ ? SSL_read(tls_->get(), buffer.data(),
@@ -401,19 +390,15 @@ struct SyncStream::Impl {
           return absl::UnavailableError(
               "server closed before terminating its reply");
         }
-        if (auto status =
-                WaitForSsl(tls_->get(), received, deadline_, "TLS read");
-            !status.ok())
-          return status;
+        LAVIK_RETURN_IF_ERROR(
+            WaitForSsl(tls_->get(), received, deadline_, "TLS read"));
       } else {
         if (received == 0)
           return absl::UnavailableError(
               "server closed before terminating its reply");
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return ErrnoStatus("read");
-        if (auto status = WaitFor(fd_.get(), POLLIN, deadline_, "read");
-            !status.ok())
-          return status;
+        LAVIK_RETURN_IF_ERROR(WaitFor(fd_.get(), POLLIN, deadline_, "read"));
       }
     }
   }
@@ -425,7 +410,7 @@ SyncStream::~SyncStream() = default;
 absl::StatusOr<std::unique_ptr<SyncStream>> SyncStream::Connect(
     const SyncTarget& target, SyncDeadline deadline, int cancel_fd) {
   const IoDeadline io_deadline{deadline, cancel_fd};
-  if (auto status = CheckDeadline(io_deadline); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(CheckDeadline(io_deadline));
   std::optional<SocketEndpoint> endpoint;
   auto connect = [&]() -> absl::StatusOr<FileDescriptor> {
     if (target.transport_ == SyncTarget::Transport::kUnix) {
@@ -435,22 +420,20 @@ absl::StatusOr<std::unique_ptr<SyncStream>> SyncStream::Connect(
         target.transport_ != SyncTarget::Transport::kTcpMtls) {
       return absl::InvalidArgumentError("unsupported synchronous transport");
     }
-    auto parsed = ParseEndpoint(target.endpoint_);
-    if (!parsed.ok()) return parsed.status();
-    endpoint = *parsed;
+    LAVIK_ASSIGN_OR_RETURN(endpoint, ParseEndpoint(target.endpoint_));
     return net::Connect(endpoint->family_,
                         reinterpret_cast<const sockaddr*>(&endpoint->address_),
                         endpoint->length_, io_deadline);
   };
   auto fd = connect();
-  if (!fd.ok()) return fd.status();
+  LAVIK_RETURN_IF_ERROR(fd.status());
   auto impl = std::make_unique<Impl>(Impl{std::move(*fd), {}, {}, io_deadline});
   if (target.transport_ == SyncTarget::Transport::kTcpMtls) {
     auto context = MakeTlsContext(target.tls_);
-    if (!context.ok()) return context.status();
+    LAVIK_RETURN_IF_ERROR(context.status());
     auto session = StartTls(context->get(), impl->fd_.get(), *endpoint,
                             target.tls_, io_deadline);
-    if (!session.ok()) return session.status();
+    LAVIK_RETURN_IF_ERROR(session.status());
     impl->tls_context_.emplace(std::move(*context));
     impl->tls_.emplace(std::move(*session));
   }

@@ -22,6 +22,7 @@
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/replication_command.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -179,16 +180,12 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     auto& index = partition.indexes_[db_id];
     found = index.Find(digest, key);
     if (found != nullptr && !found->key_complete()) [[unlikely]] {
-      auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-      if (!resolved.ok()) {
-        co_return resolved.status();
-      }
-      found = *resolved;
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          found, co_await FindVerifiedEntry(store, index, digest, key));
     }
   }
   bool exists = found != nullptr && found->value_.kind() == RecordKind::kValue;
-  const auto readable = ValidateGroupedRead(partition, db_id, key, found);
-  if (!readable.ok()) co_return readable;
+  LAVIK_CO_RETURN_IF_ERROR(ValidateGroupedRead(partition, db_id, key, found));
   // Expiry metadata is out-of-line and uncommon in the no-TTL workload. Do
   // not read wall time for the ordinary overwrite path; it is irrelevant when
   // the index entry cannot expire.
@@ -206,13 +203,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      MaterializeIndexLocation(*found),
                                      ExtentsFor(store, found));
-    if (!loaded.ok()) {
-      co_return loaded.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
     auto encoded = EncodeDiskValue(std::move(*loaded));
-    if (!encoded.ok()) {
-      co_return encoded.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
     result.old_value_.emplace(std::move(*encoded));
   }
 
@@ -242,7 +235,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
 #endif
   );
   if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   result.applied_ = true;
   if (trace != nullptr) trace->replication_done_ns_ = SetTraceNowNanos();
   co_return result;
@@ -275,11 +268,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
-    }
-    found = *resolved;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        found, co_await FindVerifiedEntry(store, index, digest, key));
   }
   const std::uint64_t now_ms = UnixTimeMillis();
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
@@ -309,11 +299,10 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
 
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
-    absl::Status status = co_await AppendLocked(
+    LAVIK_CO_RETURN_IF_ERROR(co_await AppendLocked(
         store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
         ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true,
-        nullptr, mutation_precondition);
-    if (!status.ok()) co_return status;
+        nullptr, mutation_precondition));
     co_return true;
   }
 
@@ -325,28 +314,22 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
                  .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                  .replication_epoch_ = partition.replication_epoch_,
                  .index_generation_ = partition.grouped_generations_[db_id]});
-    if (!view.ok()) co_return view.status();
-    const auto updated = co_await UpdateGroupedExpirationLocked(
+    LAVIK_CO_RETURN_IF_ERROR(view.status());
+    LAVIK_CO_RETURN_IF_ERROR(co_await UpdateGroupedExpirationLocked(
         store, partition, db_id, key, digest, *view, expire_at_ms, tx,
-        replication, mutation_precondition);
-    if (!updated.ok()) co_return updated;
+        replication, mutation_precondition));
     co_return true;
   }
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    previous, ExtentsFor(store, found));
-  if (!loaded.ok()) {
-    co_return loaded.status();
-  }
+  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
   const std::span<const std::byte> value_bytes = loaded->value();
   std::string_view value(reinterpret_cast<const char*>(value_bytes.data()),
                          value_bytes.size());
-  absl::Status status = co_await AppendLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await AppendLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       previous.value_type(), expire_at_ms, tx, previous.logical_size_, nullptr,
-      nullptr, replication, true, nullptr, mutation_precondition);
-  if (!status.ok()) {
-    co_return status;
-  }
+      nullptr, replication, true, nullptr, mutation_precondition));
   co_return true;
 }
 
@@ -375,21 +358,17 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
-    }
-    found = *resolved;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        found, co_await FindVerifiedEntry(store, index, digest, key));
   }
   if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
     co_return false;
   }
   const bool expired = IsExpiredNow(*found);
-  absl::Status status = co_await AppendLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await AppendLocked(
       store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
       ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true, nullptr,
-      mutation_precondition);
-  if (!status.ok()) co_return status;
+      mutation_precondition));
   co_return !expired;
 }
 
@@ -440,12 +419,11 @@ StorageEngine::Impl::RestoreRawValueLocked(
     if (!exists) co_return RestoreRawResult{};
     auto deleted = co_await DeleteLocked(db_id, key, digest, tx, replication,
                                          mutation_precondition);
-    if (!deleted.ok()) co_return deleted.status();
+    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
-  absl::Status written = co_await WriteRawValueLocked(
-      db_id, key, digest, value, tx, replication, mutation_precondition);
-  if (!written.ok()) co_return written;
+  LAVIK_CO_RETURN_IF_ERROR(co_await WriteRawValueLocked(
+      db_id, key, digest, value, tx, replication, mutation_precondition));
   co_return RestoreRawResult{.changed_ = true};
 }
 
@@ -624,9 +602,8 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
           co_await CurrentStore().durability_progress_.Wait();
 #endif
         } else {
-          const auto waited = co_await bycorf::SleepFor(
-              *CurrentStore().worker_, std::chrono::microseconds(50));
-          if (!waited.ok()) co_return waited;
+          LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+              *CurrentStore().worker_, std::chrono::microseconds(50)));
         }
       }
       if (next_predecessor) {
@@ -674,9 +651,8 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   LAVIK_MAYBE_CRASH_AT("tx-commit-append");
   WorkerStore& store = CurrentStore();
   LAVIK_FAULT_INJECT({
-    const auto gated = co_await PauseGroupedDecisionForTest(
-        *store.worker_, store.durability_progress_, shards, true);
-    if (!gated.ok()) co_return gated;
+    LAVIK_CO_RETURN_IF_ERROR(co_await PauseGroupedDecisionForTest(
+        *store.worker_, store.durability_progress_, shards, true));
   });
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
@@ -687,11 +663,8 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       .tx_ = commit_receipt,
       .kind_ = RecordKind::kTxCommit,
   };
-  absl::Status written = co_await WriteRecordLocked(
-      store, record_write, nullptr, std::move(retirements));
-  if (!written.ok()) {
-    co_return written;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await WriteRecordLocked(
+      store, record_write, nullptr, std::move(retirements)));
   std::uint64_t dataset_changes = 0;
   for (const TxShardWrites* shard : shards) {
     if (shard != nullptr) dataset_changes += shard->dataset_changes_;
@@ -723,19 +696,18 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       });
   if (grouped) {
     unlock.Unlock();
-    auto durable = co_await AwaitRelocationDurable(RelocationDurabilityFence{
-        .block_id_ = commit_location.block_id(),
-        .allocation_epoch_ = commit_location.allocation_epoch(),
-        .block_owner_ = commit_location.block_owner(),
-        .committed_bytes_ =
-            static_cast<std::uint32_t>(commit_location.record_offset() +
-                                       commit_location.total_disk_bytes()),
-    });
-    if (!durable.ok()) co_return durable;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await AwaitRelocationDurable(RelocationDurabilityFence{
+            .block_id_ = commit_location.block_id(),
+            .allocation_epoch_ = commit_location.allocation_epoch(),
+            .block_owner_ = commit_location.block_owner(),
+            .committed_bytes_ =
+                static_cast<std::uint32_t>(commit_location.record_offset() +
+                                           commit_location.total_disk_bytes()),
+        }));
     LAVIK_FAULT_INJECT({
-      const auto gated = co_await PauseGroupedDecisionForTest(
-          *store.worker_, store.durability_progress_, shards, false);
-      if (!gated.ok()) co_return gated;
+      LAVIK_CO_RETURN_IF_ERROR(co_await PauseGroupedDecisionForTest(
+          *store.worker_, store.durability_progress_, shards, false));
     });
     for (auto* shard : shards) {
       if (shard != nullptr && shard->grouped_decision_ != nullptr) {
@@ -1304,10 +1276,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     const auto applied = MaterializeIndexLocation(*current);
     std::string external_key;
     if (!current->key_complete()) {
-      auto loaded = co_await LoadOutOfIndexKey(store, applied,
-                                               current->logical_key_size());
-      if (!loaded.ok()) co_return loaded.status();
-      external_key = std::move(*loaded);
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          external_key, co_await LoadOutOfIndexKey(
+                            store, applied, current->logical_key_size()));
     }
     const auto key = current->key_complete() ? current->key()
                                              : std::string_view(external_key);
@@ -1318,9 +1289,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     auto grouped =
         partition.grouped_objects_[entry->db_id_].CurrentForMutation(key);
     if (grouped) {
-      const auto removed =
-          partition.grouped_objects_[entry->db_id_].Erase(key, grouped);
-      if (!removed.ok()) co_return removed;
+      LAVIK_CO_RETURN_IF_ERROR(
+          partition.grouped_objects_[entry->db_id_].Erase(key, grouped));
     }
     if (applied.kind() == RecordKind::kValue) {
       --partition.live_key_count_[entry->db_id_];
@@ -1375,7 +1345,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     }
     co_await store.store_state_mutex_.Lock();
     unlock.Adopt();
-    if (!dead.ok()) co_return dead;
+    LAVIK_CO_RETURN_IF_ERROR(dead);
   }
   co_return absl::OkStatus();
 }
@@ -1734,18 +1704,14 @@ StorageEngine::Impl::WriteExtentValueLocked(
     ++state.pins_;
     auto write_extent = [&]() -> Task<absl::Status> {
       LAVIK_FAULT_INJECT(if (extent_index == 0) {
-        const auto paused = co_await PauseGroupedWriteForTest(
-            *store.worker_, fault_key, "extent");
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(co_await PauseGroupedWriteForTest(
+            *store.worker_, fault_key, "extent"));
       });
       std::fill_n(staging.data_, kStorageBlockBytes, std::byte{0});
       std::size_t copied = 0;
       if (cursor != nullptr) {
-        auto copied_status = cursor->Read(std::span<std::byte>(
-            staging.data_ + kBlockHeaderBytes, payload_bytes));
-        if (!copied_status.ok()) {
-          co_return copied_status;
-        }
+        LAVIK_CO_RETURN_IF_ERROR(cursor->Read(std::span<std::byte>(
+            staging.data_ + kBlockHeaderBytes, payload_bytes)));
         copied = payload_bytes;
       }
       while (copied < payload_bytes) {
@@ -1989,9 +1955,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
     auto extents =
         co_await WriteExtentValueLocked(store, std::string_view{}, value);
-    if (!extents.ok()) {
-      co_return extents.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(extents.status());
     if (value_type == ValueType::kHash) {
       LAVIK_MAYBE_CRASH_AT("hash-extents-durable-before-root");
     }
@@ -2670,7 +2634,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         auto paused = co_await bycorf::SleepFor(
             *store.worker_, std::chrono::milliseconds(1000));
         co_await store.store_state_mutex_.Lock();
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(paused);
       });
   // Re-resolve the active stream after allocation waits; another writer may
   // have installed a successor while store_state_mutex_ was released.
@@ -2709,11 +2673,11 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   };
   IndirectKeyHandle indirect_key;
   if (request.key_indirect_) {
-    auto resolved = co_await EnsureIndirectKey(
-        store, request.key_, request.digest_, request.tx_, request.for_defrag_,
-        request.unlock_writer_while_waiting_);
-    if (!resolved.ok()) co_return resolved.status();
-    indirect_key = std::move(*resolved);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        indirect_key,
+        co_await EnsureIndirectKey(store, request.key_, request.digest_,
+                                   request.tx_, request.for_defrag_,
+                                   request.unlock_writer_while_waiting_));
   }
   // The UUID was bound to the original key's slot when created. Checking its
   // slot avoids rehashing a multi-megabyte key for every auxiliary segment.
@@ -2769,15 +2733,12 @@ acquire_active_stream:
       allocated = co_await AcquireWriteBlock(
           store, request.for_defrag_, request.unlock_writer_while_waiting_);
     }
-    if (!allocated.ok()) {
-      co_return allocated.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(allocated.status());
     // Recheck after allocation released the store lock: a maintenance path
     // may have installed a successor, or another writer consumed the tail.
     if (active_stream().has_value() &&
         active_stream()->committed_bytes_ + total_disk_bytes <= append_limit) {
-      absl::Status returned = co_await return_reserved(*allocated);
-      if (!returned.ok()) co_return returned;
+      LAVIK_CO_RETURN_IF_ERROR(co_await return_reserved(*allocated));
       continue;
     }
     if (active_stream().has_value()) {
@@ -2801,8 +2762,7 @@ acquire_active_stream:
           // across an atomic rewrite cannot wait for a flush that needs the
           // same lock. Their concurrency is separately bounded.
           if (!store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
-            absl::Status returned = co_await return_reserved(*allocated);
-            if (!returned.ok()) co_return returned;
+            LAVIK_CO_RETURN_IF_ERROR(co_await return_reserved(*allocated));
             co_return absl::Status(absl::StatusCode::kResourceExhausted,
                                    "no storage write buffer is available");
           }
@@ -2823,8 +2783,7 @@ acquire_active_stream:
           // return both resources and let the outer loop append to it.
           if (active_stream().has_value()) {
             store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-            absl::Status returned = co_await return_reserved(*allocated);
-            if (!returned.ok()) co_return returned;
+            LAVIK_CO_RETURN_IF_ERROR(co_await return_reserved(*allocated));
             continue;
           }
         }
@@ -2842,8 +2801,7 @@ acquire_active_stream:
         } else {
           store.buffers_.ReleaseHeapWriteBuffer(heap_buffer);
         }
-        absl::Status returned = co_await return_reserved(*allocated);
-        if (!returned.ok()) co_return returned;
+        LAVIK_CO_RETURN_IF_ERROR(co_await return_reserved(*allocated));
         co_return absl::Status(absl::StatusCode::kInternal,
                                "active write staging allocation is invalid");
       }
@@ -2925,12 +2883,10 @@ acquire_active_stream:
     previous_entry = index_ptr->Find(request.digest_, request.key_);
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
-      auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
-                                                 request.digest_, request.key_);
-      if (!resolved.ok()) {
-        co_return resolved.status();
-      }
-      previous_entry = *resolved;
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          previous_entry,
+          co_await FindVerifiedEntry(store, *index_ptr, request.digest_,
+                                     request.key_));
     }
   }
   if (!auxiliary && request.relocation_ != nullptr &&
@@ -2968,10 +2924,10 @@ acquire_active_stream:
                          : nullptr;
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
-      auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
-                                                 request.digest_, request.key_);
-      if (!resolved.ok()) co_return resolved.status();
-      previous_entry = *resolved;
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          previous_entry,
+          co_await FindVerifiedEntry(store, *index_ptr, request.digest_,
+                                     request.key_));
     }
     if (request.explicit_root_ != nullptr &&
         request.explicit_root_->reject_older_sequence_ &&
@@ -2996,7 +2952,7 @@ acquire_active_stream:
                 partition_ptr->grouped_generations_[request.db_id_],
         },
         /*allow_failed=*/request.replacement_undo_ != nullptr);
-    if (!old_view.ok()) co_return old_view.status();
+    LAVIK_CO_RETURN_IF_ERROR(old_view.status());
     auto pinned = co_await PrepinGroupedRetirementsLocked(
         store, *old_view,
         grouped_root &&
@@ -3028,13 +2984,12 @@ acquire_active_stream:
         auto paused = co_await bycorf::SleepFor(
             *store.worker_, std::chrono::milliseconds(1000));
         co_await store.store_state_mutex_.Lock();
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(paused);
       }
     });
-    auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
-                                               request.digest_, request.key_);
-    if (!resolved.ok()) co_return resolved.status();
-    previous_entry = *resolved;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        previous_entry, co_await FindVerifiedEntry(
+                            store, *index_ptr, request.digest_, request.key_));
   }
   // FindVerifiedEntry and the RDB old-value capture may release the store
   // mutex. Another writer can fill and seal this worker's append stream while
@@ -3130,7 +3085,7 @@ acquire_active_stream:
             writer_id, true, request.external_, request.key_indirect_, false,
             false, txid != 0, request.kind_, request.value_type_,
             request.expire_at_ms_ != 0, true));
-    const auto prepared = request.group_->prepare_root_(GroupedObjectVersion{
+    LAVIK_CO_RETURN_IF_ERROR(request.group_->prepare_root_(GroupedObjectVersion{
         .root_ = provisional,
         .db_epoch_ =
             request.explicit_root_ != nullptr
@@ -3141,8 +3096,7 @@ acquire_active_stream:
                                   : partition_ptr->replication_epoch_,
         .index_generation_ =
             partition_ptr->grouped_generations_[request.db_id_],
-    });
-    if (!prepared.ok()) co_return prepared;
+    }));
   }
   GroupedObject::Handle previous_grouped;
   std::shared_ptr<std::vector<RetiredRecord>> grouped_retirements;
@@ -3154,18 +3108,19 @@ acquire_active_stream:
                             ? std::optional(request.group_->changed_groups_)
                             : std::nullopt;
   if (!request.for_defrag_ && previous && previous->grouped()) {
-    auto old_view = partition_ptr->grouped_objects_[request.db_id_].Lookup(
-        request.key_,
-        GroupedObjectVersion{
-            .root_ = *previous,
-            .db_epoch_ = EffectiveRecordDbEpoch(*partition_ptr, request.db_id_),
-            .replication_epoch_ = partition_ptr->replication_epoch_,
-            .index_generation_ =
-                partition_ptr->grouped_generations_[request.db_id_],
-        },
-        /*allow_failed=*/request.replacement_undo_ != nullptr);
-    if (!old_view.ok()) co_return old_view.status();
-    previous_grouped = std::move(*old_view);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        previous_grouped,
+        partition_ptr->grouped_objects_[request.db_id_].Lookup(
+            request.key_,
+            GroupedObjectVersion{
+                .root_ = *previous,
+                .db_epoch_ =
+                    EffectiveRecordDbEpoch(*partition_ptr, request.db_id_),
+                .replication_epoch_ = partition_ptr->replication_epoch_,
+                .index_generation_ =
+                    partition_ptr->grouped_generations_[request.db_id_],
+            },
+            /*allow_failed=*/request.replacement_undo_ != nullptr));
     if (request.tx_ != nullptr && previous->tx_tagged() &&
         (grouped_dependency_pins == nullptr ||
          !grouped_dependency_pins->Contains(RetiredRecordOf(*previous)))) {
@@ -3178,14 +3133,14 @@ acquire_active_stream:
       // Replacing a grouped graph also needs a shared failure decision: the
       // top-level root may be compact, but its old graph is still atomic.
       auto decision = PrepareGroupedDecision(*request.tx_);
-      if (!decision.ok()) co_return decision.status();
+      LAVIK_CO_RETURN_IF_ERROR(decision.status());
     }
     if (replacement_grouped != nullptr &&
         previous_grouped->incarnation() != replacement_grouped->incarnation())
       touched_groups.reset();
     auto retired = CollectGroupedRetirements(
         previous_grouped, replacement_grouped, touched_groups);
-    if (!retired.ok()) co_return retired.status();
+    LAVIK_CO_RETURN_IF_ERROR(retired.status());
     for (const auto& child : *retired) {
       if (child.tx_tagged_ && (grouped_dependency_pins == nullptr ||
                                !grouped_dependency_pins->Contains(child))) {
@@ -3203,7 +3158,7 @@ acquire_active_stream:
       request.tx_->collect_undo_ && replacement_grouped != nullptr) {
     auto discarded = CollectGroupedRetirements(
         replacement_grouped, previous_grouped, touched_groups);
-    if (!discarded.ok()) co_return discarded.status();
+    LAVIK_CO_RETURN_IF_ERROR(discarded.status());
     if (!discarded->empty())
       grouped_abort_retirements =
           std::make_shared<std::vector<RetiredRecord>>(std::move(*discarded));
@@ -3230,7 +3185,7 @@ acquire_active_stream:
   // the old GC copy outrank the later publication at the same command seq.
   // From here through index/side publication the owner never yields.
   auto allocated_lsn = AllocateLsn(store);
-  if (!allocated_lsn.ok()) co_return allocated_lsn.status();
+  LAVIK_CO_RETURN_IF_ERROR(allocated_lsn.status());
   const std::uint64_t lsn = *allocated_lsn;
   updated.max_lsn_ = std::max(updated.max_lsn_, lsn);
   LAVIK_FAULT_INJECT(
@@ -3249,8 +3204,7 @@ acquire_active_stream:
   }
   if (index_ptr != nullptr && effective_precondition != nullptr &&
       static_cast<bool>(*effective_precondition)) {
-    absl::Status admissible = effective_precondition->Validate();
-    if (!admissible.ok()) co_return admissible;
+    LAVIK_CO_RETURN_IF_ERROR(effective_precondition->Validate());
   }
   // Admit exceptional reference-directory allocations before publishing any
   // staging bytes. Ordinary keys do not touch these maps. A later encoding

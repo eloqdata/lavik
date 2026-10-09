@@ -20,6 +20,7 @@
 
 #include "lavik/meta/hash.h"
 #include "lavik/population_manifest_format.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -147,28 +148,28 @@ MetaPopulationManifestStore::Deserialize(std::string_view bytes) {
   }
   MetaReader reader(bytes);
   auto version = reader.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown population manifest schema version");
   }
   auto documents = reader.ReadCount(kMaxMetaPopulationManifestsInSnapshot);
-  if (!documents.ok()) return documents.status();
+  LAVIK_RETURN_IF_ERROR(documents.status());
 
   MetaPopulationManifestStore store;
   for (std::uint32_t i = 0; i < *documents; ++i) {
     auto digest = ReadFixedArray<32>(reader);
-    if (!digest.ok()) return digest.status();
+    LAVIK_RETURN_IF_ERROR(digest.status());
     auto entries = reader.ReadList<MetaPopulationManifestEntry>(
         kMaxMetaPopulationManifestEntries,
         [](MetaReader& item_reader)
             -> absl::StatusOr<MetaPopulationManifestEntry> {
           auto partition_id = item_reader.ReadU32();
-          if (!partition_id.ok()) return partition_id.status();
+          LAVIK_RETURN_IF_ERROR(partition_id.status());
           auto logical_epoch = item_reader.ReadU64();
-          if (!logical_epoch.ok()) return logical_epoch.status();
+          LAVIK_RETURN_IF_ERROR(logical_epoch.status());
           return MetaPopulationManifestEntry{*partition_id, *logical_epoch};
         });
-    if (!entries.ok()) return entries.status();
+    LAVIK_RETURN_IF_ERROR(entries.status());
     if (!IsCanonical(*entries) || !EntriesInDomain(*entries) ||
         CanonicalDigest(*entries) != *digest ||
         !store.documents_
@@ -179,7 +180,7 @@ MetaPopulationManifestStore::Deserialize(std::string_view bytes) {
       return MetaFailStopError("invalid population manifest snapshot");
     }
   }
-  if (auto status = reader.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(reader.Finish());
   return store;
 }
 

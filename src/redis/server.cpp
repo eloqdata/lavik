@@ -77,6 +77,7 @@
 #include "lavik/resp.h"
 #include "lavik/session.h"
 #include "lavik/slowlog.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/engine.h"
 #include "lavik/tx/tx_shard.h"
 #include "lavik/version.h"
@@ -603,7 +604,7 @@ bool RedisService::AdmitConnection(int fd, bool tls_endpoint) noexcept {
 
 absl::Status RedisService::SetMaxClients(std::uint64_t value) {
   auto allowed = MaxClientsAllowedByFileLimit(value);
-  if (!allowed.ok()) return allowed.status();
+  LAVIK_RETURN_IF_ERROR(allowed.status());
   if (*allowed < value) {
     return absl::ResourceExhaustedError(absl::StrCat(
         "maxclients ", value, " cannot preserve ",
@@ -691,7 +692,7 @@ Task<absl::Status> RedisService::ImportRdb() {
   }
 
   auto reader = rdb::FileReader::Open(load_rdb_file_);
-  if (!reader.ok()) co_return reader.status();
+  LAVIK_CO_RETURN_IF_ERROR(reader.status());
 
   // Validate every object before mutating storage. The open file is then
   // rewound and decoded a second time through bounded reads during application.
@@ -700,10 +701,9 @@ Task<absl::Status> RedisService::ImportRdb() {
   std::vector<std::string> function_libraries;
   while (true) {
     auto entry = reader->NextStreaming();
-    if (!entry.ok()) co_return entry.status();
+    LAVIK_CO_RETURN_IF_ERROR(entry.status());
     if (!entry->has_value()) break;
-    auto drained = reader->DrainCollection();
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(reader->DrainCollection());
     if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
       ++entry_count;
     } else if ((**entry).kind_ == rdb::FileEntryKind::kFunctionLibrary) {
@@ -712,16 +712,15 @@ Task<absl::Status> RedisService::ImportRdb() {
       ++skipped_count;
     }
   }
-  absl::Status functions_validated =
-      co_await ValidateLuaFunctionCatalog(function_libraries);
-  if (!functions_validated.ok()) co_return functions_validated;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await ValidateLuaFunctionCatalog(function_libraries));
   reader->Rewind();
 
   std::uint64_t imported = 0;
   std::uint64_t expired = 0;
   while (true) {
     auto next = reader->NextStreaming();
-    if (!next.ok()) co_return next.status();
+    LAVIK_CO_RETURN_IF_ERROR(next.status());
     if (!next->has_value()) break;
     rdb::FileEntry entry = std::move(**next);
     if (entry.kind_ != rdb::FileEntryKind::kValue) {
@@ -788,9 +787,8 @@ Task<absl::Status> RedisService::ImportRdb() {
     }
     const auto durability = co_await storage_->DurabilityStats();
     if (durability.tx_commits_pending_ == 0) break;
-    absl::Status slept = co_await bycorf::SleepFor(
-        *ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!slept.ok()) co_return slept;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (storage_->RuntimeFailureLatched()) {
     co_return absl::InternalError("storage failed during RDB import commit");
@@ -1175,13 +1173,11 @@ Task<absl::Status> WriteOrBatchReply(TcpStream& stream,
                                      ReadLatencyTrace read_trace = {},
                                      SetLatencyTrace set_trace = {}) {
   if (encoded.size() > kMaximumBatchedReplyBytes) {
-    absl::Status flushed = co_await FlushReplyBatch(stream, batch);
-    if (!flushed.ok()) co_return flushed;
+    LAVIK_CO_RETURN_IF_ERROR(co_await FlushReplyBatch(stream, batch));
   } else {
     if (!batch->empty() &&
         encoded.size() > kMaximumBatchedReplyBytes - batch->bytes_.size()) {
-      absl::Status flushed = co_await FlushReplyBatch(stream, batch);
-      if (!flushed.ok()) co_return flushed;
+      LAVIK_CO_RETURN_IF_ERROR(co_await FlushReplyBatch(stream, batch));
     }
     if (more_commands || !batch->empty()) {
       batch->Append(encoded, std::move(read_trace), std::move(set_trace));
@@ -1406,13 +1402,11 @@ Task<absl::Status> BreakStalledStream(StreamStallRef state, int fd) {
       ::shutdown(fd, SHUT_RDWR);
       co_return absl::OkStatus();
     }
-    absl::Status slept = co_await bycorf::SleepFor(
+    // Propagate cancellation when the worker shuts down.
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
         *ThisWorker().self_,
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
-            std::chrono::milliseconds(1));
-    if (!slept.ok()) {
-      co_return slept;  // worker shutting down
-    }
+            std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }
@@ -1460,7 +1454,7 @@ Task<absl::Status> WriteReplyContinuation(TcpStream& stream,
       status = co_await stream.WriteAllV(
           std::span<const iovec>(buffers.data(), count));
     }
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     if (stall) stall->last_progress_ = std::chrono::steady_clock::now();
   }
   continuation.fragments_.clear();
@@ -1469,14 +1463,14 @@ Task<absl::Status> WriteReplyContinuation(TcpStream& stream,
   // order and send each chunk before asking for the next one.
   while (continuation.source_) {
     auto chunk = co_await continuation.source_();
-    if (!chunk.ok()) co_return chunk.status();
+    LAVIK_CO_RETURN_IF_ERROR(chunk.status());
     if (chunk->empty()) break;
     std::span<const std::byte> remaining(
         reinterpret_cast<const std::byte*>(chunk->data()), chunk->size());
     while (!remaining.empty()) {
       const std::size_t length = std::min(kWriteSegmentBytes, remaining.size());
-      absl::Status status = co_await stream.WriteAll(remaining.first(length));
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await stream.WriteAll(remaining.first(length)));
       remaining = remaining.subspan(length);
       if (stall) stall->last_progress_ = std::chrono::steady_clock::now();
     }
@@ -1515,7 +1509,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     while (reply.continuation_ && reply.continuation_->source_) {
       auto chunk = co_await reply.continuation_->source_();
-      if (!chunk.ok()) co_return chunk.status();
+      LAVIK_CO_RETURN_IF_ERROR(chunk.status());
       if (chunk->empty()) break;
       EnqueuePubSubReply(session, std::move(*chunk));
     }
@@ -1683,7 +1677,7 @@ Task<absl::Status> RedisService::ServeSubscribed(
   absl::Status joined = co_await WaitPubSubReaderDone(session);
   UnregisterPubSubSession(session);
   ctx.pubsub_session_.reset();
-  if (!streamed.ok()) co_return streamed;
+  LAVIK_CO_RETURN_IF_ERROR(streamed);
   if (ctx.close_after_pubsub_) {
     stream.Close().IgnoreError();
   }
@@ -1708,8 +1702,7 @@ Task<absl::Status> RedisService::HandoffReplicationConnection(
   // client sweeps cannot retire it. Redis export keeps its existing ordering:
   // prior replies flush while it is still registered as an ordinary client.
   if (native) UnregisterClientConnection(ctx.conn_id_);
-  absl::Status flushed = co_await FlushReplyBatch(stream, &pending);
-  if (!flushed.ok()) co_return flushed;
+  LAVIK_CO_RETURN_IF_ERROR(co_await FlushReplyBatch(stream, &pending));
   ConnectionClosed();
   ctx.counted_as_client_ = false;
   auto peer_address = stream.PeerAddress();
@@ -1788,18 +1781,16 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
               ? ExecuteAuth(authenticator_, ctx, request.args_)
               : ExecuteHello(authenticator_, replication_, ctx, request.args_,
                              ctx.reply_builder_);
-      absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies);
-      if (!written.ok()) co_return written;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies));
       continue;
     }
 
     if (!ctx.authenticated_) {
       const std::string_view encoded =
           ctx.reply_builder_.AppendError("NOAUTH Authentication required.");
-      absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies);
-      if (!written.ok()) co_return written;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies));
       continue;
     }
 
@@ -1809,9 +1800,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (handshake != ReplicationHandshake::kNone) {
         if (auto encoded =
                 PrepareReplicationHandshake(handshake, ctx, request.args_)) {
-          absl::Status written = co_await WriteOrBatchReply(
-              stream, *encoded, !ready.empty(), &pending_replies);
-          if (!written.ok()) co_return written;
+          LAVIK_CO_RETURN_IF_ERROR(co_await WriteOrBatchReply(
+              stream, *encoded, !ready.empty(), &pending_replies));
           continue;
         }
         const bool isolated =
@@ -1853,9 +1843,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       const bool may_block = !ctx.in_multi_ && request.spec_ != nullptr &&
                              (request.spec_->flags_ & kCmdMayBlock) != 0;
       if (may_block && !pending_replies.empty()) {
-        absl::Status flushed =
-            co_await FlushReplyBatch(stream, &pending_replies);
-        if (!flushed.ok()) co_return flushed;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await FlushReplyBatch(stream, &pending_replies));
       }
 
       // Valkey emits queued MULTI children only when EXEC reaches them. The
@@ -1975,8 +1964,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (reply.start_monitoring_) [[unlikely]] {
       // MONITOR is no longer an in-flight request while its connection waits
       // indefinitely for asynchronously published messages.
-      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
-      if (!flushed.ok()) co_return flushed;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await FlushReplyBatch(stream, &pending_replies));
       request_guard.Release();
       command_memory.Release();
       co_return co_await StreamMonitorMessages(stream, ctx.monitor_session_);
@@ -1985,19 +1974,18 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       // The first SUBSCRIBE/EXEC response is already on the wire. Messages
       // published during that write have only been queued, so the dedicated
       // single writer preserves confirmation-before-message ordering.
-      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
-      if (!flushed.ok()) co_return flushed;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await FlushReplyBatch(stream, &pending_replies));
       request_guard.Release();
       command_memory.Release();
-      absl::Status subscribed = co_await ServeSubscribed(
+      LAVIK_CO_RETURN_IF_ERROR(co_await ServeSubscribed(
           stream, ctx, &input, &parser, &ready, &client_buffers,
-          &unassigned_input_bytes, &multi_input_bytes, &deferred_read_error);
-      if (!subscribed.ok()) co_return subscribed;
+          &unassigned_input_bytes, &multi_input_bytes, &deferred_read_error));
       continue;
     }
     if (reply.close_connection_ || ShutdownRequested()) [[unlikely]] {
-      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
-      if (!flushed.ok()) co_return flushed;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await FlushReplyBatch(stream, &pending_replies));
       stream.Close().IgnoreError();
       co_return absl::OkStatus();
     }

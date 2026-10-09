@@ -17,6 +17,7 @@
 #include <array>
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 
 namespace lavik::storage {
@@ -189,13 +190,13 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         if (physical == nullptr)
           co_return absl::DataLossError("missing List search page");
         GroupedScratchBudget budget;
-        auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
-        if (!added.ok()) co_return added;
+        LAVIK_CO_RETURN_IF_ERROR(
+            budget.AddGroup(*physical, object->ExtentsFor(id)));
         auto scratch = budget.Reserve(1);
-        if (!scratch.ok()) co_return scratch.status();
+        LAVIK_CO_RETURN_IF_ERROR(scratch.status());
         auto page = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object, id.prefix_);
-        if (!page.ok()) co_return page.status();
+        LAVIK_CO_RETURN_IF_ERROR(page.status());
         const auto& entries = page->snapshot_.entries_;
         for (std::size_t item = 0; item < entries.size() && visited < inspect;
              ++item, ++visited) {
@@ -211,8 +212,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
             break;
           }
           if (++matches >= wanted) {
-            auto appended = AppendPosition(position, &result);
-            if (!appended.ok()) co_return appended;
+            LAVIK_CO_RETURN_IF_ERROR(AppendPosition(position, &result));
             if (result.positions_.size() >= limit) break;
           }
         }
@@ -228,15 +228,12 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   // admission through the command, including the final mutation snapshots.
   GroupedScratchBudget incoming_budget;
   for (const auto value : operation.values_) {
-    auto added = incoming_budget.AddBytes(value.size());
-    if (!added.ok()) co_return added;
-    added = incoming_budget.AddBytes(256);
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(incoming_budget.AddBytes(value.size()));
+    LAVIK_CO_RETURN_IF_ERROR(incoming_budget.AddBytes(256));
   }
-  const auto incoming_added = incoming_budget.AddBytes(operation.value_.size());
-  if (!incoming_added.ok()) co_return incoming_added;
+  LAVIK_CO_RETURN_IF_ERROR(incoming_budget.AddBytes(operation.value_.size()));
   auto incoming_scratch = incoming_budget.Reserve(4);
-  if (!incoming_scratch.ok()) co_return incoming_scratch.status();
+  LAVIK_CO_RETURN_IF_ERROR(incoming_scratch.status());
   std::uint64_t rank = 0;
   std::uint64_t erase_count = 0;
   std::vector<OrderedCollectionEntry> insertions;
@@ -360,23 +357,22 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     const auto* entry = object->FindGroup(id);
     if (entry == nullptr)
       co_return absl::DataLossError("missing List scratch page");
-    const auto added = page_budget.AddGroup(*entry, object->ExtentsFor(id));
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(
+        page_budget.AddGroup(*entry, object->ExtentsFor(id)));
   }
   const auto read_width =
       std::min(ListReadBatch::kWidth, end_page - begin_page);
   if (read_only && read_width > 1) {
     // The ordinary budget includes one loader's fixed scratch. Admit the
     // additional bounded coroutine frames before starting any parallel IO.
-    const auto added = page_budget.AddBytes((read_width - 1) * 4096);
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(page_budget.AddBytes((read_width - 1) * 4096));
   }
   // Reads own each requested string once: page results move into the reply.
   // The per-entry allowance covers both vectors' string headers; physical
   // read buffers have independent accounting, including oversized pages.
   // No mutation/encoding copies are needed, even with a wave in flight.
   auto page_scratch = page_budget.Reserve(read_only ? 1 : 4);
-  if (!page_scratch.ok()) co_return page_scratch.status();
+  LAVIK_CO_RETURN_IF_ERROR(page_scratch.status());
   auto retain_output = [&]() -> absl::Status {
     std::size_t bytes = result.values_.capacity() * sizeof(std::string);
     for (const auto& value : result.values_) {
@@ -400,9 +396,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     std::size_t offset = first->offset_;
     if (end_page - begin_page > 1) result.values_.reserve(erase_count);
     auto append = [&](ListReadBatch::Result values) -> absl::Status {
-      if (!values.ok()) {
-        return values.status();
-      }
+      LAVIK_RETURN_IF_ERROR(values.status());
       if (end_page - begin_page == 1)
         result.values_ = std::move(*values);
       else
@@ -461,8 +455,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       if (population_changed()) co_return ListResult{};
       co_return read_status;
     }
-    const auto retained = retain_output();
-    if (!retained.ok()) co_return retained;
+    LAVIK_CO_RETURN_IF_ERROR(retain_output());
     co_return result;
   }
   std::vector<LoadedOrderedGroup> loaded;
@@ -473,7 +466,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object,
         directory.groups()[first->group_index_].id_);
-    if (!page.ok()) co_return page.status();
+    LAVIK_CO_RETURN_IF_ERROR(page.status());
     if (first->offset_ >= page->snapshot_.entries_.size())
       co_return absl::DataLossError("List replacement rank exceeds page");
     const auto old_size =
@@ -504,7 +497,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     auto page =
         co_await LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
                                           object, directory.groups()[i].id_);
-    if (!page.ok()) co_return page.status();
+    LAVIK_CO_RETURN_IF_ERROR(page.status());
     loaded.push_back(std::move(*page));
   }
   // The mutation's page reservation now covers reused payloads too. A pivot
@@ -526,8 +519,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     if (operation.kind_ == ListOperationKind::kPopRight) {
       std::reverse(result.values_.begin(), result.values_.end());
     }
-    const auto retained = retain_output();
-    if (!retained.ok()) co_return retained;
+    LAVIK_CO_RETURN_IF_ERROR(retain_output());
   }
 
   if (scan) {
@@ -579,8 +571,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         const bool destination_left = operation.second_ != 0;
         const auto moved = source_left ? after.front() : after.back();
         result.values_.emplace_back(moved);
-        const auto retained = retain_output();
-        if (!retained.ok()) co_return retained;
+        LAVIK_CO_RETURN_IF_ERROR(retain_output());
         if (source_left == destination_left || count == 1) co_return result;
         if (source_left)
           after.erase(after.begin());
@@ -622,7 +613,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   }
   auto plan = PlanOrderedCollectionSplice(directory, std::move(loaded), rank,
                                           erase_count, std::move(insertions));
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   result.changed_ = plan->changed_;
   result.length_ = plan->root_.item_count_;
   if (!result.changed_) co_return result;
@@ -632,11 +623,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     prepared->plan_ = std::move(*plan);
     co_return result;
   }
-  const auto status = co_await CommitGroupedOrderedMutationLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
-  if (!status.ok()) co_return status;
+      mutation_precondition));
   co_return result;
 }
 

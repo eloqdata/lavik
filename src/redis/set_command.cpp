@@ -38,6 +38,7 @@
 #include "lavik/command_table.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/engine.h"
 #include "lavik/tx/transaction.h"
 
@@ -463,7 +464,7 @@ Task<absl::Status> PrepareSetEffects(SetMultiContext* context) {
             return guard->TrySetCommandArgs(std::move(effects));
           });
     }
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     context->effects_prepared_ = true;
     co_return absl::OkStatus();
   } catch (const std::length_error&) {
@@ -478,7 +479,7 @@ Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
     const storage::Digest digest = storage::ComputeDigest(destination);
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, destination, digest, LocalWrites(*context));
-    if (!deleted.ok()) co_return deleted.status();
+    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
     if (context->output_.empty()) {
       context->changed_ = *deleted;
       co_return absl::OkStatus();
@@ -486,7 +487,7 @@ Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
     auto added = co_await g_storage->ExecuteSetLocked(
         request.db_id_, destination, digest, context->add_,
         LocalWrites(*context));
-    if (!added.ok()) co_return added.status();
+    LAVIK_CO_RETURN_IF_ERROR(added.status());
     context->changed_ = true;
     co_return absl::OkStatus();
   } catch (const std::length_error&) {
@@ -512,7 +513,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
           length.kind_ = storage::HashOperationKind::kLength;
           auto result = co_await g_storage->ExecuteSetLocked(
               request.db_id_, request.args_[2], key.digest_, length);
-          if (!result.ok()) co_return result.status();
+          LAVIK_CO_RETURN_IF_ERROR(result.status());
           continue;
         }
         if (key.arg_index_ != 1) continue;
@@ -521,7 +522,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
         contains.fields_.push_back(context->move_member_);
         auto result = co_await g_storage->ExecuteSetLocked(
             request.db_id_, request.args_[1], key.digest_, contains);
-        if (!result.ok()) co_return result.status();
+        LAVIK_CO_RETURN_IF_ERROR(result.status());
         context->source_exists_ = result->key_exists_;
         context->source_contains_ =
             !result->values_.empty() && result->values_.front().has_value();
@@ -531,7 +532,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
       read.kind_ = storage::HashOperationKind::kKeys;
       auto result = co_await g_storage->ExecuteSetLocked(
           request.db_id_, request.args_[key.arg_index_], key.digest_, read);
-      if (!result.ok()) co_return result.status();
+      LAVIK_CO_RETURN_IF_ERROR(result.status());
       std::size_t bytes = 0;
       if (!AddWorkingBytes(&bytes, result->values_.size(),
                            sizeof(std::string))) {
@@ -561,14 +562,14 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
     if (context->single_shard_ && store) {
       auto prepared = ComputeAggregate(context);
       if (prepared.ok()) prepared = co_await PrepareSetEffects(context);
-      if (!prepared.ok()) co_return prepared;
+      LAVIK_CO_RETURN_IF_ERROR(prepared);
       absl::Status replaced = co_await ReplaceDestination(context);
       if (!replaced.ok()) {
         ReleaseSetWorkingSet(context);
         if (!context->tx_writes_.empty()) {
-          auto restored = co_await g_storage->FinishTxLocal(
-              context->tx_writes_[bycorf::ThisWorker().id_], /*rollback=*/true);
-          if (!restored.ok()) co_return restored;
+          LAVIK_CO_RETURN_IF_ERROR(co_await g_storage->FinishTxLocal(
+              context->tx_writes_[bycorf::ThisWorker().id_],
+              /*rollback=*/true));
         }
         co_return replaced;
       }
@@ -601,7 +602,7 @@ Task<absl::Status> SetWriteShardCallback(void* opaque,
       auto result = co_await g_storage->ExecuteSetLocked(
           request.db_id_, request.args_[key.arg_index_], key.digest_, operation,
           LocalWrites(*context));
-      if (!result.ok()) co_return result.status();
+      LAVIK_CO_RETURN_IF_ERROR(result.status());
       context->changed_ = true;
     }
     co_return absl::OkStatus();
@@ -769,13 +770,12 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       read = co_await SetReadShardCallback(opaque, slice);
       if (!read.ok() || !ctx->source_contains_) co_return read;
       read = co_await PrepareSetEffects(ctx);
-      if (!read.ok()) co_return read;
+      LAVIK_CO_RETURN_IF_ERROR(read);
       absl::Status written = co_await SetWriteShardCallback(opaque, slice);
       if (!written.ok()) {
         ReleaseSetWorkingSet(ctx);
-        auto restored = co_await g_storage->FinishTxLocal(
-            ctx->tx_writes_[bycorf::ThisWorker().id_], /*rollback=*/true);
-        if (!restored.ok()) co_return restored;
+        LAVIK_CO_RETURN_IF_ERROR(co_await g_storage->FinishTxLocal(
+            ctx->tx_writes_[bycorf::ThisWorker().id_], /*rollback=*/true));
         co_return written;
       }
       co_return co_await g_storage->FinishTxLocal(

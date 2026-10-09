@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "lavik/status_macros.h"
 #include "replication_internal.h"
 
 namespace lavik {
@@ -54,7 +55,7 @@ absl::StatusOr<RedisPsyncReply> ParseRedisPsyncReply(std::string_view line) {
 
 Task<absl::StatusOr<std::string>> ReceiveRedisRdb(TcpStream& stream) {
   auto header = co_await ReadLine(stream);
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   if (header->empty() || header->front() != '$' ||
       header->starts_with("$EOF:")) {
     co_return absl::InvalidArgumentError(absl::StrCat(
@@ -84,21 +85,19 @@ Task<absl::StatusOr<std::string>> ReceiveRedisRdb(TcpStream& stream) {
         std::min<std::uint64_t>(remaining, buffer.size()));
     auto read =
         co_await stream.ReadSome(std::span<std::byte>(buffer).first(wanted));
-    if (!read.ok()) co_return read.status();
+    LAVIK_CO_RETURN_IF_ERROR(read.status());
     if (*read == 0) {
       co_return absl::UnavailableError(
           "Redis closed connection during RDB transfer");
     }
-    absl::Status written = WriteFileAll(
-        file.fd(), std::span<const std::byte>(buffer).first(*read));
-    if (!written.ok()) co_return written;
+    LAVIK_CO_RETURN_IF_ERROR(WriteFileAll(
+        file.fd(), std::span<const std::byte>(buffer).first(*read)));
     remaining -= *read;
   }
   // Redis replication uses a bulk-style length header but does not append the
   // RESP bulk string CRLF after the RDB payload. The next byte is already the
   // first byte of the incremental command stream.
-  absl::Status closed = file.Close();
-  if (!closed.ok()) co_return closed;
+  LAVIK_CO_RETURN_IF_ERROR(file.Close());
   co_return file.ReleasePath();
 }
 
@@ -172,9 +171,8 @@ absl::StatusOr<RedisClusterTopology> ParseRedisClusterNodes(
     RedisClusterMaster entry;
     entry.node_id_ = std::string(fields[0]);
     entry.myself_ = myself;
-    auto endpoint = ParseRedisClusterAddress(fields[1]);
-    if (!endpoint.ok()) return endpoint.status();
-    entry.endpoint_ = std::move(*endpoint);
+    LAVIK_ASSIGN_OR_RETURN(entry.endpoint_,
+                           ParseRedisClusterAddress(fields[1]));
     for (std::size_t i = 8; i < fields.size(); ++i) {
       const std::string_view token = fields[i];
       if (token.starts_with('[')) {
@@ -266,7 +264,7 @@ absl::StatusOr<ReplicaOfConfig> ParseRedisClusterAddress(
 
 Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream) {
   auto header = co_await ReadLine(stream);
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   if (header->empty()) {
     co_return absl::InvalidArgumentError("empty Redis reply");
   }
@@ -283,7 +281,7 @@ Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream) {
     co_return absl::InvalidArgumentError("invalid Redis bulk reply length");
   }
   auto body = co_await ReadExact(stream, static_cast<std::size_t>(length) + 2);
-  if (!body.ok()) co_return body.status();
+  LAVIK_CO_RETURN_IF_ERROR(body.status());
   if (!body->ends_with("\r\n")) {
     co_return absl::InvalidArgumentError("Redis bulk reply is not terminated");
   }
@@ -299,7 +297,7 @@ auto ReplicationManager::ReplicationGroup::ProbeNativeUpstreamConnection(
     -> Task<absl::Status> {
   auto connected = co_await ConnectTcp(
       upstream.host_, upstream.port_, tls_context_, &transport->sockets_, true);
-  if (!connected.ok()) co_return connected.status();
+  LAVIK_CO_RETURN_IF_ERROR(connected.status());
   TcpStream stream = std::move(*connected);
   struct CloseGuard {
     TcpStream* stream_;
@@ -308,7 +306,7 @@ auto ReplicationManager::ReplicationGroup::ProbeNativeUpstreamConnection(
   ScopedSocketSetMembership membership(&transport->sockets_, stream.NativeFd());
   absl::Status status =
       co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   // The anonymous native handshake is a protocol probe: the source replies
   // with its identity and immediately retires the temporary session. In
   // particular, a replica rejects it before this node changes roles, since
@@ -317,9 +315,9 @@ auto ReplicationManager::ReplicationGroup::ProbeNativeUpstreamConnection(
       "LVPSYNC", std::string(kProtocolVersion), "?", "?", "?", "?", "?", "?"};
   const std::string encoded_hello = EncodeRespCommand(hello);
   status = co_await WriteText(stream, encoded_hello);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto response = co_await ReadLine(stream);
-  if (!response.ok()) co_return response.status();
+  LAVIK_CO_RETURN_IF_ERROR(response.status());
   if (response->starts_with("+LVFULLRESYNC ")) co_return absl::OkStatus();
   co_return absl::FailedPreconditionError(
       absl::StrCat("upstream rejected Lavik protocol probe: ", *response));
@@ -337,9 +335,8 @@ auto ReplicationManager::ReplicationGroup::ProbeNativeUpstream(
       co_await ProbeNativeUpstreamConnection(upstream, transport);
   transport->finished_ = true;
   while (!transport->watcher_finished_) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return result;
 }
@@ -381,13 +378,12 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
   std::optional<UpstreamDiscovery> discovery;
   if (upstream.has_value()) {
     if (native) {
-      absl::Status probed = co_await ProbeNativeUpstream(*upstream);
-      if (!probed.ok()) co_return probed;
+      LAVIK_CO_RETURN_IF_ERROR(co_await ProbeNativeUpstream(*upstream));
     } else {
       auto prepared = co_await PrepareRedisUpstream(*upstream);
       // Authenticate and obtain a valid PSYNC response before retiring a
       // healthy subscription or closing local admission.
-      if (!prepared.ok()) co_return prepared.status();
+      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
       discovery = std::move(*prepared);
     }
     if (replication_shutdown_requested_ ||
@@ -411,9 +407,8 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
       if (!teardown_running) replica_reconfiguration_running_ = true;
     }
     if (!teardown_running) break;
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   struct ReconfigurationGuard {
     bool& running_;
@@ -499,22 +494,19 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
     }
   }
   if (retire_source_before_gates) {
-    absl::Status drained = co_await DrainSourceEgress();
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(co_await DrainSourceEgress());
   }
 
   while (!CloseAllCommandDbGates()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   struct RoleGateGuard {
     ~RoleGateGuard() { OpenAllCommandDbGates(); }
   } role_gate;
   while (CommandDbOperationsActive()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
 
   // FUNCTION and FCALL take database admission before the Function guard.
@@ -526,8 +518,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
     promotion_catalog_guard = co_await AcquireFunctionCatalogOperation();
   }
 
-  absl::Status quiesced = co_await storage_->QuiesceExpiration();
-  if (!quiesced.ok()) co_return quiesced;
+  LAVIK_CO_RETURN_IF_ERROR(co_await storage_->QuiesceExpiration());
   bool expiration_quiesced = true;
   struct ExpirationResumeGuard {
     storage::StorageEngine* storage_ = nullptr;
@@ -596,9 +587,8 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
               source->offset_.load(std::memory_order_acquire) + 1);
         }
       } else if (applied_frontier_ != nullptr) {
-        auto snapshot = applied_frontier_->TrySnapshot();
-        if (!snapshot.ok()) co_return snapshot.status();
-        promotion_base.parent_frontier_.flow_cursors_ = std::move(*snapshot);
+        LAVIK_ASSIGN_OR_CO_RETURN(promotion_base.parent_frontier_.flow_cursors_,
+                                  applied_frontier_->TrySnapshot());
       }
       promotion_base.storage_accumulator_ = absl::StrCat(
           "role-epoch:", role_epoch_.load(std::memory_order_relaxed));
@@ -705,7 +695,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
     } else {
       retired = co_await RetireSourceHistory();
     }
-    if (!retired.ok()) co_return retired;
+    LAVIK_CO_RETURN_IF_ERROR(retired);
   }
   if (discard_incomplete_root) {
     absl::Status cleared = co_await storage_->FlushAllDetach();
@@ -718,7 +708,7 @@ auto ReplicationManager::ReplicationGroup::SetUpstream(
   }
   if (promotion_required) {
     auto prepared = co_await PreparePromotion(std::move(promotion_base));
-    if (!prepared.ok()) co_return prepared.status();
+    LAVIK_CO_RETURN_IF_ERROR(prepared.status());
     ActivatePreparedPromotion();
     expiration_quiesced = false;
   }
@@ -769,7 +759,7 @@ auto ReplicationManager::ReplicationGroup::AddUpstream(ReplicaOfConfig upstream)
         "Redis Cluster topology is faulted; use REPLICAOF to rebuild it");
   }
   auto discovery = co_await PrepareRedisUpstream(upstream);
-  if (!discovery.ok()) co_return discovery.status();
+  LAVIK_CO_RETURN_IF_ERROR(discovery.status());
   if (!discovery->redis_cluster_ || !discovery->topology_.has_value() ||
       !discovery->self_.has_value()) {
     co_return absl::FailedPreconditionError(
@@ -828,7 +818,7 @@ auto ReplicationManager::ReplicationGroup::QueryRedisClusterTopology(
     -> Task<absl::StatusOr<std::optional<RedisClusterTopology>>> {
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
                                        tls_context_, &outbound_sockets_);
-  if (!connected.ok()) co_return connected.status();
+  LAVIK_CO_RETURN_IF_ERROR(connected.status());
   TcpStream stream = std::move(*connected);
   ScopedSocketSetMembership membership(&outbound_sockets_, stream.NativeFd());
   absl::Status status =
@@ -848,7 +838,7 @@ auto ReplicationManager::ReplicationGroup::QueryRedisClusterTopology(
   const std::vector<std::string> command{"CLUSTER", "NODES"};
   const std::string encoded_command = EncodeRespCommand(command);
   auto status = co_await WriteText(stream, encoded_command);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto body = co_await ReadRedisBulkReply(stream);
   if (!body.ok()) {
     const std::string message(body.status().message());
@@ -859,14 +849,14 @@ auto ReplicationManager::ReplicationGroup::QueryRedisClusterTopology(
     co_return body.status();
   }
   auto topology = ParseRedisClusterNodes(*body);
-  if (!topology.ok()) co_return topology.status();
+  LAVIK_CO_RETURN_IF_ERROR(topology.status());
   co_return std::optional<RedisClusterTopology>(std::move(*topology));
 }
 
 auto ReplicationManager::ReplicationGroup::DiscoverRedis(TcpStream& stream)
     -> Task<absl::StatusOr<UpstreamDiscovery>> {
   auto topology = co_await QueryRedisClusterTopology(stream);
-  if (!topology.ok()) co_return topology.status();
+  LAVIK_CO_RETURN_IF_ERROR(topology.status());
   UpstreamDiscovery result;
   if (!topology->has_value()) co_return result;
   result.redis_cluster_ = true;
@@ -890,20 +880,20 @@ auto ReplicationManager::ReplicationGroup::PrepareRedisUpstreamConnection(
     -> Task<absl::StatusOr<UpstreamDiscovery>> {
   auto connected = co_await ConnectTcp(
       upstream.host_, upstream.port_, tls_context_, &transport->sockets_, true);
-  if (!connected.ok()) co_return connected.status();
+  LAVIK_CO_RETURN_IF_ERROR(connected.status());
   auto prepared = std::make_shared<PreparedRedisConnection>(
       std::move(*connected), transport);
   auto& stream = prepared->stream_;
   absl::Status status =
       co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto discovery = co_await DiscoverRedis(stream);
-  if (!discovery.ok()) co_return discovery.status();
+  LAVIK_CO_RETURN_IF_ERROR(discovery.status());
   // The actual Redis handshake determines compatibility. Neither product
   // identity probes nor a native-protocol fallback are part of REPLICAOF.
   auto fresh = std::make_shared<RedisSource>();
   auto reply = co_await StartRedisPsync(stream, fresh);
-  if (!reply.ok()) co_return reply.status();
+  LAVIK_CO_RETURN_IF_ERROR(reply.status());
   if (!reply->full_) {
     co_return absl::FailedPreconditionError(
         "Redis accepted partial sync without a valid local dataset");
@@ -932,9 +922,8 @@ auto ReplicationManager::ReplicationGroup::PrepareRedisUpstream(
   }
   transport->finished_ = true;
   while (!transport->watcher_finished_) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return result;
 }
@@ -1062,8 +1051,8 @@ auto ReplicationManager::ReplicationGroup::BeginRedisFullSyncAttempt(
     absl::Status current = co_await CancelAndWaitForReplicaFlows(session);
     if (stopped.ok() && !current.ok()) stopped = current;
   }
-  if (!invalidated.ok()) co_return invalidated;
-  if (!stopped.ok()) co_return stopped;
+  LAVIK_CO_RETURN_IF_ERROR(invalidated);
+  LAVIK_CO_RETURN_IF_ERROR(stopped);
   co_return session_id;
 }
 
@@ -1079,9 +1068,8 @@ auto ReplicationManager::ReplicationGroup::WaitForRedisFullSyncActivation(
             "Redis full sync was cancelled before population activation");
       }
     }
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }
@@ -1181,9 +1169,8 @@ auto ReplicationManager::ReplicationGroup::RedisTopologyMonitor(
     std::uint64_t role_epoch) -> Task<absl::Status> {
   unsigned incompatible_observations = 0;
   while (true) {
-    absl::Status slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                   kRedisTopologyPollInterval);
-    if (!slept.ok()) co_return slept;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, kRedisTopologyPollInterval));
     std::vector<ReplicaOfConfig> endpoints;
     {
       AssertStateOwner();
@@ -1344,17 +1331,16 @@ auto ReplicationManager::ReplicationGroup::ImportRedisRdb(
     const std::string& path, const std::shared_ptr<RedisSource>& source)
     -> Task<absl::Status> {
   auto reader = rdb::FileReader::Open(path);
-  if (!reader.ok()) co_return reader.status();
+  LAVIK_CO_RETURN_IF_ERROR(reader.status());
 
   std::uint64_t entries = 0;
   std::uint64_t skipped = 0;
   std::vector<std::string> function_libraries;
   while (true) {
     auto next = reader->NextStreaming();
-    if (!next.ok()) co_return next.status();
+    LAVIK_CO_RETURN_IF_ERROR(next.status());
     if (!next->has_value()) break;
-    auto drained = reader->DrainCollection();
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(reader->DrainCollection());
     if ((**next).kind_ == rdb::FileEntryKind::kValue) {
       ++entries;
     } else if ((**next).kind_ == rdb::FileEntryKind::kFunctionLibrary) {
@@ -1363,9 +1349,8 @@ auto ReplicationManager::ReplicationGroup::ImportRedisRdb(
       ++skipped;
     }
   }
-  absl::Status functions_validated =
-      co_await ValidateLuaFunctionCatalog(function_libraries);
-  if (!functions_validated.ok()) co_return functions_validated;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await ValidateLuaFunctionCatalog(function_libraries));
   reader->Rewind();
 
   co_await redis_fullsync_mutex_.Lock();
@@ -1373,17 +1358,15 @@ auto ReplicationManager::ReplicationGroup::ImportRedisRdb(
                                       bycorf::ThisWorker().self_);
 
   while (!CloseAllCommandDbGates()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   struct CommandGateGuard {
     ~CommandGateGuard() { OpenAllCommandDbGates(); }
   } command_gate_guard;
   while (CommandDbOperationsActive()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   {
     AssertStateOwner();
@@ -1396,8 +1379,7 @@ auto ReplicationManager::ReplicationGroup::ImportRedisRdb(
   }
 
   const std::vector<std::uint16_t> slots = RedisSlotsVector(source->slots_);
-  absl::Status cleared = co_await storage_->ResetPartitionsDetach(slots);
-  if (!cleared.ok()) co_return cleared;
+  LAVIK_CO_RETURN_IF_ERROR(co_await storage_->ResetPartitionsDetach(slots));
 
   std::uint64_t imported = 0;
   std::uint64_t expired = 0;
@@ -1465,10 +1447,9 @@ auto ReplicationManager::ReplicationGroup::ExpectRedisReply(
     TcpStream& stream, std::vector<std::string> command,
     std::string_view expected) -> Task<absl::Status> {
   const std::string encoded = EncodeRespCommand(command);
-  absl::Status sent = co_await WriteText(stream, encoded);
-  if (!sent.ok()) co_return sent;
+  LAVIK_CO_RETURN_IF_ERROR(co_await WriteText(stream, encoded));
   auto reply = co_await ReadLine(stream);
-  if (!reply.ok()) co_return reply.status();
+  LAVIK_CO_RETURN_IF_ERROR(reply.status());
   if (*reply != expected) {
     co_return absl::FailedPreconditionError(
         absl::StrCat("Redis replication handshake failed: ", *reply));
@@ -1492,7 +1473,7 @@ auto ReplicationManager::ReplicationGroup::ValidateRedisSourceCommand(
   if (!redis_cluster_) return absl::OkStatus();
   RespCommand wire{.args_ = command.args_};
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
-  if (!request.ok()) return request.status();
+  LAVIK_RETURN_IF_ERROR(request.status());
   if (request->kind_ == CommandKind::kFlushDb ||
       request->kind_ == CommandKind::kFlushAll ||
       request->kind_ == CommandKind::kFunction) {
@@ -1524,17 +1505,15 @@ auto ReplicationManager::ReplicationGroup::ResetRedisSourceSlots(
   bycorf::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
                                       bycorf::ThisWorker().self_);
   while (!CloseAllCommandDbGates()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   struct CommandGateGuard {
     ~CommandGateGuard() { OpenAllCommandDbGates(); }
   } reopen;
   while (CommandDbOperationsActive()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   {
     AssertStateOwner();
@@ -1556,7 +1535,7 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
   std::vector<ReplicatedCommand> transaction;
   while (true) {
     auto wire = co_await commands.Next();
-    if (!wire.ok()) co_return wire.status();
+    LAVIK_CO_RETURN_IF_ERROR(wire.status());
     if (source->role_epoch_ != role_epoch_.load(std::memory_order_acquire)) {
       co_return absl::CancelledError(
           "Redis replication source was detached before command apply");
@@ -1589,8 +1568,7 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
             "PING inside Redis replicated transaction");
       }
       source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
-      absl::Status acked = co_await SendRedisAck(stream, source);
-      if (!acked.ok()) co_return acked;
+      LAVIK_CO_RETURN_IF_ERROR(co_await SendRedisAck(stream, source));
       continue;
     }
     if (EqualCaseInsensitive(name, "REPLCONF")) {
@@ -1600,8 +1578,7 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
             "unsupported REPLCONF in Redis replication stream");
       }
       source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
-      absl::Status acked = co_await SendRedisAck(stream, source);
-      if (!acked.ok()) co_return acked;
+      LAVIK_CO_RETURN_IF_ERROR(co_await SendRedisAck(stream, source));
       continue;
     }
     if (EqualCaseInsensitive(name, "MULTI")) {
@@ -1621,12 +1598,10 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
       }
       transaction_bytes += wire->bytes_;
       for (const ReplicatedCommand& command : transaction) {
-        absl::Status valid = ValidateRedisSourceCommand(command, source);
-        if (!valid.ok()) co_return valid;
+        LAVIK_CO_RETURN_IF_ERROR(ValidateRedisSourceCommand(command, source));
       }
-      absl::Status applied =
-          co_await ApplyRedisReplicatedTransaction(transaction);
-      if (!applied.ok()) co_return applied;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await ApplyRedisReplicatedTransaction(transaction));
       source->selected_db_ = db_id;
       source->offset_.fetch_add(transaction_bytes, std::memory_order_acq_rel);
       transaction.clear();
@@ -1641,8 +1616,7 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
       transaction.push_back(std::move(command));
       continue;
     }
-    absl::Status valid = ValidateRedisSourceCommand(command, source);
-    if (!valid.ok()) co_return valid;
+    LAVIK_CO_RETURN_IF_ERROR(ValidateRedisSourceCommand(command, source));
     if (redis_cluster_ && (EqualCaseInsensitive(name, "FLUSHDB") ||
                            EqualCaseInsensitive(name, "FLUSHALL"))) {
       if (command.args_.size() > 2 ||
@@ -1652,8 +1626,7 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
         co_return absl::InvalidArgumentError(
             "invalid Redis replicated flush command");
       }
-      absl::Status reset = co_await ResetRedisSourceSlots(source);
-      if (!reset.ok()) co_return reset;
+      LAVIK_CO_RETURN_IF_ERROR(co_await ResetRedisSourceSlots(source));
       source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
       continue;
     }
@@ -1674,20 +1647,20 @@ auto ReplicationManager::ReplicationGroup::StartRedisPsync(
   {
     std::vector<std::string> command{"PING"};
     status = co_await ExpectRedisReply(stream, std::move(command), "+PONG");
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   {
     std::vector<std::string> command{"REPLCONF", "listening-port",
                                      absl::StrCat(listen_port_)};
     status = co_await ExpectRedisReply(stream, std::move(command), "+OK");
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   // Do not advertise the EOF capability: length-delimited RDB transfer lets
   // us consume exactly the snapshot bytes without scanning for a delimiter.
   {
     std::vector<std::string> command{"REPLCONF", "capa", "psync2"};
     status = co_await ExpectRedisReply(stream, std::move(command), "+OK");
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
 
   std::optional<std::string> replid;
@@ -1712,11 +1685,11 @@ auto ReplicationManager::ReplicationGroup::StartRedisPsync(
   }
   const std::string encoded = EncodeRespCommand(command);
   status = co_await WriteText(stream, encoded);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto response = co_await ReadLine(stream);
-  if (!response.ok()) co_return response.status();
+  LAVIK_CO_RETURN_IF_ERROR(response.status());
   auto parsed = ParseRedisPsyncReply(*response);
-  if (!parsed.ok()) co_return parsed.status();
+  LAVIK_CO_RETURN_IF_ERROR(parsed.status());
   co_return std::move(*parsed);
 }
 
@@ -1726,13 +1699,11 @@ auto ReplicationManager::ReplicationGroup::RedisFollowerOnline(
   if (role_epoch_.load(std::memory_order_acquire) != source->role_epoch_) {
     co_return absl::CancelledError("replication role epoch was replaced");
   }
-  absl::Status activated = co_await WaitForRedisFullSyncActivation(source);
-  if (!activated.ok()) co_return activated;
+  LAVIK_CO_RETURN_IF_ERROR(co_await WaitForRedisFullSyncActivation(source));
   StoreRedisLink(source, true);
   source->syncing_ = false;
   RefreshRedisRole();
-  absl::Status status = co_await SendRedisAck(stream, source);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(co_await SendRedisAck(stream, source));
   spdlog::info("Redis PSYNC follower online with {}:{} slots={}",
                source->upstream_.host_, source->upstream_.port_,
                FormatRedisSlots(source->slots_));
@@ -1746,12 +1717,12 @@ auto ReplicationManager::ReplicationGroup::CompleteRedisFullSync(
   source->dataset_valid_ = false;
   RefreshRedisRole();
   auto full_sync_session = co_await BeginRedisFullSyncAttempt(source);
-  if (!full_sync_session.ok()) co_return full_sync_session.status();
+  LAVIK_CO_RETURN_IF_ERROR(full_sync_session.status());
   auto rdb_path = co_await ReceiveRedisRdb(stream);
-  if (!rdb_path.ok()) co_return rdb_path.status();
+  LAVIK_CO_RETURN_IF_ERROR(rdb_path.status());
   absl::Status status = co_await ImportRedisRdb(*rdb_path, source);
   (void)::unlink(rdb_path->c_str());
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   {
     co_await redis_fullsync_mutex_.Lock();
@@ -1829,7 +1800,7 @@ auto ReplicationManager::ReplicationGroup::CompleteRedisFullSync(
       // physical maintenance here prevents a partial Cluster import from
       // being mistaken for a complete local population.
       status = co_await storage_->FinalizeReplicaFullSync(*full_sync_session);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       redis_full_sync_session_id_ = 0;
     }
   }
@@ -1855,11 +1826,10 @@ auto ReplicationManager::ReplicationGroup::RunRedisReplicaSession(
       co_return absl::CancelledError("Redis source was cancelled");
     }
   } else {
-    auto connected =
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        stream,
         co_await ConnectTcp(source->upstream_.host_, source->upstream_.port_,
-                            tls_context_, &session->sockets_);
-    if (!connected.ok()) co_return connected.status();
-    stream = std::move(*connected);
+                            tls_context_, &session->sockets_));
     auto authenticated =
         co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
     if (!authenticated.ok()) {
@@ -1887,7 +1857,7 @@ auto ReplicationManager::ReplicationGroup::RunRedisConnectedSession(
       prepared_reply.has_value()
           ? absl::StatusOr<RedisPsyncReply>(std::move(*prepared_reply))
           : co_await StartRedisPsync(stream, source);
-  if (!reply.ok()) co_return reply.status();
+  LAVIK_CO_RETURN_IF_ERROR(reply.status());
 
   if (reply->full_) {
     co_return co_await CompleteRedisFullSync(

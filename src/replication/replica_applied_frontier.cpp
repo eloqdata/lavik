@@ -22,6 +22,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::detail {
 
@@ -84,8 +85,7 @@ absl::Status ReplicaAppliedFrontier::ValidateAdvance(
 
 absl::Status ReplicaAppliedFrontier::AdvanceAfterApply(
     unsigned flow_id, std::uint64_t applied_lsn) noexcept {
-  absl::Status valid = ValidateAdvance(flow_id, applied_lsn);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateAdvance(flow_id, applied_lsn));
   const std::uint64_t current =
       flows_[flow_id].next_lsn_.load(std::memory_order_acquire);
   if (current == applied_lsn + 1) return absl::OkStatus();
@@ -104,9 +104,8 @@ absl::Status ReplicaAppliedFrontier::AdvanceBatchAfterApply(
         "replica Applied publisher is out of range");
   }
   for (std::size_t i = 0; i < updates.size(); ++i) {
-    absl::Status valid =
-        ValidateAdvance(updates[i].flow_id_, updates[i].applied_lsn_);
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(
+        ValidateAdvance(updates[i].flow_id_, updates[i].applied_lsn_));
     for (std::size_t j = 0; j < i; ++j) {
       if (updates[j].flow_id_ == updates[i].flow_id_) {
         return absl::InvalidArgumentError(
@@ -115,8 +114,7 @@ absl::Status ReplicaAppliedFrontier::AdvanceBatchAfterApply(
     }
   }
 
-  absl::Status begun = BeginPublication(publisher_id);
-  if (!begun.ok()) return begun;
+  LAVIK_RETURN_IF_ERROR(BeginPublication(publisher_id));
   for (const FlowApplied& update : updates) {
     const std::uint64_t current =
         flows_[update.flow_id_].next_lsn_.load(std::memory_order_relaxed);
@@ -143,8 +141,7 @@ absl::Status ReplicaAppliedFrontier::InstallNextLsns(
     return absl::FailedPreconditionError(
         "replica Applied frontier is poisoned");
   }
-  absl::Status begun = BeginPublication(0);
-  if (!begun.ok()) return begun;
+  LAVIK_RETURN_IF_ERROR(BeginPublication(0));
   for (unsigned flow = 0; flow < flow_count_; ++flow) {
     StoreNextLsn(flow, next_lsns[flow]);
   }

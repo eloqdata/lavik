@@ -20,6 +20,7 @@
 
 #include "absl/strings/cord.h"
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -252,11 +253,8 @@ Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
         target, [this, target]() -> Task<absl::Status> {
           WorkerStore& store = *stores_[target];
           while (store.expiry_cycle_running_) {
-            absl::Status waited = co_await bycorf::SleepFor(
-                *store.worker_, std::chrono::milliseconds(1));
-            if (!waited.ok()) {
-              co_return waited;
-            }
+            LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+                *store.worker_, std::chrono::milliseconds(1)));
           }
           co_return absl::OkStatus();
         });
@@ -342,9 +340,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   auto resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                  candidate.digest_, candidate.key_);
-  if (!resolved.ok()) {
-    co_return resolved.status();
-  }
+  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
   auto* current = *resolved;
   const auto matches_candidate = [&candidate](const RecordIndex::Entry* entry) {
     return entry != nullptr && entry->value_.kind() == RecordKind::kValue &&
@@ -388,7 +384,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                  candidate.digest_, candidate.key_);
-  if (!resolved.ok()) co_return resolved.status();
+  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
   current = *resolved;
   if (!matches_candidate(current)) co_return absl::OkStatus();
   if (current->value_.shielding()) co_return durable;
@@ -407,7 +403,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
             .replication_epoch_ = partition.replication_epoch_,
             .index_generation_ =
                 partition.grouped_generations_[candidate.db_id_]});
-    if (!view.ok()) co_return view.status();
+    LAVIK_CO_RETURN_IF_ERROR(view.status());
     if (*view == nullptr)
       co_return absl::DataLossError("missing expired grouped view");
     grouped = std::move(*view);
@@ -416,9 +412,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     // retirement records. Their source blocks retain UUID dependencies
     // until physical retirement.
     // Admission failure leaves the expired key indexed for a later retry.
-    auto retired = CollectGroupedRetirements(grouped, nullptr);
-    if (!retired.ok()) co_return retired.status();
-    grouped_retirements = std::move(*retired);
+    LAVIK_ASSIGN_OR_CO_RETURN(grouped_retirements,
+                              CollectGroupedRetirements(grouped, nullptr));
   }
 
   // Append can fail before reaching its publication precondition. The
@@ -487,10 +482,8 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
   while (!store->worker_->stop_requested()) {
     const auto interval = std::chrono::milliseconds(
         ActiveExpirationConfigValue(ActiveExpirationConfigKey::kIntervalMs));
-    absl::Status waited = co_await bycorf::SleepFor(*store->worker_, interval);
-    if (!waited.ok()) {
-      co_return waited;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await bycorf::SleepFor(*store->worker_, interval));
     // Raise the flag before checking the pause count — with no suspension
     // between the two, a cycle QuiesceExpiration's increment misses is
     // already visible to its drain. The guard drops the flag on every exit
@@ -598,9 +591,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         for (const ExternalExpired& candidate : external_expired) {
           auto key = co_await LoadOutOfIndexKey(*store, candidate.location_,
                                                 candidate.key_bytes_);
-          if (!key.ok()) {
-            co_return key.status();
-          }
+          LAVIK_CO_RETURN_IF_ERROR(key.status());
           RecordIndex::Entry* current =
               index.FindAddress(candidate.entry_address_, candidate.hash_);
           if (current == nullptr) continue;

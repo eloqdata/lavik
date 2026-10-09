@@ -22,6 +22,7 @@
 
 #include "impl.h"
 #include "lavik/fault_pause.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -129,8 +130,7 @@ absl::StatusOr<std::string> StorageEngine::Impl::EncodePromotionBase(
         std::string_view(base.parent_history_id_),
         std::string_view(base.parent_frontier_.history_context_),
         std::string_view(base.storage_accumulator_)}) {
-    absl::Status appended = PutString(&output, value);
-    if (!appended.ok()) return appended;
+    LAVIK_RETURN_IF_ERROR(PutString(&output, value));
   }
   for (const std::uint64_t cursor : base.parent_frontier_.flow_cursors_) {
     if (cursor == 0) {
@@ -198,9 +198,8 @@ absl::StatusOr<std::string> StorageEngine::Impl::EncodeSystemStateManifest(
   }
   std::string promotion;
   if (state.promotion_base_.has_value()) {
-    auto encoded = EncodePromotionBase(*state.promotion_base_);
-    if (!encoded.ok()) return encoded.status();
-    promotion = std::move(*encoded);
+    LAVIK_ASSIGN_OR_RETURN(promotion,
+                           EncodePromotionBase(*state.promotion_base_));
   }
   const std::size_t ref_count =
       state.catalog_extents_ == nullptr ? 0 : state.catalog_extents_->size();
@@ -318,10 +317,9 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
     return absl::InternalError("durable promotion base length mismatch");
   }
   if (promotion_bytes != 0) {
-    auto promotion =
-        DecodePromotionBase(encoded.substr(offset, promotion_bytes));
-    if (!promotion.ok()) return promotion.status();
-    state.promotion_base_ = std::move(*promotion);
+    LAVIK_ASSIGN_OR_RETURN(
+        state.promotion_base_,
+        DecodePromotionBase(encoded.substr(offset, promotion_bytes)));
   }
   offset += promotion_bytes;
   state.population_identity_ = encoded.substr(offset, identity_bytes);
@@ -362,10 +360,9 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
     const StorageDevice& device = devices_[device_index];
     for (unsigned slot = 0; slot < 2; ++slot) {
       std::array<std::byte, kDirectIoAlignment> page{};
-      absl::Status read = ReadExactlyAt(
+      LAVIK_RETURN_IF_ERROR(ReadExactlyAt(
           device.path_, page,
-          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
-      if (!read.ok()) return read;
+          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot)));
       if (IsZero(page)) continue;
       saw_any_root = true;
       std::array<std::byte, sizeof(SystemStateRoot)> payload{};
@@ -419,9 +416,8 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
     const std::size_t read_bytes =
         AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
     std::vector<std::byte> bytes(read_bytes);
-    absl::Status read = ReadExactlyAt(devices_[device_index].path_, bytes,
-                                      LocalBlockOffset(ref.block_id_));
-    if (!read.ok()) return read;
+    LAVIK_RETURN_IF_ERROR(ReadExactlyAt(devices_[device_index].path_, bytes,
+                                        LocalBlockOffset(ref.block_id_)));
     BlockHeader header;
     if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                     bytes.data(), kBlockHeaderBytes),
@@ -445,12 +441,12 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
   };
 
   auto manifest = read_extent(selected->root_.manifest_, 0);
-  if (!manifest.ok()) return manifest.status();
+  LAVIK_RETURN_IF_ERROR(manifest.status());
   if (manifest->size() != selected->root_.manifest_bytes_) {
     return absl::InternalError("system-state root manifest length mismatch");
   }
   auto decoded = DecodeSystemStateManifest(*manifest);
-  if (!decoded.ok()) return decoded.status();
+  LAVIK_RETURN_IF_ERROR(decoded.status());
   if (decoded->generation_ != selected->generation_) {
     return absl::InternalError("system-state root and manifest disagree");
   }
@@ -465,7 +461,7 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
          ++index) {
       auto part = read_extent(decoded->catalog_extents_->at(index),
                               static_cast<std::uint32_t>(index));
-      if (!part.ok()) return part.status();
+      LAVIK_RETURN_IF_ERROR(part.status());
       catalog->append(*part);
     }
     if (catalog->size() != decoded->catalog_bytes_ ||
@@ -530,7 +526,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
       });
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
+  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -542,9 +538,8 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
                          buffer.data_, kDirectIoAlignment));
   const StorageDevice& device = devices_[device_index];
   LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE"));
   });
   // Buffer admission and the hop to this device's owner may suspend. This is
   // the first irreversible root write, not the earlier extent preparation.
@@ -552,8 +547,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
   // time. Never recheck between devices: a partial root set cannot be aborted
   // as if the catalog were unchanged.
   if (!root_write_started) {
-    absl::Status authorized = mutation_precondition.Validate();
-    if (!authorized.ok()) co_return authorized;
+    LAVIK_CO_RETURN_IF_ERROR(mutation_precondition.Validate());
     root_write_started = true;
   }
   auto written = co_await WriteStorageBuffer(
@@ -567,9 +561,8 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
         : written.status();
   }
   LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FUNCTION_CATALOG_AFTER_ROOT_WRITE_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_AFTER_ROOT_WRITE_HOLD_FILE"));
     const char* fail = std::getenv("LAVIK_SYSTEM_STATE_ROOT_SYNC_FAIL_FILE");
     if (fail != nullptr && ::access(fail, F_OK) == 0) {
       co_return absl::UnavailableError(
@@ -600,9 +593,8 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
   co_await store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
   if (replace_catalog) {
-    auto written = co_await WriteExtentValueLocked(store, catalog_dump);
-    if (!written.ok()) co_return written.status();
-    new_catalog = std::move(*written);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        new_catalog, co_await WriteExtentValueLocked(store, catalog_dump));
     next.catalog_extents_ = new_catalog;
     next.catalog_bytes_ = catalog_dump.size();
     LAVIK_MAYBE_CRASH_AT("function-catalog-body-durable");
@@ -718,9 +710,8 @@ StorageEngine::Impl::CommitFunctionCatalog(
       .dump_crc64_ = Crc64(AsBytes(dump)),
   };
   if (next.full_sync_session_id_ != 0) next.catalog_ready_ = true;
-  absl::Status committed = co_await CommitSystemState(
-      std::move(next), dump, true, false, std::move(mutation_precondition));
-  if (!committed.ok()) co_return committed;
+  LAVIK_CO_RETURN_IF_ERROR(co_await CommitSystemState(
+      std::move(next), dump, true, false, std::move(mutation_precondition)));
   co_return system_state_.catalog_token_;
 }
 
@@ -755,9 +746,8 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
         });
   }
   while (active_tx_commits_.load(std::memory_order_acquire) != 0) {
-    absl::Status slept = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!slept.ok()) co_return slept;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   // Keep each suspension in its own statement. GCC 13 can reuse the wrong
   // coroutine-frame slot when both arms of ?: contain co_await.
@@ -771,7 +761,7 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
     } else {
       durable = co_await bycorf::SubmitTaskTo(worker, drain);
     }
-    if (!durable.ok()) co_return durable;
+    LAVIK_CO_RETURN_IF_ERROR(durable);
   }
   co_return absl::OkStatus();
 }
@@ -848,9 +838,8 @@ StorageEngine::Impl::ConsumePopulationRecovery() {
     LAVIK_MAYBE_CRASH_AT("recovery_before_proof_consume");
     DurableSystemState next = system_state_;
     next.clean_shutdown_proof_.clear();
-    absl::Status consumed =
-        co_await CommitSystemState(std::move(next), {}, false);
-    if (!consumed.ok()) co_return consumed;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await CommitSystemState(std::move(next), {}, false));
     LAVIK_MAYBE_CRASH_AT("recovery_after_proof_consume");
   }
   co_return std::optional<PopulationRecoveryRecord>(std::move(record));
@@ -906,7 +895,7 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
         0, [this, session_id]() { return BeginReplicaFullSync(session_id); });
   }
   auto paused = co_await BeginPopulationChange(session_id);
-  if (!paused.ok()) co_return paused.status();
+  LAVIK_CO_RETURN_IF_ERROR(paused.status());
   const auto generation = paused->generation_;
   co_await system_state_mutex_.Lock();
   UnlockGuard unlock(&system_state_mutex_, bycorf::ThisWorker().self_);
@@ -1017,9 +1006,8 @@ Task<absl::Status> StorageEngine::Impl::CompleteReplicaFullSync(
   next.full_sync_session_id_ = 0;
   next.population_token_ = population;
   next.catalog_ready_ = true;
-  absl::Status committed =
-      co_await CommitSystemState(std::move(next), {}, false);
-  if (!committed.ok()) co_return committed;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await CommitSystemState(std::move(next), {}, false));
   replica_recovery_fenced_.store(false, std::memory_order_release);
   replica_loading_.store(false, std::memory_order_release);
   spdlog::info(

@@ -57,6 +57,7 @@
 #include "lavik/metrics.h"
 #include "lavik/numeric_endpoint.h"
 #include "lavik/replication.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::cluster {
@@ -88,7 +89,7 @@ bool IsZero(const control::WireId128& value) {
 
 absl::StatusOr<std::uint64_t> Entropy64() {
   auto generated = control::GenerateId128();
-  if (!generated.ok()) return generated.status();
+  LAVIK_RETURN_IF_ERROR(generated.status());
   std::uint64_t value = 0;
   std::memcpy(&value, generated->data(), sizeof(value));
   return value;
@@ -381,7 +382,7 @@ class ReplicationNodeControlActions final : public NodeControlActions {
         co_await replication_.ObserveIdentity();
     auto translated = detail::TranslateClusterFailoverControl(
         *desired, local_identity, use_tls_);
-    if (!translated.ok()) co_return translated.status();
+    LAVIK_CO_RETURN_IF_ERROR(translated.status());
     absl::Status result = absl::OkStatus();
     // Always attempt every applicable level-triggered intent so replacement
     // or removal cannot strand cleanup behind another subsystem's failure.
@@ -1158,7 +1159,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
   };
   std::string fitted;
   auto initial = fits(&fitted);
-  if (!initial.ok()) return initial.status();
+  LAVIK_RETURN_IF_ERROR(initial.status());
   if (*initial) return fitted;
 
   const auto shorten_summary =
@@ -1168,7 +1169,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
     heartbeat.health.summary.clear();
     std::string candidate_bytes;
     auto base = fits(&candidate_bytes);
-    if (!base.ok()) return base.status();
+    LAVIK_RETURN_IF_ERROR(base.status());
     if (!*base) {
       heartbeat.health.summary = original;
       return false;
@@ -1185,7 +1186,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
       heartbeat.health.summary.assign(original.data(), prefix);
       if (prefix < original.size()) heartbeat.health.summary.append(kSuffix);
       auto candidate = fits(&candidate_bytes);
-      if (!candidate.ok()) return candidate.status();
+      LAVIK_RETURN_IF_ERROR(candidate.status());
       if (*candidate) {
         best = heartbeat.health.summary;
         best_bytes = std::move(candidate_bytes);
@@ -1201,7 +1202,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
   };
 
   auto summary_fit = shorten_summary(&fitted);
-  if (!summary_fit.ok()) return summary_fit.status();
+  LAVIK_RETURN_IF_ERROR(summary_fit.status());
   if (*summary_fit) return fitted;
 
   if (!std::holds_alternative<control::ReplicaCandidate>(
@@ -1214,7 +1215,7 @@ absl::StatusOr<std::string> FitHeartbeatToSingleFrame(
       "candidate progress omitted: single-frame limit",
       heartbeat.health.summary.empty() ? "" : "; ", heartbeat.health.summary);
   summary_fit = shorten_summary(&fitted);
-  if (!summary_fit.ok()) return summary_fit.status();
+  LAVIK_RETURN_IF_ERROR(summary_fit.status());
   if (*summary_fit) return fitted;
   return absl::ResourceExhaustedError(
       "heartbeat fixed fields exceed the single-frame protocol limit");
@@ -1264,7 +1265,7 @@ absl::Status MetaEndpointDirectory::Update(
     }
     auto value =
         ParseNumericControlEndpoint(EndpointText(endpoint.host, endpoint.port));
-    if (!value.ok()) return value.status();
+    LAVIK_RETURN_IF_ERROR(value.status());
     value->server_id_ = endpoint.server_id;
     value->principal_ = endpoint.principal;
     const auto duplicate = std::find_if(
@@ -1721,9 +1722,7 @@ struct MetaControlClientService::Impl {
   bycorf::Task<absl::StatusOr<control::WireMessage>> ReadWithDeadline(
       control::ControlFrameStream& frames, SocketDeadline& deadline,
       std::chrono::milliseconds timeout, std::string_view phase) {
-    if (absl::Status armed = deadline.Arm(timeout); !armed.ok()) {
-      co_return armed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(deadline.Arm(timeout));
     auto message = co_await frames.ReadMessage();
     if (deadline.Disarm()) {
       co_return absl::DeadlineExceededError(
@@ -1744,10 +1743,9 @@ struct MetaControlClientService::Impl {
         co_return absl::CancelledError("Meta control client stopped");
       }
       if (!next.has_value()) {
-        auto read = co_await ReadWithDeadline(
-            frames, deadline, progress_timeout, "control object transfer");
-        if (!read.ok()) co_return read.status();
-        next = std::move(*read);
+        LAVIK_ASSIGN_OR_CO_RETURN(
+            next, co_await ReadWithDeadline(frames, deadline, progress_timeout,
+                                            "control object transfer"));
       }
       const bool aborted =
           std::holds_alternative<control::TransferAbort>(*next);
@@ -1765,7 +1763,7 @@ struct MetaControlClientService::Impl {
           },
           *next);
       next.reset();
-      if (!accepted.ok()) co_return accepted;
+      LAVIK_CO_RETURN_IF_ERROR(accepted);
       if (aborted) {
         co_return absl::AbortedError("peer aborted control object transfer");
       }
@@ -1783,17 +1781,16 @@ struct MetaControlClientService::Impl {
       std::chrono::milliseconds progress_timeout,
       std::optional<control::WireMessage> first = std::nullopt) {
     if (!first.has_value()) {
-      auto read = co_await ReadWithDeadline(frames, deadline, progress_timeout,
-                                            "initial FullDesiredState");
-      if (!read.ok()) co_return read.status();
-      first = std::move(*read);
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          first, co_await ReadWithDeadline(frames, deadline, progress_timeout,
+                                           "initial FullDesiredState"));
     }
     if (auto* direct = std::get_if<control::FullDesiredState>(&*first)) {
       co_return std::move(*direct);
     }
     auto transfer = co_await ReceiveTransfer(frames, deadline, progress_timeout,
                                              std::move(first));
-    if (!transfer.ok()) co_return transfer.status();
+    LAVIK_CO_RETURN_IF_ERROR(transfer.status());
     if (transfer->kind_ != control::TransferKind::kFullDesiredState) {
       co_return absl::InvalidArgumentError(
           "expected initial FullDesiredState transfer");
@@ -1805,16 +1802,13 @@ struct MetaControlClientService::Impl {
                                      std::string_view local_boot_id) {
     auto prepared = PrepareNodeControlState(desired, options_.node_id_,
                                             options_.request_worker_count_);
-    if (!prepared.ok()) co_return prepared.status();
+    LAVIK_CO_RETURN_IF_ERROR(prepared.status());
     // Directory parsing is part of the all-or-nothing local control boundary.
     // Validate into a private copy before publishing topology; committing the
     // copy after the awaited installer transition cannot fail.
     MetaEndpointDirectory refreshed_directory = directory_;
-    if (absl::Status refreshed =
-            refreshed_directory.Refresh(desired.directory.endpoints);
-        !refreshed.ok()) {
-      co_return refreshed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(
+        refreshed_directory.Refresh(desired.directory.endpoints));
     const ProjectionBasis basis{
         .control_revision_ = desired.local.revision,
     };
@@ -1835,10 +1829,9 @@ struct MetaControlClientService::Impl {
                  directive.recipient_node_id == options_.node_id_ &&
                  directive.recipient_boot_id == local_boot_id;
         });
-    absl::Status installed = co_await installer_.InstallFullStateTransition(
+    LAVIK_CO_RETURN_IF_ERROR(co_await installer_.InstallFullStateTransition(
         std::move(*prepared), basis, local_population_transition_expected,
-        expected_source_authorization_replays);
-    if (!installed.ok()) co_return installed;
+        expected_source_authorization_replays));
     directory_ = std::move(refreshed_directory);
     RecordClusterControlFullStateApplied();
     co_return absl::OkStatus();
@@ -1860,7 +1853,7 @@ struct MetaControlClientService::Impl {
       control::ControlSessionWriter& writer,
       const control::DirectiveResult& result) {
     auto encoded = control::EncodeMessage(control::WireMessage(result));
-    if (!encoded.ok()) co_return encoded.status();
+    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
     // The size probe's encoding is reused for the send itself on both paths.
     if (encoded->payload.size() <= control::kMaxFramePayloadBytes) {
       co_return co_await writer.Write(control::MessagePriority::kReliable,
@@ -1872,7 +1865,7 @@ struct MetaControlClientService::Impl {
     // There is no per-chunk acknowledgement; ResultCommitted remains the
     // application-level acknowledgement for the completed result.
     auto object_id = control::GenerateId128();
-    if (!object_id.ok()) co_return object_id.status();
+    LAVIK_CO_RETURN_IF_ERROR(object_id.status());
     auto owned =
         std::make_shared<const std::string>(std::move(encoded->payload));
     co_return co_await writer.WriteTransfer(
@@ -1905,11 +1898,8 @@ struct MetaControlClientService::Impl {
       return absl::FailedPreconditionError(
           "directive does not name the current session");
     }
-    if (absl::Status live = ValidateLiveDirective(directive, desired,
-                                                  options_.node_id_, boot_id);
-        !live.ok()) {
-      return live;
-    }
+    LAVIK_RETURN_IF_ERROR(
+        ValidateLiveDirective(directive, desired, options_.node_id_, boot_id));
     NodeDirective::Kind kind = NodeDirective::Kind::kReplication;
     switch (directive.kind) {
       case control::WireDirectiveKind::kRebuild:
@@ -1933,7 +1923,7 @@ struct MetaControlClientService::Impl {
     std::uint32_t flow_count = 0;
     if (rebuild) {
       auto request = control::DecodeRebuildRequest(directive.payload);
-      if (!request.ok()) return request.status();
+      LAVIK_RETURN_IF_ERROR(request.status());
       flow_count = request->source_flow_count;
     }
     const auto target_node = NodeId::Parse(directive.target_node_id);
@@ -2157,7 +2147,7 @@ struct MetaControlClientService::Impl {
     auto normalized = NormalizeDirective(
         directive, state->session_, state->boot_id_,
         state->replication_identity_.local_history_id_, *state->desired_);
-    if (!normalized.ok()) co_return normalized.status();
+    LAVIK_CO_RETURN_IF_ERROR(normalized.status());
     state->accepted_directives_.push_back(directive.identity);
     state->directive_queue_.push_back(DirectiveWork{
         .wire_ = directive, .normalized_ = std::move(*normalized)});
@@ -2200,8 +2190,7 @@ struct MetaControlClientService::Impl {
       if (task.recipient_boot_id != state->boot_id_) continue;
       auto directive = LiveDirective(task, state->session_.session_id_.bytes(),
                                      state->desired_->local.revision);
-      if (auto status = co_await QueueDirective(state, directive); !status.ok())
-        co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(co_await QueueDirective(state, directive));
     }
     co_return absl::OkStatus();
   }
@@ -2210,16 +2199,11 @@ struct MetaControlClientService::Impl {
       const std::shared_ptr<SessionState>& state,
       control::ControlSessionWriter& writer,
       const control::NodeControlUpdate& update) {
-    if (auto status = CheckClientService(update.service); !status.ok())
-      co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(CheckClientService(update.service));
     auto next = std::make_shared<control::NodeControlState>(*state->desired_);
-    if (auto status = control::ApplyNodeControlUpdate(*next, update);
-        !status.ok())
-      co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(control::ApplyNodeControlUpdate(*next, update));
     MetaEndpointDirectory directory = directory_;
-    if (auto status = directory.Refresh(next->directory.endpoints);
-        !status.ok())
-      co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(directory.Refresh(next->directory.endpoints));
     const bool local_changed = next->local != state->desired_->local;
     const bool tasks_changed =
         next->tasks_revision != state->desired_->tasks_revision;
@@ -2251,26 +2235,20 @@ struct MetaControlClientService::Impl {
     } else if (local_changed || tasks_changed) {
       DisableDirectiveDispatch(state);
       RequestHeartbeatPause(state);
-      if (auto status = co_await WaitForHeartbeatQuiesced(state); !status.ok())
-        co_return status;
-      if (auto status = co_await WaitForDirectiveExecutor(state); !status.ok())
-        co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WaitForHeartbeatQuiesced(state));
+      LAVIK_CO_RETURN_IF_ERROR(co_await WaitForDirectiveExecutor(state));
       // Cancel only completion observers. Matching native operations survive
       // reconciliation and their idempotent requests attach new observers.
-      if (auto status = co_await CancelAndWaitForDirectiveCompletions(state);
-          !status.ok())
-        co_return status;
-      if (auto status = co_await Install(*next, state->boot_id_); !status.ok())
-        co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await CancelAndWaitForDirectiveCompletions(state));
+      LAVIK_CO_RETURN_IF_ERROR(co_await Install(*next, state->boot_id_));
       state->accepted_directives_.clear();
       state->challenge_rotation_.Reset();
     } else if (routing_changed) {
       auto prepared = PrepareNodeControlState(*next, options_.node_id_,
                                               options_.request_worker_count_);
-      if (!prepared.ok()) co_return prepared.status();
-      if (auto status = installer_.InstallRouting(std::move(*prepared));
-          !status.ok())
-        co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
+      LAVIK_CO_RETURN_IF_ERROR(installer_.InstallRouting(std::move(*prepared)));
     }
     directory_ = std::move(directory);
     state->desired_ = std::move(next);
@@ -2289,10 +2267,8 @@ struct MetaControlClientService::Impl {
             state->desired_->local.groups, options_.node_id_)
             ? std::min(state->heartbeat_interval_, next_interval)
             : next_interval;
-    if (auto status =
-            co_await SendApplied(writer, *state->desired_, update.request_id);
-        !status.ok())
-      co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await SendApplied(writer, *state->desired_, update.request_id));
     state->directive_dispatch_enabled_ = true;
     ResumeHeartbeat(state);
     if (policy_only) co_return absl::OkStatus();
@@ -2412,11 +2388,10 @@ struct MetaControlClientService::Impl {
            !state->heartbeat_projection_gate_.pause_requested()) {
       const auto now_ms = LeaseClockMillis();
       if (now_ms >= deadline_ms) break;
-      const absl::Status slept = co_await bycorf::SleepFor(
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
           *state->worker_,
           std::min(std::chrono::milliseconds(deadline_ms - now_ms),
-                   kDeadlinePollInterval));
-      if (!slept.ok()) co_return slept;
+                   kDeadlinePollInterval)));
     }
     co_return absl::OkStatus();
   }
@@ -2756,13 +2731,9 @@ struct MetaControlClientService::Impl {
             "lease grant does not match the accepted leader or local control "
             "authority");
       }
-      if (absl::Status exact_duration =
-              detail::ValidateResolvedLeaseGrantDuration(
-                  grant->granted_duration_ms,
-                  pending.challenged_authority_lease_duration_ms_);
-          !exact_duration.ok()) {
-        co_return exact_duration;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(detail::ValidateResolvedLeaseGrantDuration(
+          grant->granted_duration_ms,
+          pending.challenged_authority_lease_duration_ms_));
       auto deadline_ms = state->challenge_tracker_.AcceptGrant(
           state->session_.session_id_.bytes(), *grant, LeaseClockMillis());
       // An exact but expired Grant is consumed by the tracker and must still
@@ -2770,7 +2741,7 @@ struct MetaControlClientService::Impl {
       // it as causal proof that Data installed Ack N. Session invalidation
       // revokes any older retained authority before reauthentication starts a
       // new causal sequence whose first valid Grant can safely restore service.
-      if (!deadline_ms.ok()) co_return deadline_ms.status();
+      LAVIK_CO_RETURN_IF_ERROR(deadline_ms.status());
       const std::int64_t grant_ms = grant->granted_duration_ms;
       const auto grant_sent_at =
           MonotonicTime(std::chrono::milliseconds(*deadline_ms - grant_ms));
@@ -2804,10 +2775,7 @@ struct MetaControlClientService::Impl {
                               (state->directive_runner_running_ &&
                                state->directive_completion_tasks_ != 0);
         DisableDirectiveDispatch(state);
-        if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
-            !joined.ok()) {
-          co_return joined;
-        }
+        LAVIK_CO_RETURN_IF_ERROR(co_await WaitForDirectiveExecutor(state));
         authority =
             co_await installer_.ApplyLeaseGrantTransition(authority_message);
       }
@@ -2816,7 +2784,7 @@ struct MetaControlClientService::Impl {
           std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - grant_started)
               .count());
-      if (!authority.ok()) co_return authority;
+      LAVIK_CO_RETURN_IF_ERROR(authority);
       if (discarded_directive) {
         co_return absl::AbortedError(
             "lease installation overtook queued directive admission");
@@ -2893,22 +2861,17 @@ struct MetaControlClientService::Impl {
     }
     control::ControlFrameStream frames(stream);
     control::ControlSessionWriter writer(frames, kSessionWriteQueueBytes);
-    if (absl::Status prepared = frames.Prepare(); !prepared.ok()) {
-      co_return prepared;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(frames.Prepare());
     SocketDeadline socket_deadline(worker, stream);
     if (options_.tls_context_ != nullptr) {
-      if (absl::Status armed = socket_deadline.Arm(kHandshakeTimeout);
-          !armed.ok()) {
-        co_return armed;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(socket_deadline.Arm(kHandshakeTimeout));
       absl::Status tls = co_await stream.StartTls(
           options_.tls_context_, /*server=*/false, endpoint.host_);
       if (socket_deadline.Disarm()) {
         co_return absl::DeadlineExceededError(
             "Meta control TLS handshake timed out");
       }
-      if (!tls.ok()) co_return tls;
+      LAVIK_CO_RETURN_IF_ERROR(tls);
     }
 
     const ReplicationIdentity replication_identity =
@@ -2919,10 +2882,7 @@ struct MetaControlClientService::Impl {
       co_return absl::FailedPreconditionError(
           "replication boot/history identity is not ready");
     }
-    if (absl::Status armed = socket_deadline.Arm(kHandshakeTimeout);
-        !armed.ok()) {
-      co_return armed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(socket_deadline.Arm(kHandshakeTimeout));
     absl::Status hello_sent = co_await writer.Write(
         control::MessagePriority::kReliable,
         control::WireMessage(control::ClientHello{
@@ -2944,7 +2904,7 @@ struct MetaControlClientService::Impl {
       co_return absl::DeadlineExceededError(
           "Meta control ServerHello timed out");
     }
-    if (!hello_message.ok()) co_return hello_message.status();
+    LAVIK_CO_RETURN_IF_ERROR(hello_message.status());
     const auto* hello = std::get_if<control::ServerHello>(&*hello_message);
     if (hello == nullptr) {
       co_return absl::InvalidArgumentError("expected ServerHello");
@@ -2962,11 +2922,8 @@ struct MetaControlClientService::Impl {
     // but the wrong URI identity must not poison discovery before this
     // handshake is rejected.
     MetaEndpointDirectory next_directory = directory_;
-    if (absl::Status updated =
-            next_directory.Update(hello->directory, hello->leader_id);
-        !updated.ok()) {
-      co_return updated;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(
+        next_directory.Update(hello->directory, hello->leader_id));
     const auto hello_member =
         std::find_if(hello->directory.begin(), hello->directory.end(),
                      [&](const control::WireMetaEndpoint& member) {
@@ -2977,11 +2934,8 @@ struct MetaControlClientService::Impl {
       co_return absl::InvalidArgumentError(
           "ServerHello identity is absent from the committed directory");
     }
-    if (absl::Status pinned =
-            ValidateDialedMetaIdentity(endpoint, *hello_member);
-        !pinned.ok()) {
-      co_return pinned;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(
+        ValidateDialedMetaIdentity(endpoint, *hello_member));
     if (hello->negotiated_version != control::kProtocolVersion ||
         hello->raft_term == 0) {
       co_return absl::InvalidArgumentError(
@@ -2989,15 +2943,12 @@ struct MetaControlClientService::Impl {
     }
     if (options_.tls_context_ != nullptr) {
       auto sans = stream.PeerCertificateUriSans();
-      if (!sans.ok()) co_return sans.status();
+      LAVIK_CO_RETURN_IF_ERROR(sans.status());
       const std::string& expected_principal = endpoint.principal_.has_value()
                                                   ? *endpoint.principal_
                                                   : *hello_member->principal;
-      if (absl::Status identity =
-              ValidateUniqueControlPrincipal(*sans, expected_principal);
-          !identity.ok()) {
-        co_return identity;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(
+          ValidateUniqueControlPrincipal(*sans, expected_principal));
     }
     if (hello->disposition == control::ServerHelloDisposition::kRejected) {
       service_incompatible_ = true;
@@ -3008,8 +2959,7 @@ struct MetaControlClientService::Impl {
       *follower = true;
       co_return absl::UnavailableError("connected Meta node is not leader");
     }
-    if (auto status = CheckClientService(hello->service); !status.ok())
-      co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(CheckClientService(hello->service));
     if (!hello->leader_id.has_value() ||
         *hello->leader_id != hello->meta_server_id ||
         IsZero(hello->session_id) || hello->session_generation == 0 ||
@@ -3037,9 +2987,8 @@ struct MetaControlClientService::Impl {
     auto run_established = [&]() -> bycorf::Task<absl::Status> {
       auto initial =
           co_await ReceiveFullState(frames, socket_deadline, progress_timeout);
-      if (!initial.ok()) co_return initial.status();
-      if (auto status = CheckClientService(initial->service); !status.ok())
-        co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(initial.status());
+      LAVIK_CO_RETURN_IF_ERROR(CheckClientService(initial->service));
       if (control::DataHeartbeatIntervalMs(
               initial->authority_lease_duration_ms) >
           hello->observation_ttl_ms) {
@@ -3052,15 +3001,9 @@ struct MetaControlClientService::Impl {
       auto selected =
           control::SelectNodeControlState(*initial, options_.node_id_);
       initial = control::FullDesiredState{};
-      if (absl::Status installed =
-              co_await Install(selected, replication_identity.boot_id_);
-          !installed.ok()) {
-        co_return installed;
-      }
-      if (absl::Status applied = co_await SendApplied(writer, selected);
-          !applied.ok()) {
-        co_return applied;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await Install(selected, replication_identity.boot_id_));
+      LAVIK_CO_RETURN_IF_ERROR(co_await SendApplied(writer, selected));
       state = std::make_shared<SessionState>();
       state->worker_ = &worker;
       state->stream_ = &stream;
@@ -3102,8 +3045,7 @@ struct MetaControlClientService::Impl {
       ++state->active_tasks_;
       worker.Spawn(RunHeartbeatProducer(state));
       SetClusterControlConnected(true);
-      if (auto status = co_await QueueCurrentTasks(state); !status.ok())
-        co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(co_await QueueCurrentTasks(state));
 
       StringTransferSink transfer_sink;
       control::LargeObjectReassembler transfer_reassembler(transfer_sink);
@@ -3147,7 +3089,7 @@ struct MetaControlClientService::Impl {
             co_return absl::FailedPreconditionError(
                 "overlapping inbound control transfers are not supported");
           }
-          const absl::Status accepted = std::visit(
+          LAVIK_CO_RETURN_IF_ERROR(std::visit(
               [&](const auto& message) -> absl::Status {
                 using T = std::decay_t<decltype(message)>;
                 if constexpr (std::is_same_v<T, control::TransferStart> ||
@@ -3159,14 +3101,10 @@ struct MetaControlClientService::Impl {
                 return absl::InternalError(
                     "non-transfer reached the transfer reassembler");
               },
-              *incoming);
-          if (!accepted.ok()) co_return accepted;
+              *incoming));
           if (advances) {
-            if (absl::Status armed =
-                    state->inbound_transfer_deadline_->Arm(progress_timeout);
-                !armed.ok()) {
-              co_return armed;
-            }
+            LAVIK_CO_RETURN_IF_ERROR(
+                state->inbound_transfer_deadline_->Arm(progress_timeout));
           }
           if (finishes) (void)state->inbound_transfer_deadline_->Disarm();
           if (starts) transfer_active = true;
@@ -3196,12 +3134,9 @@ struct MetaControlClientService::Impl {
           if (transfer.kind_ == control::TransferKind::kNodeControlUpdate) {
             auto replacement =
                 control::DecodeNodeControlUpdate(std::move(transfer.bytes_));
-            if (!replacement.ok()) co_return replacement.status();
-            if (absl::Status applied = co_await ApplyControlUpdate(
-                    state, writer, std::move(*replacement));
-                !applied.ok()) {
-              co_return applied;
-            }
+            LAVIK_CO_RETURN_IF_ERROR(replacement.status());
+            LAVIK_CO_RETURN_IF_ERROR(co_await ApplyControlUpdate(
+                state, writer, std::move(*replacement)));
             continue;
           }
           co_return absl::InvalidArgumentError(
@@ -3220,59 +3155,35 @@ struct MetaControlClientService::Impl {
             co_return absl::FailedPreconditionError(
                 "direct control update interrupted an inbound transfer");
           }
-          if (absl::Status applied = co_await ApplyControlUpdate(
-                  state, writer, std::move(*replacement));
-              !applied.ok()) {
-            co_return applied;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(co_await ApplyControlUpdate(
+              state, writer, std::move(*replacement)));
           continue;
         }
         if (const auto* ack = std::get_if<control::HeartbeatAck>(&*incoming)) {
-          if (absl::Status handled = co_await HandleHeartbeatAck(state, *ack);
-              !handled.ok()) {
-            co_return handled;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(co_await HandleHeartbeatAck(state, *ack));
           continue;
         }
         if (const auto* fence = std::get_if<control::Fence>(&*incoming)) {
           DisableDirectiveDispatch(state);
-          if (absl::Status fenced = co_await HandleFence(
-                  *fence, session, replication_identity.boot_id_);
-              !fenced.ok()) {
-            co_return fenced;
-          }
-          if (absl::Status joined = co_await WaitForDirectiveExecutor(state);
-              !joined.ok()) {
-            co_return joined;
-          }
-          if (absl::Status cancelled =
-                  co_await CancelAndWaitForDirectiveCompletions(state);
-              !cancelled.ok()) {
-            co_return cancelled;
-          }
-          if (absl::Status revoked =
-                  co_await installer_.RevokeSourceAuthorizationsTransition();
-              !revoked.ok()) {
-            co_return revoked;
-          }
-          if (absl::Status acknowledged = co_await writer.Write(
-                  control::MessagePriority::kAuthority,
-                  control::WireMessage(control::FenceAck{
-                      .session_id = fence->session_id,
-                      .target_boot_id = fence->target_boot_id,
-                      .reject_through = fence->reject_through,
-                  }));
-              !acknowledged.ok()) {
-            co_return acknowledged;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(co_await HandleFence(
+              *fence, session, replication_identity.boot_id_));
+          LAVIK_CO_RETURN_IF_ERROR(co_await WaitForDirectiveExecutor(state));
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await CancelAndWaitForDirectiveCompletions(state));
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await installer_.RevokeSourceAuthorizationsTransition());
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await writer.Write(control::MessagePriority::kAuthority,
+                                    control::WireMessage(control::FenceAck{
+                                        .session_id = fence->session_id,
+                                        .target_boot_id = fence->target_boot_id,
+                                        .reject_through = fence->reject_through,
+                                    })));
           continue;
         }
         if (std::holds_alternative<control::ResultCommitted>(*incoming) ||
             std::holds_alternative<control::ResultNoLongerTracked>(*incoming)) {
-          if (absl::Status handled = HandleResultAck(state, *incoming);
-              !handled.ok()) {
-            co_return handled;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(HandleResultAck(state, *incoming));
           continue;
         }
         co_return absl::InvalidArgumentError(
@@ -3358,15 +3269,13 @@ MetaControlClientService::Create(MetaControlClientOptions options,
     return absl::InvalidArgumentError(
         "Meta control requires workers and at least one seed");
   }
-  if (auto status = control::ValidateClientService(options.service_,
-                                                   options.capabilities_, true);
-      !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(control::ValidateClientService(
+      options.service_, options.capabilities_, true));
   std::vector<MetaControlEndpoint> seeds;
   seeds.reserve(options.seeds_.size());
   for (const std::string& seed : options.seeds_) {
     auto parsed = ParseNumericControlEndpoint(seed);
-    if (!parsed.ok()) return parsed.status();
+    LAVIK_RETURN_IF_ERROR(parsed.status());
     if (std::none_of(seeds.begin(), seeds.end(), [&](const auto& existing) {
           return SameEndpoint(existing, *parsed);
         })) {

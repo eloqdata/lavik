@@ -36,6 +36,7 @@
 #include "lavik/client_endpoint.h"
 #include "lavik/meta/cluster_status.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 #include "openssl/rand.h"
 
 namespace lavik::meta {
@@ -386,9 +387,9 @@ class Reader {
   }
   absl::StatusOr<std::uint32_t> U32() {
     auto high = U16();
-    if (!high.ok()) return high.status();
+    LAVIK_RETURN_IF_ERROR(high.status());
     auto low = U16();
-    if (!low.ok()) return low.status();
+    LAVIK_RETURN_IF_ERROR(low.status());
     return (static_cast<std::uint32_t>(*high) << 16) | *low;
   }
   absl::StatusOr<std::string_view> Raw(std::size_t size) {
@@ -399,7 +400,7 @@ class Reader {
   }
   absl::StatusOr<std::string> String() {
     auto size = U32();
-    if (!size.ok()) return size.status();
+    LAVIK_RETURN_IF_ERROR(size.status());
     if (*size > kMaxWireString || *size > bytes_.size() - offset_) {
       return Invalid("invalid clustercreate string length");
     }
@@ -602,7 +603,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       continue;
     }
     if (item.name == "--") {
-      if (absl::Status status = finish_section(); !status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(finish_section());
       section = Section::kNone;
       section_fields.clear();
       continue;
@@ -613,12 +614,11 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
         return Invalid("duplicate or misplaced manifest field " + item.name);
       }
       if (item.name == "schema_version") {
-        auto value = ParseUnsigned<std::uint32_t>(item);
-        if (!value.ok()) return value.status();
-        result.schema_version_ = *value;
+        LAVIK_ASSIGN_OR_RETURN(result.schema_version_,
+                               ParseUnsigned<std::uint32_t>(item));
       } else if (item.name == "client_mode") {
         auto value = ParseString(item);
-        if (!value.ok()) return value.status();
+        LAVIK_RETURN_IF_ERROR(value.status());
         if (*value == "single") {
           result.client_mode_ = ClientMode::kSingle;
         } else if (*value == "cluster") {
@@ -628,7 +628,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
         }
       } else if (item.name == "slot_strategy") {
         auto value = ParseString(item);
-        if (!value.ok()) return value.status();
+        LAVIK_RETURN_IF_ERROR(value.status());
         if (*value != "contiguous-even") {
           return Invalid("unsupported Slot allocation strategy");
         }
@@ -646,17 +646,15 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
     switch (section) {
       case Section::kBootstrapPolicy:
         if (item.name == "automatic_uncontrolled_failover_suspect_after_ms") {
-          auto value = ParseUnsigned<std::uint64_t>(item);
-          if (!value.ok()) return value.status();
-          result.automatic_uncontrolled_failover_suspect_after_ms_ = *value;
+          LAVIK_ASSIGN_OR_RETURN(
+              result.automatic_uncontrolled_failover_suspect_after_ms_,
+              ParseUnsigned<std::uint64_t>(item));
         } else if (item.name == "candidate_recovery_budget_ms") {
-          auto value = ParseUnsigned<std::uint64_t>(item);
-          if (!value.ok()) return value.status();
-          result.candidate_recovery_budget_ms_ = *value;
+          LAVIK_ASSIGN_OR_RETURN(result.candidate_recovery_budget_ms_,
+                                 ParseUnsigned<std::uint64_t>(item));
         } else if (item.name == "authority_lease_duration_ms") {
-          auto value = ParseUnsigned<std::uint64_t>(item);
-          if (!value.ok()) return value.status();
-          result.authority_lease_duration_ms_ = *value;
+          LAVIK_ASSIGN_OR_RETURN(result.authority_lease_duration_ms_,
+                                 ParseUnsigned<std::uint64_t>(item));
         } else {
           return Invalid("unknown bootstrap_policy field");
         }
@@ -664,24 +662,24 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       case Section::kMeta: {
         if (item.name == "id") {
           auto value = ParseUnsigned<std::uint32_t>(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.meta_members_.back().server_id_ = *value;
         } else if (item.name == "raft_endpoint") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.meta_members_.back().raft_endpoint_ = std::move(*value);
         } else if (item.name == "data_control_endpoint") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.meta_members_.back().data_control_endpoint_ =
               std::move(*value);
         } else if (item.name == "sentinel_endpoint") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.meta_members_.back().sentinel_endpoint_ = std::move(*value);
         } else if (item.name == "ctl_endpoint") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.meta_members_.back().ctl_endpoint_ = std::move(*value);
         } else {
           return Invalid("unknown meta_members field");
@@ -691,15 +689,15 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       case Section::kData:
         if (item.name == "id") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.data_nodes_.back().node_id_ = std::move(*value);
         } else if (item.name == "client_endpoint") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.data_nodes_.back().client_endpoint_ = std::move(*value);
         } else if (item.name == "tls_endpoint") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.data_nodes_.back().tls_endpoint_ = std::move(*value);
         } else {
           return Invalid("unknown data_nodes field");
@@ -708,15 +706,15 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       case Section::kGroup:
         if (item.name == "id") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.groups_.back().group_id_ = std::move(*value);
         } else if (item.name == "primary") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.groups_.back().primary_node_id_ = std::move(*value);
         } else if (item.name == "replicas") {
           auto values = ParseStringList(item);
-          if (!values.ok()) return values.status();
+          LAVIK_RETURN_IF_ERROR(values.status());
           result.groups_.back().replica_node_ids_ = std::move(*values);
         } else {
           return Invalid("unknown groups field");
@@ -725,15 +723,15 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
       case Section::kSlot:
         if (item.name == "first") {
           auto value = ParseUnsigned<std::uint16_t>(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.slot_ranges_.back().first_ = *value;
         } else if (item.name == "last") {
           auto value = ParseUnsigned<std::uint16_t>(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.slot_ranges_.back().last_ = *value;
         } else if (item.name == "group") {
           auto value = ParseString(item);
-          if (!value.ok()) return value.status();
+          LAVIK_RETURN_IF_ERROR(value.status());
           result.slot_ranges_.back().group_id_ = std::move(*value);
         } else {
           return Invalid("unknown slot_ranges field");
@@ -744,7 +742,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
     }
   }
   if (section != Section::kNone) {
-    if (absl::Status status = finish_section(); !status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(finish_section());
   }
   if (!top_fields.contains("schema_version") ||
       !top_fields.contains("client_mode") || result.meta_members_.empty()) {
@@ -754,9 +752,7 @@ absl::StatusOr<ClusterCreateManifestV1> ParseClusterCreateManifest(
   if (result.slots_generated_ && !result.slot_ranges_.empty()) {
     return Invalid("slot_strategy and slot_ranges are mutually exclusive");
   }
-  if (absl::Status status = ValidateAndNormalize(&result); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateAndNormalize(&result));
   return result;
 }
 
@@ -764,9 +760,7 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
     const ClusterCreateManifestV1& manifest,
     const MetaOperationId& root_operation_id) {
   ClusterCreateManifestV1 canonical = manifest;
-  if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateAndNormalize(&canonical));
   if (canonical != manifest) {
     return Invalid("clustercreate request manifest is not normalized");
   }
@@ -787,52 +781,32 @@ absl::StatusOr<std::string> EncodeClusterCreateRequest(
   writer.U32(static_cast<std::uint32_t>(manifest.meta_members_.size()));
   for (const auto& member : manifest.meta_members_) {
     writer.U32(member.server_id_);
-    if (absl::Status status = writer.String(member.raft_endpoint_);
-        !status.ok()) {
-      return status;
-    }
-    if (absl::Status status = writer.String(member.data_control_endpoint_);
-        !status.ok()) {
-      return status;
-    }
-    if (absl::Status status = writer.String(member.sentinel_endpoint_);
-        !status.ok())
-      return status;
-    if (absl::Status status = writer.String(member.ctl_endpoint_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(writer.String(member.raft_endpoint_));
+    LAVIK_RETURN_IF_ERROR(writer.String(member.data_control_endpoint_));
+    LAVIK_RETURN_IF_ERROR(writer.String(member.sentinel_endpoint_));
+    LAVIK_RETURN_IF_ERROR(writer.String(member.ctl_endpoint_));
   }
   writer.U16(manifest.slots_generated_ ? 1 : 0);
   writer.U32(static_cast<std::uint32_t>(manifest.data_nodes_.size()));
   for (const auto& node : manifest.data_nodes_) {
-    if (absl::Status status = writer.String(node.node_id_); !status.ok())
-      return status;
-    if (absl::Status status = writer.String(node.client_endpoint_);
-        !status.ok())
-      return status;
-    if (absl::Status status = writer.String(node.tls_endpoint_); !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(writer.String(node.node_id_));
+    LAVIK_RETURN_IF_ERROR(writer.String(node.client_endpoint_));
+    LAVIK_RETURN_IF_ERROR(writer.String(node.tls_endpoint_));
   }
   writer.U32(static_cast<std::uint32_t>(manifest.groups_.size()));
   for (const auto& group : manifest.groups_) {
-    if (absl::Status status = writer.String(group.group_id_); !status.ok())
-      return status;
-    if (absl::Status status = writer.String(group.primary_node_id_);
-        !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(writer.String(group.group_id_));
+    LAVIK_RETURN_IF_ERROR(writer.String(group.primary_node_id_));
     writer.U32(static_cast<std::uint32_t>(group.replica_node_ids_.size()));
     for (const std::string& replica : group.replica_node_ids_) {
-      if (absl::Status status = writer.String(replica); !status.ok())
-        return status;
+      LAVIK_RETURN_IF_ERROR(writer.String(replica));
     }
   }
   writer.U32(static_cast<std::uint32_t>(manifest.slot_ranges_.size()));
   for (const auto& range : manifest.slot_ranges_) {
     writer.U16(range.first_);
     writer.U16(range.last_);
-    if (absl::Status status = writer.String(range.group_id_); !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(writer.String(range.group_id_));
   }
   std::string request = "clustercreate 1 " + Hex(writer.bytes());
   if (request.size() + 1 > kMaxAdminCommandBytes) {
@@ -850,14 +824,14 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
     return Invalid("invalid clustercreate request envelope");
   }
   auto bytes = Unhex(request.substr(kPrefix.size()));
-  if (!bytes.ok()) return bytes.status();
+  LAVIK_RETURN_IF_ERROR(bytes.status());
   Reader reader(*bytes);
   auto version = reader.U16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kWireVersion)
     return Invalid("unsupported clustercreate version");
   auto root = reader.Raw(root_operation_id->size());
-  if (!root.ok()) return root.status();
+  LAVIK_RETURN_IF_ERROR(root.status());
   std::copy(root->begin(), root->end(), root_operation_id->begin());
   if (IsZero(*root_operation_id))
     return Invalid("clustercreate root operation id is zero");
@@ -915,15 +889,9 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   manifest.data_nodes_.reserve(*node_count);
   for (std::uint32_t index = 0; index < *node_count; ++index) {
     ClusterCreateManifestV1::DataNode node;
-    auto id = reader.String();
-    if (!id.ok()) return id.status();
-    node.node_id_ = std::move(*id);
-    auto endpoint = reader.String();
-    if (!endpoint.ok()) return endpoint.status();
-    node.client_endpoint_ = std::move(*endpoint);
-    auto tls_endpoint = reader.String();
-    if (!tls_endpoint.ok()) return tls_endpoint.status();
-    node.tls_endpoint_ = std::move(*tls_endpoint);
+    LAVIK_ASSIGN_OR_RETURN(node.node_id_, reader.String());
+    LAVIK_ASSIGN_OR_RETURN(node.client_endpoint_, reader.String());
+    LAVIK_ASSIGN_OR_RETURN(node.tls_endpoint_, reader.String());
     manifest.data_nodes_.push_back(std::move(node));
   }
 
@@ -933,19 +901,15 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   manifest.groups_.reserve(*group_count);
   for (std::uint32_t index = 0; index < *group_count; ++index) {
     ClusterCreateManifestV1::Group group;
-    auto id = reader.String();
-    if (!id.ok()) return id.status();
-    group.group_id_ = std::move(*id);
-    auto primary = reader.String();
-    if (!primary.ok()) return primary.status();
-    group.primary_node_id_ = std::move(*primary);
+    LAVIK_ASSIGN_OR_RETURN(group.group_id_, reader.String());
+    LAVIK_ASSIGN_OR_RETURN(group.primary_node_id_, reader.String());
     auto replica_count = reader.U32();
     if (!replica_count.ok() || *replica_count > kMaxManifestItems)
       return Invalid("invalid replica count");
     group.replica_node_ids_.reserve(*replica_count);
     for (std::uint32_t replica = 0; replica < *replica_count; ++replica) {
       auto id_value = reader.String();
-      if (!id_value.ok()) return id_value.status();
+      LAVIK_RETURN_IF_ERROR(id_value.status());
       group.replica_node_ids_.push_back(std::move(*id_value));
     }
     manifest.groups_.push_back(std::move(group));
@@ -957,21 +921,14 @@ absl::StatusOr<ClusterCreateManifestV1> DecodeClusterCreateRequest(
   manifest.slot_ranges_.reserve(*range_count);
   for (std::uint32_t index = 0; index < *range_count; ++index) {
     ClusterCreateManifestV1::SlotRange range;
-    auto first = reader.U16();
-    if (!first.ok()) return first.status();
-    range.first_ = *first;
-    auto last = reader.U16();
-    if (!last.ok()) return last.status();
-    range.last_ = *last;
-    auto group = reader.String();
-    if (!group.ok()) return group.status();
-    range.group_id_ = std::move(*group);
+    LAVIK_ASSIGN_OR_RETURN(range.first_, reader.U16());
+    LAVIK_ASSIGN_OR_RETURN(range.last_, reader.U16());
+    LAVIK_ASSIGN_OR_RETURN(range.group_id_, reader.String());
     manifest.slot_ranges_.push_back(std::move(range));
   }
   if (!reader.done()) return Invalid("trailing clustercreate request data");
   ClusterCreateManifestV1 canonical = manifest;
-  if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(ValidateAndNormalize(&canonical));
   if (canonical != manifest)
     return Invalid("clustercreate request is not canonical");
   return manifest;
@@ -1003,8 +960,7 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
     const MetaAdminTarget& seed, const ClusterCreateManifestV1& manifest,
     const ClusterStatusOptions& options) const {
   ClusterCreateManifestV1 canonical = manifest;
-  if (absl::Status status = ValidateAndNormalize(&canonical); !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(ValidateAndNormalize(&canonical));
   if (canonical != manifest)
     return Invalid("clustercreate manifest is not normalized");
 
@@ -1045,12 +1001,12 @@ absl::StatusOr<ClusterCreateOutcome> ClusterOperator::Create(
         absl::DeadlineExceededError("cluster-create deadline expired"));
   }
   auto root_operation_id = GenerateOperationId();
-  if (!root_operation_id.ok()) return root_operation_id.status();
+  LAVIK_RETURN_IF_ERROR(root_operation_id.status());
   const std::string expected_id = Hex(
       std::string_view(reinterpret_cast<const char*>(root_operation_id->data()),
                        root_operation_id->size()));
   auto request = EncodeClusterCreateRequest(manifest, *root_operation_id);
-  if (!request.ok()) return request.status();
+  LAVIK_RETURN_IF_ERROR(request.status());
   auto reply = round_trip_(leader, *request, options.deadline_);
   if (!reply.ok()) {
     if (MetaAdminRequestDefinitelyNotSent(reply.status())) {

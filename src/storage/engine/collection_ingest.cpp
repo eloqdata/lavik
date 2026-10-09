@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/collection_ingest_budget.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -120,14 +121,14 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
        *expected_items > std::numeric_limits<std::uint32_t>::max()))
     co_return absl::InvalidArgumentError("invalid collection restore input");
   const auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
-  if (!metadata.ok()) co_return metadata.status();
+  LAVIK_CO_RETURN_IF_ERROR(metadata.status());
   const bool exists = metadata->exists_;
   if (exists && !replace) co_return RestoreRawResult{.busy_ = true};
   if (expire_at_ms != 0 && expire_at_ms <= UnixTimeMillis()) {
     if (!exists) co_return RestoreRawResult{};
     auto deleted = co_await DeleteLocked(db_id, key, digest, outer, replication,
                                          mutation_precondition);
-    if (!deleted.ok()) co_return deleted.status();
+    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
     co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
   }
 
@@ -164,7 +165,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     if (outer->grouped_ingest_batch_ != nullptr)
       co_return absl::FailedPreconditionError("nested collection restore");
     const auto decision = PrepareGroupedDecision(*outer);
-    if (!decision.ok()) co_return decision.status();
+    LAVIK_CO_RETURN_IF_ERROR(decision.status());
     // Transaction callbacks are serial on each owner. Temporarily owning the
     // whole accumulator preserves its prefix/capacity and permits noexcept
     // return on abort; no vector merge may allocate on an OOM rollback path.
@@ -181,9 +182,9 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     const auto predecessor = co_await AwaitGroupedDependencyLocked(
         store, partition.grouped_objects_[db_id].CurrentForMutation(key), 0);
     store.store_state_mutex_.Unlock(*store.worker_);
-    if (!predecessor.ok()) co_return predecessor;
-    const auto space = co_await BeforeGroupedTransaction(store, 1U << 20);
-    if (!space.ok()) co_return space;
+    LAVIK_CO_RETURN_IF_ERROR(predecessor);
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await BeforeGroupedTransaction(store, 1U << 20));
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
                        std::span(&writes, 1),
@@ -244,13 +245,12 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     auto found = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                             digest, key);
-    if (!found.ok()) co_return found.status();
+    LAVIK_CO_RETURN_IF_ERROR(found.status());
     prefix_address = *found;
     const auto old = partition.grouped_objects_[db_id].CurrentForMutation(key);
     const auto old_records = old ? old->record_count() : 0;
-    auto reserved =
-        ReserveIngestVector(restored_groups, old_records, state->undo_charge_);
-    if (!reserved.ok()) co_return reserved;
+    LAVIK_CO_RETURN_IF_ERROR(
+        ReserveIngestVector(restored_groups, old_records, state->undo_charge_));
     constexpr auto width = 4 * sizeof(RecoveredOrderedGroup) +
                            4 * sizeof(RecoveredGroupedRecord) +
                            4 * sizeof(GroupedRecordId);
@@ -430,8 +430,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       if (type == ValueType::kSortedSet && state->applied_count_ != 0 &&
           !splice_sorted) {
         std::vector<ScoredMemberView> entries;
-        auto admitted = ReserveIngestVector(entries, count, merge_charge);
-        if (!admitted.ok()) co_return admitted;
+        LAVIK_CO_RETURN_IF_ERROR(
+            ReserveIngestVector(entries, count, merge_charge));
         for (const auto& item : merged.scored_members_)
           entries.push_back({item.member_, item.score_});
         co_await store.store_state_mutex_.Lock();
@@ -472,7 +472,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       merge_charge.Resize(input_charges.capacity() *
                           sizeof(RetainedMemoryCharge));
       merged_bytes = 0;
-      if (!written.ok()) co_return written;
+      LAVIK_CO_RETURN_IF_ERROR(written);
       state->applied_count_ += count;
       if (first_write) {
         co_await store.store_state_mutex_.Lock();
@@ -499,16 +499,16 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     bool done = false;
     while (!done) {
       auto page = co_await reader();
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       if (page->value_type_ != type)
         co_return absl::DataLossError("collection input changes type");
       auto bytes = CollectionCompactEncoder::MeasurePage(*page);
-      if (!bytes.ok()) co_return bytes.status();
+      LAVIK_CO_RETURN_IF_ERROR(bytes.status());
       if (type == ValueType::kStream) {
         std::size_t largest = stream_validator.RetainedBytes();
         for (const auto& record : page->elements_) {
           auto key = StreamRecordKey(record);
-          if (!key.ok()) co_return key.status();
+          LAVIK_CO_RETURN_IF_ERROR(key.status());
           largest = std::max(largest, key->size());
         }
         if (largest > (SIZE_MAX - 512) / 4)
@@ -518,8 +518,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
         if (!charge)
           co_return absl::ResourceExhaustedError("OOM Stream validation keys");
         for (const auto& record : page->elements_) {
-          auto valid = stream_validator.Read(record);
-          if (!valid.ok()) co_return valid;
+          LAVIK_CO_RETURN_IF_ERROR(stream_validator.Read(record));
         }
         stream_validation_charge.Adopt(&*charge,
                                        stream_validator.RetainedBytes());
@@ -528,8 +527,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       if (page->size() == 0) continue;
       bool fits = can_merge(*page, *bytes);
       if (!fits && merged.size() != 0) {
-        auto written = co_await flush();
-        if (!written.ok()) co_return written;
+        LAVIK_CO_RETURN_IF_ERROR(co_await flush());
         fits = can_merge(*page, *bytes);
       }
       auto append = [&](auto& destination, auto& source) {
@@ -545,29 +543,25 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
         merged_status = append(merged.scored_members_, page->scored_members_);
       else
         merged_status = append(merged.elements_, page->elements_);
-      if (!merged_status.ok()) co_return merged_status;
-      auto admitted = ReserveIngestVector(
-          input_charges, input_charges.size() + 1, merge_charge);
-      if (!admitted.ok()) co_return admitted;
+      LAVIK_CO_RETURN_IF_ERROR(merged_status);
+      LAVIK_CO_RETURN_IF_ERROR(ReserveIngestVector(
+          input_charges, input_charges.size() + 1, merge_charge));
       input_charges.push_back(std::move(page->retained_charge_));
       merged_bytes += *bytes;
       // A page can contain one indivisible large element. Do not keep growing
       // a batch that fails the probe; let the writer's concrete admission
       // decide whether that one page can be processed, or return OOM.
       if (!fits || done) {
-        auto written = co_await flush();
-        if (!written.ok()) co_return written;
+        LAVIK_CO_RETURN_IF_ERROR(co_await flush());
       }
     }
-    auto written = co_await flush();
-    if (!written.ok()) co_return written;
+    LAVIK_CO_RETURN_IF_ERROR(co_await flush());
     if (state->applied_count_ == 0 ||
         (type != ValueType::kStream && expected_items &&
          *expected_items != state->applied_count_))
       co_return absl::DataLossError("collection EOF cardinality mismatch");
     if (type == ValueType::kStream) {
-      const auto valid = stream_validator.Finish();
-      if (!valid.ok()) co_return valid;
+      LAVIK_CO_RETURN_IF_ERROR(stream_validator.Finish());
     }
     // Intermediate roots are deliberately grouped so the streaming parser
     // never needs a full image. After EOF validation, the same transaction
@@ -585,28 +579,24 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       const auto location = current->version().root_;
       auto compact = co_await LoadGroupedValue(store, partition, db_id, key,
                                                digest, location, nullptr);
-      if (!compact.ok()) co_return compact.status();
+      LAVIK_CO_RETURN_IF_ERROR(compact.status());
       const auto bytes = compact->value();
       if (bytes.size() >= kCollectionGroupTargetBytes)
         co_return absl::InternalError("collection demotion byte bound failed");
-      written = co_await AppendLocked(
+      LAVIK_CO_RETURN_IF_ERROR(co_await AppendLocked(
           store, partition, db_id, key, digest,
           std::string_view(reinterpret_cast<const char*>(bytes.data()),
                            bytes.size()),
           RecordKind::kValue, type, expire_at_ms, &writes,
           location.logical_size_, nullptr, nullptr, replication, true, nullptr,
-          mutation_precondition);
-      if (!written.ok()) co_return written;
-      written = SquashReplicaCollectionUndo(store, *state);
-      if (!written.ok()) co_return written;
+          mutation_precondition));
+      LAVIK_CO_RETURN_IF_ERROR(SquashReplicaCollectionUndo(store, *state));
     } else if (replication != nullptr) {
-      written = co_await UpdateGroupedExpirationLocked(
+      LAVIK_CO_RETURN_IF_ERROR(co_await UpdateGroupedExpirationLocked(
           store, partition, db_id, key, digest,
           partition.grouped_objects_[db_id].CurrentForMutation(key),
-          expire_at_ms, &writes, replication);
-      if (!written.ok()) co_return written;
-      written = SquashReplicaCollectionUndo(store, *state);
-      if (!written.ok()) co_return written;
+          expire_at_ms, &writes, replication));
+      LAVIK_CO_RETURN_IF_ERROR(SquashReplicaCollectionUndo(store, *state));
     }
     co_return absl::OkStatus();
   };
@@ -773,7 +763,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   }
   if (status.ok() && outer == nullptr) PublishCommittedFullSyncEffects(&writes);
   return_accumulator.completed_ = true;
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   co_return RestoreRawResult{.changed_ = true};
 }
 

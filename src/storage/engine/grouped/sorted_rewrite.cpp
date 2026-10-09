@@ -20,6 +20,8 @@
 #include <cmath>
 #include <limits>
 
+#include "lavik/status_macros.h"
+
 namespace lavik::storage {
 namespace {
 
@@ -61,10 +63,8 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanSortedSetRewrite(
     return absl::InvalidArgumentError(
         "Sorted Set rewrite has wrong source/count");
   }
-  auto valid = ValidateOrder(before);
-  if (!valid.ok()) return valid;
-  valid = ValidateOrder(after);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateOrder(before));
+  LAVIK_RETURN_IF_ERROR(ValidateOrder(after));
   OrderedCollectionMutationPlan plan{
       .root_ = root, .expected_sequence_ = directory.sequence(), .writes_ = {}};
   plan.root_.item_count_ = after.size();
@@ -128,7 +128,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanSortedSetRewrite(
       drafts.push_back({.page_ = std::move(page), .changed_ = false});
     } else {
       auto split = SplitOrderedGroup(std::move(page), next_id, target_bytes);
-      if (!split.ok()) return split.status();
+      LAVIK_RETURN_IF_ERROR(split.status());
       next_id = split->next_group_id_;
       for (auto& part : split->groups_) {
         drafts.push_back({.page_ = std::move(part)});

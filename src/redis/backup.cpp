@@ -48,6 +48,7 @@
 #include "lavik/rdb.h"
 #include "lavik/rdb_collection.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lua_eval.h"
 #include "spdlog/spdlog.h"
 
@@ -239,9 +240,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     } cut_guard{this};
 
     while (!CloseAllCommandDbGates()) {
-      absl::Status yielded = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!yielded.ok()) co_return yielded;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     struct GateGuard {
       bool open_ = false;
@@ -262,15 +262,13 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
             if (std::chrono::steady_clock::now() >= deadline)
               co_return absl::DeadlineExceededError(
                   "backup test cut hold expired");
-            absl::Status waited = co_await bycorf::SleepFor(
-                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-            if (!waited.ok()) co_return waited;
+            LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
           }
         });
     while (CommandDbOperationsActive()) {
-      absl::Status yielded = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!yielded.ok()) co_return yielded;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
 
     // SAVE and BGSAVE manage their own all-database gate, so normal command
@@ -392,9 +390,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
           });
     }
     while (remaining_.load(std::memory_order_acquire) != 0) {
-      absl::Status yielded = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!yielded.ok()) co_return yielded;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     absl::Status scan_status = status();
     if (scan_status.ok()) {
@@ -405,9 +402,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       output_.RequestAbort(scan_status);
     }
     while (!output_.done()) {
-      absl::Status yielded = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!yielded.ok()) co_return yielded;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     absl::Status output_status = output_.result();
     co_return scan_status.ok() ? output_status : scan_status;
@@ -446,9 +442,8 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       while (!output_.TryPush(&fragment, worker_id)) {
         if (output_.failed())
           co_return absl::InternalError("RDB output writer failed");
-        auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                std::chrono::milliseconds(1));
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
       }
       bytes.remove_prefix(piece.size());
     }
@@ -460,32 +455,31 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     auto encoder = rdb::CollectionFileEncoder::Create(
         value.db_id_, value.key_, value.value_.value_type_,
         value.value_.logical_size_, value.value_.expire_at_ms_);
-    if (!encoder.ok()) co_return encoder.status();
+    LAVIK_CO_RETURN_IF_ERROR(encoder.status());
     auto drain = [&]() -> Task<absl::Status> {
       while (auto span = encoder->Next()) {
-        auto status = co_await PushEntrySpan(worker_id, *span);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await PushEntrySpan(worker_id, *span));
       }
       co_return absl::OkStatus();
     };
     auto status = co_await drain();
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     std::uint64_t cursor = 0;
     for (;;) {
       auto page = co_await storage_->ReadRdbCollectionPage(
           session_id_, value.collection_token_, cursor);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       status = encoder->StartPage(*page);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       status = co_await drain();
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       cursor = page->next_cursor_;
       if (page->done_) break;
       // Keep at most one decoded page while disk/output waits. The encoder
       // has drained its borrowed spans before this page goes out of scope.
     }
     status = encoder->Finish();
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     co_return co_await storage_->FinishRdbCollection(session_id_,
                                                      value.collection_token_);
   }
@@ -879,9 +873,8 @@ bool SynchronousRdbSaveActive() noexcept {
 
 Task<absl::Status> WaitForSynchronousRdbSave() {
   while (SynchronousRdbSaveActive()) {
-    auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -111,9 +112,8 @@ Task<absl::Status> StorageEngine::Impl::WriteIndirectKey(
       AlignRecord(RecordHeaderBytes(sizeof(IndirectKeyId)) + key_bytes) >
       kStorageBlockBytes - kBlockHeaderBytes;
   if (external && extents == nullptr) {
-    auto written = co_await WriteExtentValueLocked(store, key);
-    if (!written.ok()) co_return written.status();
-    extents = std::move(*written);
+    LAVIK_ASSIGN_OR_CO_RETURN(extents,
+                              co_await WriteExtentValueLocked(store, key));
   }
   std::string manifest = external ? EncodeManifest(*extents) : std::string{};
   RecordLocation location;
@@ -129,8 +129,8 @@ Task<absl::Status> StorageEngine::Impl::WriteIndirectKey(
       .external_ = external,
       .indirect_key_record_ = true,
   };
-  auto written = co_await WriteRecordLocked(store, record_write, extents);
-  if (!written.ok()) co_return written;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await WriteRecordLocked(store, record_write, extents));
   ++handle->physical_copies_;
   // A data record must never become durable before its UUID's original key.
   // Publication happens after this fence, including for relocation. Readers
@@ -144,7 +144,7 @@ Task<absl::Status> StorageEngine::Impl::WriteIndirectKey(
           location.record_offset() + location.total_disk_bytes())};
   auto durable = co_await AwaitRelocationDurableLocal(store, fence);
   co_await store.store_state_mutex_.Lock();
-  if (!durable.ok()) co_return durable;
+  LAVIK_CO_RETURN_IF_ERROR(durable);
   handle->location_ = location;
   handle->extents_ = std::move(extents);
   co_return absl::OkStatus();
@@ -176,7 +176,7 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
       continue;
     auto handle = found->value_;
     auto actual = co_await LoadIndirectKey(handle);
-    if (!actual.ok()) co_return actual.status();
+    LAVIK_CO_RETURN_IF_ERROR(actual.status());
     if (*actual != key) continue;
     if (tx != nullptr) tx->indirect_keys_.push_back({std::string(key), id});
     co_return handle;
@@ -190,8 +190,8 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
   do {
     auto hi = RandomStorageSetId();
     auto lo = RandomStorageSetId();
-    if (!hi.ok()) co_return hi.status();
-    if (!lo.ok()) co_return lo.status();
+    LAVIK_CO_RETURN_IF_ERROR(hi.status());
+    LAVIK_CO_RETURN_IF_ERROR(lo.status());
     handle->id_ = {(*hi & ~std::uint64_t{0x3fff}) | RedisSlot(key), *lo};
     // RFC 4122 variant/version bits; the slot occupies two different bytes.
     auto* bytes = reinterpret_cast<unsigned char*>(handle->id_.data());
@@ -204,8 +204,7 @@ Task<absl::StatusOr<IndirectKeyHandle>> StorageEngine::Impl::EnsureIndirectKey(
   // Reserve the identity before any KeyRecord reaches staging. The caller's
   // handle pins this unpublished entry through I/O; original-key candidates
   // and the cleaner see it only after the durability fence succeeds.
-  auto inserted = InsertIndirectKey(store, handle);
-  if (!inserted.ok()) co_return inserted;
+  LAVIK_CO_RETURN_IF_ERROR(InsertIndirectKey(store, handle));
   auto written =
       co_await WriteIndirectKey(store, handle, key, for_defrag, true);
   if (!written.ok()) {
@@ -262,7 +261,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseIndirectKeyReferences(
       released = release();
     else
       released = co_await bycorf::SubmitTo(owner, std::move(release));
-    if (!released.ok()) co_return released;
+    LAVIK_CO_RETURN_IF_ERROR(released);
   }
   co_return absl::OkStatus();
 }
@@ -359,14 +358,12 @@ Task<absl::Status> StorageEngine::Impl::RelocateIndirectKey(
     co_return absl::OkStatus();
   std::string key;
   if (handle->extents_ == nullptr) {
-    auto loaded = co_await LoadIndirectKey(handle);
-    if (!loaded.ok()) co_return loaded.status();
-    key = std::move(*loaded);
+    LAVIK_ASSIGN_OR_CO_RETURN(key, co_await LoadIndirectKey(handle));
   }
   // Extent payloads are immutable and shared by every physical KeyRecord
   // copy. Relocation rewrites only their manifest, not a multi-megabyte key.
-  auto written = co_await WriteIndirectKey(store, handle, key, true, true);
-  if (!written.ok()) co_return written;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await WriteIndirectKey(store, handle, key, true, true));
   // The UUID never changes and all source-block references already share the
   // same handle. Updating this one location also updates snapshots and stale
   // records; the replacement is durable before the old copy loses liveness.

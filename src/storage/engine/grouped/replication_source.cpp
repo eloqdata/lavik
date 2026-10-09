@@ -17,6 +17,7 @@
 #include <type_traits>
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/collection_compact_stream.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -177,7 +178,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     auto decoded = co_await LoadOrderedGroupSnapshot(
         store, partition, stream->db_id_, stream->key_, stream->digest_, object,
         id.prefix_, true);
-    if (!decoded.ok()) co_return decoded.status();
+    LAVIK_CO_RETURN_IF_ERROR(decoded.status());
     if (page.value_type_ == ValueType::kStream ||
         page.value_type_ == ValueType::kString ||
         page.value_type_ == ValueType::kList) {
@@ -195,7 +196,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
     auto decoded = co_await LoadHashGroupSnapshot(
         store, partition, stream->db_id_, stream->key_, stream->digest_, object,
         id, true);
-    if (!decoded.ok()) co_return decoded.status();
+    LAVIK_CO_RETURN_IF_ERROR(decoded.status());
     if (page.value_type_ == ValueType::kHash)
       page.fields_.reserve(count);
     else
@@ -253,7 +254,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
                .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                .replication_epoch_ = partition.replication_epoch_,
                .index_generation_ = partition.grouped_generations_[db_id]});
-  if (!object.ok()) co_return object.status();
+  LAVIK_CO_RETURN_IF_ERROR(object.status());
   if (*object == nullptr)
     co_return absl::DataLossError("missing full-sync collection view");
   auto capture = partition.fullsync_subscribers_.find(session_id);
@@ -308,16 +309,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
     }
   } cleanup{this, &store, &stream, &published};
   SourceReadGuard reading(&stream->reading_);
-  auto prepared = PrepareGroupedSnapshotPins(&stream->saved_);
-  if (!prepared.ok()) co_return prepared;
-  auto pinned = co_await PinRdbSnapshotValue(&stream->saved_);
-  if (!pinned.ok()) co_return pinned;
+  LAVIK_CO_RETURN_IF_ERROR(PrepareGroupedSnapshotPins(&stream->saved_));
+  LAVIK_CO_RETURN_IF_ERROR(co_await PinRdbSnapshotValue(&stream->saved_));
   LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES(
                              "LAVIK_PAUSE_FULLSYNC_COLLECTION_SCAN_KEY", key)) {
     spdlog::info("paused full-sync collection pre-scan key={}", key);
-    auto waited = co_await bycorf::SleepFor(*store.worker_,
-                                            std::chrono::milliseconds(5000));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(5000)));
   });
   stream->ResetCursor();
   std::uint64_t bytes = location.value_type() == ValueType::kString ? 0
@@ -327,9 +325,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
                             : 8;
   while (!stream->pages_done_) {
     auto page = co_await NextFullSyncCollectionPage(stream);
-    if (!page.ok()) co_return page.status();
+    LAVIK_CO_RETURN_IF_ERROR(page.status());
     auto measured = CollectionCompactEncoder::MeasurePage(*page);
-    if (!measured.ok()) co_return measured.status();
+    LAVIK_CO_RETURN_IF_ERROR(measured.status());
     if (*measured > std::numeric_limits<std::uint64_t>::max() - bytes)
       co_return absl::OutOfRangeError(
           "full-sync collection wire length overflow");
@@ -341,7 +339,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
           ? stream->saved_.grouped_->ordered_directory().root().item_count_
           : location.logical_size_,
       bytes);
-  if (!encoder.ok()) co_return encoder.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoder.status());
   stream->encoder_.emplace(std::move(*encoder));
   stream->encoded_bytes_ = bytes;
   stream->ResetCursor();
@@ -355,8 +353,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
   // Revalidate/admit the table only after the last suspension: other snapshot
   // readers can publish sources while this stream measures its pages. Capacity
   // belongs to the capture, not an individual value released by ACK.
-  auto map_prepared = PrepareFullSyncPinnedValueInsert(capture->second);
-  if (!map_prepared.ok()) co_return map_prepared;
+  LAVIK_CO_RETURN_IF_ERROR(PrepareFullSyncPinnedValueInsert(capture->second));
   {
     auto [_, inserted] = capture->second.pinned_values_.emplace(
         id, WorkerStore::FullSyncCapture::PinnedValue{
@@ -385,9 +382,8 @@ StorageEngine::Impl::ReadFullSyncCollectionChunk(
                               stream->key_)) {
         spdlog::info("paused full-sync collection chunk key={} page_bytes={}",
                      stream->key_, stream->page_->RetainedBytes());
-        auto waited = co_await bycorf::SleepFor(
-            *stream->store_->worker_, std::chrono::milliseconds(5000));
-        if (!waited.ok()) co_return waited;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *stream->store_->worker_, std::chrono::milliseconds(5000)));
       });
   const auto count = static_cast<std::size_t>(
       std::min<std::uint64_t>(max_bytes, stream->encoded_bytes_ - offset));

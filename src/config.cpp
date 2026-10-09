@@ -41,6 +41,7 @@
 #include "absl/strings/str_split.h"
 #include "bycorf/runtime/cross_core.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 
 namespace lavik {
 namespace {
@@ -118,9 +119,7 @@ constexpr ConfigOption ScalarOption(std::string_view name,
             auto& field = ConfigField<Members...>(options);
             using T = std::remove_cvref_t<decltype(field)>;
             if constexpr (std::is_same_v<T, bool>) {
-              auto parsed = ParseYesNo(value, name);
-              if (!parsed.ok()) return parsed.status();
-              field = *parsed;
+              LAVIK_ASSIGN_OR_RETURN(field, ParseYesNo(value, name));
             } else if constexpr (std::is_same_v<T, std::string>) {
               field = value;
             } else {
@@ -351,7 +350,7 @@ absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
   }
 
   auto bytes = ParseMemorySize(text);
-  if (!bytes.ok()) return bytes.status();
+  LAVIK_RETURN_IF_ERROR(bytes.status());
   return ClientBufferLimit{.value_ = *bytes, .percentage_ = false};
 }
 
@@ -363,7 +362,7 @@ std::string FormatClientBufferLimit(ClientBufferLimit limit) {
 
 absl::StatusOr<std::size_t> ParseClientQueryBufferLimit(std::string_view text) {
   auto bytes = ParseMemorySize(text);
-  if (!bytes.ok()) return bytes.status();
+  LAVIK_RETURN_IF_ERROR(bytes.status());
   if (*bytes < kMinimumClientQueryBufferLimit ||
       *bytes > static_cast<std::size_t>(std::numeric_limits<long>::max())) {
     return absl::InvalidArgumentError(
@@ -463,8 +462,7 @@ absl::Status ApplyRedisConfigDirective(
     std::vector<unsigned> cpus;
     for (std::string_view item : absl::StrSplit(directive[1], ',')) {
       unsigned cpu = 0;
-      auto status = ParseUnsigned(item, name, &cpu, true);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(ParseUnsigned(item, name, &cpu, true));
       cpus.push_back(cpu);
     }
     options->cpu_ids_ = std::move(cpus);
@@ -472,16 +470,14 @@ absl::Status ApplyRedisConfigDirective(
   }
   if (name == "maxmemory-clients") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    auto limit = ParseClientBufferLimit(directive[1]);
-    if (!limit.ok()) return limit.status();
-    options->maxmemory_clients_ = *limit;
+    LAVIK_ASSIGN_OR_RETURN(options->maxmemory_clients_,
+                           ParseClientBufferLimit(directive[1]));
     return absl::OkStatus();
   }
   if (name == "client-query-buffer-limit") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    auto limit = ParseClientQueryBufferLimit(directive[1]);
-    if (!limit.ok()) return limit.status();
-    options->client_query_buffer_limit_bytes_ = *limit;
+    LAVIK_ASSIGN_OR_RETURN(options->client_query_buffer_limit_bytes_,
+                           ParseClientQueryBufferLimit(directive[1]));
     return absl::OkStatus();
   }
   if (name == "save") {
@@ -499,12 +495,10 @@ absl::Status ApplyRedisConfigDirective(
     parsed.reserve((directive.size() - 1) / 2);
     for (std::size_t i = 1; i < directive.size(); i += 2) {
       RdbSaveRule rule;
-      absl::Status status =
-          ParseUnsigned(directive[i], "save seconds", &rule.seconds_, false);
-      if (!status.ok()) return status;
-      status =
-          ParseUnsigned(directive[i + 1], "save changes", &rule.changes_, true);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(
+          ParseUnsigned(directive[i], "save seconds", &rule.seconds_, false));
+      LAVIK_RETURN_IF_ERROR(ParseUnsigned(directive[i + 1], "save changes",
+                                          &rule.changes_, true));
       parsed.push_back(rule);
     }
     options->rdb_save_rules_.insert(options->rdb_save_rules_.end(),
@@ -517,9 +511,8 @@ absl::Status ApplyRedisConfigDirective(
       return absl::InvalidArgumentError("replicaof host must not be empty");
     }
     std::uint16_t port = 0;
-    absl::Status parsed =
-        ParseUnsigned(directive[2], absl::StrCat(name, " port"), &port, false);
-    if (!parsed.ok()) return parsed;
+    LAVIK_RETURN_IF_ERROR(
+        ParseUnsigned(directive[2], absl::StrCat(name, " port"), &port, false));
     if (name == "replicaof") {
       options->replicaof_ = ReplicaOfConfig{directive[1], port};
     } else {
@@ -542,9 +535,8 @@ absl::Status ApplyRedisConfigDirective(
 
   if (name == "slowlog-log-slower-than") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    absl::Status parsed =
-        ParseSigned(directive[1], name, &options->slowlog_log_slower_than_us_);
-    if (!parsed.ok()) return parsed;
+    LAVIK_RETURN_IF_ERROR(
+        ParseSigned(directive[1], name, &options->slowlog_log_slower_than_us_));
     if (options->slowlog_log_slower_than_us_ < -1) {
       return absl::InvalidArgumentError(
           "slowlog-log-slower-than must be greater than or equal to -1");
@@ -554,8 +546,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "background-warrant-percent") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     unsigned value = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &value, false);
-    if (!parsed.ok()) return parsed;
+    LAVIK_RETURN_IF_ERROR(ParseUnsigned(directive[1], name, &value, false));
     if (value > 100) {
       return absl::InvalidArgumentError(
           "background-warrant-percent must be between 1 and 100");
@@ -566,8 +557,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "replication-snapshot-batch-size") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     std::size_t count = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &count, false);
-    if (!parsed.ok()) return parsed;
+    LAVIK_RETURN_IF_ERROR(ParseUnsigned(directive[1], name, &count, false));
     if (count > kMaxReplicationSnapshotBatchSize) {
       return absl::InvalidArgumentError(
           "replication-snapshot-batch-size is out of range");
@@ -579,8 +569,7 @@ absl::Status ApplyRedisConfigDirective(
       name == "replication-publish-queue-mb-per-worker") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     std::size_t megabytes = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &megabytes, false);
-    if (!parsed.ok()) return parsed;
+    LAVIK_RETURN_IF_ERROR(ParseUnsigned(directive[1], name, &megabytes, false));
     constexpr std::size_t kMiB = 1024 * 1024;
     if (megabytes > std::numeric_limits<std::size_t>::max() / kMiB) {
       return absl::OutOfRangeError(
@@ -596,8 +585,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "storage-read-buffer-kb") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     std::size_t kilobytes = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &kilobytes, false);
-    if (!parsed.ok()) return parsed;
+    LAVIK_RETURN_IF_ERROR(ParseUnsigned(directive[1], name, &kilobytes, false));
     constexpr std::size_t kKiB = 1024;
     if (kilobytes > std::numeric_limits<std::size_t>::max() / kKiB) {
       return absl::OutOfRangeError("storage read buffer size is too large");
@@ -608,7 +596,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "redis-export-disk-backlog-size") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto bytes = ParseMemorySize(directive[1]);
-    if (!bytes.ok()) return bytes.status();
+    LAVIK_RETURN_IF_ERROR(bytes.status());
     constexpr std::size_t block = 8ULL * 1024 * 1024;
     if (*bytes < block)
       return absl::InvalidArgumentError(
@@ -620,7 +608,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "repl-backlog-size") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto bytes = ParseMemorySize(directive[1]);
-    if (!bytes.ok()) return bytes.status();
+    LAVIK_RETURN_IF_ERROR(bytes.status());
     if (*bytes == 0) {
       return absl::InvalidArgumentError("repl-backlog-size must be nonzero");
     }
@@ -662,8 +650,7 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
       return absl::InvalidArgumentError(
           "data-file path does not match selected storage backend");
   }
-  const absl::Status logging = ValidateLoggingOptions(options.logging_);
-  if (!logging.ok()) return logging;
+  LAVIK_RETURN_IF_ERROR(ValidateLoggingOptions(options.logging_));
   if (options.bind_addresses_.empty()) {
     return absl::InvalidArgumentError("at least one bind address is required");
   }
@@ -853,7 +840,7 @@ absl::StatusOr<std::vector<unsigned>> SelectedWorkerCpus(
 absl::Status ResolveAutomaticShardCount(ServerOptions* options) {
   if (options->shard_count_ != 0) return absl::OkStatus();
   auto cpus = SelectedWorkerCpus(*options);
-  if (!cpus.ok()) return cpus.status();
+  LAVIK_RETURN_IF_ERROR(cpus.status());
   options->shard_count_ = static_cast<unsigned>(cpus->size()) -
                           static_cast<unsigned>(options->meta_exclusive_cpu_);
   return absl::OkStatus();
@@ -864,7 +851,7 @@ absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
   if (!options.pin_workers_ && !options.meta_exclusive_cpu_)
     return std::vector<unsigned>{};
   auto selected = SelectedWorkerCpus(options);
-  if (!selected.ok()) return selected.status();
+  LAVIK_RETURN_IF_ERROR(selected.status());
   const auto& cpus = *selected;
   const auto data_cpu_count = cpus.size() - options.meta_exclusive_cpu_;
   std::vector<unsigned> result;

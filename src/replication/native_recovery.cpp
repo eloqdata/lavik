@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "lavik/status_macros.h"
+
 namespace lavik::detail {
 namespace {
 void Put(std::string& out, std::uint64_t value, unsigned bytes) {
@@ -83,8 +85,7 @@ std::vector<std::vector<NativeHistoryRange>> MergeWorkerHistoryCoverage(
 
 absl::StatusOr<std::string> EncodeRecoveryAdvertisement(
     const NativeRecoveryAdvertisement& report) {
-  auto status = Validate(report);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(Validate(report));
   std::string out = "LVA1";
   Put(out, report.boot_id_.size(), 2);
   out.append(report.boot_id_);
@@ -127,8 +128,7 @@ absl::StatusOr<NativeRecoveryAdvertisement> DecodeRecoveryAdvertisement(
     }
   }
   if (!wire.empty()) return invalid;
-  auto status = Validate(report);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(Validate(report));
   return report;
 }
 absl::StatusOr<std::string> EncodeRecoveryEffectManifest(
@@ -193,8 +193,7 @@ absl::StatusOr<std::vector<std::uint64_t>> RecoveryTarget(
     return absl::InvalidArgumentError("invalid local recovery Applied cut");
   std::vector<std::uint64_t> target(local.begin(), local.end());
   for (const auto& donor : donors) {
-    auto status = Validate(donor);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(Validate(donor));
     if (donor.applied_.size() != target.size())
       return absl::InvalidArgumentError(
           "recovery report layout differs from its origin domain");

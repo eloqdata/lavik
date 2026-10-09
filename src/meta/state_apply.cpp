@@ -32,6 +32,7 @@
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/failover.h"
 #include "lavik/meta/hash.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 
@@ -873,11 +874,8 @@ absl::Status ValidateFailoverBeginAnchors(
             "owner anchor");
       }
     }
-    if (absl::Status status = ValidateFailoverCandidateAgainstGroup(
-            stores, group, *candidate_action);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverCandidateAgainstGroup(
+        stores, group, *candidate_action));
   }
   return absl::OkStatus();
 }
@@ -1102,13 +1100,9 @@ absl::Status ValidateFailoverCommitPrestate(
       return MetaDomainRejectError(
           "controlled failover current authority is stale");
     }
-    if (absl::Status status = ValidateControlledFailoverOperation(
-            stores, command.operation_id_, command.expected_operation_revision_,
-            command.group_id_,
-            transition.controlled_->absolute_deadline_unix_ms_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateControlledFailoverOperation(
+        stores, command.operation_id_, command.expected_operation_revision_,
+        command.group_id_, transition.controlled_->absolute_deadline_unix_ms_));
   } else if (transition.target_term_ != command.expected_group_term_ ||
              grant_state.grant_.has_value()) {
     return MetaDomainRejectError(
@@ -1310,11 +1304,8 @@ absl::Status ApplyAuthorityActivationKernel(
     return MetaDomainRejectError(
         "group term already has a different authority effect");
   }
-  if (absl::Status status =
-          stores.topology_.ValidateActivate(cmd, activation_action_id);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      stores.topology_.ValidateActivate(cmd, activation_action_id));
   if (!effect_present) {
     const std::uint64_t epoch = stores.topology_.TopologyEpoch();
     if (epoch == std::numeric_limits<std::uint64_t>::max() ||
@@ -1331,11 +1322,8 @@ absl::Status ApplyAuthorityActivationKernel(
           "new owner ", cmd.new_owner_, " is not a registered active node"));
     }
   }
-  if (absl::Status status = stores.topology_.ActivateAuthority(
-          cmd, std::move(activation_action_id));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      stores.topology_.ActivateAuthority(cmd, std::move(activation_action_id)));
   return stores.topology_.SetTopologyEpoch(cmd.new_topology_epoch_);
 }
 
@@ -2847,11 +2835,11 @@ absl::StatusOr<std::string> MetaStores::Serialize() const {
   w.WriteString(topology_.Serialize());
   w.WriteString(policy_.Serialize());
   const auto operation = operation_.Serialize();
-  if (!operation.ok()) return operation.status();
+  LAVIK_RETURN_IF_ERROR(operation.status());
   w.WriteString(*operation);
   w.WriteString(population_manifest_.Serialize());
   const auto audit = audit_.Serialize();
-  if (!audit.ok()) return audit.status();
+  LAVIK_RETURN_IF_ERROR(audit.status());
   w.WriteString(*audit);
   std::string out = w.TakeBuffer();
   if (out.size() > kMaxMetaSnapshotBytes) {
@@ -2868,7 +2856,7 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   }
   MetaReader r(bytes);
   const auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported meta stores schema version");
   }
@@ -2877,44 +2865,32 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   constexpr std::uint32_t kBlobCap =
       static_cast<std::uint32_t>(kMaxMetaSnapshotBytes);
   const auto identity = r.ReadString(kBlobCap);
-  if (!identity.ok()) return identity.status();
+  LAVIK_RETURN_IF_ERROR(identity.status());
   const auto topology = r.ReadString(kBlobCap);
-  if (!topology.ok()) return topology.status();
+  LAVIK_RETURN_IF_ERROR(topology.status());
   const auto policy = r.ReadString(kBlobCap);
-  if (!policy.ok()) return policy.status();
+  LAVIK_RETURN_IF_ERROR(policy.status());
   const auto operation = r.ReadString(kBlobCap);
-  if (!operation.ok()) return operation.status();
+  LAVIK_RETURN_IF_ERROR(operation.status());
   const auto population_manifest = r.ReadString(kBlobCap);
-  if (!population_manifest.ok()) return population_manifest.status();
+  LAVIK_RETURN_IF_ERROR(population_manifest.status());
   const auto audit = r.ReadString(kBlobCap);
-  if (!audit.ok()) return audit.status();
-  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(audit.status());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
 
   MetaStores stores;
-  auto identity_store = MetaIdentityStore::Deserialize(*identity);
-  if (!identity_store.ok()) return identity_store.status();
-  stores.identity_ = std::move(*identity_store);
-  auto topology_store = MetaTopologyStore::Deserialize(*topology);
-  if (!topology_store.ok()) return topology_store.status();
-  stores.topology_ = std::move(*topology_store);
-  auto policy_store = MetaPolicyStore::Deserialize(*policy);
-  if (!policy_store.ok()) return policy_store.status();
-  stores.policy_ = std::move(*policy_store);
-  auto operation_store = MetaOperationStore::Deserialize(*operation);
-  if (!operation_store.ok()) return operation_store.status();
-  stores.operation_ = std::move(*operation_store);
-  auto population_manifest_store =
-      MetaPopulationManifestStore::Deserialize(*population_manifest);
-  if (!population_manifest_store.ok()) {
-    return population_manifest_store.status();
-  }
-  stores.population_manifest_ = std::move(*population_manifest_store);
-  auto audit_store = MetaAuditStore::Deserialize(*audit);
-  if (!audit_store.ok()) return audit_store.status();
-  stores.audit_ = std::move(*audit_store);
-  if (absl::Status status = ValidateDecodedAggregate(stores); !status.ok()) {
-    return status;
-  }
+  LAVIK_ASSIGN_OR_RETURN(stores.identity_,
+                         MetaIdentityStore::Deserialize(*identity));
+  LAVIK_ASSIGN_OR_RETURN(stores.topology_,
+                         MetaTopologyStore::Deserialize(*topology));
+  LAVIK_ASSIGN_OR_RETURN(stores.policy_, MetaPolicyStore::Deserialize(*policy));
+  LAVIK_ASSIGN_OR_RETURN(stores.operation_,
+                         MetaOperationStore::Deserialize(*operation));
+  LAVIK_ASSIGN_OR_RETURN(
+      stores.population_manifest_,
+      MetaPopulationManifestStore::Deserialize(*population_manifest));
+  LAVIK_ASSIGN_OR_RETURN(stores.audit_, MetaAuditStore::Deserialize(*audit));
+  LAVIK_RETURN_IF_ERROR(ValidateDecodedAggregate(stores));
   return stores;
 }
 
@@ -3007,20 +2983,20 @@ std::string EncodeMetaApplyResult(const MetaApplyResult& result) {
 absl::StatusOr<MetaApplyResult> DecodeMetaApplyResult(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU8();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != 1) {
     return MetaFailStopError("unknown apply-result payload version");
   }
   auto verdict = r.ReadU8();
-  if (!verdict.ok()) return verdict.status();
+  LAVIK_RETURN_IF_ERROR(verdict.status());
   if (*verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kAccepted) &&
       *verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kRejected)) {
     return MetaFailStopError("unknown apply-result verdict");
   }
   auto log_index = r.ReadU64();
-  if (!log_index.ok()) return log_index.status();
+  LAVIK_RETURN_IF_ERROR(log_index.status());
   auto command_tag = r.ReadU16();
-  if (!command_tag.ok()) return command_tag.status();
+  LAVIK_RETURN_IF_ERROR(command_tag.status());
   if (*command_tag <
           static_cast<std::uint16_t>(MetaCommandTag::kRegisterNode) ||
       *command_tag >
@@ -3028,8 +3004,8 @@ absl::StatusOr<MetaApplyResult> DecodeMetaApplyResult(std::string_view bytes) {
     return MetaFailStopError("unknown apply-result command tag");
   }
   auto detail = r.ReadString(kMaxMetaAuditDetailBytes);
-  if (!detail.ok()) return detail.status();
-  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(detail.status());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
   return MetaApplyResult{static_cast<MetaAuditVerdict>(*verdict),
                          std::string(*detail), *log_index,
                          static_cast<MetaCommandTag>(*command_tag)};

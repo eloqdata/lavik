@@ -16,6 +16,7 @@
 
 #include "bycorf/runtime/cross_core.h"
 #include "lavik/rdb.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::rdb {
 
@@ -40,8 +41,7 @@ bycorf::Task<absl::StatusOr<storage::RestoreRawResult>> RestoreFileEntry(
     // Expired values can be skipped by storage. Drain on the same owner so
     // decoder accounting stays local and the next file header is reachable.
     if (result.ok() && !result->busy_) {
-      auto drained = reader->DrainCollection();
-      if (!drained.ok()) co_return drained;
+      LAVIK_CO_RETURN_IF_ERROR(reader->DrainCollection());
     }
     co_return result;
   };

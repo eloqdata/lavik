@@ -26,6 +26,7 @@
 
 #include "lavik/cluster/meta_client.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::cluster {
@@ -41,22 +42,22 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
   if (options.tls) target.tls_ = *options.tls;
   auto stream = net::SyncStream::Connect(
       target, std::chrono::steady_clock::now() + 2s, options.cancel_fd);
-  if (!stream.ok()) return stream.status();
+  LAVIK_RETURN_IF_ERROR(stream.status());
   auto payload = control::EncodeMessage(control::BootstrapHello{
       .node_id = options.node_id, .capabilities = options.capabilities});
-  if (!payload.ok()) return payload.status();
+  LAVIK_RETURN_IF_ERROR(payload.status());
   control::FrameEncoder encoder;
   auto request =
       encoder.Encode(control::MessageType::kBootstrapHello, payload->payload);
-  if (!request.ok()) return request.status();
-  if (auto status = (*stream)->WriteAll(*request); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(request.status());
+  LAVIK_RETURN_IF_ERROR((*stream)->WriteAll(*request));
   auto header_bytes = (*stream)->ReadExact(control::kFrameHeaderBytes);
   if (!header_bytes.ok())
     return absl::IsDataLoss(header_bytes.status())
                ? absl::UnavailableError(header_bytes.status().message())
                : header_bytes.status();
   auto header = control::ParseFrameHeader(*header_bytes);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   if (header->type != control::MessageType::kBootstrapReply) {
     return absl::InvalidArgumentError("expected Meta BootstrapReply");
   }
@@ -67,9 +68,9 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
                : body.status();
   control::FrameDecoder decoder;
   auto frame = decoder.Decode(*header_bytes + *body);
-  if (!frame.ok()) return frame.status();
+  LAVIK_RETURN_IF_ERROR(frame.status());
   auto decoded = control::DecodeMessage(frame->type, frame->payload);
-  if (!decoded.ok()) return decoded.status();
+  LAVIK_RETURN_IF_ERROR(decoded.status());
   auto reply = std::get<control::BootstrapReply>(std::move(*decoded));
   const auto& hello = reply.server;
   if (hello.negotiated_version != control::kProtocolVersion ||
@@ -84,9 +85,7 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
         return value.server_id == hello.meta_server_id;
       });
   if (member != hello.directory.end()) {
-    if (auto status = ValidateDialedMetaIdentity(endpoint, *member);
-        !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(ValidateDialedMetaIdentity(endpoint, *member));
   } else if (!hello.directory.empty() ||
              reply.disposition == control::BootstrapDisposition::kReady) {
     return absl::PermissionDeniedError(
@@ -94,7 +93,7 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
   }
   if (options.tls) {
     auto sans = (*stream)->PeerUriSans();
-    if (!sans.ok()) return sans.status();
+    LAVIK_RETURN_IF_ERROR(sans.status());
     // Before Genesis, an unresolved configured seed has no committed
     // directory to return. Authenticate its canonical Meta role/IP identity,
     // but learn no endpoint or mode from that retry-only response.
@@ -102,9 +101,7 @@ absl::StatusOr<control::BootstrapReply> QueryMode(
         member != hello.directory.end() && member->principal
             ? *member->principal
             : "lavik://meta/" + std::to_string(hello.meta_server_id));
-    if (auto status = ValidateUniqueControlPrincipal(*sans, principal);
-        !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(ValidateUniqueControlPrincipal(*sans, principal));
   }
   return reply;
 }
@@ -145,7 +142,7 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
   std::vector<MetaControlEndpoint> seeds;
   for (const auto& seed : options.seeds) {
     auto endpoint = ParseNumericControlEndpoint(seed);
-    if (!endpoint.ok()) return endpoint.status();
+    LAVIK_RETURN_IF_ERROR(endpoint.status());
     seeds.push_back(std::move(*endpoint));
   }
   MetaEndpointDirectory directory(std::move(seeds));
@@ -164,10 +161,8 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
         continue;
       }
       if (!reply->server.directory.empty()) {
-        if (auto status = directory.Update(reply->server.directory,
-                                           reply->server.leader_id);
-            !status.ok())
-          return status;
+        LAVIK_RETURN_IF_ERROR(
+            directory.Update(reply->server.directory, reply->server.leader_id));
       }
       switch (reply->disposition) {
         case control::BootstrapDisposition::kUnauthorized:
@@ -181,10 +176,8 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
             return absl::FailedPreconditionError(
                 "bootstrap mode did not come from a ready Meta leader");
           }
-          if (auto status = control::ValidateClientService(
-                  reply->server.service, options.capabilities, false);
-              !status.ok())
-            return status;
+          LAVIK_RETURN_IF_ERROR(control::ValidateClientService(
+              reply->server.service, options.capabilities, false));
           return reply->server.service;
         case control::BootstrapDisposition::kRetry:
           if (last_reason != reply->server.rejection_reason) {
@@ -198,10 +191,8 @@ absl::StatusOr<control::ServiceDeclaration> BootstrapClientService(
     // must not accumulate additional delay, matching MetaReconnectPolicy's
     // no-failure-count rule; simultaneous Data boots are few enough that the
     // session-reconnect jitter is not needed here.
-    if (auto status =
-            Backoff(options.cancel_fd, std::chrono::milliseconds(100));
-        !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(
+        Backoff(options.cancel_fd, std::chrono::milliseconds(100)));
   }
 }
 

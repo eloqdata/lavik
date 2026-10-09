@@ -27,6 +27,7 @@
 #include "absl/container/node_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "lavik/memory.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/stream_records.h"
 #include "lavik/storage/format.h"
 #include "rdb_record_spool.h"
@@ -410,7 +411,7 @@ bool LzfDecompress(Reader* input, std::size_t remaining, std::string* output) {
 // handling to each string operation.
 absl::StatusOr<std::string> ReadString(Reader* reader) try {
   auto length = ReadLength(reader);
-  if (!length.ok()) return length.status();
+  LAVIK_RETURN_IF_ERROR(length.status());
   if (!length->encoded) {
     if (length->value > storage::kMaxStringBytes ||
         length->value > reader->remaining())
@@ -443,8 +444,8 @@ absl::StatusOr<std::string> ReadString(Reader* reader) try {
   if (length->value != 3) return Bad("unknown encoded string");
   auto compressed_size = ReadLength(reader);
   auto output_size = ReadLength(reader);
-  if (!compressed_size.ok()) return compressed_size.status();
-  if (!output_size.ok()) return output_size.status();
+  LAVIK_RETURN_IF_ERROR(compressed_size.status());
+  LAVIK_RETURN_IF_ERROR(output_size.status());
   if (compressed_size->encoded || output_size->encoded ||
       output_size->value > storage::kMaxStringBytes ||
       compressed_size->value > reader->remaining())
@@ -464,12 +465,12 @@ absl::StatusOr<std::string> ReadString(Reader* reader) try {
 absl::Status SkipModuleBody(Reader* reader) {
   while (true) {
     auto opcode = ReadLength(reader);
-    if (!opcode.ok()) return opcode.status();
+    LAVIK_RETURN_IF_ERROR(opcode.status());
     if (opcode->encoded) return Bad("encoded Redis Module opcode");
     if (opcode->value == 0) return absl::OkStatus();
     if (opcode->value == 1 || opcode->value == 2) {
       auto value = ReadLength(reader);
-      if (!value.ok()) return value.status();
+      LAVIK_RETURN_IF_ERROR(value.status());
       if (value->encoded) return Bad("encoded Redis Module integer");
       continue;
     }
@@ -483,7 +484,7 @@ absl::Status SkipModuleBody(Reader* reader) {
     if (opcode->value == 5) {
       reader->ResetExpandedAccounting();
       auto value = ReadString(reader);
-      if (!value.ok()) return value.status();
+      LAVIK_RETURN_IF_ERROR(value.status());
       continue;
     }
     return Bad("unknown Redis Module opcode");
@@ -492,7 +493,7 @@ absl::Status SkipModuleBody(Reader* reader) {
 
 absl::Status SkipModuleValue(Reader* reader) {
   auto module_id = ReadLength(reader);
-  if (!module_id.ok()) return module_id.status();
+  LAVIK_RETURN_IF_ERROR(module_id.status());
   if (module_id->encoded) return Bad("encoded Redis Module id");
   return SkipModuleBody(reader);
 }
@@ -501,9 +502,9 @@ absl::Status SkipModuleAux(Reader* reader) {
   auto module_id = ReadLength(reader);
   auto when_opcode = ReadLength(reader);
   auto when = ReadLength(reader);
-  if (!module_id.ok()) return module_id.status();
-  if (!when_opcode.ok()) return when_opcode.status();
-  if (!when.ok()) return when.status();
+  LAVIK_RETURN_IF_ERROR(module_id.status());
+  LAVIK_RETURN_IF_ERROR(when_opcode.status());
+  LAVIK_RETURN_IF_ERROR(when.status());
   if (module_id->encoded || when_opcode->encoded || when->encoded ||
       when_opcode->value != 2) {
     return Bad("invalid Redis Module auxiliary header");
@@ -991,7 +992,7 @@ absl::StatusOr<std::vector<Entry>> DecodeStreamNode(
   if (!key_reader.Be64(&master.ms) || !key_reader.Be64(&master.seq))
     return Bad("invalid Stream node ID");
   auto listpack = DecodeListpack(blob);
-  if (!listpack.ok()) return listpack.status();
+  LAVIK_RETURN_IF_ERROR(listpack.status());
   std::size_t at = 0;
   auto integer = [&](std::int64_t* out) {
     if (at >= listpack->size()) return false;
@@ -1079,12 +1080,12 @@ absl::StatusOr<Stream> DecodeStreamRdb(Reader* reader, std::uint8_t type) {
   for (std::uint64_t node = 0; node < listpack_count->value; ++node) {
     auto key = ReadString(reader);
     auto blob = ReadString(reader);
-    if (!key.ok()) return key.status();
-    if (!blob.ok()) return blob.status();
+    LAVIK_RETURN_IF_ERROR(key.status());
+    LAVIK_RETURN_IF_ERROR(blob.status());
     if (key->size() != 16 || !node_keys.insert(*key).second)
       return Bad("invalid Stream node key");
     auto entries = DecodeStreamNode(*key, *blob);
-    if (!entries.ok()) return entries.status();
+    LAVIK_RETURN_IF_ERROR(entries.status());
     if (!entries->empty()) stream.node_entries.push_back(entries->size());
     for (auto& entry : *entries) {
       if (!ids.insert(entry.id).second) return Bad("duplicate Stream ID");
@@ -1197,7 +1198,7 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
                                              std::uint8_t type) {
   if (type == kString) {
     auto value = ReadString(reader);
-    if (!value.ok()) return value.status();
+    LAVIK_RETURN_IF_ERROR(value.status());
     return LogicalValue{storage::ValueType::kString, std::move(*value)};
   }
   if (type == kList || type == kSet || type == kHash || type == kZSet ||
@@ -1211,12 +1212,11 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
       values.reserve(static_cast<std::size_t>(count->value));
       for (std::uint64_t i = 0; i < count->value; ++i) {
         auto value = ReadString(reader);
-        if (!value.ok()) return value.status();
+        LAVIK_RETURN_IF_ERROR(value.status());
         values.push_back(std::move(*value));
       }
       if (type == kSet) {
-        auto unique = UniqueStrings(values);
-        if (!unique.ok()) return unique;
+        LAVIK_RETURN_IF_ERROR(UniqueStrings(values));
       }
       return LogicalValue{
           type == kList ? storage::ValueType::kList : storage::ValueType::kSet,
@@ -1228,12 +1228,11 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
       for (std::uint64_t i = 0; i < count->value; ++i) {
         auto field = ReadString(reader);
         auto value = ReadString(reader);
-        if (!field.ok()) return field.status();
-        if (!value.ok()) return value.status();
+        LAVIK_RETURN_IF_ERROR(field.status());
+        LAVIK_RETURN_IF_ERROR(value.status());
         values.emplace_back(std::move(*field), std::move(*value));
       }
-      auto unique = UniquePairs(values);
-      if (!unique.ok()) return unique;
+      LAVIK_RETURN_IF_ERROR(UniquePairs(values));
       return LogicalValue{storage::ValueType::kHash, std::move(values)};
     }
     ZElements values;
@@ -1241,7 +1240,7 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
     std::set<std::string_view> members;
     for (std::uint64_t i = 0; i < count->value; ++i) {
       auto member = ReadString(reader);
-      if (!member.ok()) return member.status();
+      LAVIK_RETURN_IF_ERROR(member.status());
       double score = 0;
       if (type == kZSet2) {
         std::uint64_t bits = 0;
@@ -1274,32 +1273,25 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
       type == kHashListpack || type == kZSetListpack || type == kSetListpack ||
       type == kSetIntset || type == kHashZipmap) {
     auto blob = ReadString(reader);
-    if (!blob.ok()) return blob.status();
+    LAVIK_RETURN_IF_ERROR(blob.status());
     Strings flat;
     if (type == kSetIntset) {
-      auto decoded = DecodeIntset(*blob);
-      if (!decoded.ok()) return decoded.status();
-      flat = std::move(*decoded);
+      LAVIK_ASSIGN_OR_RETURN(flat, DecodeIntset(*blob));
     } else if (type == kHashZipmap) {
-      auto decoded = DecodeZipmap(*blob);
-      if (!decoded.ok()) return decoded.status();
-      flat = std::move(*decoded);
+      LAVIK_ASSIGN_OR_RETURN(flat, DecodeZipmap(*blob));
     } else if (type == kListZiplist || type == kHashZiplist ||
                type == kZSetZiplist) {
-      auto decoded = DecodeZiplist(*blob);
-      if (!decoded.ok()) return decoded.status();
-      flat = std::move(*decoded);
+      LAVIK_ASSIGN_OR_RETURN(flat, DecodeZiplist(*blob));
     } else {
       auto decoded = DecodeListpack(*blob);
-      if (!decoded.ok()) return decoded.status();
+      LAVIK_RETURN_IF_ERROR(decoded.status());
       for (auto& item : *decoded) flat.push_back(item.String());
     }
     if (flat.empty()) return Bad("empty collection");
     if (type == kListZiplist)
       return LogicalValue{storage::ValueType::kList, std::move(flat)};
     if (type == kSetIntset || type == kSetListpack) {
-      auto unique = UniqueStrings(flat);
-      if (!unique.ok()) return unique;
+      LAVIK_RETURN_IF_ERROR(UniqueStrings(flat));
       return LogicalValue{storage::ValueType::kSet, std::move(flat)};
     }
     if (flat.size() % 2 != 0) return Bad("odd collection pair count");
@@ -1307,8 +1299,7 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
       Pairs pairs;
       for (std::size_t i = 0; i < flat.size(); i += 2)
         pairs.emplace_back(std::move(flat[i]), std::move(flat[i + 1]));
-      auto unique = UniquePairs(pairs);
-      if (!unique.ok()) return unique;
+      LAVIK_RETURN_IF_ERROR(UniquePairs(pairs));
       return LogicalValue{storage::ValueType::kHash, std::move(pairs)};
     }
     ZElements values;
@@ -1341,17 +1332,17 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
         container = encoded->value;
       }
       auto blob = ReadString(reader);
-      if (!blob.ok()) return blob.status();
+      LAVIK_RETURN_IF_ERROR(blob.status());
       if (container == 1)
         values.push_back(std::move(*blob));
       else if (type == kListQuicklist) {
         auto node = DecodeZiplist(*blob);
-        if (!node.ok()) return node.status();
+        LAVIK_RETURN_IF_ERROR(node.status());
         values.insert(values.end(), std::make_move_iterator(node->begin()),
                       std::make_move_iterator(node->end()));
       } else {
         auto node = DecodeListpack(*blob);
-        if (!node.ok()) return node.status();
+        LAVIK_RETURN_IF_ERROR(node.status());
         for (auto& item : *node) values.push_back(item.String());
       }
     }
@@ -1361,7 +1352,7 @@ absl::StatusOr<LogicalValue> DecodeRdbObject(Reader* reader,
   if (type == kStreamListpacks || type == kStreamListpacks2 ||
       type == kStreamListpacks3) {
     auto stream = DecodeStreamRdb(reader, type);
-    if (!stream.ok()) return stream.status();
+    LAVIK_RETURN_IF_ERROR(stream.status());
     return LogicalValue{storage::ValueType::kStream, std::move(*stream)};
   }
   if (type == kModulePreGa || type == kModule2)
@@ -1405,7 +1396,7 @@ storage::ValueType CollectionType(std::uint8_t type) {
 // string limit. The actual decode below validates the LZF contents.
 absl::StatusOr<std::size_t> MeasureString(Reader* reader) {
   auto length = ReadLength(reader);
-  if (!length.ok()) return length.status();
+  LAVIK_RETURN_IF_ERROR(length.status());
   std::uint64_t encoded = length->value;
   std::uint64_t decoded = encoded;
   if (length->encoded) {
@@ -1415,8 +1406,8 @@ absl::StatusOr<std::size_t> MeasureString(Reader* reader) {
     } else if (length->value == 3) {
       auto input = ReadLength(reader);
       auto output = ReadLength(reader);
-      if (!input.ok()) return input.status();
-      if (!output.ok()) return output.status();
+      LAVIK_RETURN_IF_ERROR(input.status());
+      LAVIK_RETURN_IF_ERROR(output.status());
       if (input->encoded || output->encoded) return Bad("invalid LZF lengths");
       encoded = input->value;
       decoded = output->value;
@@ -1461,19 +1452,19 @@ class StreamInput {
                                                            std::uint8_t type) {
     auto input = std::make_unique<StreamInput>();
     auto nodes = Number(reader, UINT32_MAX);
-    if (!nodes.ok()) return nodes.status();
+    LAVIK_RETURN_IF_ERROR(nodes.status());
     std::uint64_t live = 0, live_nodes = 0;
     Id last_entry{};
     for (std::uint64_t i = 0; i < *nodes; ++i) {
       auto key = String(reader), blob = String(reader);
-      if (!key.ok()) return key.status();
-      if (!blob.ok()) return blob.status();
+      LAVIK_RETURN_IF_ERROR(key.status());
+      LAVIK_RETURN_IF_ERROR(blob.status());
       if (key->value_.size() != 16) return Bad("invalid Stream node key");
       auto status = input->spool_.Add(std::string(1, '\7') + key->value_, {});
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       PackedMeasurement measured;
       status = DecodeListpack(blob->value_, &measured).status();
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       if (measured.count > (SIZE_MAX - 4096) / 256 ||
           measured.strings > (SIZE_MAX - 4096 - measured.count * 256) / 4)
         return Oom();
@@ -1483,7 +1474,7 @@ class StreamInput {
       std::vector<MemoryReservation> repeated_fields;
       auto entries =
           DecodeStreamNode(key->value_, blob->value_, &repeated_fields);
-      if (!entries.ok()) return entries.status();
+      LAVIK_RETURN_IF_ERROR(entries.status());
       live += entries->size();
       if (live > UINT32_MAX) return Bad("Stream message count overflow");
       if (!entries->empty()) {
@@ -1492,13 +1483,13 @@ class StreamInput {
         PutLe32(&count, entries->size());
         status = input->Add(
             IdKey(std::string_view("\3", 1), entries->front().id), count);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         std::string interval;
         PutBe64(&interval, entries->back().id.ms);
         PutBe64(&interval, entries->back().id.seq);
         status = input->spool_.Add(
             IdKey(std::string_view("\6", 1), entries->front().id), interval);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         last_entry = std::max(last_entry, entries->back().id);
       }
       for (const auto& entry : *entries) {
@@ -1512,14 +1503,14 @@ class StreamInput {
         }
         status =
             input->Add(IdKey(std::string_view("\1", 1), entry.id), payload);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
       }
     }
     auto length = Number(reader, UINT32_MAX), last_ms = Number(reader),
          last_seq = Number(reader);
-    if (!length.ok()) return length.status();
-    if (!last_ms.ok()) return last_ms.status();
-    if (!last_seq.ok()) return last_seq.status();
+    LAVIK_RETURN_IF_ERROR(length.status());
+    LAVIK_RETURN_IF_ERROR(last_ms.status());
+    LAVIK_RETURN_IF_ERROR(last_seq.status());
     if (*length != live || last_entry > Id{*last_ms, *last_seq})
       return Bad("Stream length mismatch");
     input->length_ = live;
@@ -1528,7 +1519,7 @@ class StreamInput {
     if (type >= kStreamListpacks2) {
       for (unsigned i = 0; i < 5; ++i) {
         auto value = Number(reader);
-        if (!value.ok()) return value.status();
+        LAVIK_RETURN_IF_ERROR(value.status());
         if (i == 2) deleted.ms = *value;
         if (i == 3) deleted.seq = *value;
         if (i == 4) added = *value;
@@ -1542,36 +1533,34 @@ class StreamInput {
     PutLe64(&header, added);
     PutLe32(&header, live);
     auto status = input->Add(std::string_view("\0", 1), header);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     std::string count;
     PutLe32(&count, live_nodes);
     status = input->Add(std::string_view("\2", 1), count);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     auto groups = Number(reader, UINT32_MAX);
-    if (!groups.ok()) return groups.status();
+    LAVIK_RETURN_IF_ERROR(groups.status());
     count.clear();
     PutLe32(&count, *groups);
     status = input->Add(std::string_view("\4", 1), count);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     for (std::uint64_t gi = 0; gi < *groups; ++gi) {
       auto name = String(reader);
       auto ms = Number(reader), seq = Number(reader);
-      if (!name.ok()) return name.status();
-      if (!ms.ok()) return ms.status();
-      if (!seq.ok()) return seq.status();
+      LAVIK_RETURN_IF_ERROR(name.status());
+      LAVIK_RETURN_IF_ERROR(ms.status());
+      LAVIK_RETURN_IF_ERROR(seq.status());
       std::uint64_t read = UINT64_MAX;
       if (type >= kStreamListpacks2) {
-        auto value = Number(reader);
-        if (!value.ok()) return value.status();
-        read = *value;
+        LAVIK_ASSIGN_OR_RETURN(read, Number(reader));
       }
       const auto prefix = GroupPrefix(name->value_);
       auto pending = Number(reader, UINT32_MAX);
-      if (!pending.ok()) return pending.status();
+      LAVIK_RETURN_IF_ERROR(pending.status());
       count.clear();
       PutLe32(&count, *pending);
       status = input->Add(prefix + '\2', count);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       for (std::uint64_t pi = 0; pi < *pending; ++pi) {
         Id id;
         std::uint64_t delivery = 0;
@@ -1579,17 +1568,17 @@ class StreamInput {
             !reader->Le64(&delivery))
           return Bad("truncated Stream PEL");
         auto deliveries = Number(reader);
-        if (!deliveries.ok()) return deliveries.status();
+        LAVIK_RETURN_IF_ERROR(deliveries.status());
         std::string payload;
         PutLe64(&payload, id.ms);
         PutLe64(&payload, id.seq);
         PutLe64(&payload, delivery);
         PutLe64(&payload, *deliveries);
         status = input->Add(IdKey(prefix + '\3', id), payload);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
       }
       auto consumers = Number(reader, UINT32_MAX);
-      if (!consumers.ok()) return consumers.status();
+      LAVIK_RETURN_IF_ERROR(consumers.status());
       std::string group;
       PutLe32(&group, name->value_.size());
       group.append(name->value_);
@@ -1598,10 +1587,10 @@ class StreamInput {
       PutLe64(&group, read);
       PutLe32(&group, *consumers);
       status = input->Add(prefix + '\0', group);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       for (std::uint64_t ci = 0; ci < *consumers; ++ci) {
         auto consumer = String(reader);
-        if (!consumer.ok()) return consumer.status();
+        LAVIK_RETURN_IF_ERROR(consumer.status());
         std::uint64_t seen = 0, active = 0;
         if (!reader->Le64(&seen)) return Bad("truncated Stream consumer");
         active = seen;
@@ -1614,21 +1603,21 @@ class StreamInput {
         PutLe64(&payload, active);
         Name(key, consumer->value_);
         status = input->Add(key, payload);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         auto local = Number(reader, *pending);
-        if (!local.ok()) return local.status();
+        LAVIK_RETURN_IF_ERROR(local.status());
         for (std::uint64_t pi = 0; pi < *local; ++pi) {
           Id id;
           if (!reader->Be64(&id.ms) || !reader->Be64(&id.seq))
             return Bad("truncated consumer PEL ID");
           status = input->spool_.Add(IdKey(prefix + '\3', id) + '\1',
                                      consumer->value_);
-          if (!status.ok()) return status;
+          LAVIK_RETURN_IF_ERROR(status);
         }
       }
     }
     status = input->spool_.Finish();
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     input->validator_.emplace(live);
     return input;
   }
@@ -1639,10 +1628,9 @@ class StreamInput {
     page.retained_charge_.Account(CurrentMemoryAccountingShard(), 0);
     for (;;) {
       auto record = spool_.Next();
-      if (!record.ok()) return record.status();
+      LAVIK_RETURN_IF_ERROR(record.status());
       if (!*record) {
-        auto status = validator_->Finish();
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(validator_->Finish());
         page.done_ = done_ = true;
         break;
       }
@@ -1691,7 +1679,7 @@ class StreamInput {
       if (pending) {
         if (row.value_.size() != 32) return Bad("invalid Stream PEL join");
         auto owner = spool_.Next();
-        if (!owner.ok()) return owner.status();
+        LAVIK_RETURN_IF_ERROR(owner.status());
         if (!*owner || (**owner).key_ != row.key_ + '\1')
           return Bad("unowned or duplicate Stream PEL entry");
         previous_ = (**owner).key_;
@@ -1711,8 +1699,7 @@ class StreamInput {
       std::string encoded = row.key_;
       encoded.append(row.value_);
       PutLe32(&encoded, row.key_.size());
-      auto status = validator_->Read(encoded);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(validator_->Read(encoded));
       page.elements_.push_back(std::move(encoded));
       page.retained_charge_.Resize(page.RetainedBytes());
       if (page.RetainedBytes() >= 8192) break;
@@ -1729,7 +1716,7 @@ class StreamInput {
   static absl::StatusOr<std::uint64_t> Number(
       Reader* reader, std::uint64_t maximum = UINT64_MAX) {
     auto value = ReadLength(reader);
-    if (!value.ok()) return value.status();
+    LAVIK_RETURN_IF_ERROR(value.status());
     if (value->encoded || value->value > maximum)
       return Bad("invalid Stream RDB count or ID");
     return value->value;
@@ -1737,14 +1724,12 @@ class StreamInput {
   static absl::StatusOr<RecordSpool::Record> String(Reader* reader) {
     Reader measure = *reader;
     auto bytes = MeasureString(&measure);
-    if (!bytes.ok()) return bytes.status();
+    LAVIK_RETURN_IF_ERROR(bytes.status());
     auto reservation = TryReserveMemory(*bytes * 4 + 512);
     if (!reservation) return Oom();
     RecordSpool::Record result{.reservation_ = std::move(reservation)};
     reader->ResetExpandedAccounting();
-    auto value = ReadString(reader);
-    if (!value.ok()) return value.status();
-    result.value_ = std::move(*value);
+    LAVIK_ASSIGN_OR_RETURN(result.value_, ReadString(reader));
     return result;
   }
   static void Name(std::string& key, std::string_view name) {
@@ -1782,15 +1767,13 @@ class CollectionInput {
       Reader* reader, std::uint8_t type) {
     auto result = std::unique_ptr<CollectionInput>(new CollectionInput(type));
     if (CollectionType(type) == storage::ValueType::kStream) {
-      auto stream = StreamInput::Open(reader, type);
-      if (!stream.ok()) return stream.status();
-      result->stream_ = std::move(*stream);
+      LAVIK_ASSIGN_OR_RETURN(result->stream_, StreamInput::Open(reader, type));
       result->expected_ = result->stream_->length();
       return result;
     }
     if (result->plain_ || result->quick_) {
       auto count = ReadLength(reader);
-      if (!count.ok()) return count.status();
+      LAVIK_RETURN_IF_ERROR(count.status());
       if (count->encoded || count->value == 0)
         return Bad("invalid collection length");
       result->remaining_ = count->value;
@@ -1820,15 +1803,15 @@ class CollectionInput {
     std::size_t count = 0;
     do {
       auto first = MeasureString(&measure);
-      if (!first.ok()) return first.status();
+      LAVIK_RETURN_IF_ERROR(first.status());
       bytes += *first + 256;
       if (type_ == kHash) {
         auto second = MeasureString(&measure);
-        if (!second.ok()) return second.status();
+        LAVIK_RETURN_IF_ERROR(second.status());
         bytes += *second;
       } else if (type() == storage::ValueType::kSortedSet) {
         auto score = ReadCollectionScore(&measure, type_);
-        if (!score.ok()) return score.status();
+        LAVIK_RETURN_IF_ERROR(score.status());
       }
       ++count;
     } while (count < remaining_ && bytes < 1024 * 1024);
@@ -1845,19 +1828,18 @@ class CollectionInput {
       Reader origin = *input;
       input->ResetExpandedAccounting();
       auto first = ReadString(input);
-      if (!first.ok()) return first.status();
+      LAVIK_RETURN_IF_ERROR(first.status());
       if (type_ != kList) {
-        auto unique = Remember(*first, origin);
-        if (!unique.ok()) return unique;
+        LAVIK_RETURN_IF_ERROR(Remember(*first, origin));
       }
       if (type_ == kHash) {
         input->ResetExpandedAccounting();
         auto second = ReadString(input);
-        if (!second.ok()) return second.status();
+        LAVIK_RETURN_IF_ERROR(second.status());
         page.fields_.push_back({std::move(*first), std::move(*second)});
       } else if (type() == storage::ValueType::kSortedSet) {
         auto score = ReadCollectionScore(input, type_);
-        if (!score.ok()) return score.status();
+        LAVIK_RETURN_IF_ERROR(score.status());
         page.scored_members_.push_back({std::move(*first), *score});
       } else
         page.elements_.push_back(std::move(*first));
@@ -1886,18 +1868,18 @@ class CollectionInput {
     auto equal = [&](Reader original) -> absl::StatusOr<bool> {
       Reader measure = original;
       auto size = MeasureString(&measure);
-      if (!size.ok()) return size.status();
+      LAVIK_RETURN_IF_ERROR(size.status());
       auto reservation = TryReserveMemory(*size + 64);
       if (!reservation) return Oom();
       original.ResetExpandedAccounting();
       auto old = ReadString(&original);
-      if (!old.ok()) return old.status();
+      LAVIK_RETURN_IF_ERROR(old.status());
       return *old == member;
     };
     const auto first = identities_.find(digest);
     if (first != identities_.end()) {
       auto same = equal(first->second);
-      if (!same.ok()) return same.status();
+      LAVIK_RETURN_IF_ERROR(same.status());
       if (*same) return Bad("duplicate collection member or field");
       // Digest collisions remain exact checks against the original immutable
       // RDB input. The secondary tree stays empty for distinct digests, so a
@@ -1905,7 +1887,7 @@ class CollectionInput {
       const auto range = collided_identities_.equal_range(digest);
       for (auto it = range.first; it != range.second; ++it) {
         same = equal(it->second);
-        if (!same.ok()) return same.status();
+        LAVIK_RETURN_IF_ERROR(same.status());
         if (*same) return Bad("duplicate collection member or field");
       }
     }
@@ -1926,20 +1908,20 @@ class CollectionInput {
     std::uint64_t container = 2;
     if (type_ == kListQuicklist2) {
       auto flag = ReadLength(input);
-      if (!flag.ok()) return flag.status();
+      LAVIK_RETURN_IF_ERROR(flag.status());
       if (flag->encoded || (flag->value != 1 && flag->value != 2))
         return Bad("invalid quicklist container");
       container = flag->value;
     }
     Reader measure = *input;
     auto expanded = MeasureString(&measure);
-    if (!expanded.ok()) return expanded.status();
+    LAVIK_RETURN_IF_ERROR(expanded.status());
     auto blob_reservation = TryReserveMemory(*expanded + 64);
     if (!blob_reservation) return Oom();
     Reader origin = *input;
     input->ResetExpandedAccounting();
     auto blob = ReadString(input);
-    if (!blob.ok()) return blob.status();
+    LAVIK_RETURN_IF_ERROR(blob.status());
     // The allocation-free measurement pass checks every packed entry rather
     // than trusting a possibly saturated/corrupt count in the packed header.
     // Only then reserve decoded vectors, string expansion and duplicate-check
@@ -1957,7 +1939,7 @@ class CollectionInput {
       measured_status = DecodeZiplist(*blob, &measured).status();
     else
       measured_status = DecodeListpack(*blob, &measured).status();
-    if (!measured_status.ok()) return measured_status;
+    LAVIK_RETURN_IF_ERROR(measured_status);
     if (measured.count > (SIZE_MAX - *expanded - 4096) / 192) return Oom();
     const auto headers = measured.count * 192 + *expanded + 4096;
     if (measured.strings > (SIZE_MAX - headers) / 3) return Oom();
@@ -1969,12 +1951,10 @@ class CollectionInput {
       if (container == 1)
         page.elements_.push_back(std::move(*blob));
       else if (type_ == kListQuicklist) {
-        auto values = DecodeZiplist(*blob);
-        if (!values.ok()) return values.status();
-        page.elements_ = std::move(*values);
+        LAVIK_ASSIGN_OR_RETURN(page.elements_, DecodeZiplist(*blob));
       } else {
         auto values = DecodeListpack(*blob);
-        if (!values.ok()) return values.status();
+        LAVIK_RETURN_IF_ERROR(values.status());
         page.elements_.reserve(values->size());
         for (auto& value : *values) page.elements_.push_back(value.String());
       }
@@ -1982,7 +1962,7 @@ class CollectionInput {
     } else {
       origin.ResetExpandedAccounting();
       auto logical = DecodeRdbObject(&origin, type_);
-      if (!logical.ok()) return logical.status();
+      LAVIK_RETURN_IF_ERROR(logical.status());
       if (type() == storage::ValueType::kHash) {
         auto& pairs = std::get<Pairs>(logical->value);
         page.fields_.reserve(pairs.size());
@@ -2508,7 +2488,7 @@ absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
   // on every error path, and moving FileReader never invalidates its cursors.
   auto impl = std::make_unique<Impl>();
   auto status = impl->input_.Open(path);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(status);
   auto& input = impl->input_;
   char header[9];
   if (input.size() < 10) {
@@ -2543,7 +2523,7 @@ absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
       const auto end = input.size() - 8;
       for (std::size_t at = 0; at < end;) {
         const auto part = input.Chunk(at).substr(0, end - at);
-        if (!input.status().ok()) return input.status();
+        LAVIK_RETURN_IF_ERROR(input.status());
         crc = UpdateCrc64(crc, part);
         at += part.size();
       }
@@ -2559,21 +2539,21 @@ absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
 
 absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
   auto entry = NextImpl(false);
-  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  LAVIK_RETURN_IF_ERROR(impl_->input_.status());
   return entry;
 }
 
 absl::StatusOr<std::optional<FileEntry>> FileReader::NextStreaming() {
   auto entry = NextImpl(true);
-  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  LAVIK_RETURN_IF_ERROR(impl_->input_.status());
   return entry;
 }
 
 absl::StatusOr<storage::CollectionPage> FileReader::ReadCollectionPage() {
-  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  LAVIK_RETURN_IF_ERROR(impl_->input_.status());
   if (!impl_->collection_) return Bad("no active RDB collection");
   auto page = impl_->collection_->Next(&impl_->reader_);
-  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  LAVIK_RETURN_IF_ERROR(impl_->input_.status());
   if (page.ok() && page->done_) impl_->collection_.reset();
   return page;
 }
@@ -2581,14 +2561,14 @@ absl::StatusOr<storage::CollectionPage> FileReader::ReadCollectionPage() {
 absl::Status FileReader::DrainCollection() {
   while (impl_->collection_) {
     auto page = ReadCollectionPage();
-    if (!page.ok()) return page.status();
+    LAVIK_RETURN_IF_ERROR(page.status());
   }
   return absl::OkStatus();
 }
 
 absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
     bool stream_collections) {
-  if (!impl_->input_.status().ok()) return impl_->input_.status();
+  LAVIK_RETURN_IF_ERROR(impl_->input_.status());
   if (impl_->collection_) return Bad("RDB collection must be drained first");
   if (impl_->finished_) return std::optional<FileEntry>();
 
@@ -2656,15 +2636,15 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
       auto key = ReadString(&impl_->reader_);
       impl_->reader_.ResetExpandedAccounting();
       auto value = ReadString(&impl_->reader_);
-      if (!key.ok()) return key.status();
-      if (!value.ok()) return value.status();
+      LAVIK_RETURN_IF_ERROR(key.status());
+      LAVIK_RETURN_IF_ERROR(value.status());
       continue;
     }
     if (type == kResizeDb) {
       auto keys = ReadLength(&impl_->reader_);
       auto expires = ReadLength(&impl_->reader_);
-      if (!keys.ok()) return keys.status();
-      if (!expires.ok()) return expires.status();
+      LAVIK_RETURN_IF_ERROR(keys.status());
+      LAVIK_RETURN_IF_ERROR(expires.status());
       if (keys->encoded || expires->encoded) {
         return Bad("invalid RDB resize hint");
       }
@@ -2672,7 +2652,7 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
     }
     if (type == kSelectDb) {
       auto db = ReadLength(&impl_->reader_);
-      if (!db.ok()) return db.status();
+      LAVIK_RETURN_IF_ERROR(db.status());
       if (db->encoded || db->value >= storage::kLogicalDatabaseCount) {
         return Bad("RDB database is outside Lavik's DB range");
       }
@@ -2682,7 +2662,7 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
     if (type == kFunction2) {
       impl_->reader_.ResetExpandedAccounting();
       auto code = ReadString(&impl_->reader_);
-      if (!code.ok()) return code.status();
+      LAVIK_RETURN_IF_ERROR(code.status());
       return std::optional<FileEntry>(FileEntry{
           .kind_ = FileEntryKind::kFunctionLibrary,
           .db_id_ = impl_->db_id_,
@@ -2695,8 +2675,7 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
       return Bad("pre-release Redis Function format is not skippable");
     }
     if (type == kModuleAux) {
-      absl::Status skipped = SkipModuleAux(&impl_->reader_);
-      if (!skipped.ok()) return skipped;
+      LAVIK_RETURN_IF_ERROR(SkipModuleAux(&impl_->reader_));
       return std::optional<FileEntry>(FileEntry{
           .kind_ = FileEntryKind::kSkippedModuleAux,
           .db_id_ = impl_->db_id_,
@@ -2708,10 +2687,9 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
 
     impl_->reader_.ResetExpandedAccounting();
     auto key = ReadString(&impl_->reader_);
-    if (!key.ok()) return key.status();
+    LAVIK_RETURN_IF_ERROR(key.status());
     if (type == kModule2) {
-      absl::Status skipped = SkipModuleValue(&impl_->reader_);
-      if (!skipped.ok()) return skipped;
+      LAVIK_RETURN_IF_ERROR(SkipModuleValue(&impl_->reader_));
       FileEntry entry{.kind_ = FileEntryKind::kSkippedModuleValue,
                       .db_id_ = impl_->db_id_,
                       .key_ = std::move(*key),
@@ -2730,9 +2708,8 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
     impl_->reader_.ResetExpandedAccounting();
     if (stream_collections &&
         CollectionType(type) != storage::ValueType::kNone) {
-      auto collection = CollectionInput::Open(&impl_->reader_, type);
-      if (!collection.ok()) return collection.status();
-      impl_->collection_ = std::move(*collection);
+      LAVIK_ASSIGN_OR_RETURN(impl_->collection_,
+                             CollectionInput::Open(&impl_->reader_, type));
       FileEntry entry{
           .kind_ = FileEntryKind::kValue,
           .db_id_ = impl_->db_id_,
@@ -2751,9 +2728,9 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::NextImpl(
       return std::optional<FileEntry>(std::move(entry));
     }
     auto logical = DecodeRdbObject(&impl_->reader_, type);
-    if (!logical.ok()) return logical.status();
+    LAVIK_RETURN_IF_ERROR(logical.status());
     auto value = EncodeRaw(std::move(*logical));
-    if (!value.ok()) return value.status();
+    LAVIK_RETURN_IF_ERROR(value.status());
     value->expire_at_ms_ = impl_->expire_at_ms_.value_or(0);
 
     FileEntry entry{.kind_ = FileEntryKind::kValue,
@@ -2881,8 +2858,7 @@ absl::StatusOr<FileWriter> FileWriter::Open(std::string target_path) {
   const std::string version = std::to_string(kVersion);
   const std::string header =
       absl::StrCat("REDIS", std::string(4 - version.size(), '0'), version);
-  absl::Status written = writer.impl_->Write(header);
-  if (!written.ok()) return written;
+  LAVIK_RETURN_IF_ERROR(writer.impl_->Write(header));
   return writer;
 }
 
@@ -2913,7 +2889,7 @@ absl::Status FileWriter::Finish() {
         "cannot close RDB temporary file: ", std::strerror(errno)));
   }
   impl_->fd_ = -1;
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(status);
   if (::rename(impl_->temporary_path_.c_str(), impl_->target_path_.c_str()) !=
       0) {
     return absl::InternalError(
@@ -2939,7 +2915,7 @@ absl::Status FileWriter::Finish() {
 
 absl::StatusOr<std::string> EncodeDump(const storage::RawValue& value) {
   auto logical = DecodeRaw(value);
-  if (!logical.ok()) return logical.status();
+  LAVIK_RETURN_IF_ERROR(logical.status());
   return EncodeRdbObject(*logical);
 }
 
@@ -2951,7 +2927,7 @@ absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
     return absl::InvalidArgumentError("invalid RDB file entry");
   }
   auto dump = EncodeDump(value);
-  if (!dump.ok()) return dump.status();
+  LAVIK_RETURN_IF_ERROR(dump.status());
   if (dump->size() < 11) {
     return absl::InternalError("encoded RDB object is truncated");
   }
@@ -3035,7 +3011,7 @@ absl::StatusOr<std::vector<std::string>> DecodeFunctionDump(
     }
     reader.ResetExpandedAccounting();
     auto code = ReadString(&reader);
-    if (!code.ok()) return code.status();
+    LAVIK_RETURN_IF_ERROR(code.status());
     libraries.push_back(std::move(*code));
   }
   return libraries;
@@ -3060,7 +3036,7 @@ absl::StatusOr<storage::RawValue> DecodeDump(std::string_view payload) {
   std::uint8_t type = 0;
   if (!reader.Byte(&type)) return Bad();
   auto logical = DecodeRdbObject(&reader, type);
-  if (!logical.ok()) return logical.status();
+  LAVIK_RETURN_IF_ERROR(logical.status());
   if (!reader.done()) return Bad("trailing object data");
   return EncodeRaw(std::move(*logical));
 }
@@ -3072,9 +3048,8 @@ struct DumpReader::Impl {
     if (!reader_.Byte(&type_)) return Bad();
     collection_.reset();
     if (CollectionType(type_) != storage::ValueType::kNone) {
-      auto opened = CollectionInput::Open(&reader_, type_);
-      if (!opened.ok()) return opened.status();
-      collection_ = std::move(*opened);
+      LAVIK_ASSIGN_OR_RETURN(collection_,
+                             CollectionInput::Open(&reader_, type_));
     }
     complete_ = false;
     return absl::OkStatus();
@@ -3103,8 +3078,7 @@ absl::StatusOr<DumpReader> DumpReader::Open(std::string_view payload) {
     return absl::InvalidArgumentError(
         "DUMP payload version or checksum are wrong");
   auto impl = std::make_unique<Impl>(payload.substr(0, payload.size() - 10));
-  auto status = impl->Initialize();
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(impl->Initialize());
   return DumpReader(std::move(impl));
 }
 
@@ -3137,7 +3111,7 @@ absl::StatusOr<storage::RawValue> DumpReader::ReadRawValue() {
   if (collection() || impl_->complete_)
     return Bad("DUMP raw value is not active");
   auto logical = DecodeRdbObject(&impl_->reader_, impl_->type_);
-  if (!logical.ok()) return logical.status();
+  LAVIK_RETURN_IF_ERROR(logical.status());
   if (!impl_->reader_.done()) return Bad("trailing object data");
   impl_->complete_ = true;
   return EncodeRaw(std::move(*logical));
@@ -3158,12 +3132,12 @@ absl::Status StreamFileEncoder::OutputBudget(std::size_t bytes) {
 }
 
 absl::Status StreamFileEncoder::StartPage(const storage::CollectionPage& page) {
-  if (!status_.ok()) return status_;
+  LAVIK_RETURN_IF_ERROR(status_);
   if (page_ || phase_ != Phase::kRecords || done_)
     return absl::FailedPreconditionError("RDB Stream page is not drained");
   for (const auto& row : page.elements_) {
     auto key = storage::StreamRecordKey(row);
-    if (!key.ok()) return key.status();
+    LAVIK_RETURN_IF_ERROR(key.status());
     if (key->size() > (SIZE_MAX - 1024) / 12)
       return absl::ResourceExhaustedError("RDB Stream validator size overflow");
     const auto bytes = key->size() * 12 + 1024;
@@ -3175,12 +3149,10 @@ absl::Status StreamFileEncoder::StartPage(const storage::CollectionPage& page) {
         state_charge_.Account(CurrentMemoryAccountingShard(), 0);
       state_charge_.Resize(bytes);
     }
-    auto valid = validator_.Read(row);
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(validator_.Read(row));
   }
   if (page.done_) {
-    auto valid = validator_.Finish();
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(validator_.Finish());
   }
   page_ = &page;
   entry_ = 0;
@@ -3220,17 +3192,15 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
   };
   for (;;) {
     if (phase_ == Phase::kConsumerCount) {
-      auto status = consumers_->Finish();
-      if (!status.ok()) return status;
-      status = OutputBudget(32);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(consumers_->Finish());
+      LAVIK_RETURN_IF_ERROR(OutputBudget(32));
       WriteLength(&output_, consumer_count_);
       phase_ = Phase::kConsumers;
       return std::optional<std::string_view>(output_);
     }
     if (phase_ == Phase::kConsumers) {
       auto row = consumers_->Next();
-      if (!row.ok()) return row.status();
+      LAVIK_RETURN_IF_ERROR(row.status());
       if (!*row) {
         if (consumer_count_ != 0)
           return Bad("incomplete Stream consumer output");
@@ -3243,7 +3213,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
       const auto& record = **row;
       if (record.value_.empty()) return Bad("invalid Stream consumer output");
       auto status = OutputBudget(record.value_.size());
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       if (record.value_[0] == '\0') {
         if (consumer_count_ == 0 || record.key_.empty() ||
             record.key_.back() != '\0')
@@ -3257,7 +3227,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
         consumer_prefix_ = record.key_;
         consumer_prefix_.back() = '\1';
         auto count = consumers_->CountPrefix(consumer_prefix_);
-        if (!count.ok()) return count.status();
+        LAVIK_RETURN_IF_ERROR(count.status());
         output_.assign(record.value_, 1, std::string::npos);
         WriteLength(&output_, *count);
       } else {
@@ -3277,10 +3247,10 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
     const auto& record = page_->elements_[entry_++];
     auto key = storage::StreamRecordKey(record),
          payload = storage::StreamRecordPayload(record);
-    if (!key.ok()) return key.status();
-    if (!payload.ok()) return payload.status();
+    LAVIK_RETURN_IF_ERROR(key.status());
+    LAVIK_RETURN_IF_ERROR(payload.status());
     auto status = OutputBudget(record.size());
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     Reader in(*payload);
     const auto kind = static_cast<unsigned char>((*key)[0]);
     if (kind == 0) {
@@ -3298,7 +3268,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
       entry.fields.reserve(fields);
       for (std::uint32_t i = 0; i < fields; ++i) {
         auto field = raw_string(in);
-        if (!field.ok()) return field.status();
+        LAVIK_RETURN_IF_ERROR(field.status());
         entry.fields.push_back(std::move(*field));
       }
       if (!in.done()) return Bad("trailing Stream output entry");
@@ -3344,7 +3314,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
       if (consumers_) return Bad("previous Stream group not drained");
       consumers_ = std::make_unique<RecordSpool>();
       auto name = raw_string(in);
-      if (!name.ok()) return name.status();
+      LAVIK_RETURN_IF_ERROR(name.status());
       std::uint64_t ms = 0, seq = 0, read = 0;
       std::uint32_t count = 0;
       if (!in.Le64(&ms) || !in.Le64(&seq) || !in.Le64(&read) ||
@@ -3360,7 +3330,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
     if (!consumers_) return Bad("missing Stream output group");
     if (subtype == 1) {
       auto name = raw_string(in);
-      if (!name.ok()) return name.status();
+      LAVIK_RETURN_IF_ERROR(name.status());
       std::uint64_t seen = 0, active = 0;
       if (!in.Le64(&seen) || !in.Le64(&active))
         return Bad("invalid Stream consumer output");
@@ -3369,7 +3339,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
       PutLe64(&output_, seen);
       PutLe64(&output_, active);
       status = consumers_->Add(name_key(*name) + '\0', output_);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       output_.clear();
       continue;
     }
@@ -3388,14 +3358,14 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
     if (!in.Le64(&id.ms) || !in.Le64(&id.seq))
       return Bad("invalid Stream pending ID");
     auto owner = raw_string(in);
-    if (!owner.ok()) return owner.status();
+    LAVIK_RETURN_IF_ERROR(owner.status());
     if (!in.Le64(&delivery) || !in.Le64(&count))
       return Bad("invalid Stream pending state");
     PutBe64(&output_, id.ms);
     PutBe64(&output_, id.seq);
     status = consumers_->Add(name_key(*owner) + '\1' + output_,
                              std::string(1, '\1') + output_);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     PutLe64(&output_, delivery);
     WriteLength(&output_, count);
     if (--pending_ == 0) phase_ = Phase::kConsumerCount;
@@ -3404,7 +3374,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
 }
 
 absl::Status StreamFileEncoder::Finish() const {
-  if (!status_.ok()) return status_;
+  LAVIK_RETURN_IF_ERROR(status_);
   if (!done_ || page_ || phase_ != Phase::kRecords || consumers_ ||
       messages_ != expected_)
     return absl::FailedPreconditionError("incomplete RDB Stream output");

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/grouped/sorted_rewrite.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
@@ -26,14 +27,14 @@ absl::StatusOr<OrderedCollectionMutationPlan> PrepareOrderedGroups(
     std::string_view encoded, std::uint64_t count,
     OrderedCollectionKind collection_kind = OrderedCollectionKind::kSortedSet) {
   auto entries = DecodeOrderedCompactValue(collection_kind, encoded, count);
-  if (!entries.ok()) return entries.status();
+  LAVIK_RETURN_IF_ERROR(entries.status());
   const auto record_count = entries->size();
   OrderedGroupSnapshot initial{.kind_ = collection_kind,
                                .incarnation_ = 1,
                                .id_ = 1,
                                .entries_ = std::move(*entries)};
   auto split = SplitOrderedGroup(std::move(initial), 2);
-  if (!split.ok()) return split.status();
+  LAVIK_RETURN_IF_ERROR(split.status());
   return OrderedCollectionMutationPlan{
       .root_ = {.kind_ = collection_kind,
                 .incarnation_ = 1,
@@ -109,9 +110,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) co_return resolved.status();
-    found = *resolved;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        found, co_await FindVerifiedEntry(store, index, digest, key));
   }
 
   const bool stored_value =
@@ -124,7 +124,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     // A tentative failed root must not hide behind its uncommitted TTL in
     // whole-value callbacks either.
     const auto readable = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    if (!readable.ok()) co_return readable.status();
+    LAVIK_CO_RETURN_IF_ERROR(readable.status());
   }
   if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
@@ -159,14 +159,15 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     write_snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
   GroupedObject::Handle grouped;
   if (exists && location.grouped()) {
-    auto object = partition.grouped_objects_[db_id].Lookup(
-        key, GroupedObjectVersion{
-                 .root_ = location,
-                 .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
-                 .replication_epoch_ = observed_replication_epoch,
-                 .index_generation_ = partition.grouped_generations_[db_id]});
-    if (!object.ok()) co_return object.status();
-    grouped = std::move(*object);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        grouped,
+        partition.grouped_objects_[db_id].Lookup(
+            key,
+            GroupedObjectVersion{
+                .root_ = location,
+                .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+                .replication_epoch_ = observed_replication_epoch,
+                .index_generation_ = partition.grouped_generations_[db_id]}));
   }
   if (access.metadata_only_) {
     if (!read_only)
@@ -177,7 +178,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                                   .logical_size_ = location.logical_size_,
                                   .expire_at_ms_ = location.expire_at_ms_};
     auto update = callback(metadata);
-    if (!update.ok()) co_return update.status();
+    LAVIK_CO_RETURN_IF_ERROR(update.status());
     if (update->changed_)
       co_return absl::InvalidArgumentError("metadata callback mutated");
     co_return absl::OkStatus();
@@ -274,12 +275,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         const auto* entry = grouped->FindGroup(id);
         if (!entry)
           co_return absl::DataLossError("missing Sorted Set callback page");
-        auto admitted = budget.AddGroup(*entry, grouped->ExtentsFor(id));
-        if (!admitted.ok()) co_return admitted;
+        LAVIK_CO_RETURN_IF_ERROR(
+            budget.AddGroup(*entry, grouped->ExtentsFor(id)));
       }
     } else {
-      auto admitted = budget.AddGroup(found->value_, extents);
-      if (!admitted.ok()) co_return admitted;
+      LAVIK_CO_RETURN_IF_ERROR(budget.AddGroup(found->value_, extents));
     }
     // The loader's scratch ends when it returns the encoded read buffer.
     // Legacy callbacks then decode, mutate and encode again; grouped writes
@@ -287,7 +287,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     // Keep conservative headroom through publication, not just through load.
     // Replies with multiplicity (ZRANDMEMBER) admit their separate output.
     auto admitted = budget.Reserve(6);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     callback_admission.emplace(std::move(*admitted));
   }
   std::optional<LoadedValue> loaded;
@@ -306,8 +306,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     }
   });
   LAVIK_FAULT_INJECT(if (unlocked_compact_write) {
-    auto paused = co_await PauseCompactWriteForTest(*store.worker_, key);
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await PauseCompactWriteForTest(*store.worker_, key));
   });
   if (exists) {
     auto value = co_await LoadValue(store, partition, db_id, key, digest,
@@ -327,7 +327,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   }
 
   auto update = callback(view);
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   // A missing key may be created directly as a large graph. Keep both
   // indexes private/admitted until absence and population are revalidated;
   // the commit adapter stamps their placeholder incarnations together.
@@ -337,34 +337,30 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   if (unlocked_create && update->changed_ && !update->erase_ &&
       update->encoded_.size() >= kCollectionPromotionBytes) {
     GroupedScratchBudget budget;
-    auto added = budget.AddBytes(update->encoded_.size());
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(update->encoded_.size()));
     if (update->logical_size_ > std::numeric_limits<std::size_t>::max() / 256)
       co_return absl::ResourceExhaustedError(
           "Sorted Set creation count overflow");
-    added = budget.AddBytes(update->logical_size_ * 256);
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(update->logical_size_ * 256));
     auto admitted = budget.Reserve(1);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     create_admission.emplace(std::move(*admitted));
     auto plan = PrepareOrderedGroups(update->encoded_, update->logical_size_);
-    if (!plan.ok()) co_return plan.status();
+    LAVIK_CO_RETURN_IF_ERROR(plan.status());
     created_groups.emplace(std::move(*plan));
     LAVIK_FAULT_INJECT({
-      const auto paused = co_await PauseGroupedWriteForTest(*store.worker_, key,
-                                                            "create-members");
-      if (!paused.ok()) co_return paused;
+      LAVIK_CO_RETURN_IF_ERROR(co_await PauseGroupedWriteForTest(
+          *store.worker_, key, "create-members"));
     });
-    auto members = co_await PrepareSortedSetMembers(
-        store, partition, db_id, key, digest, nullptr, *created_groups, true);
-    if (!members.ok()) co_return members.status();
-    created_members = std::move(*members);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        created_members,
+        co_await PrepareSortedSetMembers(store, partition, db_id, key, digest,
+                                         nullptr, *created_groups, true));
   }
   if (unlocked_compact_write || unlocked_create) {
     LAVIK_FAULT_INJECT(if (unlocked_create) {
-      const auto paused =
-          co_await PauseGroupedWriteForTest(*store.worker_, key, "create");
-      if (!paused.ok()) co_return paused;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await PauseGroupedWriteForTest(*store.worker_, key, "create"));
     });
     co_await store.store_state_mutex_.Lock();
     unlock.Adopt();
@@ -372,9 +368,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     if (unlocked_create) {
       auto* current = index.Find(digest, key);
       if (current != nullptr && !current->key_complete()) {
-        auto verified = co_await FindVerifiedEntry(store, index, digest, key);
-        if (!verified.ok()) co_return verified.status();
-        current = *verified;
+        LAVIK_ASSIGN_OR_CO_RETURN(
+            current, co_await FindVerifiedEntry(store, index, digest, key));
       }
       valid = ValidateCollectionCreateSnapshot(store, partition, db_id, current,
                                                now_ms, *write_snapshot,
@@ -383,7 +378,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       valid = ValidateCompactWriteSnapshot(store, partition, db_id, key, digest,
                                            location, *write_snapshot);
     }
-    if (!valid.ok()) co_return valid;
+    LAVIK_CO_RETURN_IF_ERROR(valid);
     // Validate even a no-op before returning success. Never retry this
     // callback: it already populated the typed command's private result.
     // Command DB admission remains held through AppendLocked's later waits;
@@ -444,20 +439,17 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     if (grouped == nullptr) {
       if (value_type == ValueType::kStream) {
         GroupedScratchBudget budget;
-        auto added = budget.AddBytes(encoded.size());
-        if (!added.ok()) co_return added;
+        LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(encoded.size()));
         auto admitted = budget.Reserve(6);
-        if (!admitted.ok()) co_return admitted.status();
+        LAVIK_CO_RETURN_IF_ERROR(admitted.status());
         stream_promotion_admission.emplace(std::move(*admitted));
       }
-      auto created =
-          PrepareOrderedGroups(encoded, logical_size, collection_kind);
-      if (!created.ok()) co_return created.status();
-      plan = std::move(*created);
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          plan, PrepareOrderedGroups(encoded, logical_size, collection_kind));
     } else {
       auto after =
           DecodeOrderedCompactValue(collection_kind, encoded, logical_size);
-      if (!after.ok()) co_return after.status();
+      LAVIK_CO_RETURN_IF_ERROR(after.status());
       if (!grouped->is_ordered() ||
           grouped->ordered_directory().root().kind_ != collection_kind ||
           !view.has_value()) {
@@ -465,15 +457,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       }
       auto before = DecodeOrderedCompactValue(collection_kind, view->encoded_,
                                               location.logical_size_);
-      if (!before.ok()) co_return before.status();
+      LAVIK_CO_RETURN_IF_ERROR(before.status());
       const auto& directory = grouped->ordered_directory();
       // Legacy collection callbacks still compute a complete logical
       // result. Route it against old page boundaries so a score moving across
       // the entire set does not rewrite the unaffected intervening pages.
-      auto mutation =
-          PlanSortedSetRewrite(directory, *before, std::move(*after));
-      if (!mutation.ok()) co_return mutation.status();
-      plan = std::move(*mutation);
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          plan, PlanSortedSetRewrite(directory, *before, std::move(*after)));
       if (value_type == ValueType::kStream)
         plan.root_.stream_length_ = logical_size;
       if (!plan.changed_) {

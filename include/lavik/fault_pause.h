@@ -17,6 +17,7 @@
 #pragma once
 
 #include "lavik/fault_injection.h"
+#include "lavik/status_macros.h"
 
 #if LAVIK_FAULTS_ENABLED
 #include <unistd.h>
@@ -43,9 +44,8 @@ inline bycorf::Task<absl::Status> PauseWhileFileExists(const char* variable) {
     if (std::chrono::steady_clock::now() >= deadline) {
       co_return absl::DeadlineExceededError("fault pause was not released");
     }
-    auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }

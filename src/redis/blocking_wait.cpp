@@ -44,6 +44,7 @@
 #include "lavik/cluster/runtime.h"
 #include "lavik/metrics.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/engine.h"
 
 namespace lavik {
@@ -513,13 +514,12 @@ Task<absl::Status> TimeoutBlockingWaiter(
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) break;
-    absl::Status slept = co_await bycorf::SleepFor(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
         *bycorf::ThisWorker().self_,
         std::min(
             deadline - now,
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                kCancellationGranularity)));
-    if (!slept.ok()) co_return slept;
+                kCancellationGranularity))));
   }
   waiter->SignalTimeout();
   co_return absl::OkStatus();
@@ -806,9 +806,8 @@ Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>> RegisterBlockingWait(
   if (impl->registrations_.empty()) {
     co_return absl::InvalidArgumentError("blocking wait has no keys");
   }
-  absl::Status registered =
-      co_await RegisterBlockingWaiter(impl->waiter_, impl->registrations_);
-  if (!registered.ok()) co_return registered;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await RegisterBlockingWaiter(impl->waiter_, impl->registrations_));
   RegisterBlockedClient(impl->client_id_, impl->waiter_);
   RecordClientBlocked();
   if (deadline.has_value()) {

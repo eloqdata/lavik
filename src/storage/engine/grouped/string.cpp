@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -126,18 +127,19 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   auto resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
-  if (!resolved.ok()) co_return resolved.status();
+  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
   auto* found = *resolved;
   GroupedObject::Handle grouped;
   if (found && found->value_.grouped()) {
-    auto object = partition.grouped_objects_[db_id].Lookup(
-        key, GroupedObjectVersion{
-                 .root_ = MaterializeIndexLocation(*found),
-                 .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
-                 .replication_epoch_ = partition.replication_epoch_,
-                 .index_generation_ = partition.grouped_generations_[db_id]});
-    if (!object.ok()) co_return object.status();
-    grouped = std::move(*object);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        grouped,
+        partition.grouped_objects_[db_id].Lookup(
+            key,
+            GroupedObjectVersion{
+                .root_ = MaterializeIndexLocation(*found),
+                .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+                .replication_epoch_ = partition.replication_epoch_,
+                .index_generation_ = partition.grouped_generations_[db_id]}));
   }
   const bool exists = found && found->value_.kind() == RecordKind::kValue &&
                       !IsExpiredNow(*found);
@@ -178,10 +180,9 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     co_return absl::OutOfRangeError(
         "string exceeds maximum allowed size (proto-max-bulk-len)");
   if (grouped && operation.kind_ == Kind::kAppend && count == 0) {
-    const auto status = co_await UpdateGroupedExpirationLocked(
+    LAVIK_CO_RETURN_IF_ERROR(co_await UpdateGroupedExpirationLocked(
         store, partition, db_id, key, digest, grouped, location.expire_at_ms_,
-        tx, replication, mutation_precondition);
-    if (!status.ok()) co_return status;
+        tx, replication, mutation_precondition));
     result.changed_ = true;
     co_return result;
   }
@@ -225,7 +226,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     if (exists) {
       auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                        location, ExtentsFor(store, found));
-      if (!loaded.ok()) co_return loaded.status();
+      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
       auto data = loaded->value();
       bytes.assign(reinterpret_cast<const char*>(data.data()), data.size());
     }
@@ -235,12 +236,11 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
         result.bit_ == operation.bit_)
       co_return result;
     if (!read_only) {
-      const auto status = co_await AppendLocked(
+      LAVIK_CO_RETURN_IF_ERROR(co_await AppendLocked(
           store, partition, db_id, key, digest, bytes, RecordKind::kValue,
           ValueType::kString, exists ? location.expire_at_ms_ : 0, tx,
           bytes.size(), nullptr, nullptr, replication, true, nullptr,
-          mutation_precondition);
-      if (!status.ok()) co_return status;
+          mutation_precondition));
     }
   } else {
     OrderedCollectionMutationPlan plan{
@@ -260,7 +260,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       if (id <= grouped->group_count()) {
         auto loaded = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, grouped, id);
-        if (!loaded.ok()) co_return loaded.status();
+        LAVIK_CO_RETURN_IF_ERROR(loaded.status());
         bytes = std::move(loaded->snapshot_.entries_.front().value_);
       }
       if (!read_only)
@@ -275,10 +275,9 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
         plan.writes_.push_back(StringPage(plan.root_, id, std::move(bytes)));
     }
     if (!read_only) {
-      const auto status = co_await CommitGroupedOrderedMutationLocked(
+      LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, grouped, std::move(plan),
-          location.expire_at_ms_, tx, replication, mutation_precondition);
-      if (!status.ok()) co_return status;
+          location.expire_at_ms_, tx, replication, mutation_precondition));
     }
   }
   result.length_ = new_size;

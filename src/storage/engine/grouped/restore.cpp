@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -96,7 +97,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     root.revision_ = revision;
     auto rebuilt =
         previous->ordered_directory().Apply(root, revision, {}, sequence);
-    if (!rebuilt.ok()) co_return rebuilt.status();
+    LAVIK_CO_RETURN_IF_ERROR(rebuilt.status());
     ordered_directory.emplace(std::move(*rebuilt));
     payload = EncodeOrderedCollectionRoot(root);
   } else {
@@ -116,11 +117,11 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
     for (const auto& [id, record] : previous->directory().retired_groups())
       append(record);
     auto rebuilt = HashGroupDirectory::Recover(root, sequence, candidates, {});
-    if (!rebuilt.ok()) co_return rebuilt.status();
+    LAVIK_CO_RETURN_IF_ERROR(rebuilt.status());
     hash_directory.emplace(std::move(*rebuilt));
     payload = EncodeGroupedHashRoot(root);
   }
-  if (!payload.ok()) co_return payload.status();
+  LAVIK_CO_RETURN_IF_ERROR(payload.status());
   std::vector<GroupedRecordId> changed;
   changed.reserve(replaced_count);
   if (replaced_count != 0) {
@@ -130,9 +131,9 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
                                 bool) { changed.push_back(id); });
   }
   auto decision = PrepareGroupedDecision(*compensation);
-  if (!decision.ok()) co_return decision.status();
+  LAVIK_CO_RETURN_IF_ERROR(decision.status());
   auto reserved = side.PreparePublish(key, replaced);
-  if (!reserved.ok()) co_return reserved.status();
+  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   GroupedObject::PreparedHandle builder;
@@ -154,16 +155,15 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
         // The original journal retains the old physical pages and their
         // pins. Share them directly; neither group payloads nor extent
         // values are read or rewritten as part of this compensation.
-        auto prepared = previous->is_ordered()
-                            ? GroupedObject::PrepareUpdateOrdered(
-                                  previous, version, *ordered_directory, {})
-                            : GroupedObject::PrepareUpdate(previous, version,
-                                                           *hash_directory, {});
-        if (!prepared.ok()) return prepared.status();
-        builder = std::move(*prepared);
+        LAVIK_ASSIGN_OR_RETURN(
+            builder, previous->is_ordered()
+                         ? GroupedObject::PrepareUpdateOrdered(
+                               previous, version, *ordered_directory, {})
+                         : GroupedObject::PrepareUpdate(previous, version,
+                                                        *hash_directory, {}));
         publication.reset();
         auto refreshed = side.PreparePublish(key, current);
-        if (!refreshed.ok()) return refreshed.status();
+        LAVIK_RETURN_IF_ERROR(refreshed.status());
         publication.emplace(std::move(*refreshed));
         return absl::OkStatus();
       },

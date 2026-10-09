@@ -36,6 +36,7 @@
 #include "lavik/client_endpoint.h"
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -1321,9 +1322,8 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   // ValidateProposal plugins run leader-locally. The first rejection aborts
   // the proposal before anything is encoded or appended.
   for (const MetaValidateHook& hook : hooks_) {
-    const absl::Status status =
-        hook(command, view, observations_, proposal_now_unix_ms);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(
+        hook(command, view, observations_, proposal_now_unix_ms));
   }
 
   // Actor injection: the trusted entry's principal plus a
@@ -1337,7 +1337,7 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
       command);
 
   auto encoded = MetaStateMachine::EncodeCommand(command);
-  if (!encoded.ok()) co_return encoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
 
   auto waiter = std::make_shared<ProposeWaiter>();
   waiter->foreign_executor_ = options_.foreign_executor_;
@@ -1346,7 +1346,7 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   waiter->recovery_reservation_ = std::move(recovery_reservation);
   std::vector<std::shared_ptr<MetaRaftBuffer>> logs;
   logs.push_back(*encoded);
-  const absl::Status submitted =
+  LAVIK_CO_RETURN_IF_ERROR(
       proposal_executor_->Submit([server = server_, logs = std::move(logs),
                                   waiter, proposal_term]() mutable {
         try {
@@ -1365,8 +1365,7 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
         } catch (const std::logic_error&) {
           FailProposeDispatch(waiter);
         }
-      });
-  if (!submitted.ok()) co_return submitted;
+      }));
   // The seam's own round-trip bound (Raft results have no
   // client-side timeout). It includes executor queueing time and first-wins
   // against the raft completion.

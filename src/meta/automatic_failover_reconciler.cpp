@@ -47,6 +47,7 @@
 #include "lavik/meta/hash.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/policy_store.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -447,7 +448,7 @@ MetaAutomaticFailoverReason CommandReason(
 absl::StatusOr<MetaRequestId> NextId(
     const MetaAutomaticFailoverReconcilerOptions& options) {
   auto id = options.next_id_();
-  if (!id.ok()) return id.status();
+  LAVIK_RETURN_IF_ERROR(id.status());
   if (IsZero(*id)) {
     return absl::FailedPreconditionError(
         "automatic failover generated a zero identity");
@@ -541,9 +542,8 @@ bycorf::Task<absl::Status> TestPause(
   constexpr auto kSlice = std::chrono::milliseconds(25);
   while (!core->cancelled_ && delay > std::chrono::milliseconds::zero()) {
     const auto slice = std::min(delay, kSlice);
-    const auto slept =
-        co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice);
-    if (!slept.ok()) co_return slept;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, slice));
     delay -= slice;
   }
   co_return absl::OkStatus();
@@ -634,7 +634,7 @@ absl::Status ValidateAutomaticProposal(
       DetectionFacts(*group), *automatic, *lease, runtime, observations,
       core->options_.now_steady_ms_(), core->options_.observation_ttl_ms_,
       /*warmup_complete=*/true);
-  if (!input.ok()) return input.status();
+  LAVIK_RETURN_IF_ERROR(input.status());
   // The command records the exact reason observed at the threshold edge, but
   // moving between exact failure reasons does not interrupt unserviceability.
   // Requiring equality here would discard a completed debounce interval just

@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
@@ -45,8 +46,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
   const auto root_identity = object->directory().root();
   const auto incarnation = root_identity.incarnation_;
   for (;;) {
-    const auto readable = object->ReadStatus();
-    if (!readable.ok()) co_return readable;
+    LAVIK_CO_RETURN_IF_ERROR(object->ReadStatus());
     if (EffectiveRecordDbEpoch(partition, db_id) != original.db_epoch_ ||
         partition.replication_epoch_ != original.replication_epoch_ ||
         partition.grouped_generations_[db_id] != original.index_generation_) {
@@ -58,7 +58,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
       // fails: otherwise a reused block could lend an old entry a new epoch.
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[db_id], digest, key, original.root_);
-      if (!resolved.ok()) co_return resolved.status();
+      LAVIK_CO_RETURN_IF_ERROR(resolved.status());
       if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
           (*resolved)->value_.mutation_sequence_ !=
               original.root_.mutation_sequence_) {
@@ -71,7 +71,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
                    .replication_epoch_ = original.replication_epoch_,
                    .index_generation_ = original.index_generation_,
                });
-      if (!current.ok()) co_return current.status();
+      LAVIK_CO_RETURN_IF_ERROR(current.status());
       if (*current == nullptr ||
           ((*current)->is_ordered() && !(*current)->has_member_index()) ||
           (*current)->directory().root() != root_identity) {
@@ -127,14 +127,13 @@ StorageEngine::Impl::LoadHashGroupPayload(
         partition.grouped_generations_[db_id] != original.index_generation_) {
       co_return absl::NotFoundError("grouped population changed during read");
     }
-    const auto after_io = object->ReadStatus();
-    if (!after_io.ok()) co_return after_io;
+    LAVIK_CO_RETURN_IF_ERROR(object->ReadStatus());
     if (loaded.ok()) {
       const auto bytes = loaded->value();
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
       const auto envelope = DecodeHashGroupMetadata(payload, payload.size());
-      if (!envelope.ok()) co_return envelope.status();
+      LAVIK_CO_RETURN_IF_ERROR(envelope.status());
       // Streaming readers admit a page from its captured physical metadata.
       // Reject corrupt counts before any decoder allocates its vectors.
       if (envelope->incarnation_ != incarnation || envelope->id_ != id ||
@@ -151,7 +150,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
     }
     auto resolved = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                                digest, key);
-    if (!resolved.ok()) co_return resolved.status();
+    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
     if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
         (*resolved)->value_.mutation_sequence_ !=
             original.root_.mutation_sequence_) {
@@ -165,7 +164,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
                  .replication_epoch_ = original.replication_epoch_,
                  .index_generation_ = original.index_generation_,
              });
-    if (!current.ok()) co_return current.status();
+    LAVIK_CO_RETURN_IF_ERROR(current.status());
     if (*current == nullptr ||
         ((*current)->is_ordered() && !(*current)->has_member_index()) ||
         (*current)->directory().root() != root_identity) {
@@ -188,12 +187,12 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
   auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                               digest, object, id, pinned);
-  if (!loaded.ok()) co_return loaded.status();
+  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
   const auto bytes = loaded->loaded_.value();
   const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                  bytes.size());
   auto decoded = DecodeHashGroup(payload);
-  if (!decoded.ok()) co_return decoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(decoded.status());
   for (const auto& field : decoded->value_.entries_) {
     if (!id.ContainsHash(
             ComputeDigest(field.field_, object->directory().root().seed_)
@@ -215,7 +214,7 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
     (void)prefix;
     auto loaded = co_await LoadHashGroupSnapshot(
         store, partition, db_id, key, digest, object, metadata.id_, pinned);
-    if (!loaded.ok()) co_return loaded.status();
+    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
     for (auto& field : loaded->snapshot_.value_.entries_) {
       result.entries_.push_back(std::move(field));
     }
@@ -235,15 +234,15 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
                                       GroupedObject::Handle snapshot) {
   const bool pinned = snapshot != nullptr;
   if (!pinned) {
-    auto found = partition.grouped_objects_[db_id].Lookup(
-        key, GroupedObjectVersion{
-                 .root_ = location,
-                 .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
-                 .replication_epoch_ = partition.replication_epoch_,
-                 .index_generation_ = partition.grouped_generations_[db_id],
-             });
-    if (!found.ok()) co_return found.status();
-    snapshot = std::move(*found);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        snapshot,
+        partition.grouped_objects_[db_id].Lookup(
+            key, GroupedObjectVersion{
+                     .root_ = location,
+                     .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+                     .replication_epoch_ = partition.replication_epoch_,
+                     .index_generation_ = partition.grouped_generations_[db_id],
+                 }));
   } else if (!snapshot->version().root_.SamePhysicalRecord(location)) {
     co_return absl::DataLossError("snapshot grouped root identity mismatch");
   }
@@ -258,36 +257,34 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
   };
   if (snapshot->is_ordered()) {
     for (const auto& metadata : snapshot->ordered_directory().groups()) {
-      const auto admitted = include_group({metadata.id_, 0});
-      if (!admitted.ok()) co_return admitted;
+      LAVIK_CO_RETURN_IF_ERROR(include_group({metadata.id_, 0}));
     }
   } else {
     for (const auto& [prefix, metadata] : snapshot->directory().groups()) {
-      const auto admitted = include_group(metadata.id_);
-      if (!admitted.ok()) co_return admitted;
+      LAVIK_CO_RETURN_IF_ERROR(include_group(metadata.id_));
     }
   }
   // Legacy full-image consumers hold both decoded entries and their encoded
   // image. Reserve before the first page, not after constructing that image.
   // The returned read buffer has its own independent admitted lifetime.
   auto scratch = budget.Reserve(2);
-  if (!scratch.ok()) co_return scratch.status();
+  LAVIK_CO_RETURN_IF_ERROR(scratch.status());
   absl::StatusOr<std::string> encoded;
   if (snapshot != nullptr && snapshot->is_ordered()) {
     auto value = co_await LoadGroupedOrderedValue(store, partition, db_id, key,
                                                   digest, snapshot, pinned);
-    if (!value.ok()) co_return value.status();
+    LAVIK_CO_RETURN_IF_ERROR(value.status());
     encoded = EncodeOrderedCompactValue(
         snapshot->ordered_directory().root().kind_, *value);
   } else {
     auto value = co_await LoadGroupedHashValue(store, partition, db_id, key,
                                                digest, snapshot, pinned);
-    if (!value.ok()) co_return value.status();
+    LAVIK_CO_RETURN_IF_ERROR(value.status());
     encoded = EncodeHashValue(*value);
   }
-  if (!encoded.ok()) co_return encoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
   auto buffer = co_await store.buffers_.AcquireReadBuffer(encoded->size());
-  if (!buffer.ok()) co_return buffer.status();
+  LAVIK_CO_RETURN_IF_ERROR(buffer.status());
   const auto output = buffer->io_buffer();
   if (output.size_ < encoded->size()) {
     co_return absl::ResourceExhaustedError("grouped output buffer too small");

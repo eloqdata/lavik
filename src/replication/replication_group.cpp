@@ -35,6 +35,7 @@
 #include "absl/status/statusor.h"
 #include "lavik/memory.h"
 #include "lavik/population_manifest_format.h"
+#include "lavik/status_macros.h"
 
 namespace lavik {
 namespace {
@@ -187,7 +188,7 @@ absl::StatusOr<PopulationManifest> PopulationManifest::Create(
   }
 
   auto id = HashManifest(entries);
-  if (!id.ok()) return id.status();
+  LAVIK_RETURN_IF_ERROR(id.status());
   std::array<std::uint64_t, kReplicationPartitionCount> logical_epochs{};
   for (const PopulationManifestEntry& entry : entries) {
     logical_epochs[entry.partition_id_] = entry.logical_epoch_;
@@ -240,9 +241,7 @@ class ReplicationGroup::Impl {
       return absl::FailedPreconditionError(
           "replication group is failure-latched for this boot");
     }
-    absl::Status identity_status =
-        ValidateIdentity(directive.identity_, source_less);
-    if (!identity_status.ok()) return identity_status;
+    LAVIK_RETURN_IF_ERROR(ValidateIdentity(directive.identity_, source_less));
     if (local_node_id_.empty() || local_boot_id_.empty()) {
       return absl::FailedPreconditionError(
           "replication group local node identity is invalid");
@@ -344,9 +343,7 @@ class ReplicationGroup::Impl {
   absl::StatusOr<DestructiveResetAuthorization> BeginPopulation(
       const RebuildDirective& directive, const PopulationManifest& manifest,
       bool source_less) {
-    absl::Status validated =
-        ValidatePopulation(directive, manifest, source_less);
-    if (!validated.ok()) return validated;
+    LAVIK_RETURN_IF_ERROR(ValidatePopulation(directive, manifest, source_less));
     if (state_ == ReplicationGroupState::kRebuilding) {
       if (current_directive_.has_value() && *current_directive_ == directive) {
         return DestructiveResetAuthorization(directive.identity_);
@@ -391,8 +388,7 @@ class ReplicationGroup::Impl {
   absl::Status RecordPartitionReset(const RebuildIdentity& identity,
                                     std::uint32_t partition_id,
                                     std::uint64_t target_local_epoch) {
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     if (partition_id >= kReplicationPartitionCount) {
       return absl::InvalidArgumentError(
           "physical reset partition is out of range");
@@ -416,8 +412,7 @@ class ReplicationGroup::Impl {
                                       std::uint32_t partition_id,
                                       std::uint64_t logical_epoch,
                                       std::uint64_t target_local_epoch) {
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     if (partition_id >= kReplicationPartitionCount) {
       return absl::InvalidArgumentError(
           "physical handoff partition is out of range");
@@ -447,8 +442,7 @@ class ReplicationGroup::Impl {
   absl::Status RecordFlowCutVector(
       const RebuildIdentity& identity,
       std::span<const std::uint64_t> stable_next_lsns) {
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     if (current_directive_->flow_count_ == 0) {
       return absl::FailedPreconditionError(
           "empty population has no source flow cut");
@@ -475,15 +469,13 @@ class ReplicationGroup::Impl {
   }
 
   absl::Status MarkFunctionCatalogComplete(const RebuildIdentity& identity) {
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     function_catalog_complete_ = true;
     return absl::OkStatus();
   }
 
   absl::Status MarkStoragePromoted(const RebuildIdentity& identity) {
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     if (!CutProofComplete()) {
       return absl::FailedPreconditionError(
           "storage promotion requires complete manifest, catalog, and flow "
@@ -571,8 +563,7 @@ class ReplicationGroup::Impl {
               "history switch regressed below its population cut");
       }
     }
-    auto validated = ValidateRebuild(child, manifest);
-    if (!validated.ok()) return validated;
+    LAVIK_RETURN_IF_ERROR(ValidateRebuild(child, manifest));
     return CommitHistoryProof(parent, child, required_parent, child_origin);
   }
 
@@ -614,8 +605,7 @@ class ReplicationGroup::Impl {
         }
       }
     }
-    auto validated = ValidateRebuild(source, manifest);
-    if (!validated.ok()) return validated;
+    LAVIK_RETURN_IF_ERROR(ValidateRebuild(source, manifest));
     return CommitHistoryProof(population, source, source_cut, source_cut);
   }
 
@@ -656,8 +646,7 @@ class ReplicationGroup::Impl {
       return absl::FailedPreconditionError(
           "ready population belongs to a different rebuild identity");
     }
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     if (!CutProofComplete() || !storage_promoted_) {
       return absl::FailedPreconditionError(
           "rebuild proof is incomplete and cannot publish readiness");
@@ -673,8 +662,7 @@ class ReplicationGroup::Impl {
       return absl::FailedPreconditionError(
           "replication group is failure-latched for this boot");
     }
-    absl::Status current = ValidateCurrent(identity);
-    if (!current.ok()) return current;
+    LAVIK_RETURN_IF_ERROR(ValidateCurrent(identity));
     DiscardCurrentProof();
     return absl::OkStatus();
   }

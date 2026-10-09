@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -98,25 +99,24 @@ struct StorageEngine::Impl::StreamPageAccess {
     const auto* physical = object_->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream page");
     GroupedScratchBudget budget;
-    auto added = budget.AddGroup(*physical, object_->ExtentsFor(id));
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(
+        budget.AddGroup(*physical, object_->ExtentsFor(id)));
     auto admitted = budget.Reserve(6);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     page_reservations_.emplace(index, std::move(*admitted));
     auto page = co_await engine_.LoadOrderedGroupSnapshot(
         store_, partition_, db_id_, key_, digest_, object_, id.prefix_);
-    if (!page.ok()) co_return page.status();
+    LAVIK_CO_RETURN_IF_ERROR(page.status());
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
-    if (!max_key.ok()) co_return max_key.status();
-    auto remembered =
-        object_->ordered_directory().RememberStreamPageMaxKey(index, *max_key);
-    if (!remembered.ok()) co_return remembered;
+    LAVIK_CO_RETURN_IF_ERROR(max_key.status());
+    LAVIK_CO_RETURN_IF_ERROR(
+        object_->ordered_directory().RememberStreamPageMaxKey(index, *max_key));
     if (index == 0) {
       auto header =
           StreamRecordPayload(page->snapshot_.entries_.front().value_);
-      if (!header.ok()) co_return header.status();
-      remembered = object_->ordered_directory().RememberStreamHeader(*header);
-      if (!remembered.ok()) co_return remembered;
+      LAVIK_CO_RETURN_IF_ERROR(header.status());
+      LAVIK_CO_RETURN_IF_ERROR(
+          object_->ordered_directory().RememberStreamHeader(*header));
     }
     pages_.emplace(index, std::move(*page));
     co_return absl::OkStatus();
@@ -131,10 +131,10 @@ struct StorageEngine::Impl::StreamPageAccess {
                       .stream_max_key_.LessThan(wanted);
       if (!less) {
         auto status = co_await Load(middle);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(status);
         auto bound =
             StreamRecordKey(pages_.at(middle).snapshot_.entries_.back().value_);
-        if (!bound.ok()) co_return bound.status();
+        LAVIK_CO_RETURN_IF_ERROR(bound.status());
         less = *bound < wanted;
       }
       if (*less)
@@ -147,12 +147,12 @@ struct StorageEngine::Impl::StreamPageAccess {
   Task<absl::StatusOr<std::optional<std::string>>> Find(
       std::string_view wanted) {
     auto index = co_await Route(wanted);
-    if (!index.ok()) co_return index.status();
+    LAVIK_CO_RETURN_IF_ERROR(index.status());
     auto status = co_await Load(*index);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     for (const auto& entry : pages_.at(*index).snapshot_.entries_) {
       auto key = StreamRecordKey(entry.value_);
-      if (!key.ok()) co_return key.status();
+      LAVIK_CO_RETURN_IF_ERROR(key.status());
       if (*key == wanted) co_return std::optional(entry.value_);
     }
     co_return std::nullopt;
@@ -162,14 +162,14 @@ struct StorageEngine::Impl::StreamPageAccess {
   Task<absl::StatusOr<std::optional<std::string>>> Previous(
       std::string_view wanted) {
     auto index = co_await Route(wanted);
-    if (!index.ok()) co_return index.status();
+    LAVIK_CO_RETURN_IF_ERROR(index.status());
     for (;;) {
       auto status = co_await Load(*index);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       const auto& entries = pages_.at(*index).snapshot_.entries_;
       for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         auto key = StreamRecordKey(it->value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key <= wanted) co_return std::optional(it->value_);
       }
       if (*index == 0) co_return std::nullopt;
@@ -178,7 +178,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   }
   Task<absl::StatusOr<std::string>> Required(std::string_view wanted) {
     auto record = co_await Find(wanted);
-    if (!record.ok()) co_return record.status();
+    LAVIK_CO_RETURN_IF_ERROR(record.status());
     if (!*record)
       co_return absl::DataLossError("missing Stream metadata record");
     co_return std::move(**record);
@@ -190,14 +190,14 @@ struct StorageEngine::Impl::StreamPageAccess {
     std::vector<std::string> result;
     if (count == 0) co_return result;
     auto first = co_await Route(low);
-    if (!first.ok()) co_return first.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
     for (auto index = *first;
          index < object_->ordered_directory().groups().size(); ++index) {
       auto status = co_await Load(index);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       for (const auto& entry : pages_.at(index).snapshot_.entries_) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key >= high) co_return result;
         if (*key < low || (exclusive && *key == low)) continue;
         result.push_back(entry.value_);
@@ -211,23 +211,23 @@ struct StorageEngine::Impl::StreamPageAccess {
       std::string_view low, std::string_view high,
       const std::function<absl::Status(std::string_view)>& visitor) {
     auto first = co_await Route(low);
-    if (!first.ok()) co_return first.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
     for (auto i = *first; i < object_->ordered_directory().groups().size();
          ++i) {
       const bool cached = pages_.contains(i);
       auto status = co_await Load(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       bool done = false;
       for (const auto& entry : pages_.at(i).snapshot_.entries_) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key >= high) {
           done = true;
           break;
         }
         if (*key < low) continue;
         status = visitor(entry.value_);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(status);
       }
       if (!cached) {
         pages_.erase(i);
@@ -246,16 +246,16 @@ struct StorageEngine::Impl::StreamPageAccess {
     const auto low = IdKey(std::string(prefix) + '\3', range.first_);
     const auto high = IdKey(std::string(prefix) + '\3', range.last_);
     auto first = co_await Route(low);
-    if (!first.ok()) co_return first.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
     for (auto i = *first; i < object_->ordered_directory().groups().size();
          ++i) {
       const bool cached = pages_.contains(i);
       auto status = co_await Load(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       const auto before = result.size();
       for (const auto& entry : pages_.at(i).snapshot_.entries_) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key > high || (range.last_exclusive_ && *key == high))
           co_return result;
         if (*key < low || (range.first_exclusive_ && *key == low)) continue;
@@ -291,8 +291,8 @@ struct StorageEngine::Impl::StreamPageAccess {
                                                  std::string_view high) {
     if (low >= high) co_return 0;
     auto first = co_await Route(low), last = co_await Route(high);
-    if (!first.ok()) co_return first.status();
-    if (!last.ok()) co_return last.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
+    LAVIK_CO_RETURN_IF_ERROR(last.status());
     std::uint64_t count = 0;
     const auto& groups = object_->ordered_directory().groups();
     for (auto i = *first; i <= *last; ++i) {
@@ -301,10 +301,10 @@ struct StorageEngine::Impl::StreamPageAccess {
         continue;
       }
       auto status = co_await Load(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       for (const auto& entry : pages_.at(i).snapshot_.entries_) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key >= low && *key < high) ++count;
       }
     }
@@ -314,8 +314,8 @@ struct StorageEngine::Impl::StreamPageAccess {
                                                           std::string_view high,
                                                           std::uint64_t rank) {
     auto first = co_await Route(low), last = co_await Route(high);
-    if (!first.ok()) co_return first.status();
-    if (!last.ok()) co_return last.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
+    LAVIK_CO_RETURN_IF_ERROR(last.status());
     const auto& groups = object_->ordered_directory().groups();
     for (auto i = *first; i <= *last; ++i) {
       if (i != *first && i != *last && rank >= groups[i].item_count_) {
@@ -323,10 +323,10 @@ struct StorageEngine::Impl::StreamPageAccess {
         continue;
       }
       auto status = co_await Load(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       for (const auto& entry : pages_.at(i).snapshot_.entries_) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key >= low && *key < high) {
           if (rank == 0) co_return std::optional(entry.value_);
           --rank;
@@ -350,8 +350,8 @@ struct StorageEngine::Impl::StreamPageAccess {
                                 std::vector<std::uint64_t>& retired) {
     if (low >= high) co_return absl::OkStatus();
     auto first = co_await Route(low), last = co_await Route(high);
-    if (!first.ok()) co_return first.status();
-    if (!last.ok()) co_return last.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
+    LAVIK_CO_RETURN_IF_ERROR(last.status());
     std::erase_if(changes, [&](const auto& item) {
       return item.key_ >= low && item.key_ < high;
     });
@@ -362,10 +362,10 @@ struct StorageEngine::Impl::StreamPageAccess {
         continue;
       }
       auto status = co_await Load(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       for (const auto& entry : pages_.at(i).snapshot_.entries_) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key >= low && *key < high)
           Change(changes, std::string(*key), std::nullopt);
       }
@@ -380,19 +380,19 @@ struct StorageEngine::Impl::StreamPageAccess {
     std::string high(prefix);
     high.back() = '\1';
     auto first = co_await Route(low), last = co_await Route(high);
-    if (!first.ok()) co_return first.status();
-    if (!last.ok()) co_return last.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
+    LAVIK_CO_RETURN_IF_ERROR(last.status());
     std::uint64_t removed = 0;
     const auto& groups = object_->ordered_directory().groups();
     for (auto i = *first; i <= *last; ++i) {
       const bool cached = pages_.contains(i);
       auto status = co_await Load(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       std::vector<std::string> matches;
       const auto& entries = pages_.at(i).snapshot_.entries_;
       for (const auto& entry : entries) {
         auto key = StreamRecordKey(entry.value_);
-        if (!key.ok()) co_return key.status();
+        LAVIK_CO_RETURN_IF_ERROR(key.status());
         if (*key < low || *key >= high) continue;
         auto payload = StreamRecordPayload(entry.value_);
         if (!payload.ok() || payload->size() < 36 ||
@@ -441,7 +441,7 @@ struct StorageEngine::Impl::StreamPageAccess {
       std::string wanted(entry_key);
       wanted[0] = '\3';
       auto previous = co_await Previous(wanted);
-      if (!previous.ok()) co_return previous.status();
+      LAVIK_CO_RETURN_IF_ERROR(previous.status());
       std::optional<std::string> result;
       if (*previous && (**previous).front() == '\3')
         result = std::move(**previous);
@@ -453,7 +453,7 @@ struct StorageEngine::Impl::StreamPageAccess {
         auto current =
             result ? StreamRecordKey(*result)
                    : absl::StatusOr<std::string_view>(std::string_view{});
-        if (!current.ok()) co_return current.status();
+        LAVIK_CO_RETURN_IF_ERROR(current.status());
         if (!result || change.key_ >= *current) result = *change.record_;
       }
       if (!result) co_return absl::DataLossError("missing Stream trim node");
@@ -463,13 +463,12 @@ struct StorageEngine::Impl::StreamPageAccess {
     if (trim.max_length_) {
       remove = length > *trim.max_length_ ? length - *trim.max_length_ : 0;
     } else {
-      auto count = co_await CountRange(entries_begin,
-                                       IdKey(entries_begin, trim.min_id_));
-      if (!count.ok()) co_return count.status();
-      remove = *count;
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          remove, co_await CountRange(entries_begin,
+                                      IdKey(entries_begin, trim.min_id_)));
       if (appended) {
         auto value = StreamRecordPayload(*appended);
-        if (!value.ok()) co_return value.status();
+        LAVIK_CO_RETURN_IF_ERROR(value.status());
         if (ReadId(*value) < trim.min_id_) ++remove;
       }
     }
@@ -480,26 +479,23 @@ struct StorageEngine::Impl::StreamPageAccess {
     std::optional<std::string> first, node;
     if (remove < length) {
       auto selected = co_await select(remove);
-      if (!selected.ok()) co_return selected.status();
+      LAVIK_CO_RETURN_IF_ERROR(selected.status());
       if (!*selected)
         co_return absl::DataLossError("missing Stream trim boundary");
       first = std::move(**selected);
       auto key = StreamRecordKey(*first);
-      if (!key.ok()) co_return key.status();
-      auto containing = co_await node_at(*key);
-      if (!containing.ok()) co_return containing.status();
-      node = std::move(*containing);
+      LAVIK_CO_RETURN_IF_ERROR(key.status());
+      LAVIK_ASSIGN_OR_CO_RETURN(node, co_await node_at(*key));
       if (trim.approximate_ && remove != 0) {
         auto start = StreamRecordKey(*node);
-        if (!start.ok()) co_return start.status();
+        LAVIK_CO_RETURN_IF_ERROR(start.status());
         std::string boundary(*start);
         boundary[0] = '\1';
         if (boundary != *key) {
-          auto count = co_await CountRange(entries_begin, boundary);
-          if (!count.ok()) co_return count.status();
-          remove = *count;
+          LAVIK_ASSIGN_OR_CO_RETURN(
+              remove, co_await CountRange(entries_begin, boundary));
           selected = co_await select(remove);
-          if (!selected.ok()) co_return selected.status();
+          LAVIK_CO_RETURN_IF_ERROR(selected.status());
           if (!*selected)
             co_return absl::DataLossError("missing Stream node boundary");
           first = std::move(**selected);
@@ -509,7 +505,7 @@ struct StorageEngine::Impl::StreamPageAccess {
     StreamTrimResult result{.removed_ = remove, .length_ = length - remove};
     if (first) {
       auto value = StreamRecordPayload(*first);
-      if (!value.ok()) co_return value.status();
+      LAVIK_CO_RETURN_IF_ERROR(value.status());
       result.first_id_ = ReadId(*value);
     }
     if (remove == 0) co_return result;
@@ -524,9 +520,9 @@ struct StorageEngine::Impl::StreamPageAccess {
       message_boundary = *key;
       node_boundary = *node_key;
       auto count = co_await CountRange(nodes_begin, node_boundary);
-      if (!count.ok()) co_return count.status();
+      LAVIK_CO_RETURN_IF_ERROR(count.status());
       auto all_nodes = co_await Required(entries_end);
-      if (!all_nodes.ok()) co_return all_nodes.status();
+      LAVIK_CO_RETURN_IF_ERROR(all_nodes.status());
       for (const auto& change : changes)
         if (change.key_ == entries_end && change.record_)
           all_nodes = *change.record_;
@@ -537,7 +533,7 @@ struct StorageEngine::Impl::StreamPageAccess {
       std::string old_first(node_boundary);
       old_first[0] = '\1';
       auto preceding = co_await CountRange(entries_begin, old_first);
-      if (!preceding.ok()) co_return preceding.status();
+      LAVIK_CO_RETURN_IF_ERROR(preceding.status());
       const auto within = remove - *preceding;
       if (within >= Count(*node_payload))
         co_return absl::DataLossError("invalid partial Stream trim node");
@@ -551,14 +547,14 @@ struct StorageEngine::Impl::StreamPageAccess {
     }
     auto status =
         co_await EraseRange(entries_begin, message_boundary, changes, retired);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     status = co_await EraseRange(nodes_begin, node_boundary, changes, retired);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     std::string count(4, '\0');
     SetCount(count, 0, remaining_nodes);
     Change(changes, entries_end, Record(entries_end, count));
     auto header = co_await Required(std::string_view("\0", 1));
-    if (!header.ok()) co_return header.status();
+    LAVIK_CO_RETURN_IF_ERROR(header.status());
     for (const auto& change : changes)
       if (change.key_ == std::string_view("\0", 1) && change.record_)
         header = *change.record_;
@@ -577,10 +573,9 @@ struct StorageEngine::Impl::StreamPageAccess {
     const auto& directory = object_->ordered_directory();
     const auto& groups = directory.groups();
     GroupedScratchBudget budget;
-    auto added = budget.AddBytes(groups.size() * 64);
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(groups.size() * 64));
     auto admitted = budget.Reserve(1);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     // Keep the existing conservative routing admission through publication.
     // Sparse plans allocate only affected intervals inside this bound.
     reservations_.push_back(std::move(*admitted));
@@ -603,18 +598,16 @@ struct StorageEngine::Impl::StreamPageAccess {
       for (auto adjacent = *index == 0 ? 0 : *index - 1;
            adjacent < std::min(*index + 2, groups.size()); ++adjacent) {
         if (retired_set.contains(groups[adjacent].id_)) continue;
-        auto status = co_await Load(adjacent);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await Load(adjacent));
       }
     }
     for (auto& change : changes) {
       auto index = co_await Route(change.key_);
-      if (!index.ok()) co_return index.status();
+      LAVIK_CO_RETURN_IF_ERROR(index.status());
       for (auto adjacent = *index == 0 ? 0 : *index - 1;
            adjacent < std::min(*index + 2, groups.size()); ++adjacent) {
         if (retired_set.contains(groups[adjacent].id_)) continue;
-        auto status = co_await Load(adjacent);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await Load(adjacent));
       }
       change.page_id_ = groups[*index].id_;
     }
@@ -644,9 +637,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   auto route = [&](std::string_view wanted) { return cache.Route(wanted); };
   auto find = [&](std::string_view wanted) { return cache.Required(wanted); };
   auto header = co_await find(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto header_payload = StreamRecordPayload(*header);
-  if (!header_payload.ok()) co_return header_payload.status();
+  LAVIK_CO_RETURN_IF_ERROR(header_payload.status());
   if (header_payload->size() != 48 || !header_payload->starts_with("LXS1") ||
       Count(*header_payload, 44) != length)
     co_return absl::DataLossError("Stream length disagrees with root");
@@ -658,30 +651,29 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
                        .logical_size_ = 0,
                        .expire_at_ms_ = object->version().root_.expire_at_ms_,
                        .stream_incremental_trim_ = true});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (!update->changed_) co_return absl::OkStatus();
   if (update->erase_ || update->reuse_encoded_ || update->logical_size_ != 1 ||
       length == UINT32_MAX)
     co_return absl::OutOfRangeError("invalid Stream append result/count");
   GroupedScratchBudget incoming;
-  auto added = incoming.AddBytes(update->encoded_.size());
-  if (!added.ok()) co_return added;
+  LAVIK_CO_RETURN_IF_ERROR(incoming.AddBytes(update->encoded_.size()));
   auto admitted = incoming.Reserve(6);
-  if (!admitted.ok()) co_return admitted.status();
+  LAVIK_CO_RETURN_IF_ERROR(admitted.status());
   auto records = DecodeStreamRecords(update->encoded_, 1);
-  if (!records.ok()) co_return records.status();
+  LAVIK_CO_RETURN_IF_ERROR(records.status());
   // One header, entry, node-count, node and group-count, with no groups. This
   // rejects a callback violating its append-only access contract before
   // write.
   if (records->size() != 5)
     co_return absl::InvalidArgumentError("Stream append changed group state");
   auto new_header = StreamRecordPayload((*records)[0].value_);
-  if (!new_header.ok()) co_return new_header.status();
+  LAVIK_CO_RETURN_IF_ERROR(new_header.status());
   std::string header_bytes(*new_header);
   SetCount(header_bytes, 44, length + 1);
   (*records)[0].value_ = Record(std::string_view("\0", 1), header_bytes);
   auto node_count = co_await find(std::string_view("\2", 1));
-  if (!node_count.ok()) co_return node_count.status();
+  LAVIK_CO_RETURN_IF_ERROR(node_count.status());
   auto node_payload = StreamRecordPayload(*node_count);
   if (!node_payload.ok() || node_payload->size() != 4)
     co_return absl::DataLossError("invalid Stream node count");
@@ -691,15 +683,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   std::optional<std::string> last_node;
   if (nodes != 0) {
     auto index = co_await route(std::string_view("\4", 1));
-    if (!index.ok()) co_return index.status();
-    auto status = co_await load(*index);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(index.status());
+    LAVIK_CO_RETURN_IF_ERROR(co_await load(*index));
     for (const auto& entry : pages.at(*index).snapshot_.entries_) {
       if (entry.value_.front() == '\3') last_node = entry.value_;
     }
     if (!last_node && *index != 0) {
-      status = co_await load(*index - 1);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(co_await load(*index - 1));
       const auto& entry = pages.at(*index - 1).snapshot_.entries_.back();
       if (entry.value_.front() == '\3') last_node = entry.value_;
     }
@@ -724,7 +714,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
     replacements.push_back(Record(std::string_view("\2", 1), count_bytes));
   } else {
     auto tail_key = StreamRecordKey(*last_node);
-    if (!tail_key.ok()) co_return tail_key.status();
+    LAVIK_CO_RETURN_IF_ERROR(tail_key.status());
     std::string count_bytes(4, '\0');
     SetCount(count_bytes, 0, tail_count + 1);
     replacements.push_back(Record(*tail_key, count_bytes));
@@ -732,7 +722,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   std::vector<StreamRecordChange> changes;
   for (auto& replacement : replacements) {
     auto record_key = StreamRecordKey(replacement);
-    if (!record_key.ok()) co_return record_key.status();
+    LAVIK_CO_RETURN_IF_ERROR(record_key.status());
     changes.push_back(
         {.key_ = std::string(*record_key), .record_ = std::move(replacement)});
   }
@@ -741,13 +731,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   if (update->stream_trim_) {
     auto result = co_await cache.Trim(*update->stream_trim_, changes, retired,
                                       final_length);
-    if (!result.ok()) co_return result.status();
+    LAVIK_CO_RETURN_IF_ERROR(result.status());
     final_length = result->length_;
     if (update->stream_trim_complete_) update->stream_trim_complete_(*result);
   }
   auto plan =
       co_await cache.Plan(std::move(changes), final_length, std::move(retired));
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       update->expire_at_ms_.value_or(object->version().root_.expire_at_ms_), tx,
@@ -762,7 +752,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
   auto header = co_await cache.Required(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto payload = StreamRecordPayload(*header);
   const auto length = object->ordered_directory().root().logical_size();
   if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
@@ -772,7 +762,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
   if (length != 0) {
     auto last = co_await cache.Select(std::string_view("\1", 1),
                                       std::string_view("\2", 1), length - 1);
-    if (!last.ok()) co_return last.status();
+    LAVIK_CO_RETURN_IF_ERROR(last.status());
     if (!*last) co_return absl::DataLossError("missing Stream last message");
     auto value = StreamRecordPayload(**last);
     if (!value.ok() || value->size() < 20)
@@ -791,7 +781,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
                        .logical_size_ = length != 0,
                        .expire_at_ms_ = object->version().root_.expire_at_ms_,
                        .stream_length_ = length});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (!update->changed_) co_return absl::OkStatus();
   if (update->erase_ || update->reuse_encoded_ ||
       update->encoded_.size() != partial.size() ||
@@ -804,7 +794,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
   changes.push_back({.key_ = std::string("\0", 1),
                      .record_ = Record(std::string_view("\0", 1), bytes)});
   auto plan = co_await cache.Plan(std::move(changes), length);
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
@@ -823,22 +813,22 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
   auto retain = [&](std::size_t bytes) -> absl::Status {
     GroupedScratchBudget budget;
     auto status = budget.AddBytes(bytes + 128);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     auto reservation = budget.Reserve(6);
-    if (!reservation.ok()) return reservation.status();
+    LAVIK_RETURN_IF_ERROR(reservation.status());
     cache.reservations_.push_back(std::move(*reservation));
     return absl::OkStatus();
   };
   auto header = co_await cache.Required(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto payload = StreamRecordPayload(*header);
   if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
     co_return absl::DataLossError("invalid Stream inspection header");
   std::string partial(*payload);
   auto nodes = co_await cache.Required(std::string_view("\2", 1));
   auto groups = co_await cache.Required(std::string_view("\4", 1));
-  if (!nodes.ok()) co_return nodes.status();
-  if (!groups.ok()) co_return groups.status();
+  LAVIK_CO_RETURN_IF_ERROR(nodes.status());
+  LAVIK_CO_RETURN_IF_ERROR(groups.status());
   auto node_count = StreamRecordPayload(*nodes),
        group_count = StreamRecordPayload(*groups);
   if (!node_count.ok() || !group_count.ok() || node_count->size() != 4 ||
@@ -851,7 +841,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
   if (length != 0) {
     auto first = co_await cache.Select(std::string_view("\1", 1),
                                        std::string_view("\2", 1), 0);
-    if (!first.ok()) co_return first.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
     if (!*first) co_return absl::DataLossError("missing Stream first entry");
     auto value = StreamRecordPayload(**first);
     if (!value.ok() || value->size() < 20)
@@ -862,7 +852,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
       if (length != 1) {
         auto last = co_await cache.Select(
             std::string_view("\1", 1), std::string_view("\2", 1), length - 1);
-        if (!last.ok()) co_return last.status();
+        LAVIK_CO_RETURN_IF_ERROR(last.status());
         if (!*last) co_return absl::DataLossError("missing Stream last entry");
         entries.push_back(std::move(**last));
       }
@@ -875,7 +865,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
   SetCount(partial, 44, entries.size());
   for (const auto& entry : entries) {
     auto value = StreamRecordPayload(entry);
-    if (!value.ok()) co_return value.status();
+    LAVIK_CO_RETURN_IF_ERROR(value.status());
     partial.append(*value);
   }
   auto at = partial.size();
@@ -892,13 +882,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
   while (access.kind_ != Kind::kStream) {
     std::optional<std::string> selected;
     if (single) {
-      auto found = co_await cache.Find(cursor + '\0');
-      if (!found.ok()) co_return found.status();
-      selected = std::move(*found);
+      LAVIK_ASSIGN_OR_CO_RETURN(selected, co_await cache.Find(cursor + '\0'));
     } else {
-      auto found = co_await cache.Select(cursor, std::string_view("\6", 1), 0);
-      if (!found.ok()) co_return found.status();
-      selected = std::move(*found);
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          selected,
+          co_await cache.Select(cursor, std::string_view("\6", 1), 0));
     }
     if (!selected) break;
     auto value = StreamGroupHeaderPayload(*selected);
@@ -909,12 +897,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
     std::string end(prefix);
     end.back() = '\1';
     auto status = retain(value->size());
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     std::string group_header(*value);
     StreamGroupSummary summary{.name_ = name,
                                .consumers_ = Count(*value, value->size() - 4)};
     auto count = co_await cache.Required(prefix + '\2');
-    if (!count.ok()) co_return count.status();
+    LAVIK_CO_RETURN_IF_ERROR(count.status());
     auto count_value = StreamRecordPayload(*count);
     if (!count_value.ok() || count_value->size() != 4)
       co_return absl::DataLossError("invalid Stream inspection PEL count");
@@ -925,13 +913,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
           co_await cache.Visit(prefix + '\1', prefix + '\2',
                                [&](std::string_view record) -> absl::Status {
                                  auto value = StreamRecordPayload(record);
-                                 if (!value.ok()) return value.status();
-                                 auto admitted = retain(value->size());
-                                 if (!admitted.ok()) return admitted;
+                                 LAVIK_RETURN_IF_ERROR(value.status());
+                                 LAVIK_RETURN_IF_ERROR(retain(value->size()));
                                  consumers.emplace_back(*value);
                                  return absl::OkStatus();
                                });
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       if (consumers.size() != summary.consumers_)
         co_return absl::DataLossError(
             "Stream inspection consumer count mismatch");
@@ -947,8 +934,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
                   "invalid Stream inspection pending row");
             std::string owner(value->substr(20, Count(*value, 16)));
             if (!summary.consumer_pending_.contains(owner)) {
-              auto admitted = retain(owner.size());
-              if (!admitted.ok()) return admitted;
+              LAVIK_RETURN_IF_ERROR(retain(owner.size()));
             }
             auto& owner_count = summary.consumer_pending_[owner];
             ++owner_count;
@@ -959,13 +945,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
             if (access.kind_ == Kind::kFull &&
                 (access.count_ == 0 || seen <= access.count_ ||
                  owner_count <= access.count_)) {
-              auto admitted = retain(value->size());
-              if (!admitted.ok()) return admitted;
+              LAVIK_RETURN_IF_ERROR(retain(value->size()));
               pending.emplace_back(*value);
             }
             return absl::OkStatus();
           });
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       if (seen != summary.pending_)
         co_return absl::DataLossError(
             "Stream inspection pending count mismatch");
@@ -990,7 +975,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
                        .stream_length_ = length,
                        .stream_first_id_ = first_id,
                        .stream_inspection_ = &inspection});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (update->changed_)
     co_return absl::InvalidArgumentError("Stream inspection callback mutated");
   co_return absl::OkStatus();
@@ -1004,7 +989,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
   auto header = co_await cache.Required(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto payload = StreamRecordPayload(*header);
   const auto length = object->ordered_directory().root().logical_size();
   if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
@@ -1017,7 +1002,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
                        .logical_size_ = 0,
                        .expire_at_ms_ = object->version().root_.expire_at_ms_,
                        .stream_incremental_trim_ = true});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (!update->changed_) co_return absl::OkStatus();
   if (!update->stream_trim_ || update->erase_ || update->reuse_encoded_ ||
       update->encoded_ != partial)
@@ -1026,12 +1011,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
   std::vector<std::uint64_t> retired;
   auto result =
       co_await cache.Trim(*update->stream_trim_, changes, retired, length);
-  if (!result.ok()) co_return result.status();
+  LAVIK_CO_RETURN_IF_ERROR(result.status());
   if (update->stream_trim_complete_) update->stream_trim_complete_(*result);
   if (result->removed_ == 0) co_return absl::OkStatus();
   auto plan = co_await cache.Plan(std::move(changes), result->length_,
                                   std::move(retired));
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
@@ -1047,7 +1032,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     const MutationPrecondition* mutation_precondition) {
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
   auto header = co_await cache.Required(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto payload = StreamRecordPayload(*header);
   const auto length = object->ordered_directory().root().logical_size();
   if (!payload.ok() || payload->size() != 48 || Count(*payload, 44) != length)
@@ -1061,7 +1046,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
   for (const auto& id : ids) {
     const auto entry_key = IdKey(std::string_view("\1", 1), id);
     auto entry = co_await cache.Find(entry_key);
-    if (!entry.ok()) co_return entry.status();
+    LAVIK_CO_RETURN_IF_ERROR(entry.status());
     if (!*entry) continue;
     auto value = StreamRecordPayload(**entry);
     if (!value.ok() || value->size() < 20)
@@ -1073,7 +1058,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     deleted.insert(entry_key);
     changes.push_back({.key_ = entry_key, .record_ = std::nullopt});
     auto node = co_await cache.Previous(IdKey(std::string_view("\3", 1), id));
-    if (!node.ok()) co_return node.status();
+    LAVIK_CO_RETURN_IF_ERROR(node.status());
     if (!*node || (**node).front() != '\3')
       co_return absl::DataLossError("missing Stream delete node");
     auto node_key = StreamRecordKey(**node);
@@ -1095,7 +1080,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
       CompactValueView{.encoded_ = partial,
                        .logical_size_ = deleted.size(),
                        .expire_at_ms_ = object->version().root_.expire_at_ms_});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (!update->changed_) co_return absl::OkStatus();
   if (deleted.empty() || update->erase_ || update->reuse_encoded_ ||
       update->logical_size_ != 0 || update->encoded_.size() != 56 ||
@@ -1104,7 +1089,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
       update->encoded_.substr(44) != std::string(12, '\0'))
     co_return absl::InvalidArgumentError("invalid partial Stream deletion");
   auto node_count = co_await cache.Required(std::string_view("\2", 1));
-  if (!node_count.ok()) co_return node_count.status();
+  LAVIK_CO_RETURN_IF_ERROR(node_count.status());
   auto count_payload = StreamRecordPayload(*node_count);
   if (!count_payload.ok() || count_payload->size() != 4)
     co_return absl::DataLossError("invalid Stream node count");
@@ -1124,11 +1109,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     if (deleted.contains(first_key)) {
       auto next = co_await cache.Scan(first_key, std::string_view("\2", 1),
                                       deleted.size() + 1, true);
-      if (!next.ok()) co_return next.status();
+      LAVIK_CO_RETURN_IF_ERROR(next.status());
       bool found = false;
       for (const auto& record : *next) {
         auto candidate = StreamRecordKey(record);
-        if (!candidate.ok()) co_return candidate.status();
+        LAVIK_CO_RETURN_IF_ERROR(candidate.status());
         if (deleted.contains(std::string(*candidate))) continue;
         next_key = *candidate;
         next_key[0] = '\3';
@@ -1151,7 +1136,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
   changes.push_back({.key_ = std::string("\0", 1),
                      .record_ = Record(std::string_view("\0", 1), new_header)});
   auto plan = co_await cache.Plan(std::move(changes), length - deleted.size());
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
@@ -1170,7 +1155,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
     co_return absl::DataLossError("invalid Stream ACK view");
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
   auto header = co_await cache.Required(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto payload = StreamRecordPayload(*header);
   if (!payload.ok() || payload->size() != 48)
     co_return absl::DataLossError("invalid Stream ACK header");
@@ -1181,7 +1166,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
   }
   prefix.append("\0\0", 2);
   auto group = co_await cache.Find(prefix + '\0');
-  if (!group.ok()) co_return group.status();
+  LAVIK_CO_RETURN_IF_ERROR(group.status());
   std::string partial(*payload);
   SetCount(partial, 44, 0);
   partial.append(8, '\0');
@@ -1197,7 +1182,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
     SetCount(group_header, group_header.size() - 4, 0);
     partial.append(group_header);
     auto count_record = co_await cache.Required(prefix + '\2');
-    if (!count_record.ok()) co_return count_record.status();
+    LAVIK_CO_RETURN_IF_ERROR(count_record.status());
     auto count_payload = StreamRecordPayload(*count_record);
     if (!count_payload.ok() || count_payload->size() != 4)
       co_return absl::DataLossError("invalid Stream ACK pending count");
@@ -1210,10 +1195,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
         for (unsigned i = 8; i != 0; --i)
           pending_key.push_back(half >> ((i - 1) * 8));
       auto record = co_await cache.Find(pending_key);
-      if (!record.ok()) co_return record.status();
+      LAVIK_CO_RETURN_IF_ERROR(record.status());
       if (!*record) continue;
       auto item = StreamRecordPayload(**record);
-      if (!item.ok()) co_return item.status();
+      LAVIK_CO_RETURN_IF_ERROR(item.status());
       pending.emplace_back(*item);
       changes.push_back(
           {.key_ = std::move(pending_key), .record_ = std::nullopt});
@@ -1231,7 +1216,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
       CompactValueView{.encoded_ = partial,
                        .logical_size_ = 0,
                        .expire_at_ms_ = object->version().root_.expire_at_ms_});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (!update->changed_) co_return absl::OkStatus();
   // The ACK contract can only remove the requested, existing PEL entries.
   // An unexpected callback after-image must never erase unloaded group state.
@@ -1244,7 +1229,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
       {.key_ = prefix + '\2', .record_ = Record(prefix + '\2', count_bytes)});
   auto plan = co_await cache.Plan(
       std::move(changes), object->ordered_directory().root().logical_size());
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
@@ -1263,13 +1248,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     co_return absl::DataLossError("invalid partial Stream group view");
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
   auto header = co_await cache.Required(std::string_view("\0", 1));
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   auto header_payload = StreamRecordPayload(*header);
   if (!header_payload.ok() || header_payload->size() != 48)
     co_return absl::DataLossError("invalid partial Stream header");
   const auto prefix = GroupPrefix(access.group_);
   auto group = co_await cache.Find(prefix + '\0');
-  if (!group.ok()) co_return group.status();
+  LAVIK_CO_RETURN_IF_ERROR(group.status());
   std::uint32_t total_consumers = 0, total_pending = 0;
   std::string original_group, original_count;
   std::vector<std::string> entries, consumers, pending;
@@ -1310,11 +1295,11 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
             });
         if (!status.ok() && !absl::IsOutOfRange(status)) co_return status;
       } else {
-        auto selected = co_await cache.Scan(
-            IdKey(std::string_view("\1", 1), last_id),
-            std::string_view("\2", 1), *access.read_new_count_, true);
-        if (!selected.ok()) co_return selected.status();
-        entries = std::move(*selected);
+        LAVIK_ASSIGN_OR_CO_RETURN(
+            entries,
+            co_await cache.Scan(IdKey(std::string_view("\1", 1), last_id),
+                                std::string_view("\2", 1),
+                                *access.read_new_count_, true));
       }
       for (const auto& entry : entries) {
         auto value = StreamRecordPayload(entry);
@@ -1327,7 +1312,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
                                                  access.entry_ids_.end());
       for (const auto& id : ids) {
         auto entry = co_await cache.Find(IdKey(std::string_view("\1", 1), id));
-        if (!entry.ok()) co_return entry.status();
+        LAVIK_CO_RETURN_IF_ERROR(entry.status());
         if (*entry) entries.push_back(std::move(**entry));
       }
     }
@@ -1337,28 +1322,27 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       const auto consumer_key = ConsumerKey(prefix, name);
       allowed.insert(consumer_key);
       auto consumer = co_await cache.Find(consumer_key);
-      if (!consumer.ok()) co_return consumer.status();
+      LAVIK_CO_RETURN_IF_ERROR(consumer.status());
       if (*consumer) consumers.push_back(std::move(**consumer));
     }
-    auto count = co_await cache.Required(prefix + '\2');
-    if (!count.ok()) co_return count.status();
-    original_count = std::move(*count);
+    LAVIK_ASSIGN_OR_CO_RETURN(original_count,
+                              co_await cache.Required(prefix + '\2'));
     auto count_payload = StreamRecordPayload(original_count);
     if (!count_payload.ok() || count_payload->size() != 4)
       co_return absl::DataLossError("invalid partial Stream PEL count");
     total_pending = Count(*count_payload);
     if (access.pending_scan_) {
       auto selected = co_await cache.ScanPending(prefix, *access.pending_scan_);
-      if (!selected.ok()) co_return selected.status();
+      LAVIK_CO_RETURN_IF_ERROR(selected.status());
       for (const auto& row : *selected) {
         auto payload = StreamRecordPayload(row);
-        if (!payload.ok()) co_return payload.status();
+        LAVIK_CO_RETURN_IF_ERROR(payload.status());
         const auto id = ReadId(*payload);
         pending_ids.insert(id);
         if (access.pending_scan_->load_entries_) {
           auto entry =
               co_await cache.Find(IdKey(std::string_view("\1", 1), id));
-          if (!entry.ok()) co_return entry.status();
+          LAVIK_CO_RETURN_IF_ERROR(entry.status());
           if (*entry) {
             if (access.entry_ids_only_) {
               auto payload = StreamRecordPayload(**entry);
@@ -1399,7 +1383,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       const auto pending_key = IdKey(prefix + '\3', id);
       allowed.insert(pending_key);
       auto item = co_await cache.Find(pending_key);
-      if (!item.ok()) co_return item.status();
+      LAVIK_CO_RETURN_IF_ERROR(item.status());
       if (*item) pending.push_back(std::move(**item));
     }
   }
@@ -1419,15 +1403,14 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       entries.size() + pending_ids.size() + access.consumers_.size() + 4;
   if (names != 0 && copies > SIZE_MAX / names)
     co_return absl::ResourceExhaustedError("Stream PEL owner size overflow");
-  auto incoming_size = incoming_budget.AddBytes(names * copies);
-  if (!incoming_size.ok()) co_return incoming_size;
+  LAVIK_CO_RETURN_IF_ERROR(incoming_budget.AddBytes(names * copies));
   auto incoming_charge = incoming_budget.Reserve(8);
-  if (!incoming_charge.ok()) co_return incoming_charge.status();
+  LAVIK_CO_RETURN_IF_ERROR(incoming_charge.status());
   std::string partial(*header_payload);
   SetCount(partial, 44, entries.size());
   for (const auto& entry : entries) {
     auto payload = StreamRecordPayload(entry);
-    if (!payload.ok()) co_return payload.status();
+    LAVIK_CO_RETURN_IF_ERROR(payload.status());
     partial.append(*payload);
   }
   auto at = partial.size();
@@ -1439,13 +1422,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
   if (*group) {
     SetCount(partial, partial.size() - 4, 1);
     auto payload = StreamRecordPayload(original_group);
-    if (!payload.ok()) co_return payload.status();
+    LAVIK_CO_RETURN_IF_ERROR(payload.status());
     std::string group_header(*payload);
     SetCount(group_header, group_header.size() - 4, consumers.size());
     partial.append(group_header);
     for (const auto& consumer : consumers) {
       auto value = StreamRecordPayload(consumer);
-      if (!value.ok()) co_return value.status();
+      LAVIK_CO_RETURN_IF_ERROR(value.status());
       partial.append(*value);
     }
     at = partial.size();
@@ -1453,7 +1436,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     SetCount(partial, at, pending.size());
     for (const auto& item : pending) {
       auto value = StreamRecordPayload(item);
-      if (!value.ok()) co_return value.status();
+      LAVIK_CO_RETURN_IF_ERROR(value.status());
       partial.append(*value);
     }
   }
@@ -1461,7 +1444,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
   if (object->ordered_directory().root().logical_size() != 0) {
     auto first = co_await cache.Scan(std::string_view("\1", 1),
                                      std::string_view("\2", 1), 1);
-    if (!first.ok()) co_return first.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
     if (first->empty())
       co_return absl::DataLossError("missing first Stream entry");
     auto payload = StreamRecordPayload(first->front());
@@ -1475,7 +1458,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       .expire_at_ms_ = object->version().root_.expire_at_ms_,
       .stream_length_ = object->ordered_directory().root().logical_size(),
       .stream_first_id_ = first_id});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (!update->changed_) co_return absl::OkStatus();
   if (read_only || update->erase_ || update->reuse_encoded_ ||
       update->logical_size_ != entries.size())
@@ -1493,9 +1476,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     std::string end(prefix);
     end.back() = '\1';
     auto status = co_await cache.EraseRange(prefix, end, changes, retired);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     auto count_record = co_await cache.Required(std::string_view("\4", 1));
-    if (!count_record.ok()) co_return count_record.status();
+    LAVIK_CO_RETURN_IF_ERROR(count_record.status());
     auto payload = StreamRecordPayload(*count_record);
     if (!payload.ok() || payload->size() != 4 || Count(*payload) == 0)
       co_return absl::DataLossError("invalid Stream group count");
@@ -1506,7 +1489,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     auto plan = co_await cache.Plan(
         std::move(changes), object->ordered_directory().root().logical_size(),
         std::move(retired));
-    if (!plan.ok()) co_return plan.status();
+    LAVIK_CO_RETURN_IF_ERROR(plan.status());
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(*plan),
         object->version().root_.expire_at_ms_, tx, replication,
@@ -1516,17 +1499,17 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     co_return absl::InvalidArgumentError("partial Stream group was created");
   auto before = DecodeStreamRecords(partial, entries.size());
   auto after = DecodeStreamRecords(update->encoded_, entries.size());
-  if (!before.ok()) co_return before.status();
-  if (!after.ok()) co_return after.status();
+  LAVIK_CO_RETURN_IF_ERROR(before.status());
+  LAVIK_CO_RETURN_IF_ERROR(after.status());
   std::map<std::string, std::string> old_records, new_records;
   for (auto& item : *before) {
     auto key = StreamRecordKey(item.value_);
-    if (!key.ok()) co_return key.status();
+    LAVIK_CO_RETURN_IF_ERROR(key.status());
     old_records.emplace(std::string(*key), std::move(item.value_));
   }
   for (auto& item : *after) {
     auto key = StreamRecordKey(item.value_);
-    if (!key.ok()) co_return key.status();
+    LAVIK_CO_RETURN_IF_ERROR(key.status());
     new_records.emplace(std::string(*key), std::move(item.value_));
   }
   const auto group_key = prefix + '\0', count_key = prefix + '\2';
@@ -1558,7 +1541,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     for (const auto& id : access.pending_ids_)
       allowed.insert(IdKey(prefix + '\3', id));
     auto count_record = co_await cache.Required(std::string_view("\4", 1));
-    if (!count_record.ok()) co_return count_record.status();
+    LAVIK_CO_RETURN_IF_ERROR(count_record.status());
     auto payload = StreamRecordPayload(*count_record);
     if (!payload.ok() || payload->size() != 4 || Count(*payload) == UINT32_MAX)
       co_return absl::DataLossError("invalid Stream group count");
@@ -1596,7 +1579,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       co_return absl::InvalidArgumentError("invalid Stream consumer removal");
     auto removed = co_await cache.ErasePendingConsumer(
         prefix, *access.remove_consumer_, changes, retired);
-    if (!removed.ok()) co_return removed.status();
+    LAVIK_CO_RETURN_IF_ERROR(removed.status());
     if (*removed > total_pending)
       co_return absl::DataLossError("Stream consumer removal count mismatch");
     std::string count(4, '\0');
@@ -1608,7 +1591,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
   auto plan = co_await cache.Plan(
       std::move(changes), object->ordered_directory().root().logical_size(),
       std::move(retired));
-  if (!plan.ok()) co_return plan.status();
+  LAVIK_CO_RETURN_IF_ERROR(plan.status());
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
@@ -1641,25 +1624,24 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     const auto* physical = object->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream probe page");
     GroupedScratchBudget budget;
-    auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(
+        budget.AddGroup(*physical, object->ExtentsFor(id)));
     auto admitted = budget.Reserve(2);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     probe_charge.emplace(std::move(*admitted));
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object, groups[index].id_);
-    if (!page.ok()) co_return page.status();
+    LAVIK_CO_RETURN_IF_ERROR(page.status());
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
-    if (!max_key.ok()) co_return max_key.status();
-    auto remembered =
-        object->ordered_directory().RememberStreamPageMaxKey(index, *max_key);
-    if (!remembered.ok()) co_return remembered;
+    LAVIK_CO_RETURN_IF_ERROR(max_key.status());
+    LAVIK_CO_RETURN_IF_ERROR(
+        object->ordered_directory().RememberStreamPageMaxKey(index, *max_key));
     if (index == 0) {
       auto payload =
           StreamRecordPayload(page->snapshot_.entries_.front().value_);
-      if (!payload.ok()) co_return payload.status();
-      remembered = object->ordered_directory().RememberStreamHeader(*payload);
-      if (!remembered.ok()) co_return remembered;
+      LAVIK_CO_RETURN_IF_ERROR(payload.status());
+      LAVIK_CO_RETURN_IF_ERROR(
+          object->ordered_directory().RememberStreamHeader(*payload));
     }
     co_return std::move(page);
   };
@@ -1668,7 +1650,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     header.assign(cached);
   } else {
     auto first = co_await load(0);
-    if (!first.ok()) co_return first.status();
+    LAVIK_CO_RETURN_IF_ERROR(first.status());
     auto payload =
         StreamRecordPayload(first->snapshot_.entries_.front().value_);
     if (!payload.ok() || payload->size() != 48 || !payload->starts_with("LXS1"))
@@ -1683,9 +1665,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
       auto less = groups[middle].stream_max_key_.LessThan(wanted);
       if (!less) {
         auto page = co_await load(middle);
-        if (!page.ok()) co_return page.status();
+        LAVIK_CO_RETURN_IF_ERROR(page.status());
         auto bound = StreamRecordKey(page->snapshot_.entries_.back().value_);
-        if (!bound.ok()) co_return bound.status();
+        LAVIK_CO_RETURN_IF_ERROR(bound.status());
         less = *bound < wanted;
       }
       if (*less)
@@ -1703,20 +1685,20 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
       const auto* physical = object->FindGroup(id);
       if (!physical) co_return absl::DataLossError("missing Stream range page");
       GroupedScratchBudget budget;
-      auto added = budget.AddGroup(*physical, object->ExtentsFor(id));
-      if (!added.ok()) co_return added;
+      LAVIK_CO_RETURN_IF_ERROR(
+          budget.AddGroup(*physical, object->ExtentsFor(id)));
       // Retained selected entries and the callback's decode/reply copies must
       // stay admitted after this page's temporary decoder has been destroyed.
       auto admitted = budget.Reserve(6);
-      if (!admitted.ok()) co_return admitted.status();
+      LAVIK_CO_RETURN_IF_ERROR(admitted.status());
       auto page = co_await load(index);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       const auto old_count = entries.size();
       const auto& values = page->snapshot_.entries_;
       for (std::size_t n = 0; n < values.size(); ++n) {
         const auto& entry = values[range.reverse_ ? values.size() - 1 - n : n];
         auto record_key = StreamRecordKey(entry.value_);
-        if (!record_key.ok()) co_return record_key.status();
+        LAVIK_CO_RETURN_IF_ERROR(record_key.status());
         const bool below =
             range.first_exclusive_ ? *record_key <= low : *record_key < low;
         const bool above =
@@ -1727,7 +1709,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
         }
         if (below || above) continue;
         auto payload = StreamRecordPayload(entry.value_);
-        if (!payload.ok()) co_return payload.status();
+        LAVIK_CO_RETURN_IF_ERROR(payload.status());
         entries.emplace_back(*payload);
         if (entries.size() == range.count_) {
           done = true;
@@ -1755,7 +1737,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
       CompactValueView{.encoded_ = header,
                        .logical_size_ = entries.size(),
                        .expire_at_ms_ = object->version().root_.expire_at_ms_});
-  if (!update.ok()) co_return update.status();
+  LAVIK_CO_RETURN_IF_ERROR(update.status());
   if (update->changed_)
     co_return absl::InvalidArgumentError("Stream range callback mutated");
   co_return absl::OkStatus();

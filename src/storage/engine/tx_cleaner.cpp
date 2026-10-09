@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -50,7 +51,7 @@ Task<absl::Status> ForEachCleanerOwner(unsigned count, bool parallel,
       } else {
         status = co_await bycorf::SubmitTaskTo(owner, std::move(step));
       }
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
     }
     co_return absl::OkStatus();
   }
@@ -296,9 +297,8 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
       }
     }
     if (!live_transaction) co_return absl::OkStatus();
-    const absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2)));
   }
 }
 
@@ -450,9 +450,8 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
     }
   }
   if (fence) {
-    const absl::Status durable =
-        co_await AwaitRelocationDurableLocal(store, *fence);
-    if (!durable.ok()) co_return durable;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await AwaitRelocationDurableLocal(store, *fence));
   }
 
   co_await store.store_state_mutex_.Lock();
@@ -536,10 +535,9 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
       current->allocation_epoch_ == block.allocation_epoch_)
     current->defragging_ = false;
   store.store_state_mutex_.Unlock(*store.worker_);
-  if (!promoted.ok()) co_return promoted;
+  LAVIK_CO_RETURN_IF_ERROR(promoted);
   for (const RelocationDurabilityFence& destination : fences) {
-    const absl::Status durable = co_await AwaitRelocationDurable(destination);
-    if (!durable.ok()) co_return durable;
+    LAVIK_CO_RETURN_IF_ERROR(co_await AwaitRelocationDurable(destination));
   }
   // Keep failed fence obligations on the source block. A later pass must not
   // retire it just because relocation already removed its live tagged bytes.
@@ -636,7 +634,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   absl::flat_hash_set<std::uint64_t> settled_txids;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto local = co_await inspect_owner(owner, true);
-    if (!local.ok()) co_return local.status();
+    LAVIK_CO_RETURN_IF_ERROR(local.status());
     for (const TxCleanerBlock& block : *local)
       if (!block.active_transaction_)
         settled_txids.insert(block.txids_.begin(), block.txids_.end());
@@ -649,7 +647,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
       commit_fences;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto local = co_await inspect_owner(owner, false);
-    if (!local.ok()) co_return local.status();
+    LAVIK_CO_RETURN_IF_ERROR(local.status());
     for (const TxCleanerBlock& block : *local)
       for (const auto& [txid, record_end] : block.commit_decisions_) {
         committed->insert(txid);
@@ -673,7 +671,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
 
   // Promote owners concurrently, but keep decision and source blocks until
   // every owner has finished its destination durability waits.
-  const absl::Status promoted = co_await ForEachCleanerOwner(
+  LAVIK_CO_RETURN_IF_ERROR(co_await ForEachCleanerOwner(
       worker_count_, !shutdown_drain, [&](unsigned owner) {
         return std::pair{
             owner,
@@ -689,7 +687,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
                          found->second) {
                       const absl::Status durable =
                           co_await AwaitRelocationDurable(decision);
-                      if (!durable.ok()) co_return durable;
+                      LAVIK_CO_RETURN_IF_ERROR(durable);
                     }
                   }
                   // Recovered commit records were already validated on disk.
@@ -700,12 +698,11 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
                   tx_cleaner_dirty_.store(true, std::memory_order_release);
                   continue;
                 }
-                if (!result.ok()) co_return result;
+                LAVIK_CO_RETURN_IF_ERROR(result);
               }
               co_return absl::OkStatus();
             }};
-      });
-  if (!promoted.ok()) co_return promoted;
+      }));
 
   // Recheck after promotion and destination durability. A decision may be
   // discarded once every Tx block naming that transaction has no live tagged
@@ -717,7 +714,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
   absl::flat_hash_set<std::uint64_t> decisions_needed;
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     auto current = co_await inspect_owner(owner, false);
-    if (!current.ok()) co_return current.status();
+    LAVIK_CO_RETURN_IF_ERROR(current.status());
     for (const TxCleanerBlock& block : *current)
       if (block.live_tagged_bytes_ != 0 || block.dependency_pins_ != 0 ||
           block.pending_relocation_)
@@ -744,7 +741,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner(bool shutdown_drain) {
         tx_cleaner_dirty_.store(true, std::memory_order_release);
         continue;
       }
-      if (!retired.ok()) co_return retired;
+      LAVIK_CO_RETURN_IF_ERROR(retired);
       tx_cleaner_dirty_.store(true, std::memory_order_release);
     }
   }
@@ -798,7 +795,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCleanerForShutdown() {
             return InspectTxBlocksLocal(*stores_[owner], false);
           });
         }
-        if (!state.ok()) co_return state.status();
+        LAVIK_CO_RETURN_IF_ERROR(state.status());
         if (!state->empty())
           co_return absl::FailedPreconditionError(
               "transaction blocks remain at shutdown checkpoint");

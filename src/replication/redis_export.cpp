@@ -16,6 +16,7 @@
 
 #include "../redis/stream_command.h"
 #include "lavik/replication.h"
+#include "lavik/status_macros.h"
 #include "replication_internal.h"
 
 namespace lavik {
@@ -170,9 +171,8 @@ class RedisRdbStreamQueue
       while (!TryPush(&fragment, owner)) {
         if (aborted_.load(std::memory_order_acquire))
           co_return absl::CancelledError("Redis RDB export cancelled");
-        auto status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                std::chrono::milliseconds(1));
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
       }
       bytes.remove_prefix(piece.size());
     }
@@ -184,34 +184,33 @@ class RedisRdbStreamQueue
     auto encoder = rdb::CollectionFileEncoder::Create(
         value.db_id_, value.key_, value.value_.value_type_,
         value.value_.logical_size_, value.value_.expire_at_ms_);
-    if (!encoder.ok()) co_return encoder.status();
+    LAVIK_CO_RETURN_IF_ERROR(encoder.status());
     auto drain = [&]() -> Task<absl::Status> {
       while (auto span = encoder->Next()) {
-        auto status = co_await PushEntrySpan(owner, *span);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await PushEntrySpan(owner, *span));
       }
       co_return absl::OkStatus();
     };
     auto status = co_await drain();
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     std::uint64_t cursor = 0;
     for (;;) {
       if (aborted_.load(std::memory_order_acquire))
         co_return absl::CancelledError("Redis RDB export cancelled");
       auto page = co_await storage_->ReadRdbCollectionPage(
           session_id_, value.collection_token_, cursor);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       status = encoder->StartPage(*page);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       // The admitted page owns all borrowed strings until network queue
       // backpressure has accepted every span; no whole-object copy is made.
       status = co_await drain();
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       cursor = page->next_cursor_;
       if (page->done_) break;
     }
     status = encoder->Finish();
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     co_return co_await storage_->FinishRdbCollection(session_id_,
                                                      value.collection_token_);
   }
@@ -439,13 +438,12 @@ Task<absl::StatusOr<std::optional<RedisExportEvent>>> ReadLocalRedisExportEvent(
       co_return absl::InternalError(
           "Redis export replication fragments are out of order");
     }
-    absl::Status appended = AppendReplicationString(&encoded, frame.payload_);
-    if (!appended.ok()) co_return appended;
+    LAVIK_CO_RETURN_IF_ERROR(AppendReplicationString(&encoded, frame.payload_));
     cursor = batch->next_;
     ++next_fragment;
     if (!last) continue;
     auto command = DecodeReplicationCommand(encoded);
-    if (!command.ok()) co_return command.status();
+    LAVIK_CO_RETURN_IF_ERROR(command.status());
     co_return std::optional<RedisExportEvent>(RedisExportEvent{
         .worker_ = worker,
         .kind_ = kind,
@@ -463,7 +461,7 @@ absl::StatusOr<RedisExportTransaction> ParseRedisExportTransaction(
         "malformed Redis export transaction envelope");
   }
   auto metadata = DecodeReplicationTransactionEnvelope(args[0]);
-  if (!metadata.ok()) return metadata.status();
+  LAVIK_RETURN_IF_ERROR(metadata.status());
   RedisExportTransaction transaction;
   transaction.id_ = metadata->id_;
   transaction.command_.db_id_ = event.command_.db_id_;
@@ -528,7 +526,7 @@ absl::StatusOr<std::string> EncodeRedisExportCommand(
   std::vector<Child> expanded;
   for (const auto& child : children) {
     auto commands = RedisExportStreamGroup(child.args_);
-    if (!commands.ok()) return commands.status();
+    LAVIK_RETURN_IF_ERROR(commands.status());
     if (commands->size() > 1) transactional = true;
     for (auto& args : *commands)
       expanded.push_back({.db_ = child.db_, .args_ = std::move(args)});
@@ -591,7 +589,7 @@ Task<absl::Status> FillRedisExportHeads(storage::StorageEngine* storage,
         worker, [storage, worker, cursor = state->cursors_[worker]] {
           return ReadLocalRedisExportEvent(storage, worker, cursor);
         });
-    if (!event.ok()) co_return event.status();
+    LAVIK_CO_RETURN_IF_ERROR(event.status());
     if (event->has_value()) state->heads_[worker] = std::move(**event);
   }
   // Ready cross-worker barriers take priority over unrelated local mutations;
@@ -638,17 +636,15 @@ Task<absl::Status> SendRedisExportMutation(RedisExportSink& sink,
     }
     auto encoded = EncodeRedisExportCommand(state->heads_[worker]->command_,
                                             false, &state->selected_db_);
-    if (!encoded.ok()) co_return encoded.status();
-    absl::Status sent = co_await sink.Write(*encoded);
-    if (!sent.ok()) co_return sent;
+    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(co_await sink.Write(*encoded));
     state->last_write_ = std::chrono::steady_clock::now();
     state->cursors_[worker] = state->heads_[worker]->next_;
     state->heads_[worker].reset();
     state->next_worker_ = (worker + 1) % workers;
-    absl::Status advanced = co_await AdvanceRedisExportCursor(
+    LAVIK_CO_RETURN_IF_ERROR(co_await AdvanceRedisExportCursor(
         storage, backpressure, worker, session_id, state->cursors_[worker],
-        state->context_);
-    if (!advanced.ok()) co_return advanced;
+        state->context_));
     state->phase_ = RedisExportBacklogState::Phase::kFill;
     co_return absl::OkStatus();
   }
@@ -670,7 +666,7 @@ Task<absl::Status> SendRedisExportTransaction(RedisExportSink& sink,
       continue;
     }
     auto transaction = ParseRedisExportTransaction(*state->heads_[worker]);
-    if (!transaction.ok()) co_return transaction.status();
+    LAVIK_CO_RETURN_IF_ERROR(transaction.status());
     bool ready = true;
     std::vector<std::uint8_t> included(workers, 0);
     std::optional<ReplicatedCommand> payload;
@@ -687,7 +683,7 @@ Task<absl::Status> SendRedisExportTransaction(RedisExportSink& sink,
         continue;
       }
       auto peer = ParseRedisExportTransaction(*state->heads_[participant]);
-      if (!peer.ok()) co_return peer.status();
+      LAVIK_CO_RETURN_IF_ERROR(peer.status());
       if (peer->id_ != transaction->id_) {
         ready = false;
         continue;
@@ -717,17 +713,15 @@ Task<absl::Status> SendRedisExportTransaction(RedisExportSink& sink,
     }
     auto encoded =
         EncodeRedisExportCommand(*payload, true, &state->selected_db_);
-    if (!encoded.ok()) co_return encoded.status();
-    absl::Status sent = co_await sink.Write(*encoded);
-    if (!sent.ok()) co_return sent;
+    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(co_await sink.Write(*encoded));
     state->last_write_ = std::chrono::steady_clock::now();
     for (unsigned participant : transaction->participants_) {
       state->cursors_[participant] = state->heads_[participant]->next_;
       state->heads_[participant].reset();
-      absl::Status advanced = co_await AdvanceRedisExportCursor(
+      LAVIK_CO_RETURN_IF_ERROR(co_await AdvanceRedisExportCursor(
           storage, backpressure, participant, session_id,
-          state->cursors_[participant], state->context_);
-      if (!advanced.ok()) co_return advanced;
+          state->cursors_[participant], state->context_));
     }
     state->next_worker_ = (worker + 1) % workers;
     state->phase_ = RedisExportBacklogState::Phase::kFill;
@@ -771,17 +765,15 @@ Task<absl::Status> SendRedisExportControl(RedisExportSink& sink,
                               .args_ = {args[0]}};
     auto encoded =
         EncodeRedisExportCommand(control, false, &state->selected_db_);
-    if (!encoded.ok()) co_return encoded.status();
-    absl::Status sent = co_await sink.Write(*encoded);
-    if (!sent.ok()) co_return sent;
+    LAVIK_CO_RETURN_IF_ERROR(encoded.status());
+    LAVIK_CO_RETURN_IF_ERROR(co_await sink.Write(*encoded));
     state->last_write_ = std::chrono::steady_clock::now();
     for (unsigned peer = 0; peer < workers; ++peer) {
       state->cursors_[peer] = state->heads_[peer]->next_;
       state->heads_[peer].reset();
-      absl::Status advanced = co_await AdvanceRedisExportCursor(
+      LAVIK_CO_RETURN_IF_ERROR(co_await AdvanceRedisExportCursor(
           storage, backpressure, peer, session_id, state->cursors_[peer],
-          state->context_);
-      if (!advanced.ok()) co_return advanced;
+          state->context_));
     }
     state->phase_ = RedisExportBacklogState::Phase::kFill;
     co_return absl::OkStatus();
@@ -963,8 +955,7 @@ auto ReplicationManager::ReplicationGroup::ServeRedisExportConnection(
     co_return absl::FailedPreconditionError(
         "node lost valid source state during PSYNC setup");
   }
-  absl::Status configured = ConfigureConnectedFd(stream.NativeFd());
-  if (!configured.ok()) co_return configured;
+  LAVIK_CO_RETURN_IF_ERROR(ConfigureConnectedFd(stream.NativeFd()));
   const std::uint64_t session_id =
       next_master_session_id_.fetch_add(1, std::memory_order_relaxed);
   SetClientReplicationSession(client_id, session_id);
@@ -1028,7 +1019,7 @@ auto ReplicationManager::ReplicationGroup::RunRedisExportSession(
     }
     status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
                                        std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   bool gates_open = false;
   struct GateGuard {
@@ -1042,7 +1033,7 @@ auto ReplicationManager::ReplicationGroup::RunRedisExportSession(
       co_return absl::CancelledError("Redis export admission cancelled");
     status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
                                        std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
 
   if (!RedisExportValid(*context))
@@ -1395,8 +1386,7 @@ auto ReplicationManager::ReplicationGroup::PrepareRedisExport(
   } else {
     // Standalone has no population-owned publisher until its first consumer.
     // Use the common history initialization, never a Redis-only history reset.
-    auto ready = co_await EnsureReplicationHistoryReady();
-    if (!ready.ok()) co_return ready;
+    LAVIK_CO_RETURN_IF_ERROR(co_await EnsureReplicationHistoryReady());
     StartIdleReplicationHistoryMonitor();
   }
   context->history_ = history_id_;
@@ -1412,12 +1402,12 @@ auto ReplicationManager::ReplicationGroup::PrepareRedisExport(
         co_return absl::FailedPreconditionError(
             "Owner replication history is not active");
     } else {
-      auto enabled = co_await bycorf::SubmitTaskTo(worker, [this, worker,
-                                                            context] {
-        return storage_->EnableReplicationLog(
-            context->id_, BacklogCapacityForFlow(worker, backlog_size_bytes()));
-      });
-      if (!enabled.ok()) co_return enabled;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await bycorf::SubmitTaskTo(worker, [this, worker, context] {
+            return storage_->EnableReplicationLog(
+                context->id_,
+                BacklogCapacityForFlow(worker, backlog_size_bytes()));
+          }));
     }
   }
   if (!RedisExportValid(*context))

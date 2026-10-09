@@ -29,6 +29,7 @@
 #include "lavik/fault_injection.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/commands.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -576,7 +577,7 @@ void MetaStateMachine::SetCommitEventSink(MetaCommitEventSink sink) {
 absl::StatusOr<std::shared_ptr<MetaRaftBuffer>> MetaStateMachine::EncodeCommand(
     const MetaCommand& command) {
   absl::StatusOr<std::string> encoded = EncodeMetaCommand(command);
-  if (!encoded.ok()) return encoded.status();
+  LAVIK_RETURN_IF_ERROR(encoded.status());
   std::shared_ptr<MetaRaftBuffer> out = MetaRaftBuffer::alloc(encoded->size());
   std::memcpy(out->data_begin(), encoded->data(), encoded->size());
   return out;
@@ -670,7 +671,7 @@ absl::StatusOr<std::string> MetaStateMachine::Capture(
 absl::Status MetaStateMachine::Install(std::uint64_t index,
                                        std::string_view image) {
   auto stores = MetaStores::Deserialize(image);
-  if (!stores.ok()) return stores.status();
+  LAVIK_RETURN_IF_ERROR(stores.status());
   std::lock_guard lock(mutex_);
   if (index < last_committed_idx_.load()) {
     return absl::FailedPreconditionError(

@@ -68,6 +68,7 @@
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -3017,8 +3018,7 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
   if (membership_gate == nullptr) {
     return absl::InvalidArgumentError("membership gate must not be null");
   }
-  const absl::Status valid = ValidateOptions(options);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateOptions(options));
   auto core = std::make_shared<Core>();
   core->foreign_executor_ = foreign_executor;
   core->server_ = std::move(server);
@@ -3046,9 +3046,8 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
     tls.key_file_ = core->options_.tls_key_file_;
     tls.ca_cert_file_ = core->options_.tls_ca_cert_file_;
     tls.client_auth_ = bycorf::TlsClientAuth::kRequired;
-    auto context = bycorf::TlsContext::CreateServer(tls);
-    if (!context.ok()) return context.status();
-    core->tls_context_ = std::move(*context);
+    LAVIK_ASSIGN_OR_RETURN(core->tls_context_,
+                           bycorf::TlsContext::CreateServer(tls));
   }
   return std::shared_ptr<MetaCtlServer>(new MetaCtlServer(std::move(core)));
 }

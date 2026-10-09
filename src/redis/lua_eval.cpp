@@ -39,6 +39,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 extern "C" {
@@ -830,7 +831,7 @@ class LuaWorkerRuntime {
           "another function library is already staged");
     }
     auto metadata = ParseLibraryMetadata(code);
-    if (!metadata.ok()) return metadata.status();
+    LAVIK_RETURN_IF_ERROR(metadata.status());
     const std::string& library_name = metadata->first;
     const auto existing_library = libraries_.find(library_name);
     if (existing_library != libraries_.end()) {
@@ -952,9 +953,7 @@ thread_local std::shared_ptr<LuaWorkerRuntime> g_staged_lua_runtime;
 
 absl::StatusOr<std::shared_ptr<LuaWorkerRuntime>> WorkerLuaRuntime() {
   if (g_lua_runtime == nullptr) {
-    auto runtime = LuaWorkerRuntime::Create();
-    if (!runtime.ok()) return runtime.status();
-    g_lua_runtime = std::move(*runtime);
+    LAVIK_ASSIGN_OR_RETURN(g_lua_runtime, LuaWorkerRuntime::Create());
   }
   return g_lua_runtime;
 }
@@ -993,9 +992,9 @@ absl::Status ReadBulkPayload(std::string_view encoded, std::size_t* position,
                              std::string_view* payload) {
   std::string_view line;
   absl::Status status = ReadLine(encoded, position, &line);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(status);
   auto length = ParseLength(line);
-  if (!length.ok()) return length.status();
+  LAVIK_RETURN_IF_ERROR(length.status());
   if (*length < 0 ||
       static_cast<std::uint64_t>(*length) > encoded.size() - *position) {
     return absl::InvalidArgumentError("invalid RESP bulk length");
@@ -1019,23 +1018,22 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
   std::string_view line;
   switch (type) {
     case '+': {
-      absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(ReadLine(encoded, position, &line));
       return PushWrappedString(state, "ok", line);
     }
     case ':': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto value = ParseLength(line);
-      if (!value.ok()) return value.status();
+      LAVIK_RETURN_IF_ERROR(value.status());
       lua_pushnumber(state, static_cast<lua_Number>(*value));
       return absl::OkStatus();
     }
     case '$': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      if (!length.ok()) return length.status();
+      LAVIK_RETURN_IF_ERROR(length.status());
       if (*length == -1) {
         lua_pushboolean(state, 0);
         return absl::OkStatus();
@@ -1055,8 +1053,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
     }
     case '=': {
       std::string_view payload;
-      absl::Status status = ReadBulkPayload(encoded, position, &payload);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(ReadBulkPayload(encoded, position, &payload));
       if (payload.size() < 4 || payload[3] != ':') {
         return absl::InvalidArgumentError("invalid RESP verbatim string");
       }
@@ -1086,8 +1083,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       return absl::OkStatus();
     }
     case ',': {
-      absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(ReadLine(encoded, position, &line));
       double value = 0;
       if (line == "inf") {
         value = std::numeric_limits<double>::infinity();
@@ -1109,15 +1105,14 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       return absl::OkStatus();
     }
     case '(': {
-      absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(ReadLine(encoded, position, &line));
       return PushWrappedString(state, "big_number", line);
     }
     case '*': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      if (!length.ok()) return length.status();
+      LAVIK_RETURN_IF_ERROR(length.status());
       if (*length == -1) {
         lua_pushboolean(state, 0);
         return absl::OkStatus();
@@ -1128,16 +1123,16 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       lua_createtable(state, static_cast<int>(*length), 0);
       for (int i = 1; i <= static_cast<int>(*length); ++i) {
         status = PushRespValue(state, encoded, position, depth + 1);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         lua_rawseti(state, -2, i);
       }
       return absl::OkStatus();
     }
     case '%': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      if (!length.ok()) return length.status();
+      LAVIK_RETURN_IF_ERROR(length.status());
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP map length");
       }
@@ -1145,9 +1140,9 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       lua_createtable(state, 0, static_cast<int>(*length));
       for (int i = 0; i < static_cast<int>(*length); ++i) {
         status = PushRespValue(state, encoded, position, depth + 1);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         status = PushRespValue(state, encoded, position, depth + 1);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         lua_rawset(state, -3);
       }
       lua_setfield(state, -2, "map");
@@ -1155,9 +1150,9 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
     }
     case '~': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      if (!length.ok()) return length.status();
+      LAVIK_RETURN_IF_ERROR(length.status());
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP set length");
       }
@@ -1165,7 +1160,7 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
       lua_createtable(state, 0, static_cast<int>(*length));
       for (int i = 0; i < static_cast<int>(*length); ++i) {
         status = PushRespValue(state, encoded, position, depth + 1);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         lua_pushboolean(state, 1);
         lua_rawset(state, -3);
       }
@@ -1174,31 +1169,31 @@ absl::Status PushRespValue(lua_State* state, std::string_view encoded,
     }
     case '>': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      if (!length.ok()) return length.status();
+      LAVIK_RETURN_IF_ERROR(length.status());
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP push length");
       }
       lua_createtable(state, static_cast<int>(*length), 0);
       for (int i = 1; i <= static_cast<int>(*length); ++i) {
         status = PushRespValue(state, encoded, position, depth + 1);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         lua_rawseti(state, -2, i);
       }
       return absl::OkStatus();
     }
     case '|': {
       absl::Status status = ReadLine(encoded, position, &line);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       auto length = ParseLength(line);
-      if (!length.ok()) return length.status();
+      LAVIK_RETURN_IF_ERROR(length.status());
       if (*length < 0 || *length > std::numeric_limits<int>::max()) {
         return absl::InvalidArgumentError("invalid RESP attribute length");
       }
       for (int i = 0; i < static_cast<int>(*length) * 2; ++i) {
         status = PushRespValue(state, encoded, position, depth + 1);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
         lua_pop(state, 1);
       }
       return PushRespValue(state, encoded, position, depth + 1);
@@ -1538,7 +1533,7 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::Create(
     std::string_view script, std::span<const std::string> keys,
     std::span<const std::string> argv, RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
-  if (!runtime.ok()) return runtime.status();
+  LAVIK_RETURN_IF_ERROR(runtime.status());
   auto impl = std::make_unique<Impl>();
   impl->client_resp_version_ = client_resp_version;
   impl->runtime_ = *runtime;
@@ -1561,7 +1556,7 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
     std::string_view sha, std::span<const std::string> keys,
     std::span<const std::string> argv, RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
-  if (!runtime.ok()) return runtime.status();
+  LAVIK_RETURN_IF_ERROR(runtime.status());
   auto impl = std::make_unique<Impl>();
   impl->client_resp_version_ = client_resp_version;
   impl->runtime_ = *runtime;
@@ -1580,7 +1575,7 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFunction(
     std::string_view name, std::span<const std::string> keys,
     std::span<const std::string> argv, RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
-  if (!runtime.ok()) return runtime.status();
+  LAVIK_RETURN_IF_ERROR(runtime.status());
   auto impl = std::make_unique<Impl>();
   impl->client_resp_version_ = client_resp_version;
   impl->runtime_ = *runtime;
@@ -1739,17 +1734,16 @@ StageCompleteLuaFunctionCatalogLocally(
         "another complete Function catalog is already staged");
   }
   auto current = WorkerLuaRuntime();
-  if (!current.ok()) return current.status();
+  LAVIK_RETURN_IF_ERROR(current.status());
   auto staged = LuaWorkerRuntime::Create();
-  if (!staged.ok()) return staged.status();
-  absl::Status scripts = (*current)->CopyScriptsTo(staged->get());
-  if (!scripts.ok()) return scripts;
+  LAVIK_RETURN_IF_ERROR(staged.status());
+  LAVIK_RETURN_IF_ERROR((*current)->CopyScriptsTo(staged->get()));
 
   std::vector<LuaFunctionLibrary> libraries;
   libraries.reserve(library_codes.size());
   for (const std::string& code : library_codes) {
     auto library = (*staged)->StageFunctionLibrary(code);
-    if (!library.ok()) return library.status();
+    LAVIK_RETURN_IF_ERROR(library.status());
     (*staged)->CommitStagedFunctionLibrary();
     libraries.push_back(std::move(*library));
   }

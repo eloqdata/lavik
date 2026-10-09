@@ -35,6 +35,7 @@
 #include "lavik/meta/raft.h"
 #include "lavik/meta/state_machine.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -122,7 +123,7 @@ absl::StatusOr<MetaMemberRecord> ReadBinding(MetaReader& r) {
   auto ctl =
       r.ReadOptional<std::string>([](auto& in) -> absl::StatusOr<std::string> {
         auto s = in.ReadString(kMaxMetaEndpointBytes);
-        if (!s.ok()) return s.status();
+        LAVIK_RETURN_IF_ERROR(s.status());
         return std::string(*s);
       });
   auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
@@ -221,7 +222,7 @@ absl::StatusOr<std::string> EncodeMembershipIntent(
   if (w.buffer().size() > kMaxMetaPayloadBytes)
     return Conflict("membership intent too large");
   auto checked = DecodeMembershipIntent(w.buffer());
-  if (!checked.ok()) return checked.status();
+  LAVIK_RETURN_IF_ERROR(checked.status());
   if (*checked != plan) return Conflict("membership intent is not canonical");
   return w.TakeBuffer();
 }
@@ -297,7 +298,7 @@ Plan PlanMembershipStep(const MetaMembershipView& view,
   if (op.kind_ != kMetaMembershipOperationKind || Terminal(op))
     return std::nullopt;
   auto intent = DecodeMembershipIntent(op.intent_);
-  if (!intent.ok()) return intent.status();
+  LAVIK_RETURN_IF_ERROR(intent.status());
   const auto& p = *intent;
   auto after = p.before_;
   if (p.add_)

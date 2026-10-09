@@ -19,6 +19,7 @@
 #include <algorithm>
 
 #include "bycorf/runtime/worker.h"
+#include "lavik/status_macros.h"
 #include "lavik/tx/tx_shard.h"
 
 namespace lavik::tx {
@@ -207,8 +208,7 @@ Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
     entry_hook_(entry_hook_ctx_, shard.shard_id_);
   }
   if (validator_ != nullptr) {
-    absl::Status valid = validator_(validator_ctx_, shard.shard_id_);
-    if (!valid.ok()) co_return valid;
+    LAVIK_CO_RETURN_IF_ERROR(validator_(validator_ctx_, shard.shard_id_));
   }
   co_return co_await cb_(cb_ctx_, Slice(shard));
 }
@@ -313,9 +313,7 @@ Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
   }
   co_await RoundAwaiter{this, Phase::kArm};
   for (ShardData& sd : shards_) {
-    if (!sd.status_.ok()) {
-      co_return sd.status_;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(sd.status_);
   }
   co_return absl::OkStatus();
 }

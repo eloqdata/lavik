@@ -18,6 +18,7 @@
 #include <optional>
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -324,8 +325,7 @@ Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(WorkerStore* store) {
       delay = ScheduleSleep(interval_due - std::chrono::steady_clock::now());
     if (mode == TombRaiderMode::kDaily && daily_due)
       delay = ScheduleSleep(*daily_due - std::chrono::system_clock::now());
-    const auto waited = co_await bycorf::SleepFor(*store->worker_, delay);
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(*store->worker_, delay));
   }
   co_return absl::OkStatus();
 }
@@ -380,45 +380,35 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   // The reap must not start until every worker's sweep has finished: the
   // record that still needs a candidate may sit in the last unswept block.
   for (unsigned target = 0; target < worker_count_; ++target) {
-    absl::Status marked = co_await bycorf::SubmitTaskTo(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
         target, [this, target, &round]() -> Task<absl::Status> {
           co_return co_await TombMarkLocal(*stores_[target], round);
-        });
-    if (!marked.ok()) {
-      co_return marked;
-    }
+        }));
     if (!TombRaiderRoundValid(round)) {
       co_return absl::OkStatus();
     }
   }
 #if LAVIK_FAULTS_ENABLED
   if (tomb_raider_test_hook_) {
-    auto hooked =
-        co_await tomb_raider_test_hook_(TombRaiderTestPoint::kAfterMark);
-    if (!hooked.ok()) co_return hooked;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await tomb_raider_test_hook_(TombRaiderTestPoint::kAfterMark));
     if (!TombRaiderRoundValid(round)) co_return absl::OkStatus();
   }
 #endif
   for (unsigned target = 0; target < worker_count_; ++target) {
-    absl::Status swept = co_await bycorf::SubmitTaskTo(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
         target, [this, target, &round]() -> Task<absl::Status> {
           co_return co_await TombSweepLocal(*stores_[target], round);
-        });
-    if (!swept.ok()) {
-      co_return swept;
-    }
+        }));
     if (!TombRaiderRoundValid(round)) {
       co_return absl::OkStatus();
     }
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
-    absl::Status reaped = co_await bycorf::SubmitTaskTo(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
         target, [this, target, &round]() -> Task<absl::Status> {
           co_return co_await TombReapLocal(*stores_[target], round);
-        });
-    if (!reaped.ok()) {
-      co_return reaped;
-    }
+        }));
     if (!TombRaiderRoundValid(round)) {
       co_return absl::OkStatus();
     }
@@ -470,10 +460,9 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
           store, partition.indexes_[claim.db_id_], claim.digest_, claim.key_);
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
-        if (!resolved.ok()) co_return resolved.status();
-        const auto hooked = co_await tomb_raider_test_hook_(
-            TombRaiderTestPoint::kAfterClaimLookup);
-        if (!hooked.ok()) co_return hooked;
+        LAVIK_CO_RETURN_IF_ERROR(resolved.status());
+        LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kAfterClaimLookup));
         // A fault hook is itself an async boundary. Ordinary writes need not
         // advance a population generation, so never retain its raw result.
         if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
@@ -561,14 +550,12 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
 #if LAVIK_FAULTS_ENABLED
     if (tomb_raider_test_hook_) {
-      auto status = co_await tomb_raider_test_hook_(
-          TombRaiderTestPoint::kBeforeRetirementWait);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+          TombRaiderTestPoint::kBeforeRetirementWait));
     }
 #endif
-    auto waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1)));
   }
   if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
   std::vector<BlockSnapshot> blocks;
@@ -612,14 +599,12 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       }
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
-        auto status = co_await tomb_raider_test_hook_(
-            TombRaiderTestPoint::kBeforeRetirementWait);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kBeforeRetirementWait));
       }
 #endif
-      auto waited = co_await bycorf::SleepFor(*store.worker_,
-                                              std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
     }
     co_return false;
   };
@@ -654,7 +639,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
     bool retired = false;
     while (!present(snapshot)) {
       auto available = co_await await_block(snapshot);
-      if (!available.ok()) co_return available.status();
+      LAVIK_CO_RETURN_IF_ERROR(available.status());
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
       if (!*available) {
         retired = true;
@@ -690,18 +675,15 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       auto read = co_await ReadStorageBuffer(
           *store.worker_, store.files_[file_id], sweep.buffer_,
           sweep.registered(), block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
+      LAVIK_CO_RETURN_IF_ERROR(read.status());
       if (*read != kStorageBlockBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short block read during tomb raider sweep");
       }
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
-        const auto hooked = co_await tomb_raider_test_hook_(
-            TombRaiderTestPoint::kAfterSweepRead);
-        if (!hooked.ok()) co_return hooked;
+        LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kAfterSweepRead));
       }
 #endif
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
@@ -718,7 +700,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       // lookup. Its UUID registry may already be gone after reclamation.
       if (!present(snapshot)) {
         auto available = co_await await_block(snapshot);
-        if (!available.ok()) co_return available.status();
+        LAVIK_CO_RETURN_IF_ERROR(available.status());
         if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
         // Already issued prefix claims only keep tombstones alive. Retaining
         // them after durable block retirement is conservative; the unscanned
@@ -792,10 +774,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
             .db_id_ = record.db_id_,
         });
         if (pending[key_owner].size() >= 512) {
-          absl::Status flushed = co_await flush_claims(key_owner);
-          if (!flushed.ok()) {
-            co_return flushed;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(co_await flush_claims(key_owner));
         }
       }
       if (++decoded % 256 == 0) {
@@ -816,11 +795,8 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       }
       const auto sleep_chunk =
           std::min(sleep_remaining, kMaxForfeitCheckpointSleep);
-      absl::Status slept =
-          co_await bycorf::SleepFor(*store.worker_, sleep_chunk);
-      if (!slept.ok()) {
-        co_return slept;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await bycorf::SleepFor(*store.worker_, sleep_chunk));
       sleep_remaining -= sleep_chunk;
     }
   }
@@ -828,10 +804,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
     if (!TombRaiderRoundValid(round, &store)) {
       co_return absl::OkStatus();
     }
-    absl::Status flushed = co_await flush_claims(owner);
-    if (!flushed.ok()) {
-      co_return flushed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await flush_claims(owner));
   }
   co_return absl::OkStatus();
 }
@@ -911,9 +884,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
     if (candidate.key_.empty() && candidate.key_bytes_ != 0) [[unlikely]] {
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
-        const auto hooked = co_await tomb_raider_test_hook_(
-            TombRaiderTestPoint::kBeforeReapKeyLoad);
-        if (!hooked.ok()) co_return hooked;
+        LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kBeforeReapKeyLoad));
       }
 #endif
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
@@ -921,9 +893,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
                                             candidate.key_bytes_);
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
-        const auto hooked = co_await tomb_raider_test_hook_(
-            TombRaiderTestPoint::kAfterReapKeyLoad);
-        if (!hooked.ok()) co_return hooked;
+        LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kAfterReapKeyLoad));
       }
 #endif
       if (!key.ok()) {
@@ -939,9 +910,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
     }
 #if LAVIK_FAULTS_ENABLED
     if (tomb_raider_test_hook_) {
-      const auto hooked =
-          co_await tomb_raider_test_hook_(TombRaiderTestPoint::kBeforeReapLock);
-      if (!hooked.ok()) co_return hooked;
+      LAVIK_CO_RETURN_IF_ERROR(co_await tomb_raider_test_hook_(
+          TombRaiderTestPoint::kBeforeReapLock));
     }
 #endif
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
@@ -956,9 +926,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
     auto resolved =
         co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                    candidate.digest_, candidate.key_);
-    if (!resolved.ok()) {
-      co_return resolved.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
     if (partition.replication_epoch_ != candidate.replication_epoch_) {
       round.cancelled_.store(true, std::memory_order_release);

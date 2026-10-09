@@ -87,6 +87,7 @@
 #include "lavik/replication_group.h"
 #include "lavik/replication_history.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/engine.h"
 #include "native_recovery.h"
 #include "native_reparent.h"
@@ -129,9 +130,8 @@ class ClusterRebuildCompletionState {
       // Rebuilds can legitimately run for hours. This low-frequency poll is
       // cancellation-safe (no borrowed coroutine handle remains registered)
       // and there is at most one active target population per process.
-      absl::Status waited =
-          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10)));
     }
   }
 
@@ -164,9 +164,8 @@ class ClusterPromotionPrepareCompletionState {
       if (std::optional<Result> terminal = result(); terminal.has_value()) {
         co_return *terminal;
       }
-      absl::Status waited =
-          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10)));
     }
   }
 
@@ -328,8 +327,7 @@ class DataReader {
     if (remaining() < size) {
       return absl::InvalidArgumentError("malformed replication record payload");
     }
-    absl::Status reserved = ReserveReplicationString(value, size);
-    if (!reserved.ok()) return reserved;
+    LAVIK_RETURN_IF_ERROR(ReserveReplicationString(value, size));
     value->assign(input_.data() + position_, size);
     position_ += size;
     return absl::OkStatus();
@@ -513,7 +511,7 @@ class RedisCommandStream {
           std::min(input.size(), kMaxPendingBytes - pending_.size());
       auto read =
           co_await stream_->ReadSome(std::span<std::byte>(input).first(wanted));
-      if (!read.ok()) co_return read.status();
+      LAVIK_CO_RETURN_IF_ERROR(read.status());
       if (*read == 0) {
         co_return absl::UnavailableError("Redis replication connection closed");
       }
@@ -1219,8 +1217,7 @@ struct ReplicaSession {
     // after this point must never retry with a mixture of old-history and
     // replacement-population cursors.
     std::vector<std::uint64_t> reset(applied_frontier_->size(), 1);
-    absl::Status installed = applied_frontier_->InstallNextLsns(reset);
-    if (!installed.ok()) return installed;
+    LAVIK_RETURN_IF_ERROR(applied_frontier_->InstallNextLsns(reset));
     fullsync_cursors_reset_ = true;
     return absl::OkStatus();
   }
@@ -1241,8 +1238,7 @@ struct ReplicaSession {
 
   absl::StatusOr<std::vector<std::uint64_t>> FullSyncCutVector() const {
     std::lock_guard lock(fullsync_mutex_);
-    absl::Status complete = ValidateFullSyncCutVectorLocked();
-    if (!complete.ok()) return complete;
+    LAVIK_RETURN_IF_ERROR(ValidateFullSyncCutVectorLocked());
     std::vector<std::uint64_t> result;
     result.reserve(fullsync_cuts_.size());
     for (const std::optional<std::uint64_t>& cut : fullsync_cuts_) {
@@ -1253,15 +1249,13 @@ struct ReplicaSession {
 
   absl::Status InstallFullSyncCutVector() {
     std::lock_guard lock(fullsync_mutex_);
-    absl::Status complete = ValidateFullSyncCutVectorLocked();
-    if (!complete.ok()) return complete;
+    LAVIK_RETURN_IF_ERROR(ValidateFullSyncCutVectorLocked());
     std::vector<std::uint64_t> cut;
     cut.reserve(fullsync_cuts_.size());
     for (const std::optional<std::uint64_t>& next_lsn : fullsync_cuts_) {
       cut.push_back(*next_lsn);
     }
-    absl::Status installed = applied_frontier_->InstallNextLsns(cut);
-    if (!installed.ok()) return installed;
+    LAVIK_RETURN_IF_ERROR(applied_frontier_->InstallNextLsns(cut));
     for (unsigned flow = 0; flow < fullsync_cuts_.size(); ++flow) {
       flow_phases_[flow] = FlowProtocolPhase::kFullCutAwaitCursor;
     }

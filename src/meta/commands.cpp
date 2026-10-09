@@ -23,6 +23,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "lavik/meta/value_codec.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -46,16 +47,10 @@ absl::Status CheckCap(std::string_view field, std::size_t size,
 absl::Status WriteCommandHeader(MetaWriter& w, MetaCommandTag tag,
                                 const MetaRequestId& request_id,
                                 const ActorContext& actor) {
-  if (auto st = CheckCap("actor_principal", actor.principal_.size(),
-                         kMaxMetaPrincipalBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = CheckCap("readable_time", actor.readable_time_.size(),
-                         kMaxMetaActorReadableTimeBytes);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("actor_principal", actor.principal_.size(),
+                                 kMaxMetaPrincipalBytes));
+  LAVIK_RETURN_IF_ERROR(CheckCap("readable_time", actor.readable_time_.size(),
+                                 kMaxMetaActorReadableTimeBytes));
   w.WriteU16(static_cast<std::uint16_t>(tag));
   WriteFixedArray(w, request_id);
   WriteActorContext(w, actor);
@@ -65,7 +60,7 @@ absl::Status WriteCommandHeader(MetaWriter& w, MetaCommandTag tag,
 absl::StatusOr<std::string> ReadBoundedString(MetaReader& r,
                                               std::uint32_t cap) {
   auto raw = r.ReadString(cap);
-  if (!raw.ok()) return raw.status();
+  LAVIK_RETURN_IF_ERROR(raw.status());
   return std::string(*raw);
 }
 
@@ -76,9 +71,9 @@ struct MetaCommandHeader {
 
 absl::StatusOr<MetaCommandHeader> ReadCommandHeader(MetaReader& r) {
   auto request_id = ReadFixedArray<16>(r);
-  if (!request_id.ok()) return request_id.status();
+  LAVIK_RETURN_IF_ERROR(request_id.status());
   auto actor = ReadActorContext(r);
-  if (!actor.ok()) return actor.status();
+  LAVIK_RETURN_IF_ERROR(actor.status());
   MetaCommandHeader header;
   header.request_id_ = *request_id;
   header.actor_ = std::move(*actor);
@@ -90,10 +85,7 @@ absl::StatusOr<MetaCommandHeader> ReadCommandHeader(MetaReader& r) {
 // ---------------------------------------------------------------------------
 
 absl::Status WriteNodeId(MetaWriter& w, const std::string& node_id) {
-  if (auto st = CheckCap("node_id", node_id.size(), kMetaNodeIdBytes);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("node_id", node_id.size(), kMetaNodeIdBytes));
   w.WriteString(node_id);
   return absl::OkStatus();
 }
@@ -103,10 +95,8 @@ absl::StatusOr<std::string> ReadNodeId(MetaReader& r) {
 }
 
 absl::Status WriteGroupId(MetaWriter& w, const std::string& group_id) {
-  if (auto st = CheckCap("group_id", group_id.size(), kMaxMetaGroupIdBytes);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("group_id", group_id.size(), kMaxMetaGroupIdBytes));
   w.WriteString(group_id);
   return absl::OkStatus();
 }
@@ -117,16 +107,11 @@ absl::StatusOr<std::string> ReadGroupId(MetaReader& r) {
 
 absl::Status WriteEndpoints(MetaWriter& w,
                             const std::vector<std::string>& endpoints) {
-  if (auto st =
-          CheckCap("endpoints", endpoints.size(), kMaxMetaEndpointsPerNode);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("endpoints", endpoints.size(), kMaxMetaEndpointsPerNode));
   for (const std::string& ep : endpoints) {
-    if (auto st = CheckCap("endpoint", ep.size(), kMaxMetaEndpointBytes);
-        !st.ok()) {
-      return st;
-    }
+    LAVIK_RETURN_IF_ERROR(
+        CheckCap("endpoint", ep.size(), kMaxMetaEndpointBytes));
   }
   w.WriteList(endpoints, [](MetaWriter& ww, const std::string& ep) {
     ww.WriteString(ep);
@@ -147,7 +132,7 @@ absl::Status WriteRole(MetaWriter& w, MetaNodeRole role) {
 
 absl::StatusOr<MetaNodeRole> ReadRole(MetaReader& r) {
   auto role = r.ReadU8();
-  if (!role.ok()) return role.status();
+  LAVIK_RETURN_IF_ERROR(role.status());
   if (*role != static_cast<std::uint8_t>(MetaNodeRole::kPrimary) &&
       *role != static_cast<std::uint8_t>(MetaNodeRole::kReplica)) {
     return MetaFailStopError("unknown node role");
@@ -161,35 +146,29 @@ absl::StatusOr<MetaNodeRole> ReadRole(MetaReader& r) {
 // ---------------------------------------------------------------------------
 
 absl::Status WriteCommandBody(MetaWriter& w, const RegisterNode& cmd) {
-  if (auto st =
-          CheckCap("principal", cmd.principal_.size(), kMaxMetaPrincipalBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRegisterNode,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("principal", cmd.principal_.size(), kMaxMetaPrincipalBytes));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kRegisterNode,
+                                           cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteNodeId(w, cmd.node_id_));
   w.WriteString(cmd.principal_);
-  if (auto st = WriteEndpoints(w, cmd.endpoints_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteEndpoints(w, cmd.endpoints_));
 
   return WriteRole(w, cmd.role_);
 }
 
 absl::StatusOr<RegisterNode> ReadRegisterNodeBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
+  LAVIK_RETURN_IF_ERROR(node_id.status());
   auto principal = ReadBoundedString(r, kMaxMetaPrincipalBytes);
-  if (!principal.ok()) return principal.status();
+  LAVIK_RETURN_IF_ERROR(principal.status());
   auto endpoints = ReadEndpoints(r);
-  if (!endpoints.ok()) return endpoints.status();
+  LAVIK_RETURN_IF_ERROR(endpoints.status());
 
   auto role = ReadRole(r);
-  if (!role.ok()) return role.status();
+  LAVIK_RETURN_IF_ERROR(role.status());
   RegisterNode cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -202,14 +181,11 @@ absl::StatusOr<RegisterNode> ReadRegisterNodeBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const UpdateNode& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kUpdateNode,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kUpdateNode,
+                                           cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteNodeId(w, cmd.node_id_));
   w.WriteU64(cmd.expected_revision_);
-  if (auto st = WriteEndpoints(w, cmd.endpoints_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteEndpoints(w, cmd.endpoints_));
 
   w.WriteU64(cmd.new_topology_epoch_);
   return absl::OkStatus();
@@ -217,16 +193,16 @@ absl::Status WriteCommandBody(MetaWriter& w, const UpdateNode& cmd) {
 
 absl::StatusOr<UpdateNode> ReadUpdateNodeBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
+  LAVIK_RETURN_IF_ERROR(node_id.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   auto endpoints = ReadEndpoints(r);
-  if (!endpoints.ok()) return endpoints.status();
+  LAVIK_RETURN_IF_ERROR(endpoints.status());
 
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   UpdateNode cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -239,23 +215,20 @@ absl::StatusOr<UpdateNode> ReadUpdateNodeBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const RetireNode& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRetireNode,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kRetireNode,
+                                           cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteNodeId(w, cmd.node_id_));
   w.WriteU64(cmd.expected_revision_);
   return absl::OkStatus();
 }
 
 absl::StatusOr<RetireNode> ReadRetireNodeBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
+  LAVIK_RETURN_IF_ERROR(node_id.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   RetireNode cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -265,23 +238,20 @@ absl::StatusOr<RetireNode> ReadRetireNodeBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const CreateGroup& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kCreateGroup,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kCreateGroup,
+                                           cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
   w.WriteU64(cmd.new_topology_epoch_);
   return absl::OkStatus();
 }
 
 absl::StatusOr<CreateGroup> ReadCreateGroupBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   CreateGroup cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -295,15 +265,12 @@ absl::Status WriteCommandBody(MetaWriter& w, const AssignNodeToGroup& cmd) {
                   [](std::uint8_t byte) { return byte == 0; })) {
     return MetaDomainRejectError("assignment_id must not be zero");
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kAssignNodeToGroup,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kAssignNodeToGroup, cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
+  LAVIK_RETURN_IF_ERROR(WriteNodeId(w, cmd.node_id_));
   WriteFixedArray(w, cmd.assignment_id_);
-  if (auto st = WriteRole(w, cmd.role_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteRole(w, cmd.role_));
   w.WriteU64(cmd.expected_revision_);
   w.WriteU64(cmd.new_topology_epoch_);
   return absl::OkStatus();
@@ -311,19 +278,19 @@ absl::Status WriteCommandBody(MetaWriter& w, const AssignNodeToGroup& cmd) {
 
 absl::StatusOr<AssignNodeToGroup> ReadAssignNodeToGroupBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
+  LAVIK_RETURN_IF_ERROR(node_id.status());
   auto assignment_id = ReadFixedArray<16>(r);
-  if (!assignment_id.ok()) return assignment_id.status();
+  LAVIK_RETURN_IF_ERROR(assignment_id.status());
   auto role = ReadRole(r);
-  if (!role.ok()) return role.status();
+  LAVIK_RETURN_IF_ERROR(role.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   AssignNodeToGroup cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -337,13 +304,10 @@ absl::StatusOr<AssignNodeToGroup> ReadAssignNodeToGroupBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const RemoveNodeFromGroup& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRemoveNodeFromGroup,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kRemoveNodeFromGroup, cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
+  LAVIK_RETURN_IF_ERROR(WriteNodeId(w, cmd.node_id_));
   w.WriteU64(cmd.expected_revision_);
   w.WriteU64(cmd.new_topology_epoch_);
   return absl::OkStatus();
@@ -351,15 +315,15 @@ absl::Status WriteCommandBody(MetaWriter& w, const RemoveNodeFromGroup& cmd) {
 
 absl::StatusOr<RemoveNodeFromGroup> ReadRemoveNodeFromGroupBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
+  LAVIK_RETURN_IF_ERROR(node_id.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   RemoveNodeFromGroup cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -382,23 +346,15 @@ absl::Status CheckSlotRange(const MetaSlotAssignment& range) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const SetSlotMap& cmd) {
-  if (auto st = CheckCap("ranges", cmd.ranges_.size(), kMaxMetaSlotRangeCount);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("ranges", cmd.ranges_.size(), kMaxMetaSlotRangeCount));
   for (const MetaSlotAssignment& range : cmd.ranges_) {
-    if (auto st = CheckSlotRange(range); !st.ok()) return st;
-    if (auto st = CheckCap("range group_id", range.group_id_.size(),
-                           kMaxMetaGroupIdBytes);
-        !st.ok()) {
-      return st;
-    }
+    LAVIK_RETURN_IF_ERROR(CheckSlotRange(range));
+    LAVIK_RETURN_IF_ERROR(CheckCap("range group_id", range.group_id_.size(),
+                                   kMaxMetaGroupIdBytes));
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetSlotMap,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kSetSlotMap,
+                                           cmd.request_id_, cmd.actor_));
   w.WriteList(cmd.ranges_, [](MetaWriter& ww, const MetaSlotAssignment& range) {
     ww.WriteU16(range.first_slot_);
     ww.WriteU16(range.last_slot_);
@@ -410,26 +366,26 @@ absl::Status WriteCommandBody(MetaWriter& w, const SetSlotMap& cmd) {
 
 absl::StatusOr<MetaSlotAssignment> ReadSlotAssignment(MetaReader& r) {
   auto first = r.ReadU16();
-  if (!first.ok()) return first.status();
+  LAVIK_RETURN_IF_ERROR(first.status());
   auto last = r.ReadU16();
-  if (!last.ok()) return last.status();
+  LAVIK_RETURN_IF_ERROR(last.status());
   if (*first > *last || *last >= kMetaSlotCount) {
     return MetaFailStopError("slot range out of bounds");
   }
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   return MetaSlotAssignment{*first, *last, std::move(*group_id)};
 }
 
 absl::StatusOr<SetSlotMap> ReadSetSlotMapBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto ranges = r.ReadList<MetaSlotAssignment>(
       kMaxMetaSlotRangeCount,
       [](MetaReader& rr) { return ReadSlotAssignment(rr); });
-  if (!ranges.ok()) return ranges.status();
+  LAVIK_RETURN_IF_ERROR(ranges.status());
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   SetSlotMap cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -440,12 +396,10 @@ absl::StatusOr<SetSlotMap> ReadSetSlotMapBody(MetaReader& r) {
 
 absl::Status WriteCommandBody(MetaWriter& w,
                               const SetGroupReplicationState& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetGroupReplicationState,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(w, MetaCommandTag::kSetGroupReplicationState,
+                         cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
   w.WriteU64(cmd.expected_population_manifest_revision_);
   WriteFixedArray(w, cmd.expected_population_manifest_digest_);
   w.WriteU64(cmd.new_population_manifest_revision_);
@@ -459,23 +413,23 @@ absl::Status WriteCommandBody(MetaWriter& w,
 absl::StatusOr<SetGroupReplicationState> ReadSetGroupReplicationStateBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto expected_manifest = r.ReadU64();
-  if (!expected_manifest.ok()) return expected_manifest.status();
+  LAVIK_RETURN_IF_ERROR(expected_manifest.status());
   auto expected_manifest_digest = ReadFixedArray<32>(r);
-  if (!expected_manifest_digest.ok()) return expected_manifest_digest.status();
+  LAVIK_RETURN_IF_ERROR(expected_manifest_digest.status());
   auto new_manifest = r.ReadU64();
-  if (!new_manifest.ok()) return new_manifest.status();
+  LAVIK_RETURN_IF_ERROR(new_manifest.status());
   auto new_manifest_digest = ReadFixedArray<32>(r);
-  if (!new_manifest_digest.ok()) return new_manifest_digest.status();
+  LAVIK_RETURN_IF_ERROR(new_manifest_digest.status());
   auto expected_partition = r.ReadU64();
-  if (!expected_partition.ok()) return expected_partition.status();
+  LAVIK_RETURN_IF_ERROR(expected_partition.status());
   auto new_partition = r.ReadU64();
-  if (!new_partition.ok()) return new_partition.status();
+  LAVIK_RETURN_IF_ERROR(new_partition.status());
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   SetGroupReplicationState cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -547,10 +501,7 @@ absl::Status ValidateFailoverAction(const MetaFailoverCandidateAction& action) {
   if (IsZero(action.action_id_)) {
     return MetaDomainRejectError("failover action id is zero");
   }
-  if (auto status = ValidateFailoverCandidate(action.candidate_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverCandidate(action.candidate_));
   if (action.operator_recovery_) {
     if (action.domain_ != MetaFailoverCompatibilityDomain{} ||
         (action.authorization_.has_value() &&
@@ -560,10 +511,8 @@ absl::Status ValidateFailoverAction(const MetaFailoverCandidateAction& action) {
           "operator recovery cannot claim a source frontier or lossless "
           "cutover");
     }
-  } else if (auto status = ValidateFailoverDomain(action.domain_);
-             !status.ok()) {
-    return status;
-  }
+  } else
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverDomain(action.domain_));
   if (action.authorization_.has_value()) {
     return ValidateFailoverAuthorization(*action.authorization_);
   }
@@ -598,10 +547,8 @@ absl::Status ValidateFailoverTransitionImpl(
     return MetaDomainRejectError("invalid failover transition mode");
   }
   if (transition.candidate_action_.has_value()) {
-    if (auto status = ValidateFailoverAction(*transition.candidate_action_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(
+        ValidateFailoverAction(*transition.candidate_action_));
     const MetaFailoverCandidateAction& action = *transition.candidate_action_;
     if (action.domain_.source_group_term_ >= transition.target_term_) {
       return MetaDomainRejectError(
@@ -630,10 +577,8 @@ absl::Status ValidateFailoverTransitionImpl(
       return MetaDomainRejectError(
           "only uncontrolled failover may collect recovery events");
     }
-    if (auto status =
-            ValidateFailoverDeadline(*transition.recovery_deadline_unix_ms_);
-        !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(
+        ValidateFailoverDeadline(*transition.recovery_deadline_unix_ms_));
   }
 
   if (transition.mode_ == MetaFailoverMode::kControlled) {
@@ -645,11 +590,8 @@ absl::Status ValidateFailoverTransitionImpl(
     if (IsZero(transition.controlled_->operation_id_)) {
       return MetaDomainRejectError("controlled failover operation id is zero");
     }
-    if (auto status = ValidateFailoverDeadline(
-            transition.controlled_->absolute_deadline_unix_ms_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverDeadline(
+        transition.controlled_->absolute_deadline_unix_ms_));
     const MetaFailoverCandidateAction& action = *transition.candidate_action_;
     if (action.operator_recovery_ ||
         action.candidate_.node_id_ == action.domain_.source_node_id_) {
@@ -683,18 +625,15 @@ void WriteFailoverCandidateUnchecked(MetaWriter& writer,
 absl::StatusOr<MetaFailoverCandidate> ReadFailoverCandidate(
     MetaReader& reader) {
   auto node_id = ReadNodeId(reader);
-  if (!node_id.ok()) return node_id.status();
+  LAVIK_RETURN_IF_ERROR(node_id.status());
   auto assignment_id = ReadFixedArray<16>(reader);
-  if (!assignment_id.ok()) return assignment_id.status();
+  LAVIK_RETURN_IF_ERROR(assignment_id.status());
   auto boot_id = ReadFixedArray<kMetaBootIncarnationBytes>(reader);
-  if (!boot_id.ok()) return boot_id.status();
+  LAVIK_RETURN_IF_ERROR(boot_id.status());
   MetaFailoverCandidate candidate{std::move(*node_id), *assignment_id,
                                   *boot_id};
-  if (auto status =
-          FailStopDecodedFailover(ValidateFailoverCandidate(candidate));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      FailStopDecodedFailover(ValidateFailoverCandidate(candidate)));
   return candidate;
 }
 
@@ -711,25 +650,23 @@ void WriteFailoverDomainUnchecked(
 absl::StatusOr<MetaFailoverCompatibilityDomain> ReadFailoverDomain(
     MetaReader& reader) {
   auto source_group_term = reader.ReadU64();
-  if (!source_group_term.ok()) return source_group_term.status();
+  LAVIK_RETURN_IF_ERROR(source_group_term.status());
   auto source_node_id = ReadNodeId(reader);
-  if (!source_node_id.ok()) return source_node_id.status();
+  LAVIK_RETURN_IF_ERROR(source_node_id.status());
   auto source_assignment_id = ReadFixedArray<16>(reader);
-  if (!source_assignment_id.ok()) return source_assignment_id.status();
+  LAVIK_RETURN_IF_ERROR(source_assignment_id.status());
   auto source_boot_id = ReadFixedArray<kMetaBootIncarnationBytes>(reader);
-  if (!source_boot_id.ok()) return source_boot_id.status();
+  LAVIK_RETURN_IF_ERROR(source_boot_id.status());
   auto source_history_id =
       ReadFixedArray<kMetaReplicationHistoryIdBytes>(reader);
-  if (!source_history_id.ok()) return source_history_id.status();
+  LAVIK_RETURN_IF_ERROR(source_history_id.status());
   auto flow_count = reader.ReadU32();
-  if (!flow_count.ok()) return flow_count.status();
+  LAVIK_RETURN_IF_ERROR(flow_count.status());
   MetaFailoverCompatibilityDomain domain{
       *source_group_term, std::move(*source_node_id), *source_assignment_id,
       *source_boot_id,    *source_history_id,         *flow_count};
-  if (auto status = FailStopDecodedFailover(ValidateFailoverDomain(domain));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      FailStopDecodedFailover(ValidateFailoverDomain(domain)));
   return domain;
 }
 
@@ -742,16 +679,13 @@ void WriteFailoverAuthorizationUnchecked(
 absl::StatusOr<MetaFailoverAuthorization> ReadFailoverAuthorization(
     MetaReader& reader) {
   auto revision = reader.ReadU64();
-  if (!revision.ok()) return revision.status();
+  LAVIK_RETURN_IF_ERROR(revision.status());
   auto loss = reader.ReadU8();
-  if (!loss.ok()) return loss.status();
+  LAVIK_RETURN_IF_ERROR(loss.status());
   MetaFailoverAuthorization authorization{*revision,
                                           static_cast<MetaFailoverLoss>(*loss)};
-  if (auto status =
-          FailStopDecodedFailover(ValidateFailoverAuthorization(authorization));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      FailStopDecodedFailover(ValidateFailoverAuthorization(authorization)));
   return authorization;
 }
 
@@ -772,28 +706,26 @@ void WriteFailoverActionUnchecked(MetaWriter& writer,
 absl::StatusOr<MetaFailoverCandidateAction> ReadFailoverAction(
     MetaReader& reader) {
   auto action_id = ReadFixedArray<16>(reader);
-  if (!action_id.ok()) return action_id.status();
+  LAVIK_RETURN_IF_ERROR(action_id.status());
   auto candidate = ReadFailoverCandidate(reader);
-  if (!candidate.ok()) return candidate.status();
+  LAVIK_RETURN_IF_ERROR(candidate.status());
   auto operator_recovery = reader.ReadU8();
-  if (!operator_recovery.ok()) return operator_recovery.status();
+  LAVIK_RETURN_IF_ERROR(operator_recovery.status());
   if (*operator_recovery > 1)
     return FailStopDecodedFailover(
         MetaDomainRejectError("invalid operator recovery flag"));
   absl::StatusOr<MetaFailoverCompatibilityDomain> domain =
       MetaFailoverCompatibilityDomain{};
   if (*operator_recovery == 0) domain = ReadFailoverDomain(reader);
-  if (!domain.ok()) return domain.status();
+  LAVIK_RETURN_IF_ERROR(domain.status());
   auto authorization = reader.ReadOptional<MetaFailoverAuthorization>(
       [](MetaReader& nested) { return ReadFailoverAuthorization(nested); });
-  if (!authorization.ok()) return authorization.status();
+  LAVIK_RETURN_IF_ERROR(authorization.status());
   MetaFailoverCandidateAction action{
       *action_id, std::move(*candidate), std::move(*domain),
       std::move(*authorization), *operator_recovery != 0};
-  if (auto status = FailStopDecodedFailover(ValidateFailoverAction(action));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      FailStopDecodedFailover(ValidateFailoverAction(action)));
   return action;
 }
 
@@ -806,15 +738,12 @@ void WriteFailoverTransitionRefUnchecked(
 absl::StatusOr<MetaFailoverTransitionRef> ReadFailoverTransitionRef(
     MetaReader& reader) {
   auto transition_id = ReadFixedArray<16>(reader);
-  if (!transition_id.ok()) return transition_id.status();
+  LAVIK_RETURN_IF_ERROR(transition_id.status());
   auto revision = reader.ReadU64();
-  if (!revision.ok()) return revision.status();
+  LAVIK_RETURN_IF_ERROR(revision.status());
   MetaFailoverTransitionRef transition{*transition_id, *revision};
-  if (auto status =
-          FailStopDecodedFailover(ValidateFailoverTransitionRef(transition));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      FailStopDecodedFailover(ValidateFailoverTransitionRef(transition)));
   return transition;
 }
 
@@ -844,28 +773,28 @@ void WriteFailoverTransitionUnchecked(
 absl::StatusOr<MetaFailoverTransition> ReadFailoverTransitionUnchecked(
     MetaReader& reader) {
   auto transition_id = ReadFixedArray<16>(reader);
-  if (!transition_id.ok()) return transition_id.status();
+  LAVIK_RETURN_IF_ERROR(transition_id.status());
   auto revision = reader.ReadU64();
-  if (!revision.ok()) return revision.status();
+  LAVIK_RETURN_IF_ERROR(revision.status());
   auto mode = reader.ReadU8();
-  if (!mode.ok()) return mode.status();
+  LAVIK_RETURN_IF_ERROR(mode.status());
   auto target_term = reader.ReadU64();
-  if (!target_term.ok()) return target_term.status();
+  LAVIK_RETURN_IF_ERROR(target_term.status());
   auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
       [](MetaReader& nested) { return ReadFailoverAction(nested); });
-  if (!action.ok()) return action.status();
+  LAVIK_RETURN_IF_ERROR(action.status());
   auto controlled = reader.ReadOptional<MetaControlledFailover>(
       [](MetaReader& nested) -> absl::StatusOr<MetaControlledFailover> {
         auto operation_id = ReadFixedArray<16>(nested);
-        if (!operation_id.ok()) return operation_id.status();
+        LAVIK_RETURN_IF_ERROR(operation_id.status());
         auto deadline = nested.ReadU64();
-        if (!deadline.ok()) return deadline.status();
+        LAVIK_RETURN_IF_ERROR(deadline.status());
         return MetaControlledFailover{*operation_id, *deadline};
       });
-  if (!controlled.ok()) return controlled.status();
+  LAVIK_RETURN_IF_ERROR(controlled.status());
   auto recovery_deadline = reader.ReadOptional<std::uint64_t>(
       [](MetaReader& nested) { return nested.ReadU64(); });
-  if (!recovery_deadline.ok()) return recovery_deadline.status();
+  LAVIK_RETURN_IF_ERROR(recovery_deadline.status());
   return MetaFailoverTransition{
       *transition_id,
       *revision,
@@ -907,19 +836,19 @@ void WriteFailoverGroupAnchorsUnchecked(MetaWriter& writer,
 template <typename Command>
 absl::Status ReadFailoverGroupAnchors(MetaReader& reader, Command& command) {
   auto owner_node_id = ReadNodeId(reader);
-  if (!owner_node_id.ok()) return owner_node_id.status();
+  LAVIK_RETURN_IF_ERROR(owner_node_id.status());
   auto owner_assignment_id = ReadFixedArray<16>(reader);
-  if (!owner_assignment_id.ok()) return owner_assignment_id.status();
+  LAVIK_RETURN_IF_ERROR(owner_assignment_id.status());
   auto membership_revision = reader.ReadU64();
-  if (!membership_revision.ok()) return membership_revision.status();
+  LAVIK_RETURN_IF_ERROR(membership_revision.status());
   auto group_term = reader.ReadU64();
-  if (!group_term.ok()) return group_term.status();
+  LAVIK_RETURN_IF_ERROR(group_term.status());
   auto manifest_revision = reader.ReadU64();
-  if (!manifest_revision.ok()) return manifest_revision.status();
+  LAVIK_RETURN_IF_ERROR(manifest_revision.status());
   auto manifest_digest = ReadFixedArray<32>(reader);
-  if (!manifest_digest.ok()) return manifest_digest.status();
+  LAVIK_RETURN_IF_ERROR(manifest_digest.status());
   auto partition_epoch = reader.ReadU64();
-  if (!partition_epoch.ok()) return partition_epoch.status();
+  LAVIK_RETURN_IF_ERROR(partition_epoch.status());
 
   command.expected_owner_node_id_ = std::move(*owner_node_id);
   command.expected_owner_assignment_id_ = *owner_assignment_id;
@@ -950,15 +879,11 @@ absl::Status ValidateFailoverReason(std::string_view reason) {
 
 template <typename Command>
 absl::Status ValidateFailoverBeginBase(const Command& command) {
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
   if (IsZero(command.transition_id_)) {
     return MetaDomainRejectError("failover transition id is zero");
   }
-  if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupAnchors(command));
   if (command.expected_group_term_ ==
           std::numeric_limits<std::uint64_t>::max() ||
       command.target_term_ != command.expected_group_term_ + 1) {
@@ -969,13 +894,8 @@ absl::Status ValidateFailoverBeginBase(const Command& command) {
 }
 
 absl::Status ValidateCommand(const BeginControlledFailover& command) {
-  if (auto status = ValidateFailoverBeginBase(command); !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverAction(command.candidate_action_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverBeginBase(command));
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverAction(command.candidate_action_));
   if (command.candidate_action_.authorization_.has_value()) {
     return MetaDomainRejectError(
         "controlled failover begin action must be unauthorized");
@@ -994,18 +914,13 @@ absl::Status ValidateCommand(const BeginControlledFailover& command) {
     return MetaDomainRejectError(
         "controlled failover domain does not match the owner anchor");
   }
-  if (auto status = ValidateFailoverOperation(
-          command.operation_id_, command.expected_operation_revision_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverOperation(
+      command.operation_id_, command.expected_operation_revision_));
   return ValidateFailoverDeadline(command.absolute_deadline_unix_ms_);
 }
 
 absl::Status ValidateCommand(const BeginUncontrolledFailover& command) {
-  if (auto status = ValidateFailoverBeginBase(command); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverBeginBase(command));
   if (static_cast<std::uint8_t>(command.trigger_reason_) >
       static_cast<std::uint8_t>(
           MetaAutomaticFailoverReason::kPopulationUnready)) {
@@ -1018,10 +933,7 @@ absl::Status ValidateCommand(const BeginUncontrolledFailover& command) {
       return MetaDomainRejectError(
           "automatic uncontrolled failover begin must be candidate-less");
     }
-    if (auto status = ValidateFailoverAction(*command.candidate_action_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverAction(*command.candidate_action_));
     if (command.candidate_action_->authorization_.has_value()) {
       return MetaDomainRejectError(
           "uncontrolled failover begin action must be unauthorized");
@@ -1048,29 +960,19 @@ absl::Status ValidateCommand(const BeginUncontrolledFailover& command) {
       return MetaDomainRejectError(
           "only automatic failover may preempt a controlled operation");
     }
-    if (auto status = ValidateFailoverOperation(
-            *command.preempted_operation_id_,
-            *command.expected_preempted_operation_revision_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverOperation(
+        *command.preempted_operation_id_,
+        *command.expected_preempted_operation_revision_));
   }
   return absl::OkStatus();
 }
 
 absl::Status ValidateCommand(const SetUncontrolledCandidate& command) {
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
+  LAVIK_RETURN_IF_ERROR(
+      ValidateFailoverTransitionRef(command.expected_transition_));
   if (command.candidate_action_.has_value()) {
-    if (auto status = ValidateFailoverAction(*command.candidate_action_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverAction(*command.candidate_action_));
     if (command.candidate_action_->authorization_.has_value()) {
       return MetaDomainRejectError(
           "candidate replacement must not carry authorization");
@@ -1080,24 +982,18 @@ absl::Status ValidateCommand(const SetUncontrolledCandidate& command) {
 }
 
 absl::Status ValidateCommand(const StartCandidateRecovery& command) {
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok())
-    return status;
-  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
-      !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
+  LAVIK_RETURN_IF_ERROR(
+      ValidateFailoverTransitionRef(command.expected_transition_));
   if (IsZero(command.action_id_))
     return MetaDomainRejectError("recovery action id is zero");
   return ValidateFailoverDeadline(command.recovery_deadline_unix_ms_);
 }
 
 absl::Status ValidateCommand(const AuthorizeFailoverPrepare& command) {
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
+  LAVIK_RETURN_IF_ERROR(
+      ValidateFailoverTransitionRef(command.expected_transition_));
   if (IsZero(command.action_id_) ||
       !IsValidFailoverLoss(command.loss_if_cutover_)) {
     return MetaDomainRejectError("invalid failover authorization command");
@@ -1106,43 +1002,26 @@ absl::Status ValidateCommand(const AuthorizeFailoverPrepare& command) {
 }
 
 absl::Status ValidateCommand(const AbortControlledFailover& command) {
-  if (auto status = ValidateFailoverOperation(
-          command.operation_id_, command.expected_operation_revision_);
-      !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverOperation(
+      command.operation_id_, command.expected_operation_revision_));
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
   if (command.expected_transition_.has_value()) {
-    if (auto status =
-            ValidateFailoverTransitionRef(*command.expected_transition_);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(
+        ValidateFailoverTransitionRef(*command.expected_transition_));
   }
   return ValidateFailoverReason(command.reason_);
 }
 
 absl::Status ValidateCommand(const DegradeControlledFailover& command) {
-  if (auto status = ValidateFailoverOperation(
-          command.operation_id_, command.expected_operation_revision_);
-      !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverOperation(
+      command.operation_id_, command.expected_operation_revision_));
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
+  LAVIK_RETURN_IF_ERROR(
+      ValidateFailoverTransitionRef(command.expected_transition_));
   if (command.expected_candidate_action_.has_value()) {
     const MetaFailoverCandidateAction& action =
         *command.expected_candidate_action_;
-    if (auto status = ValidateFailoverAction(action); !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(ValidateFailoverAction(action));
     if (action.candidate_.node_id_ == action.domain_.source_node_id_ ||
         (action.authorization_.has_value() &&
          action.authorization_->loss_if_cutover_ != MetaFailoverLoss::kNone) ||
@@ -1166,24 +1045,15 @@ absl::Status ValidateCommand(const DegradeControlledFailover& command) {
 
 template <typename Command>
 absl::Status ValidateFailoverCommitBase(const Command& command) {
-  if (auto status = ValidateFailoverGroupId(command.group_id_); !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverTransitionRef(command.expected_transition_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupId(command.group_id_));
+  LAVIK_RETURN_IF_ERROR(
+      ValidateFailoverTransitionRef(command.expected_transition_));
   if (IsZero(command.action_id_) || command.authorized_revision_ == 0 ||
       command.authorized_revision_ > command.expected_transition_.revision_) {
     return MetaDomainRejectError("invalid failover commit authorization CAS");
   }
-  if (auto status = ValidateFailoverCandidate(command.expected_candidate_);
-      !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverGroupAnchors(command); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverCandidate(command.expected_candidate_));
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverGroupAnchors(command));
   if (command.new_topology_epoch_ == 0) {
     return MetaDomainRejectError("invalid failover cutover topology epoch");
   }
@@ -1191,14 +1061,9 @@ absl::Status ValidateFailoverCommitBase(const Command& command) {
 }
 
 absl::Status ValidateCommand(const CommitControlledFailover& command) {
-  if (auto status = ValidateFailoverCommitBase(command); !status.ok()) {
-    return status;
-  }
-  if (auto status = ValidateFailoverOperation(
-          command.operation_id_, command.expected_operation_revision_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverCommitBase(command));
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverOperation(
+      command.operation_id_, command.expected_operation_revision_));
   if (command.expected_candidate_.node_id_ == command.expected_owner_node_id_) {
     return MetaDomainRejectError(
         "controlled failover candidate must differ from owner");
@@ -1211,9 +1076,7 @@ absl::Status ValidateCommand(const CommitControlledFailover& command) {
 }
 
 absl::Status ValidateCommand(const CommitUncontrolledFailover& command) {
-  if (auto status = ValidateFailoverCommitBase(command); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverCommitBase(command));
   if (!IsValidFailoverLoss(command.loss_if_cutover_)) {
     return MetaDomainRejectError("invalid uncontrolled failover loss result");
   }
@@ -1235,38 +1098,31 @@ void WriteFailoverCommitBaseUnchecked(MetaWriter& writer,
 template <typename Command>
 absl::Status ReadFailoverCommitBase(MetaReader& reader, Command& command) {
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition = ReadFailoverTransitionRef(reader);
-  if (!transition.ok()) return transition.status();
+  LAVIK_RETURN_IF_ERROR(transition.status());
   auto action_id = ReadFixedArray<16>(reader);
-  if (!action_id.ok()) return action_id.status();
+  LAVIK_RETURN_IF_ERROR(action_id.status());
   auto authorized_revision = reader.ReadU64();
-  if (!authorized_revision.ok()) return authorized_revision.status();
+  LAVIK_RETURN_IF_ERROR(authorized_revision.status());
   auto candidate = ReadFailoverCandidate(reader);
-  if (!candidate.ok()) return candidate.status();
+  LAVIK_RETURN_IF_ERROR(candidate.status());
   command.group_id_ = std::move(*group_id);
   command.expected_transition_ = *transition;
   command.action_id_ = *action_id;
   command.authorized_revision_ = *authorized_revision;
   command.expected_candidate_ = std::move(*candidate);
-  if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
-    return status;
-  }
-  auto topology_epoch = reader.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
-  command.new_topology_epoch_ = *topology_epoch;
+  LAVIK_RETURN_IF_ERROR(ReadFailoverGroupAnchors(reader, command));
+  LAVIK_ASSIGN_OR_RETURN(command.new_topology_epoch_, reader.ReadU64());
   return absl::OkStatus();
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const BeginControlledFailover& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kBeginControlledFailover,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kBeginControlledFailover,
+                         command.request_id_, command.actor_));
   writer.WriteString(command.group_id_);
   WriteFixedArray(writer, command.transition_id_);
   writer.WriteU64(command.target_term_);
@@ -1281,21 +1137,21 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<BeginControlledFailover> ReadBeginControlledFailoverBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition_id = ReadFixedArray<16>(reader);
-  if (!transition_id.ok()) return transition_id.status();
+  LAVIK_RETURN_IF_ERROR(transition_id.status());
   auto target_term = reader.ReadU64();
-  if (!target_term.ok()) return target_term.status();
+  LAVIK_RETURN_IF_ERROR(target_term.status());
   auto action = ReadFailoverAction(reader);
-  if (!action.ok()) return action.status();
+  LAVIK_RETURN_IF_ERROR(action.status());
   auto operation_id = ReadFixedArray<16>(reader);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto operation_revision = reader.ReadU64();
-  if (!operation_revision.ok()) return operation_revision.status();
+  LAVIK_RETURN_IF_ERROR(operation_revision.status());
   auto deadline = reader.ReadU64();
-  if (!deadline.ok()) return deadline.status();
+  LAVIK_RETURN_IF_ERROR(deadline.status());
   BeginControlledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
@@ -1306,25 +1162,17 @@ absl::StatusOr<BeginControlledFailover> ReadBeginControlledFailoverBody(
   command.operation_id_ = *operation_id;
   command.expected_operation_revision_ = *operation_revision;
   command.absolute_deadline_unix_ms_ = *deadline;
-  if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
-    return status;
-  }
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ReadFailoverGroupAnchors(reader, command));
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const BeginUncontrolledFailover& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kBeginUncontrolledFailover,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kBeginUncontrolledFailover,
+                         command.request_id_, command.actor_));
   writer.WriteString(command.group_id_);
   WriteFixedArray(writer, command.transition_id_);
   writer.WriteU64(command.target_term_);
@@ -1348,30 +1196,30 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<BeginUncontrolledFailover> ReadBeginUncontrolledFailoverBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition_id = ReadFixedArray<16>(reader);
-  if (!transition_id.ok()) return transition_id.status();
+  LAVIK_RETURN_IF_ERROR(transition_id.status());
   auto target_term = reader.ReadU64();
-  if (!target_term.ok()) return target_term.status();
+  LAVIK_RETURN_IF_ERROR(target_term.status());
   auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
       [](MetaReader& nested) { return ReadFailoverAction(nested); });
-  if (!action.ok()) return action.status();
+  LAVIK_RETURN_IF_ERROR(action.status());
   auto trigger_reason = reader.ReadU8();
-  if (!trigger_reason.ok()) return trigger_reason.status();
+  LAVIK_RETURN_IF_ERROR(trigger_reason.status());
   auto suspect_duration_ms = reader.ReadU64();
-  if (!suspect_duration_ms.ok()) return suspect_duration_ms.status();
+  LAVIK_RETURN_IF_ERROR(suspect_duration_ms.status());
   using PreemptedOperation = std::pair<MetaOperationId, std::uint64_t>;
   auto preempted_operation = reader.ReadOptional<PreemptedOperation>(
       [](MetaReader& nested) -> absl::StatusOr<PreemptedOperation> {
         auto operation_id = ReadFixedArray<16>(nested);
-        if (!operation_id.ok()) return operation_id.status();
+        LAVIK_RETURN_IF_ERROR(operation_id.status());
         auto expected_revision = nested.ReadU64();
-        if (!expected_revision.ok()) return expected_revision.status();
+        LAVIK_RETURN_IF_ERROR(expected_revision.status());
         return PreemptedOperation{*operation_id, *expected_revision};
       });
-  if (!preempted_operation.ok()) return preempted_operation.status();
+  LAVIK_RETURN_IF_ERROR(preempted_operation.status());
   BeginUncontrolledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
@@ -1387,25 +1235,17 @@ absl::StatusOr<BeginUncontrolledFailover> ReadBeginUncontrolledFailoverBody(
     command.expected_preempted_operation_revision_ =
         (*preempted_operation)->second;
   }
-  if (auto status = ReadFailoverGroupAnchors(reader, command); !status.ok()) {
-    return status;
-  }
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ReadFailoverGroupAnchors(reader, command));
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const SetUncontrolledCandidate& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kSetUncontrolledCandidate,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kSetUncontrolledCandidate,
+                         command.request_id_, command.actor_));
   writer.WriteString(command.group_id_);
   WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
   writer.WriteOptional(
@@ -1419,35 +1259,30 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<SetUncontrolledCandidate> ReadSetUncontrolledCandidateBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition = ReadFailoverTransitionRef(reader);
-  if (!transition.ok()) return transition.status();
+  LAVIK_RETURN_IF_ERROR(transition.status());
   auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
       [](MetaReader& nested) { return ReadFailoverAction(nested); });
-  if (!action.ok()) return action.status();
+  LAVIK_RETURN_IF_ERROR(action.status());
   SetUncontrolledCandidate command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
   command.group_id_ = std::move(*group_id);
   command.expected_transition_ = *transition;
   command.candidate_action_ = std::move(*action);
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const StartCandidateRecovery& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kStartCandidateRecovery,
-                             command.request_id_, command.actor_);
-      !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kStartCandidateRecovery,
+                         command.request_id_, command.actor_));
   writer.WriteString(command.group_id_);
   WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
   WriteFixedArray(writer, command.action_id_);
@@ -1458,36 +1293,31 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<StartCandidateRecovery> ReadStartCandidateRecoveryBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group = ReadGroupId(reader);
-  if (!group.ok()) return group.status();
+  LAVIK_RETURN_IF_ERROR(group.status());
   auto transition = ReadFailoverTransitionRef(reader);
-  if (!transition.ok()) return transition.status();
+  LAVIK_RETURN_IF_ERROR(transition.status());
   auto action = ReadFixedArray<16>(reader);
-  if (!action.ok()) return action.status();
+  LAVIK_RETURN_IF_ERROR(action.status());
   auto deadline = reader.ReadU64();
-  if (!deadline.ok()) return deadline.status();
+  LAVIK_RETURN_IF_ERROR(deadline.status());
   StartCandidateRecovery command{header->request_id_,
                                  std::move(header->actor_),
                                  std::move(*group),
                                  *transition,
                                  *action,
                                  *deadline};
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const AuthorizeFailoverPrepare& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kAuthorizeFailoverPrepare,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kAuthorizeFailoverPrepare,
+                         command.request_id_, command.actor_));
   writer.WriteString(command.group_id_);
   WriteFailoverTransitionRefUnchecked(writer, command.expected_transition_);
   WriteFixedArray(writer, command.action_id_);
@@ -1498,15 +1328,15 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<AuthorizeFailoverPrepare> ReadAuthorizeFailoverPrepareBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition = ReadFailoverTransitionRef(reader);
-  if (!transition.ok()) return transition.status();
+  LAVIK_RETURN_IF_ERROR(transition.status());
   auto action_id = ReadFixedArray<16>(reader);
-  if (!action_id.ok()) return action_id.status();
+  LAVIK_RETURN_IF_ERROR(action_id.status());
   auto loss = reader.ReadU8();
-  if (!loss.ok()) return loss.status();
+  LAVIK_RETURN_IF_ERROR(loss.status());
   AuthorizeFailoverPrepare command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
@@ -1514,22 +1344,16 @@ absl::StatusOr<AuthorizeFailoverPrepare> ReadAuthorizeFailoverPrepareBody(
   command.expected_transition_ = *transition;
   command.action_id_ = *action_id;
   command.loss_if_cutover_ = static_cast<MetaFailoverLoss>(*loss);
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const AbortControlledFailover& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kAbortControlledFailover,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kAbortControlledFailover,
+                         command.request_id_, command.actor_));
   WriteFixedArray(writer, command.operation_id_);
   writer.WriteU64(command.expected_operation_revision_);
   writer.WriteString(command.group_id_);
@@ -1545,18 +1369,18 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<AbortControlledFailover> ReadAbortControlledFailoverBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(reader);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto operation_revision = reader.ReadU64();
-  if (!operation_revision.ok()) return operation_revision.status();
+  LAVIK_RETURN_IF_ERROR(operation_revision.status());
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition = reader.ReadOptional<MetaFailoverTransitionRef>(
       [](MetaReader& nested) { return ReadFailoverTransitionRef(nested); });
-  if (!transition.ok()) return transition.status();
+  LAVIK_RETURN_IF_ERROR(transition.status());
   auto reason = ReadBoundedString(reader, kMaxMetaAbortReasonBytes);
-  if (!reason.ok()) return reason.status();
+  LAVIK_RETURN_IF_ERROR(reason.status());
   AbortControlledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
@@ -1565,22 +1389,16 @@ absl::StatusOr<AbortControlledFailover> ReadAbortControlledFailoverBody(
   command.group_id_ = std::move(*group_id);
   command.expected_transition_ = std::move(*transition);
   command.reason_ = std::move(*reason);
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const DegradeControlledFailover& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kDegradeControlledFailover,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kDegradeControlledFailover,
+                         command.request_id_, command.actor_));
   WriteFixedArray(writer, command.operation_id_);
   writer.WriteU64(command.expected_operation_revision_);
   writer.WriteString(command.group_id_);
@@ -1598,23 +1416,23 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<DegradeControlledFailover> ReadDegradeControlledFailoverBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(reader);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto operation_revision = reader.ReadU64();
-  if (!operation_revision.ok()) return operation_revision.status();
+  LAVIK_RETURN_IF_ERROR(operation_revision.status());
   auto group_id = ReadGroupId(reader);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto transition = ReadFailoverTransitionRef(reader);
-  if (!transition.ok()) return transition.status();
+  LAVIK_RETURN_IF_ERROR(transition.status());
   auto action = reader.ReadOptional<MetaFailoverCandidateAction>(
       [](MetaReader& nested) { return ReadFailoverAction(nested); });
-  if (!action.ok()) return action.status();
+  LAVIK_RETURN_IF_ERROR(action.status());
   auto retain =
       reader.ReadBool("invalid retained failover candidate presence tag");
-  if (!retain.ok()) return retain.status();
+  LAVIK_RETURN_IF_ERROR(retain.status());
   auto reason = ReadBoundedString(reader, kMaxMetaAbortReasonBytes);
-  if (!reason.ok()) return reason.status();
+  LAVIK_RETURN_IF_ERROR(reason.status());
   DegradeControlledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
@@ -1625,22 +1443,16 @@ absl::StatusOr<DegradeControlledFailover> ReadDegradeControlledFailoverBody(
   command.expected_candidate_action_ = std::move(*action);
   command.retain_candidate_action_ = *retain;
   command.reason_ = std::move(*reason);
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const CommitControlledFailover& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status =
-          WriteCommandHeader(writer, MetaCommandTag::kCommitControlledFailover,
-                             command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kCommitControlledFailover,
+                         command.request_id_, command.actor_));
   WriteFixedArray(writer, command.operation_id_);
   writer.WriteU64(command.expected_operation_revision_);
   WriteFailoverCommitBaseUnchecked(writer, command);
@@ -1650,35 +1462,27 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<CommitControlledFailover> ReadCommitControlledFailoverBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(reader);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto operation_revision = reader.ReadU64();
-  if (!operation_revision.ok()) return operation_revision.status();
+  LAVIK_RETURN_IF_ERROR(operation_revision.status());
   CommitControlledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
   command.operation_id_ = *operation_id;
   command.expected_operation_revision_ = *operation_revision;
-  if (auto status = ReadFailoverCommitBase(reader, command); !status.ok()) {
-    return status;
-  }
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ReadFailoverCommitBase(reader, command));
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
 absl::Status WriteCommandBody(MetaWriter& writer,
                               const CommitUncontrolledFailover& command) {
-  if (auto status = ValidateCommand(command); !status.ok()) return status;
-  if (auto status = WriteCommandHeader(
-          writer, MetaCommandTag::kCommitUncontrolledFailover,
-          command.request_id_, command.actor_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateCommand(command));
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(writer, MetaCommandTag::kCommitUncontrolledFailover,
+                         command.request_id_, command.actor_));
   WriteFailoverCommitBaseUnchecked(writer, command);
   writer.WriteU8(static_cast<std::uint8_t>(command.loss_if_cutover_));
   return absl::OkStatus();
@@ -1687,20 +1491,15 @@ absl::Status WriteCommandBody(MetaWriter& writer,
 absl::StatusOr<CommitUncontrolledFailover> ReadCommitUncontrolledFailoverBody(
     MetaReader& reader) {
   auto header = ReadCommandHeader(reader);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   CommitUncontrolledFailover command;
   command.request_id_ = header->request_id_;
   command.actor_ = std::move(header->actor_);
-  if (auto status = ReadFailoverCommitBase(reader, command); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ReadFailoverCommitBase(reader, command));
   auto loss = reader.ReadU8();
-  if (!loss.ok()) return loss.status();
+  LAVIK_RETURN_IF_ERROR(loss.status());
   command.loss_if_cutover_ = static_cast<MetaFailoverLoss>(*loss);
-  if (auto status = FailStopDecodedFailover(ValidateCommand(command));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(FailStopDecodedFailover(ValidateCommand(command)));
   return command;
 }
 
@@ -1708,11 +1507,11 @@ absl::StatusOr<CommitUncontrolledFailover> ReadCommitUncontrolledFailoverBody(
 template <typename Cmd>
 absl::StatusOr<Cmd> ReadGroupTermGate(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto expected_term = r.ReadU64();
-  if (!expected_term.ok()) return expected_term.status();
+  LAVIK_RETURN_IF_ERROR(expected_term.status());
   Cmd cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1722,12 +1521,9 @@ absl::StatusOr<Cmd> ReadGroupTermGate(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const BeginGroupTerm& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kBeginGroupTerm,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kBeginGroupTerm,
+                                           cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
   w.WriteU64(cmd.expected_term_);
   w.WriteU64(cmd.new_term_);
   return absl::OkStatus();
@@ -1735,37 +1531,32 @@ absl::Status WriteCommandBody(MetaWriter& w, const BeginGroupTerm& cmd) {
 
 absl::StatusOr<BeginGroupTerm> ReadBeginGroupTermBody(MetaReader& r) {
   auto cmd = ReadGroupTermGate<BeginGroupTerm>(r);
-  if (!cmd.ok()) return cmd.status();
-  auto new_term = r.ReadU64();
-  if (!new_term.ok()) return new_term.status();
-  cmd->new_term_ = *new_term;
+  LAVIK_RETURN_IF_ERROR(cmd.status());
+  LAVIK_ASSIGN_OR_RETURN(cmd->new_term_, r.ReadU64());
   return cmd;
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kActivateAuthority,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kActivateAuthority, cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
   w.WriteU64(cmd.expected_term_);
-  if (auto st = WriteNodeId(w, cmd.new_owner_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteNodeId(w, cmd.new_owner_));
   w.WriteU64(cmd.new_topology_epoch_);
   return absl::OkStatus();
 }
 
 absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
+  LAVIK_RETURN_IF_ERROR(group_id.status());
   auto expected_term = r.ReadU64();
-  if (!expected_term.ok()) return expected_term.status();
+  LAVIK_RETURN_IF_ERROR(expected_term.status());
   auto new_owner = ReadNodeId(r);
-  if (!new_owner.ok()) return new_owner.status();
+  LAVIK_RETURN_IF_ERROR(new_owner.status());
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   ActivateAuthority cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1777,12 +1568,9 @@ absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const FenceGroup& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kFenceGroup,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kFenceGroup,
+                                           cmd.request_id_, cmd.actor_));
+  LAVIK_RETURN_IF_ERROR(WriteGroupId(w, cmd.group_id_));
   w.WriteU64(cmd.expected_term_);
   w.WriteU64(cmd.new_term_);
   return absl::OkStatus();
@@ -1790,10 +1578,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const FenceGroup& cmd) {
 
 absl::StatusOr<FenceGroup> ReadFenceGroupBody(MetaReader& r) {
   auto cmd = ReadGroupTermGate<FenceGroup>(r);
-  if (!cmd.ok()) return cmd.status();
-  auto new_term = r.ReadU64();
-  if (!new_term.ok()) return new_term.status();
-  cmd->new_term_ = *new_term;
+  LAVIK_RETURN_IF_ERROR(cmd.status());
+  LAVIK_ASSIGN_OR_RETURN(cmd->new_term_, r.ReadU64());
   return cmd;
 }
 
@@ -1802,20 +1588,12 @@ absl::StatusOr<FenceGroup> ReadFenceGroupBody(MetaReader& r) {
 // ---------------------------------------------------------------------------
 
 absl::Status WriteCommandBody(MetaWriter& w, const PutPolicy& cmd) {
-  if (auto st =
-          CheckCap("policy_id", cmd.policy_id_.size(), kMaxMetaPolicyIdBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = CheckCap("content", cmd.content_.size(), kMaxMetaPayloadBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPutPolicy,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("policy_id", cmd.policy_id_.size(), kMaxMetaPolicyIdBytes));
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("content", cmd.content_.size(), kMaxMetaPayloadBytes));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kPutPolicy,
+                                           cmd.request_id_, cmd.actor_));
   w.WriteString(cmd.policy_id_);
   w.WriteU64(cmd.version_);
   w.WriteString(cmd.content_);
@@ -1824,13 +1602,13 @@ absl::Status WriteCommandBody(MetaWriter& w, const PutPolicy& cmd) {
 
 absl::StatusOr<PutPolicy> ReadPutPolicyBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto policy_id = ReadBoundedString(r, kMaxMetaPolicyIdBytes);
-  if (!policy_id.ok()) return policy_id.status();
+  LAVIK_RETURN_IF_ERROR(policy_id.status());
   auto version = r.ReadU64();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   auto content = ReadBoundedString(r, kMaxMetaPayloadBytes);
-  if (!content.ok()) return content.status();
+  LAVIK_RETURN_IF_ERROR(content.status());
   PutPolicy cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1845,19 +1623,12 @@ absl::StatusOr<PutPolicy> ReadPutPolicyBody(MetaReader& r) {
 // ---------------------------------------------------------------------------
 
 absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
-  if (auto st = CheckCap("kind", cmd.kind_.size(), kMaxMetaOperationKindBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = CheckCap("intent", cmd.intent_.size(), kMaxMetaPayloadBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSubmitOperation,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("kind", cmd.kind_.size(), kMaxMetaOperationKindBytes));
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("intent", cmd.intent_.size(), kMaxMetaPayloadBytes));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kSubmitOperation,
+                                           cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteString(cmd.kind_);
   w.WriteString(cmd.intent_);
@@ -1868,17 +1639,17 @@ absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
 
 absl::StatusOr<SubmitOperation> ReadSubmitOperationBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto kind = ReadBoundedString(r, kMaxMetaOperationKindBytes);
-  if (!kind.ok()) return kind.status();
+  LAVIK_RETURN_IF_ERROR(kind.status());
   auto intent = ReadBoundedString(r, kMaxMetaPayloadBytes);
-  if (!intent.ok()) return intent.status();
+  LAVIK_RETURN_IF_ERROR(intent.status());
   auto intent_hash = ReadFixedArray<32>(r);
-  if (!intent_hash.ok()) return intent_hash.status();
+  LAVIK_RETURN_IF_ERROR(intent_hash.status());
   auto replication_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
-  if (!replication_history.ok()) return replication_history.status();
+  LAVIK_RETURN_IF_ERROR(replication_history.status());
   SubmitOperation cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1892,16 +1663,11 @@ absl::StatusOr<SubmitOperation> ReadSubmitOperationBody(MetaReader& r) {
 
 absl::Status WriteCommandBody(MetaWriter& w,
                               const TransitionOperationPhase& cmd) {
-  if (auto st = CheckCap("kind_phase_blob", cmd.kind_phase_blob_.size(),
-                         kMaxMetaPayloadBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = CheckCap("current_directives", cmd.current_directives_.size(),
-                         kMaxMetaDirectivesPerOperation);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("kind_phase_blob", cmd.kind_phase_blob_.size(),
+                                 kMaxMetaPayloadBytes));
+  LAVIK_RETURN_IF_ERROR(CheckCap("current_directives",
+                                 cmd.current_directives_.size(),
+                                 kMaxMetaDirectivesPerOperation));
   for (const MetaDirectiveSpec& directive : cmd.current_directives_) {
     if (directive.recipient_node_id_.empty() ||
         directive.recipient_node_id_.size() > kMetaNodeIdBytes ||
@@ -1917,11 +1683,9 @@ absl::Status WriteCommandBody(MetaWriter& w,
       return MetaDomainRejectError("invalid directive field size");
     }
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kTransitionOperationPhase,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(w, MetaCommandTag::kTransitionOperationPhase,
+                         cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.kind_phase_blob_);
@@ -1932,17 +1696,17 @@ absl::Status WriteCommandBody(MetaWriter& w,
 absl::StatusOr<TransitionOperationPhase> ReadTransitionOperationPhaseBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   auto blob = ReadBoundedString(r, kMaxMetaPayloadBytes);
-  if (!blob.ok()) return blob.status();
+  LAVIK_RETURN_IF_ERROR(blob.status());
   auto directives = r.ReadList<MetaDirectiveSpec>(
       kMaxMetaDirectivesPerOperation,
       [](MetaReader& reader) { return ReadMetaDirectiveSpec(reader); });
-  if (!directives.ok()) return directives.status();
+  LAVIK_RETURN_IF_ERROR(directives.status());
   TransitionOperationPhase cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -1962,13 +1726,13 @@ void WriteTerminalReceiptKey(MetaWriter& w, const MetaTerminalReceiptKey& key) {
 
 absl::StatusOr<MetaTerminalReceiptKey> ReadTerminalReceiptKey(MetaReader& r) {
   auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto directive_id = ReadFixedArray<16>(r);
-  if (!directive_id.ok()) return directive_id.status();
+  LAVIK_RETURN_IF_ERROR(directive_id.status());
   auto attempt_id = ReadFixedArray<16>(r);
-  if (!attempt_id.ok()) return attempt_id.status();
+  LAVIK_RETURN_IF_ERROR(attempt_id.status());
   auto directive_revision = r.ReadU64();
-  if (!directive_revision.ok()) return directive_revision.status();
+  LAVIK_RETURN_IF_ERROR(directive_revision.status());
   return MetaTerminalReceiptKey{*operation_id, *directive_id, *attempt_id,
                                 *directive_revision};
 }
@@ -1986,11 +1750,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const CommitDirectiveResult& cmd) {
       cmd.result_.size() > kMaxMetaPayloadBytes) {
     return MetaDomainRejectError("invalid directive result field size");
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kCommitDirectiveResult,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kCommitDirectiveResult, cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.operation_id_);
   WriteFixedArray(w, cmd.directive_id_);
   WriteFixedArray(w, cmd.attempt_id_);
@@ -2006,23 +1767,23 @@ absl::Status WriteCommandBody(MetaWriter& w, const CommitDirectiveResult& cmd) {
 absl::StatusOr<CommitDirectiveResult> ReadCommitDirectiveResultBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto directive_id = ReadFixedArray<16>(r);
-  if (!directive_id.ok()) return directive_id.status();
+  LAVIK_RETURN_IF_ERROR(directive_id.status());
   auto attempt_id = ReadFixedArray<16>(r);
-  if (!attempt_id.ok()) return attempt_id.status();
+  LAVIK_RETURN_IF_ERROR(attempt_id.status());
   auto directive_revision = r.ReadU64();
-  if (!directive_revision.ok()) return directive_revision.status();
+  LAVIK_RETURN_IF_ERROR(directive_revision.status());
   auto recipient_node = ReadBoundedString(r, kMetaNodeIdBytes);
-  if (!recipient_node.ok()) return recipient_node.status();
+  LAVIK_RETURN_IF_ERROR(recipient_node.status());
   auto recipient_boot = ReadFixedArray<kMetaBootIncarnationBytes>(r);
-  if (!recipient_boot.ok()) return recipient_boot.status();
+  LAVIK_RETURN_IF_ERROR(recipient_boot.status());
   auto assignment_id = ReadFixedArray<16>(r);
-  if (!assignment_id.ok()) return assignment_id.status();
+  LAVIK_RETURN_IF_ERROR(assignment_id.status());
   auto status = r.ReadU8();
-  if (!status.ok()) return status.status();
+  LAVIK_RETURN_IF_ERROR(status.status());
   if (*status <
           static_cast<std::uint8_t>(MetaDirectiveResultStatus::kSucceeded) ||
       *status >
@@ -2030,7 +1791,7 @@ absl::StatusOr<CommitDirectiveResult> ReadCommitDirectiveResultBody(
     return MetaFailStopError("unknown directive result status");
   }
   auto result = ReadBoundedString(r, kMaxMetaPayloadBytes);
-  if (!result.ok()) return result.status();
+  LAVIK_RETURN_IF_ERROR(result.status());
 
   CommitDirectiveResult cmd;
   cmd.request_id_ = header->request_id_;
@@ -2048,15 +1809,10 @@ absl::StatusOr<CommitDirectiveResult> ReadCommitDirectiveResultBody(
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const CompleteOperation& cmd) {
-  if (auto st = CheckCap("result", cmd.result_.size(), kMaxMetaPayloadBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kCompleteOperation,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("result", cmd.result_.size(), kMaxMetaPayloadBytes));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kCompleteOperation, cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.result_);
@@ -2066,15 +1822,15 @@ absl::Status WriteCommandBody(MetaWriter& w, const CompleteOperation& cmd) {
 
 absl::StatusOr<CompleteOperation> ReadCompleteOperationBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   auto result = ReadBoundedString(r, kMaxMetaPayloadBytes);
-  if (!result.ok()) return result.status();
+  LAVIK_RETURN_IF_ERROR(result.status());
   auto data_loss = r.ReadBool("data_loss_possible must be 0 or 1");
-  if (!data_loss.ok()) return data_loss.status();
+  LAVIK_RETURN_IF_ERROR(data_loss.status());
   CompleteOperation cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2086,16 +1842,10 @@ absl::StatusOr<CompleteOperation> ReadCompleteOperationBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const AbortOperation& cmd) {
-  if (auto st =
-          CheckCap("reason", cmd.reason_.size(), kMaxMetaAbortReasonBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kAbortOperation,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("reason", cmd.reason_.size(), kMaxMetaAbortReasonBytes));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kAbortOperation,
+                                           cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.reason_);
@@ -2104,13 +1854,13 @@ absl::Status WriteCommandBody(MetaWriter& w, const AbortOperation& cmd) {
 
 absl::StatusOr<AbortOperation> ReadAbortOperationBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
+  LAVIK_RETURN_IF_ERROR(operation_id.status());
   auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
+  LAVIK_RETURN_IF_ERROR(expected_revision.status());
   auto reason = ReadBoundedString(r, kMaxMetaAbortReasonBytes);
-  if (!reason.ok()) return reason.status();
+  LAVIK_RETURN_IF_ERROR(reason.status());
   AbortOperation cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2121,16 +1871,10 @@ absl::StatusOr<AbortOperation> ReadAbortOperationBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const ArchiveOperations& cmd) {
-  if (auto st = CheckCap("operation_seqs", cmd.operation_seqs_.size(),
-                         kMaxMetaActiveOperations);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kArchiveOperations,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("operation_seqs", cmd.operation_seqs_.size(),
+                                 kMaxMetaActiveOperations));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kArchiveOperations, cmd.request_id_, cmd.actor_));
   w.WriteList(cmd.operation_seqs_,
               [](MetaWriter& ww, std::uint64_t seq) { ww.WriteU64(seq); });
   return absl::OkStatus();
@@ -2138,10 +1882,10 @@ absl::Status WriteCommandBody(MetaWriter& w, const ArchiveOperations& cmd) {
 
 absl::StatusOr<ArchiveOperations> ReadArchiveOperationsBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto seqs = r.ReadList<std::uint64_t>(
       kMaxMetaActiveOperations, [](MetaReader& rr) { return rr.ReadU64(); });
-  if (!seqs.ok()) return seqs.status();
+  LAVIK_RETURN_IF_ERROR(seqs.status());
   ArchiveOperations cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2150,20 +1894,17 @@ absl::StatusOr<ArchiveOperations> ReadArchiveOperationsBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const PruneAudit& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPruneAudit,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kPruneAudit,
+                                           cmd.request_id_, cmd.actor_));
   w.WriteU64(cmd.through_log_index_);
   return absl::OkStatus();
 }
 
 absl::StatusOr<PruneAudit> ReadPruneAuditBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto through = r.ReadU64();
-  if (!through.ok()) return through.status();
+  LAVIK_RETURN_IF_ERROR(through.status());
   PruneAudit cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2172,21 +1913,15 @@ absl::StatusOr<PruneAudit> ReadPruneAuditBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const SetAuditPolicy& cmd) {
-  if (auto st = CheckCap("attestation", cmd.attestation_.size(),
-                         kMaxMetaAttestationBytes);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("attestation", cmd.attestation_.size(),
+                                 kMaxMetaAttestationBytes));
   if (cmd.policy_ != MetaAuditPolicy::kDisabled &&
       cmd.policy_ != MetaAuditPolicy::kBoundedRotate &&
       cmd.policy_ != MetaAuditPolicy::kStrictExport) {
     return MetaDomainRejectError("unknown audit policy");
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetAuditPolicy,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kSetAuditPolicy,
+                                           cmd.request_id_, cmd.actor_));
   w.WriteU8(static_cast<std::uint8_t>(cmd.policy_));
   w.WriteString(cmd.attestation_);
   return absl::OkStatus();
@@ -2194,14 +1929,14 @@ absl::Status WriteCommandBody(MetaWriter& w, const SetAuditPolicy& cmd) {
 
 absl::StatusOr<SetAuditPolicy> ReadSetAuditPolicyBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto policy = r.ReadU8();
-  if (!policy.ok()) return policy.status();
+  LAVIK_RETURN_IF_ERROR(policy.status());
   if (*policy > static_cast<std::uint8_t>(MetaAuditPolicy::kStrictExport)) {
     return MetaFailStopError("unknown audit policy tag");
   }
   auto attestation = ReadBoundedString(r, kMaxMetaAttestationBytes);
-  if (!attestation.ok()) return attestation.status();
+  LAVIK_RETURN_IF_ERROR(attestation.status());
   SetAuditPolicy cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2211,16 +1946,10 @@ absl::StatusOr<SetAuditPolicy> ReadSetAuditPolicyBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const PruneOperationArchive& cmd) {
-  if (auto st = CheckCap("operation_seqs", cmd.operation_seqs_.size(),
-                         kMaxMetaArchivedOperationSummaries);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPruneOperationArchive,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("operation_seqs", cmd.operation_seqs_.size(),
+                                 kMaxMetaArchivedOperationSummaries));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kPruneOperationArchive, cmd.request_id_, cmd.actor_));
   w.WriteList(cmd.operation_seqs_,
               [](MetaWriter& ww, std::uint64_t seq) { ww.WriteU64(seq); });
   return absl::OkStatus();
@@ -2229,11 +1958,11 @@ absl::Status WriteCommandBody(MetaWriter& w, const PruneOperationArchive& cmd) {
 absl::StatusOr<PruneOperationArchive> ReadPruneOperationArchiveBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto seqs =
       r.ReadList<std::uint64_t>(kMaxMetaArchivedOperationSummaries,
                                 [](MetaReader& rr) { return rr.ReadU64(); });
-  if (!seqs.ok()) return seqs.status();
+  LAVIK_RETURN_IF_ERROR(seqs.status());
   PruneOperationArchive cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2242,16 +1971,10 @@ absl::StatusOr<PruneOperationArchive> ReadPruneOperationArchiveBody(
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const PruneTerminalReceipts& cmd) {
-  if (auto st = CheckCap("terminal receipts", cmd.receipts_.size(),
-                         kMaxMetaTerminalReceiptPrunesPerCommand);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPruneTerminalReceipts,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckCap("terminal receipts", cmd.receipts_.size(),
+                                 kMaxMetaTerminalReceiptPrunesPerCommand));
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kPruneTerminalReceipts, cmd.request_id_, cmd.actor_));
   w.WriteList(cmd.receipts_, WriteTerminalReceiptKey);
   return absl::OkStatus();
 }
@@ -2259,11 +1982,11 @@ absl::Status WriteCommandBody(MetaWriter& w, const PruneTerminalReceipts& cmd) {
 absl::StatusOr<PruneTerminalReceipts> ReadPruneTerminalReceiptsBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto receipts = r.ReadList<MetaTerminalReceiptKey>(
       kMaxMetaTerminalReceiptPrunesPerCommand,
       [](MetaReader& reader) { return ReadTerminalReceiptKey(reader); });
-  if (!receipts.ok()) return receipts.status();
+  LAVIK_RETURN_IF_ERROR(receipts.status());
   PruneTerminalReceipts cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2272,11 +1995,8 @@ absl::StatusOr<PruneTerminalReceipts> ReadPruneTerminalReceiptsBody(
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
-  if (auto st =
-          CheckCap("principal", cmd.principal_.size(), kMaxMetaPrincipalBytes);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("principal", cmd.principal_.size(), kMaxMetaPrincipalBytes));
   if (cmd.data_control_endpoint_.empty() ||
       cmd.data_control_endpoint_.size() > kMaxMetaEndpointBytes) {
     return MetaDomainRejectError(
@@ -2287,11 +2007,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
        cmd.ctl_endpoint_->size() > kMaxMetaEndpointBytes)) {
     return MetaDomainRejectError("ctl_endpoint is empty or exceeds its cap");
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kBindMetaMember,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kBindMetaMember,
+                                           cmd.request_id_, cmd.actor_));
   w.WriteU32(cmd.server_id_);
   w.WriteString(cmd.principal_);
   w.WriteString(cmd.data_control_endpoint_);
@@ -2305,23 +2022,22 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
 
 absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto server_id = r.ReadU32();
-  if (!server_id.ok()) return server_id.status();
+  LAVIK_RETURN_IF_ERROR(server_id.status());
   auto principal = ReadBoundedString(r, kMaxMetaPrincipalBytes);
-  if (!principal.ok()) return principal.status();
+  LAVIK_RETURN_IF_ERROR(principal.status());
   auto data_control_endpoint = ReadBoundedString(r, kMaxMetaEndpointBytes);
-  if (!data_control_endpoint.ok()) return data_control_endpoint.status();
+  LAVIK_RETURN_IF_ERROR(data_control_endpoint.status());
   auto has_ctl_endpoint = r.ReadBool("invalid ctl endpoint presence tag");
-  if (!has_ctl_endpoint.ok()) return has_ctl_endpoint.status();
+  LAVIK_RETURN_IF_ERROR(has_ctl_endpoint.status());
   std::optional<std::string> ctl_endpoint;
   if (*has_ctl_endpoint) {
-    auto decoded = ReadBoundedString(r, kMaxMetaEndpointBytes);
-    if (!decoded.ok()) return decoded.status();
-    ctl_endpoint = std::move(*decoded);
+    LAVIK_ASSIGN_OR_RETURN(ctl_endpoint,
+                           ReadBoundedString(r, kMaxMetaEndpointBytes));
   }
   auto sentinel = ReadBoundedString(r, kMaxMetaEndpointBytes);
-  if (!sentinel.ok()) return sentinel.status();
+  LAVIK_RETURN_IF_ERROR(sentinel.status());
   BindMetaMember cmd;
   cmd.sentinel_endpoint_ = std::move(*sentinel);
   cmd.request_id_ = header->request_id_;
@@ -2334,20 +2050,17 @@ absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const RetireMetaMember& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRetireMetaMember,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(w, MetaCommandTag::kRetireMetaMember,
+                                           cmd.request_id_, cmd.actor_));
   w.WriteU32(cmd.server_id_);
   return absl::OkStatus();
 }
 
 absl::StatusOr<RetireMetaMember> ReadRetireMetaMemberBody(MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto server_id = r.ReadU32();
-  if (!server_id.ok()) return server_id.status();
+  LAVIK_RETURN_IF_ERROR(server_id.status());
   RetireMetaMember cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2359,11 +2072,8 @@ absl::Status WriteCommandBody(MetaWriter& w, const PutPopulationManifest& cmd) {
   if (cmd.entries_.size() > kMetaSlotCount) {
     return MetaDomainRejectError("population manifest entry cap exceeded");
   }
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPutPopulationManifest,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteCommandHeader(
+      w, MetaCommandTag::kPutPopulationManifest, cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.manifest_digest_);
   w.WriteList(cmd.entries_,
               [](MetaWriter& writer, const MetaPopulationManifestEntry& entry) {
@@ -2376,19 +2086,19 @@ absl::Status WriteCommandBody(MetaWriter& w, const PutPopulationManifest& cmd) {
 absl::StatusOr<PutPopulationManifest> ReadPutPopulationManifestBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto digest = ReadFixedArray<32>(r);
-  if (!digest.ok()) return digest.status();
+  LAVIK_RETURN_IF_ERROR(digest.status());
   auto entries = r.ReadList<MetaPopulationManifestEntry>(
       kMetaSlotCount,
       [](MetaReader& reader) -> absl::StatusOr<MetaPopulationManifestEntry> {
         auto partition_id = reader.ReadU32();
-        if (!partition_id.ok()) return partition_id.status();
+        LAVIK_RETURN_IF_ERROR(partition_id.status());
         auto logical_epoch = reader.ReadU64();
-        if (!logical_epoch.ok()) return logical_epoch.status();
+        LAVIK_RETURN_IF_ERROR(logical_epoch.status());
         return MetaPopulationManifestEntry{*partition_id, *logical_epoch};
       });
-  if (!entries.ok()) return entries.status();
+  LAVIK_RETURN_IF_ERROR(entries.status());
   PutPopulationManifest cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2399,11 +2109,9 @@ absl::StatusOr<PutPopulationManifest> ReadPutPopulationManifestBody(
 
 absl::Status WriteCommandBody(MetaWriter& w,
                               const PrunePopulationManifest& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPrunePopulationManifest,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      WriteCommandHeader(w, MetaCommandTag::kPrunePopulationManifest,
+                         cmd.request_id_, cmd.actor_));
   WriteFixedArray(w, cmd.manifest_digest_);
   return absl::OkStatus();
 }
@@ -2411,9 +2119,9 @@ absl::Status WriteCommandBody(MetaWriter& w,
 absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
     MetaReader& r) {
   auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
+  LAVIK_RETURN_IF_ERROR(header.status());
   auto digest = ReadFixedArray<32>(r);
-  if (!digest.ok()) return digest.status();
+  LAVIK_RETURN_IF_ERROR(digest.status());
   PrunePopulationManifest cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
@@ -2430,9 +2138,7 @@ absl::Status ValidateMetaFailoverTransition(
 
 absl::Status WriteMetaFailoverTransition(
     MetaWriter& writer, const MetaFailoverTransition& transition) {
-  if (auto status = ValidateFailoverTransitionImpl(transition); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverTransitionImpl(transition));
   WriteFailoverTransitionUnchecked(writer, transition);
   return absl::OkStatus();
 }
@@ -2440,24 +2146,20 @@ absl::Status WriteMetaFailoverTransition(
 absl::StatusOr<MetaFailoverTransition> ReadMetaFailoverTransition(
     MetaReader& reader) {
   auto transition = ReadFailoverTransitionUnchecked(reader);
-  if (!transition.ok()) return transition.status();
-  if (auto status =
-          FailStopDecodedFailover(ValidateFailoverTransitionImpl(*transition));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(transition.status());
+  LAVIK_RETURN_IF_ERROR(
+      FailStopDecodedFailover(ValidateFailoverTransitionImpl(*transition)));
   return transition;
 }
 
 absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
   MetaWriter w;
   w.WriteU16(kMetaCommandFormatVersion);
-  auto status = std::visit(
+  LAVIK_RETURN_IF_ERROR(std::visit(
       [&w](const auto& cmd) -> absl::Status {
         return WriteCommandBody(w, cmd);
       },
-      command);
-  if (!status.ok()) return status;
+      command));
   if (w.buffer().size() > kMaxMetaCommandBytes) {
     return MetaDomainRejectError("command exceeds kMaxMetaCommandBytes");
   }
@@ -2479,238 +2181,166 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
   }
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaCommandFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto tag = r.ReadU16();
-  if (!tag.ok()) return tag.status();
+  LAVIK_RETURN_IF_ERROR(tag.status());
 
   MetaCommand command;
   switch (static_cast<MetaCommandTag>(*tag)) {
     case MetaCommandTag::kRegisterNode: {
-      auto body = ReadRegisterNodeBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadRegisterNodeBody(r));
       break;
     }
     case MetaCommandTag::kUpdateNode: {
-      auto body = ReadUpdateNodeBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadUpdateNodeBody(r));
       break;
     }
     case MetaCommandTag::kRetireNode: {
-      auto body = ReadRetireNodeBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadRetireNodeBody(r));
       break;
     }
     case MetaCommandTag::kCreateGroup: {
-      auto body = ReadCreateGroupBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadCreateGroupBody(r));
       break;
     }
     case MetaCommandTag::kAssignNodeToGroup: {
-      auto body = ReadAssignNodeToGroupBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadAssignNodeToGroupBody(r));
       break;
     }
     case MetaCommandTag::kRemoveNodeFromGroup: {
-      auto body = ReadRemoveNodeFromGroupBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadRemoveNodeFromGroupBody(r));
       break;
     }
     case MetaCommandTag::kSetSlotMap: {
-      auto body = ReadSetSlotMapBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadSetSlotMapBody(r));
       break;
     }
     case MetaCommandTag::kBeginGroupTerm: {
-      auto body = ReadBeginGroupTermBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadBeginGroupTermBody(r));
       break;
     }
     case MetaCommandTag::kActivateAuthority: {
-      auto body = ReadActivateAuthorityBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadActivateAuthorityBody(r));
       break;
     }
     case MetaCommandTag::kFenceGroup: {
-      auto body = ReadFenceGroupBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadFenceGroupBody(r));
       break;
     }
     case MetaCommandTag::kPutPolicy: {
-      auto body = ReadPutPolicyBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadPutPolicyBody(r));
       break;
     }
     case MetaCommandTag::kSubmitOperation: {
-      auto body = ReadSubmitOperationBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadSubmitOperationBody(r));
       break;
     }
     case MetaCommandTag::kTransitionOperationPhase: {
-      auto body = ReadTransitionOperationPhaseBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadTransitionOperationPhaseBody(r));
       break;
     }
     case MetaCommandTag::kCompleteOperation: {
-      auto body = ReadCompleteOperationBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadCompleteOperationBody(r));
       break;
     }
     case MetaCommandTag::kAbortOperation: {
-      auto body = ReadAbortOperationBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadAbortOperationBody(r));
       break;
     }
     case MetaCommandTag::kArchiveOperations: {
-      auto body = ReadArchiveOperationsBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadArchiveOperationsBody(r));
       break;
     }
     case MetaCommandTag::kPruneAudit: {
-      auto body = ReadPruneAuditBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadPruneAuditBody(r));
       break;
     }
     case MetaCommandTag::kPruneOperationArchive: {
-      auto body = ReadPruneOperationArchiveBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadPruneOperationArchiveBody(r));
       break;
     }
     case MetaCommandTag::kBindMetaMember: {
-      auto body = ReadBindMetaMemberBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadBindMetaMemberBody(r));
       break;
     }
     case MetaCommandTag::kRetireMetaMember: {
-      auto body = ReadRetireMetaMemberBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadRetireMetaMemberBody(r));
       break;
     }
     case MetaCommandTag::kSetGroupReplicationState: {
-      auto body = ReadSetGroupReplicationStateBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadSetGroupReplicationStateBody(r));
       break;
     }
     case MetaCommandTag::kSetAuditPolicy: {
-      auto body = ReadSetAuditPolicyBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadSetAuditPolicyBody(r));
       break;
     }
     case MetaCommandTag::kPutPopulationManifest: {
-      auto body = ReadPutPopulationManifestBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadPutPopulationManifestBody(r));
       break;
     }
     case MetaCommandTag::kPrunePopulationManifest: {
-      auto body = ReadPrunePopulationManifestBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadPrunePopulationManifestBody(r));
       break;
     }
     case MetaCommandTag::kCommitDirectiveResult: {
-      auto body = ReadCommitDirectiveResultBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadCommitDirectiveResultBody(r));
       break;
     }
     case MetaCommandTag::kPruneTerminalReceipts: {
-      auto body = ReadPruneTerminalReceiptsBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadPruneTerminalReceiptsBody(r));
       break;
     }
     case MetaCommandTag::kBeginControlledFailover: {
-      auto body = ReadBeginControlledFailoverBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadBeginControlledFailoverBody(r));
       break;
     }
     case MetaCommandTag::kBeginUncontrolledFailover: {
-      auto body = ReadBeginUncontrolledFailoverBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadBeginUncontrolledFailoverBody(r));
       break;
     }
     case MetaCommandTag::kSetUncontrolledCandidate: {
-      auto body = ReadSetUncontrolledCandidateBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadSetUncontrolledCandidateBody(r));
       break;
     }
     case MetaCommandTag::kAuthorizeFailoverPrepare: {
-      auto body = ReadAuthorizeFailoverPrepareBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadAuthorizeFailoverPrepareBody(r));
       break;
     }
     case MetaCommandTag::kAbortControlledFailover: {
-      auto body = ReadAbortControlledFailoverBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadAbortControlledFailoverBody(r));
       break;
     }
     case MetaCommandTag::kDegradeControlledFailover: {
-      auto body = ReadDegradeControlledFailoverBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadDegradeControlledFailoverBody(r));
       break;
     }
     case MetaCommandTag::kCommitControlledFailover: {
-      auto body = ReadCommitControlledFailoverBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadCommitControlledFailoverBody(r));
       break;
     }
     case MetaCommandTag::kStartCandidateRecovery: {
-      auto body = ReadStartCandidateRecoveryBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadStartCandidateRecoveryBody(r));
       break;
     }
     case MetaCommandTag::kCommitUncontrolledFailover: {
-      auto body = ReadCommitUncontrolledFailoverBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
+      LAVIK_ASSIGN_OR_RETURN(command, ReadCommitUncontrolledFailoverBody(r));
       break;
     }
     default:
       return MetaFailStopError("unknown command tag");
   }
-  if (auto st = r.Finish(); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(r.Finish());
   return command;
 }
 
 absl::StatusOr<std::string> EncodeMetaGroupRecord(
     const MetaGroupRecord& record) {
-  if (auto st = CheckCap("owner", record.owner_.size(), kMetaNodeIdBytes);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckCap("owner", record.owner_.size(), kMetaNodeIdBytes));
   const bool zero_digest =
       std::all_of(record.population_manifest_digest_.begin(),
                   record.population_manifest_digest_.end(),
@@ -2731,26 +2361,16 @@ absl::StatusOr<std::string> EncodeMetaGroupRecord(
 absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   MetaGroupRecord record;
-  auto owner = r.ReadString(kMetaNodeIdBytes);
-  if (!owner.ok()) return owner.status();
-  record.owner_ = std::string(*owner);
-  auto group_term = r.ReadU64();
-  if (!group_term.ok()) return group_term.status();
-  record.group_term_ = *group_term;
-  auto population_manifest_revision = r.ReadU64();
-  if (!population_manifest_revision.ok()) {
-    return population_manifest_revision.status();
-  }
-  record.population_manifest_revision_ = *population_manifest_revision;
-  auto population_manifest_digest = ReadFixedArray<32>(r);
-  if (!population_manifest_digest.ok())
-    return population_manifest_digest.status();
-  record.population_manifest_digest_ = *population_manifest_digest;
+  LAVIK_ASSIGN_OR_RETURN(record.owner_, r.ReadString(kMetaNodeIdBytes));
+  LAVIK_ASSIGN_OR_RETURN(record.group_term_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(record.population_manifest_revision_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(record.population_manifest_digest_,
+                         ReadFixedArray<32>(r));
   const bool zero_digest =
       std::all_of(record.population_manifest_digest_.begin(),
                   record.population_manifest_digest_.end(),
@@ -2758,12 +2378,8 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes) {
   if ((record.population_manifest_revision_ == 0) != zero_digest) {
     return MetaFailStopError("manifest revision/digest invariant violated");
   }
-  auto partition_replication_epoch = r.ReadU64();
-  if (!partition_replication_epoch.ok()) {
-    return partition_replication_epoch.status();
-  }
-  record.partition_replication_epoch_ = *partition_replication_epoch;
-  if (auto st = r.Finish(); !st.ok()) return st;
+  LAVIK_ASSIGN_OR_RETURN(record.partition_replication_epoch_, r.ReadU64());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
   return record;
 }
 

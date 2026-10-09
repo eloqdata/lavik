@@ -18,6 +18,8 @@
 
 #include <limits>
 
+#include "lavik/status_macros.h"
+
 namespace lavik::storage {
 
 namespace {
@@ -138,12 +140,12 @@ absl::StatusOr<HashEntryView> HashValueReader::Next() {
 
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
   auto reader = HashValueReader::Open(payload);
-  if (!reader.ok()) return reader.status();
+  LAVIK_RETURN_IF_ERROR(reader.status());
   HashValue value;
   value.entries_.reserve(reader->size());
   for (std::size_t index = 0; index < reader->size(); ++index) {
     auto view = reader->Next();
-    if (!view.ok()) return view.status();
+    LAVIK_RETURN_IF_ERROR(view.status());
     HashEntry entry;
     entry.field_.assign(view->field_);
     entry.value_.assign(view->value_);
@@ -163,10 +165,9 @@ absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {
   std::string output;
   std::size_t bytes = kHashValueHeaderBytes;
   for (const HashEntry& entry : value.entries_) {
-    auto next = AppendHashEntrySize(bytes, entry.field_.size(),
-                                    entry.value_.size(), output.max_size());
-    if (!next.ok()) return next.status();
-    bytes = *next;
+    LAVIK_ASSIGN_OR_RETURN(
+        bytes, AppendHashEntrySize(bytes, entry.field_.size(),
+                                   entry.value_.size(), output.max_size()));
   }
 
   output.reserve(bytes);

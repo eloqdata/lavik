@@ -21,6 +21,7 @@
 #include <cstring>
 #include <limits>
 
+#include "lavik/status_macros.h"
 #include "rdb_stream_encoder.h"
 
 namespace lavik::rdb {
@@ -100,7 +101,7 @@ absl::StatusOr<CollectionFileEncoder> CollectionFileEncoder::Create(
 absl::StatusOr<CollectionFileEncoder> CollectionFileEncoder::CreateDump(
     storage::ValueType type, std::uint64_t item_count) {
   auto result = Create(0, {}, type, item_count, 0);
-  if (!result.ok()) return result.status();
+  LAVIK_RETURN_IF_ERROR(result.status());
   // SELECTDB and empty key framing belong to files, not DUMP values.
   result->header_[0] = result->header_[2];
   result->header_bytes_ = 1;
@@ -122,8 +123,7 @@ absl::Status CollectionFileEncoder::StartPage(
        type_ != storage::ValueType::kStream && !page.elements_.empty()))
     return absl::InvalidArgumentError("invalid RDB collection page");
   if (stream_) {
-    auto status = stream_->StartPage(page);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(stream_->StartPage(page));
     cursor_ = page.next_cursor_;
     saw_last_ = page.done_;
     return absl::OkStatus();

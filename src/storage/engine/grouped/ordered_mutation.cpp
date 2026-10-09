@@ -18,6 +18,7 @@
 
 #include "../impl.h"
 #include "dependency_guard.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 #include "lavik/storage/detail/stream_records.h"
@@ -83,9 +84,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   const bool outer_transaction = tx != nullptr;
   TxShardWrites standalone;
   if (!tx) {
-    const auto predecessor =
-        co_await PrepareGroupedDependencyLocked(store, source_side, nullptr);
-    if (!predecessor.ok()) co_return predecessor;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await PrepareGroupedDependencyLocked(store, source_side, nullptr));
     std::uint64_t append_bytes = kBlockHeaderSlotBytes;
     for (const auto& page : plan.writes_) {
       append_bytes += kBlockHeaderSlotBytes;
@@ -99,7 +99,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     store.store_state_mutex_.Unlock(*store.worker_);
     const auto space = co_await BeforeGroupedTransaction(store, append_bytes);
     co_await store.store_state_mutex_.Lock();
-    if (!space.ok()) co_return space;
+    LAVIK_CO_RETURN_IF_ERROR(space);
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
                        std::span(&standalone, 1),
@@ -109,9 +109,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     tx = &standalone;
   }
   GroupedDependencyGuard dependency_guard(*tx, outer_transaction);
-  const auto dependency =
-      co_await PrepareGroupedDependencyLocked(store, source_side, tx);
-  if (!dependency.ok()) co_return dependency;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await PrepareGroupedDependencyLocked(store, source_side, tx));
   if (EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
       partition.replication_epoch_ != replication_epoch ||
       store.index_generations_[db_id] != index_generation ||
@@ -148,7 +147,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       // A distinct decision forces its own durable fence without marking the
       // still-uncommitted outer transaction durable prematurely.
       const auto child_decision = PrepareGroupedDecision(batch);
-      if (!child_decision.ok()) co_return child_decision.status();
+      LAVIK_CO_RETURN_IF_ERROR(child_decision.status());
     }
   }
   const auto revision = outer_transaction ? batch.txid_ : tx->txid_;
@@ -179,7 +178,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   else
     member_mutation = co_await PrepareSortedSetMembers(
         store, partition, db_id, key, digest, previous, plan);
-  if (!member_mutation.ok()) co_return member_mutation.status();
+  LAVIK_CO_RETURN_IF_ERROR(member_mutation.status());
   auto& member_plan = member_mutation->plan_;
   if (value_type == ValueType::kSortedSet) {
     if (!previous && prepared_members != nullptr) {
@@ -199,22 +198,21 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     plan.root_.member_index_ = member_plan.root_;
   }
   auto root_payload = EncodeOrderedCollectionRoot(plan.root_);
-  if (!root_payload.ok()) co_return root_payload.status();
+  LAVIK_CO_RETURN_IF_ERROR(root_payload.status());
   // Validate every indivisible field/envelope before the first disk write.
   // Keep both graphs' checked encoders until writing so each page is validated
   // only once at this boundary. Both plans stay unmoved and immutable while
   // the encoders borrow their snapshots across allocation/extent IO waits.
   GroupedScratchBudget encoder_budget;
   for (std::size_t i = 0; i < plan.writes_.size(); ++i) {
-    auto added = encoder_budget.AddBytes(sizeof(OrderedGroupEncoder));
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(
+        encoder_budget.AddBytes(sizeof(OrderedGroupEncoder)));
   }
   for (std::size_t i = 0; i < member_plan.writes_.size(); ++i) {
-    auto added = encoder_budget.AddBytes(sizeof(HashGroupEncoder));
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(encoder_budget.AddBytes(sizeof(HashGroupEncoder)));
   }
   auto encoder_admission = encoder_budget.Reserve(1);
-  if (!encoder_admission.ok()) co_return encoder_admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoder_admission.status());
   std::vector<OrderedGroupEncoder> ordered_encoders;
   std::vector<HashGroupEncoder> member_encoders;
   std::vector<std::uint64_t> ordered_sizes;
@@ -231,7 +229,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     member_sizes.reserve(member_plan.writes_.size());
     for (const auto& snapshot : plan.writes_) {
       auto encoder = OrderedGroupEncoder::Create(snapshot);
-      if (!encoder.ok()) co_return encoder.status();
+      LAVIK_CO_RETURN_IF_ERROR(encoder.status());
       if (encoder->encoded_bytes() > kMaxRecordPayloadBytes) {
         co_return absl::OutOfRangeError(
             "group snapshot and parent key exceed payload limit");
@@ -241,7 +239,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     }
     for (const auto& snapshot : member_plan.writes_) {
       auto encoder = HashGroupEncoder::Create(snapshot);
-      if (!encoder.ok()) co_return encoder.status();
+      LAVIK_CO_RETURN_IF_ERROR(encoder.status());
       if (encoder->encoded_bytes() > kMaxRecordPayloadBytes)
         co_return absl::OutOfRangeError(
             "member snapshot and parent key exceed payload limit");
@@ -280,15 +278,14 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           const auto* entry = previous->FindGroup(id);
           if (entry == nullptr)
             co_return absl::DataLossError("missing ordered page for demotion");
-          const auto added = budget.AddGroup(*entry, previous->ExtentsFor(id));
-          if (!added.ok()) co_return added;
+          LAVIK_CO_RETURN_IF_ERROR(
+              budget.AddGroup(*entry, previous->ExtentsFor(id)));
         }
-        auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +
-                                     plan.root_.item_count_ *
-                                         sizeof(OrderedCollectionEntry));
-        if (!added.ok()) co_return added;
+        LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(
+            2 * kCollectionGroupTargetBytes +
+            plan.root_.item_count_ * sizeof(OrderedCollectionEntry)));
         auto scratch = budget.Reserve(2);
-        if (!scratch.ok()) co_return scratch.status();
+        LAVIK_CO_RETURN_IF_ERROR(scratch.status());
         std::map<std::uint64_t, const OrderedGroupSnapshot*> changed_pages;
         for (const auto& page : plan.writes_)
           changed_pages.emplace(page.id_, &page);
@@ -314,7 +311,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
               co_return absl::DataLossError("missing demotion page route");
             auto loaded = co_await LoadOrderedGroupSnapshot(
                 store, partition, db_id, key, digest, previous, id, false);
-            if (!loaded.ok()) co_return loaded.status();
+            LAVIK_CO_RETURN_IF_ERROR(loaded.status());
             for (auto& entry : loaded->snapshot_.entries_)
               compact.push_back(std::move(entry));
             id = route->next_;
@@ -325,7 +322,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
              compact.size() != plan.root_.item_count_))
           co_return absl::DataLossError("ordered demotion count mismatch");
         auto encoded = EncodeOrderedCompactValue(plan.root_.kind_, compact);
-        if (!encoded.ok()) co_return encoded.status();
+        LAVIK_CO_RETURN_IF_ERROR(encoded.status());
         if (encoded->size() >= kCollectionGroupTargetBytes)
           co_return absl::InternalError("ordered demotion byte bound failed");
         compact_payload = std::move(*encoded);
@@ -337,9 +334,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     // hands no transaction receipt to the queue. Keep its prior dependency
     // boundary until that path has its own commit/failure handoff.
     if (!outer_transaction) {
-      const auto durable =
-          co_await AwaitGroupedDependencyLocked(store, source_side, tx->txid_);
-      if (!durable.ok()) co_return durable;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await AwaitGroupedDependencyLocked(store, source_side, tx->txid_));
     }
     if (!SameLogicalView(source_side, side.CurrentForMutation(key)) ||
         EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
@@ -355,19 +351,19 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     co_return demoted;
   }
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
-  if (!decision.ok()) co_return decision.status();
+  LAVIK_CO_RETURN_IF_ERROR(decision.status());
   if (outer_transaction) {
     // Auxiliary records retain the outer transaction tag AND this command's
     // independent batch tag. An errored EXEC command never commits its batch,
     // even if the surrounding EXEC later commits all its successful commands.
     auto batch_decision = PrepareGroupedDecision(batch);
-    if (!batch_decision.ok()) co_return batch_decision.status();
+    LAVIK_CO_RETURN_IF_ERROR(batch_decision.status());
   }
   if (!SameLogicalView(source_side, side.CurrentForMutation(key)))
     co_return absl::AbortedError("member-index source changed during prepare");
   source_side = side.CurrentForMutation(key);
   auto reserved = side.PreparePublish(key, source_side);
-  if (!reserved.ok()) co_return reserved.status();
+  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   std::vector<GroupedRecordLocation> written;
@@ -410,8 +406,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         if (LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_GROUP_AUX_KEY", key,
                                     "LAVIK_FAIL_GROUP_AUX_NTH",
                                     written.size() + 1)) {
-          const auto abandoned = co_await abandon();
-          if (!abandoned.ok()) co_return abandoned;
+          LAVIK_CO_RETURN_IF_ERROR(co_await abandon());
           co_return absl::ResourceExhaustedError(
               "OOM injected grouped auxiliary admission failure");
         });
@@ -473,7 +468,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         command_batch};
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {
       auto max_key = StreamRecordKey(page.entries_.back().value_);
-      if (!max_key.ok()) co_return max_key.status();
+      LAVIK_CO_RETURN_IF_ERROR(max_key.status());
       candidate.stream_max_key_.Set(*max_key);
     }
     candidates.push_back(std::move(candidate));
@@ -500,11 +495,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         version.decision_ = *decision;
         std::optional<HashGroupDirectory> members;
         if (!previous && plan.root_.member_index_) {
-          auto recovered = HashGroupDirectory::Recover(
-              *plan.root_.member_index_, sequence, member_candidates,
-              absl::flat_hash_set<std::uint64_t>{tx->txid_, command_batch});
-          if (!recovered.ok()) return recovered.status();
-          members = std::move(*recovered);
+          LAVIK_ASSIGN_OR_RETURN(
+              members,
+              HashGroupDirectory::Recover(*plan.root_.member_index_, sequence,
+                                          member_candidates,
+                                          absl::flat_hash_set<std::uint64_t>{
+                                              tx->txid_, command_batch}));
         }
         absl::StatusOr<OrderedGroupDirectory> directory =
             previous ? current->ordered_directory().Apply(plan.root_, revision,
@@ -515,31 +511,29 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                            absl::flat_hash_set<std::uint64_t>{tx->txid_,
                                                               command_batch},
                            sequence, std::move(members));
-        if (!directory.ok()) return directory.status();
+        LAVIK_RETURN_IF_ERROR(directory.status());
         if (plan.root_.kind_ == OrderedCollectionKind::kStream) {
           for (const auto& page : plan.writes_) {
             if (page.id_ != plan.root_.first_group_ || page.retired_) continue;
             auto header = StreamRecordPayload(page.entries_.front().value_);
-            if (!header.ok()) return header.status();
-            auto remembered = directory->RememberStreamHeader(*header);
-            if (!remembered.ok()) return remembered;
+            LAVIK_RETURN_IF_ERROR(header.status());
+            LAVIK_RETURN_IF_ERROR(directory->RememberStreamHeader(*header));
             break;
           }
         }
-        auto prepared =
-            previous ? GroupedObject::PrepareUpdateOrdered(
-                           current, version, std::move(*directory), written)
-                     : GroupedObject::PrepareCreateOrdered(
-                           version, std::move(*directory), written,
-                           store.record_index_entry_arena_);
-        if (!prepared.ok()) return prepared.status();
-        builder = std::move(*prepared);
+        LAVIK_ASSIGN_OR_RETURN(
+            builder, previous
+                         ? GroupedObject::PrepareUpdateOrdered(
+                               current, version, std::move(*directory), written)
+                         : GroupedObject::PrepareCreateOrdered(
+                               version, std::move(*directory), written,
+                               store.record_index_entry_arena_));
         if (source_side) {
           // Root GC may have changed its physical address as well as moving
           // individual groups. Existing side entries need no new capacity.
           publication.reset();
           auto refreshed = side.PreparePublish(key, current);
-          if (!refreshed.ok()) return refreshed.status();
+          LAVIK_RETURN_IF_ERROR(refreshed.status());
           publication.emplace(std::move(*refreshed));
         }
         return absl::OkStatus();
@@ -633,7 +627,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         store.store_state_mutex_.Unlock(*store.worker_);
         const auto capacity = co_await WaitForTxCommitCapacity();
         co_await store.store_state_mutex_.Lock();
-        if (!capacity.ok()) co_return capacity;
+        LAVIK_CO_RETURN_IF_ERROR(capacity);
       }
     }
   }

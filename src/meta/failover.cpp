@@ -32,6 +32,7 @@
 #include "lavik/meta/coordinator.h"
 #include "lavik/meta/encoding.h"
 #include "lavik/meta/hash.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -54,12 +55,12 @@ void WriteHeader(MetaWriter& writer) {
 
 absl::Status ReadHeader(MetaReader& reader) {
   auto magic = reader.ReadRaw(kOperationIntentMagic.size());
-  if (!magic.ok()) return magic.status();
+  LAVIK_RETURN_IF_ERROR(magic.status());
   if (*magic != kOperationIntentMagic) {
     return Corrupt("unknown failover blob magic");
   }
   auto version = reader.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kFailoverSchemaVersion) {
     return Corrupt("unknown failover blob version");
   }
@@ -265,7 +266,7 @@ absl::Status ValidateCommitProposal(
   }
   auto prepared = ExactCandidatePrepared(*transition, action, facts,
                                          observations, proposal_now_unix_ms);
-  if (!prepared.ok()) return prepared.status();
+  LAVIK_RETURN_IF_ERROR(prepared.status());
   return absl::OkStatus();
 }
 
@@ -286,10 +287,7 @@ absl::Status ValidateFailoverOperationIntent(
 
 absl::StatusOr<std::string> EncodeFailoverOperationIntent(
     const FailoverOperationIntent& intent) {
-  if (absl::Status status = ValidateFailoverOperationIntent(intent);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateFailoverOperationIntent(intent));
   MetaWriter writer;
   WriteHeader(writer);
   writer.WriteString(intent.group_id_);
@@ -300,21 +298,15 @@ absl::StatusOr<std::string> EncodeFailoverOperationIntent(
 absl::StatusOr<FailoverOperationIntent> DecodeFailoverOperationIntent(
     std::string_view encoded) {
   MetaReader reader(encoded);
-  if (absl::Status status = ReadHeader(reader); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(ReadHeader(reader));
 
   FailoverOperationIntent intent;
-  auto group_id = reader.ReadString(kMaxMetaGroupIdBytes);
-  if (!group_id.ok()) return group_id.status();
-  intent.group_id_ = std::move(*group_id);
-  auto deadline = reader.ReadU64();
-  if (!deadline.ok()) return deadline.status();
-  intent.absolute_deadline_unix_ms_ = *deadline;
-  if (absl::Status status = reader.Finish(); !status.ok()) return status;
-  if (absl::Status status =
-          DecodeValidation(ValidateFailoverOperationIntent(intent));
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_ASSIGN_OR_RETURN(intent.group_id_,
+                         reader.ReadString(kMaxMetaGroupIdBytes));
+  LAVIK_ASSIGN_OR_RETURN(intent.absolute_deadline_unix_ms_, reader.ReadU64());
+  LAVIK_RETURN_IF_ERROR(reader.Finish());
+  LAVIK_RETURN_IF_ERROR(
+      DecodeValidation(ValidateFailoverOperationIntent(intent)));
   return intent;
 }
 
@@ -373,18 +365,14 @@ absl::Status ValidateFailoverTransition(
     if (!group.has_value() || group->failover_transition_.has_value()) {
       return Invalid("controlled failover begin pre-state is stale");
     }
-    if (absl::Status source = RequireExactCurrentSource(
-            begin->group_id_, begin->candidate_action_.domain_, facts,
-            observations, proposal_now_unix_ms);
-        !source.ok()) {
-      return source;
-    }
-    if (auto candidate = ExactCandidateProgress(
-            begin->group_id_, begin->candidate_action_, facts, observations,
-            proposal_now_unix_ms, /*action_is_committed=*/false);
-        !candidate.ok()) {
-      return candidate.status();
-    }
+    LAVIK_RETURN_IF_ERROR(RequireExactCurrentSource(
+        begin->group_id_, begin->candidate_action_.domain_, facts, observations,
+        proposal_now_unix_ms));
+    LAVIK_RETURN_IF_ERROR(
+        (ExactCandidateProgress(begin->group_id_, begin->candidate_action_,
+                                facts, observations, proposal_now_unix_ms,
+                                /*action_is_committed=*/false))
+            .status());
     return absl::OkStatus();
   }
 
@@ -406,13 +394,11 @@ absl::Status ValidateFailoverTransition(
       }
     }
     if (begin->candidate_action_.has_value()) {
-      if (auto candidate = ExactCandidateProgress(
-              begin->group_id_, *begin->candidate_action_, facts, observations,
-              proposal_now_unix_ms,
-              /*action_is_committed=*/false);
-          !candidate.ok()) {
-        return candidate.status();
-      }
+      LAVIK_RETURN_IF_ERROR(
+          (ExactCandidateProgress(begin->group_id_, *begin->candidate_action_,
+                                  facts, observations, proposal_now_unix_ms,
+                                  /*action_is_committed=*/false))
+              .status());
     }
     return absl::OkStatus();
   }
@@ -456,12 +442,11 @@ absl::Status ValidateFailoverTransition(
       }
     }
     if (set->candidate_action_.has_value()) {
-      if (auto candidate = ExactCandidateProgress(
-              set->group_id_, *set->candidate_action_, facts, observations,
-              proposal_now_unix_ms, /*action_is_committed=*/false);
-          !candidate.ok()) {
-        return candidate.status();
-      }
+      LAVIK_RETURN_IF_ERROR(
+          (ExactCandidateProgress(set->group_id_, *set->candidate_action_,
+                                  facts, observations, proposal_now_unix_ms,
+                                  /*action_is_committed=*/false))
+              .status());
     }
     return absl::OkStatus();
   }
@@ -516,7 +501,7 @@ absl::Status ValidateFailoverTransition(
     auto progress = ExactCandidateProgress(authorize->group_id_, action, facts,
                                            observations, proposal_now_unix_ms,
                                            /*action_is_committed=*/true);
-    if (!progress.ok()) return progress.status();
+    LAVIK_RETURN_IF_ERROR(progress.status());
 
     if (transition->mode_ == MetaFailoverMode::kUncontrolled &&
         !action.operator_recovery_) {

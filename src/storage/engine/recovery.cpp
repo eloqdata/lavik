@@ -20,6 +20,7 @@
 #include <tuple>
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -60,7 +61,7 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
       read = co_await ReadRecoveryExtentInto(
           store, ref, static_cast<std::uint32_t>(index), destination);
     }
-    if (!read.ok()) co_return read;
+    LAVIK_CO_RETURN_IF_ERROR(read);
     offset += std::min<std::size_t>(ref.payload_bytes_, destination.size());
   }
   if (offset != key.size()) {
@@ -76,14 +77,14 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  if (!acquired.ok()) co_return acquired.status();
+  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer io = lease.io_buffer();
   io.size_ = read_bytes;
   const auto [file_id, block_offset] = FileOffset(ref.block_id_);
   auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
                                          io, lease.registered(), block_offset);
-  if (!read.ok()) co_return read.status();
+  LAVIK_CO_RETURN_IF_ERROR(read.status());
   if (*read != read_bytes) {
     co_return absl::InternalError("short recovered extent read");
   }
@@ -112,9 +113,8 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     // The caller awaits each extent before proceeding. Even an SPDK owner hop
     // has exclusive access to this bounded, non-affine decoder until return;
     // no borrowed I/O span or worker-owned metadata survives this call.
-    auto status = ordered->Read(std::string_view(
-        reinterpret_cast<const char*>(payload.data()), payload.size()));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(ordered->Read(std::string_view(
+        reinterpret_cast<const char*>(payload.data()), payload.size())));
   }
   if (!destination.empty()) {
     std::memcpy(destination.data(), payload.data(),
@@ -167,7 +167,7 @@ StorageEngine::Impl::LoadRecoveryPayloadPrefix(
       read = co_await ReadRecoveryExtentInto(
           store, ref, static_cast<std::uint32_t>(index), destination, ordered);
     }
-    if (!read.ok()) co_return read;
+    LAVIK_CO_RETURN_IF_ERROR(read);
     copied += count;
   }
   if (copied != bytes) {
@@ -264,17 +264,13 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryBatches(
     RecoveryBatch batch;
     std::swap(batch, pending);
     if (target == store.worker_->id()) {
-      absl::Status applied = ApplyRecovery(target, std::move(batch));
-      if (!applied.ok()) co_return applied;
+      LAVIK_CO_RETURN_IF_ERROR(ApplyRecovery(target, std::move(batch)));
       continue;
     }
-    absl::Status applied = co_await bycorf::SubmitTo(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTo(
         target, [this, target, batch = std::move(batch)]() mutable {
           return ApplyRecovery(target, std::move(batch));
-        });
-    if (!applied.ok()) {
-      co_return applied;
-    }
+        }));
   }
   co_return absl::OkStatus();
 }
@@ -285,9 +281,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     absl::flat_hash_set<std::uint64_t>* committed_txids,
     bool indirect_key_pass) {
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
+  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer header_buffer = lease.io_buffer();
   header_buffer.size_ = kBlockHeaderBytes;
@@ -394,9 +388,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       auto read = co_await ReadStorageBuffer(
           *store.worker_, store.files_[file_id], header_buffer,
           lease.registered(), block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
+      LAVIK_CO_RETURN_IF_ERROR(read.status());
       if (*read != kBlockHeaderBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short read while scanning block header");
@@ -482,10 +474,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       if (block.kind_ == BlockKind::kPayloadExtent) {
         ReportRecoveryProgress(0, /*allocated=*/true);
         if (buffered_bytes >= batch_target_bytes) {
-          absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
-          if (!applied.ok()) {
-            co_return applied;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await ApplyRecoveryBatches(store, batches));
           buffered_bytes = 0;
         }
         continue;
@@ -495,8 +485,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           checkpoint_active_.load(std::memory_order_acquire)) {
         if (!indirect_key_pass) ReportRecoveryProgress(0, /*allocated=*/true);
         if (buffered_bytes >= batch_target_bytes) {
-          absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
-          if (!applied.ok()) co_return applied;
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await ApplyRecoveryBatches(store, batches));
           buffered_bytes = 0;
         }
         continue;
@@ -505,9 +495,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
                                         recovery.buffer_, recovery.registered(),
                                         block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
+      LAVIK_CO_RETURN_IF_ERROR(read.status());
       if (*read != kStorageBlockBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short read while scanning committed block");
@@ -576,11 +564,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           record_offset += record.total_disk_bytes_;
           ++records;
           if (buffered_bytes >= batch_target_bytes) {
-            absl::Status applied =
-                co_await ApplyRecoveryBatches(store, batches);
-            if (!applied.ok()) {
-              co_return applied;
-            }
+            LAVIK_CO_RETURN_IF_ERROR(
+                co_await ApplyRecoveryBatches(store, batches));
             buffered_bytes = 0;
           }
           continue;
@@ -596,15 +581,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         ExtentManifest extents;
         if (record.external_) {
           const std::uint64_t extent_bytes = record.logical_size_;
-          auto decoded = DecodeManifest(
-              payload_span, extent_bytes,
-              record.kind_ != RecordKind::kValue ||
-                  (record.value_type_ == ValueType::kString &&
-                   !record.grouped_ && !record.auxiliary_group_));
-          if (!decoded.ok()) {
-            co_return decoded.status();
-          }
-          extents = std::move(*decoded);
+          LAVIK_ASSIGN_OR_CO_RETURN(
+              extents, DecodeManifest(
+                           payload_span, extent_bytes,
+                           record.kind_ != RecordKind::kValue ||
+                               (record.value_type_ == ValueType::kString &&
+                                !record.grouped_ && !record.auxiliary_group_)));
         }
         if (block.kind_ == BlockKind::kIndirectKeys) {
           if (record.kind_ != RecordKind::kValue ||
@@ -620,10 +602,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           std::memcpy(id.data(), key.data(), sizeof(id));
           std::string original;
           if (record.external_) {
-            auto loaded = co_await LoadExternalKeyForRecovery(
-                store, extents, record.logical_size_);
-            if (!loaded.ok()) co_return loaded.status();
-            original = std::move(*loaded);
+            LAVIK_ASSIGN_OR_CO_RETURN(
+                original, co_await LoadExternalKeyForRecovery(
+                              store, extents, record.logical_size_));
           } else {
             if (record.payload_bytes_ != record.logical_size_)
               co_return absl::DataLossError(
@@ -654,8 +635,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             const auto key = IndirectKeyIdBytes(handle->id_);
             auto* entry = target.indirect_keys_.Find(ComputeDigest(key), key);
             if (entry == nullptr) {
-              auto inserted = InsertIndirectKey(target, handle);
-              if (!inserted.ok()) return inserted;
+              LAVIK_RETURN_IF_ERROR(InsertIndirectKey(target, handle));
               target.indirect_key_candidates_[handle->digest_].push_back(
                   handle->id_);
               if (!target.indirect_key_gc_queue_)
@@ -680,7 +660,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             installed = install();
           else
             installed = co_await bycorf::SubmitTo(owner, std::move(install));
-          if (!installed.ok()) co_return installed;
+          LAVIK_CO_RETURN_IF_ERROR(installed);
           auto note = [this, block_owner, block_id,
                        epoch = block.allocation_epoch_, id, record_offset] {
             stores_[block_owner]
@@ -700,7 +680,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         Digest indirect_digest{};
         if (record.key_indirect_) [[unlikely]] {
           auto handle = co_await FindIndirectKey(record.key_id_);
-          if (!handle.ok()) co_return handle.status();
+          LAVIK_CO_RETURN_IF_ERROR(handle.status());
           loaded_key = (*handle)->recovery_key_;
           indirect_digest = (*handle)->digest_;
           if (loaded_key == nullptr || loaded_key->size() != record.key_bytes_)
@@ -785,7 +765,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 reinterpret_cast<const char*>(payload), record.payload_bytes_);
             if (ordered && IsOrderedPageId(auxiliary_group->id_)) {
               auto decoded = DecodeOrderedGroup(encoded);
-              if (!decoded.ok()) co_return decoded.status();
+              LAVIK_CO_RETURN_IF_ERROR(decoded.status());
               if (decoded->kind_ != ordered_kind ||
                   decoded->incarnation_ != auxiliary_group->incarnation_ ||
                   decoded->id_ != auxiliary_group->id_.prefix_ ||
@@ -803,7 +783,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 if (!decoded->retired_) {
                   auto max_key =
                       StreamRecordKey(decoded->entries_.back().value_);
-                  if (!max_key.ok()) co_return max_key.status();
+                  LAVIK_CO_RETURN_IF_ERROR(max_key.status());
                   ordered_group->stream_max_key_.Set(*max_key);
                 }
               } else if (!decoded->entries_.empty()) {
@@ -813,7 +793,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               }
             } else {
               auto decoded = DecodeHashGroup(encoded);
-              if (!decoded.ok()) co_return decoded.status();
+              LAVIK_CO_RETURN_IF_ERROR(decoded.status());
               if (decoded->incarnation_ != auxiliary_group->incarnation_ ||
                   decoded->id_ != auxiliary_group->id_ ||
                   decoded->retired_ != auxiliary_group->retired_ ||
@@ -845,10 +825,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               co_return absl::DataLossError(
                   "recovered grouped root is too large");
             }
-            auto loaded = co_await LoadRecoveryPayloadPrefix(store, extents,
-                                                             encoded_bytes);
-            if (!loaded.ok()) co_return loaded.status();
-            metadata_bytes = std::move(*loaded);
+            LAVIK_ASSIGN_OR_CO_RETURN(metadata_bytes,
+                                      co_await LoadRecoveryPayloadPrefix(
+                                          store, extents, encoded_bytes));
             encoded = metadata_bytes;
           } else {
             encoded = std::string_view(reinterpret_cast<const char*>(payload),
@@ -856,7 +835,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
           if (ordered) {
             auto decoded = DecodeOrderedCollectionRoot(encoded);
-            if (!decoded.ok()) co_return decoded.status();
+            LAVIK_CO_RETURN_IF_ERROR(decoded.status());
             if (decoded->revision_ == 0) {
               decoded->revision_ = record.mutation_sequence_;
             }
@@ -870,7 +849,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             AtomicMax(&recovery_max_txid_, decoded->incarnation_);
           } else {
             auto decoded = DecodeGroupedHashRoot(encoded);
-            if (!decoded.ok()) co_return decoded.status();
+            LAVIK_CO_RETURN_IF_ERROR(decoded.status());
             if (decoded->field_count_ != record.logical_size_) {
               co_return absl::DataLossError(
                   "grouped root count disagrees with its record header");
@@ -910,10 +889,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         record_offset += record.total_disk_bytes_;
         ++records;
         if (buffered_bytes >= batch_target_bytes) {
-          absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
-          if (!applied.ok()) {
-            co_return applied;
-          }
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await ApplyRecoveryBatches(store, batches));
           buffered_bytes = 0;
         }
       }
@@ -925,10 +902,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
       ReportRecoveryProgress(records, /*allocated=*/true);
       if (buffered_bytes >= batch_target_bytes) {
-        absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
-        if (!applied.ok()) {
-          co_return applied;
-        }
+        LAVIK_CO_RETURN_IF_ERROR(co_await ApplyRecoveryBatches(store, batches));
         buffered_bytes = 0;
       }
     }
@@ -1008,8 +982,7 @@ absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
       store.recovery_tx_records_.emplace_back(std::move(recovered));
       continue;
     }
-    absl::Status applied = ApplyRecoveredRecord(store, recovered);
-    if (!applied.ok()) return applied;
+    LAVIK_RETURN_IF_ERROR(ApplyRecoveredRecord(store, recovered));
   }
   for (const RecoveryBatch::CommitRecord& commit : batch.commit_records_) {
     BlockState* state = FindBlockState(store, commit.block_id_);
@@ -1154,10 +1127,9 @@ absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
       winner.set_tx_tagged(recovered.txid_ != 0);
       RecordIndex::Entry* winner_entry = found;
       if (winner_entry != nullptr) {
-        auto replaced = ReplaceIndexLocation(store, index, winner_entry,
-                                             recovered.digest_, winner);
-        if (!replaced.ok()) return replaced.status();
-        winner_entry = *replaced;
+        LAVIK_ASSIGN_OR_RETURN(winner_entry,
+                               ReplaceIndexLocation(store, index, winner_entry,
+                                                    recovered.digest_, winner));
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
                                        winner, !winner.key_indirect());
@@ -1328,8 +1300,7 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
       // charged as live, or leave a side view for a discarded root.
       for (auto it = lower; it != end; ++it) {
         if (!it->grouped_reachable_) continue;
-        auto checked = co_await ValidateRecoveredGroup(store, *it);
-        if (!checked.ok()) co_return checked;
+        LAVIK_CO_RETURN_IF_ERROR(co_await ValidateRecoveredGroup(store, *it));
       }
       co_return absl::OkStatus();
     };
@@ -1410,9 +1381,8 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
         retain_selected();
         continue;
       }
-      auto published = partition.grouped_objects_[root_db].Publish(
-          key, nullptr, std::move(*object));
-      if (!published.ok()) co_return published;
+      LAVIK_CO_RETURN_IF_ERROR(partition.grouped_objects_[root_db].Publish(
+          key, nullptr, std::move(*object)));
       retain_selected();
       continue;
     }
@@ -1463,10 +1433,9 @@ Task<absl::Status> StorageEngine::Impl::RecoverGroupedObjects(
     auto object =
         GroupedObject::Create(version, std::move(*directory), locations,
                               store.record_index_entry_arena_);
-    if (!object.ok()) co_return object.status();
-    auto published = partition.grouped_objects_[root_db].Publish(
-        key, nullptr, std::move(*object));
-    if (!published.ok()) co_return published;
+    LAVIK_CO_RETURN_IF_ERROR(object.status());
+    LAVIK_CO_RETURN_IF_ERROR(partition.grouped_objects_[root_db].Publish(
+        key, nullptr, std::move(*object)));
     retain_selected();
   }
   // pop_front releases element blocks but leaves the deque's peak-sized map.
@@ -1566,9 +1535,9 @@ StorageEngine::Impl::RecoverOrderedObject(
       OrderedGroupMetadataDecoder decoder(bytes);
       auto prefix = co_await LoadRecoveryPayloadPrefix(
           store, extents, kOrderedGroupHeaderBytes, &decoder);
-      if (!prefix.ok()) co_return prefix.status();
+      LAVIK_CO_RETURN_IF_ERROR(prefix.status());
       auto metadata = decoder.Finish();
-      if (!metadata.ok()) co_return metadata.status();
+      LAVIK_CO_RETURN_IF_ERROR(metadata.status());
       if (metadata->kind_ != root.kind_ ||
           metadata->incarnation_ != candidate.incarnation_ ||
           metadata->id_ != candidate.id_ ||
@@ -1597,16 +1566,15 @@ StorageEngine::Impl::RecoverOrderedObject(
   }
   std::optional<HashGroupDirectory> members;
   if (root.member_index_) {
-    auto recovered = HashGroupDirectory::Recover(
-        *root.member_index_, version.root_.mutation_sequence_,
-        member_candidates, recovery_committed_txids_);
-    if (!recovered.ok()) co_return recovered.status();
-    members = std::move(*recovered);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        members, HashGroupDirectory::Recover(
+                     *root.member_index_, version.root_.mutation_sequence_,
+                     member_candidates, recovery_committed_txids_));
   }
   auto directory = OrderedGroupDirectory::Recover(
       root, revision, candidates, recovery_committed_txids_,
       version.root_.mutation_sequence_, std::move(members));
-  if (!directory.ok()) co_return directory.status();
+  LAVIK_CO_RETURN_IF_ERROR(directory.status());
   RecoveryVector<GroupedRecordLocation> locations;
   locations.reserve(candidates.size());
   const auto append = [&](const OrderedGroupEntry& candidate) {
@@ -1669,9 +1637,9 @@ Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
   // reused obsolete extent cannot make an otherwise valid startup fail.
   auto prefix =
       co_await LoadRecoveryPayloadPrefix(store, extents, kHashGroupHeaderBytes);
-  if (!prefix.ok()) co_return prefix.status();
+  LAVIK_CO_RETURN_IF_ERROR(prefix.status());
   auto decoded = DecodeHashGroupMetadata(*prefix, encoded_bytes);
-  if (!decoded.ok()) co_return decoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(decoded.status());
   const auto expected = record.AuxiliaryGroup();
   if (decoded->incarnation_ != expected.incarnation_ ||
       decoded->id_ != expected.id_ ||

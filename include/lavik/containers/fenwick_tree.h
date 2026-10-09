@@ -28,6 +28,7 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
 #include "lavik/containers/cow_array.h"
+#include "lavik/status_macros.h"
 
 namespace lavik {
 
@@ -59,7 +60,7 @@ class FenwickTree {
       if (parent < ends.size()) ends[parent] += ends[i];
     }
     auto cells = Storage::From(ends);
-    if (!cells.ok()) return cells.status();
+    LAVIK_RETURN_IF_ERROR(cells.status());
     FenwickTree result;
     result.cells_ = std::move(*cells);
     return result;
@@ -129,15 +130,14 @@ class FenwickTree {
     }
     const auto old_suffix = cells_.size() - first;
     auto appended = cells_.Appended(std::span(encoded).subspan(old_suffix));
-    if (!appended.ok()) return appended.status();
+    LAVIK_RETURN_IF_ERROR(appended.status());
     FenwickTree result;
     result.cells_ = std::move(*appended);
     for (std::size_t i = 0; i < old_suffix; ++i) {
-      auto status = result.cells_.Set(first + i, encoded[i]);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(result.cells_.Set(first + i, encoded[i]));
     }
-    auto status = result.ApplyPartialSums(prefix_changes, item_count, first);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(
+        result.ApplyPartialSums(prefix_changes, item_count, first));
     return result;
   }
 
@@ -184,8 +184,8 @@ class FenwickTree {
       const auto value = absl::int128(cells_[index]) + delta;
       if (value < 0 || value > item_count)
         return absl::DataLossError("invalid Fenwick updated sum");
-      auto status = cells_.Set(index, static_cast<std::uint64_t>(value));
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(
+          cells_.Set(index, static_cast<std::uint64_t>(value)));
     }
     return absl::OkStatus();
   }

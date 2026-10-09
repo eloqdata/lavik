@@ -19,6 +19,7 @@
 #include "absl/strings/str_cat.h"
 #include "device_affinity.h"
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -41,10 +42,9 @@ ReadSystemStateRootCandidates(const std::string& path) {
   bool saw_nonzero = false;
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
-    absl::Status read = ReadExactlyAt(
+    LAVIK_RETURN_IF_ERROR(ReadExactlyAt(
         path, page,
-        MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
-    if (!read.ok()) return read;
+        MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot)));
     if (IsZero(page)) continue;
     saw_nonzero = true;
     MirroredSystemStateRoot candidate;
@@ -71,7 +71,7 @@ SelectCommonSystemStateRoot(const std::vector<std::string>& paths) {
   bool saw_any = false;
   for (const std::string& path : paths) {
     auto loaded = ReadSystemStateRootCandidates(path);
-    if (!loaded.ok()) return loaded.status();
+    LAVIK_RETURN_IF_ERROR(loaded.status());
     saw_any |= !loaded->empty();
     candidates.push_back(std::move(*loaded));
   }
@@ -105,10 +105,9 @@ absl::Status InstallSystemStateRoot(
     const std::optional<MirroredSystemStateRoot>& root) {
   std::array<std::byte, kDirectIoAlignment> zero{};
   for (unsigned slot = 0; slot < 2; ++slot) {
-    absl::Status cleared = WriteExactlyAt(
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
-        false);
-    if (!cleared.ok()) return cleared;
+        false));
   }
   if (!root.has_value()) {
     return WriteExactlyAt(
@@ -136,10 +135,9 @@ absl::Status ResetStorageMetadata(const std::string& path,
     for (std::uint64_t offset = 0; offset < bytes; offset += kResetChunkBytes) {
       const std::size_t chunk = static_cast<std::size_t>(
           std::min<std::uint64_t>(kResetChunkBytes, bytes - offset));
-      absl::Status status = bycorf::WriteSpdkStorage(
+      LAVIK_RETURN_IF_ERROR(bycorf::WriteSpdkStorage(
           path, std::span<const std::byte>(zero.data(), chunk), offset,
-          offset + chunk == bytes);
-      if (!status.ok()) return status;
+          offset + chunk == bytes));
     }
     return absl::OkStatus();
   }
@@ -174,22 +172,16 @@ absl::Status InitializeAddedDeviceMetadata(
     const std::string& path, std::uint64_t capacity_blocks,
     const std::vector<std::uint64_t>& epoch_values) {
   std::array<std::byte, kDirectIoAlignment> zero{};
-  absl::Status status = WriteExactlyAt(path, zero, kDeviceLabelOffset, true);
-  if (!status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(WriteExactlyAt(path, zero, kDeviceLabelOffset, true));
 
   for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
        ++page_index) {
     const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
     const std::size_t payload_bytes =
         std::min(kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
-    status = WriteExactlyAt(
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 1),
-        false);
-    if (!status.ok()) {
-      return status;
-    }
+        false));
     std::array<std::byte, kDirectIoAlignment> page{};
     EncodeMetadataPage(
         MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index), 1,
@@ -198,51 +190,37 @@ absl::Status InitializeAddedDeviceMetadata(
                 byte_offset,
             payload_bytes),
         page);
-    status = WriteExactlyAt(
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, page, MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 0),
-        true);
-    if (!status.ok()) {
-      return status;
-    }
+        true));
   }
 
   const std::size_t bitmap_pages = ScanBitmapPageCount(capacity_blocks);
   for (std::size_t page_index = 0; page_index < bitmap_pages; ++page_index) {
-    status = WriteExactlyAt(
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero,
         MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 0),
-        false);
-    if (!status.ok()) {
-      return status;
-    }
-    status = WriteExactlyAt(
+        false));
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1), true);
-    if (!status.ok()) {
-      return status;
-    }
+        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1),
+        true));
   }
   const std::uint64_t checkpoint_bitmap_offset =
       CheckpointBitmapMetadataOffset(capacity_blocks);
   for (std::size_t page_index = 0; page_index < bitmap_pages; ++page_index) {
-    status = WriteExactlyAt(
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 0), false);
-    if (!status.ok()) {
-      return status;
-    }
-    status = WriteExactlyAt(
+        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 0),
+        false));
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 1), true);
-    if (!status.ok()) {
-      return status;
-    }
+        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 1), true));
   }
   for (unsigned slot = 0; slot < 2; ++slot) {
-    status = WriteExactlyAt(
+    LAVIK_RETURN_IF_ERROR(WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
-        slot == 1);
-    if (!status.ok()) return status;
+        slot == 1));
   }
   return absl::OkStatus();
 }
@@ -278,9 +256,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   std::vector<std::optional<DeviceLabel>> labels;
   for (const std::string& path : options_.data_files_) {
     auto probed = ProbeStoragePath(path);
-    if (!probed.ok()) {
-      return probed.status();
-    }
+    LAVIK_RETURN_IF_ERROR(probed.status());
     if (probed->size_bytes_ < 2 * kStorageBlockBytes) {
       return absl::Status(
           absl::StatusCode::kOutOfRange,
@@ -329,16 +305,14 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     for (std::size_t i = 0; i < path_info.size(); ++i) {
       spdlog::warn("resetting all Lavik data on storage path {}",
                    options_.data_files_[i]);
-      absl::Status reset =
+      LAVIK_RETURN_IF_ERROR(
           ResetStorageMetadata(options_.data_files_[i],
-                               path_info[i].size_bytes_ / kStorageBlockBytes);
-      if (!reset.ok()) return reset;
+                               path_info[i].size_bytes_ / kStorageBlockBytes));
     }
   } else {
     for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
-      auto label = ReadDeviceLabel(options_.data_files_[i]);
-      if (!label.ok()) return label.status();
-      labels[i] = std::move(*label);
+      LAVIK_ASSIGN_OR_RETURN(labels[i],
+                             ReadDeviceLabel(options_.data_files_[i]));
     }
   }
 
@@ -435,11 +409,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       }
     }
   } else {
-    auto generated = RandomStorageSetId();
-    if (!generated.ok()) {
-      return generated.status();
-    }
-    storage_set_id = *generated;
+    LAVIK_ASSIGN_OR_RETURN(storage_set_id, RandomStorageSetId());
     for (std::size_t i = 0; i < labels.size(); ++i) {
       assigned_device_ids[i] = i;
     }
@@ -585,9 +555,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
             options_.data_files_[i], kEpochMetadataOffset,
             MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index),
             payload_bytes);
-        if (!loaded.ok()) {
-          return loaded.status();
-        }
+        LAVIK_RETURN_IF_ERROR(loaded.status());
         const std::size_t first_value = byte_offset / sizeof(std::uint64_t);
         const std::size_t value_count = payload_bytes / sizeof(std::uint64_t);
         for (std::size_t value_index = 0; value_index < value_count;
@@ -605,21 +573,15 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       }
     }
     auto inherited_system_state = SelectCommonSystemStateRoot(existing_paths);
-    if (!inherited_system_state.ok()) {
-      return inherited_system_state.status();
-    }
+    LAVIK_RETURN_IF_ERROR(inherited_system_state.status());
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (labels[i].has_value()) {
         continue;
       }
-      absl::Status initialized = InitializeAddedDeviceMetadata(
-          options_.data_files_[i], capacity_by_path[i], canonical_epochs);
-      if (!initialized.ok()) {
-        return initialized;
-      }
-      absl::Status system_state_installed = InstallSystemStateRoot(
-          options_.data_files_[i], *inherited_system_state);
-      if (!system_state_installed.ok()) return system_state_installed;
+      LAVIK_RETURN_IF_ERROR(InitializeAddedDeviceMetadata(
+          options_.data_files_[i], capacity_by_path[i], canonical_epochs));
+      LAVIK_RETURN_IF_ERROR(InstallSystemStateRoot(options_.data_files_[i],
+                                                   *inherited_system_state));
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
           .version_ = kStorageFormatVersion,
@@ -630,10 +592,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           .device_count_ = configured_device_count,
           .block_bytes_ = kStorageBlockBytes,
       };
-      absl::Status written = WriteDeviceLabel(options_.data_files_[i], label);
-      if (!written.ok()) {
-        return written;
-      }
+      LAVIK_RETURN_IF_ERROR(WriteDeviceLabel(options_.data_files_[i], label));
       labels[i] = label;
     }
     // Publish all new labels before changing an old label's member count. An
@@ -643,11 +602,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         continue;
       }
       labels[i]->device_count_ = configured_device_count;
-      absl::Status written =
-          WriteDeviceLabel(options_.data_files_[i], *labels[i]);
-      if (!written.ok()) {
-        return written;
-      }
+      LAVIK_RETURN_IF_ERROR(
+          WriteDeviceLabel(options_.data_files_[i], *labels[i]));
     }
     spdlog::info("expanded storage set from {} to {} devices",
                  previous_device_count, configured_device_count);
@@ -663,10 +619,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           .device_count_ = configured_device_count,
           .block_bytes_ = kStorageBlockBytes,
       };
-      absl::Status written = WriteDeviceLabel(options_.data_files_[i], label);
-      if (!written.ok()) {
-        return written;
-      }
+      LAVIK_RETURN_IF_ERROR(WriteDeviceLabel(options_.data_files_[i], label));
       labels[i] = label;
     }
   }
@@ -700,8 +653,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   spdlog::info("storage flush submission size={} bytes",
                options_.flush_size_bytes_);
 
-  absl::Status system_state = LoadSystemState();
-  if (!system_state.ok()) return system_state;
+  LAVIK_RETURN_IF_ERROR(LoadSystemState());
 
   worker_count_ = worker_count;
   epoch_values_ = InitialEpochValues();
@@ -943,10 +895,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           partition_store.replication_epoch_;
     }
   }
-  absl::Status affinity = ConfigureWorkerDeviceAffinity();
-  if (!affinity.ok()) {
-    return affinity;
-  }
+  LAVIK_RETURN_IF_ERROR(ConfigureWorkerDeviceAffinity());
   // Metadata probing is complete. Return its temporary controller qpairs so
   // a controller advertising exactly worker_count queues can still start.
   bycorf::ReleaseSpdkStorageMetadataQpairs();
@@ -1067,9 +1016,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
     } else {
       applied = co_await bycorf::SubmitTo(owner, std::move(apply_live));
     }
-    if (!applied.ok()) {
-      co_return applied;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(applied);
   }
   co_return absl::OkStatus();
 }
@@ -1124,9 +1071,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await open_barrier_->Wait(worker);
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   std::vector<RecoveryBatch> batches(worker_count_);
   std::vector<std::uint64_t> zero_blocks;
@@ -1145,7 +1090,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_consumed_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
     checkpoint_load.status_ =
@@ -1153,7 +1098,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_capacity_loaded_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (worker.id() == 0 && checkpoint_active_.load(std::memory_order_acquire)) {
     const absl::Status prepared = co_await PrepareCheckpointIndexes();
@@ -1168,14 +1113,14 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_capacity_ready_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
     checkpoint_load.status_ = PreallocateCheckpointIndexes(store);
   }
 
   status = co_await checkpoint_indexes_preallocated_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (worker.id() == 0 && checkpoint_active_.load(std::memory_order_acquire)) {
     absl::Status preallocation_status = absl::OkStatus();
@@ -1198,14 +1143,14 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_indexes_ready_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
     checkpoint_load.status_ = co_await LoadCheckpoint(store, &checkpoint_load);
   }
 
   status = co_await checkpoint_loaded_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (checkpoint_active_.load(std::memory_order_acquire) &&
       checkpoint_load.status_.ok()) {
@@ -1213,7 +1158,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_index_validated_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (worker.id() == 0) {
     if (checkpoint_active_.load(std::memory_order_acquire)) {
@@ -1292,9 +1237,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await metadata_barrier_->Wait(worker);
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
     if (worker.id() == 0) {
@@ -1316,7 +1259,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_retired_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
     // Complete directories are already restored; do not reconstruct them from
@@ -1358,7 +1301,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     co_return status;
   }
   status = co_await indirect_key_recovery_barrier_->Wait(worker);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   // KeyRecord recovery restores every durable UUID copy, including obsolete
   // copies and extent ownership. Reattach the checkpoint's physical user-record
   // references before any block can be reclaimed, even for deleted user keys.
@@ -1397,9 +1340,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await recovery_barrier_->Wait(worker);
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(status);
 
   for (const auto& ref : checkpoint_load.indirect_references_) {
     const auto* state = FindBlockState(store, ref.block_id_);
@@ -1808,9 +1749,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await recovery_accounting_barrier_->Wait(worker);
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(status);
   // Every worker has finished transaction adjudication and grouped recovery.
   // The shared decisions have no runtime readers; only worker 0 destroys them.
   if (worker.id() == 0) {
@@ -1868,9 +1807,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   }
   status = co_await free_list_barrier_->Wait(worker);
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(status);
   // Reclaim orphan extents before writing recovery tombstones. On a full
   // device these may be the only reusable blocks, so deferring this pass
   // until after DeleteLocked makes every restart fail at the same point.
@@ -1898,9 +1835,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   }
   status = co_await orphan_extent_barrier_->Wait(worker);
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(status);
   // The recovered roots above have now been charged exactly once and free
   // blocks are available. Normal AppendLocked accounting can therefore
   // replace every expired winner with a tombstone without either
@@ -2208,7 +2143,7 @@ absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
       });
     }
     auto planned = PlanControllerAffinity(inputs, worker_count_);
-    if (!planned.ok()) return planned.status();
+    LAVIK_RETURN_IF_ERROR(planned.status());
 
     device_owners_.assign(devices_.size(), {});
     auto assign_controller = [this](ControllerPlan& controller,
@@ -2362,17 +2297,13 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   // join its cancellable round before any worker freezes append streams.
   while (store->expiry_cycle_running_ || store->indirect_key_cleaner_running_ ||
          tomb_raider_running_.load(std::memory_order_acquire)) {
-    absl::Status status = co_await bycorf::SleepFor(
-        *store->worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1)));
   }
 
   while (active_defrags_.load(std::memory_order_acquire) != 0) {
-    absl::Status status = co_await bycorf::SleepFor(
-        *store->worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) {
-      co_return status;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1)));
   }
 
   // Replication's in-memory backlog owns a separately replenished standby.
@@ -2383,9 +2314,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     const bool pending = store->replication_log_.standby_refill_pending_;
     store->replication_log_.mutex_.Unlock(*store->worker_);
     if (!pending) break;
-    absl::Status status = co_await bycorf::SleepFor(
-        *store->worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1)));
   }
   co_await store->replication_log_.mutex_.Lock();
   store->replication_log_.standby_block_.reset();
@@ -2399,9 +2329,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     const bool prefetch_pending = store->standby_prefetch_pending_;
     store->store_state_mutex_.Unlock(*store->worker_);
     if (!prefetch_pending) break;
-    absl::Status status = co_await bycorf::SleepFor(
-        *store->worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1)));
   }
 
   co_await store->active_block_allocation_mutex_.Lock();
@@ -2421,8 +2350,7 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     SealActiveBlocks(*store);
   }
   if (standby.has_value()) {
-    absl::Status returned = co_await ReturnReservedBlock(*standby);
-    if (!returned.ok()) co_return returned;
+    LAVIK_CO_RETURN_IF_ERROR(co_await ReturnReservedBlock(*standby));
   }
 
   while (true) {
@@ -2449,11 +2377,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     if (done) {
       co_return absl::OkStatus();
     }
-    absl::Status status = co_await bycorf::SleepFor(
-        *store->worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) {
-      co_return status;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store->worker_, std::chrono::milliseconds(1)));
   }
 }
 

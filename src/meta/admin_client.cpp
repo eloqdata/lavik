@@ -17,6 +17,7 @@
 #include "lavik/meta/admin_client.h"
 
 #include "absl/strings/cord.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -57,7 +58,7 @@ absl::StatusOr<std::string> MetaAdminClient::RoundTrip(
 
   auto stream = net::SyncStream::Connect(target, deadline);
   if (!stream.ok()) return MarkMetaAdminRequestNotSent(stream.status());
-  if (auto status = (*stream)->WriteAll(wire); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR((*stream)->WriteAll(wire));
   return (*stream)->ReadLine(kMaxReplyBytes);
 }
 

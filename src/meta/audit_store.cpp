@@ -21,6 +21,7 @@
 #include <string>
 #include <utility>
 
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -39,28 +40,22 @@ void WriteRecord(MetaWriter& w, const MetaAuditRecord& entry) {
 
 absl::StatusOr<MetaAuditRecord> ReadRecord(MetaReader& r) {
   MetaAuditRecord entry;
-  auto index = r.ReadU64();
-  if (!index.ok()) return index.status();
-  entry.log_index_ = *index;
-  auto principal = r.ReadString(kMaxMetaPrincipalBytes);
-  if (!principal.ok()) return principal.status();
-  entry.actor_principal_ = std::string(*principal);
-  auto summary = r.ReadString(kMaxMetaAuditSummaryBytes);
-  if (!summary.ok()) return summary.status();
-  entry.command_summary_ = std::string(*summary);
+  LAVIK_ASSIGN_OR_RETURN(entry.log_index_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(entry.actor_principal_,
+                         r.ReadString(kMaxMetaPrincipalBytes));
+  LAVIK_ASSIGN_OR_RETURN(entry.command_summary_,
+                         r.ReadString(kMaxMetaAuditSummaryBytes));
   auto verdict = r.ReadU8();
-  if (!verdict.ok()) return verdict.status();
+  LAVIK_RETURN_IF_ERROR(verdict.status());
   if (*verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kAccepted) &&
       *verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kRejected)) {
     return MetaFailStopError("unknown audit verdict tag");
   }
   entry.verdict_ = static_cast<MetaAuditVerdict>(*verdict);
-  auto detail = r.ReadString(kMaxMetaAuditDetailBytes);
-  if (!detail.ok()) return detail.status();
-  entry.verdict_detail_ = std::string(*detail);
-  auto time = r.ReadString(kMaxMetaAuditReadableTimeBytes);
-  if (!time.ok()) return time.status();
-  entry.readable_time_ = std::string(*time);
+  LAVIK_ASSIGN_OR_RETURN(entry.verdict_detail_,
+                         r.ReadString(kMaxMetaAuditDetailBytes));
+  LAVIK_ASSIGN_OR_RETURN(entry.readable_time_,
+                         r.ReadString(kMaxMetaAuditReadableTimeBytes));
   return entry;
 }
 
@@ -323,31 +318,27 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
     std::string_view bytes, std::uint32_t window_capacity) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported audit blob schema version");
   }
   auto floor = r.ReadU64();
-  if (!floor.ok()) return floor.status();
+  LAVIK_RETURN_IF_ERROR(floor.status());
   MetaAuditPolicy policy = MetaAuditPolicy::kBoundedRotate;
   std::uint64_t dropped_total = 0;
   std::uint64_t dropped_through = 0;
   auto policy_tag = r.ReadU8();
-  if (!policy_tag.ok()) return policy_tag.status();
+  LAVIK_RETURN_IF_ERROR(policy_tag.status());
   if (*policy_tag > static_cast<std::uint8_t>(MetaAuditPolicy::kStrictExport)) {
     return MetaFailStopError("unknown audit policy tag");
   }
   policy = static_cast<MetaAuditPolicy>(*policy_tag);
-  auto dropped_count = r.ReadU64();
-  if (!dropped_count.ok()) return dropped_count.status();
-  dropped_total = *dropped_count;
-  auto dropped_floor = r.ReadU64();
-  if (!dropped_floor.ok()) return dropped_floor.status();
-  dropped_through = *dropped_floor;
+  LAVIK_ASSIGN_OR_RETURN(dropped_total, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(dropped_through, r.ReadU64());
   auto entries = r.ReadList<MetaAuditRecord>(
       window_capacity, [](MetaReader& rr) { return ReadRecord(rr); });
-  if (!entries.ok()) return entries.status();
-  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(entries.status());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
 
   MetaAuditStore store(window_capacity);
   store.pruned_floor_ = *floor;
@@ -370,23 +361,19 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
 absl::StatusOr<MetaAuditExport> DecodeMetaAuditExport(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported audit export schema version");
   }
   std::uint64_t dropped_total = 0;
   std::uint64_t dropped_through = 0;
-  auto count = r.ReadU64();
-  if (!count.ok()) return count.status();
-  dropped_total = *count;
-  auto through = r.ReadU64();
-  if (!through.ok()) return through.status();
-  dropped_through = *through;
+  LAVIK_ASSIGN_OR_RETURN(dropped_total, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(dropped_through, r.ReadU64());
   auto entries = r.ReadList<MetaAuditRecord>(
       kMaxMetaAuditWindowRecords,
       [](MetaReader& rr) { return ReadRecord(rr); });
-  if (!entries.ok()) return entries.status();
-  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(entries.status());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
 
   MetaAuditExport out;
   out.dropped_total_ = dropped_total;

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -115,7 +116,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
     } else {
       status = co_await bycorf::SubmitTaskTo(owner, release);
     }
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   co_return absl::OkStatus();
 }
@@ -135,8 +136,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
     }
     extent_bytes += ref.payload_bytes_;
   }
-  absl::Status pinned = co_await PinFullSyncExtents(extents);
-  if (!pinned.ok()) co_return pinned;
+  LAVIK_CO_RETURN_IF_ERROR(co_await PinFullSyncExtents(extents));
   auto capture = partition.fullsync_subscribers_.find(session_id);
   const auto session = store.fullsync_sessions_.find(session_id);
   if (session == store.fullsync_sessions_.end() ||
@@ -350,7 +350,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   auto& index = partition.indexes_[requested.db_id_];
   auto resolved =
       co_await FindVerifiedEntry(store, index, digest, requested.key_);
-  if (!resolved.ok()) co_return resolved.status();
+  LAVIK_CO_RETURN_IF_ERROR(resolved.status());
 
   const RecordIndex::Entry* current = *resolved;
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
@@ -388,7 +388,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
       source_id = co_await PinFullSyncValue(store, session_id, partition,
                                             location, extents);
     }
-    if (!source_id.ok()) co_return source_id.status();
+    LAVIK_CO_RETURN_IF_ERROR(source_id.status());
     key_lock.Reset();
     co_return SnapshotRecord{
         .kind_ = SnapshotRecord::Kind::kValue,
@@ -407,7 +407,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   }
   auto loaded = co_await LoadValue(store, partition, requested.db_id_,
                                    requested.key_, digest, location, extents);
-  if (!loaded.ok()) co_return loaded.status();
+  LAVIK_CO_RETURN_IF_ERROR(loaded.status());
   const std::span<const std::byte> value = loaded->value();
   SnapshotRecord result{
       .kind_ = SnapshotRecord::Kind::kValue,
@@ -531,9 +531,7 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
           std::move(state.external_[index]);
       auto key = co_await LoadOutOfIndexKey(CurrentStore(), candidate.location_,
                                             candidate.key_bytes_);
-      if (!key.ok()) {
-        co_return key.status();
-      }
+      LAVIK_CO_RETURN_IF_ERROR(key.status());
       const RecordIndex::Entry* current =
           state.index_->FindAddress(candidate.entry_address_, candidate.hash_);
       if (current == nullptr) continue;
@@ -851,9 +849,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
   if (capture->second.pending_snapshot_keys_.empty()) {
     auto scanned = co_await ScanPartition(partition_id, db_id, cursor, count,
                                           now_ms, max_bytes);
-    if (!scanned.ok()) {
-      co_return scanned.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(scanned.status());
     capture = partition.fullsync_subscribers_.find(session_id);
     if (capture == partition.fullsync_subscribers_.end()) {
       co_return absl::FailedPreconditionError(
@@ -924,9 +920,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
                              session_id, baseline_version, &records[i], &join));
     }
     co_await join.Join();
-    if (!join.error_.ok()) {
-      co_return join.error_;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(join.error_);
     first = last;
   }
   for (std::optional<SnapshotRecord>& record : records) {
@@ -993,7 +987,7 @@ StorageEngine::Impl::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
   for (const SnapshotRecord& record : requested) {
     auto loaded = co_await ReadFullSyncOverrideRecord(store, partition,
                                                       session_id, record);
-    if (!loaded.ok()) co_return loaded.status();
+    LAVIK_CO_RETURN_IF_ERROR(loaded.status());
     constexpr std::size_t kRecordMetadataBytes = 128;
     const bool streamed = loaded->source_id_ != 0;
     const std::uint64_t effective_value_bytes =
@@ -1106,7 +1100,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::ReadFullSyncValueChunk(
     } else {
       status = co_await bycorf::SubmitTaskTo(owner, read);
     }
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     written += slice;
     absolute += slice;
     extent_start = extent_end;
@@ -1389,11 +1383,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   }
   if (persisted_replication_epoch == 0) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      absl::Status advanced =
-          co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
-      if (!advanced.ok()) {
-        co_return advanced;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]));
     }
   }
 
@@ -1403,8 +1394,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "partition replication epoch exhausted");
   }
-  const auto aborted_stage = co_await AbortReplicaValueStage(store, partition);
-  if (!aborted_stage.ok()) co_return aborted_stage;
+  LAVIK_CO_RETURN_IF_ERROR(co_await AbortReplicaValueStage(store, partition));
   // Stop this worker's append stream before making the new epoch durable.
   // Otherwise a concurrent command could append an old-epoch record after
   // the metadata commit and receive OK even though restart must discard it.
@@ -1417,11 +1407,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
                            "replica reset superseded by another session");
   }
   if (persisted_replication_epoch == 0) {
-    absl::Status persisted = co_await PersistEpochValue(
-        kLogicalDatabaseCount + partition_id, next_epoch);
-    if (!persisted.ok()) {
-      co_return persisted;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await PersistEpochValue(
+        kLogicalDatabaseCount + partition_id, next_epoch));
   }
 
   struct OldKey {
@@ -1449,9 +1436,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     for (const ExternalKey& external : external_keys) {
       auto key = co_await LoadOutOfIndexKey(store, external.location_,
                                             external.key_bytes_);
-      if (!key.ok()) {
-        co_return key.status();
-      }
+      LAVIK_CO_RETURN_IF_ERROR(key.status());
       old_keys.push_back(OldKey{.db_id_ = db_id, .key_ = std::move(*key)});
     }
   }
@@ -1477,8 +1462,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
         .unlock_writer_while_waiting_ = false,
         .key_indirect_ = key_indirect,
     };
-    absl::Status tombstone = co_await WriteRecordLocked(store, record_write);
-    if (!tombstone.ok()) co_return tombstone;
+    LAVIK_CO_RETURN_IF_ERROR(co_await WriteRecordLocked(store, record_write));
   }
   co_return next_epoch;
 }
@@ -1537,8 +1521,7 @@ StorageEngine::Impl::ResetReplicaPartitions(
   // and replication epoch filters. Allocated stale records retain their UUID
   // dependencies until their blocks retire; the scan bitmap excludes retired
   // blocks. Value extents are read only after epoch and winner selection.
-  absl::Status persisted = co_await PersistEpochValues(epoch_updates);
-  if (!persisted.ok()) co_return persisted;
+  LAVIK_CO_RETURN_IF_ERROR(co_await PersistEpochValues(epoch_updates));
 
   co_await store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
@@ -1636,7 +1619,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetach(
             return ResetPartitionsDetachLocal(ids);
           });
     }
-    if (!reset.ok()) co_return reset;
+    LAVIK_CO_RETURN_IF_ERROR(reset);
   }
   co_return absl::OkStatus();
 }
@@ -1669,8 +1652,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
                                partition.replica_candidate_epoch_ + 1);
   }
   // Durably fence old records before making the detached indexes invisible.
-  absl::Status persisted = co_await PersistEpochValues(epoch_updates);
-  if (!persisted.ok()) co_return persisted;
+  LAVIK_CO_RETURN_IF_ERROR(co_await PersistEpochValues(epoch_updates));
 
   co_await store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
@@ -1813,7 +1795,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReplicaCommandNeedsApply(
   }
   auto found =
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
-  if (!found.ok()) co_return found.status();
+  LAVIK_CO_RETURN_IF_ERROR(found.status());
   if (!context_current()) {
     co_return absl::FailedPreconditionError(
         "FULL command context changed during coverage lookup");
@@ -1846,8 +1828,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
   if (!status.ok() && sync && sync->session_id_ == session_id &&
       sync->replication_epoch_ == replication_epoch) {
     sync->stream_failed_ = true;
-    const auto aborted = co_await AbortReplicaValueStage(store, partition);
-    if (!aborted.ok()) co_return aborted;
+    LAVIK_CO_RETURN_IF_ERROR(co_await AbortReplicaValueStage(store, partition));
   }
   co_return status;
 }
@@ -1954,9 +1935,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       partition.replica_value_stage_->memory_charge_.Adopt(&*stage_reservation,
                                                            stage_bytes);
       if (streamed_collection) {
-        const auto started = co_await BeginReplicaCollection(
-            store, partition, *partition.replica_value_stage_);
-        if (!started.ok()) co_return started;
+        LAVIK_CO_RETURN_IF_ERROR(co_await BeginReplicaCollection(
+            store, partition, *partition.replica_value_stage_));
       } else {
         partition.replica_value_stage_->value_.reserve(
             static_cast<std::size_t>(record.logical_size_));
@@ -1980,9 +1960,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
                                "invalid replicated large value chunk frame");
       }
       if (stage->collection_) {
-        const auto consumed = co_await ConsumeReplicaCollection(
-            store, partition, *stage, record.value_, false);
-        if (!consumed.ok()) co_return consumed;
+        LAVIK_CO_RETURN_IF_ERROR(co_await ConsumeReplicaCollection(
+            store, partition, *stage, record.value_, false));
       } else {
         stage->value_.append(record.value_);
       }
@@ -2003,9 +1982,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
                                "invalid replicated large value commit frame");
       }
       if (stage->collection_) {
-        const auto complete = co_await ConsumeReplicaCollection(
-            store, partition, *stage, {}, true);
-        if (!complete.ok()) co_return complete;
+        LAVIK_CO_RETURN_IF_ERROR(co_await ConsumeReplicaCollection(
+            store, partition, *stage, {}, true));
         stage.reset();
         continue;
       }
@@ -2043,9 +2021,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     auto& index = partition.indexes_[applied.db_id_];
     auto resolved =
         co_await FindVerifiedEntry(store, index, digest, applied.key_);
-    if (!resolved.ok()) {
-      co_return resolved.status();
-    }
+    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
     auto* current = *resolved;
     if (current != nullptr &&
         current->value_.mutation_sequence_ >= applied.mutation_sequence_) {
@@ -2088,7 +2064,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       written = co_await WriteGroupedStringLocked(
           store, partition, applied.db_id_, applied.key_, digest,
           applied.value_, applied.expire_at_ms_, nullptr, nullptr, nullptr);
-      if (!written.ok()) co_return written;
+      LAVIK_CO_RETURN_IF_ERROR(written);
       partition.mutation_sequence_ =
           std::max(partition.mutation_sequence_, applied.mutation_sequence_);
       continue;
@@ -2111,9 +2087,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
       auto extents = co_await WriteExtentValueLocked(store, std::string_view{},
                                                      applied.value_);
-      if (!extents.ok()) {
-        co_return extents.status();
-      }
+      LAVIK_CO_RETURN_IF_ERROR(extents.status());
       const std::string manifest = EncodeManifest(**extents);
       const RecordWriteRequest record_write{
           .key_ = applied.key_,
@@ -2150,9 +2124,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
       };
       written = co_await WriteRecordLocked(store, record_write);
     }
-    if (!written.ok()) {
-      co_return written;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(written);
     partition.mutation_sequence_ =
         std::max(partition.mutation_sequence_, applied.mutation_sequence_);
   }
@@ -2182,9 +2154,8 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicaRootWritesLocal(
           "storage write failed while draining replica root");
     }
     if (done) co_return absl::OkStatus();
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1)));
   }
 }
 
@@ -2228,9 +2199,8 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
       }
       return absl::OkStatus();
     };
-    absl::Status valid =
-        target == 0 ? validate() : co_await bycorf::SubmitTo(target, validate);
-    if (!valid.ok()) co_return valid;
+    LAVIK_CO_RETURN_IF_ERROR(
+        target == 0 ? validate() : co_await bycorf::SubmitTo(target, validate));
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto drain = [this, target]() {
@@ -2246,7 +2216,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     } else {
       drained = co_await bycorf::SubmitTaskTo(target, drain);
     }
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(drained);
   }
 
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -2259,7 +2229,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     } else {
       settled = co_await bycorf::SubmitTaskTo(target, settle);
     }
-    if (!settled.ok()) co_return settled;
+    LAVIK_CO_RETURN_IF_ERROR(settled);
   }
 
   std::vector<std::pair<std::size_t, std::uint64_t>> epoch_updates;
@@ -2267,8 +2237,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     epoch_updates.emplace_back(db_id, local_db_epochs[db_id]);
   }
-  absl::Status persisted = co_await PersistEpochValues(epoch_updates);
-  if (!persisted.ok()) co_return persisted;
+  LAVIK_CO_RETURN_IF_ERROR(co_await PersistEpochValues(epoch_updates));
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     db_epochs_[db_id].store(local_db_epochs[db_id], std::memory_order_release);
     replica_source_db_epochs_[db_id].store(source_db_epochs[db_id],
@@ -2307,7 +2276,7 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     } else {
       published = co_await bycorf::SubmitTaskTo(target, publish);
     }
-    if (!published.ok()) co_return published;
+    LAVIK_CO_RETURN_IF_ERROR(published);
   }
   std::array<std::byte, 2 * kLogicalDatabaseCount * sizeof(std::uint64_t)>
       population_bytes{};
@@ -2317,12 +2286,11 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
       population_bytes.data() + kLogicalDatabaseCount * sizeof(std::uint64_t),
       source_db_epochs.data(), kLogicalDatabaseCount * sizeof(std::uint64_t));
   if (ReplicaRecoveryFenced()) {
-    absl::Status completed = co_await CompleteReplicaFullSync(
+    LAVIK_CO_RETURN_IF_ERROR(co_await CompleteReplicaFullSync(
         session_id, PopulationToken{
                         .generation_ = session_id,
                         .digest_ = Crc64(population_bytes),
-                    });
-    if (!completed.ok()) co_return completed;
+                    }));
   }
   co_return absl::OkStatus();
 }
@@ -2354,8 +2322,8 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
             partition.replica_sync_->session_id_ != session_id ||
             !partition.replica_value_stage_)
           continue;
-        const auto aborted = co_await AbortReplicaValueStage(store, partition);
-        if (!aborted.ok()) co_return aborted;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await AbortReplicaValueStage(store, partition));
       }
       co_return absl::OkStatus();
     };
@@ -2366,7 +2334,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     } else {
       cancelled = co_await bycorf::SubmitTaskTo(target, cancel);
     }
-    if (!cancelled.ok()) co_return cancelled;
+    LAVIK_CO_RETURN_IF_ERROR(cancelled);
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto drain = [this, target]() {
@@ -2379,7 +2347,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     } else {
       drained = co_await bycorf::SubmitTaskTo(target, drain);
     }
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(drained);
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto discard = [this, target, session_id]() -> Task<absl::Status> {
@@ -2434,7 +2402,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
     } else {
       discarded = co_await bycorf::SubmitTaskTo(target, discard);
     }
-    if (!discarded.ok()) co_return discarded;
+    LAVIK_CO_RETURN_IF_ERROR(discarded);
   }
   co_return co_await CancelPopulationChange(admission);
 }

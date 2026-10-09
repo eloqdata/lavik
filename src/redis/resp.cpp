@@ -25,6 +25,7 @@
 #include <string_view>
 
 #include "absl/strings/str_cat.h"
+#include "lavik/status_macros.h"
 
 namespace lavik {
 
@@ -78,8 +79,7 @@ absl::Status ReserveArguments(std::vector<std::string>* output,
 
 absl::Status PushArgument(std::vector<std::string>* output,
                           std::string argument) {
-  absl::Status reserved = ReserveArguments(output, output->size() + 1);
-  if (!reserved.ok()) return reserved;
+  LAVIK_RETURN_IF_ERROR(ReserveArguments(output, output->size() + 1));
   output->push_back(std::move(argument));
   return absl::OkStatus();
 }
@@ -103,9 +103,8 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
       }
       if (quote == 0 && (value == ' ' || value == '\t')) break;
       if (value != '\\') {
-        absl::Status appended =
-            AppendArgument(&argument, std::string_view(&value, 1));
-        if (!appended.ok()) return appended;
+        LAVIK_RETURN_IF_ERROR(
+            AppendArgument(&argument, std::string_view(&value, 1)));
         continue;
       }
       if (pos == line.size())
@@ -143,16 +142,14 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
           value = escaped;
           break;
       }
-      absl::Status appended =
-          AppendArgument(&argument, std::string_view(&value, 1));
-      if (!appended.ok()) return appended;
+      LAVIK_RETURN_IF_ERROR(
+          AppendArgument(&argument, std::string_view(&value, 1)));
     }
     if (!closed) return absl::InvalidArgumentError("unterminated inline quote");
     if (quote != 0 && pos < line.size() && line[pos] != ' ' &&
         line[pos] != '\t')
       return absl::InvalidArgumentError("characters after inline quote");
-    absl::Status pushed = PushArgument(&args, std::move(argument));
-    if (!pushed.ok()) return pushed;
+    LAVIK_RETURN_IF_ERROR(PushArgument(&args, std::move(argument)));
   }
   return args;
 }

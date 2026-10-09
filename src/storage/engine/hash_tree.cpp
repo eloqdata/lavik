@@ -29,6 +29,7 @@
 #include "lavik/memory.h"
 #include "lavik/random_sample.h"
 #include "lavik/redis_parse.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/hash_read.h"
 
@@ -118,7 +119,7 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
                                                  HashOperationKind kind,
                                                  std::uint64_t count) {
   auto reader = HashValueReader::Open(payload);
-  if (!reader.ok()) return reader.status();
+  LAVIK_RETURN_IF_ERROR(reader.status());
   if (reader->size() != count) {
     return absl::InternalError(
         "Hash element count does not match record metadata");
@@ -142,7 +143,7 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
   auto inspect = *reader;
   for (std::size_t i = 0; i < count; ++i) {
     auto entry = inspect.Next();
-    if (!entry.ok()) return entry.status();
+    LAVIK_RETURN_IF_ERROR(entry.status());
     if (!add_bytes(width * sizeof(std::optional<std::string>)) ||
         (fields &&
          !add_bytes(std::max(entry->field_.size(), inline_capacity) + 1)) ||
@@ -163,7 +164,7 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
   result.values_.reserve(count * width);
   for (std::size_t i = 0; i < count; ++i) {
     auto entry = reader->Next();
-    if (!entry.ok()) return entry.status();
+    LAVIK_RETURN_IF_ERROR(entry.status());
     if (fields) result.values_.emplace_back(std::in_place, entry->field_);
     if (values) result.values_.emplace_back(std::in_place, entry->value_);
   }
@@ -442,9 +443,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) co_return resolved.status();
-    found = *resolved;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        found, co_await FindVerifiedEntry(store, index, digest, key));
   }
   const bool stored_value =
       found != nullptr && found->value_.kind() == RecordKind::kValue;
@@ -453,7 +453,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const bool exists = stored_value && !IsExpired(*found, now_ms);
   if (!exists && stored_value && found->value_.grouped()) {
     auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    if (!metadata.ok()) co_return metadata.status();
+    LAVIK_CO_RETURN_IF_ERROR(metadata.status());
   }
   if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
@@ -487,15 +487,15 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;
   GroupedObject::Handle grouped;
   if (exists && location.grouped()) {
-    auto view = partition.grouped_objects_[db_id].Lookup(
-        key, GroupedObjectVersion{
-                 .root_ = location,
-                 .db_epoch_ = observed_db_epoch,
-                 .replication_epoch_ = observed_replication_epoch,
-                 .index_generation_ = partition.grouped_generations_[db_id],
-             });
-    if (!view.ok()) co_return view.status();
-    grouped = std::move(*view);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        grouped,
+        partition.grouped_objects_[db_id].Lookup(
+            key, GroupedObjectVersion{
+                     .root_ = location,
+                     .db_epoch_ = observed_db_epoch,
+                     .replication_epoch_ = observed_replication_epoch,
+                     .index_generation_ = partition.grouped_generations_[db_id],
+                 }));
     // Validate the preceding decision, but never inherit its fields/pages.
     // Append/CommitGroupedHashMutation still find and retire the old side
     // view; a null mutation predecessor creates a fresh incarnation.
@@ -555,9 +555,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
   });
   LAVIK_FAULT_INJECT(if (unlocked_grouped_write) {
-    const auto paused =
-        co_await PauseGroupedWriteForTest(*store.worker_, key, "prepare");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await PauseGroupedWriteForTest(*store.worker_, key, "prepare"));
   });
   LAVIK_FAULT_INJECT(if (unlocked_compact_write &&
                          value_type == ValueType::kHash) {
@@ -570,16 +569,15 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       if (parsed.ec == std::errc{} && parsed.ptr == end && milliseconds > 0) {
         spdlog::info("compact hash write pause armed key={} milliseconds={}",
                      key, milliseconds);
-        auto paused = co_await bycorf::SleepFor(
-            *store.worker_, std::chrono::milliseconds(milliseconds));
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *store.worker_, std::chrono::milliseconds(milliseconds)));
         spdlog::info("compact hash write pause complete key={}", key);
       }
     }
   });
   LAVIK_FAULT_INJECT(if (unlocked_compact_write) {
-    const auto paused = co_await PauseCompactWriteForTest(*store.worker_, key);
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await PauseCompactWriteForTest(*store.worker_, key));
   });
   LAVIK_FAULT_INJECT(if (read_only) {
     if (const char* configured = std::getenv("LAVIK_HASH_READ_PAUSE_MS");
@@ -588,9 +586,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       const char* end = configured + std::strlen(configured);
       const auto parsed = std::from_chars(configured, end, milliseconds);
       if (parsed.ec == std::errc{} && parsed.ptr == end && milliseconds != 0) {
-        absl::Status paused = co_await bycorf::SleepFor(
-            *store.worker_, std::chrono::milliseconds(milliseconds));
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *store.worker_, std::chrono::milliseconds(milliseconds)));
       }
     }
   });
@@ -663,13 +660,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (entry == nullptr)
       co_return absl::DataLossError("grouped scan has no physical page");
     GroupedScratchBudget budget;
-    const auto included =
-        budget.AddGroup(*entry, grouped->ExtentsFor(route->id_));
-    if (!included.ok()) co_return included;
+    LAVIK_CO_RETURN_IF_ERROR(
+        budget.AddGroup(*entry, grouped->ExtentsFor(route->id_)));
     // Matching strings move into the reply; no second payload copy is made.
     // The physical read buffer has its own independent admission.
     auto scratch = budget.Reserve(1);
-    if (!scratch.ok()) co_return scratch.status();
+    LAVIK_CO_RETURN_IF_ERROR(scratch.status());
     auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                  digest, grouped, route->id_);
     if (!loaded.ok()) {
@@ -745,10 +741,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return absl::ResourceExhaustedError("Hash operand index overflow");
     // Routing and per-page views, including growth rounding and empty
     // operands. Request strings themselves remain client-owned.
-    auto added = budget.AddBytes(operation.fields_.size() * 256);
-    if (!added.ok()) co_return added;
+    LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(operation.fields_.size() * 256));
     auto admitted = budget.Reserve(1);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     operand_scratch.emplace(std::move(*admitted));
     leaf_edits.reserve(operation.fields_.size());
   }
@@ -765,12 +760,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         co_return absl::OutOfRangeError("Hash field or value exceeds 512 MiB");
       for (const auto bytes : {operation.fields_[i].size(),
                                operation.values_[i].size(), std::size_t{256}}) {
-        const auto added = budget.AddBytes(bytes);
-        if (!added.ok()) co_return added;
+        LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(bytes));
       }
     }
     auto admitted = budget.Reserve(unlocked_create ? 2 : 4);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     grouped_scratch.emplace(std::move(*admitted));
   } else if (grouped != nullptr) {
     GroupedScratchBudget budget;
@@ -817,26 +811,22 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       std::optional<GroupedRecordId> previous;
       for (const auto& edit : leaf_edits) {
         if (previous == edit.id_) continue;
-        const auto added = add_group(edit.id_);
-        if (!added.ok()) co_return added;
+        LAVIK_CO_RETURN_IF_ERROR(add_group(edit.id_));
         previous = edit.id_;
       }
     } else {
       for (const auto id : selected) {
-        const auto added = add_group(id);
-        if (!added.ok()) co_return added;
+        LAVIK_CO_RETURN_IF_ERROR(add_group(id));
       }
     }
     for (const auto field : operation.fields_) {
-      const auto added = budget.AddBytes(field.size());
-      if (!added.ok()) co_return added;
+      LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(field.size()));
     }
     for (const auto value : operation.values_) {
-      const auto added = budget.AddBytes(value.size());
-      if (!added.ok()) co_return added;
+      LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(value.size()));
     }
     auto admitted = budget.Reserve(4);
-    if (!admitted.ok()) co_return admitted.status();
+    LAVIK_CO_RETURN_IF_ERROR(admitted.status());
     grouped_scratch.emplace(std::move(*admitted));
   }
   HashValue compact;
@@ -864,12 +854,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       } while (begin < leaf_edits.size() && leaf_edits[begin].id_ == id);
       auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                                   digest, grouped, id);
-      if (!loaded.ok()) co_return loaded.status();
+      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
       const auto bytes = loaded->loaded_.value();
       auto edited = ApplyHashGroupEdits(
           {reinterpret_cast<const char*>(bytes.data()), bytes.size()},
           plan.root_.seed_, kind, edits);
-      if (!edited.ok()) co_return edited.status();
+      LAVIK_CO_RETURN_IF_ERROR(edited.status());
       if (!edited->changed_) continue;
       result.changed_ = plan.changed_ = true;
       edited_length += edited->added_;
@@ -933,9 +923,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return ReadCompactHashResult(payload, operation.kind_,
                                       location.logical_size_);
     }
-    auto decoded = DecodeHashValue(payload);
-    if (!decoded.ok()) co_return decoded.status();
-    compact = std::move(*decoded);
+    LAVIK_ASSIGN_OR_CO_RETURN(compact, DecodeHashValue(payload));
     if (compact.entries_.size() != location.logical_size_) {
       co_return absl::InternalError(
           "Hash element count does not match record metadata");
@@ -1040,7 +1028,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   auto append_random = [&]() -> absl::Status {
     if (compact.entries_.empty()) return absl::OkStatus();
     auto requested = requested_samples();
-    if (!requested.ok()) return requested.status();
+    LAVIK_RETURN_IF_ERROR(requested.status());
     if (operation.count_provided_ && operation.count_ < 0) {
       for (std::uint64_t i = 0; i < *requested; ++i) {
         const HashEntry& entry = compact.entries_[RandomRank(
@@ -1123,12 +1111,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         if (compact.entries_.size() > kMaxPositions ||
             operation.fields_.size() > kMaxPositions - compact.entries_.size())
           co_return absl::ResourceExhaustedError("field index size overflow");
-        auto added = budget.AddBytes(
+        LAVIK_CO_RETURN_IF_ERROR(budget.AddBytes(
             (compact.entries_.size() + operation.fields_.size()) *
-            kPositionBytes);
-        if (!added.ok()) co_return added;
+            kPositionBytes));
         auto admitted = budget.Reserve(1);
-        if (!admitted.ok()) co_return admitted.status();
+        LAVIK_CO_RETURN_IF_ERROR(admitted.status());
         lookup_scratch.emplace(std::move(*admitted));
         field_positions.reserve(compact.entries_.size() +
                                 operation.fields_.size());
@@ -1193,7 +1180,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           current == nullptr
               ? std::optional<std::string_view>{}
               : std::optional<std::string_view>{current->value_});
-      if (!updated.ok()) co_return updated.status();
+      LAVIK_CO_RETURN_IF_ERROR(updated.status());
       mark_group_changed(field);
       if (current == nullptr) {
         compact.entries_.push_back(HashEntry{.digest_ = ComputeDigest(field),
@@ -1288,13 +1275,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return result;
     }
     case HashOperationKind::kRandomFields: {
-      absl::Status sampled = append_random();
-      if (!sampled.ok()) co_return sampled;
+      LAVIK_CO_RETURN_IF_ERROR(append_random());
       co_return result;
     }
     case HashOperationKind::kPopRandom: {
       auto requested = requested_samples();
-      if (!requested.ok()) co_return requested.status();
+      LAVIK_CO_RETURN_IF_ERROR(requested.status());
       auto ranks = SampleUniqueRandomRanks(compact.entries_.size(), *requested,
                                            false, RandomSampleGenerator());
       std::sort(ranks.begin(), ranks.end());
@@ -1363,17 +1349,16 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       auto prepared =
           PrepareGroupedHashMutation(grouped, std::move(compact), changed,
                                      result.length_, grouped->revision());
-      if (!prepared.ok()) co_return prepared.status();
+      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
       grouped_plan.emplace(std::move(*prepared));
     }
     co_await store.store_state_mutex_.Lock();
     unlock.Adopt();
-    const auto valid = ValidateGroupedWriteSnapshot(
+    LAVIK_CO_RETURN_IF_ERROR(ValidateGroupedWriteSnapshot(
         store, partition, db_id, key, grouped, observed_write,
         mutation_precondition != nullptr
             ? mutation_precondition
-            : (tx != nullptr ? &tx->mutation_precondition_ : nullptr));
-    if (!valid.ok()) co_return valid;
+            : (tx != nullptr ? &tx->mutation_precondition_ : nullptr)));
   }
   std::optional<std::string> prepared_compact_payload;
   bool compact_write_promotes = false;
@@ -1383,19 +1368,18 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       if (unlocked_create && compact_write_promotes) {
         auto prepared = PrepareGroupedHashMutation(nullptr, std::move(compact),
                                                    {}, result.length_, 1);
-        if (!prepared.ok()) co_return prepared.status();
+        LAVIK_CO_RETURN_IF_ERROR(prepared.status());
         grouped_plan.emplace(std::move(*prepared));
       } else if (!compact_write_promotes) {
         auto encoded = EncodeHashValue(compact);
-        if (!encoded.ok()) co_return encoded.status();
+        LAVIK_CO_RETURN_IF_ERROR(encoded.status());
         prepared_compact_payload.emplace(std::move(*encoded));
       }
     }
 
     LAVIK_FAULT_INJECT(if (unlocked_create) {
-      const auto paused =
-          co_await PauseGroupedWriteForTest(*store.worker_, key, "create");
-      if (!paused.ok()) co_return paused;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await PauseGroupedWriteForTest(*store.worker_, key, "create"));
     });
     co_await store.store_state_mutex_.Lock();
     unlock.Adopt();
@@ -1405,9 +1389,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       // re-resolve them rather than rejecting a valid expired predecessor.
       auto* current = index.Find(digest, key);
       if (current != nullptr && !current->key_complete()) {
-        auto verified = co_await FindVerifiedEntry(store, index, digest, key);
-        if (!verified.ok()) co_return verified.status();
-        current = *verified;
+        LAVIK_ASSIGN_OR_CO_RETURN(
+            current, co_await FindVerifiedEntry(store, index, digest, key));
       }
       valid = ValidateCollectionCreateSnapshot(store, partition, db_id, current,
                                                now_ms, observed_write,
@@ -1416,7 +1399,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       valid = ValidateCompactWriteSnapshot(store, partition, db_id, key, digest,
                                            location, observed_write);
     }
-    if (!valid.ok()) co_return valid;
+    LAVIK_CO_RETURN_IF_ERROR(valid);
   }
   if (!result.changed_) {
     if (value_type == ValueType::kHash &&
@@ -1427,8 +1410,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
               ? mutation_precondition
               : (tx != nullptr ? &tx->mutation_precondition_ : nullptr);
       if (effective_precondition != nullptr) {
-        absl::Status valid = effective_precondition->Validate();
-        if (!valid.ok()) co_return valid;
+        LAVIK_CO_RETURN_IF_ERROR(effective_precondition->Validate());
       }
       tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
     }
@@ -1457,13 +1439,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       (grouped != nullptr || ((unlocked_compact_write || unlocked_create)
                                   ? compact_write_promotes
                                   : NeedsGroupedHash(compact)))) {
-    absl::Status written = co_await CommitGroupedHashMutationLocked(
+    LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedHashMutationLocked(
         store, partition, db_id, key, digest, grouped, std::move(compact),
         std::vector<GroupedRecordId>(changed_groups.begin(),
                                      changed_groups.end()),
         result.length_, value_type, expire_at_ms, tx, replication,
-        mutation_precondition, grouped_plan ? &*grouped_plan : nullptr);
-    if (!written.ok()) co_return written;
+        mutation_precondition, grouped_plan ? &*grouped_plan : nullptr));
     co_return result;
   }
   RecordKind kind = RecordKind::kValue;
@@ -1475,16 +1456,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   } else if (prepared_compact_payload.has_value()) {
     payload = std::move(*prepared_compact_payload);
   } else {
-    auto encoded = EncodeHashValue(compact);
-    if (!encoded.ok()) co_return encoded.status();
-    payload = std::move(*encoded);
+    LAVIK_ASSIGN_OR_CO_RETURN(payload, EncodeHashValue(compact));
   }
-  absl::Status written = co_await AppendLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await AppendLocked(
       store, partition, db_id, key, digest, payload, kind, published_type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? compact.entries_.size() : 0, nullptr,
-      nullptr, replication, true, nullptr, mutation_precondition);
-  if (!written.ok()) co_return written;
+      nullptr, replication, true, nullptr, mutation_precondition));
   co_return result;
 }
 

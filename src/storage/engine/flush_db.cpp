@@ -16,6 +16,7 @@
 
 #include "impl.h"
 #include "lavik/fault_pause.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -90,8 +91,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushDb(
   if (delta > std::numeric_limits<std::uint64_t>::max() - local) {
     co_return absl::OutOfRangeError("database epoch exhausted");
   }
-  absl::Status advanced = co_await AdvanceDbEpoch(db_id, local + delta);
-  if (!advanced.ok()) co_return advanced;
+  LAVIK_CO_RETURN_IF_ERROR(co_await AdvanceDbEpoch(db_id, local + delta));
   replica_source_db_epochs_[db_id].store(source_db_epoch,
                                          std::memory_order_release);
   co_return absl::OkStatus();
@@ -130,8 +130,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushAll(
   }
   // The caller holds every command DB gate. The 16 DB epochs occupy one
   // metadata page, so persist them as one vector before detaching any index.
-  absl::Status detached = co_await DetachDbEpochs(next);
-  if (!detached.ok()) co_return detached;
+  LAVIK_CO_RETURN_IF_ERROR(co_await DetachDbEpochs(next));
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     replica_source_db_epochs_[db_id].store(source_epochs[db_id],
                                            std::memory_order_release);
@@ -163,9 +162,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
   }
   if (updates.empty()) co_return absl::OkStatus();
 
-  absl::Status persisted =
-      co_await PersistEpochValues(updates, std::move(mutation_precondition));
-  if (!persisted.ok()) co_return persisted;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await PersistEpochValues(updates, std::move(mutation_precondition)));
   for (const auto& [index, epoch] : updates) {
     db_epochs_[index].store(epoch, std::memory_order_release);
   }
@@ -186,7 +184,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
     } else {
       detached = co_await bycorf::SubmitTaskTo(target, detach);
     }
-    if (!detached.ok()) co_return detached;
+    LAVIK_CO_RETURN_IF_ERROR(detached);
   }
   co_return absl::OkStatus();
 }
@@ -208,11 +206,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(
   if (next == current) {
     co_return absl::OkStatus();
   }
-  absl::Status status =
-      co_await PersistEpochValue(db_id, next, std::move(mutation_precondition));
-  if (!status.ok()) {
-    co_return status;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await PersistEpochValue(
+      db_id, next, std::move(mutation_precondition)));
   db_epochs_[db_id].store(next, std::memory_order_release);
 
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -231,9 +226,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(
     } else {
       detached = co_await bycorf::SubmitTaskTo(target, detach);
     }
-    if (!detached.ok()) {
-      co_return detached;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(detached);
   }
   co_return absl::OkStatus();
 }
@@ -267,17 +260,14 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedAllWorkers(bool wait) {
       reclaimed = co_await reclaim();
     else
       reclaimed = co_await bycorf::SubmitTaskTo(target, reclaim);
-    if (!reclaimed.ok()) co_return reclaimed;
+    LAVIK_CO_RETURN_IF_ERROR(reclaimed);
   }
   co_return absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::AdvanceDbEpoch(std::uint8_t db_id,
                                                        std::uint64_t next) {
-  absl::Status detached = co_await DetachDbEpoch(db_id, next);
-  if (!detached.ok()) {
-    co_return detached;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await DetachDbEpoch(db_id, next));
   co_return co_await ReclaimDetachedAllWorkers(/*wait=*/true);
 }
 
@@ -538,11 +528,8 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
             "injected detached reclaim wait failure");
       }
     });
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) {
-      co_return waited;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1)));
   }
   if (store.write_failed_ || RuntimeFailureLatched()) {
     co_return absl::Status(

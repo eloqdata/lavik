@@ -17,6 +17,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/cord.h"
 #include "lavik/fault_pause.h"
+#include "lavik/status_macros.h"
 #include "replication_internal.h"
 
 #if LAVIK_FAULTS_ENABLED
@@ -76,10 +77,8 @@ DecodeRecords(std::string_view payload) try {
         value_type > static_cast<std::uint8_t>(storage::ValueType::kStream)) {
       return absl::InvalidArgumentError("malformed replication record payload");
     }
-    absl::Status key = reader.String(key_size, &record.key_);
-    if (!key.ok()) return key;
-    absl::Status value = reader.String(value_size, &record.value_);
-    if (!value.ok()) return value;
+    LAVIK_RETURN_IF_ERROR(reader.String(key_size, &record.key_));
+    LAVIK_RETURN_IF_ERROR(reader.String(value_size, &record.value_));
     record.kind_ = static_cast<SnapshotRecord::Kind>(kind);
     record.value_type_ = static_cast<storage::ValueType>(value_type);
     records.push_back(std::move(record));
@@ -345,7 +344,7 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(
   const std::string service = std::to_string(port);
   if (cancellable_dns) {
     auto resolved = co_await ResolveRecoveryAddress(host, port, sockets);
-    if (!resolved.ok()) co_return resolved.status();
+    LAVIK_CO_RETURN_IF_ERROR(resolved.status());
     addresses = std::exchange((*resolved)->addresses_, nullptr);
   } else {
     const int resolved = ::getaddrinfo(std::string(host).c_str(),
@@ -496,9 +495,8 @@ ResolveRecoveryAddress(std::string_view host, std::uint16_t port,
     // Waiting shares the session's cancellation and recovery deadline.
     if (!resolved) resolved = AsyncDnsQuery::Start(host, port);
     if (resolved && resolved->done_.load(std::memory_order_acquire)) break;
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (resolved->result_ != 0)
     co_return absl::UnavailableError("cannot resolve recovery donor");
@@ -545,10 +543,9 @@ Task<absl::Status> AuthenticateUpstream(TcpStream& stream,
   if (username != "default") args.emplace_back(username);
   args.emplace_back(password);
   const std::string encoded = EncodeRespCommand(args);
-  absl::Status sent = co_await WriteText(stream, encoded);
-  if (!sent.ok()) co_return sent;
+  LAVIK_CO_RETURN_IF_ERROR(co_await WriteText(stream, encoded));
   auto response = co_await ReadLine(stream);
-  if (!response.ok()) co_return response.status();
+  LAVIK_CO_RETURN_IF_ERROR(response.status());
   if (*response != "+OK") {
     co_return absl::PermissionDeniedError(
         absl::StrCat("replication AUTH failed: ", *response));
@@ -592,7 +589,7 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
       co_return line;
     }
     auto read = co_await stream.ReadSome(input);
-    if (!read.ok()) co_return read.status();
+    LAVIK_CO_RETURN_IF_ERROR(read.status());
     if (*read == 0) {
       co_return absl::UnavailableError("replication peer closed connection");
     }
@@ -605,7 +602,7 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     TcpStream& stream) {
   auto header = co_await ReadExact(stream, kDataFrameHeaderBytes);
-  if (!header.ok()) co_return header.status();
+  LAVIK_CO_RETURN_IF_ERROR(header.status());
   DataReader reader(*header);
   std::uint32_t magic = 0;
   std::uint8_t version = 0, kind = 0;
@@ -620,7 +617,7 @@ Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     co_return absl::InvalidArgumentError("malformed replication frame header");
   }
   auto payload = co_await ReadExact(stream, payload_bytes);
-  if (!payload.ok()) co_return payload.status();
+  LAVIK_CO_RETURN_IF_ERROR(payload.status());
   if (DataFrameCrc32c(*payload) != payload_crc32c) {
     co_return absl::DataLossError("replication frame CRC32C mismatch");
   }
@@ -631,14 +628,13 @@ Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
 Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
                                             std::size_t size) {
   std::string result;
-  absl::Status reserved = ReserveReplicationString(&result, size);
-  if (!reserved.ok()) co_return reserved;
+  LAVIK_CO_RETURN_IF_ERROR(ReserveReplicationString(&result, size));
   result.resize(size);
   std::size_t offset = 0;
   while (offset < size) {
     auto read = co_await stream.ReadSome(std::span<std::byte>(
         reinterpret_cast<std::byte*>(result.data() + offset), size - offset));
-    if (!read.ok()) co_return read.status();
+    LAVIK_CO_RETURN_IF_ERROR(read.status());
     if (*read == 0) co_return absl::UnavailableError("replication peer closed");
     offset += *read;
   }
@@ -652,11 +648,9 @@ Task<absl::Status> WriteDataFrame(TcpStream& stream, DataFrameKind kind,
       std::numeric_limits<std::size_t>::max() - kDataFrameHeaderBytes) {
     co_return ReplicationMemoryExhausted("replication frame");
   }
-  absl::Status reserved =
-      ReserveReplicationString(&frame, kDataFrameHeaderBytes + payload.size());
-  if (!reserved.ok()) co_return reserved;
-  absl::Status appended = AppendDataFrame(&frame, kind, payload);
-  if (!appended.ok()) co_return appended;
+  LAVIK_CO_RETURN_IF_ERROR(
+      ReserveReplicationString(&frame, kDataFrameHeaderBytes + payload.size()));
+  LAVIK_CO_RETURN_IF_ERROR(AppendDataFrame(&frame, kind, payload));
   LAVIK_FAULT_INJECT(if (kind == DataFrameKind::kRecords && !payload.empty()) {
     const char* corrupt_record =
         std::getenv("LAVIK_REPLICATION_CORRUPT_FULLSYNC_RECORD_FRAME_ONCE");
@@ -675,9 +669,8 @@ Task<absl::Status> WriteDataFrame(TcpStream& stream, DataFrameKind kind,
 
 absl::Status AppendDataFrame(std::string* output, DataFrameKind kind,
                              std::string_view payload) {
-  absl::Status header = AppendDataFrameHeader(output, kind, payload.size(),
-                                              DataFrameCrc32c(payload));
-  if (!header.ok()) return header;
+  LAVIK_RETURN_IF_ERROR(AppendDataFrameHeader(output, kind, payload.size(),
+                                              DataFrameCrc32c(payload)));
   output->append(payload);
   return absl::OkStatus();
 }
@@ -764,8 +757,7 @@ absl::Status EncodeRecords(std::uint16_t partition_id,
     bytes += EncodedRecordBytes(record);
   }
   output->clear();
-  absl::Status reserved = ReserveReplicationString(output, bytes);
-  if (!reserved.ok()) return reserved;
+  LAVIK_RETURN_IF_ERROR(ReserveReplicationString(output, bytes));
   PutU16(*output, partition_id);
   PutU32(*output, static_cast<std::uint32_t>(records.size()));
   for (const SnapshotRecord& record : records) {
@@ -798,9 +790,8 @@ absl::Status AppendReplicationString(std::string* output,
     return absl::ResourceExhaustedError(
         "replication command exceeds the native event limit");
   }
-  absl::Status reserved =
-      ReserveReplicationString(output, output->size() + value.size());
-  if (!reserved.ok()) return reserved;
+  LAVIK_RETURN_IF_ERROR(
+      ReserveReplicationString(output, output->size() + value.size()));
   output->append(value);
   return absl::OkStatus();
 }
@@ -859,9 +850,8 @@ Task<absl::Status> WaitAtSourceAdmissionFaultBarrier(
       "LAVIK_REPLICATION_SOURCE_ADMISSION_BARRIER_PATH";
   const char* path = std::getenv(kBarrierVariable);
   if (path == nullptr || *path == '\0') co_return absl::OkStatus();
-  absl::Status signalled = SignalFaultBarrier(
-      kBarrierVariable, "source authorization fault barrier");
-  if (!signalled.ok()) co_return signalled;
+  LAVIK_CO_RETURN_IF_ERROR(SignalFaultBarrier(
+      kBarrierVariable, "source authorization fault barrier"));
   for (;;) {
     if (shutdown_requested.load(std::memory_order_acquire)) {
       co_return absl::CancelledError(
@@ -873,9 +863,8 @@ Task<absl::Status> WaitAtSourceAdmissionFaultBarrier(
           absl::StrCat("could not observe source admission fault barrier: ",
                        std::strerror(errno)));
     }
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
 }
 #endif
@@ -1092,9 +1081,8 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
       teardown_running = replica_session_teardown_running_;
     }
     if (!teardown_running) break;
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (cluster_control_stopping_) {
     co_return absl::CancelledError(
@@ -1134,8 +1122,8 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
           "stale or retired rebuild admission request");
     }
   }
-  absl::Status validated = cluster_group_->ValidateRebuild(directive, manifest);
-  if (!validated.ok()) co_return validated;
+  LAVIK_CO_RETURN_IF_ERROR(
+      cluster_group_->ValidateRebuild(directive, manifest));
 
   // Own the transition before cancellation can suspend. Concurrent starts
   // must not publish a newer request while this caller joins the old one.
@@ -1148,16 +1136,13 @@ auto ReplicationManager::ReplicationGroup::StartClusterRebuildDirective(
   LAVIK_FAULT_INJECT(
       const char* hold = std::getenv("LAVIK_REBUILD_START_HOLD_FILE");
       if (hold != nullptr && ::access(hold, F_OK) == 0) {
-        auto signalled = SignalFaultBarrier("LAVIK_REBUILD_START_ACK_FILE",
-                                            "rebuild start barrier");
-        if (!signalled.ok()) co_return signalled;
-        auto paused = co_await fault_injection::PauseWhileFileExists(
-            "LAVIK_REBUILD_START_HOLD_FILE");
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(SignalFaultBarrier(
+            "LAVIK_REBUILD_START_ACK_FILE", "rebuild start barrier"));
+        LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_REBUILD_START_HOLD_FILE"));
       });
-  auto cancelled =
-      co_await CancelPendingClusterRebuild("rebuild admission superseded");
-  if (!cancelled.ok()) co_return cancelled;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await CancelPendingClusterRebuild("rebuild admission superseded"));
   StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
   storage_->SetExpirationAuthority(false);
   // Stop old apply work while preserving its completed population and frontier.
@@ -1210,12 +1195,10 @@ auto ReplicationManager::ReplicationGroup::CancelPendingClusterRebuild(
   LAVIK_FAULT_INJECT(
       const char* hold = std::getenv("LAVIK_REBUILD_CANCEL_HOLD_FILE");
       if (hold != nullptr && ::access(hold, F_OK) == 0) {
-        auto signalled = SignalFaultBarrier("LAVIK_REBUILD_CANCEL_ACK_FILE",
-                                            "rebuild cancel barrier");
-        if (!signalled.ok()) co_return signalled;
-        auto paused = co_await fault_injection::PauseWhileFileExists(
-            "LAVIK_REBUILD_CANCEL_HOLD_FILE");
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(SignalFaultBarrier(
+            "LAVIK_REBUILD_CANCEL_ACK_FILE", "rebuild cancel barrier"));
+        LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_REBUILD_CANCEL_HOLD_FILE"));
       });
   pending->completion_->Resolve(stopped.ok() ? absl::CancelledError(reason)
                                              : stopped);
@@ -1234,15 +1217,13 @@ auto ReplicationManager::ReplicationGroup::AdmitPendingClusterRebuild(
     return absl::CancelledError(
         "rebuild admission was replaced before source acceptance");
   }
-  auto validated =
-      cluster_group_->ValidateRebuild(context->directive_, *context->manifest_);
-  if (!validated.ok()) return validated;
+  LAVIK_RETURN_IF_ERROR(cluster_group_->ValidateRebuild(context->directive_,
+                                                        *context->manifest_));
   // Source identity and the shared FULL slot are now established. Withdraw
   // the old proof immediately before issuing the new reset capability.
   if (cluster_rebuild_ != nullptr) {
-    auto retired =
-        cluster_group_->InvalidateProof(cluster_rebuild_->directive_.identity_);
-    if (!retired.ok()) return retired;
+    LAVIK_RETURN_IF_ERROR(cluster_group_->InvalidateProof(
+        cluster_rebuild_->directive_.identity_));
     cluster_rebuild_->state_.store(ReplicationGroupState::kNotReady,
                                    std::memory_order_release);
     cluster_rebuild_->ready_token_.reset();
@@ -1273,7 +1254,7 @@ auto ReplicationManager::ReplicationGroup::ApplyClusterRebuildDirective(
     PopulationManifest manifest) -> Task<absl::Status> {
   auto started = co_await StartClusterRebuildDirective(
       std::move(upstream), std::move(directive), std::move(manifest));
-  if (!started.ok()) co_return started.status();
+  LAVIK_CO_RETURN_IF_ERROR(started.status());
   co_return co_await (*started)->Await();
 }
 
@@ -1350,7 +1331,7 @@ auto ReplicationManager::ReplicationGroup::StartEmptyPopulationInitialization(
           "empty population proof was invalidated; a fresh attempt is "
           "required");
     }
-    if (!validated.ok()) co_return validated;
+    LAVIK_CO_RETURN_IF_ERROR(validated);
     if (replica_reconfiguration_running_ || cluster_rebuild_ != nullptr ||
         active_replica_session_ != nullptr || upstream_.has_value() ||
         coordinator_started_) {
@@ -1416,23 +1397,21 @@ auto ReplicationManager::ReplicationGroup::
     if (cluster_rebuild_ != nullptr) co_return absl::OkStatus();
   }
   auto manifest = PopulationManifest::Create({});
-  if (!manifest.ok()) co_return manifest.status();
+  LAVIK_CO_RETURN_IF_ERROR(manifest.status());
   if (manifest->id() != directive.identity_.manifest_id_) {
     co_return absl::InvalidArgumentError(
         "fault-seeded promotion requires the empty population manifest");
   }
 
   constexpr std::uint64_t kFaultFullSyncSession = 0x50524f4d4f5445ULL;
-  absl::Status storage_ready =
-      co_await storage_->BeginReplicaFullSync(kFaultFullSyncSession);
-  if (!storage_ready.ok()) co_return storage_ready;
-  storage_ready = co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes({});
-  if (!storage_ready.ok()) co_return storage_ready;
-  storage_ready = co_await storage_->CompleteReplicaFullSync(
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await storage_->BeginReplicaFullSync(kFaultFullSyncSession));
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes({}));
+  LAVIK_CO_RETURN_IF_ERROR(co_await storage_->CompleteReplicaFullSync(
       kFaultFullSyncSession,
       storage::PopulationToken{.generation_ = kFaultFullSyncSession,
-                               .digest_ = 1});
-  if (!storage_ready.ok()) co_return storage_ready;
+                               .digest_ = 1}));
 
   if (directive.identity_.term_ <= 1) {
     co_return absl::InvalidArgumentError(
@@ -1448,9 +1427,8 @@ auto ReplicationManager::ReplicationGroup::
     // the storage certificate/crash protocol covered by process tests.
     const auto action = cluster_failover_action_;
     const auto follow = cluster_follow_owner_;
-    storage_ready = co_await InstallRecoveredPopulation(
-        {std::move(ready_identity), directive.required_applied_next_lsns_});
-    if (!storage_ready.ok()) co_return storage_ready;
+    LAVIK_CO_RETURN_IF_ERROR(co_await InstallRecoveredPopulation(
+        {std::move(ready_identity), directive.required_applied_next_lsns_}));
     AssertStateOwner();
     if (cluster_failover_action_ != action || cluster_follow_owner_ != follow ||
         (action != nullptr && action->cancelled_) ||
@@ -1474,7 +1452,7 @@ auto ReplicationManager::ReplicationGroup::
       .safe_source_active_ = true,
   };
   auto authorization = cluster_group_->BeginRebuild(rebuild, *manifest);
-  if (!authorization.ok()) co_return authorization.status();
+  LAVIK_CO_RETURN_IF_ERROR(authorization.status());
   auto population = std::make_shared<ClusterRebuildContext>(
       rebuild, *manifest, std::move(*authorization));
   for (std::uint32_t partition = 0; partition < kReplicationPartitionCount;
@@ -1486,7 +1464,7 @@ auto ReplicationManager::ReplicationGroup::
       recorded = cluster_group_->RecordPartitionHandoff(
           rebuild.identity_, partition, 0, target_epoch);
     }
-    if (!recorded.ok()) co_return recorded;
+    LAVIK_CO_RETURN_IF_ERROR(recorded);
   }
   absl::Status proof =
       cluster_group_->MarkFunctionCatalogComplete(rebuild.identity_);
@@ -1497,15 +1475,14 @@ auto ReplicationManager::ReplicationGroup::
   if (proof.ok()) {
     proof = cluster_group_->MarkStoragePromoted(rebuild.identity_);
   }
-  if (!proof.ok()) co_return proof;
+  LAVIK_CO_RETURN_IF_ERROR(proof);
   auto ready = cluster_group_->PublishReady(rebuild.identity_);
-  if (!ready.ok()) co_return ready.status();
+  LAVIK_CO_RETURN_IF_ERROR(ready.status());
 
   auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
       directive.required_applied_next_lsns_.size(), storage_->worker_count());
-  absl::Status frontier_installed =
-      frontier->InstallNextLsns(directive.required_applied_next_lsns_);
-  if (!frontier_installed.ok()) co_return frontier_installed;
+  LAVIK_CO_RETURN_IF_ERROR(
+      frontier->InstallNextLsns(directive.required_applied_next_lsns_));
   population->ready_token_ = *ready;
   population->state_.store(ReplicationGroupState::kReady,
                            std::memory_order_release);
@@ -1549,9 +1526,8 @@ auto ReplicationManager::ReplicationGroup::WaitAtPromotionFaultBarrier(
     const char* signal_variable) -> Task<absl::StatusOr<bool>> {
   const char* signal_path = std::getenv(signal_variable);
   if (signal_path == nullptr || *signal_path == '\0') co_return false;
-  absl::Status signalled =
-      SignalFaultBarrier(signal_variable, "promotion fault barrier");
-  if (!signalled.ok()) co_return signalled;
+  LAVIK_CO_RETURN_IF_ERROR(
+      SignalFaultBarrier(signal_variable, "promotion fault barrier"));
   for (;;) {
     AssertStateOwner();
     const bool exact_action_current =
@@ -1559,9 +1535,8 @@ auto ReplicationManager::ReplicationGroup::WaitAtPromotionFaultBarrier(
         cluster_failover_action_->prepare_directive_.has_value() &&
         *cluster_failover_action_->prepare_directive_ == context->directive_;
     if (!exact_action_current || context->cancellation_requested_) break;
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return true;
 }
@@ -1623,7 +1598,7 @@ auto ReplicationManager::ReplicationGroup::AdoptLocalOwnerHistory()
   const auto& bridge = *history_bridge_;
   auto revision =
       cluster_group_->NextDirectiveRevision(bridge.child_.source_group_term_);
-  if (!revision.ok()) return revision.status();
+  LAVIK_RETURN_IF_ERROR(revision.status());
   RebuildDirective child = cluster_rebuild_->directive_;
   auto& identity = child.identity_;
   identity.term_ = bridge.child_.source_group_term_;
@@ -1643,7 +1618,8 @@ auto ReplicationManager::ReplicationGroup::AdoptLocalOwnerHistory()
   // Operator recovery creates a fresh local base in the target term and
   // has no comparable historical parent. Bind that complete base to its
   // first publisher; ordinary promotion crosses into a successor term.
-  auto ready =
+  LAVIK_ASSIGN_OR_RETURN(
+      adopted->ready_token_,
       bridge.parent_.source_group_term_ == bridge.child_.source_group_term_
           ? cluster_group_->BindLocalSourceHistory(
                 *cluster_rebuild_->ready_token_, child,
@@ -1653,9 +1629,7 @@ auto ReplicationManager::ReplicationGroup::AdoptLocalOwnerHistory()
                 *cluster_rebuild_->manifest_,
                 bridge.promotion_.frozen_applied_next_lsns_,
                 bridge.promotion_.frozen_applied_next_lsns_,
-                bridge.child_origin_);
-  if (!ready.ok()) return ready.status();
-  adopted->ready_token_ = std::move(*ready);
+                bridge.child_origin_));
   cluster_rebuild_ = std::move(adopted);
   // Native Owner progress is sampled from its live source logs. Retaining a
   // fixed replica frontier here would advertise a stale child cursor.
@@ -1938,9 +1912,8 @@ auto ReplicationManager::ReplicationGroup::
 #if LAVIK_FAULTS_ENABLED
   if (LAVIK_FAULT_MATCHES("LAVIK_REPLICATION_SEED_READY_PROMOTION_CANDIDATE",
                           identity.attempt_id_)) {
-    absl::Status seeded =
-        co_await SeedReadyPromotionCandidateForFaultTest(directive);
-    if (!seeded.ok()) co_return seeded;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await SeedReadyPromotionCandidateForFaultTest(directive));
   }
 #endif
 
@@ -1998,7 +1971,7 @@ auto ReplicationManager::ReplicationGroup::
           "promotion-prepare does not match the ready candidate anchors");
     }
     auto current = applied_frontier_->TrySnapshot();
-    if (!current.ok()) co_return current.status();
+    LAVIK_CO_RETURN_IF_ERROR(current.status());
     for (std::size_t flow = 0; flow < current->size(); ++flow) {
       if ((*current)[flow] < directive.required_applied_next_lsns_[flow]) {
         co_return absl::FailedPreconditionError(
@@ -2229,9 +2202,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterSourcePause(
     PublishHeartbeatObservation();
     co_return absl::OkStatus();
   }
-  if (absl::Status valid = ValidateClusterSourcePause(*desired); !valid.ok()) {
-    co_return valid;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(ValidateClusterSourcePause(*desired));
   if (!SourcePausePopulationMatches(*desired)) {
     co_return absl::FailedPreconditionError(
         "cluster source pause does not match the ready owner population");
@@ -2441,9 +2412,8 @@ auto ReplicationManager::ReplicationGroup::WaitForFailoverActionRetry(
       co_return absl::DeadlineExceededError(context->failure_detail_);
     }
     const auto wait = std::min(remaining, kSlice);
-    absl::Status waited =
-        co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, wait);
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await bycorf::SleepFor(*bycorf::ThisWorker().self_, wait));
     remaining -= wait;
   }
   co_return absl::OkStatus();
@@ -2488,7 +2458,7 @@ auto ReplicationManager::ReplicationGroup::ReadRecoveryFrame(TcpStream& stream,
                                                              std::size_t bound)
     -> Task<absl::StatusOr<std::string>> {
   auto line = co_await ReadLine(stream);
-  if (!line.ok()) co_return line.status();
+  LAVIK_CO_RETURN_IF_ERROR(line.status());
   const auto words = SplitWords(*line);
   std::uint64_t size = 0;
   std::uint32_t crc = 0;
@@ -2499,7 +2469,7 @@ auto ReplicationManager::ReplicationGroup::ReadRecoveryFrame(TcpStream& stream,
         "invalid recovery frame header or byte bound");
   }
   auto payload = co_await ReadExact(stream, size);
-  if (!payload.ok()) co_return payload.status();
+  LAVIK_CO_RETURN_IF_ERROR(payload.status());
   if (DataFrameCrc32c(*payload) != crc)
     co_return absl::DataLossError("recovery frame checksum mismatch");
   co_return std::move(*payload);
@@ -2569,9 +2539,8 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterRecovery(
   while ((previous != nullptr &&
           (previous->active_exports_ != 0 || !previous->watcher_finished_)) ||
          (action != nullptr && action->recovery_running_)) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (action != nullptr && !action->recovery_.has_value())
     action->recovery_started_ = false;
@@ -2588,7 +2557,7 @@ auto ReplicationManager::ReplicationGroup::ResetRetainedHistory(
   AssertStateOwner();
   const auto revision = ++retained_reset_revision_;
   for (unsigned worker = 0; worker < retained_histories_.size(); ++worker) {
-    auto status = co_await bycorf::SubmitTo(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTo(
         worker, [this, worker, revision, history, flow_count] {
           auto& installed = retained_reset_revisions_[worker];
           if (revision < installed)
@@ -2596,8 +2565,7 @@ auto ReplicationManager::ReplicationGroup::ResetRetainedHistory(
           auto reset = retained_histories_[worker]->Reset(history, flow_count);
           if (reset.ok()) installed = revision;
           return reset;
-        });
-    if (!status.ok()) co_return status;
+        }));
     if (revision != retained_reset_revision_)
       co_return absl::CancelledError("retained history reset superseded");
   }
@@ -2669,16 +2637,16 @@ auto ReplicationManager::ReplicationGroup::SendRetainedEffect(
       co_return absl::CancelledError("retained export was revoked");
     if (effect.ok()) break;
   }
-  if (!effect.ok()) co_return effect.status();
+  LAVIK_CO_RETURN_IF_ERROR(effect.status());
   for (const auto& record : *effect) {
     if (!detail::RecoveryCovers(report, record.flow_id_, record.lsn_))
       co_return absl::NotFoundError(
           "recovery effect has unavailable participants");
   }
   auto manifest = detail::EncodeRecoveryEffectManifest(*effect);
-  if (!manifest.ok()) co_return manifest.status();
+  LAVIK_CO_RETURN_IF_ERROR(manifest.status());
   auto status = co_await WriteRecoveryFrame(stream, *manifest);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   for (const auto& record : *effect) {
     for (std::size_t offset = 0; offset < record.bytes_;) {
       if (!current())
@@ -2690,11 +2658,11 @@ auto ReplicationManager::ReplicationGroup::SendRetainedEffect(
           });
       if (!current())
         co_return absl::CancelledError("retained export was revoked");
-      if (!chunk.ok()) co_return chunk.status();
+      LAVIK_CO_RETURN_IF_ERROR(chunk.status());
       if (chunk->total_bytes_ != record.bytes_)
         co_return absl::DataLossError("retained event changed during copy-out");
       status = co_await WriteRecoveryFrame(stream, chunk->bytes_);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       offset += chunk->bytes_.size();
     }
   }
@@ -2762,9 +2730,8 @@ auto ReplicationManager::ReplicationGroup::CancelPartialExports()
   while (std::ranges::any_of(exports, [](const auto& transfer) {
     return !transfer->finished_ || !transfer->watcher_finished_;
   })) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }
@@ -2845,14 +2812,14 @@ auto ReplicationManager::ReplicationGroup::RunParentExport(
       " ", parent.source_history_id_, " ", EncodeAppliedVector(boundary), " ",
       EncodeAppliedVector(bridge->child_origin_), "\r\n");
   auto status = co_await WriteText(stream, hello);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto encoded = detail::EncodeRecoveryAdvertisement(report);
-  if (!encoded.ok()) co_return encoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
   status = co_await WriteRecoveryFrame(stream, *encoded);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   while (current() && history_bridge_ == bridge) {
     auto line = co_await ReadLine(stream);
-    if (!line.ok()) co_return line.status();
+    LAVIK_CO_RETURN_IF_ERROR(line.status());
     const auto words = SplitWords(*line);
     if (words.size() == 2 && words[0] == "SWITCH") {
       auto final = DecodeAppliedVector(words[1]);
@@ -2877,9 +2844,9 @@ auto ReplicationManager::ReplicationGroup::RunParentExport(
       // it.
       continuation_proofs_[args[4]] = std::move(continuation);
       status = co_await WriteText(stream, reply);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       auto ack = co_await ReadLine(stream);
-      if (!ack.ok()) co_return ack.status();
+      LAVIK_CO_RETURN_IF_ERROR(ack.status());
       co_return *ack == "ACK"
           ? absl::OkStatus()
           : absl::InvalidArgumentError("invalid HistorySwitch ACK");
@@ -2896,7 +2863,7 @@ auto ReplicationManager::ReplicationGroup::RunParentExport(
     };
     status = co_await SendRetainedEffect(stream, parent.source_history_id_,
                                          report, flow, lsn, effect_current);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   co_return absl::CancelledError("partial export was superseded");
 }
@@ -3010,7 +2977,7 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
     co_return absl::FailedPreconditionError(
         "donor has no complete same-domain replica population");
   auto cut = applied_frontier_->TrySnapshot();
-  if (!cut.ok()) co_return cut.status();
+  LAVIK_CO_RETURN_IF_ERROR(cut.status());
   detail::NativeRecoveryAdvertisement report{
       boot_id_, std::move(*cut),
       co_await RetainedCoverage(local.domain_.source_history_id_)};
@@ -3028,16 +2995,16 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
     });
   }
   auto encoded = detail::EncodeRecoveryAdvertisement(report);
-  if (!encoded.ok()) co_return encoded.status();
+  LAVIK_CO_RETURN_IF_ERROR(encoded.status());
   auto status = co_await WriteRecoveryFrame(stream, *encoded);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
 #if LAVIK_FAULTS_ENABLED
   bool delayed_first_effect = false;
 #endif
   while (cluster_recovery_ == scope && !scope->sockets_.cancelled() &&
          !scope->Expired()) {
     auto request = co_await ReadLine(stream);
-    if (!request.ok()) co_return request.status();
+    LAVIK_CO_RETURN_IF_ERROR(request.status());
     const auto words = SplitWords(*request);
     unsigned flow = 0;
     std::uint64_t lsn = 0;
@@ -3067,9 +3034,8 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
         const auto until = std::chrono::steady_clock::now() +
                            std::chrono::milliseconds(milliseconds);
         while (current() && std::chrono::steady_clock::now() < until) {
-          auto slept = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                 std::chrono::milliseconds(5));
-          if (!slept.ok()) co_return slept;
+          LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+              *bycorf::ThisWorker().self_, std::chrono::milliseconds(5)));
         }
         if (!current())
           co_return absl::CancelledError("recovery delay cancelled");
@@ -3077,7 +3043,7 @@ auto ReplicationManager::ReplicationGroup::ServeRecoveryDonor(
     });
     status = co_await SendRetainedEffect(
         stream, local.domain_.source_history_id_, report, flow, lsn, current);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     LAVIK_FAULT_INJECT(if (std::getenv("LAVIK_TEST_RECOVERY_TRACE") !=
                            nullptr) {
       spdlog::info(
@@ -3096,12 +3062,12 @@ auto ReplicationManager::ReplicationGroup::FetchRetainedEffect(
     -> Task<absl::StatusOr<std::unique_ptr<RecoveryReceivedEffect>>> {
   const std::string request = absl::StrCat(flow, " ", lsn, "\r\n");
   auto status = co_await WriteText(stream, request);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto response =
       co_await ReadRecoveryFrame(stream, detail::kRecoveryMetadataBytes);
-  if (!response.ok()) co_return response.status();
+  LAVIK_CO_RETURN_IF_ERROR(response.status());
   auto manifest = detail::DecodeRecoveryEffectManifest(*response);
-  if (!manifest.ok()) co_return manifest.status();
+  LAVIK_CO_RETURN_IF_ERROR(manifest.status());
   if (!std::ranges::any_of(*manifest, [&](const auto& record) {
         return record.flow_id_ == flow && record.lsn_ == lsn;
       }))
@@ -3134,7 +3100,7 @@ auto ReplicationManager::ReplicationGroup::FetchRetainedEffect(
       response = co_await ReadRecoveryFrame(
           stream, std::min<std::uint64_t>(
                       64 * 1024, record.bytes_ - value.canonical_.size()));
-      if (!response.ok()) co_return response.status();
+      LAVIK_CO_RETURN_IF_ERROR(response.status());
       value.canonical_.append(*response);
     }
     received->records_.push_back(std::move(value));
@@ -3174,9 +3140,8 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeer(
     if (peer->report_.has_value() || peer->sockets_.cancelled() ||
         scope->Expired() || cluster_recovery_ != scope)
       co_return result;
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(5));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(5)));
   }
   co_return absl::CancelledError("recovery discovery ended");
 }
@@ -3190,7 +3155,7 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
   auto connected = co_await ConnectTcp(
       peer->peer_.endpoint_.host_, peer->peer_.endpoint_.port_, tls_context_,
       &peer->sockets_, /*cancellable_dns=*/true);
-  if (!connected.ok()) co_return connected.status();
+  LAVIK_CO_RETURN_IF_ERROR(connected.status());
   TcpStream stream = std::move(*connected);
   // TcpStream is a non-owning handle. Close even on authentication/decoding
   // errors before retrying discovery. The membership declared after this
@@ -3202,16 +3167,16 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
   } close{stream};
   ScopedSocketSetMembership membership(&peer->sockets_, stream.NativeFd());
   auto status = co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   const auto handshake = EncodeRespCommand(
       RecoveryHandshake(scope->desired_.action_, peer->peer_.member_));
   status = co_await WriteText(stream, handshake);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto response =
       co_await ReadRecoveryFrame(stream, detail::kRecoveryMetadataBytes);
-  if (!response.ok()) co_return response.status();
+  LAVIK_CO_RETURN_IF_ERROR(response.status());
   auto report = detail::DecodeRecoveryAdvertisement(*response);
-  if (!report.ok()) co_return report.status();
+  LAVIK_CO_RETURN_IF_ERROR(report.status());
   if (report->applied_.size() != scope->desired_.action_.domain_.flow_count_)
     co_return absl::InvalidArgumentError(
         "donor report has a different origin layout");
@@ -3222,13 +3187,13 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
     if (!peer->request_.has_value()) {
       status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
                                          std::chrono::milliseconds(1));
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       continue;
     }
     const auto [flow, lsn] = *peer->request_;
     auto received =
         co_await FetchRetainedEffect(stream, *peer->report_, budget, flow, lsn);
-    if (!received.ok()) co_return received.status();
+    LAVIK_CO_RETURN_IF_ERROR(received.status());
     // A fully received bundle no longer depends on donor liveness. Only the
     // coordinator admits it into NativeReplay under the current population.
     peer->received_ = std::move(*received);
@@ -3237,7 +3202,7 @@ auto ReplicationManager::ReplicationGroup::RunRecoveryPeerConnection(
     while (peer->received_ != nullptr && !peer->sockets_.cancelled()) {
       status = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
                                          std::chrono::milliseconds(1));
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
     }
   }
   co_return absl::OkStatus();
@@ -3294,14 +3259,13 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
     const bool recovered =
         LAVIK_FAULT_MATCHES("LAVIK_REPLICATION_SEED_CLEAN_RECOVERED_CANDIDATE",
                             HexBytes(action->desired_.action_id_));
-    auto seeded =
-        co_await SeedReadyPromotionCandidateForFaultTest(directive, recovered);
-    if (!seeded.ok()) co_return seeded;
-    auto retained = recovered ? absl::OkStatus()
-                              : co_await ResetRetainedHistory(
-                                    action->desired_.domain_.source_history_id_,
-                                    action->desired_.domain_.flow_count_);
-    if (!retained.ok()) co_return retained;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await SeedReadyPromotionCandidateForFaultTest(directive, recovered));
+    LAVIK_CO_RETURN_IF_ERROR(
+        recovered ? absl::OkStatus()
+                  : co_await ResetRetainedHistory(
+                        action->desired_.domain_.source_history_id_,
+                        action->desired_.domain_.flow_count_));
   }
 #endif
   auto stopped = co_await StopClusterFollowIngress(cluster_follow_owner_);
@@ -3330,7 +3294,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
       }
       if (current() && FailoverReplicaDomainMatches(action->desired_)) {
         auto cut = applied_frontier_->TrySnapshot();
-        if (!cut.ok()) co_return cut.status();
+        LAVIK_CO_RETURN_IF_ERROR(cut.status());
         action->recovery_ = ClusterCandidateRecoveryResult{
             std::move(*cut), "coverage-unavailable"};
         action->state_ = ClusterFailoverActionState::kRecoveryComplete;
@@ -3345,7 +3309,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
   }
   const auto applied = applied_frontier_;
   auto initial = applied->TrySnapshot();
-  if (!initial.ok()) co_return initial.status();
+  LAVIK_CO_RETURN_IF_ERROR(initial.status());
   detail::NativeReplay replay(applied, retained_histories_,
                               action->desired_.domain_.source_history_id_);
   std::vector<std::shared_ptr<RecoveryPeerSession>> peers;
@@ -3494,7 +3458,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
       break;
     }
   }
-  if (!result.ok()) co_return result;
+  LAVIK_CO_RETURN_IF_ERROR(result);
   if (!current())
     co_return absl::CancelledError("candidate recovery was replaced");
   if (applied_frontier_ != applied ||
@@ -3505,7 +3469,7 @@ auto ReplicationManager::ReplicationGroup::RunCandidateRecovery(
     co_return absl::FailedPreconditionError(action->failure_detail_);
   }
   auto final = applied->TrySnapshot();
-  if (!final.ok()) co_return final.status();
+  LAVIK_CO_RETURN_IF_ERROR(final.status());
   action->recovery_ =
       ClusterCandidateRecoveryResult{std::move(*final), std::move(reason)};
   action->state_ = ClusterFailoverActionState::kRecoveryComplete;
@@ -3896,8 +3860,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFailoverAction(
         "mode");
   }
   if (desired.has_value()) {
-    absl::Status validated = ValidateClusterFailoverAction(*desired);
-    if (!validated.ok()) co_return validated;
+    LAVIK_CO_RETURN_IF_ERROR(ValidateClusterFailoverAction(*desired));
   }
   if (pending_activation_action_id.has_value() &&
       IsZeroBytes(*pending_activation_action_id)) {
@@ -3973,9 +3936,8 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFailoverAction(
     if (previous->recovery_running_ && cluster_recovery_ != nullptr)
       cluster_recovery_->sockets_.Cancel();
     while (!previous->runner_finished_ || previous->recovery_running_) {
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     const bool retain_for_activation =
         pending_activation_action_id == std::optional<ClusterFailoverActionId>(
@@ -4161,10 +4123,7 @@ auto ReplicationManager::ReplicationGroup::ActivateClusterPreparedPromotion(
     co_return absl::CancelledError(
         "cluster promotion activation stopped for process shutdown");
   }
-  if (absl::Status valid = ValidateClusterFailoverActivation(activation);
-      !valid.ok()) {
-    co_return valid;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(ValidateClusterFailoverActivation(activation));
   AssertStateOwner();
   if (!ClusterActivationPopulationMatches(activation)) {
     co_return absl::FailedPreconditionError(
@@ -4238,8 +4197,7 @@ auto ReplicationManager::ReplicationGroup::ActivateClusterPreparedPromotion(
     co_return absl::FailedPreconditionError(
         "activation has no exact parent/child history descriptor");
   }
-  auto adopted = AdoptLocalOwnerHistory();
-  if (!adopted.ok()) co_return adopted;
+  LAVIK_CO_RETURN_IF_ERROR(AdoptLocalOwnerHistory());
   ActivatePreparedPromotionRole();
   if (is_loading()) {
     co_return absl::FailedPreconditionError(
@@ -4300,8 +4258,7 @@ auto ReplicationManager::ReplicationGroup::RevokeClusterExpirationAuthority()
   }
   CancelRedisExport();
   storage_->SetExpirationAuthority(false);
-  absl::Status drained = co_await storage_->QuiesceExpiration();
-  if (!drained.ok()) co_return drained;
+  LAVIK_CO_RETURN_IF_ERROR(co_await storage_->QuiesceExpiration());
   storage_->ResumeExpiration();
   co_return absl::OkStatus();
 }
@@ -4384,7 +4341,7 @@ auto ReplicationManager::ReplicationGroup::NormalizeClusterFollowOwner(
               return left.partition_id_ < right.partition_id_;
             });
   auto manifest = PopulationManifest::Create(desired.manifest_entries_);
-  if (!manifest.ok()) return manifest.status();
+  LAVIK_RETURN_IF_ERROR(manifest.status());
   if (manifest->id() != desired.manifest_id_) {
     return absl::FailedPreconditionError(
         "follow-owner manifest entries do not match their FDS digest");
@@ -4428,8 +4385,7 @@ auto ReplicationManager::ReplicationGroup::StopClusterFollowIngress(
   if (session != nullptr) session->Cancel();
 
   if (session != nullptr) {
-    absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
-    if (!stopped.ok()) co_return stopped;
+    LAVIK_CO_RETURN_IF_ERROR(co_await CancelAndWaitForReplicaFlows(session));
     if (std::optional<std::string> uncertain = session->FailStopReason();
         uncertain.has_value()) {
       co_return absl::InternalError(*uncertain);
@@ -4440,13 +4396,11 @@ auto ReplicationManager::ReplicationGroup::StopClusterFollowIngress(
         population->state_.load(std::memory_order_acquire) ==
             ReplicationGroupState::kRebuilding) {
       if (session->session_id_ != 0) {
-        absl::Status aborted =
-            co_await storage_->AbortReplicaRoot(session->session_id_);
-        if (!aborted.ok()) co_return aborted;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await storage_->AbortReplicaRoot(session->session_id_));
       }
-      absl::Status invalidated =
-          cluster_group_->InvalidateProof(population->directive_.identity_);
-      if (!invalidated.ok()) co_return invalidated;
+      LAVIK_CO_RETURN_IF_ERROR(
+          cluster_group_->InvalidateProof(population->directive_.identity_));
       population->state_.store(ReplicationGroupState::kNotReady,
                                std::memory_order_release);
       population->ready_token_.reset();
@@ -4462,9 +4416,8 @@ auto ReplicationManager::ReplicationGroup::StopClusterFollowIngress(
     }
   }
   while (coordinator_started_) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }
@@ -4497,7 +4450,7 @@ auto ReplicationManager::ReplicationGroup::BeginClusterFollowFullPopulation(
   // next revision from that owner prevents every FULL retry from being
   // rejected forever as stale after the transient context disappears.
   auto revision = cluster_group_->NextDirectiveRevision(desired.group_term_);
-  if (!revision.ok()) return revision.status();
+  LAVIK_RETURN_IF_ERROR(revision.status());
 
   RebuildDirective directive{
       .identity_ =
@@ -4529,22 +4482,20 @@ auto ReplicationManager::ReplicationGroup::BeginClusterFollowFullPopulation(
       .flow_count_ = source_flow_count,
       .safe_source_active_ = true,
   };
-  absl::Status validated = cluster_group_->ValidateRebuild(
-      directive, session->cluster_follow_->manifest_);
-  if (!validated.ok()) return validated;
+  LAVIK_RETURN_IF_ERROR(cluster_group_->ValidateRebuild(
+      directive, session->cluster_follow_->manifest_));
 
   const std::shared_ptr<ClusterRebuildContext> previous = cluster_rebuild_;
   if (previous != nullptr) {
-    absl::Status invalidated =
-        cluster_group_->InvalidateProof(previous->directive_.identity_);
-    if (!invalidated.ok()) return invalidated;
+    LAVIK_RETURN_IF_ERROR(
+        cluster_group_->InvalidateProof(previous->directive_.identity_));
     previous->state_.store(ReplicationGroupState::kNotReady,
                            std::memory_order_release);
     previous->ready_token_.reset();
   }
   auto authorization = cluster_group_->BeginRebuild(
       directive, session->cluster_follow_->manifest_);
-  if (!authorization.ok()) return authorization.status();
+  LAVIK_RETURN_IF_ERROR(authorization.status());
   auto population = std::make_shared<ClusterRebuildContext>(
       std::move(directive), session->cluster_follow_->manifest_,
       std::move(*authorization));
@@ -4581,28 +4532,25 @@ auto ReplicationManager::ReplicationGroup::FreezeFormerOwnerPopulation(
   // a cancelled FULL may itself own the gates. Keep publication available
   // until every previously admitted writer and expiration task has drained.
   while (!CloseAllCommandDbGates()) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   struct GateGuard {
     ~GateGuard() { OpenAllCommandDbGates(); }
   } gate;
   while (CommandDbOperationsActive()) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   auto catalog_guard = co_await AcquireFunctionCatalogOperation();
   (void)catalog_guard;
-  auto quiesced = co_await storage_->QuiesceExpiration();
-  if (!quiesced.ok()) co_return quiesced;
+  LAVIK_CO_RETURN_IF_ERROR(co_await storage_->QuiesceExpiration());
   struct ExpiryGuard {
     storage::StorageEngine* storage_;
     ~ExpiryGuard() { storage_->ResumeExpiration(); }
   } expiry{storage_};
   auto watermark = co_await CaptureNativeReplicationWatermark();
-  if (!watermark.ok()) co_return watermark.status();
+  LAVIK_CO_RETURN_IF_ERROR(watermark.status());
   if (!watermark->has_value()) {
     // An idle source has no retained events or reconnectable downstreams.
     // Establish its current publisher boundary only after the drain; this
@@ -4610,21 +4558,20 @@ auto ReplicationManager::ReplicationGroup::FreezeFormerOwnerPopulation(
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const auto capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
-      auto enabled = co_await bycorf::SubmitTaskTo(
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
           worker, [this, capacity]() -> Task<absl::Status> {
             co_return co_await storage_->EnableReplicationLog(
                 role_epoch_.load(std::memory_order_acquire), capacity);
-          });
-      if (!enabled.ok()) co_return enabled;
+          }));
     }
     watermark = co_await CaptureNativeReplicationWatermark();
-    if (!watermark.ok()) co_return watermark.status();
+    LAVIK_CO_RETURN_IF_ERROR(watermark.status());
     if (!watermark->has_value())
       co_return absl::FailedPreconditionError(
           "former Owner has no complete source boundary");
   }
   auto revision = cluster_group_->NextDirectiveRevision(source_term);
-  if (!revision.ok()) co_return revision.status();
+  LAVIK_CO_RETURN_IF_ERROR(revision.status());
   RebuildDirective source = cluster_rebuild_->directive_;
   auto& identity = source.identity_;
   identity.term_ = source_term;
@@ -4642,15 +4589,14 @@ auto ReplicationManager::ReplicationGroup::FreezeFormerOwnerPopulation(
       source, *cluster_rebuild_->manifest_, *cluster_rebuild_->ready_token_);
   auto applied = std::make_shared<detail::ReplicaAppliedFrontier>(
       source.flow_count_, storage_->worker_count());
-  auto installed = applied->InstallNextLsns((*watermark)->next_lsns_);
-  if (!installed.ok()) co_return installed;
+  LAVIK_CO_RETURN_IF_ERROR(applied->InstallNextLsns((*watermark)->next_lsns_));
   auto upstream_node = node_id_;
   auto upstream_history = (*watermark)->history_id_;
-  auto ready = cluster_group_->BindLocalSourceHistory(
-      *cluster_rebuild_->ready_token_, source, *cluster_rebuild_->manifest_,
-      (*watermark)->next_lsns_);
-  if (!ready.ok()) co_return ready.status();
-  adopted->ready_token_ = std::move(*ready);
+  LAVIK_ASSIGN_OR_CO_RETURN(
+      adopted->ready_token_,
+      cluster_group_->BindLocalSourceHistory(
+          *cluster_rebuild_->ready_token_, source, *cluster_rebuild_->manifest_,
+          (*watermark)->next_lsns_));
   cluster_rebuild_ = std::move(adopted);
   applied_frontier_ = std::move(applied);
   upstream_node_id_ = std::move(upstream_node);
@@ -4680,9 +4626,8 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
   // A pending explicit start may still be joining old ingress. Let it publish
   // before replacing the relationship so it cannot appear after this FDS.
   while (cluster_rebuild_starting_) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (cluster_control_stopping_)
     co_return absl::CancelledError(
@@ -4691,7 +4636,7 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
   std::shared_ptr<ClusterFollowOwnerContext> next;
   if (desired.has_value()) {
     auto normalized = NormalizeClusterFollowOwner(std::move(*desired));
-    if (!normalized.ok()) co_return normalized.status();
+    LAVIK_CO_RETURN_IF_ERROR(normalized.status());
     if (cluster_rebuild_ != nullptr &&
         !cluster_rebuild_->manifest_.has_value() &&
         cluster_rebuild_->directive_.identity_.manifest_id_ ==
@@ -4712,9 +4657,8 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
     }
   }
 
-  auto cancelled = co_await CancelPendingClusterRebuild(
-      "explicit rebuild replaced by follow relationship");
-  if (!cancelled.ok()) co_return cancelled;
+  LAVIK_CO_RETURN_IF_ERROR(co_await CancelPendingClusterRebuild(
+      "explicit rebuild replaced by follow relationship"));
 
   const std::shared_ptr<ClusterFollowOwnerContext> previous =
       std::move(cluster_follow_owner_);
@@ -4763,8 +4707,8 @@ auto ReplicationManager::ReplicationGroup::ReconcileClusterFollowOwner(
   // path owns the ledger under master_mutex_, the same lock as LVPSYNC
   // classification and registry publication.
   if (previous_was_owner || must_fence_target) {
-    absl::Status revoked = co_await RevokeClusterRebuildSourceAuthorizations();
-    if (!revoked.ok()) co_return revoked;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await RevokeClusterRebuildSourceAuthorizations());
   }
   if (previous_was_follower || legacy_ingress) {
     absl::Status stopped = co_await StopClusterFollowIngress(previous);
@@ -4855,9 +4799,8 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
           replica_session_teardown_running_ || cluster_rebuild_starting_;
     }
     if (!teardown_running) break;
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
 
   // An FDS replacement cannot retire a Ready population out from under the
@@ -4875,9 +4818,8 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
             !cluster_promotion_prepare_->completion_->result().has_value();
       }
       if (!promotion_running) break;
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
   }
 
@@ -4895,8 +4837,7 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
     // A lost Meta transport fences serving, but is not a directive revocation.
     // Exact pending admission survives until the replacement FDS checks scope.
     if (!still_desired && !preserve_current_follow_attempt) {
-      auto cancelled = co_await CancelPendingClusterRebuild(reason);
-      if (!cancelled.ok()) co_return cancelled;
+      LAVIK_CO_RETURN_IF_ERROR(co_await CancelPendingClusterRebuild(reason));
     }
   }
 
@@ -4964,8 +4905,7 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
       co_return absl::OkStatus();
     }
     if (cluster_recovery_ != nullptr) {
-      auto revoked = co_await ReconcileClusterRecovery(std::nullopt);
-      if (!revoked.ok()) co_return revoked;
+      LAVIK_CO_RETURN_IF_ERROR(co_await ReconcileClusterRecovery(std::nullopt));
       // Joining recovery may change readiness within the same context.
       // Retirement must not continue with the pre-suspension proof.
       if (cluster_rebuild_ != context ||
@@ -5067,15 +5007,13 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
     // coordinator observes the reconfiguration bit, aborts any known
     // candidate root, and exits before this owner retires the proof.
     while (coordinator_started_) {
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
   }
 
   if (shutdown_identity.has_value()) {
-    absl::Status drained = co_await storage_->QuiesceExpiration();
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(co_await storage_->QuiesceExpiration());
     struct ExpirationResumeGuard {
       storage::StorageEngine* storage_;
       ~ExpirationResumeGuard() { storage_->ResumeExpiration(); }
@@ -5087,7 +5025,7 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
     std::vector<std::uint64_t> frozen;
     if (shutdown_native) {
       auto watermark = co_await CaptureNativeReplicationWatermark();
-      if (!watermark.ok()) co_return watermark.status();
+      LAVIK_CO_RETURN_IF_ERROR(watermark.status());
       if (watermark->has_value()) {
         shutdown_identity->term_ = owner_source_term_;
         shutdown_identity->source_node_id_ = node_id_;
@@ -5098,9 +5036,7 @@ auto ReplicationManager::ReplicationGroup::RetireClusterPopulation(
         frozen = (*watermark)->next_lsns_;
       }
     } else if (shutdown_frontier != nullptr) {
-      auto snapshot = shutdown_frontier->TrySnapshot();
-      if (!snapshot.ok()) co_return snapshot.status();
-      frozen = std::move(*snapshot);
+      LAVIK_ASSIGN_OR_CO_RETURN(frozen, shutdown_frontier->TrySnapshot());
     }
     if (!frozen.empty()) {
       storage_->StageCleanShutdownProof(
@@ -5174,13 +5110,11 @@ auto ReplicationManager::ReplicationGroup::InstallRecoveredPopulation(
     // The process test removes this marker to release startup recovery.
     const char* barrier = std::getenv("LAVIK_RECOVERY_INSTALL_BARRIER_PATH");
     if (barrier != nullptr && *barrier != '\0') {
-      absl::Status signalled = SignalFaultBarrier(
-          "LAVIK_RECOVERY_INSTALL_BARRIER_PATH", "population recovery");
-      if (!signalled.ok()) co_return signalled;
+      LAVIK_CO_RETURN_IF_ERROR(SignalFaultBarrier(
+          "LAVIK_RECOVERY_INSTALL_BARRIER_PATH", "population recovery"));
       while (::access(barrier, F_OK) == 0) {
-        absl::Status waited = co_await bycorf::SleepFor(
-            *bycorf::ThisWorker().self_, std::chrono::milliseconds(10));
-        if (!waited.ok()) co_return waited;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(10)));
       }
     }
   });
@@ -5194,9 +5128,8 @@ auto ReplicationManager::ReplicationGroup::InstallRecoveredPopulation(
   // The certificate recovers only a complete cut, never historical payload.
   // Bind an empty cache so newly applied donor/parent events retain their
   // original lineage and can become the next promotion's secondary suffix.
-  auto retained = co_await ResetRetainedHistory(identity.source_history_id_,
-                                                population.frontier_.size());
-  if (!retained.ok()) co_return retained;
+  LAVIK_CO_RETURN_IF_ERROR(co_await ResetRetainedHistory(
+      identity.source_history_id_, population.frontier_.size()));
   if (cluster_rebuild_ != old_population ||
       cluster_failover_action_ != old_action ||
       cluster_follow_owner_ != old_follow || cluster_control_stopping_ ||
@@ -5204,11 +5137,10 @@ auto ReplicationManager::ReplicationGroup::InstallRecoveredPopulation(
     co_return absl::CancelledError("recovered population install superseded");
   auto ready =
       cluster_group_->RecoverPopulation(identity, population.frontier_);
-  if (!ready.ok()) co_return ready.status();
+  LAVIK_CO_RETURN_IF_ERROR(ready.status());
   auto frontier = std::make_shared<detail::ReplicaAppliedFrontier>(
       population.frontier_.size(), storage_->worker_count());
-  absl::Status installed = frontier->InstallNextLsns(population.frontier_);
-  if (!installed.ok()) co_return installed;
+  LAVIK_CO_RETURN_IF_ERROR(frontier->InstallNextLsns(population.frontier_));
   cluster_rebuild_ = std::make_shared<ClusterRebuildContext>(std::move(*ready));
   applied_frontier_ = std::move(frontier);
   upstream_node_id_ = identity.source_node_id_;
@@ -5225,10 +5157,10 @@ auto ReplicationManager::ReplicationGroup::RecoverClusterPopulation()
     -> Task<absl::Status> {
   AssertStateOwner();
   auto record = co_await storage_->ConsumePopulationRecovery();
-  if (!record.ok()) co_return record.status();
+  LAVIK_CO_RETURN_IF_ERROR(record.status());
   if (!meta_managed_ || !record->has_value()) co_return absl::OkStatus();
   auto scope = detail::DecodeRecoveredPopulation((**record).identity_);
-  if (!scope.ok()) co_return scope.status();
+  LAVIK_CO_RETURN_IF_ERROR(scope.status());
   if (scope->identity_.target_node_id_ != node_id_) {
     co_return absl::FailedPreconditionError(
         "recovered storage belongs to another Data node");
@@ -5242,7 +5174,7 @@ auto ReplicationManager::ReplicationGroup::RecoverClusterPopulation()
     co_return absl::OkStatus();
   }
   auto proof = detail::DecodeRecoveredPopulation((**record).clean_proof_);
-  if (!proof.ok()) co_return proof.status();
+  LAVIK_CO_RETURN_IF_ERROR(proof.status());
   if (proof->frontier_.empty() || !detail::SameRecoveredPopulationScope(
                                       scope->identity_, proof->identity_)) {
     co_return absl::DataLossError(
@@ -5268,10 +5200,8 @@ auto ReplicationManager::ReplicationGroup::CancelClusterRebuildForShutdown()
   }
   AssertStateOwner();
   cluster_control_stopping_ = true;
-  auto recovery_stopped = co_await ReconcileClusterRecovery(std::nullopt);
-  if (!recovery_stopped.ok()) co_return recovery_stopped;
-  auto partial_stopped = co_await CancelPartialExports();
-  if (!partial_stopped.ok()) co_return partial_stopped;
+  LAVIK_CO_RETURN_IF_ERROR(co_await ReconcileClusterRecovery(std::nullopt));
+  LAVIK_CO_RETURN_IF_ERROR(co_await CancelPartialExports());
   cluster_follow_owner_.reset();
   SetDesiredUpstream(std::nullopt);
 
@@ -5303,9 +5233,8 @@ auto ReplicationManager::ReplicationGroup::CancelClusterRebuildForShutdown()
   activated_failover_activation_.reset();
   activated_failover_prepared_context_.reset();
   while (action != nullptr && !action->runner_finished_) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
 
   co_return co_await RetireClusterPopulation(
@@ -5536,9 +5465,8 @@ auto ReplicationManager::ReplicationGroup::AuthorizeClusterRebuildSource(
       // assignment_id_ names the rebuild target. source_assignment_id_
       // separately binds the local ReadyToken, so remove/re-add of the same
       // stable source node cannot revive an old export authorization.
-      auto authorized = source_authorizations_.Authorize(directive);
-      if (!authorized.ok()) co_return authorized.status();
-      action = *authorized;
+      LAVIK_ASSIGN_OR_CO_RETURN(action,
+                                source_authorizations_.Authorize(directive));
     }
     if (action != detail::SourceAuthorizationAction::kRevokeOlder) {
       co_return absl::OkStatus();
@@ -5548,8 +5476,8 @@ auto ReplicationManager::ReplicationGroup::AuthorizeClusterRebuildSource(
     // Do not publish it beside older capabilities: cancel/join their exports
     // first, then retry against the retained watermark and current
     // role/history.
-    absl::Status revoked = co_await RevokeClusterRebuildSourceAuthorizations();
-    if (!revoked.ok()) co_return revoked;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await RevokeClusterRebuildSourceAuthorizations());
   }
 }
 
@@ -5632,12 +5560,10 @@ auto ReplicationManager::ReplicationGroup::
         "cluster source revocation requires Meta-managed population mode");
   }
   if (mode != SourceAuthorizationRetirementMode::kFdsReplacement) {
-    auto revoked = co_await ReconcileClusterRecovery(std::nullopt);
-    if (!revoked.ok()) co_return revoked;
+    LAVIK_CO_RETURN_IF_ERROR(co_await ReconcileClusterRecovery(std::nullopt));
   }
   if (mode != SourceAuthorizationRetirementMode::kFdsReplacement) {
-    auto stopped = co_await CancelPartialExports();
-    if (!stopped.ok()) co_return stopped;
+    LAVIK_CO_RETURN_IF_ERROR(co_await CancelPartialExports());
   }
   struct RevocationGuard {
     unsigned* in_flight_ = nullptr;
@@ -5706,10 +5632,9 @@ auto ReplicationManager::ReplicationGroup::
   // section before cancellation joins an admission deliberately paused at
   // its second check. Release builds contain neither the environment lookup
   // nor the extra syscall.
-  absl::Status revocation_signalled =
+  LAVIK_CO_RETURN_IF_ERROR(
       SignalFaultBarrier("LAVIK_REPLICATION_SOURCE_REVOCATION_BARRIER_ACK_PATH",
-                         "source authorization fault barrier");
-  if (!revocation_signalled.ok()) co_return revocation_signalled;
+                         "source authorization fault barrier"));
 #endif
   for (const auto& session : sessions) session->Cancel();
   auto next_warning =
@@ -5719,9 +5644,8 @@ auto ReplicationManager::ReplicationGroup::
          std::any_of(sessions.begin(), sessions.end(), [](const auto& session) {
            return session->control_active() || session->connected_flows() != 0;
          })) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     if (std::chrono::steady_clock::now() >= next_warning) {
       spdlog::warn(
           "waiting for revoked cluster source handshakes/flows to release "
@@ -5744,18 +5668,16 @@ auto ReplicationManager::ReplicationGroup::
 auto ReplicationManager::ReplicationGroup::PreparePromotion(
     storage::PromotionBase promotion_base)
     -> Task<absl::StatusOr<ClusterPromotionPrepared>> {
-  auto population = storage_->RecoverPopulationToken();
-  if (!population.ok()) co_return population.status();
-  promotion_base.population_token_ = *population;
+  LAVIK_ASSIGN_OR_CO_RETURN(promotion_base.population_token_,
+                            storage_->RecoverPopulationToken());
   promotion_base.catalog_token_ = GlobalFunctionCatalog().durability_token();
 
   if (ShouldInjectPromotionPrepareFailure("storage-barrier")) {
     co_return absl::InternalError(
         "injected promotion-prepare storage barrier failure");
   }
-  absl::Status durable = co_await storage_->MakeDurable(
-      promotion_base.parent_frontier_, promotion_base.storage_accumulator_);
-  if (!durable.ok()) co_return durable;
+  LAVIK_CO_RETURN_IF_ERROR(co_await storage_->MakeDurable(
+      promotion_base.parent_frontier_, promotion_base.storage_accumulator_));
   if (promotion_base.catalog_token_ !=
       GlobalFunctionCatalog().durability_token()) {
     co_return absl::AbortedError(
@@ -5765,12 +5687,10 @@ auto ReplicationManager::ReplicationGroup::PreparePromotion(
     co_return absl::InternalError(
         "injected promotion-prepare base commit failure");
   }
-  absl::Status committed =
-      co_await storage_->CommitPromotionBase(promotion_base);
-  if (!committed.ok()) co_return committed;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await storage_->CommitPromotionBase(promotion_base));
 
-  absl::Status retired = co_await RetireSourceHistory();
-  if (!retired.ok()) co_return retired;
+  LAVIK_CO_RETURN_IF_ERROR(co_await RetireSourceHistory());
   if (ShouldInjectPromotionPrepareFailure("child-history")) {
     co_return absl::InternalError(
         "injected promotion-prepare child history failure");
@@ -5780,12 +5700,11 @@ auto ReplicationManager::ReplicationGroup::PreparePromotion(
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
     const std::size_t flow_capacity = BacklogCapacityForFlow(
         worker, backlog_size_bytes_.load(std::memory_order_acquire));
-    absl::Status enabled = co_await bycorf::SubmitTaskTo(
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
         worker, [this, child_log_epoch, flow_capacity]() -> Task<absl::Status> {
           co_return co_await storage_->EnableReplicationLog(child_log_epoch,
                                                             flow_capacity);
-        });
-    if (!enabled.ok()) co_return enabled;
+        }));
   }
 
   std::string child_history;
@@ -5836,8 +5755,7 @@ auto ReplicationManager::ReplicationGroup::CaptureNativeReplicationWatermark()
 
   // History reset owns worker 0 and can replace every flow's LSN domain.
   // Finish or observe that transition before constructing an all-flow cut.
-  absl::Status history_ready = co_await ResetInvalidReplicationHistory();
-  if (!history_ready.ok()) co_return history_ready;
+  LAVIK_CO_RETURN_IF_ERROR(co_await ResetInvalidReplicationHistory());
 
   std::string history_id;
   {
@@ -6270,7 +6188,7 @@ auto ReplicationManager::ReplicationGroup::SetBacklogSizeBytes(
             co_return status;
           });
     }
-    if (!configured.ok()) co_return configured;
+    LAVIK_CO_RETURN_IF_ERROR(configured);
   }
   backlog_size_bytes_.store(effective, std::memory_order_release);
   co_return absl::OkStatus();
@@ -6299,7 +6217,7 @@ auto ReplicationManager::ReplicationGroup::SetBacklogBackpressure(bool enabled)
         return storage_->SetReplicationBacklogBackpressure(enabled);
       });
     }
-    if (!configured.ok()) co_return configured;
+    LAVIK_CO_RETURN_IF_ERROR(configured);
   }
   backlog_backpressure_.store(enabled, std::memory_order_release);
   co_return absl::OkStatus();
@@ -6329,7 +6247,7 @@ auto ReplicationManager::ReplicationGroup::SetPublishQueueBytesPerWorker(
         return storage_->SetReplicationPublishQueueCapacity(bytes);
       });
     }
-    if (!configured.ok()) co_return configured;
+    LAVIK_CO_RETURN_IF_ERROR(configured);
   }
   publish_queue_bytes_per_worker_.store(bytes, std::memory_order_release);
   co_return absl::OkStatus();
@@ -6366,8 +6284,7 @@ auto ReplicationManager::ReplicationGroup::ServeNativeConnection(
   // written separately. Without TCP_NODELAY on the source endpoint, Nagle
   // can hold every payload behind the tiny header until the peer's delayed
   // ACK fires (about 40 ms per sparse snapshot partition on Linux).
-  absl::Status accepted_config = ConfigureConnectedFd(stream.NativeFd());
-  if (!accepted_config.ok()) co_return accepted_config;
+  LAVIK_CO_RETURN_IF_ERROR(ConfigureConnectedFd(stream.NativeFd()));
   unsigned owner = 0;
   std::uint64_t replication_session_id = 0;
   if (EqualCaseInsensitive(args.front(), "LVFLOW")) {
@@ -6400,8 +6317,7 @@ auto ReplicationManager::ReplicationGroup::ServeNativeConnection(
     co_return status;
   }
 
-  absl::Status paused = co_await stream.PauseRead();
-  if (!paused.ok()) co_return paused;
+  LAVIK_CO_RETURN_IF_ERROR(co_await stream.PauseRead());
   std::shared_ptr<bycorf::TlsState> tls_state = stream.TakeTlsState();
   const int duplicate = ::fcntl(stream.NativeFd(), F_DUPFD_CLOEXEC, 0);
   if (duplicate < 0) {
@@ -6806,9 +6722,8 @@ auto ReplicationManager::ReplicationGroup::WaitUntilStorageReady()
       co_return absl::CancelledError(
           "replication startup stopped for process shutdown");
     }
-    absl::Status slept = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!slept.ok()) co_return slept;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (!replication_shutdown_requested_) StartCoordinator();
   co_return absl::OkStatus();
@@ -7173,21 +7088,21 @@ auto ReplicationManager::ReplicationGroup::ReplayAndSwitchParent(
       identity.source_history_id_,
       static_cast<unsigned>(applied->size())};
   auto cursor = applied->TrySnapshot();
-  if (!cursor.ok()) co_return cursor.status();
+  LAVIK_CO_RETURN_IF_ERROR(cursor.status());
   auto connected = co_await ConnectTcp(
       desired.owner_endpoint_->host_, desired.owner_endpoint_->port_,
       tls_context_, &transfer->sockets_, /*cancellable_dns=*/true);
-  if (!connected.ok()) co_return connected.status();
+  LAVIK_CO_RETURN_IF_ERROR(connected.status());
   TcpStream stream = std::move(*connected);
   ScopedSocketSetMembership membership(&transfer->sockets_, stream.NativeFd());
   auto status = co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   const auto request =
       EncodeRespCommand(ParentHandshake(desired, parent, *cursor));
   status = co_await WriteText(stream, request);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   auto line = co_await ReadLine(stream);
-  if (!line.ok()) co_return line.status();
+  LAVIK_CO_RETURN_IF_ERROR(line.status());
   const auto words = SplitWords(*line);
   if (words.size() == 4 && words[0] == "-LVPARENTFULL" &&
       words[1] == desired.owner_node_id_ && IsReplicationId(words[2]) &&
@@ -7397,11 +7312,10 @@ auto ReplicationManager::ReplicationGroup::TryPartialReparent(
   transfer->finished_ = true;
   transfer->sockets_.Cancel();
   while (!transfer->watcher_finished_) {
-    auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                            std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
-  if (!result.ok()) co_return result.status();
+  LAVIK_CO_RETURN_IF_ERROR(result.status());
   if (!*result && active_replica_session_ == session &&
       cluster_follow_owner_ == relationship && !session->cancelled()) {
     relationship->force_full_.store(true, std::memory_order_release);
@@ -7421,15 +7335,13 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
           co_return absl::CancelledError("native admission fault cancelled");
         if (std::chrono::steady_clock::now() >= deadline)
           co_return absl::DeadlineExceededError("native admission fault held");
-        auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                std::chrono::milliseconds(1));
-        if (!waited.ok()) co_return waited;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
       });
-  auto partial = co_await TryPartialReparent(session);
-  if (!partial.ok()) co_return partial;
+  LAVIK_CO_RETURN_IF_ERROR(co_await TryPartialReparent(session));
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
                                        tls_context_, &session->sockets_, true);
-  if (!connected.ok()) co_return connected.status();
+  LAVIK_CO_RETURN_IF_ERROR(connected.status());
   TcpStream control = std::move(*connected);
   const int control_fd = control.NativeFd();
   ReplicationConnectionMetricGuard connection_metric(
@@ -7703,9 +7615,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
           *upstream_history_id_ != words[5] ||
           source_worker_count_ != source_workers ||
           !local_population_matches_response) {
-        auto reset = co_await ResetRetainedHistory(std::string(words[5]),
-                                                   source_workers);
-        if (!reset.ok()) co_return reset;
+        LAVIK_CO_RETURN_IF_ERROR(co_await ResetRetainedHistory(
+            std::string(words[5]), source_workers));
         if (active_replica_session_ != session || session->cancelled() ||
             role_epoch_.load(std::memory_order_relaxed) != role_epoch ||
             replica_reconfiguration_running_)
@@ -7797,7 +7708,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   if (meta_managed_ && session->cluster_rebuild_ != nullptr &&
       session->cluster_rebuild_->ready_token_.has_value()) {
     auto cut = session->applied_frontier_->TrySnapshot();
-    if (!cut.ok()) co_return cut.status();
+    LAVIK_CO_RETURN_IF_ERROR(cut.status());
     upstream_continuation_proof_ = NativeContinuationProof{
         node_id_,
         session->cluster_rebuild_->ready_token_->identity().assignment_id_,
@@ -7910,10 +7821,9 @@ auto ReplicationManager::ReplicationGroup::RecordClusterResetProof(
   if (context == nullptr) co_return absl::OkStatus();
   auto record = [this, context, resets = std::move(resets)] {
     for (const storage::ReplicaPartitionEpoch& reset : resets) {
-      absl::Status status = cluster_group_->RecordPartitionReset(
+      LAVIK_RETURN_IF_ERROR(cluster_group_->RecordPartitionReset(
           context->directive_.identity_, reset.partition_id_,
-          reset.replication_epoch_);
-      if (!status.ok()) return status;
+          reset.replication_epoch_));
     }
     return absl::OkStatus();
   };
@@ -7940,9 +7850,8 @@ auto ReplicationManager::ReplicationGroup::RecordClusterHandoffProof(
 auto ReplicationManager::ReplicationGroup::PrepareReplicaFlowMode(
     const std::shared_ptr<ReplicaSession>& session, unsigned flow_id,
     bool fullsync) -> Task<absl::Status> {
-  absl::Status agreed =
-      co_await session->flow_modes_selected_->Wait(*bycorf::ThisWorker().self_);
-  if (!agreed.ok()) co_return agreed;
+  LAVIK_CO_RETURN_IF_ERROR(co_await session->flow_modes_selected_->Wait(
+      *bycorf::ThisWorker().self_));
   if (!fullsync) co_return absl::OkStatus();
 
   if (flow_id == 0 && session->cluster_follow_ != nullptr &&
@@ -8214,7 +8123,7 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaTransactionArrival(
     -> absl::StatusOr<PreparedReplicaTransactionArrival> {
   auto record = detail::DecodeNativeTransactionRecord(
       std::move(envelope), flow_id, session->source_worker_count_);
-  if (!record.ok()) return record.status();
+  LAVIK_RETURN_IF_ERROR(record.status());
   const bool has_payload = !record->payload_.args_.empty();
   return PreparedReplicaTransactionArrival{
       .id_ = record->envelope_.id_,
@@ -8311,7 +8220,7 @@ auto ReplicationManager::ReplicationGroup::RegisterReplicaTransaction(
     -> Task<absl::StatusOr<std::shared_ptr<ReplicaTransactionArrival>>> {
   auto prepared = PrepareReplicaTransactionArrival(
       session, flow_id, lsn, std::move(envelope), std::move(predecessor));
-  if (!prepared.ok()) co_return prepared.status();
+  LAVIK_CO_RETURN_IF_ERROR(prepared.status());
   prepared->canonical_ = std::move(canonical);
   prepared->canonical_charge_ = std::move(canonical_charge);
   if (session->transaction_owners_.empty()) {
@@ -8333,7 +8242,7 @@ auto ReplicationManager::ReplicationGroup::ApplyReplicaControl(
     std::uint64_t lsn, ReplicatedCommand command, std::string canonical)
     -> Task<absl::Status> {
   auto parsed = detail::NativeControlBarrierId(command);
-  if (!parsed.ok()) co_return parsed.status();
+  LAVIK_CO_RETURN_IF_ERROR(parsed.status());
   if (flow_id >= session->source_worker_count_)
     co_return absl::InvalidArgumentError("invalid replicated control flow");
   const std::uint64_t barrier_id = *parsed;
@@ -8419,9 +8328,8 @@ auto ReplicationManager::ReplicationGroup::ApplyReplicaControl(
     arrival->status_ = std::move(status);
   }
 
-  absl::Status completed =
-      co_await arrival->completion_.Wait(*bycorf::ThisWorker().self_);
-  if (!completed.ok()) co_return completed;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await arrival->completion_.Wait(*bycorf::ThisWorker().self_));
 
   absl::Status result;
   {
@@ -8574,9 +8482,8 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
   // earlier ACKs behind an incomplete transaction: sparse traffic and WAIT
   // retain immediate progress without timers or locks.
   std::string frames;
-  absl::Status reserved =
-      ReserveReplicationString(&frames, kDataFrameHeaderBytes + 16);
-  if (!reserved.ok()) co_return reserved;
+  LAVIK_CO_RETURN_IF_ERROR(
+      ReserveReplicationString(&frames, kDataFrameHeaderBytes + 16));
   std::string payload;
   payload.reserve(16);
 
@@ -8645,10 +8552,8 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
       PutU64(payload, first_lsn);
       PutU64(payload, last_lsn);
     }
-    absl::Status appended = AppendDataFrame(&frames, kind, payload);
-    if (!appended.ok()) co_return appended;
-    absl::Status acknowledged = co_await WriteText(stream, frames);
-    if (!acknowledged.ok()) co_return acknowledged;
+    LAVIK_CO_RETURN_IF_ERROR(AppendDataFrame(&frames, kind, payload));
+    LAVIK_CO_RETURN_IF_ERROR(co_await WriteText(stream, frames));
   }
 }
 
@@ -8884,8 +8789,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
       co_await state->ack_done_ready_.Wait();
     }
   }
-  if (!state->stage_status_.ok()) co_return state->stage_status_;
-  if (!state->ack_status_.ok()) co_return state->ack_status_;
+  LAVIK_CO_RETURN_IF_ERROR(state->stage_status_);
+  LAVIK_CO_RETURN_IF_ERROR(state->ack_status_);
   co_return receiver_status;
 }
 
@@ -8896,11 +8801,10 @@ auto ReplicationManager::ReplicationGroup::SendReplicaFullSyncAck(
   PutU16(payload, partition);
   PutU64(payload, sequence);
   std::string frame;
-  absl::Status encoded =
-      ReserveReplicationString(&frame, kDataFrameHeaderBytes + payload.size());
-  if (!encoded.ok()) co_return encoded;
-  encoded = AppendDataFrame(&frame, DataFrameKind::kAck, payload);
-  if (!encoded.ok()) co_return encoded;
+  LAVIK_CO_RETURN_IF_ERROR(
+      ReserveReplicationString(&frame, kDataFrameHeaderBytes + payload.size()));
+  LAVIK_CO_RETURN_IF_ERROR(
+      AppendDataFrame(&frame, DataFrameKind::kAck, payload));
 
   // All writers run on this flow's worker, but WriteAll can suspend after a
   // short write. Keep another ACK from interleaving with the remaining bytes.
@@ -8935,12 +8839,11 @@ auto ReplicationManager::ReplicationGroup::ApplyReplicaHandoff(
     co_return absl::CancelledError("partition handoff cancelled");
   }
   const unsigned owner = partition % storage_->worker_count();
-  absl::Status handed_off =
+  LAVIK_CO_RETURN_IF_ERROR(
       co_await bycorf::SubmitTaskTo(owner, [this, session, partition, epoch]() {
         return storage_->HandoffReplicaPartition(session->session_id_,
                                                  partition, epoch);
-      });
-  if (!handed_off.ok()) co_return handed_off;
+      }));
   if (state->stopping_ || session->cancelled()) {
     co_return absl::CancelledError("partition handoff superseded");
   }
@@ -8999,7 +8902,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlowData(
   }
   state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
   while (state->active_ != 0) co_await state->changed_.Wait();
-  if (!state->status_.ok()) co_return state->status_;
+  LAVIK_CO_RETURN_IF_ERROR(state->status_);
   co_return result;
 }
 
@@ -9016,9 +8919,8 @@ auto ReplicationManager::ReplicationGroup::WaitReplicaHandoffs(
     if (session->cancelled()) {
       co_return absl::CancelledError("handoff wait cancelled");
     }
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   if (session->cancelled()) {
     co_return absl::CancelledError("handoff wait cancelled");
@@ -9042,16 +8944,15 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
   };
   while (stream.IsOpen()) {
     auto frame = co_await ReadDataFrame(stream);
-    if (!frame.ok()) co_return frame.status();
-    if (!state->status_.ok()) co_return state->status_;
-    absl::Status phase = session->ValidateDataFramePhase(flow_id, frame->first);
-    if (!phase.ok()) co_return phase;
+    LAVIK_CO_RETURN_IF_ERROR(frame.status());
+    LAVIK_CO_RETURN_IF_ERROR(state->status_);
+    LAVIK_CO_RETURN_IF_ERROR(
+        session->ValidateDataFramePhase(flow_id, frame->first));
     if (frame->first == DataFrameKind::kReset ||
         frame->first == DataFrameKind::kFullSyncCut ||
         frame->first == DataFrameKind::kCursor ||
         frame->first == DataFrameKind::kCommand) {
-      absl::Status waited = co_await WaitReplicaHandoffs(session, state);
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WaitReplicaHandoffs(session, state));
     }
     if (frame->first == DataFrameKind::kReset) {
       DataReader reader(frame->second);
@@ -9082,9 +8983,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       if (reader.remaining() != 0) {
         co_return absl::InvalidArgumentError("trailing replication reset");
       }
-      absl::Status authorized =
-          co_await ValidateClusterResetBoundary(session->cluster_rebuild_);
-      if (!authorized.ok()) co_return authorized;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await ValidateClusterResetBoundary(session->cluster_rebuild_));
       std::vector<storage::ReplicaPartitionEpoch> reset_proof;
       reset_proof.reserve(reset_count);
       for (unsigned owner = 0; owner < by_owner.size(); ++owner) {
@@ -9092,7 +8992,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         if (owner == bycorf::ThisWorker().id_) {
           auto reset = co_await storage_->ResetReplicaPartitions(
               session->session_id_, by_owner[owner]);
-          if (!reset.ok()) co_return reset.status();
+          LAVIK_CO_RETURN_IF_ERROR(reset.status());
           for (const storage::ReplicaPartitionEpoch& result : *reset) {
             epochs[result.partition_id_] = result.replication_epoch_;
             reset_proof.push_back(result);
@@ -9104,18 +9004,16 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
                 return storage_->ResetReplicaPartitions(session->session_id_,
                                                         resets);
               });
-          if (!reset.ok()) co_return reset.status();
+          LAVIK_CO_RETURN_IF_ERROR(reset.status());
           for (const storage::ReplicaPartitionEpoch& result : *reset) {
             epochs[result.partition_id_] = result.replication_epoch_;
             reset_proof.push_back(result);
           }
         }
       }
-      absl::Status recorded = co_await RecordClusterResetProof(
-          session->cluster_rebuild_, std::move(reset_proof));
-      if (!recorded.ok()) co_return recorded;
-      absl::Status acknowledged = co_await send_ack(kResetBatchAckPartition, 0);
-      if (!acknowledged.ok()) co_return acknowledged;
+      LAVIK_CO_RETURN_IF_ERROR(co_await RecordClusterResetProof(
+          session->cluster_rebuild_, std::move(reset_proof)));
+      LAVIK_CO_RETURN_IF_ERROR(co_await send_ack(kResetBatchAckPartition, 0));
     } else if (frame->first == DataFrameKind::kPartitionHandoff) {
       DataReader reader(frame->second);
       std::uint64_t sequence = 0;
@@ -9131,9 +9029,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       if (state->pending_[partition_id]) {
         co_return absl::InvalidArgumentError("overlapping partition handoff");
       }
-      absl::Status waited = co_await WaitReplicaHandoffs(
-          session, state, std::nullopt, kFullSyncHandoffWindow - 1);
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WaitReplicaHandoffs(
+          session, state, std::nullopt, kFullSyncHandoffWindow - 1));
       state->pending_[partition_id] = true;
       ++state->active_;
       // Receive order remains contiguous; completion and ACK order need not.
@@ -9167,9 +9064,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       }
       const bool first = (flags & first_flag) != 0;
       const bool last = (flags & last_flag) != 0;
-      absl::Status waited =
-          co_await WaitReplicaHandoffs(session, state, partition_id);
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await WaitReplicaHandoffs(session, state, partition_id));
       const unsigned owner = partition_id % storage_->worker_count();
       if (first) {
         if (fragment != 0 || staged_command_lsn != 0) {
@@ -9185,10 +9081,9 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         co_return absl::InvalidArgumentError(
             "full-sync command fragment is out of order");
       }
-      absl::Status appended = AppendReplicationString(
+      LAVIK_CO_RETURN_IF_ERROR(AppendReplicationString(
           &staged_command,
-          std::string_view(frame->second.data() + 31, reader.remaining()));
-      if (!appended.ok()) co_return appended;
+          std::string_view(frame->second.data() + 31, reader.remaining())));
       ++next_command_fragment;
       if (last) {
         auto command = DecodeReplicationCommand(staged_command);
@@ -9216,12 +9111,11 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         // Only publish-only effects and the separate Function catalog bypass
         // this context.
         if (!partitionless && desired_partition) {
-          absl::Status begun = co_await bycorf::SubmitTaskTo(
+          LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
               owner, [this, session, partition_id, partition_sequence]() {
                 return storage_->BeginReplicaTailCommand(
                     session->session_id_, partition_id, partition_sequence);
-              });
-          if (!begun.ok()) co_return begun;
+              }));
         }
         absl::Status applied;
         if (!command.ok()) {
@@ -9252,8 +9146,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
                     session->session_id_, partition_id, partition_sequence);
               });
         }
-        if (!applied.ok()) co_return applied;
-        if (!ended.ok()) co_return ended;
+        LAVIK_CO_RETURN_IF_ERROR(applied);
+        LAVIK_CO_RETURN_IF_ERROR(ended);
         staged_command_lsn = 0;
         next_command_fragment = 0;
         staged_command.clear();
@@ -9262,8 +9156,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         // not force a stop-and-wait round trip; the final ACK proves that
         // the complete logical command was applied and releases its queue
         // credit on the source.
-        absl::Status acknowledged = co_await send_ack(partition_id, sequence);
-        if (!acknowledged.ok()) co_return acknowledged;
+        LAVIK_CO_RETURN_IF_ERROR(co_await send_ack(partition_id, sequence));
       }
       ++expected_fullsync_sequence;
     } else if (frame->first == DataFrameKind::kFullSyncCut) {
@@ -9283,10 +9176,9 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       }
       absl::Status recorded =
           session->RecordFullSyncCut(flow_id, stable_next_lsn);
-      if (!recorded.ok()) co_return recorded;
-      absl::Status cut =
-          co_await session->fullsync_cut_->Wait(*bycorf::ThisWorker().self_);
-      if (!cut.ok()) co_return cut;
+      LAVIK_CO_RETURN_IF_ERROR(recorded);
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await session->fullsync_cut_->Wait(*bycorf::ThisWorker().self_));
       if (flow_id == 0) {
         auto cut_vector = session->FullSyncCutVector();
         if (!cut_vector.ok()) {
@@ -9503,12 +9395,10 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
         }
       }
-      absl::Status finalized = co_await session->promotion_complete_->Wait(
-          *bycorf::ThisWorker().self_);
-      if (!finalized.ok()) co_return finalized;
-      absl::Status acknowledged =
-          co_await send_ack(kResetBatchAckPartition, sequence);
-      if (!acknowledged.ok()) co_return acknowledged;
+      LAVIK_CO_RETURN_IF_ERROR(co_await session->promotion_complete_->Wait(
+          *bycorf::ThisWorker().self_));
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await send_ack(kResetBatchAckPartition, sequence));
       if (ShouldInjectFullSyncCutDrop(flow_id)) {
         spdlog::warn("injected disconnect after full-sync cut acknowledgement");
         co_return absl::UnavailableError(
@@ -9530,12 +9420,10 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           reader.remaining() != 0) {
         co_return absl::InvalidArgumentError("malformed replication cursor");
       }
-      absl::Status accepted =
-          session->AcceptBacklogCursor(flow_id, lsn, fragment);
-      if (!accepted.ok()) co_return accepted;
+      LAVIK_CO_RETURN_IF_ERROR(
+          session->AcceptBacklogCursor(flow_id, lsn, fragment));
       online_next_lsn = lsn;
-      absl::Status acknowledged = co_await send_ack(0, lsn);
-      if (!acknowledged.ok()) co_return acknowledged;
+      LAVIK_CO_RETURN_IF_ERROR(co_await send_ack(0, lsn));
     } else if (frame->first == DataFrameKind::kRecords) {
       DataReader sequence_reader(frame->second);
       std::uint64_t sequence = 0;
@@ -9546,7 +9434,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       }
       auto records = DecodeRecords(
           std::string_view(frame->second).substr(sizeof(sequence)));
-      if (!records.ok()) co_return records.status();
+      LAVIK_CO_RETURN_IF_ERROR(records.status());
       const auto found = epochs.find(records->first);
       if (found == epochs.end()) {
         co_return absl::FailedPreconditionError(
@@ -9554,9 +9442,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
       }
       const unsigned owner = records->first % storage_->worker_count();
       const std::uint16_t partition_id = records->first;
-      absl::Status waited =
-          co_await WaitReplicaHandoffs(session, state, partition_id);
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await WaitReplicaHandoffs(session, state, partition_id));
       const std::uint64_t epoch = found->second;
       const bool desired_partition =
           session->cluster_rebuild_ == nullptr ||
@@ -9571,9 +9458,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
                   session->session_id_, partition_id, epoch, records);
             });
       }
-      if (!applied.ok()) co_return applied;
-      absl::Status acknowledged = co_await send_ack(records->first, sequence);
-      if (!acknowledged.ok()) co_return acknowledged;
+      LAVIK_CO_RETURN_IF_ERROR(applied);
+      LAVIK_CO_RETURN_IF_ERROR(co_await send_ack(records->first, sequence));
       ++expected_fullsync_sequence;
     } else {
       co_return absl::InvalidArgumentError("unexpected replication data frame");
@@ -9966,7 +9852,7 @@ auto ReplicationManager::ReplicationGroup::SendFullSyncRequest(
     TcpStream& stream, const std::shared_ptr<FullSyncAckState>& state,
     DataFrameKind kind, std::string_view body, std::uint16_t partition,
     std::uint64_t sequence) -> Task<absl::Status> {
-  if (!state->status_.ok()) co_return state->status_;
+  LAVIK_CO_RETURN_IF_ERROR(state->status_);
   if (!state->expected_.emplace(sequence, partition).second) {
     co_return absl::InternalError("overlapping full-sync ACK sequence");
   }
@@ -9975,8 +9861,7 @@ auto ReplicationManager::ReplicationGroup::SendFullSyncRequest(
   // RESET predates the sequenced FULL frames and retains its wire layout.
   if (kind != DataFrameKind::kReset) PutU64(payload, sequence);
   PutString(payload, body);
-  absl::Status sent = co_await WriteDataFrame(stream, kind, payload);
-  if (!sent.ok()) co_return sent;
+  LAVIK_CO_RETURN_IF_ERROR(co_await WriteDataFrame(stream, kind, payload));
   co_return co_await WaitFullSyncRequest(state, sequence);
 }
 
@@ -9994,8 +9879,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
   state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
   if (!cursor.ok()) (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
   while (!state->receiver_done_) co_await state->changed_.Wait();
-  if (!state->status_.ok()) co_return state->status_;
-  if (!cursor.ok()) co_return cursor.status();
+  LAVIK_CO_RETURN_IF_ERROR(state->status_);
+  LAVIK_CO_RETURN_IF_ERROR(cursor.status());
   state.reset();
   LAVIK_FAULT_INJECT({
     const char* hold = std::getenv("LAVIK_FULL_AFTER_PROMOTION_ACK_HOLD_FILE");
@@ -10005,9 +9890,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
       // Deliberately retain the joined FULL flow across cancellation so the
       // process gate can observe old-session drain beside a new CONTINUE.
       while (::access(hold, F_OK) == 0 && !replication_shutdown_requested_) {
-        auto waited = co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                                std::chrono::milliseconds(10));
-        if (!waited.ok()) co_return waited;
+        LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+            *bycorf::ThisWorker().self_, std::chrono::milliseconds(10)));
       }
     }
   });
@@ -10021,7 +9905,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     -> Task<absl::StatusOr<std::uint64_t>> {
   const std::uint8_t db_count = storage_->database_count();
   auto fullsync_start = storage_->BeginFullSyncSession(session->id_);
-  if (!fullsync_start.ok()) co_return fullsync_start.status();
+  LAVIK_CO_RETURN_IF_ERROR(fullsync_start.status());
   const auto source_db_epochs = fullsync_start->db_epochs_;
   bool fullsync_session_active = true;
   const auto initial_log = storage_->LocalReplicationLogInfo();
@@ -10058,12 +9942,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     auto send_batch =
         [&](std::span<const SnapshotRecord> batch) -> Task<absl::Status> {
       std::string payload;
-      absl::Status encoded = EncodeRecords(partition_id, batch, &payload);
-      if (!encoded.ok()) co_return encoded;
-      absl::Status sent = co_await SendFullSyncRequest(
+      LAVIK_CO_RETURN_IF_ERROR(EncodeRecords(partition_id, batch, &payload));
+      LAVIK_CO_RETURN_IF_ERROR(co_await SendFullSyncRequest(
           stream, ack_state, DataFrameKind::kRecords, payload, partition_id,
-          fullsync_sequence);
-      if (!sent.ok()) co_return sent;
+          fullsync_sequence));
       session->TouchProgress(flow_id);
       ++fullsync_sequence;
       co_return absl::OkStatus();
@@ -10087,16 +9969,14 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       const bool streamed = record.source_id_ != 0;
       if (!streamed && encoded <= kBacklogBatchBytes - (2 + 4)) {
         if (encoded > kBacklogBatchBytes - normal_bytes) {
-          absl::Status sent = co_await flush_normal();
-          if (!sent.ok()) co_return sent;
+          LAVIK_CO_RETURN_IF_ERROR(co_await flush_normal());
         }
         if (normal_count == 0) normal_start = record_index;
         ++normal_count;
         normal_bytes += encoded;
         continue;
       }
-      absl::Status sent = co_await flush_normal();
-      if (!sent.ok()) co_return sent;
+      LAVIK_CO_RETURN_IF_ERROR(co_await flush_normal());
       if (record.kind_ != SnapshotRecord::Kind::kValue ||
           record.key_.size() > kBacklogBatchBytes / 2 ||
           (!streamed && record.value_.empty()) ||
@@ -10129,18 +10009,16 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           .key_ = record.key_,
           .value_ = std::move(logical_size),
       };
-      sent = co_await send_batch(std::span(&begin, 1));
-      if (!sent.ok()) co_return sent;
+      LAVIK_CO_RETURN_IF_ERROR(co_await send_batch(std::span(&begin, 1)));
       for (std::size_t chunk_index = 0; chunk_index < chunks; ++chunk_index) {
         const std::size_t offset =
             chunk_index * storage::kReplicationTransferBytes;
         std::string chunk_value;
         if (streamed) {
-          auto read = co_await storage_->ReadFullSyncValueChunk(
-              session->id_, partition_id, record.source_id_, offset,
-              storage::kReplicationTransferBytes);
-          if (!read.ok()) co_return read.status();
-          chunk_value = std::move(*read);
+          LAVIK_ASSIGN_OR_CO_RETURN(
+              chunk_value, co_await storage_->ReadFullSyncValueChunk(
+                               session->id_, partition_id, record.source_id_,
+                               offset, storage::kReplicationTransferBytes));
         } else {
           chunk_value = record.value_.substr(
               offset, std::min(storage::kReplicationTransferBytes,
@@ -10159,8 +10037,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
             .key_ = record.key_,
             .value_ = std::move(chunk_value),
         };
-        sent = co_await send_batch(std::span(&chunk, 1));
-        if (!sent.ok()) co_return sent;
+        LAVIK_CO_RETURN_IF_ERROR(co_await send_batch(std::span(&chunk, 1)));
       }
       SnapshotRecord commit{
           .kind_ = SnapshotRecord::Kind::kValueCommit,
@@ -10175,11 +10052,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           .key_ = record.key_,
           .value_ = {},
       };
-      sent = co_await send_batch(std::span(&commit, 1));
-      if (!sent.ok()) co_return sent;
+      LAVIK_CO_RETURN_IF_ERROR(co_await send_batch(std::span(&commit, 1)));
     }
-    absl::Status sent = co_await flush_normal();
-    if (!sent.ok()) co_return sent;
+    LAVIK_CO_RETURN_IF_ERROR(co_await flush_normal());
     co_return absl::OkStatus();
   };
 
@@ -10190,7 +10065,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       const std::size_t remaining_items = max_items - drained_items;
       auto pending = storage_->PeekFullSyncPublishItems(
           session->id_, std::min(remaining_items, kBacklogBatchFrames));
-      if (!pending.ok()) co_return pending.status();
+      LAVIK_CO_RETURN_IF_ERROR(pending.status());
       if (pending->empty()) co_return absl::OkStatus();
 
       if (pending->front().record_.has_value()) {
@@ -10203,10 +10078,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
             storage::RedisSlot(item.record_->key_);
         auto materialized = co_await storage_->MaterializeFullSyncPublishRecord(
             session->id_, partition_id, *item.record_);
-        if (!materialized.ok()) co_return materialized.status();
-        absl::Status sent =
-            co_await send_records(partition_id, std::span(&*materialized, 1));
-        if (!sent.ok()) co_return sent;
+        LAVIK_CO_RETURN_IF_ERROR(materialized.status());
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await send_records(partition_id, std::span(&*materialized, 1)));
         storage_->ReleaseFullSyncValue(session->id_, partition_id,
                                        materialized->source_id_);
         storage_->AcknowledgeFullSyncPublishItem(session->id_, item.id_);
@@ -10236,7 +10110,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         }
         auto source = ReplicationCommandPayloadSource::Create(
             item.command_->db_id_, args);
-        if (!source.ok()) co_return source.status();
+        LAVIK_CO_RETURN_IF_ERROR(source.status());
         if (source->size() > std::numeric_limits<std::size_t>::max()) {
           co_return absl::ResourceExhaustedError(
               "full-sync command is too large for this process");
@@ -10305,15 +10179,13 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           PutU8(payload, flags);
           const std::size_t payload_offset = payload.size();
           payload.resize(payload_offset + count);
-          absl::Status read = co_await encoded.source_.Read(
+          LAVIK_CO_RETURN_IF_ERROR(co_await encoded.source_.Read(
               command_offset, std::span(reinterpret_cast<std::byte*>(
                                             payload.data() + payload_offset),
-                                        count));
-          if (!read.ok()) co_return read;
-          absl::Status frame_header = AppendDataFrameHeader(
+                                        count)));
+          LAVIK_CO_RETURN_IF_ERROR(AppendDataFrameHeader(
               &frame_headers, DataFrameKind::kFullSyncCommand, payload.size(),
-              DataFrameCrc32c(payload));
-          if (!frame_header.ok()) co_return frame_header;
+              DataFrameCrc32c(payload)));
           if (last) {
             ack_state->expected_.emplace(fullsync_sequence,
                                          encoded.item_.command_->partition_id_);
@@ -10345,15 +10217,13 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
                                      .iov_len = frame_payloads[index].size()});
         }
         ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
-        absl::Status sent = co_await stream.WriteAllV(wire_batch);
-        if (!sent.ok()) co_return sent;
+        LAVIK_CO_RETURN_IF_ERROR(co_await stream.WriteAllV(wire_batch));
         // Sending bytes is protocol progress even when the command's final
         // fragment (and therefore its ACK) is still minutes away.
         session->TouchProgress(flow_id);
         for (const PendingFullSyncAck& expected : pending_acks) {
-          absl::Status acknowledged =
-              co_await WaitFullSyncRequest(ack_state, expected.sequence_);
-          if (!acknowledged.ok()) co_return acknowledged;
+          LAVIK_CO_RETURN_IF_ERROR(
+              co_await WaitFullSyncRequest(ack_state, expected.sequence_));
           storage_->AcknowledgeFullSyncPublishItem(session->id_,
                                                    expected.item_id_);
           ++drained_items;
@@ -10388,9 +10258,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
                                   std::chrono::milliseconds(pause_ms);
             while (!session->cancelled() &&
                    std::chrono::steady_clock::now() < deadline) {
-              absl::Status paused = co_await bycorf::SleepFor(
-                  *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-              if (!paused.ok()) co_return paused;
+              LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+                  *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
             }
             if (session->cancelled()) {
               co_return absl::CancelledError(
@@ -10405,7 +10274,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     views.reserve(args.size());
     for (const std::string& arg : args) views.push_back(arg);
     auto source = ReplicationCommandPayloadSource::Create(0, views);
-    if (!source.ok()) co_return source.status();
+    LAVIK_CO_RETURN_IF_ERROR(source.status());
     if (source->size() > std::numeric_limits<std::size_t>::max()) {
       co_return absl::ResourceExhaustedError(
           "function catalog is too large for this process");
@@ -10441,18 +10310,16 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       PutU8(payload, flags);
       const std::size_t payload_offset = payload.size();
       payload.resize(payload_offset + count);
-      absl::Status read = co_await source->Read(
+      LAVIK_CO_RETURN_IF_ERROR(co_await source->Read(
           offset, std::span(reinterpret_cast<std::byte*>(payload.data() +
                                                          payload_offset),
-                            count));
-      if (!read.ok()) co_return read;
+                            count)));
       if (last) {
         ack_state->expected_.emplace(sequence, 0);
         ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
       }
-      absl::Status sent = co_await WriteDataFrame(
-          stream, DataFrameKind::kFullSyncCommand, payload);
-      if (!sent.ok()) co_return sent;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WriteDataFrame(
+          stream, DataFrameKind::kFullSyncCommand, payload));
       session->TouchProgress(flow_id);
       if (last) {
         co_return co_await WaitFullSyncRequest(ack_state, sequence);
@@ -10470,12 +10337,11 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   // watermark. This changes publisher duty cycle before capacity admission
   // has to stop foreground writes; it does not weaken the capacity limit.
   auto drain_interleaved_publish_queue = [&]() -> Task<absl::Status> {
-    absl::Status drained =
-        co_await drain_fullsync_publish_queue(kFullSyncInterleaveCommands);
-    if (!drained.ok()) co_return drained;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await drain_fullsync_publish_queue(kFullSyncInterleaveCommands));
 
     auto info = storage_->GetFullSyncPublishQueueInfo(session->id_);
-    if (!info.ok()) co_return info.status();
+    LAVIK_CO_RETURN_IF_ERROR(info.status());
     const std::size_t high_watermark =
         std::max<std::size_t>(1, info->capacity_bytes_ / 8);
     if (info->queued_bytes_ + info->admitted_bytes_ <= high_watermark) {
@@ -10484,10 +10350,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     const std::size_t low_watermark =
         std::max<std::size_t>(1, high_watermark / 2);
     do {
-      drained = co_await drain_fullsync_publish_queue(kBacklogBatchFrames);
-      if (!drained.ok()) co_return drained;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await drain_fullsync_publish_queue(kBacklogBatchFrames));
       info = storage_->GetFullSyncPublishQueueInfo(session->id_);
-      if (!info.ok()) co_return info.status();
+      LAVIK_CO_RETURN_IF_ERROR(info.status());
       // Admitted bytes have reserved capacity but are not dequeueable until
       // their writes commit. Do not spin this worker waiting for those
       // writes.
@@ -10500,10 +10366,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     while (true) {
       auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
           session->id_, partition_id, kOverrideRecordsPerBatch);
-      if (!batch.ok()) co_return batch.status();
+      LAVIK_CO_RETURN_IF_ERROR(batch.status());
       if (batch->records_.empty()) co_return absl::OkStatus();
-      absl::Status sent = co_await send_records(partition_id, batch->records_);
-      if (!sent.ok()) co_return sent;
+      LAVIK_CO_RETURN_IF_ERROR(
+          co_await send_records(partition_id, batch->records_));
       next_sequence[partition_id] = batch->records_.back().mutation_sequence_;
       session->SetProgress(flow_id, ReplicationPhase::kOverrideCatchup,
                            fullsync_backlog_cursor.lsn_,
@@ -10520,11 +10386,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       for (const CapturedPartition& partition : captured) {
         auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
             session->id_, partition.partition_id_, kOverrideRecordsPerBatch);
-        if (!batch.ok()) co_return batch.status();
+        LAVIK_CO_RETURN_IF_ERROR(batch.status());
         if (batch->records_.empty()) continue;
-        absl::Status sent =
-            co_await send_records(partition.partition_id_, batch->records_);
-        if (!sent.ok()) co_return sent;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await send_records(partition.partition_id_, batch->records_));
         next_sequence[partition.partition_id_] =
             batch->records_.back().mutation_sequence_;
         storage_->AcknowledgePartitionFullSyncOverrides(
@@ -10543,10 +10408,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
            ack_state->handoffs_.inflight() >= kFullSyncHandoffWindow) {
       co_await ack_state->changed_.Wait();
     }
-    if (!ack_state->status_.ok()) co_return ack_state->status_;
-    absl::Status begun =
-        ack_state->handoffs_.Begin(partition_id, fullsync_sequence);
-    if (!begun.ok()) co_return begun;
+    LAVIK_CO_RETURN_IF_ERROR(ack_state->status_);
+    LAVIK_CO_RETURN_IF_ERROR(
+        ack_state->handoffs_.Begin(partition_id, fullsync_sequence));
     ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
     std::string payload;
     PutU64(payload, fullsync_sequence++);
@@ -10556,7 +10420,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     PutU64(payload, 1);
     absl::Status sent = co_await WriteDataFrame(
         stream, DataFrameKind::kPartitionHandoff, payload);
-    if (!sent.ok()) co_return sent;
+    LAVIK_CO_RETURN_IF_ERROR(sent);
     session->TouchProgress(flow_id);
     LAVIK_FAULT_INJECT(
         if (const char* configured =
@@ -10573,7 +10437,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
                  !ack_state->handoffs_.acknowledged(partition_id)) {
             co_await ack_state->changed_.Wait();
           }
-          if (!ack_state->status_.ok()) co_return ack_state->status_;
+          LAVIK_CO_RETURN_IF_ERROR(ack_state->status_);
           std::uint64_t pause_ms = 0;
           const std::size_t length = std::strlen(configured);
           const auto parsed =
@@ -10621,9 +10485,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         co_return absl::CancelledError(
             "replication session ended while waiting for transaction gate");
       }
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     gate_reopen.active_ = true;
     while (SnapshotTransactionsActive()) {
@@ -10631,9 +10494,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         co_return absl::CancelledError(
             "replication session ended while draining transactions");
       }
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     co_return absl::OkStatus();
   };
@@ -10738,9 +10600,8 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         if (pending_snapshot_records.empty()) {
           co_return absl::OkStatus();
         }
-        absl::Status flushed =
-            co_await send_records(partition_id, pending_snapshot_records);
-        if (!flushed.ok()) co_return flushed;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await send_records(partition_id, pending_snapshot_records));
         storage_->AcknowledgePartitionSnapshotRecords(
             session->id_, partition_id, pending_snapshot_records);
         pending_snapshot_records.clear();
@@ -11049,10 +10910,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   // owner-local barrier (no network round trip) to prove every flow has
   // done the same. Post-reopen writes now enter the retained backlog only.
   cleanup();
-  absl::Status capture_stopped = co_await session->WaitSnapshotCaptureStopped();
-  if (!capture_stopped.ok()) {
-    co_return capture_stopped;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await session->WaitSnapshotCaptureStopped());
   if (flow_id == 0) {
     gate_reopen.Open();
     command_gate_reopen.Open();
@@ -11066,10 +10924,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
               std::from_chars(configured, configured + length, pause_ms);
           if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
               pause_ms != 0) {
-            absl::Status paused =
+            LAVIK_CO_RETURN_IF_ERROR(
                 co_await bycorf::SleepFor(*bycorf::ThisWorker().self_,
-                                          std::chrono::milliseconds(pause_ms));
-            if (!paused.ok()) co_return paused;
+                                          std::chrono::milliseconds(pause_ms)));
           }
         });
   }
@@ -11078,12 +10935,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
   // backlog pressure accounts for post-fence writes normally.
   std::string cut_body;
   PutU64(cut_body, *backlog_cursor);
-  absl::Status cut_sent = co_await SendFullSyncRequest(
+  LAVIK_CO_RETURN_IF_ERROR(co_await SendFullSyncRequest(
       stream, ack_state, DataFrameKind::kFullSyncCut, cut_body,
-      kResetBatchAckPartition, fullsync_sequence);
-  if (!cut_sent.ok()) {
-    co_return cut_sent;
-  }
+      kResetBatchAckPartition, fullsync_sequence));
   ++fullsync_sequence;
   if (ShouldInjectPostCutReset(flow_id)) {
     // A valid but phase-invalid reset after promotion catches targets that
@@ -11114,18 +10968,16 @@ auto ReplicationManager::ReplicationGroup::EnterMasterFlowBacklog(
     -> Task<absl::Status> {
   storage::ReplicationLogCursor cursor{.lsn_ = next_lsn,
                                        .fragment_index_ = fragment_index};
-  absl::Status retained =
-      storage_->RetainReplicationLog(session->id_, cursor.lsn_);
-  if (!retained.ok()) co_return retained;
+  LAVIK_CO_RETURN_IF_ERROR(
+      storage_->RetainReplicationLog(session->id_, cursor.lsn_));
   session->SetBacklogCursor(flow_id, ReplicationPhase::kBacklog, cursor);
   std::string cursor_payload;
   PutU64(cursor_payload, next_lsn);
   PutU32(cursor_payload, fragment_index);
-  absl::Status cursor_sent =
-      co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload);
-  if (!cursor_sent.ok()) co_return cursor_sent;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload));
   auto cursor_ack = co_await ReadDataFrame(stream);
-  if (!cursor_ack.ok()) co_return cursor_ack.status();
+  LAVIK_CO_RETURN_IF_ERROR(cursor_ack.status());
   DataReader ack_reader(cursor_ack->second);
   std::uint16_t ignored_partition = 0;
   std::uint64_t acknowledged_lsn = 0;
@@ -11160,7 +11012,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveMasterFlowBacklogAcks(
 
     const std::uint64_t expected_lsn = duplex->expected_acks_.front();
     auto ack = co_await ReadDataFrame(stream);
-    if (!ack.ok()) co_return ack.status();
+    LAVIK_CO_RETURN_IF_ERROR(ack.status());
     DataReader ack_reader(ack->second);
     std::uint64_t first_lsn = 0;
     std::uint64_t last_lsn = 0;
@@ -11199,9 +11051,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveMasterFlowBacklogAcks(
     }
     const storage::ReplicationLogCursor acknowledged{.lsn_ = last_lsn + 1,
                                                      .fragment_index_ = 0};
-    absl::Status retained =
-        storage_->RetainReplicationLog(session->id_, acknowledged.lsn_);
-    if (!retained.ok()) co_return retained;
+    LAVIK_CO_RETURN_IF_ERROR(
+        storage_->RetainReplicationLog(session->id_, acknowledged.lsn_));
     session->SetBacklogCursor(flow_id, ReplicationPhase::kReady, acknowledged);
     do {
       duplex->expected_acks_.pop_front();
@@ -11334,11 +11185,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
       PutU64(prelude, wire_lsn);
       PutU32(prelude, frame.header_.fragment_index_);
       PutU8(prelude, frame.header_.flags_);
-      absl::Status frame_header = AppendDataFrameHeader(
+      LAVIK_CO_RETURN_IF_ERROR(AppendDataFrameHeader(
           &frame_headers, DataFrameKind::kCommand,
           kOnlinePayloadHeaderBytes + frame.payload_.size(),
-          DataFrameCrc32c(prelude, frame.payload_));
-      if (!frame_header.ok()) co_return frame_header;
+          DataFrameCrc32c(prelude, frame.payload_)));
       frame_headers.append(prelude);
     }
     for (std::size_t index = 0; index < batch->frames_.size(); ++index) {
@@ -11399,9 +11249,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
       co_await duplex->receiver_done_ready_.Wait();
     }
   }
-  if (!duplex->receiver_status_.ok()) {
-    co_return duplex->receiver_status_;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(duplex->receiver_status_);
   co_return sender_status;
 }
 
@@ -11453,15 +11301,13 @@ auto ReplicationManager::ReplicationGroup::ServeOwnedNativeConnection(
     if (IsLeaseAdmissionSuspended(result)) {
       const std::string reply =
           absl::StrCat(kLeaseAdmissionSuspendedReply, "\r\n");
-      const absl::Status sent = co_await WriteText(stream, reply);
-      if (!sent.ok()) co_return sent;
+      LAVIK_CO_RETURN_IF_ERROR(co_await WriteText(stream, reply));
     }
     if (IsFullAdmissionBusy(result)) {
       const auto reply = result.GetPayload(kFullAdmissionReplyPayload);
       if (reply.has_value()) {
         const std::string wire_reply(*reply);
-        const absl::Status sent = co_await WriteText(stream, wire_reply);
-        if (!sent.ok()) co_return sent;
+        LAVIK_CO_RETURN_IF_ERROR(co_await WriteText(stream, wire_reply));
       }
     }
     co_return result;
@@ -11596,8 +11442,7 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
         "node lost valid source state during the native handshake");
   }
   const bool protocol_probe = args[2] == "?";
-  absl::Status history_ready = co_await EnsureReplicationHistoryReady();
-  if (!history_ready.ok()) co_return history_ready;
+  LAVIK_CO_RETURN_IF_ERROR(co_await EnsureReplicationHistoryReady());
   // A retiring idle monitor can still be running while we wait for its
   // reset. Check only after that wait so its exit cannot leave the newly
   // enabled history without a monitor. The active control pins history
@@ -11633,16 +11478,15 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
   std::string source_group_id;
   std::shared_ptr<MasterSession> session;
   auto applied = DecodeAppliedVector(args[7]);
-  if (!applied.ok()) co_return applied.status();
+  LAVIK_CO_RETURN_IF_ERROR(applied.status());
 #if LAVIK_FAULTS_ENABLED
   if (population_handshake) {
     // Deterministically exercise the only suspension cut between optimistic
     // POPULATION admission and the master_mutex_-guarded classification /
     // publication transition. A concurrent revoker must close the gate and
     // make the second check below reject this unpublished control.
-    absl::Status barrier = co_await WaitAtSourceAdmissionFaultBarrier(
-        replication_shutdown_requested_);
-    if (!barrier.ok()) co_return barrier;
+    LAVIK_CO_RETURN_IF_ERROR(co_await WaitAtSourceAdmissionFaultBarrier(
+        replication_shutdown_requested_));
   }
 #endif
   {
@@ -12197,9 +12041,8 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
          redis_export_active_.load(std::memory_order_acquire) ||
          idle_history_monitor_running_ || history_reset_running_ ||
          source_flows_active()) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   // Flow teardown performs any history reset before ClearFlow drops the
   // final connected-flow count. Together with the monitor/reset flags, this
@@ -12215,17 +12058,15 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
 auto ReplicationManager::ReplicationGroup::DisableSourceHistory()
     -> Task<absl::Status> {
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-    absl::Status disabled = co_await bycorf::SubmitTaskTo(
-        worker, [this]() { return storage_->DisableReplicationLog(); });
-    if (!disabled.ok()) co_return disabled;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SubmitTaskTo(
+        worker, [this]() { return storage_->DisableReplicationLog(); }));
   }
   co_return absl::OkStatus();
 }
 
 auto ReplicationManager::ReplicationGroup::RetireSourceHistory()
     -> Task<absl::Status> {
-  absl::Status drained = co_await DrainSourceEgress();
-  if (!drained.ok()) co_return drained;
+  LAVIK_CO_RETURN_IF_ERROR(co_await DrainSourceEgress());
   co_return co_await DisableSourceHistory();
 }
 
@@ -12295,9 +12136,8 @@ auto ReplicationManager::ReplicationGroup::MonitorIdleReplicationHistory()
   } monitor_guard{&idle_history_monitor_running_};
 
   for (;;) {
-    absl::Status slept = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(10));
-    if (!slept.ok()) co_return slept;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(10)));
     if (is_replica() ||
         replication_shutdown_requested_.load(std::memory_order_acquire))
       co_return absl::OkStatus();
@@ -12389,15 +12229,13 @@ auto ReplicationManager::ReplicationGroup::MonitorIdleReplicationHistory()
       }
     } idle_reset_guard{&history_reset_running_, &command_gates_closed};
     while (!CloseAllCommandDbGates()) {
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
     command_gates_closed = true;
     while (CommandDbOperationsActive()) {
-      absl::Status waited = co_await bycorf::SleepFor(
-          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
     }
 
     // A handshake that arrives after the reset flag was set waits and sees
@@ -12432,9 +12270,8 @@ auto ReplicationManager::ReplicationGroup::MonitorIdleReplicationHistory()
           while (active_master_controls_.load(std::memory_order_acquire) == 0) {
             if (replication_shutdown_requested_.load(std::memory_order_acquire))
               co_return absl::OkStatus();
-            absl::Status waited = co_await bycorf::SleepFor(
-                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-            if (!waited.ok()) co_return waited;
+            LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+                *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
           }
         });
 
@@ -12444,7 +12281,7 @@ auto ReplicationManager::ReplicationGroup::MonitorIdleReplicationHistory()
           worker, [this]() { return storage_->DisableReplicationLog(); });
       if (!disabled.ok()) break;
     }
-    if (!disabled.ok()) co_return disabled;
+    LAVIK_CO_RETURN_IF_ERROR(disabled);
     spdlog::info(
         "disabled replication history after all disconnected replicas "
         "fell behind the backlog");
@@ -12467,9 +12304,8 @@ auto ReplicationManager::ReplicationGroup::EnsureReplicationHistoryReady()
   // let another handshake yield while the first one performs storage IO;
   // there is no process-global lock on the write path.
   while (history_reset_running_) {
-    absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *bycorf::ThisWorker().self_, std::chrono::milliseconds(1)));
   }
   history_reset_running_ = true;
   struct ResetGuard {
@@ -12506,11 +12342,10 @@ auto ReplicationManager::ReplicationGroup::EnsureReplicationHistoryReady()
   }
   for (const auto& session : cancelled) session->Cancel();
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
-    absl::Status disabled =
+    LAVIK_CO_RETURN_IF_ERROR(
         co_await bycorf::SubmitTaskTo(worker, [this]() -> Task<absl::Status> {
           co_return co_await storage_->DisableReplicationLog();
-        });
-    if (!disabled.ok()) co_return disabled;
+        }));
   }
   co_return absl::OkStatus();
 }
@@ -12592,7 +12427,7 @@ ReplicationManager::StartClusterRebuildDirective(ReplicaOfConfig upstream,
                                                  PopulationManifest manifest) {
   auto started = co_await group_->StartClusterRebuildDirective(
       std::move(upstream), std::move(directive), std::move(manifest));
-  if (!started.ok()) co_return started.status();
+  LAVIK_CO_RETURN_IF_ERROR(started.status());
   co_return ClusterRebuildCompletion(std::move(*started));
 }
 
@@ -12601,7 +12436,7 @@ ReplicationManager::StartEmptyPopulationInitialization(
     RebuildIdentity identity, PopulationManifest manifest) {
   auto started = co_await group_->StartEmptyPopulationInitialization(
       std::move(identity), std::move(manifest));
-  if (!started.ok()) co_return started.status();
+  LAVIK_CO_RETURN_IF_ERROR(started.status());
   co_return ClusterRebuildCompletion(std::move(*started));
 }
 
@@ -12610,7 +12445,7 @@ ReplicationManager::StartClusterPromotionPrepareDirective(
     ClusterPromotionPrepareDirective directive) {
   auto started = co_await group_->StartClusterPromotionPrepareDirective(
       std::move(directive));
-  if (!started.ok()) co_return started.status();
+  LAVIK_CO_RETURN_IF_ERROR(started.status());
   co_return ClusterPromotionPrepareCompletion(std::move(*started));
 }
 

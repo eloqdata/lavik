@@ -41,6 +41,7 @@
 #include "lavik/meta/population_manifest_store.h"
 #include "lavik/meta/state_apply.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -117,7 +118,7 @@ absl::StatusOr<control::WireDataEndpoint> ProjectDataEndpoint(
   bool has_legacy = false;
   for (const std::string& encoded : node.endpoints_) {
     auto endpoint = ParseDataEndpoint(encoded);
-    if (!endpoint.ok()) return endpoint.status();
+    LAVIK_RETURN_IF_ERROR(endpoint.status());
     has_explicit |= endpoint->kind != DataEndpointKind::kLegacy;
     has_legacy |= endpoint->kind == DataEndpointKind::kLegacy;
     parsed.push_back(std::move(*endpoint));
@@ -280,7 +281,7 @@ absl::StatusOr<control::WireProjectedDirective> ProjectDirective(
     return Inconsistent("current directive contains a non-canonical node id");
   }
   auto kind = ProjectDirectiveKind(source);
-  if (!kind.ok()) return kind.status();
+  LAVIK_RETURN_IF_ERROR(kind.status());
   const bool executes_on_target =
       *kind == control::WireDirectiveKind::kRebuild ||
       *kind == control::WireDirectiveKind::kInitializeEmptyPopulation;
@@ -408,7 +409,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
     if (member.retired_) continue;
     auto endpoint = ParseNumericHostPort(member.data_control_endpoint_,
                                          "Meta data-control endpoint");
-    if (!endpoint.ok()) return endpoint.status();
+    LAVIK_RETURN_IF_ERROR(endpoint.status());
     state.meta_directory.push_back(
         control::WireMetaEndpoint{member.server_id_, std::move(endpoint->host),
                                   endpoint->port, member.principal_});
@@ -418,7 +419,7 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
   for (const MetaNodeRecord& node : view.nodes()) {
     if (node.retired_) continue;
     auto endpoint = ProjectDataEndpoint(node);
-    if (!endpoint.ok()) return endpoint.status();
+    LAVIK_RETURN_IF_ERROR(endpoint.status());
     if (!active_nodes.insert(node.node_id_).second) {
       return Inconsistent(
           absl::StrCat("duplicate active node ", node.node_id_));
@@ -532,17 +533,14 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
     }
 
     if (source.failover_transition_.has_value()) {
-      auto transition = ProjectFailoverTransition(*source.failover_transition_);
-      if (!transition.ok()) return transition.status();
-      projected.failover_transition = std::move(*transition);
+      LAVIK_ASSIGN_OR_RETURN(
+          projected.failover_transition,
+          ProjectFailoverTransition(*source.failover_transition_));
     }
 
-    if (absl::Status status = AddManifestReference(projected.manifest_revision,
-                                                   projected.manifest_digest,
-                                                   &manifest_references);
-        !status.ok()) {
-      return status;
-    }
+    LAVIK_RETURN_IF_ERROR(AddManifestReference(projected.manifest_revision,
+                                               projected.manifest_digest,
+                                               &manifest_references));
     if (!group_indices.emplace(projected.group_id, state.groups.size())
              .second) {
       return Inconsistent(absl::StrCat("duplicate group ", projected.group_id));
@@ -577,13 +575,10 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
             absl::StrCat("stale current directive anchor: ", anchor.message()));
       }
       auto directive = ProjectDirective(operation, current);
-      if (!directive.ok()) return directive.status();
-      if (absl::Status status = AddManifestReference(
-              directive->manifest_revision, directive->manifest_digest,
-              &manifest_references);
-          !status.ok()) {
-        return status;
-      }
+      LAVIK_RETURN_IF_ERROR(directive.status());
+      LAVIK_RETURN_IF_ERROR(AddManifestReference(directive->manifest_revision,
+                                                 directive->manifest_digest,
+                                                 &manifest_references));
       state.current_directives.push_back(std::move(*directive));
     }
   }
@@ -630,9 +625,9 @@ absl::StatusOr<control::FullDesiredState> ProjectNodeState(
 absl::StatusOr<NodeControlBatch> MetaControlProjector::ProjectNode(
     const MetaDataPublicationView& view, std::string_view node_id) {
   auto state = ProjectNodeState(view, node_id);
-  if (!state.ok()) return state.status();
+  LAVIK_RETURN_IF_ERROR(state.status());
   auto encoded = control::EncodeFullDesiredState(*state);
-  if (!encoded.ok()) return encoded.status();
+  LAVIK_RETURN_IF_ERROR(encoded.status());
   return NodeControlBatch{std::move(*state), std::move(*encoded),
                           view.state_change_index()};
 }

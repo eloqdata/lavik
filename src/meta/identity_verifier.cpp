@@ -26,6 +26,7 @@
 #include "lavik/meta/commands.h"
 #include "lavik/meta/encoding.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -89,7 +90,7 @@ absl::StatusOr<MetaPrincipalIdentity> ParseMetaPrincipal(
   if (principal.starts_with(kMetaPrefix)) {
     const std::string_view id = principal.substr(kMetaPrefix.size());
     auto parsed = ParseCanonicalDecimal(id);
-    if (!parsed.ok()) return parsed.status();
+    LAVIK_RETURN_IF_ERROR(parsed.status());
     return MetaPrincipalIdentity{std::string(principal),
                                  MetaPrincipalRole::kMetaMember,
                                  std::string(id)};
@@ -112,7 +113,7 @@ absl::StatusOr<MetaPrincipalIdentity> AuthenticateMetaUriSans(
   for (const std::string& san : uri_sans) {
     if (!std::string_view(san).starts_with("lavik://")) continue;
     auto parsed = ParseMetaPrincipal(san);
-    if (!parsed.ok()) return parsed.status();
+    LAVIK_RETURN_IF_ERROR(parsed.status());
     recognized.push_back(std::move(*parsed));
   }
   if (recognized.empty()) {
@@ -177,9 +178,9 @@ absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
   const std::string_view principal_text = fields[1];
 
   auto server_id = ParseCanonicalDecimal(server_id_text);
-  if (!server_id.ok()) return server_id.status();
+  LAVIK_RETURN_IF_ERROR(server_id.status());
   auto principal = ParseMetaPrincipal(principal_text);
-  if (!principal.ok()) return principal.status();
+  LAVIK_RETURN_IF_ERROR(principal.status());
   if (principal->role_ != MetaPrincipalRole::kMetaMember ||
       principal->subject_id_ != server_id_text) {
     return absl::InvalidArgumentError(
@@ -217,7 +218,7 @@ absl::Status VerifyRaftPeerIdentity(std::int32_t claimed_server_id,
         "Raft request source id does not match member identity");
   }
   auto authenticated = AuthenticateMetaUriSans(uri_sans);
-  if (!authenticated.ok()) return authenticated.status();
+  LAVIK_RETURN_IF_ERROR(authenticated.status());
   if (authenticated->role_ != MetaPrincipalRole::kMetaMember ||
       authenticated->principal_ != expected->principal_) {
     return absl::PermissionDeniedError(

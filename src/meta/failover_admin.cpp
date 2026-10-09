@@ -30,6 +30,7 @@
 #include "absl/status/status.h"
 #include "lavik/meta/admin_client.h"
 #include "lavik/meta/cluster_status.h"
+#include "lavik/status_macros.h"
 #include "openssl/rand.h"
 
 namespace lavik::meta {
@@ -218,7 +219,7 @@ absl::Status FailoverReplyError(std::string_view reply,
 
 absl::StatusOr<std::string> EncodeFailoverAdminRequest(
     const FailoverAdminRequestV1& request) {
-  if (absl::Status status = Validate(request); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(Validate(request));
 
   Writer writer;
   writer.Raw(std::string_view(
@@ -242,27 +243,23 @@ absl::StatusOr<FailoverAdminRequestV1> DecodeFailoverAdminRequest(
   }
   request.remove_prefix(kRequestPrefix.size());
   auto bytes = Unhex(request);
-  if (!bytes.ok()) return bytes.status();
+  LAVIK_RETURN_IF_ERROR(bytes.status());
 
   Reader reader(*bytes);
   FailoverAdminRequestV1 result;
   auto operation = reader.Raw(result.operation_id_.size());
-  if (!operation.ok()) return operation.status();
+  LAVIK_RETURN_IF_ERROR(operation.status());
   std::copy(operation->begin(), operation->end(),
             reinterpret_cast<char*>(result.operation_id_.data()));
   auto group_size = reader.U16();
-  if (!group_size.ok()) return group_size.status();
+  LAVIK_RETURN_IF_ERROR(group_size.status());
   if (*group_size > kMaxMetaGroupIdBytes) {
     return Invalid("failover group id exceeds cap");
   }
-  auto group = reader.Raw(*group_size);
-  if (!group.ok()) return group.status();
-  result.group_id_ = std::string(*group);
-  auto deadline = reader.U64();
-  if (!deadline.ok()) return deadline.status();
-  result.absolute_deadline_unix_ms_ = *deadline;
+  LAVIK_ASSIGN_OR_RETURN(result.group_id_, reader.Raw(*group_size));
+  LAVIK_ASSIGN_OR_RETURN(result.absolute_deadline_unix_ms_, reader.U64());
   if (reader.remaining() != 0) return Invalid("trailing failover request data");
-  if (absl::Status status = Validate(result); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(Validate(result));
   return result;
 }
 
@@ -299,7 +296,7 @@ absl::StatusOr<FailoverOutcome> ClusterOperator::Failover(
 
   MetaAdminTarget leader;
   auto initial = CaptureStatus(seed, options, &leader);
-  if (!initial.ok()) return initial.status();
+  LAVIK_RETURN_IF_ERROR(initial.status());
   if (!initial->status_.has_value()) {
     return absl::UnavailableError(initial->retry_reason_);
   }
@@ -324,9 +321,7 @@ absl::StatusOr<FailoverOutcome> ClusterOperator::Failover(
     operation_id = *request.operation_id_;
     if (IsZero(operation_id)) return Invalid("failover operation id is zero");
   } else {
-    auto generated = GenerateOperationId();
-    if (!generated.ok()) return generated.status();
-    operation_id = *generated;
+    LAVIK_ASSIGN_OR_RETURN(operation_id, GenerateOperationId());
   }
   const std::string expected_id = Hex(operation_id);
 
@@ -353,7 +348,7 @@ absl::StatusOr<FailoverOutcome> ClusterOperator::Failover(
       {.operation_id_ = operation_id,
        .group_id_ = request.group_id_,
        .absolute_deadline_unix_ms_ = absolute_deadline});
-  if (!encoded.ok()) return encoded.status();
+  LAVIK_RETURN_IF_ERROR(encoded.status());
 
   auto reply = round_trip_(leader, *encoded, options.deadline_);
   if (!reply.ok()) {

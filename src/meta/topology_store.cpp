@@ -20,6 +20,7 @@
 #include <set>
 
 #include "absl/strings/str_cat.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -125,10 +126,8 @@ absl::Status MetaTopologyStore::BeginClusterCreate(
   if (!IsValidClientMode(client_mode)) {
     return MetaDomainRejectError("invalid cluster client mode");
   }
-  if (auto status = CheckClusterRoot(root_operation_id, genesis_commit_index);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckClusterRoot(root_operation_id, genesis_commit_index));
   if (cluster_lifecycle_.state_ != MetaClusterLifecycle::kUninitialized &&
       cluster_lifecycle_.root_operation_id_ == root_operation_id &&
       cluster_lifecycle_.genesis_commit_index_ == genesis_commit_index &&
@@ -200,7 +199,7 @@ absl::Status MetaTopologyStore::FailClusterCreate(
 }
 
 absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
-  if (auto st = CheckGroupId(cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(CheckGroupId(cmd.group_id_));
   if (const auto it = groups_.find(cmd.group_id_); it != groups_.end()) {
     // Replay: the group exists exactly as created (never mutated) and the
     // topology epoch already carries this command's value -> idempotent
@@ -214,11 +213,8 @@ absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
     return MetaDomainRejectError(
         absl::StrCat("group ", cmd.group_id_, " already exists"));
   }
-  if (auto st =
-          CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_));
   if (groups_.size() >= kMaxMetaGroups) {
     return MetaDomainRejectError("group cap reached");
   }
@@ -234,8 +230,8 @@ absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
 }
 
 absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
-  if (auto st = CheckGroupId(cmd.group_id_); !st.ok()) return st;
-  if (auto st = CheckNodeId(cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(CheckGroupId(cmd.group_id_));
+  LAVIK_RETURN_IF_ERROR(CheckNodeId(cmd.node_id_));
   if (IsZero(cmd.assignment_id_)) {
     return MetaDomainRejectError("assignment_id must not be zero");
   }
@@ -278,11 +274,8 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
   if (group.members_.size() >= kMaxMetaNodes) {
     return MetaDomainRejectError("group member cap reached");
   }
-  if (auto st =
-          CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_));
   group.members_.emplace(
       cmd.node_id_, GroupState::MemberState{cmd.assignment_id_, cmd.role_});
   group_of_node_.emplace(cmd.node_id_, cmd.group_id_);
@@ -293,8 +286,8 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
 }
 
 absl::Status MetaTopologyStore::Apply(const RemoveNodeFromGroup& cmd) {
-  if (auto st = CheckGroupId(cmd.group_id_); !st.ok()) return st;
-  if (auto st = CheckNodeId(cmd.node_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(CheckGroupId(cmd.group_id_));
+  LAVIK_RETURN_IF_ERROR(CheckNodeId(cmd.node_id_));
   const auto it = groups_.find(cmd.group_id_);
   if (it == groups_.end()) {
     return MetaDomainRejectError(absl::StrCat("unknown group ", cmd.group_id_));
@@ -316,11 +309,8 @@ absl::Status MetaTopologyStore::Apply(const RemoveNodeFromGroup& cmd) {
     return MetaDomainRejectError(
         absl::StrCat("node not a member of ", cmd.group_id_));
   }
-  if (auto st =
-          CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_));
   // No cascade: if the removed node is the record owner, owner_ is left
   // untouched; the apply dispatcher reads the fact and decides.
   group.members_.erase(member);
@@ -342,7 +332,7 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
         range.last_slot_ >= kMetaSlotCount) {
       return MetaDomainRejectError("slot range out of bounds");
     }
-    if (auto st = CheckGroupId(range.group_id_); !st.ok()) return st;
+    LAVIK_RETURN_IF_ERROR(CheckGroupId(range.group_id_));
   }
   {
     std::vector<MetaSlotAssignment> sorted = cmd.ranges_;
@@ -382,11 +372,8 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
     if (target == slots_) return absl::OkStatus();
   }
 
-  if (auto st =
-          CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_));
   for (const MetaSlotAssignment& range : cmd.ranges_) {
     if (!groups_.contains(range.group_id_)) {
       return MetaDomainRejectError(absl::StrCat(
@@ -407,7 +394,7 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
 }
 
 absl::Status MetaTopologyStore::Apply(const SetGroupReplicationState& cmd) {
-  if (auto st = CheckGroupId(cmd.group_id_); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(CheckGroupId(cmd.group_id_));
   const auto it = groups_.find(cmd.group_id_);
   if (it == groups_.end()) {
     return MetaDomainRejectError(absl::StrCat("unknown group ", cmd.group_id_));
@@ -462,11 +449,8 @@ absl::Status MetaTopologyStore::Apply(const SetGroupReplicationState& cmd) {
           cmd.expected_partition_replication_epoch_) {
     return MetaDomainRejectError("group replication update has no effect");
   }
-  if (auto st =
-          CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckNextTopologyEpoch(topology_epoch_, cmd.new_topology_epoch_));
   group.record_.population_manifest_revision_ =
       cmd.new_population_manifest_revision_;
   group.record_.population_manifest_digest_ =
@@ -522,9 +506,7 @@ absl::Status MetaTopologyStore::InstallFailoverTransition(
 
   MetaFailoverTransition installed = transition;
   installed.revision_ = committed_index;
-  if (auto status = ValidateMetaFailoverTransition(installed); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateMetaFailoverTransition(installed));
 
   GroupState& group = it->second;
   if (group.failover_transition_ == installed) {
@@ -559,9 +541,7 @@ absl::Status MetaTopologyStore::ReplaceFailoverTransition(
     return MetaDomainRejectError(
         "failover replacement cannot change transition identity");
   }
-  if (auto status = ValidateMetaFailoverTransition(installed); !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateMetaFailoverTransition(installed));
 
   GroupState& group = it->second;
   if (group.failover_transition_ == installed) {
@@ -617,10 +597,8 @@ absl::Status MetaTopologyStore::SetTopologyEpoch(
     std::uint64_t new_topology_epoch) {
   // Same value already held: idempotent no-op accept.
   if (new_topology_epoch == topology_epoch_) return absl::OkStatus();
-  if (auto st = CheckNextTopologyEpoch(topology_epoch_, new_topology_epoch);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      CheckNextTopologyEpoch(topology_epoch_, new_topology_epoch));
   topology_epoch_ = new_topology_epoch;
   return absl::OkStatus();
 }
@@ -669,8 +647,7 @@ absl::Status MetaTopologyStore::ValidateActivate(
 absl::Status MetaTopologyStore::ActivateAuthority(
     const lavik::meta::ActivateAuthority& command,
     std::optional<MetaFailoverActionId> action) {
-  if (auto status = ValidateActivate(command, action); !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(ValidateActivate(command, action));
   GroupState& group = groups_.at(command.group_id_);
   group.record_.owner_ = command.new_owner_;
   group.authority_active_ = true;
@@ -930,29 +907,29 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaTopologyStoreFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto lifecycle_state = r.ReadU8();
-  if (!lifecycle_state.ok()) return lifecycle_state.status();
+  LAVIK_RETURN_IF_ERROR(lifecycle_state.status());
   auto client_mode = r.ReadU8();
-  if (!client_mode.ok()) return client_mode.status();
+  LAVIK_RETURN_IF_ERROR(client_mode.status());
   if (*client_mode > 2) return MetaFailStopError("unknown cluster client mode");
   auto root_operation_id = ReadFixedArray<16>(r);
-  if (!root_operation_id.ok()) return root_operation_id.status();
+  LAVIK_RETURN_IF_ERROR(root_operation_id.status());
   auto genesis_commit_index = r.ReadU64();
-  if (!genesis_commit_index.ok()) return genesis_commit_index.status();
+  LAVIK_RETURN_IF_ERROR(genesis_commit_index.status());
   auto failure_summary = r.ReadString(kMaxMetaClusterFailureSummaryBytes);
-  if (!failure_summary.ok()) return failure_summary.status();
+  LAVIK_RETURN_IF_ERROR(failure_summary.status());
   if (*lifecycle_state >
       static_cast<std::uint8_t>(MetaClusterLifecycle::kProvisioningFailed)) {
     return MetaFailStopError("unknown cluster lifecycle tag");
   }
   auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
+  LAVIK_RETURN_IF_ERROR(topology_epoch.status());
   auto group_count = r.ReadCount(kMaxMetaGroups);
-  if (!group_count.ok()) return group_count.status();
+  LAVIK_RETURN_IF_ERROR(group_count.status());
 
   MetaTopologyStore store;
   store.cluster_lifecycle_.state_ =
@@ -965,46 +942,43 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   store.cluster_lifecycle_.root_operation_id_ = *root_operation_id;
   store.cluster_lifecycle_.genesis_commit_index_ = *genesis_commit_index;
   store.cluster_lifecycle_.failure_summary_ = std::move(*failure_summary);
-  if (absl::Status status = ValidateClusterLifecycle(store.cluster_lifecycle_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateClusterLifecycle(store.cluster_lifecycle_));
   store.topology_epoch_ = *topology_epoch;
   for (std::uint32_t i = 0; i < *group_count; ++i) {
     auto group_id = r.ReadString(kMaxMetaGroupIdBytes);
-    if (!group_id.ok()) return group_id.status();
+    LAVIK_RETURN_IF_ERROR(group_id.status());
     auto owner = r.ReadString(kMetaNodeIdBytes);
-    if (!owner.ok()) return owner.status();
+    LAVIK_RETURN_IF_ERROR(owner.status());
     auto group_term = r.ReadU64();
-    if (!group_term.ok()) return group_term.status();
+    LAVIK_RETURN_IF_ERROR(group_term.status());
     auto active = r.ReadBool("invalid authority state");
-    if (!active.ok()) return active.status();
+    LAVIK_RETURN_IF_ERROR(active.status());
     auto action = r.ReadOptional<MetaFailoverActionId>(
         [](MetaReader& nested) { return ReadFixedArray<16>(nested); });
-    if (!action.ok()) return action.status();
+    LAVIK_RETURN_IF_ERROR(action.status());
     if ((*active && (*group_term == 0 || owner->empty())) ||
         (action->has_value() && (!*active || IsZero(**action)))) {
       return MetaFailStopError("invalid group authority");
     }
     auto manifest_revision = r.ReadU64();
-    if (!manifest_revision.ok()) return manifest_revision.status();
+    LAVIK_RETURN_IF_ERROR(manifest_revision.status());
     auto manifest_digest = ReadFixedArray<32>(r);
-    if (!manifest_digest.ok()) return manifest_digest.status();
+    LAVIK_RETURN_IF_ERROR(manifest_digest.status());
     auto partition_epoch = r.ReadU64();
-    if (!partition_epoch.ok()) return partition_epoch.status();
+    LAVIK_RETURN_IF_ERROR(partition_epoch.status());
     auto revision = r.ReadU64();
-    if (!revision.ok()) return revision.status();
+    LAVIK_RETURN_IF_ERROR(revision.status());
     auto failover_transition = r.ReadOptional<MetaFailoverTransition>(
         [](MetaReader& nested) { return ReadMetaFailoverTransition(nested); });
-    if (!failover_transition.ok()) return failover_transition.status();
+    LAVIK_RETURN_IF_ERROR(failover_transition.status());
     auto members = r.ReadList<MetaGroupMember>(
         kMaxMetaNodes, [](MetaReader& rr) -> absl::StatusOr<MetaGroupMember> {
           auto node_id = rr.ReadString(kMetaNodeIdBytes);
-          if (!node_id.ok()) return node_id.status();
+          LAVIK_RETURN_IF_ERROR(node_id.status());
           auto assignment_id = ReadFixedArray<16>(rr);
-          if (!assignment_id.ok()) return assignment_id.status();
+          LAVIK_RETURN_IF_ERROR(assignment_id.status());
           auto role = rr.ReadU8();
-          if (!role.ok()) return role.status();
+          LAVIK_RETURN_IF_ERROR(role.status());
           if (*role != static_cast<std::uint8_t>(MetaNodeRole::kPrimary) &&
               *role != static_cast<std::uint8_t>(MetaNodeRole::kReplica)) {
             return MetaFailStopError("unknown node role");
@@ -1012,7 +986,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
           return MetaGroupMember{std::string(*node_id), *assignment_id,
                                  static_cast<MetaNodeRole>(*role)};
         });
-    if (!members.ok()) return members.status();
+    LAVIK_RETURN_IF_ERROR(members.status());
 
     // Invariant enforcement (fail-stop): a corrupt snapshot fails
     // identically on every node.
@@ -1067,13 +1041,13 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
           [](MetaReader& rr)
               -> absl::StatusOr<std::pair<std::string, MetaAssignmentId>> {
             auto node_id = rr.ReadString(kMetaNodeIdBytes);
-            if (!node_id.ok()) return node_id.status();
+            LAVIK_RETURN_IF_ERROR(node_id.status());
             auto assignment_id = ReadFixedArray<16>(rr);
-            if (!assignment_id.ok()) return assignment_id.status();
+            LAVIK_RETURN_IF_ERROR(assignment_id.status());
             return std::pair<std::string, MetaAssignmentId>{
                 std::string(*node_id), *assignment_id};
           });
-  if (!assignment_history.ok()) return assignment_history.status();
+  LAVIK_RETURN_IF_ERROR(assignment_history.status());
   for (const auto& [node_id, assignment_id] : *assignment_history) {
     if (node_id.empty() || IsZero(assignment_id) ||
         !store.last_assignment_by_node_.emplace(node_id, assignment_id)
@@ -1095,11 +1069,11 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   auto runs = r.ReadList<MetaSlotAssignment>(
       kMetaSlotCount, [](MetaReader& rr) -> absl::StatusOr<MetaSlotAssignment> {
         auto first = rr.ReadU16();
-        if (!first.ok()) return first.status();
+        LAVIK_RETURN_IF_ERROR(first.status());
         auto last = rr.ReadU16();
-        if (!last.ok()) return last.status();
+        LAVIK_RETURN_IF_ERROR(last.status());
         auto group_id = rr.ReadString(kMaxMetaGroupIdBytes);
-        if (!group_id.ok()) return group_id.status();
+        LAVIK_RETURN_IF_ERROR(group_id.status());
         if (*first > *last || *last >= kMetaSlotCount) {
           return MetaFailStopError("slot run out of bounds");
         }
@@ -1107,7 +1081,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
                                   static_cast<std::uint16_t>(*last),
                                   std::string(*group_id)};
       });
-  if (!runs.ok()) return runs.status();
+  LAVIK_RETURN_IF_ERROR(runs.status());
   std::uint32_t previous_last = 0;
   for (std::size_t i = 0; i < runs->size(); ++i) {
     const MetaSlotAssignment& run = (*runs)[i];
@@ -1123,7 +1097,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
       store.slots_[slot] = run.group_id_;
     }
   }
-  if (auto st = r.Finish(); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(r.Finish());
   if (store.cluster_lifecycle_.client_mode_ == ClientMode::kSingle &&
       (store.groups_.size() > 1 ||
        ((!runs->empty() ||

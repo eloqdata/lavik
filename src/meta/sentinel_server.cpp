@@ -50,6 +50,7 @@
 #include "lavik/numeric_endpoint.h"
 #include "lavik/password_authenticator.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/version.h"
 
 namespace lavik::meta {
@@ -551,7 +552,7 @@ SessionAction ExecuteConnectionCommand(
 // let the accept coroutine retire the listener, then join its frame.
 absl::StatusOr<int> OpenAcceptWake(const NumericEndpoint& endpoint) {
   auto addresses = bycorf::ResolveTcpAddresses(endpoint.host_, endpoint.port_);
-  if (!addresses.ok()) return addresses.status();
+  LAVIK_RETURN_IF_ERROR(addresses.status());
   const auto& address = addresses->front();
   const int fd = ::socket(address.address_.ss_family,
                           SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -871,17 +872,17 @@ absl::StatusOr<std::shared_ptr<MetaSentinelServer>> MetaSentinelServer::Create(
         (o.tls_auth_clients_ != "no" && o.tls_ca_cert_file_.empty()))
       return absl::InvalidArgumentError(
           "incomplete Sentinel TLS configuration");
-    auto context = bycorf::TlsContext::CreateServer(
-        {.cert_file_ = o.tls_cert_file_,
-         .key_file_ = o.tls_key_file_,
-         .ca_cert_file_ = o.tls_ca_cert_file_,
-         .client_auth_ = o.tls_auth_clients_ == "yes"
-                             ? bycorf::TlsClientAuth::kRequired
-                         : o.tls_auth_clients_ == "optional"
-                             ? bycorf::TlsClientAuth::kOptional
-                             : bycorf::TlsClientAuth::kNo});
-    if (!context.ok()) return context.status();
-    core->tls_context_ = *context;
+    LAVIK_ASSIGN_OR_RETURN(
+        core->tls_context_,
+        bycorf::TlsContext::CreateServer(
+            {.cert_file_ = o.tls_cert_file_,
+             .key_file_ = o.tls_key_file_,
+             .ca_cert_file_ = o.tls_ca_cert_file_,
+             .client_auth_ = o.tls_auth_clients_ == "yes"
+                                 ? bycorf::TlsClientAuth::kRequired
+                             : o.tls_auth_clients_ == "optional"
+                                 ? bycorf::TlsClientAuth::kOptional
+                                 : bycorf::TlsClientAuth::kNo}));
   }
   return std::shared_ptr<MetaSentinelServer>(
       new MetaSentinelServer(std::move(core)));

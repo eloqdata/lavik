@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -154,7 +155,7 @@ StorageEngine::Impl::CollectGroupedRetirements(
   } else {
     previous->ForEachRecord(collect);
   }
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(status);
   if (!result.empty()) {
     auto owner = std::make_shared<GroupedRetirementCharge>();
     owner->charge_.Adopt(&*reservation,
@@ -203,7 +204,7 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
     std::unique_ptr<GroupedRetirementPins>* pins) {
   if (previous == nullptr) co_return absl::OkStatus();
   auto records = CollectGroupedRetirements(previous, nullptr, touched);
-  if (!records.ok()) co_return records.status();
+  LAVIK_CO_RETURN_IF_ERROR(records.status());
   if (include_root && previous->version().root_.tx_tagged()) {
     // TTL-only writes have an empty child set, but still supersede a tagged
     // root. Its transaction block can belong to another physical owner after
@@ -325,11 +326,10 @@ Task<absl::Status> StorageEngine::Impl::ClearGroupedUndoSlots(
     if (current->value_.grouped()) continue;
     std::string external_key;
     if (!current->key_complete()) {
-      auto key =
+      LAVIK_ASSIGN_OR_CO_RETURN(
+          external_key,
           co_await LoadOutOfIndexKey(store, MaterializeIndexLocation(*current),
-                                     current->logical_key_size());
-      if (!key.ok()) co_return key.status();
-      external_key = std::move(*key);
+                                     current->logical_key_size()));
     }
     const auto key = current->key_complete() ? current->key()
                                              : std::string_view(external_key);

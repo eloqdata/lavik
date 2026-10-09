@@ -22,6 +22,7 @@
 #include "lavik/fault_pause.h"
 #include "lavik/memory.h"
 #include "lavik/replication_command.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -258,7 +259,7 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   // maxmemory cannot cover the successor, enabling replication fails cleanly
   // instead of letting the first rollover discover the missing reservation.
   auto standby = AllocateReplicationLogBlock();
-  if (!standby.ok()) co_return standby.status();
+  LAVIK_CO_RETURN_IF_ERROR(standby.status());
   log.publisher_staging_charge_.Adopt(&*staging, staging_bytes);
   log.state_ = ReplicationLogState::kActive;
   log.log_epoch_ = log_epoch;
@@ -741,7 +742,7 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
 
   auto admission = co_await AcquireReplicationPublisherAdmission(*staging_bytes,
                                                                  std::nullopt);
-  if (!admission.ok()) co_return admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(admission.status());
 
   auto publication = PrepareAdmittedReplicationCommand(
       *admission, ReplicationEventKind::kEphemeral, partition_id,
@@ -969,9 +970,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog(
       break;
     }
     if (cancelled) {
-      auto waited = co_await bycorf::SleepFor(*store.worker_,
-                                              std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
     } else {
       co_await log.publisher_capacity_ready_.Wait();
     }
@@ -1024,14 +1024,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog(
     if (cancelled) {
       if (cancelled())
         co_return absl::CancelledError("publisher fence cancelled");
-      auto waited = co_await bycorf::SleepFor(*store.worker_,
-                                              std::chrono::milliseconds(1));
-      if (!waited.ok()) co_return waited;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
     } else {
       co_await fence->ready_.Wait();
     }
   }
-  if (!fence->status_.ok()) co_return fence->status_;
+  LAVIK_CO_RETURN_IF_ERROR(fence->status_);
   co_return fence->next_lsn_;
 }
 
@@ -1293,9 +1292,8 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushReplication(
     else
       co_await bycorf::SubmitTaskTo(target, std::move(publish));
     LAVIK_FAULT_INJECT(if (target == 0) {
-      auto paused = co_await fault_injection::PauseWhileFileExists(
-          "LAVIK_FLUSH_AFTER_FIRST_FLOW_HOLD_FILE");
-      if (!paused.ok()) co_return paused;
+      LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_FLUSH_AFTER_FIRST_FLOW_HOLD_FILE"));
     });
   }
   co_return absl::OkStatus();
@@ -1493,7 +1491,7 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     log.standby_block_.reset();
   } else {
     auto allocated = AllocateReplicationLogBlock();
-    if (!allocated.ok()) co_return allocated.status();
+    LAVIK_CO_RETURN_IF_ERROR(allocated.status());
     log.blocks_.push_back(std::move(*allocated));
   }
   log.blocks_.back().history_charge_ = std::move(history_charge);
@@ -1569,10 +1567,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     // than one block get dedicated fragment blocks, including a sealed partial
     // final block. Consequently trimming one LSN can never leave its leading
     // fragment behind while retaining later events from the same block.
-    absl::Status sealed = co_await SealReplicationLogActiveBlock(store);
-    if (!sealed.ok()) {
-      co_return sealed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await SealReplicationLogActiveBlock(store));
   }
   const bool multi_block_event = payload_size > frame_payload_capacity;
   std::size_t payload_offset = 0;
@@ -1591,10 +1586,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
         sizeof(ReplicationFrameHeader) +
         (payload_offset < payload_size ? 1 : 0);
     if (remaining_block < minimum_frame_bytes) {
-      absl::Status sealed = co_await SealReplicationLogActiveBlock(store);
-      if (!sealed.ok()) {
-        co_return sealed;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(co_await SealReplicationLogActiveBlock(store));
       continue;
     }
 
@@ -1651,19 +1643,13 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     ++fragment_index;
     emitted = true;
     if (block.committed_bytes_ == kStorageBlockBytes) {
-      absl::Status sealed = co_await SealReplicationLogActiveBlock(store);
-      if (!sealed.ok()) {
-        co_return sealed;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(co_await SealReplicationLogActiveBlock(store));
     }
   } while (!emitted || payload_offset < payload_size);
 
   if (multi_block_event && !log.blocks_.empty() &&
       !log.blocks_.back().sealed_) {
-    absl::Status sealed = co_await SealReplicationLogActiveBlock(store);
-    if (!sealed.ok()) {
-      co_return sealed;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(co_await SealReplicationLogActiveBlock(store));
   }
 
   ++log.next_lsn_;
@@ -1884,9 +1870,8 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     const bool pending = log.standby_refill_pending_;
     log.mutex_.Unlock(*store.worker_);
     if (!pending) break;
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }

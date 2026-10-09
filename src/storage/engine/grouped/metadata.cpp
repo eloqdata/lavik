@@ -16,6 +16,7 @@
 
 #include "../impl.h"
 #include "dependency_guard.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -64,9 +65,8 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
   // graph's commit dependency. Owner-local writes defer that dependency to
   // commit; a shared outer transaction is one decision and never awaits itself.
   GroupedDependencyGuard dependency_guard(*tx, outer_transaction);
-  const auto dependency =
-      co_await PrepareGroupedDependencyLocked(store, previous, tx);
-  if (!dependency.ok()) co_return dependency;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await PrepareGroupedDependencyLocked(store, previous, tx));
   if (EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
       partition.replication_epoch_ != replication_epoch ||
       store.index_generations_[db_id] != index_generation ||
@@ -96,11 +96,11 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
   } else {
     payload = EncodeGroupedHashRoot(previous->directory().root());
   }
-  if (!payload.ok()) co_return payload.status();
+  LAVIK_CO_RETURN_IF_ERROR(payload.status());
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
-  if (!decision.ok()) co_return decision.status();
+  LAVIK_CO_RETURN_IF_ERROR(decision.status());
   auto reserved = side.PreparePublish(key, side.CurrentForMutation(key));
-  if (!reserved.ok()) co_return reserved.status();
+  LAVIK_CO_RETURN_IF_ERROR(reserved.status());
   std::optional<GroupedObjectIndex::Publication> publication(
       std::move(*reserved));
   GroupedObject::PreparedHandle builder;
@@ -120,12 +120,11 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
         }
         auto version = physical;
         version.decision_ = *decision;
-        auto prepared = GroupedObject::PrepareMetadataUpdate(current, version);
-        if (!prepared.ok()) return prepared.status();
-        builder = std::move(*prepared);
+        LAVIK_ASSIGN_OR_RETURN(
+            builder, GroupedObject::PrepareMetadataUpdate(current, version));
         publication.reset();
         auto refreshed = side.PreparePublish(key, current);
-        if (!refreshed.ok()) return refreshed.status();
+        LAVIK_RETURN_IF_ERROR(refreshed.status());
         publication.emplace(std::move(*refreshed));
         return absl::OkStatus();
       },

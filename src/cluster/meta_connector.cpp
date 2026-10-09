@@ -26,6 +26,7 @@
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/metrics.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::cluster::detail {
 namespace {
@@ -176,7 +177,7 @@ MetaConnectSchedule::Connect(bycorf::Worker& worker,
   // Stack-owned attempt slots cannot be released until their connect and
   // deadline CQEs have retired. Cancellation never touches the selected stream.
   while (state.Active()) co_await state.changed_.Wait();
-  if (!result.ok()) co_return result;
+  LAVIK_CO_RETURN_IF_ERROR(result);
   if (stopping.load(std::memory_order_acquire) || worker.stop_requested())
     co_return absl::CancelledError("Meta connection stopped");
   if (state.winner_ != nullptr) co_return std::move(state.winner_);

@@ -22,6 +22,7 @@
 #include "../impl.h"
 #include "lavik/glob.h"
 #include "lavik/random_sample.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
@@ -227,7 +228,7 @@ struct ScanBoundary {
         !RedisGlobMatch(operation.scan_pattern_, entry.value_))
       return absl::OkStatus();
     auto copy = CopyOutput(entry);
-    if (!copy.ok()) return copy.status();
+    LAVIK_RETURN_IF_ERROR(copy.status());
     return AppendOutput(std::move(*copy), result);
   }
   static void Sort(SortedSetResult* result) {
@@ -288,9 +289,8 @@ struct ReadCursor {
       return absl::OkStatus();
     }
     auto copied = CopyOutput(entry);
-    if (!copied.ok()) return copied.status();
-    auto appended = AppendOutput(std::move(*copied), result_);
-    if (!appended.ok()) return appended;
+    LAVIK_RETURN_IF_ERROR(copied.status());
+    LAVIK_RETURN_IF_ERROR(AppendOutput(std::move(*copied), result_));
     if (operation_.limit_ && operation_.count_ >= 0 &&
         result_->members_.size() >=
             static_cast<std::uint64_t>(operation_.count_))
@@ -332,7 +332,7 @@ absl::Status ReadCompact(std::span<const OrderedCollectionEntry> entries,
       for (const auto& entry : entries) {
         if (!BetterLexCandidate(entry, operation, after, candidate)) continue;
         auto copied = CopyOutput(entry);
-        if (!copied.ok()) return copied.status();
+        LAVIK_RETURN_IF_ERROR(copied.status());
         candidate.emplace(std::move(*copied));
       }
       if (!candidate) break;
@@ -342,8 +342,7 @@ absl::Status ReadCompact(std::span<const OrderedCollectionEntry> entries,
         continue;
       }
       skipped.reset();
-      auto appended = AppendOutput(std::move(*candidate), result);
-      if (!appended.ok()) return appended;
+      LAVIK_RETURN_IF_ERROR(AppendOutput(std::move(*candidate), result));
       if (operation.limit_ && operation.count_ >= 0 &&
           result->members_.size() >=
               static_cast<std::uint64_t>(operation.count_))
@@ -353,8 +352,7 @@ absl::Status ReadCompact(std::span<const OrderedCollectionEntry> entries,
   }
   for (std::size_t i = 0; !cursor.done_ && i < entries.size(); ++i) {
     const auto rank = operation.reverse_ ? entries.size() - 1 - i : i;
-    auto status = cursor.Visit(entries[rank], rank);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(cursor.Visit(entries[rank], rank));
   }
   return absl::OkStatus();
 }
@@ -431,8 +429,7 @@ absl::Status PrepareScoreReply(std::size_t count, SortedSetResult* result) {
 absl::Status ApplyInputs(const SortedSetOperation& operation, Members* members,
                          SortedSetResult* result) {
   if (operation.kind_ == SortedSetOperationKind::kScores) {
-    auto allocated = PrepareScoreReply(operation.members_.size(), result);
-    if (!allocated.ok()) return allocated;
+    LAVIK_RETURN_IF_ERROR(PrepareScoreReply(operation.members_.size(), result));
     for (std::size_t i = 0; i < operation.members_.size(); ++i)
       result->scores_[i] = members->at(operation.members_[i]).before_;
     return absl::OkStatus();
@@ -496,8 +493,7 @@ absl::StatusOr<MemoryReservation> ReserveInputs(
   if (count > std::numeric_limits<std::size_t>::max() / 512)
     return absl::ResourceExhaustedError("Sorted Set input size overflow");
   GroupedScratchBudget budget;
-  auto status = budget.AddBytes(count * 512);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(budget.AddBytes(count * 512));
   return budget.Reserve(1);
 }
 
@@ -510,7 +506,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   const auto valid = Validate(operation);
-  if (!valid.ok()) co_return valid;
+  LAVIK_CO_RETURN_IF_ERROR(valid);
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
   co_await store.store_state_mutex_.Lock();
@@ -518,9 +514,8 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found && !found->key_complete()) {
-    auto verified = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!verified.ok()) co_return verified.status();
-    found = *verified;
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        found, co_await FindVerifiedEntry(store, index, digest, key));
   }
   const auto now =
       operation.now_ms_ == 0 ? UnixTimeMillis() : operation.now_ms_;
@@ -530,7 +525,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     // A failed tentative root cannot use its newer TTL to look absent. The
     // checked metadata path validates its decision before applying expiry.
     const auto readable = co_await ReadKeyMetadataLocked(db_id, key, digest);
-    if (!readable.ok()) co_return readable.status();
+    LAVIK_CO_RETURN_IF_ERROR(readable.status());
   }
   if (exists && found->value_.value_type() != ValueType::kSortedSet)
     co_return absl::InvalidArgumentError(
@@ -545,7 +540,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
                  .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
                  .replication_epoch_ = partition.replication_epoch_,
                  .index_generation_ = partition.grouped_generations_[db_id]});
-    if (!view.ok()) co_return view.status();
+    LAVIK_CO_RETURN_IF_ERROR(view.status());
     if (operation.kind_ == SortedSetOperationKind::kLength) co_return result;
     if (!ReadOnly(operation) && CanPrepareGroupedWriteUnlocked(partition)) {
       const auto snapshot =
@@ -556,14 +551,13 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       found = nullptr;
       unlock.Unlock();
       LAVIK_FAULT_INJECT({
-        const auto paused =
-            co_await PauseGroupedWriteForTest(*store.worker_, key, "prepare");
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await PauseGroupedWriteForTest(*store.worker_, key, "prepare"));
       });
       auto prepared = co_await ExecuteGroupedSortedSetLocked(
           store, partition, db_id, key, digest, operation, *view, tx,
           replication, mutation_precondition, &mutation);
-      if (!prepared.ok()) co_return prepared.status();
+      LAVIK_CO_RETURN_IF_ERROR(prepared.status());
       if (plan.changed_ && !plan.delete_key_) {
         if (!mutation.members_)
           co_return absl::InternalError("missing prepared member-index plan");
@@ -571,18 +565,16 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       }
       co_await store.store_state_mutex_.Lock();
       unlock.Adopt();
-      const auto valid = ValidateGroupedWriteSnapshot(
+      LAVIK_CO_RETURN_IF_ERROR(ValidateGroupedWriteSnapshot(
           store, partition, db_id, key, *view, snapshot,
           mutation_precondition != nullptr
               ? mutation_precondition
-              : (tx != nullptr ? &tx->mutation_precondition_ : nullptr));
-      if (!valid.ok()) co_return valid;
+              : (tx != nullptr ? &tx->mutation_precondition_ : nullptr)));
       if (plan.changed_) {
-        const auto committed = co_await CommitGroupedOrderedMutationLocked(
+        LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedOrderedMutationLocked(
             store, partition, db_id, key, digest, *view, std::move(plan),
             (*view)->version().root_.expire_at_ms_, tx, replication,
-            mutation_precondition, &members);
-        if (!committed.ok()) co_return committed;
+            mutation_precondition, &members));
       }
       co_return prepared;
     }
@@ -601,9 +593,8 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       SortedSetResult missing;
       {
         if (operation.kind_ == SortedSetOperationKind::kScores) {
-          auto allocated =
-              PrepareScoreReply(operation.members_.size(), &missing);
-          if (!allocated.ok()) co_return allocated;
+          LAVIK_CO_RETURN_IF_ERROR(
+              PrepareScoreReply(operation.members_.size(), &missing));
         }
       }
       co_return missing;
@@ -615,10 +606,10 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   // compact pipeline for a compact/missing value, never for a grouped graph.
   unlock.Unlock();
   auto input_admission = ReserveInputs(operation);
-  if (!input_admission.ok()) co_return input_admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(input_admission.status());
   Members members;
   auto prepared = PrepareMembers(operation, &members);
-  if (!prepared.ok()) co_return prepared;
+  LAVIK_CO_RETURN_IF_ERROR(prepared);
   // The encoded callback result survives until the compact writer returns.
   // Keep its admission outside the synchronous callback's stack frame.
   std::optional<MemoryReservation> compact_admission;
@@ -631,10 +622,10 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     if (operation.kind_ != SortedSetOperationKind::kRemoveRange) {
       GroupedScratchBudget budget;
       auto status = budget.AddBytes(value ? value->encoded_.size() : 0);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       for (const auto& entry : operation.entries_) {
         status = budget.AddBytes(entry.member_.size() + 256);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
       }
       if (value) {
         if (value->logical_size_ >
@@ -642,31 +633,28 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
           return absl::ResourceExhaustedError(
               "Sorted Set compact count overflow");
         status = budget.AddBytes(value->logical_size_ * 256);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(status);
       }
       auto admission = budget.Reserve(4);
-      if (!admission.ok()) return admission.status();
+      LAVIK_RETURN_IF_ERROR(admission.status());
       compact_admission.emplace(std::move(*admission));
     }
     std::vector<OrderedCollectionEntry> entries;
     if (value) {
-      auto decoded =
+      LAVIK_ASSIGN_OR_RETURN(
+          entries,
           DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
-                                    value->encoded_, value->logical_size_);
-      if (!decoded.ok()) return decoded.status();
-      entries = std::move(*decoded);
+                                    value->encoded_, value->logical_size_));
     }
     result.key_exists_ = value.has_value();
     result.length_ = entries.size();
     if (operation.kind_ == SortedSetOperationKind::kScan) {
       ScanBoundary boundary;
-      auto prepared = boundary.Prepare(operation, entries.size());
-      if (!prepared.ok()) return prepared;
+      LAVIK_RETURN_IF_ERROR(boundary.Prepare(operation, entries.size()));
       for (const auto& entry : entries)
         boundary.Observe(entry, operation.scan_cursor_);
       for (const auto& entry : entries) {
-        auto emitted = boundary.Emit(entry, operation, &result);
-        if (!emitted.ok()) return emitted;
+        LAVIK_RETURN_IF_ERROR(boundary.Emit(entry, operation, &result));
       }
       ScanBoundary::Sort(&result);
       return CompactValueUpdate{};
@@ -675,11 +663,10 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       RandomSelection selection;
       auto status =
           selection.Prepare(entries.size(), operation.count_, true, &result);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(status);
       for (const auto [rank, slot] : selection.draws_) {
-        auto copied = CopyOutput(entries[rank]);
-        if (!copied.ok()) return copied.status();
-        result.members_[slot] = std::move(*copied);
+        LAVIK_ASSIGN_OR_RETURN(result.members_[slot],
+                               CopyOutput(entries[rank]));
       }
       return CompactValueUpdate{};
     }
@@ -702,7 +689,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       }
       auto encoded =
           EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
-      if (!encoded.ok()) return encoded.status();
+      LAVIK_RETURN_IF_ERROR(encoded.status());
       return CompactValueUpdate{.changed_ = true,
                                 .encoded_ = std::move(*encoded),
                                 .logical_size_ = entries.size(),
@@ -714,9 +701,8 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       for (std::size_t i = 0; i < count; ++i) {
         const auto at = operation.reverse_ ? entries.size() - 1 - i : i;
         auto copied = CopyOutput(entries[at]);
-        if (!copied.ok()) return copied.status();
-        auto appended = AppendOutput(std::move(*copied), &result);
-        if (!appended.ok()) return appended;
+        LAVIK_RETURN_IF_ERROR(copied.status());
+        LAVIK_RETURN_IF_ERROR(AppendOutput(std::move(*copied), &result));
       }
       result.changed_ = count;
       result.length_ -= count;
@@ -732,15 +718,14 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       }
       auto encoded =
           EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
-      if (!encoded.ok()) return encoded.status();
+      LAVIK_RETURN_IF_ERROR(encoded.status());
       return CompactValueUpdate{.changed_ = true,
                                 .encoded_ = std::move(*encoded),
                                 .logical_size_ = entries.size(),
                                 .expire_at_ms_ = std::nullopt};
     }
     if (ScanRead(operation)) {
-      auto read = ReadCompact(entries, operation, &result);
-      if (!read.ok()) return read;
+      LAVIK_RETURN_IF_ERROR(ReadCompact(entries, operation, &result));
       return CompactValueUpdate{};
     }
     for (const auto& entry : entries) {
@@ -752,7 +737,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       }
     }
     auto status = ApplyInputs(operation, &members, &result);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     if (ReadOnly(operation) || result.changed_ == 0)
       return CompactValueUpdate{};
     std::erase_if(entries, [&](const auto& entry) {
@@ -771,7 +756,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     }
     auto encoded =
         EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
-    if (!encoded.ok()) return encoded.status();
+    LAVIK_RETURN_IF_ERROR(encoded.status());
     return CompactValueUpdate{.changed_ = true,
                               .encoded_ = std::move(*encoded),
                               .logical_size_ = entries.size(),
@@ -785,10 +770,9 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       operation.prepare_unlocked_ &&
       (operation.kind_ == SortedSetOperationKind::kAdd ||
        operation.kind_ == SortedSetOperationKind::kRemove);
-  const auto status = co_await ExecuteCompactLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await ExecuteCompactLocked(
       db_id, key, digest, ValueType::kSortedSet, ReadOnly(operation), callback,
-      tx, now, replication, prepare_unlocked, mutation_precondition);
-  if (!status.ok()) co_return status;
+      tx, now, replication, prepare_unlocked, mutation_precondition));
   co_return result;
 }
 
@@ -805,10 +789,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           OrderedCollectionKind::kSortedSet)
     co_return absl::DataLossError("invalid grouped Sorted Set view");
   auto input_admission = ReserveInputs(operation);
-  if (!input_admission.ok()) co_return input_admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(input_admission.status());
   Members members;
   auto status = PrepareMembers(operation, &members);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   const auto& directory = object->ordered_directory();
   const auto& metadata = directory.groups();
   SortedSetResult result;
@@ -841,8 +825,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         !object->SameLogicalRoot(*current))
       return absl::NotFoundError(
           "Sorted Set logical view changed before admission");
-    const auto readable = current->ReadStatus();
-    if (!readable.ok()) return readable;
+    LAVIK_RETURN_IF_ERROR(current->ReadStatus());
     const auto* entry = current->FindGroup({metadata[i].id_, 0});
     if (!entry) return absl::DataLossError("missing Sorted Set physical page");
     return budget->AddGroup(*entry, current->ExtentsFor({metadata[i].id_, 0}));
@@ -879,8 +862,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (auto found = probed_pages.find(i); found != probed_pages.end()) {
         // Owned payloads survive GC relocation, but not logical replacement.
         GroupedScratchBudget budget;
-        auto valid = add_page_budget(&budget, i);
-        if (!valid.ok()) co_return valid;
+        LAVIK_CO_RETURN_IF_ERROR(add_page_budget(&budget, i));
         auto page = std::move(found->second);
         probed_pages.erase(found);
         co_return page;
@@ -901,10 +883,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
     }
     GroupedScratchBudget budget;
-    auto checked = add_page_budget(&budget, i);
-    if (!checked.ok()) co_return checked;
+    LAVIK_CO_RETURN_IF_ERROR(add_page_budget(&budget, i));
     auto admission = budget.Reserve(2);
-    if (!admission.ok()) co_return admission.status();
+    LAVIK_CO_RETURN_IF_ERROR(admission.status());
     auto load = [&] {
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
@@ -914,7 +895,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                                         object, metadata[i].id_);
     };
     auto page = co_await load();
-    if (!page.ok()) co_return page.status();
+    LAVIK_CO_RETURN_IF_ERROR(page.status());
     co_return ResultPage{std::move(*admission), std::move(*page)};
   };
   auto read_page = [&](std::size_t i) {
@@ -951,16 +932,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                            .members_ = removed},
         object, tx, replication, mutation_precondition, prepared,
         ordered_probe);
-    if (!deleted.ok()) co_return deleted.status();
+    LAVIK_CO_RETURN_IF_ERROR(deleted.status());
     result.changed_ = deleted->changed_;
     result.length_ = deleted->length_;
     co_return absl::OkStatus();
   };
   if (operation.kind_ == SortedSetOperationKind::kRandom) {
     RandomSelection selection;
-    auto selected =
-        selection.Prepare(result.length_, operation.count_, false, &result);
-    if (!selected.ok()) co_return selected;
+    LAVIK_CO_RETURN_IF_ERROR(
+        selection.Prepare(result.length_, operation.count_, false, &result));
     std::size_t draw = 0;
     while (draw < selection.draws_.size()) {
       const auto position = directory.FindRank(selection.draws_[draw].first);
@@ -968,7 +948,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         co_return absl::DataLossError("Sorted Set random rank missing");
       const auto i = position->group_index_;
       auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       const auto& entries = page->page_.entries_;
       do {
         const auto [rank, slot] = selection.draws_[draw];
@@ -977,9 +957,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         if (at->offset_ >= entries.size())
           co_return absl::DataLossError(
               "Sorted Set random page cardinality mismatch");
-        auto copied = CopyOutput(entries[at->offset_]);
-        if (!copied.ok()) co_return copied.status();
-        result.members_[slot] = std::move(*copied);
+        LAVIK_ASSIGN_OR_CO_RETURN(result.members_[slot],
+                                  CopyOutput(entries[at->offset_]));
         ++draw;
       } while (draw < selection.draws_.size());
     }
@@ -987,21 +966,19 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   }
   if (operation.kind_ == SortedSetOperationKind::kScan) {
     ScanBoundary boundary;
-    auto prepared = boundary.Prepare(operation, result.length_);
-    if (!prepared.ok()) co_return prepared;
+    LAVIK_CO_RETURN_IF_ERROR(boundary.Prepare(operation, result.length_));
     for (std::size_t i = 0; i < metadata.size(); ++i) {
       auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       for (const auto& entry : page->page_.entries_)
         boundary.Observe(entry, operation.scan_cursor_);
     }
     if (boundary.prefixes_.empty()) co_return result;
     for (std::size_t i = 0; i < metadata.size(); ++i) {
       auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       for (const auto& entry : page->page_.entries_) {
-        auto emitted = boundary.Emit(entry, operation, &result);
-        if (!emitted.ok()) co_return emitted;
+        LAVIK_CO_RETURN_IF_ERROR(boundary.Emit(entry, operation, &result));
       }
     }
     ScanBoundary::Sort(&result);
@@ -1016,22 +993,20 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       const auto i =
           operation.reverse_ ? metadata.size() - 1 - ordinal : ordinal;
       auto page = co_await read_owned_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       const auto& entries = page->page_.snapshot_.entries_;
       for (std::size_t j = 0;
            result.members_.size() < count && j < entries.size(); ++j) {
         const auto at = operation.reverse_ ? entries.size() - 1 - j : j;
         auto copied = CopyOutput(entries[at]);
-        if (!copied.ok()) co_return copied.status();
-        auto appended = AppendOutput(std::move(*copied), &result);
-        if (!appended.ok()) co_return appended;
+        LAVIK_CO_RETURN_IF_ERROR(copied.status());
+        LAVIK_CO_RETURN_IF_ERROR(AppendOutput(std::move(*copied), &result));
       }
       retain_probe(i, std::move(*page));
     }
     if (result.members_.size() != count)
       co_return absl::DataLossError("Sorted Set pop cardinality mismatch");
-    auto deleted = co_await remove_selected();
-    if (!deleted.ok()) co_return deleted;
+    LAVIK_CO_RETURN_IF_ERROR(co_await remove_selected());
     co_return result;
   }
   if (ScanRead(operation) && operation.kind_ != SortedSetOperationKind::kRank) {
@@ -1057,12 +1032,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         std::optional<SortedSetMember> candidate;
         for (std::size_t i = 0; i < metadata.size(); ++i) {
           auto page = co_await read_page(i);
-          if (!page.ok()) co_return page.status();
+          LAVIK_CO_RETURN_IF_ERROR(page.status());
           for (const auto& entry : page->page_.entries_) {
             if (!BetterLexCandidate(entry, operation, after, candidate))
               continue;
             auto copied = CopyOutput(entry);
-            if (!copied.ok()) co_return copied.status();
+            LAVIK_CO_RETURN_IF_ERROR(copied.status());
             candidate.emplace(std::move(*copied));
           }
         }
@@ -1073,8 +1048,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           continue;
         }
         skipped.reset();
-        auto appended = AppendOutput(std::move(*candidate), &result);
-        if (!appended.ok()) co_return appended;
+        LAVIK_CO_RETURN_IF_ERROR(AppendOutput(std::move(*candidate), &result));
         if (operation.limit_ && operation.count_ >= 0 &&
             result.members_.size() >=
                 static_cast<std::uint64_t>(operation.count_))
@@ -1105,19 +1079,17 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
          !cursor.done_ && ordinal < end_page - first_page; ++ordinal) {
       const auto i = reverse ? end_page - 1 - ordinal : first_page + ordinal;
       auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       const auto& entries = page->page_.entries_;
       if (reverse) rank -= entries.size();
       for (std::size_t j = 0; !cursor.done_ && j < entries.size(); ++j) {
         const auto index = reverse ? entries.size() - 1 - j : j;
-        auto visited = cursor.Visit(entries[index], rank + index);
-        if (!visited.ok()) co_return visited;
+        LAVIK_CO_RETURN_IF_ERROR(cursor.Visit(entries[index], rank + index));
       }
       if (!reverse) rank += entries.size();
     }
     if (operation.kind_ == SortedSetOperationKind::kRemoveRange) {
-      auto deleted = co_await remove_selected();
-      if (!deleted.ok()) co_return deleted;
+      LAVIK_CO_RETURN_IF_ERROR(co_await remove_selected());
       // Names are needed only through selection and atomic writer
       // preparation.
       result.members_.clear();
@@ -1155,15 +1127,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!physical)
         co_return absl::DataLossError("missing member prefix page");
       GroupedScratchBudget budget;
-      auto checked = budget.AddGroup(*physical, current->ExtentsFor(id));
-      if (!checked.ok()) co_return checked;
+      LAVIK_CO_RETURN_IF_ERROR(
+          budget.AddGroup(*physical, current->ExtentsFor(id)));
       auto admission = budget.Reserve(2);
-      if (!admission.ok()) co_return admission.status();
+      LAVIK_CO_RETURN_IF_ERROR(admission.status());
       auto retain_score = [&](const auto& entry) -> absl::Status {
         const auto requested = members.find(entry.field_);
         if (requested == members.end()) return absl::OkStatus();
         auto score = DecodeSortedSetMemberScore(entry.value_);
-        if (!score.ok()) return score.status();
+        LAVIK_RETURN_IF_ERROR(score.status());
         requested->second.before_ = requested->second.after_ = *score;
         ++remaining_sources;
         return absl::OkStatus();
@@ -1172,7 +1144,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           operation.kind_ == SortedSetOperationKind::kRank) {
         auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                                   digest, object, id);
-        if (!leaf.ok()) co_return leaf.status();
+        LAVIK_CO_RETURN_IF_ERROR(leaf.status());
         const auto bytes = leaf->loaded_.value();
         const std::string_view payload(
             reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -1183,15 +1155,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         status = VisitHashGroupFields(payload, leaf->field_count_, id,
                                       object->directory().root().seed_,
                                       retain_score);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(status);
         continue;
       }
       auto leaf = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                  digest, object, id);
-      if (!leaf.ok()) co_return leaf.status();
+      LAVIK_CO_RETURN_IF_ERROR(leaf.status());
       for (const auto& entry : leaf->snapshot_.value_.entries_) {
         status = retain_score(entry);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(status);
       }
       // Point writes need this same leaf again to replace its member score.
       // Retain only one admitted leaf, never a batch-sized payload cache.
@@ -1203,7 +1175,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     if (operation.kind_ == SortedSetOperationKind::kScores) {
       status = ApplyInputs(operation, &members, &result);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       co_return result;
     }
   }
@@ -1218,7 +1190,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     const auto end = directory.UpperBoundScore(*score);
     for (std::size_t i = first; i < end; ++i) {
       auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       const auto& entries = page->page_.entries_;
       for (std::size_t j = 0; j < entries.size(); ++j) {
         if (entries[j].value_ != member) continue;
@@ -1257,9 +1229,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   for (const auto& [i, page] : probed_pages) {
     GroupedScratchBudget budget;
     status = add_page_budget(&budget, i);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
     auto located = locate_sources(i, page.page_.snapshot_.entries_);
-    if (!located.ok()) co_return located.status();
+    LAVIK_CO_RETURN_IF_ERROR(located.status());
   }
   // The two resident doubles bound old-score candidates without reading
   // unrelated pages. Equal-score runs still scan for exact members. Sort
@@ -1282,9 +1254,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
          i < end && remaining_sources != 0; ++i) {
       if (probed_pages.contains(i)) continue;
       auto page = co_await read_owned_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       auto located = locate_sources(i, page->page_.snapshot_.entries_);
-      if (!located.ok()) co_return located.status();
+      LAVIK_CO_RETURN_IF_ERROR(located.status());
       // Equal-score scans may touch unrelated pages. Retain only pages with
       // requested members, so a point update never caches the whole set.
       if (*located) retain_probe(i, std::move(*page));
@@ -1295,7 +1267,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     co_return absl::DataLossError(
         "member index refers to missing ordered member");
   status = ApplyInputs(operation, &members, &result);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   if (ReadOnly(operation) || result.changed_ == 0) co_return result;
   std::optional<MemoryReservation> working_admission;
   OrderedCollectionMutationPlan plan{.root_ = directory.root(),
@@ -1309,11 +1281,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       prepared->plan_ = std::move(plan);
       co_return result;
     }
-    auto written = co_await CommitGroupedOrderedMutationLocked(
+    LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(plan),
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition);
-    if (!written.ok()) co_return written;
+        mutation_precondition));
     co_return result;
   }
 
@@ -1346,7 +1317,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         if (*state->after_ == metadata[i].max_score_) {
           if (!boundary) {
             auto page = co_await read_owned_page(i);
-            if (!page.ok()) co_return page.status();
+            LAVIK_CO_RETURN_IF_ERROR(page.status());
             boundary.emplace(std::move(*page));
           }
           if (member > boundary->page_.snapshot_.entries_.back().value_) break;
@@ -1372,18 +1343,18 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   if (selected.size() > std::numeric_limits<std::size_t>::max() / 128)
     co_return absl::ResourceExhaustedError("Sorted Set page metadata overflow");
   status = budget.AddBytes(selected.size() * 128);
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(status);
   for (const auto i : selected) {
     status = add_page_budget(&budget, i);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   for (const auto& [member, state] : members) {
     if (!state.touched_ || !state.after_) continue;
     status = budget.AddBytes(member.size() + 256);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
   auto admission = budget.Reserve(4);
-  if (!admission.ok()) co_return admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(admission.status());
   working_admission.emplace(std::move(*admission));
   auto check_plan_read = [&](std::size_t i) -> absl::Status {
     LAVIK_FAULT_INJECT(
@@ -1401,15 +1372,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   for (const auto i : modified) {
     if (probed_pages.contains(i)) {
       auto page = co_await read_owned_page(i);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       loaded.emplace(i, std::move(page->page_.snapshot_));
       // working_admission now covers the transferred strings.
     } else {
       status = check_plan_read(i);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       auto page = co_await LoadOrderedGroupSnapshot(
           store, partition, db_id, key, digest, object, metadata[i].id_);
-      if (!page.ok()) co_return page.status();
+      LAVIK_CO_RETURN_IF_ERROR(page.status());
       loaded.emplace(i, std::move(page->snapshot_));
     }
   }
@@ -1435,7 +1406,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   for (const auto i : modified) {
     if (!modified.contains(i + 1)) continue;
     auto balanced = RebalanceSortedSetGroupPair(loaded.at(i), loaded.at(i + 1));
-    if (!balanced.ok()) co_return balanced.status();
+    LAVIK_CO_RETURN_IF_ERROR(balanced.status());
   }
 
   struct Route {
@@ -1471,7 +1442,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         continue;
       }
       auto split = SplitOrderedGroup(std::move(page), next_id);
-      if (!split.ok()) co_return split.status();
+      LAVIK_CO_RETURN_IF_ERROR(split.status());
       next_id = split->next_group_id_;
       for (auto& part : split->groups_) {
         route.push_back({part.id_, i, plan.writes_.size()});
@@ -1493,12 +1464,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         const auto& old = metadata[at.source_];
         if (old.previous_ == previous && old.next_ == following) continue;
         status = check_plan_read(at.source_);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(status);
         // Revalidate the captured logical view and current physical
         // location through the ordinary loader, including GC retry checks.
         auto neighbor = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object, old.id_);
-        if (!neighbor.ok()) co_return neighbor.status();
+        LAVIK_CO_RETURN_IF_ERROR(neighbor.status());
         at.write_ = plan.writes_.size();
         plan.writes_.push_back(std::move(neighbor->snapshot_));
       }
@@ -1526,17 +1497,16 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     LAVIK_FAULT_INJECT({
       if (prepared != nullptr) {
-        const auto paused =
-            co_await PauseGroupedWriteForTest(*store.worker_, key, "members");
-        if (!paused.ok()) co_return paused;
+        LAVIK_CO_RETURN_IF_ERROR(
+            co_await PauseGroupedWriteForTest(*store.worker_, key, "members"));
       }
     });
-    auto built = co_await PrepareSortedSetMembers(
-        store, partition, db_id, key, digest, object, plan, prepared != nullptr,
-        std::span<const SortedSetMemberChange>(changes),
-        member_probe ? &*member_probe : nullptr);
-    if (!built.ok()) co_return built.status();
-    member_mutation = std::move(*built);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        member_mutation, co_await PrepareSortedSetMembers(
+                             store, partition, db_id, key, digest, object, plan,
+                             prepared != nullptr,
+                             std::span<const SortedSetMemberChange>(changes),
+                             member_probe ? &*member_probe : nullptr));
   }
   if (prepared != nullptr) {
     prepared->pages_ = std::move(*working_admission);
@@ -1544,11 +1514,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     prepared->members_.emplace(std::move(member_mutation));
     co_return result;
   }
-  auto written = co_await CommitGroupedOrderedMutationLocked(
+  LAVIK_CO_RETURN_IF_ERROR(co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition, &member_mutation);
-  if (!written.ok()) co_return written;
+      mutation_precondition, &member_mutation));
   co_return result;
 }
 

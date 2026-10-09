@@ -28,6 +28,8 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+
+#include "lavik/status_macros.h"
 #ifndef NDEBUG
 #include <thread>
 #endif
@@ -207,17 +209,14 @@ class CowArray {
     CowArray result;
     if (values.empty()) return result;
     if (values.size() <= ChunkEntries) {
-      auto chunk = AllocateChunk(values.size(), values);
-      if (!chunk.ok()) return chunk.status();
-      result.root_ = std::move(*chunk);
+      LAVIK_ASSIGN_OR_RETURN(result.root_,
+                             AllocateChunk(values.size(), values));
     } else {
       const auto chunks = 1 + (values.size() - 1) / ChunkEntries;
       for (auto remaining = (chunks - 1) >> kBranchBits; remaining != 0;
            remaining >>= kBranchBits)
         result.root_shift_ += kBranchBits;
-      auto root = Build(values, result.root_shift_);
-      if (!root.ok()) return root.status();
-      result.root_ = std::move(*root);
+      LAVIK_ASSIGN_OR_RETURN(result.root_, Build(values, result.root_shift_));
     }
     result.size_ = values.size();
     return result;
@@ -235,14 +234,14 @@ class CowArray {
     const auto size = size_ + values.size();
     if (size > ChunkEntries && result.root_.get()->capacity_ != 0) {
       auto root = AllocateBranch(nullptr);
-      if (!root.ok()) return root.status();
+      LAVIK_RETURN_IF_ERROR(root.status());
       static_cast<Branch*>(root->get())->children_[0] = std::move(result.root_);
       result.root_ = std::move(*root);
     }
     const auto last_chunk = (size - 1) / ChunkEntries;
     while ((last_chunk >> result.root_shift_) >= kBranchEntries) {
       auto root = AllocateBranch(nullptr);
-      if (!root.ok()) return root.status();
+      LAVIK_RETURN_IF_ERROR(root.status());
       static_cast<Branch*>(root->get())->children_[0] = std::move(result.root_);
       result.root_ = std::move(*root);
       result.root_shift_ += kBranchBits;
@@ -250,7 +249,7 @@ class CowArray {
     auto index = size_;
     while (!values.empty()) {
       auto slot = result.MutableChunkSlot(index / ChunkEntries);
-      if (!slot.ok()) return slot.status();
+      LAVIK_RETURN_IF_ERROR(slot.status());
       auto& link = **slot;
       const auto offset = index % ChunkEntries;
       const auto count = std::min(ChunkEntries - offset, values.size());
@@ -259,11 +258,11 @@ class CowArray {
       if (!chunk || link.use_count() != 1 || chunk->capacity_ < needed) {
         const auto capacity =
             GrowthCapacity(chunk ? chunk->capacity_ : 0, needed);
-        auto detached = AllocateChunk(
-            capacity, chunk ? std::span<const T>(chunk->data(), chunk->size_)
-                            : std::span<const T>{});
-        if (!detached.ok()) return detached.status();
-        link = std::move(*detached);
+        LAVIK_ASSIGN_OR_RETURN(
+            link,
+            AllocateChunk(capacity, chunk ? std::span<const T>(chunk->data(),
+                                                               chunk->size_)
+                                          : std::span<const T>{}));
         chunk = static_cast<Chunk*>(link.get());
       }
       std::uninitialized_copy_n(values.begin(), count, chunk->data() + offset);
@@ -292,14 +291,13 @@ class CowArray {
   absl::Status Set(std::size_t index, const T& value) {
     assert(index < size());
     auto slot = MutableChunkSlot(index / ChunkEntries);
-    if (!slot.ok()) return slot.status();
+    LAVIK_RETURN_IF_ERROR(slot.status());
     auto& link = **slot;
     auto* chunk = static_cast<Chunk*>(link.get());
     if (link.use_count() != 1) {
-      auto replacement = AllocateChunk(
-          chunk->capacity_, std::span<const T>(chunk->data(), chunk->size_));
-      if (!replacement.ok()) return replacement.status();
-      link = std::move(*replacement);
+      LAVIK_ASSIGN_OR_RETURN(
+          link, AllocateChunk(chunk->capacity_,
+                              std::span<const T>(chunk->data(), chunk->size_)));
       chunk = static_cast<Chunk*>(link.get());
     }
     chunk->data()[index % ChunkEntries] = value;
@@ -392,10 +390,8 @@ class CowArray {
     if (link->get()->capacity_ != 0) return link;
     for (auto shift = root_shift_;; shift -= kBranchBits) {
       if (!*link || link->use_count() != 1) {
-        auto replacement =
-            AllocateBranch(static_cast<const Branch*>(link->get()));
-        if (!replacement.ok()) return replacement.status();
-        *link = std::move(*replacement);
+        LAVIK_ASSIGN_OR_RETURN(
+            *link, AllocateBranch(static_cast<const Branch*>(link->get())));
       }
       link = &static_cast<Branch*>(link->get())
                   ->children_[(index >> shift) & (kBranchEntries - 1)];
@@ -404,15 +400,15 @@ class CowArray {
   }
   static absl::StatusOr<Link> Build(std::span<const T> values, unsigned shift) {
     auto root = AllocateBranch(nullptr);
-    if (!root.ok()) return root.status();
+    LAVIK_RETURN_IF_ERROR(root.status());
     auto& children = static_cast<Branch*>(root->get())->children_;
     const auto child_entries = (std::size_t{1} << shift) * ChunkEntries;
     for (std::size_t slot = 0; !values.empty(); ++slot) {
       const auto count = std::min(child_entries, values.size());
-      auto child = shift == 0 ? AllocateChunk(count, values.first(count))
-                              : Build(values.first(count), shift - kBranchBits);
-      if (!child.ok()) return child.status();
-      children[slot] = std::move(*child);
+      LAVIK_ASSIGN_OR_RETURN(
+          children[slot],
+          shift == 0 ? AllocateChunk(count, values.first(count))
+                     : Build(values.first(count), shift - kBranchBits));
       values = values.subspan(count);
     }
     return root;

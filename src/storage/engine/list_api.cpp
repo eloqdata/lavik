@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -44,7 +45,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPushLocked(
   operation.values_.assign(values.begin(), values.end());
   auto result = co_await ExecuteListLocked(db_id, key, digest, operation, tx,
                                            replication, mutation_precondition);
-  if (!result.ok()) co_return result.status();
+  LAVIK_CO_RETURN_IF_ERROR(result.status());
   co_return result->length_;
 }
 

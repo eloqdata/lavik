@@ -37,6 +37,7 @@
 #include "lavik/cluster/topology.h"
 #include "lavik/numeric_endpoint.h"
 #include "lavik/replication_group.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::cluster {
 namespace {
@@ -447,7 +448,7 @@ absl::StatusOr<PreparedFullState> PrepareNodeControlState(
   }
   auto prepared =
       PrepareMetaFullState(local, local_node_id, request_worker_count);
-  if (!prepared.ok()) return prepared.status();
+  LAVIK_RETURN_IF_ERROR(prepared.status());
   ServingStateBuilder builder;
   builder.SetInFlightStripeCount(request_worker_count);
   builder.SetTopologyEpoch(state.routing.revision);
@@ -516,9 +517,7 @@ absl::StatusOr<PreparedFullState> PrepareNodeControlState(
     builder.AddGroup(std::move(group));
   }
   for (auto& node : descriptors) builder.AddNode(std::move(node));
-  auto serving = builder.Build();
-  if (!serving.ok()) return serving.status();
-  prepared->serving_state_ = std::move(*serving);
+  LAVIK_ASSIGN_OR_RETURN(prepared->serving_state_, builder.Build());
   return prepared;
 }
 

@@ -22,6 +22,7 @@
 #include <tuple>
 
 #include "lavik/local_shared_ptr.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -337,7 +338,7 @@ absl::StatusOr<NodeHandle> BuildPhysical(
     const std::shared_ptr<ScanHashMapEntryArena>& arena) {
   if (records.empty()) return NodeHandle{};
   auto node = AllocateLocalObject<GroupIndexNode>(arena);
-  if (!node.ok()) return node.status();
+  LAVIK_RETURN_IF_ERROR(node.status());
   (*node)->size_ = records.size();
   (*node)->representative_ = records.front().id_;
   if (records.size() > kGroupIndexPageEntries) {
@@ -355,13 +356,13 @@ absl::StatusOr<NodeHandle> BuildPhysical(
     for (unsigned branch = 0; branch != 2; ++branch) {
       auto child =
           BuildPhysical(branch ? records.subspan(n) : records.first(n), arena);
-      if (!child.ok()) return child.status();
+      LAVIK_RETURN_IF_ERROR(child.status());
       (*node)->children_[branch] = std::move(*child);
     }
     return NodeHandle(std::move(*node));
   }
   auto page = AllocateLocalObject<GroupIndexPage>(arena);
-  if (!page.ok()) return page.status();
+  LAVIK_RETURN_IF_ERROR(page.status());
   const auto arrays_bytes =
       AllocatorUsableSizeForRequest(records.size() * sizeof(GroupedRecordId)) +
       AllocatorUsableSizeForRequest(records.size() * sizeof(RecordIndexValue));
@@ -385,8 +386,7 @@ absl::StatusOr<NodeHandle> BuildPhysical(
       const std::string_view key(bytes.data(), bytes.size());
       // Build callers own copies already admitted by CopyManifest, including
       // unchanged manifests shared from an old immutable page.
-      const auto inserted = Insert((*page)->extents_, key, record.extents_);
-      if (!inserted.ok()) return inserted;
+      LAVIK_RETURN_IF_ERROR(Insert((*page)->extents_, key, record.extents_));
     }
   }
   (*node)->page_ = std::move(*page);
@@ -438,9 +438,9 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
                                           changed.front().id_);
       if (found != page.ids_.end() && *found == changed.front().id_) {
         auto replacement = AllocateLocalObject<GroupIndexNode>(arena);
-        if (!replacement.ok()) return replacement.status();
+        LAVIK_RETURN_IF_ERROR(replacement.status());
         auto copied = AllocateLocalObject<GroupIndexPage>(arena);
-        if (!copied.ok()) return copied.status();
+        LAVIK_RETURN_IF_ERROR(copied.status());
         const auto arrays_bytes =
             AllocatorUsableSizeForRequest(page.ids_.size() *
                                           sizeof(GroupedRecordId)) +
@@ -499,7 +499,7 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
     return BuildPhysical(merged, arena);
   }
   auto replacement = AllocateLocalObject<GroupIndexNode>(arena);
-  if (!replacement.ok()) return replacement.status();
+  LAVIK_RETURN_IF_ERROR(replacement.status());
   // An insertion can diverge inside a skipped prefix. Wrap the existing
   // subtree at that earlier bit, sharing it unchanged on its old branch;
   // descend into its children only when reaching its actual branch bit.
@@ -522,7 +522,7 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
                    : NodeHandle{});
     auto child = UpdatePhysical(
         previous, branch ? changed.subspan(n) : changed.first(n), arena);
-    if (!child.ok()) return child.status();
+    LAVIK_RETURN_IF_ERROR(child.status());
     (*replacement)->children_[branch] = std::move(*child);
     if ((*replacement)->children_[branch]) {
       (*replacement)->size_ += (*replacement)->children_[branch]->size_;
@@ -646,7 +646,7 @@ absl::StatusOr<bool> TryUpdatePhysicalOverrides(
   }
   auto overlay =
       decltype(output.overrides_)::From(std::span(entries).first(count));
-  if (!overlay.ok()) return overlay.status();
+  LAVIK_RETURN_IF_ERROR(overlay.status());
   output.root_ = previous.root_;
   output.overrides_ = std::move(*overlay);
   return true;
@@ -735,9 +735,9 @@ absl::Status BuildStringPhysical(GroupedPhysicalState& output,
         return absl::DataLossError("missing String index segment");
     }
     auto owner = BuildPhysical(records, output.arena_);
-    if (!owner.ok()) return owner.status();
+    LAVIK_RETURN_IF_ERROR(owner.status());
     auto page = AllocateLocalObject<Page>(output.arena_);
-    if (!page.ok()) return page.status();
+    LAVIK_RETURN_IF_ERROR(page.status());
     (*page)->owner_ = std::move(*owner);
     for (std::size_t i = 0; i < records.size(); ++i) {
       (*page)->entries_[(records[i].id_.prefix_ - 1) % kGroupIndexPageEntries] =
@@ -761,7 +761,7 @@ absl::Status BuildPhysicalState(
   }
   if (previous) {
     auto updated = TryUpdatePhysicalOverrides(output, *previous, changed);
-    if (!updated.ok()) return updated.status();
+    LAVIK_RETURN_IF_ERROR(updated.status());
     if (*updated) return absl::OkStatus();
   }
   absl::InlinedVector<GroupedRecordLocation, 16> folded;
@@ -769,10 +769,10 @@ absl::Status BuildPhysicalState(
     FoldPhysicalOverrides(*previous, changed, folded);
     changed = folded;
   }
-  auto root = previous ? UpdatePhysical(previous->root_, changed, output.arena_)
-                       : BuildPhysical(changed, output.arena_);
-  if (!root.ok()) return root.status();
-  output.root_ = std::move(*root);
+  LAVIK_ASSIGN_OR_RETURN(
+      output.root_,
+      previous ? UpdatePhysical(previous->root_, changed, output.arena_)
+               : BuildPhysical(changed, output.arena_));
   return absl::OkStatus();
 }
 
@@ -805,7 +805,7 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::Create(
     std::shared_ptr<ScanHashMapEntryArena> arena) {
   auto prepared =
       PrepareCreate(version, std::move(directory), locations, std::move(arena));
-  if (!prepared.ok()) return prepared.status();
+  LAVIK_RETURN_IF_ERROR(prepared.status());
   return Handle(std::move(*prepared));
 }
 
@@ -814,8 +814,7 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreateImpl(
     GroupedObjectVersion version, Directory directory,
     std::span<const GroupedRecordLocation> locations,
     std::shared_ptr<ScanHashMapEntryArena> arena) {
-  const auto valid_root = ValidateRoot(version, directory);
-  if (!valid_root.ok()) return valid_root;
+  LAVIK_RETURN_IF_ERROR(ValidateRoot(version, directory));
   if (arena == nullptr) arena = MakeArena();
   if (!arena->externally_admitted() || arena->externally_accounted()) {
     return absl::InvalidArgumentError(
@@ -835,8 +834,7 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreateImpl(
   std::size_t active = 0;
   std::optional<GroupedRecordId> previous;
   for (auto& record : records) {
-    const auto valid = ValidateLocation(record, version, directory);
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(ValidateLocation(record, version, directory));
     const auto& location = record.location_;
     if (previous == record.id_ ||
         !physical_records
@@ -861,9 +859,9 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreateImpl(
           return absl::DataLossError("different groups share an extent block");
         }
       }
-      auto owned = CopyManifest(*record.extents_, arena->allocation_domain());
-      if (!owned.ok()) return owned.status();
-      record.extents_ = std::move(*owned);
+      LAVIK_ASSIGN_OR_RETURN(
+          record.extents_,
+          CopyManifest(*record.extents_, arena->allocation_domain()));
     }
   }
   const auto counts = RecordCounts(directory);
@@ -876,12 +874,11 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareCreateImpl(
     }
   }
   auto physical = AllocateObject<GroupedPhysicalState>(arena);
-  if (!physical.ok()) return physical.status();
+  LAVIK_RETURN_IF_ERROR(physical.status());
   (*physical)->arena_ = arena;
-  const auto built = BuildPhysicalState(**physical, nullptr, records);
-  if (!built.ok()) return built;
+  LAVIK_RETURN_IF_ERROR(BuildPhysicalState(**physical, nullptr, records));
   auto object = AllocateObject<GroupedObject>(arena);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   (*object)->version_ = version;
   (*object)->directory_ = std::move(directory);
   (*object)->physical_ = std::move(*physical);
@@ -916,8 +913,7 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareUpdate(
     return absl::FailedPreconditionError(
         "grouped update changes population or incarnation");
   }
-  const auto valid_root = ValidateRoot(provisional_version, directory);
-  if (!valid_root.ok()) return valid_root;
+  LAVIK_RETURN_IF_ERROR(ValidateRoot(provisional_version, directory));
   auto arena = expected->physical_->arena_;
   // Inline the usual one/two-page update; larger batches still grow normally.
   // This is a temporary allocation optimization, not an admission/batch limit.
@@ -929,8 +925,8 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareUpdate(
   std::int64_t active = expected->group_count();
   std::int64_t fields = expected->directory().root().field_count_;
   for (auto& record : changed) {
-    const auto valid = ValidateLocation(record, provisional_version, directory);
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(
+        ValidateLocation(record, provisional_version, directory));
     if (previous == record.id_)
       return absl::DataLossError("duplicate group update");
     previous = record.id_;
@@ -941,9 +937,9 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareUpdate(
     active += !record.retired_;
     if (!record.retired_) fields += record.location_.logical_size_;
     if (record.extents_) {
-      auto owned = CopyManifest(*record.extents_, arena->allocation_domain());
-      if (!owned.ok()) return owned.status();
-      record.extents_ = std::move(*owned);
+      LAVIK_ASSIGN_OR_RETURN(
+          record.extents_,
+          CopyManifest(*record.extents_, arena->allocation_domain()));
     }
   }
   if (active != directory.root().group_count_ ||
@@ -952,13 +948,12 @@ absl::StatusOr<GroupedObject::PreparedHandle> GroupedObject::PrepareUpdate(
         "group update omits a split retirement or child");
   }
   auto physical = AllocateObject<GroupedPhysicalState>(arena);
-  if (!physical.ok()) return physical.status();
+  LAVIK_RETURN_IF_ERROR(physical.status());
   (*physical)->arena_ = arena;
-  const auto built =
-      BuildPhysicalState(**physical, expected->physical_.get(), changed);
-  if (!built.ok()) return built;
+  LAVIK_RETURN_IF_ERROR(
+      BuildPhysicalState(**physical, expected->physical_.get(), changed));
   auto object = AllocateObject<GroupedObject>(arena);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   (*object)->version_ = provisional_version;
   (*object)->directory_ = std::move(directory);
   (*object)->physical_ = std::move(*physical);
@@ -971,7 +966,7 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::CreateOrdered(
     std::shared_ptr<ScanHashMapEntryArena> arena) {
   auto prepared = PrepareCreateOrdered(version, std::move(directory), locations,
                                        std::move(arena));
-  if (!prepared.ok()) return prepared.status();
+  LAVIK_RETURN_IF_ERROR(prepared.status());
   return Handle(std::move(*prepared));
 }
 
@@ -1006,8 +1001,7 @@ GroupedObject::PrepareUpdateOrdered(
     return absl::FailedPreconditionError(
         "grouped update changes population or incarnation");
   }
-  const auto valid_root = ValidateRoot(provisional_version, directory);
-  if (!valid_root.ok()) return valid_root;
+  LAVIK_RETURN_IF_ERROR(ValidateRoot(provisional_version, directory));
   if (expected->has_member_index() && directory.member_directory() &&
       expected->directory().root() != directory.member_directory()->root() &&
       std::none_of(
@@ -1030,8 +1024,8 @@ GroupedObject::PrepareUpdateOrdered(
   std::int64_t fields = expected->ordered_directory().root().item_count_ *
                         (expected->has_member_index() ? 2 : 1);
   for (auto& record : changed) {
-    const auto valid = ValidateLocation(record, provisional_version, directory);
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(
+        ValidateLocation(record, provisional_version, directory));
     if (previous == record.id_)
       return absl::DataLossError("duplicate group update");
     previous = record.id_;
@@ -1042,9 +1036,9 @@ GroupedObject::PrepareUpdateOrdered(
     active += !record.retired_;
     if (!record.retired_) fields += record.location_.logical_size_;
     if (record.extents_) {
-      auto owned = CopyManifest(*record.extents_, arena->allocation_domain());
-      if (!owned.ok()) return owned.status();
-      record.extents_ = std::move(*owned);
+      LAVIK_ASSIGN_OR_RETURN(
+          record.extents_,
+          CopyManifest(*record.extents_, arena->allocation_domain()));
     }
   }
   const auto* members = directory.member_directory();
@@ -1056,13 +1050,12 @@ GroupedObject::PrepareUpdateOrdered(
         "group update omits a split retirement or child");
   }
   auto physical = AllocateObject<GroupedPhysicalState>(arena);
-  if (!physical.ok()) return physical.status();
+  LAVIK_RETURN_IF_ERROR(physical.status());
   (*physical)->arena_ = arena;
-  const auto built =
-      BuildPhysicalState(**physical, expected->physical_.get(), changed);
-  if (!built.ok()) return built;
+  LAVIK_RETURN_IF_ERROR(
+      BuildPhysicalState(**physical, expected->physical_.get(), changed));
   auto object = AllocateObject<GroupedObject>(arena);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   (*object)->version_ = provisional_version;
   (*object)->directory_ = std::move(directory);
   (*object)->physical_ = std::move(*physical);
@@ -1081,12 +1074,12 @@ GroupedObject::PrepareMetadataUpdate(const Handle& expected,
     return absl::FailedPreconditionError(
         "metadata update changes grouped value");
   }
-  const auto valid = expected->is_ordered()
-                         ? ValidateRoot(version, expected->ordered_directory())
-                         : ValidateRoot(version, expected->directory());
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(
+      expected->is_ordered()
+          ? ValidateRoot(version, expected->ordered_directory())
+          : ValidateRoot(version, expected->directory()));
   auto object = AllocateObject<GroupedObject>(expected->physical_->arena_);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   if (!version.decision_) version.decision_ = expected->version_.decision_;
   (*object)->version_ = std::move(version);
   (*object)->directory_ = expected->directory_;
@@ -1099,11 +1092,10 @@ absl::Status GroupedObject::FinalizeRoot(PreparedHandle& prepared,
   if (!prepared || prepared.use_count() != 1) {
     return absl::FailedPreconditionError("grouped builder is already shared");
   }
-  const auto valid =
+  LAVIK_RETURN_IF_ERROR(
       prepared->is_ordered()
           ? ValidateRoot(exact_version, prepared->ordered_directory())
-          : ValidateRoot(exact_version, prepared->directory());
-  if (!valid.ok()) return valid;
+          : ValidateRoot(exact_version, prepared->directory()));
   const auto& old = prepared->version_;
   if (old.db_epoch_ != exact_version.db_epoch_ ||
       old.replication_epoch_ != exact_version.replication_epoch_ ||
@@ -1128,11 +1120,10 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::RelocateRoot(
     const Handle& expected, GroupedObjectVersion replacement) {
   if (!expected)
     return absl::InvalidArgumentError("missing grouped relocation source");
-  const auto valid =
+  LAVIK_RETURN_IF_ERROR(
       expected->is_ordered()
           ? ValidateRoot(replacement, expected->ordered_directory())
-          : ValidateRoot(replacement, expected->directory());
-  if (!valid.ok()) return valid;
+          : ValidateRoot(replacement, expected->directory()));
   const auto& old = expected->version_;
   if (old.db_epoch_ != replacement.db_epoch_ ||
       old.replication_epoch_ != replacement.replication_epoch_ ||
@@ -1143,7 +1134,7 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::RelocateRoot(
         "root relocation changes logical version");
   }
   auto object = AllocateObject<GroupedObject>(expected->physical_->arena_);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   if (!replacement.decision_)
     replacement.decision_ = expected->version_.decision_;
   (*object)->version_ = std::move(replacement);
@@ -1157,7 +1148,7 @@ GroupedObject::PrepareRootRelocation(const Handle& expected) {
   if (!expected)
     return absl::InvalidArgumentError("missing root relocation source");
   auto object = AllocateObject<GroupedObject>(expected->physical_->arena_);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   (*object)->version_ = expected->version_;
   (*object)->directory_ = expected->directory_;
   (*object)->physical_ = expected->physical_;
@@ -1171,8 +1162,7 @@ absl::Status GroupedObject::FinalizeRootRelocation(
       !prepared->SameLogicalRoot(*current)) {
     return absl::AbortedError("root relocation source changed");
   }
-  const auto finalized = FinalizeRoot(prepared, exact_version);
-  if (!finalized.ok()) return finalized;
+  LAVIK_RETURN_IF_ERROR(FinalizeRoot(prepared, exact_version));
   prepared->directory_ = current->directory_;
   prepared->physical_ = current->physical_;
   return absl::OkStatus();
@@ -1197,26 +1187,24 @@ absl::StatusOr<GroupedObject::Handle> GroupedObject::RelocateGroup(
                                 .location_ = replacement,
                                 .extents_ = std::move(extents),
                                 .retired_ = expected->FindGroup(id) == nullptr};
-  const auto valid = expected->is_ordered()
-                         ? ValidateLocation(changed, expected->version(),
-                                            expected->ordered_directory())
-                         : ValidateLocation(changed, expected->version(),
-                                            expected->directory());
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(expected->is_ordered()
+                            ? ValidateLocation(changed, expected->version(),
+                                               expected->ordered_directory())
+                            : ValidateLocation(changed, expected->version(),
+                                               expected->directory()));
   auto arena = expected->physical_->arena_;
   if (changed.extents_) {
-    auto owned = CopyManifest(*changed.extents_, arena->allocation_domain());
-    if (!owned.ok()) return owned.status();
-    changed.extents_ = std::move(*owned);
+    LAVIK_ASSIGN_OR_RETURN(
+        changed.extents_,
+        CopyManifest(*changed.extents_, arena->allocation_domain()));
   }
   auto physical = AllocateObject<GroupedPhysicalState>(arena);
-  if (!physical.ok()) return physical.status();
+  LAVIK_RETURN_IF_ERROR(physical.status());
   (*physical)->arena_ = arena;
-  const auto built = BuildPhysicalState(**physical, expected->physical_.get(),
-                                        std::span(&changed, 1));
-  if (!built.ok()) return built;
+  LAVIK_RETURN_IF_ERROR(BuildPhysicalState(
+      **physical, expected->physical_.get(), std::span(&changed, 1)));
   auto object = AllocateObject<GroupedObject>(arena);
-  if (!object.ok()) return object.status();
+  LAVIK_RETURN_IF_ERROR(object.status());
   (*object)->version_ = expected->version_;
   (*object)->directory_ = expected->directory_;
   (*object)->physical_ = std::move(*physical);
@@ -1355,8 +1343,7 @@ absl::StatusOr<GroupedObjectIndex::Handle> GroupedObjectIndex::Lookup(
     return absl::DataLossError("grouped root has no matching object directory");
   }
   if (!allow_failed) {
-    const auto readable = entry->value_->ReadStatus();
-    if (!readable.ok()) return readable;
+    LAVIK_RETURN_IF_ERROR(entry->value_->ReadStatus());
   }
   return entry->value_;
 }
@@ -1428,8 +1415,7 @@ GroupedObjectIndex::PreparePublish(std::string_view key,
     return absl::AbortedError("grouped object changed before reservation");
   }
   if (entry) return Publication(this, key, expected, false);
-  auto inserted = Insert(objects_, key, Handle{});
-  if (!inserted.ok()) return inserted;
+  LAVIK_RETURN_IF_ERROR(Insert(objects_, key, Handle{}));
   return Publication(this, key, expected, true);
 }
 

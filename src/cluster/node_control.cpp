@@ -38,6 +38,7 @@
 #include "absl/strings/str_cat.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::cluster {
@@ -243,9 +244,8 @@ bycorf::Task<absl::Status> NodeDirectiveCompletion::Await() const {
       co_return absl::FailedPreconditionError(
           "pending directive completion requires a Bycorf worker");
     }
-    const absl::Status waited =
-        co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(10)));
   }
 }
 
@@ -453,11 +453,8 @@ NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
     return absl::FailedPreconditionError(
         "lease grant does not name the exact installed Meta projection");
   }
-  if (const absl::Status anchor =
-          ValidateAnchor(message.anchor_, /*require_local_owner=*/true);
-      !anchor.ok()) {
-    return anchor;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      ValidateAnchor(message.anchor_, /*require_local_owner=*/true));
   if (storage_failed_) {
     return absl::FailedPreconditionError(
         "storage failed during this boot; lease recovery requires restart");
@@ -500,7 +497,7 @@ NodeControlInstaller::ValidateLeaseGrantContext(const AuthorityMessage& message,
   }
 
   auto desired = DesiredLocalClusterControl();
-  if (!desired.ok()) return desired.status();
+  LAVIK_RETURN_IF_ERROR(desired.status());
   // Static and older in-process test adapters have no desired-control layer.
   // Meta-managed projections always populate it and therefore take the
   // stronger committed owner/action validation below.
@@ -686,10 +683,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
     return absl::InvalidArgumentError(
         "directive kind does not match its opaque field schema");
   }
-  if (const absl::Status projection = ValidateProjection(directive.projection_);
-      !projection.ok()) {
-    return projection;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateProjection(directive.projection_));
   if (directive.operation_id_.empty() || directive.directive_id_.empty() ||
       directive.attempt_id_.empty() || directive.directive_revision_ == 0 ||
       directive.target_node_id_.empty() || directive.target_boot_id_.empty() ||
@@ -710,10 +704,7 @@ absl::Status NodeControlInstaller::ValidateDirectiveForStart(
     return absl::InvalidArgumentError(
         "empty population directive must not carry a source identity");
   }
-  if (const absl::Status anchor = ValidateDirectiveAnchor(directive);
-      !anchor.ok()) {
-    return anchor;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateDirectiveAnchor(directive));
   // A fence names the assignment local to the node that received it. Rebuilds
   // run on the target and therefore use the common target anchor; source-side
   // directives must compare the source member's assignment against the same
@@ -871,16 +862,14 @@ bycorf::Task<absl::Status> NodeControlInstaller::WaitForPendingDrains(
                      [this](const AuthorityAnchor& anchor) {
                        return DrainPending(anchor.group_id_);
                      })) {
-    auto relieved = co_await actions_.RelieveExportBackpressure();
-    if (!relieved.ok()) co_return relieved;
+    LAVIK_CO_RETURN_IF_ERROR(co_await actions_.RelieveExportBackpressure());
     bycorf::Worker* worker = bycorf::ThisWorker().self_;
     if (worker == nullptr) {
       co_return absl::FailedPreconditionError(
           "asynchronous assignment drain requires a Bycorf worker");
     }
-    const absl::Status waited =
-        co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(1)));
   }
   co_return absl::OkStatus();
 }
@@ -1407,19 +1396,13 @@ bycorf::Task<absl::Status> NodeControlInstaller::InstallFullStateTransition(
 
 absl::Status NodeControlInstaller::ApplyAuthority(
     const AuthorityMessage& message, MonotonicTime now) {
-  if (const absl::Status projection = ValidateProjection(message.projection_);
-      !projection.ok()) {
-    return projection;
-  }
-  if (const absl::Status anchor =
-          ValidateAnchor(message.anchor_, /*require_local_owner=*/true);
-      !anchor.ok()) {
-    return anchor;
-  }
+  LAVIK_RETURN_IF_ERROR(ValidateProjection(message.projection_));
+  LAVIK_RETURN_IF_ERROR(
+      ValidateAnchor(message.anchor_, /*require_local_owner=*/true));
 
   if (message.kind_ == AuthorityMessage::Kind::kLeaseGrant) {
     auto desired = ValidateLeaseGrantContext(message, now);
-    if (!desired.ok()) return desired.status();
+    LAVIK_RETURN_IF_ERROR(desired.status());
     const MonotonicTime deadline = SaturatingLeaseDeadline(message);
     return authority_.RenewLease(message.session_, message.anchor_, deadline,
                                  now);
@@ -1432,7 +1415,7 @@ absl::Status NodeControlInstaller::ApplyAuthority(
   }
   InvalidateDirectiveAdmissions();
   auto transitioned = ApplyFenceLocal(message);
-  if (!transitioned.ok()) return transitioned.status();
+  LAVIK_RETURN_IF_ERROR(transitioned.status());
   absl::Status result = actions_.RevokeSourceAuthorizations();
   if (*transitioned) {
     result = FirstFailure(std::move(result),
@@ -1503,7 +1486,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
   const MonotonicTime deadline = SaturatingLeaseDeadline(message);
   MonotonicTime now = LeaseClockNow();
   auto initial = ValidateLeaseGrantContext(message, now);
-  if (!initial.ok()) co_return initial.status();
+  LAVIK_CO_RETURN_IF_ERROR(initial.status());
 
   // A CLOCK_MONOTONIC-backed worker timer may still be asleep after host
   // suspend even though CLOCK_BOOTTIME says the lease is already due. Finish
@@ -1513,14 +1496,11 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyLeaseGrantTransition(
           lease_expiry_schedules_.find(message.anchor_.group_id_);
       existing != lease_expiry_schedules_.end() && existing->second->active_ &&
       existing->second->deadline_ <= now) {
-    if (absl::Status expired =
-            co_await FinishExpiredLeaseTransition(existing->second, now);
-        !expired.ok()) {
-      co_return expired;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await FinishExpiredLeaseTransition(existing->second, now));
     now = LeaseClockNow();
     initial = ValidateLeaseGrantContext(message, now);
-    if (!initial.ok()) co_return initial.status();
+    LAVIK_CO_RETURN_IF_ERROR(initial.status());
   }
 
   auto lease = std::make_shared<LeaseDeadline>(deadline.time_since_epoch());
@@ -1701,9 +1681,8 @@ bycorf::Task<absl::Status> NodeControlInstaller::ExpireLeaseAt(
     const MonotonicTime deadline = schedule->deadline_;
     const MonotonicTime now = LeaseClockNow();
     if (now < deadline) {
-      const absl::Status slept = co_await bycorf::SleepFor(
-          *worker, std::min(deadline - now, schedule->recheck_interval_));
-      if (!slept.ok()) co_return slept;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *worker, std::min(deadline - now, schedule->recheck_interval_)));
       continue;
     }
     break;
@@ -1799,15 +1778,9 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
     co_return absl::InvalidArgumentError(
         "Meta fence transition received a non-fence authority message");
   }
-  if (const absl::Status projection = ValidateProjection(message.projection_);
-      !projection.ok()) {
-    co_return projection;
-  }
-  if (const absl::Status anchor =
-          ValidateAnchor(message.anchor_, /*require_local_owner=*/true);
-      !anchor.ok()) {
-    co_return anchor;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(ValidateProjection(message.projection_));
+  LAVIK_CO_RETURN_IF_ERROR(
+      ValidateAnchor(message.anchor_, /*require_local_owner=*/true));
 
   ControlTransitionGuard transition_guard(*this);
   // Close admission before publishing the fence. Earlier admissions retain a
@@ -1816,7 +1789,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyFenceTransition(
   InvalidateDirectiveAdmissions();
   RetireLeaseSchedule(message.anchor_.group_id_);
   auto transitioned = ApplyFenceLocal(message);
-  if (!transitioned.ok()) co_return transitioned.status();
+  LAVIK_CO_RETURN_IF_ERROR(transitioned.status());
   absl::Status result = co_await WaitForDirectiveAdmissions();
   result = FirstFailure(std::move(result),
                         co_await actions_.RevokeExpirationAuthority());
@@ -1913,10 +1886,7 @@ bycorf::Task<absl::Status> NodeControlInstaller::ApplyDirective(
 
 absl::Status NodeControlInstaller::LoseSession(const SessionIdentity& session,
                                                std::string_view /*reason*/) {
-  if (absl::Status invalidated = InvalidateSessionNow(session);
-      !invalidated.ok()) {
-    return invalidated;
-  }
+  LAVIK_RETURN_IF_ERROR(InvalidateSessionNow(session));
   if (actions_.ReceivesDirectives()) {
     return absl::FailedPreconditionError(
         "directive-capable session loss requires the asynchronous NodeControl "
@@ -1964,10 +1934,7 @@ NodeControlInstaller::CancelPopulationForShutdownTransition() {
 
 bycorf::Task<absl::Status> NodeControlInstaller::LoseSessionTransition(
     const SessionIdentity& session, std::string_view /*reason*/) {
-  if (absl::Status invalidated = InvalidateSessionNow(session);
-      !invalidated.ok()) {
-    co_return invalidated;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(InvalidateSessionNow(session));
   // Remember the replaced snapshot before the first suspension. A reconnect
   // may install an equal projection, but no grant or destructive directive
   // can overtake writes admitted by the lost session.

@@ -31,6 +31,7 @@
 #include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
 #include "lavik/retained_allocator.h"
+#include "lavik/status_macros.h"
 
 namespace lavik {
 
@@ -207,9 +208,7 @@ class CowMap {
   // previous root and overlay, including when a shared AVL path must rotate.
   absl::Status Set(Key key, Value value) {
     if (overlay_ && overlay_->Find(key)) return SetBuffered(key, value);
-    auto next = SetNode(root_, key, value);
-    if (!next.ok()) return next.status();
-    root_ = std::move(*next);
+    LAVIK_ASSIGN_OR_RETURN(root_, SetNode(root_, key, value));
     return absl::OkStatus();
   }
   // Amortize repeated replacements in large maps. Small maps keep ordinary
@@ -235,14 +234,12 @@ class CowMap {
         std::sort(
             writes.begin(), writes.end(),
             [](const auto* a, const auto* b) { return a->first < b->first; });
-        auto next = ReplaceNodes(root_, writes);
-        if (!next.ok()) return next.status();
-        root_ = std::move(*next);
+        LAVIK_ASSIGN_OR_RETURN(root_, ReplaceNodes(root_, writes));
         overlay_ = {};
         return absl::OkStatus();
       }
       auto overlay = MakeOverlay(overlay_.get());
-      if (!overlay.ok()) return overlay.status();
+      LAVIK_RETURN_IF_ERROR(overlay.status());
       auto& updated = **overlay;
       std::size_t slot;
       if (current) {
@@ -261,10 +258,10 @@ class CowMap {
   // retain their original nodes; allocation failure leaves this map intact.
   absl::Status Erase(Key key) {
     auto next = EraseNode(root_, key);
-    if (!next.ok()) return next.status();
+    LAVIK_RETURN_IF_ERROR(next.status());
     if (overlay_ && overlay_->Find(key)) {
       auto overlay = MakeOverlay(overlay_.get());
-      if (!overlay.ok()) return overlay.status();
+      LAVIK_RETURN_IF_ERROR(overlay.status());
       auto& updated = **overlay;
       std::size_t slot = 0;
       while (updated.entries_[slot]->first != key) ++slot;
@@ -293,9 +290,9 @@ class CowMap {
     const bool replaces =
         pivot != writes.end() && (*pivot)->first == node->entry_.first;
     auto left = ReplaceNodes(node->left_, writes.first(before));
-    if (!left.ok()) return left.status();
+    LAVIK_RETURN_IF_ERROR(left.status());
     auto right = ReplaceNodes(node->right_, writes.subspan(before + replaces));
-    if (!right.ok()) return right.status();
+    LAVIK_RETURN_IF_ERROR(right.status());
     return Make(node->entry_.first,
                 replaces ? (*pivot)->second : node->entry_.second,
                 std::move(*left), std::move(*right));
@@ -353,31 +350,31 @@ class CowMap {
     if (Height(left) > Height(right) + 1) {
       if (Height(left->left_) >= Height(left->right_)) {
         auto next = Make(key, value, left->right_, right);
-        if (!next.ok()) return next.status();
+        LAVIK_RETURN_IF_ERROR(next.status());
         return Make(left->entry_.first, left->entry_.second, left->left_,
                     *next);
       }
       const auto pivot = left->right_;
       auto a = Make(left->entry_.first, left->entry_.second, left->left_,
                     pivot->left_);
-      if (!a.ok()) return a.status();
+      LAVIK_RETURN_IF_ERROR(a.status());
       auto b = Make(key, value, pivot->right_, right);
-      if (!b.ok()) return b.status();
+      LAVIK_RETURN_IF_ERROR(b.status());
       return Make(pivot->entry_.first, pivot->entry_.second, *a, *b);
     }
     if (Height(right) > Height(left) + 1) {
       if (Height(right->right_) >= Height(right->left_)) {
         auto next = Make(key, value, left, right->left_);
-        if (!next.ok()) return next.status();
+        LAVIK_RETURN_IF_ERROR(next.status());
         return Make(right->entry_.first, right->entry_.second, *next,
                     right->right_);
       }
       const auto pivot = right->left_;
       auto a = Make(key, value, left, pivot->left_);
-      if (!a.ok()) return a.status();
+      LAVIK_RETURN_IF_ERROR(a.status());
       auto b = Make(right->entry_.first, right->entry_.second, pivot->right_,
                     right->right_);
-      if (!b.ok()) return b.status();
+      LAVIK_RETURN_IF_ERROR(b.status());
       return Make(pivot->entry_.first, pivot->entry_.second, *a, *b);
     }
     return Make(key, value, std::move(left), std::move(right));
@@ -389,7 +386,7 @@ class CowMap {
     }
     const bool left = key < node->entry_.first;
     auto child = SetNode(left ? node->left_ : node->right_, key, value);
-    if (!child.ok()) return child.status();
+    LAVIK_RETURN_IF_ERROR(child.status());
     return Balance(node->entry_.first, node->entry_.second,
                    left ? *child : node->left_, left ? node->right_ : *child);
   }
@@ -401,13 +398,13 @@ class CowMap {
       auto* successor = node->right_.get();
       while (successor->left_) successor = successor->left_.get();
       auto right = EraseNode(node->right_, successor->entry_.first);
-      if (!right.ok()) return right.status();
+      LAVIK_RETURN_IF_ERROR(right.status());
       return Balance(successor->entry_.first, successor->entry_.second,
                      node->left_, *right);
     }
     const bool left = key < node->entry_.first;
     auto child = EraseNode(left ? node->left_ : node->right_, key);
-    if (!child.ok()) return child.status();
+    LAVIK_RETURN_IF_ERROR(child.status());
     return Balance(node->entry_.first, node->entry_.second,
                    left ? *child : node->left_, left ? node->right_ : *child);
   }

@@ -19,6 +19,7 @@
 #include <map>
 
 #include "../impl.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 
 namespace lavik::storage {
@@ -54,15 +55,12 @@ StorageEngine::Impl::PrepareSortedSetMembers(
         co_return absl::DataLossError("member-index promotion count mismatch");
       count += page.entries_.size();
       for (const auto& entry : page.entries_) {
-        auto status = incoming.AddBytes(entry.value_.size() + 256);
-        if (!status.ok()) co_return status;
+        LAVIK_CO_RETURN_IF_ERROR(incoming.AddBytes(entry.value_.size() + 256));
       }
     }
     if (count != ordered.root_.item_count_)
       co_return absl::DataLossError("member-index promotion count mismatch");
-    auto scratch = incoming.Reserve(1);
-    if (!scratch.ok()) co_return scratch.status();
-    result.scratch_ = std::move(*scratch);
+    LAVIK_ASSIGN_OR_CO_RETURN(result.scratch_, incoming.Reserve(1));
     auto& plan = result.plan_;
     plan.root_ = {.incarnation_ = ordered.root_.incarnation_,
                   .seed_ = CurrentDigestSeed(),
@@ -83,7 +81,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     }
     auto groups = GroupHashValue(std::move(value), plan.root_.incarnation_,
                                  plan.root_.seed_);
-    if (!groups.ok()) co_return groups.status();
+    LAVIK_CO_RETURN_IF_ERROR(groups.status());
     if (groups->size() > std::numeric_limits<std::uint32_t>::max())
       co_return absl::OutOfRangeError("too many member-index groups");
     plan.root_.group_count_ = groups->size();
@@ -115,7 +113,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     if (checked_changes->size() > std::numeric_limits<std::size_t>::max() / 256)
       co_return absl::ResourceExhaustedError("member-index metadata overflow");
     status = metadata_budget.AddBytes(checked_changes->size() * 256);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   } else {
     for (const auto& page : ordered.writes_) {
       std::uint64_t count = page.entries_.size();
@@ -127,11 +125,11 @@ StorageEngine::Impl::PrepareSortedSetMembers(
         co_return absl::ResourceExhaustedError(
             "member-index metadata overflow");
       status = metadata_budget.AddBytes(count * 256);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
     }
   }
   auto metadata_admission = metadata_budget.Reserve(1);
-  if (!metadata_admission.ok()) co_return metadata_admission.status();
+  LAVIK_CO_RETURN_IF_ERROR(metadata_admission.status());
 
   struct Change {
     std::optional<double> before_;
@@ -181,16 +179,16 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       if (unlocked) co_await bycorf::Yield(*store.worker_);
       GroupedScratchBudget read_budget;
       status = add_group(read_budget, {page.id_, 0});
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
       auto read_admission = read_budget.Reserve(2);
-      if (!read_admission.ok()) co_return read_admission.status();
+      LAVIK_CO_RETURN_IF_ERROR(read_admission.status());
       LAVIK_FAULT_INJECT(
           if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY",
                                   key)) co_return absl::
               UnavailableError("injected member diff read failure"););
       auto loaded = co_await LoadOrderedGroupSnapshot(
           store, partition, db_id, key, digest, previous, page.id_);
-      if (!loaded.ok()) co_return loaded.status();
+      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
       for (auto& entry : loaded->snapshot_.entries_) {
         auto found = changes.find(entry.value_);
         if (found == changes.end()) {
@@ -223,11 +221,9 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   for (const auto& [member, change] : changes) {
     if (!change.after_ || change.before_) continue;
     status = incoming.AddBytes(member.size() + 256);
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(status);
   }
-  auto scratch = incoming.Reserve(1);
-  if (!scratch.ok()) co_return scratch.status();
-  result.scratch_ = std::move(*scratch);
+  LAVIK_ASSIGN_OR_CO_RETURN(result.scratch_, incoming.Reserve(1));
   auto& plan = result.plan_;
   plan.root_ = previous->directory().root();
   if (changes.empty()) co_return result;
@@ -252,13 +248,11 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     GroupedScratchBudget leaf_budget;
     for (const auto& [id, leaf] : leaves) {
       status = add_group(leaf_budget, id);
-      if (!status.ok()) co_return status;
+      LAVIK_CO_RETURN_IF_ERROR(status);
     }
     // One retained decoded leaf plus decoder/inline encoder headroom. The
     // incoming member copies have their own reservation above.
-    auto admission = leaf_budget.Reserve(2);
-    if (!admission.ok()) co_return admission.status();
-    result.leaves_ = std::move(*admission);
+    LAVIK_ASSIGN_OR_CO_RETURN(result.leaves_, leaf_budget.Reserve(2));
   }
   for (auto& [id, leaf] : leaves) {
     // Reusing payload work must not remove the preparation phase's
@@ -271,14 +265,14 @@ StorageEngine::Impl::PrepareSortedSetMembers(
               UnavailableError("injected member-index leaf read failure"););
       auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
                                                    digest, previous, id);
-      if (!loaded.ok()) co_return loaded.status();
+      LAVIK_CO_RETURN_IF_ERROR(loaded.status());
       leaf = std::move(loaded->snapshot_);
     }
     for (const auto& entry : leaf.value_.entries_) {
       const auto found = changes.find(entry.field_);
       if (found == changes.end()) continue;
       auto score = DecodeSortedSetMemberScore(entry.value_);
-      if (!score.ok()) co_return score.status();
+      LAVIK_CO_RETURN_IF_ERROR(score.status());
       if (!found->second.before_ || *score != *found->second.before_)
         co_return absl::DataLossError("ordered/member-index score mismatch");
       found->second.found_before_ = true;
@@ -316,7 +310,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   plan.changed_ = true;
   for (auto& [id, leaf] : leaves) {
     auto split = SplitHashGroup(std::move(leaf), plan.root_.seed_);
-    if (!split.ok()) co_return split.status();
+    LAVIK_CO_RETURN_IF_ERROR(split.status());
     if (split->size() > 1) {
       if (split->size() - 1 >
           std::numeric_limits<std::uint32_t>::max() - plan.root_.group_count_)

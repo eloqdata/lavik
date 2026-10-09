@@ -38,6 +38,7 @@
 #include "lavik/meta/hash.h"
 #include "lavik/meta/population_manifest_store.h"
 #include "lavik/meta/raft.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -397,10 +398,8 @@ absl::Status ValidateV1GroupsKnown(const MetaClusterCreateView& view,
     if (declaration == nullptr)
       return absl::FailedPreconditionError(absl::StrCat(
           "creation has an unknown Group: group=", group.group_id_));
-    if (auto status = ValidateV1GroupMembers(group, *declaration, root,
-                                             require_all_members);
-        !status.ok())
-      return status;
+    LAVIK_RETURN_IF_ERROR(
+        ValidateV1GroupMembers(group, *declaration, root, require_all_members));
   }
   if (view.groups_.size() > manifest.groups_.size() ||
       (require_all_members && view.groups_.size() != manifest.groups_.size())) {
@@ -414,11 +413,8 @@ absl::Status ValidateV1FinalTopology(const MetaClusterCreateView& view,
                                      const ClusterCreateManifestV1& manifest,
                                      const MetaOperationId& root,
                                      bool allow_failed_group) {
-  if (auto status = ValidateV1Nodes(view, manifest, true); !status.ok())
-    return status;
-  if (auto status = ValidateV1GroupsKnown(view, manifest, root, true);
-      !status.ok())
-    return status;
+  LAVIK_RETURN_IF_ERROR(ValidateV1Nodes(view, manifest, true));
+  LAVIK_RETURN_IF_ERROR(ValidateV1GroupsKnown(view, manifest, root, true));
   bool slots_empty = false;
   if (!V1SlotMapMatches(view, manifest, &slots_empty) || slots_empty)
     return absl::FailedPreconditionError(
@@ -1225,7 +1221,7 @@ Plan PlanV1ClusterCreateStep(const MetaClusterCreateView& view,
     if (!child || IsTerminal(child->lifecycle_)) continue;
     auto next = PlanV1GroupStep(view, operation, *child, *manifest,
                                 manifest->groups_[index], runtime);
-    if (!next.ok()) return next;
+    LAVIK_RETURN_IF_ERROR(next);
     if (failure) {
       // Root abort stops reconciliation. First retire every unfinished sibling
       // using the existing durable failure phase, fence, then abort. Retain the

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -82,11 +83,10 @@ Task<absl::Status> StorageEngine::Impl::AppendRedisExportDiskBytes(
       .partition_sequence_ = disk.next_stream_lsn_,
       .payload_bytes_ = static_cast<std::uint32_t>(bytes.size()),
   };
-  absl::Status appended = co_await AppendRedisExportDiskFrame(
+  LAVIK_CO_RETURN_IF_ERROR(co_await AppendRedisExportDiskFrame(
       store, frame,
       std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()));
-  if (!appended.ok()) co_return appended;
+          reinterpret_cast<const std::byte*>(bytes.data()), bytes.size())));
   ++disk.next_stream_lsn_;
   co_return absl::OkStatus();
 }
@@ -323,7 +323,7 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
     }
     const std::size_t read_bytes = AlignDirect(block.committed_bytes_);
     auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-    if (!acquired.ok()) co_return acquired.status();
+    LAVIK_CO_RETURN_IF_ERROR(acquired.status());
     ReadBufferLease lease = std::move(*acquired);
     FixedBuffer buffer = lease.io_buffer();
     if (buffer.size_ < read_bytes) {

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "lavik/fault_injection.h"
+#include "lavik/status_macros.h"
 
 #if LAVIK_FAULTS_ENABLED
 #include <unistd.h>
@@ -104,9 +105,8 @@ inline bycorf::Task<absl::Status> PauseGroupedDecisionForTest(
     if (std::chrono::steady_clock::now() >= until)
       co_return absl::DeadlineExceededError(
           "grouped dependency gate timed out");
-    auto waited =
-        co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1)));
   }
   co_return fail ? absl::InternalError("injected grouped commit failure")
                  : absl::OkStatus();

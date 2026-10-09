@@ -24,6 +24,7 @@
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/meta/identity_verifier.h"
 #include "lavik/numeric_endpoint.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 namespace {
@@ -90,7 +91,7 @@ absl::Status ValidateDataEndpoints(
   bool has_explicit = false;
   for (const std::string& encoded : encoded_endpoints) {
     auto endpoint = ParseDataEndpoint(encoded);
-    if (!endpoint.ok()) return endpoint.status();
+    LAVIK_RETURN_IF_ERROR(endpoint.status());
     has_legacy |= endpoint->kind_ == DataEndpointKind::kLegacy;
     has_explicit |= endpoint->kind_ != DataEndpointKind::kLegacy;
     endpoints.push_back(std::move(*endpoint));
@@ -187,7 +188,7 @@ absl::Status ValidateActiveMetaDirectory(
   for (const MetaMemberRecord& member : members) {
     if (member.retired_) continue;
     auto endpoint = ParseMetaControlEndpoint(member);
-    if (!endpoint.ok()) return endpoint.status();
+    LAVIK_RETURN_IF_ERROR(endpoint.status());
     if (!endpoints.emplace(endpoint->host, endpoint->port).second) {
       return absl::InvalidArgumentError(
           "active Meta data-control endpoints must be unique");
@@ -248,9 +249,7 @@ absl::Status ValidateActiveMetaDirectory(
 }  // namespace
 
 absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
-  if (auto st = CheckNodeFields(cmd.node_id_, cmd.endpoints_); !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckNodeFields(cmd.node_id_, cmd.endpoints_));
   if (auto st = ValidateDataEndpoints(cmd.endpoints_); !st.ok()) {
     return MetaDomainRejectError(st.message());
   }
@@ -258,10 +257,8 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
           ValidateDataRoutesAgainstMeta(cmd.endpoints_, MetaMembers());
       !status.ok())
     return MetaDomainRejectError(status.message());
-  if (auto st = ValidateDataNodePrincipal(cmd.node_id_, cmd.principal_);
-      !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      ValidateDataNodePrincipal(cmd.node_id_, cmd.principal_));
   if (const auto existing = nodes_.find(cmd.node_id_);
       existing != nodes_.end()) {
     // Replay of the same log index: the exact post-effect (identical content,
@@ -298,9 +295,7 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
 }
 
 absl::Status MetaIdentityStore::Apply(const UpdateNode& cmd) {
-  if (auto st = CheckNodeFields(cmd.node_id_, cmd.endpoints_); !st.ok()) {
-    return st;
-  }
+  LAVIK_RETURN_IF_ERROR(CheckNodeFields(cmd.node_id_, cmd.endpoints_));
   if (auto st = ValidateDataEndpoints(cmd.endpoints_); !st.ok()) {
     return MetaDomainRejectError(st.message());
   }
@@ -583,38 +578,38 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != kMetaIdentityStoreFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto count = r.ReadCount(kMaxMetaNodes);
-  if (!count.ok()) return count.status();
+  LAVIK_RETURN_IF_ERROR(count.status());
 
   MetaIdentityStore store;
   for (std::uint32_t i = 0; i < *count; ++i) {
     auto node_id = r.ReadString(kMetaNodeIdBytes);
-    if (!node_id.ok()) return node_id.status();
+    LAVIK_RETURN_IF_ERROR(node_id.status());
     auto principal = r.ReadString(kMaxMetaPrincipalBytes);
-    if (!principal.ok()) return principal.status();
+    LAVIK_RETURN_IF_ERROR(principal.status());
     auto endpoints = r.ReadList<std::string>(
         kMaxMetaEndpointsPerNode,
         [](MetaReader& rr) -> absl::StatusOr<std::string> {
           auto raw = rr.ReadString(kMaxMetaEndpointBytes);
-          if (!raw.ok()) return raw.status();
+          LAVIK_RETURN_IF_ERROR(raw.status());
           return std::string(*raw);
         });
-    if (!endpoints.ok()) return endpoints.status();
+    LAVIK_RETURN_IF_ERROR(endpoints.status());
 
     auto role = r.ReadU8();
-    if (!role.ok()) return role.status();
+    LAVIK_RETURN_IF_ERROR(role.status());
     if (*role != static_cast<std::uint8_t>(MetaNodeRole::kPrimary) &&
         *role != static_cast<std::uint8_t>(MetaNodeRole::kReplica)) {
       return MetaFailStopError("unknown node role");
     }
     auto revision = r.ReadU64();
-    if (!revision.ok()) return revision.status();
+    LAVIK_RETURN_IF_ERROR(revision.status());
     auto retired = r.ReadBool("retired tag must be 0 or 1");
-    if (!retired.ok()) return retired.status();
+    LAVIK_RETURN_IF_ERROR(retired.status());
 
     // Invariant enforcement (fail-stop): a corrupt snapshot must fail
     // identically on every node.
@@ -654,21 +649,21 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     store.nodes_.emplace(record.node_id_, std::move(record));
   }
   auto member_count = r.ReadCount(kMaxMetaNodes);
-  if (!member_count.ok()) return member_count.status();
+  LAVIK_RETURN_IF_ERROR(member_count.status());
   for (std::uint32_t i = 0; i < *member_count; ++i) {
     auto server_id = r.ReadU32();
-    if (!server_id.ok()) return server_id.status();
+    LAVIK_RETURN_IF_ERROR(server_id.status());
     auto principal = r.ReadString(kMaxMetaPrincipalBytes);
-    if (!principal.ok()) return principal.status();
+    LAVIK_RETURN_IF_ERROR(principal.status());
     auto data_control_endpoint = r.ReadString(kMaxMetaEndpointBytes);
-    if (!data_control_endpoint.ok()) return data_control_endpoint.status();
+    LAVIK_RETURN_IF_ERROR(data_control_endpoint.status());
     auto has_ctl_endpoint =
         r.ReadBool("invalid meta ctl endpoint presence tag");
-    if (!has_ctl_endpoint.ok()) return has_ctl_endpoint.status();
+    LAVIK_RETURN_IF_ERROR(has_ctl_endpoint.status());
     std::optional<std::string> ctl_endpoint;
     if (*has_ctl_endpoint) {
       auto decoded = r.ReadString(kMaxMetaEndpointBytes);
-      if (!decoded.ok()) return decoded.status();
+      LAVIK_RETURN_IF_ERROR(decoded.status());
       auto canonical_ctl = CanonicalMetaAdminEndpoint(*decoded);
       if (!canonical_ctl.ok() || *canonical_ctl != *decoded) {
         return MetaFailStopError("non-canonical Meta ctl endpoint in snapshot");
@@ -676,14 +671,14 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       ctl_endpoint = std::move(*canonical_ctl);
     }
     auto sentinel = r.ReadString(kMaxMetaEndpointBytes);
-    if (!sentinel.ok()) return sentinel.status();
+    LAVIK_RETURN_IF_ERROR(sentinel.status());
     if (!sentinel->empty()) {
       auto canonical = CanonicalClientEndpoint(*sentinel);
       if (!canonical || *canonical != *sentinel)
         return MetaFailStopError("non-canonical Meta Sentinel endpoint");
     }
     auto retired = r.ReadBool("invalid meta member in snapshot");
-    if (!retired.ok()) return retired.status();
+    LAVIK_RETURN_IF_ERROR(retired.status());
     if (*server_id == 0 ||
         *server_id >
             static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
@@ -723,7 +718,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       !status.ok()) {
     return MetaFailStopError(status.message());
   }
-  if (auto st = r.Finish(); !st.ok()) return st;
+  LAVIK_RETURN_IF_ERROR(r.Finish());
   return store;
 }
 

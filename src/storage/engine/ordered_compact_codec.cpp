@@ -20,6 +20,7 @@
 #include <cmath>
 #include <limits>
 
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -93,10 +94,9 @@ absl::StatusOr<std::string> EncodeOrderedCompactValue(
       return absl::OutOfRangeError(
           "ordered full-image exceeds encoding limits");
     }
-    auto next = AppendOrderedEntrySize(kind, size, entry.value_.size(),
-                                       encoded.max_size());
-    if (!next.ok()) return next.status();
-    size = *next;
+    LAVIK_ASSIGN_OR_RETURN(
+        size, AppendOrderedEntrySize(kind, size, entry.value_.size(),
+                                     encoded.max_size()));
   }
   encoded.reserve(size);
   encoded.append(sorted ? "LZS1" : "LVL1");

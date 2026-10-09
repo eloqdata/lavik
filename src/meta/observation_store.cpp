@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "lavik/meta/encoding.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::meta {
 
@@ -349,10 +350,7 @@ struct MetaObservationStore::Impl {
   // committed facts. Also used (status discarded) by the const read paths.
   absl::Status Validate(const MetaObservation& observation,
                         const MetaCommittedFacts& facts) const {
-    const absl::Status identity = CheckIdentity(observation.identity_, facts);
-    if (!identity.ok()) {
-      return identity;
-    }
+    LAVIK_RETURN_IF_ERROR(CheckIdentity(observation.identity_, facts));
     const auto& payload = observation.payload_;
     if (const auto* boot = std::get_if<MetaNodeBootObs>(&payload)) {
       // Liveness marker only; carries no term/manifest binding (header).
@@ -375,13 +373,10 @@ struct MetaObservationStore::Impl {
           observation.identity_.session_generation_) {
         return MetaDomainRejectError("candidate-session-mismatch");
       }
-      const absl::Status anchor =
-          CheckPopulationAnchor(candidate->group_id_, candidate->group_term_,
-                                candidate->population_manifest_revision_,
-                                candidate->partition_replication_epoch_, facts);
-      if (!anchor.ok()) {
-        return anchor;
-      }
+      LAVIK_RETURN_IF_ERROR(CheckPopulationAnchor(
+          candidate->group_id_, candidate->group_term_,
+          candidate->population_manifest_revision_,
+          candidate->partition_replication_epoch_, facts));
       if (!facts.AssignmentMatches(candidate->group_id_, candidate->node_id_,
                                    candidate->assignment_id_)) {
         return MetaDomainRejectError("assignment-mismatch");

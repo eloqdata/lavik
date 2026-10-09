@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 namespace {
@@ -110,13 +111,12 @@ absl::Status PrepareSnapshotBlockPins(
       count += added;
   };
   if (value->extents_ != nullptr) add_count(value->extents_->size());
-  auto visited = visit_records(
+  LAVIK_RETURN_IF_ERROR(visit_records(
       [&](const auto&,
           const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
         add_count(1);
         if (extents != nullptr) add_count(extents->size());
-      });
-  if (!visited.ok()) return visited;
+      }));
   constexpr std::size_t overhead = sizeof(BlockPins) + 4 * sizeof(void*);
   if (overflow || count > (std::numeric_limits<std::size_t>::max() - overhead) /
                               sizeof(BlockPin)) {
@@ -142,13 +142,12 @@ absl::Status PrepareSnapshotBlockPins(
   };
   add_record(value->location_);
   add_extents(value->extents_);
-  visited = visit_records(
+  LAVIK_RETURN_IF_ERROR(visit_records(
       [&](const auto& entry,
           const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
         add_record(materialize(entry));
         add_extents(extents);
-      });
-  if (!visited.ok()) return visited;
+      }));
   auto& blocks = pins->blocks_;
   std::sort(blocks.begin(), blocks.end(),
             [](const BlockPin& a, const BlockPin& b) {
@@ -357,7 +356,7 @@ Task<absl::Status> StorageEngine::Impl::ReleaseRdbSnapshotValue(
     } else {
       released = co_await bycorf::SubmitTaskTo(owner, on_owner);
     }
-    if (!released.ok()) co_return released;
+    LAVIK_CO_RETURN_IF_ERROR(released);
   }
   value->block_pins_.reset();
   value->grouped_.reset();
@@ -712,7 +711,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
     if (!reservation || !token.ok()) {
       store.rdb_snapshot_->invalidated_ = true;
       (void)co_await ReleaseRdbSnapshotValue(&saved->value_);
-      if (!token.ok()) co_return token.status();
+      LAVIK_CO_RETURN_IF_ERROR(token.status());
       RecordMemoryRejection();
       co_return absl::ResourceExhaustedError(
           "OOM RDB collection stream admission failed");
@@ -795,9 +794,8 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
           const auto parsed = std::from_chars(configured, end, delay_ms);
           if (parsed.ec == std::errc{} && parsed.ptr == end && delay_ms != 0 &&
               delay_ms <= 10000) {
-            const absl::Status delayed = co_await bycorf::SleepFor(
-                *store.worker_, std::chrono::milliseconds(delay_ms));
-            if (!delayed.ok()) co_return delayed;
+            LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+                *store.worker_, std::chrono::milliseconds(delay_ms)));
           }
         }
       });
@@ -840,13 +838,13 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
             partition.id_, result.cursor_.db_id_, result.cursor_.index_cursor_,
             std::max<std::size_t>(remaining, 1), capture->snapshot_time_ms_,
             max_bytes - logical_bytes);
-        if (!scanned.ok()) co_return scanned.status();
+        LAVIK_CO_RETURN_IF_ERROR(scanned.status());
         result.cursor_.index_cursor_ = scanned->cursor_;
         for (std::string& key : scanned->keys_) {
           auto value = co_await MaterializeRdbSnapshotKey(
               store, partition, session_id, result.cursor_.db_id_,
               std::move(key));
-          if (!value.ok()) co_return value.status();
+          LAVIK_CO_RETURN_IF_ERROR(value.status());
           if (value->has_value()) {
             logical_bytes += (**value).key_.size();
             logical_bytes += (**value).value_.encoded_.size();
@@ -872,9 +870,8 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
     }
 
     if (capture->capture_admissions_ != 0) {
-      absl::Status yielded = co_await bycorf::SleepFor(
-          *store.worker_, std::chrono::milliseconds(1));
-      if (!yielded.ok()) co_return yielded;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
       continue;
     }
 
@@ -906,7 +903,7 @@ StorageEngine::Impl::ReadRdbSnapshotBatch(std::uint64_t session_id,
     for (DirtyKey& key : old_keys) {
       auto value = co_await MaterializeRdbSnapshotKey(
           store, partition, session_id, key.db_id_, std::move(key.key_));
-      if (!value.ok()) co_return value.status();
+      LAVIK_CO_RETURN_IF_ERROR(value.status());
       if (value->has_value()) {
         logical_bytes += (**value).key_.size();
         logical_bytes += (**value).value_.encoded_.size();
@@ -942,9 +939,8 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
   WorkerStore& store = CurrentStore();
   while (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id &&
          store.rdb_snapshot_->ending_) {
-    auto status =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1)));
   }
   if (!store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id) {
     co_return absl::OkStatus();
@@ -960,9 +956,8 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
   } end_guard{&store, session_id};
   store.rdb_snapshot_->invalidated_ = true;
   while (store.rdb_snapshot_->readers_ != 0) {
-    auto status =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
+    LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1)));
   }
   // No page cursor can reference the dirty-map entries after this point.
   store.rdb_snapshot_->collection_.reset();
@@ -973,9 +968,8 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
     }
     partition.rdb_snapshot_->accepting_ = false;
     while (partition.rdb_snapshot_->capture_admissions_ != 0) {
-      absl::Status yielded = co_await bycorf::SleepFor(
-          *store.worker_, std::chrono::milliseconds(1));
-      if (!yielded.ok()) co_return yielded;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
     }
     // Cancellation must also succeed when a previous admission failed. Walk
     // and release one pinned value at a time instead of allocating a vector
@@ -992,8 +986,7 @@ Task<absl::Status> StorageEngine::Impl::EndRdbSnapshot(
           pinned = &entry.value_;
       });
       if (pinned != nullptr) {
-        auto released = co_await ReleaseRdbSnapshotValue(pinned);
-        if (!released.ok()) co_return released;
+        LAVIK_CO_RETURN_IF_ERROR(co_await ReleaseRdbSnapshotValue(pinned));
         cursor = start;  // Drain any other pins in the same scanned bucket.
       }
     } while (cursor != 0 || pinned != nullptr);
@@ -1188,10 +1181,8 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
           std::atomic<std::uint32_t>* count;
           ~Settlement() { count->fetch_sub(1, std::memory_order_acq_rel); }
         } settlement{&engine->active_settlements_};
-        auto ended = co_await engine->EndRdbSnapshot(session);
-        if (!ended.ok()) co_return ended;
-        ended = co_await engine->EndRdbSnapshot(session);
-        if (!ended.ok()) co_return ended;
+        LAVIK_CO_RETURN_IF_ERROR(co_await engine->EndRdbSnapshot(session));
+        LAVIK_CO_RETURN_IF_ERROR(co_await engine->EndRdbSnapshot(session));
         std::size_t remaining = 0;
         for (const auto pin : exact_pins->blocks_) {
           const unsigned physical_owner = engine->BlockOwner(pin.block_id_);
@@ -1233,9 +1224,8 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
       active_settlements_.fetch_add(1, std::memory_order_acq_rel);
       store.worker_->Spawn(
           cancel(this, &store, session_id, pins, before, retained_bytes));
-      auto paused = co_await bycorf::SleepFor(*store.worker_,
-                                              std::chrono::milliseconds(50));
-      if (!paused.ok()) co_return paused;
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(50)));
       if (!store.rdb_snapshot_ || !store.rdb_snapshot_->ending_ ||
           store.rdb_snapshot_->readers_ == 0) {
         co_return absl::InternalError(

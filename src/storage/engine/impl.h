@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 
+#include "lavik/status_macros.h"
 #include "lavik/storage/engine.h"
 #ifdef BLOCK_SIZE
 #undef BLOCK_SIZE
@@ -1096,10 +1097,7 @@ inline absl::Status WriteExactlyAt(const std::string& path,
 inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
     const std::string& path) {
   std::array<std::byte, kDirectIoAlignment> page{};
-  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset);
-  if (!status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ReadExactlyAt(path, page, kDeviceLabelOffset));
   if (IsZero(page)) {
     return std::optional<DeviceLabel>{};
   }
@@ -1137,11 +1135,8 @@ inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
   bool selected_valid = false;
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
-    absl::Status read = ReadExactlyAt(
-        path, page, MetadataPageSlotOffset(base_offset, page_index, slot));
-    if (!read.ok()) {
-      return read;
-    }
+    LAVIK_RETURN_IF_ERROR(ReadExactlyAt(
+        path, page, MetadataPageSlotOffset(base_offset, page_index, slot)));
     if (IsZero(page)) {
       continue;
     }
@@ -1363,9 +1358,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
     const std::string& path) {
   if (bycorf::IsSpdkStoragePath(path)) {
     auto device = bycorf::ProbeSpdkStorage(path);
-    if (!device.ok()) {
-      return device.status();
-    }
+    LAVIK_RETURN_IF_ERROR(device.status());
     return StoragePathInfo{.is_block_device_ = true,
                            .io_alignment_ = device->io_alignment_,
                            .size_bytes_ = device->size_bytes_,
@@ -1380,9 +1373,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
   }
   if (S_ISBLK(file_info.st_mode)) {
     auto device = ProbeBlockDevice(path);
-    if (!device.ok()) {
-      return device.status();
-    }
+    LAVIK_RETURN_IF_ERROR(device.status());
     return StoragePathInfo{
         .is_block_device_ = true,
         .io_alignment_ = device->io_alignment_,
@@ -1457,9 +1448,8 @@ inline Task<absl::Status> PauseCompactWriteForTest(Worker& worker,
     co_return absl::OkStatus();
   spdlog::info("compact collection write pause armed key={} milliseconds={}",
                key, milliseconds);
-  auto status = co_await bycorf::SleepFor(
-      worker, std::chrono::milliseconds(milliseconds));
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+      worker, std::chrono::milliseconds(milliseconds)));
   spdlog::info("compact collection write pause complete key={}", key);
   co_return absl::OkStatus();
 }
@@ -1475,9 +1465,8 @@ inline Task<absl::Status> PauseGroupedWriteForTest(Worker& worker,
   const char* selected = std::getenv("LAVIK_GROUPED_WRITE_PAUSE_PHASE");
   if (selected == nullptr || phase != selected) co_return absl::OkStatus();
   spdlog::info("grouped write pause armed key={} phase={}", key, phase);
-  const auto status =
-      co_await bycorf::SleepFor(worker, std::chrono::seconds(3));
-  if (!status.ok()) co_return status;
+  LAVIK_CO_RETURN_IF_ERROR(
+      co_await bycorf::SleepFor(worker, std::chrono::seconds(3)));
   spdlog::info("grouped write pause complete key={} phase={}", key, phase);
   co_return absl::OkStatus();
 }

@@ -16,6 +16,7 @@
 
 #include "impl.h"
 #include "lavik/fault_pause.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -75,9 +76,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
                      page_indexes.end());
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
+  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
@@ -118,11 +117,8 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
         .active_slot_ = next_slot,
     });
   }
-  absl::Status synced = co_await bycorf::Fdatasync(
-      *store.worker_, store.files_[device.file_index_]);
-  if (!synced.ok()) {
-    co_return synced;
-  }
+  LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::Fdatasync(
+      *store.worker_, store.files_[device.file_index_]));
   for (std::size_t i = 0; i < page_indexes.size(); ++i) {
     allocator.bitmap_pages_[page_indexes[i]] = committed[i];
   }
@@ -253,11 +249,8 @@ StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
           : DefragReserveForDevice(device_index) +
                 (purpose == AllocationPurpose::kRedisExportBacklog ? 2 : 0);
   if (allocator.ready_blocks_.size() <= reserve) {
-    absl::Status refill =
-        co_await RefillReadyBlocksLocal(device_index, allocator);
-    if (!refill.ok()) {
-      co_return refill;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(
+        co_await RefillReadyBlocksLocal(device_index, allocator));
   }
   if (allocator.ready_blocks_.size() <= reserve) {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
@@ -397,9 +390,7 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocks(
                                                      std::move(blocks));
           });
     }
-    if (!returned.ok()) {
-      co_return returned;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(returned);
   }
   co_return absl::OkStatus();
 }
@@ -441,21 +432,17 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
       kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
+  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
   LAVIK_FAULT_INJECT(if (!mutation.started_) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE"));
   });
   // The allocator lock and buffer admission can suspend. Validate only after
   // those waits, before changing pending metadata or issuing any epoch write.
-  absl::Status authorized = mutation.BeginWrite();
-  if (!authorized.ok()) co_return authorized;
+  LAVIK_CO_RETURN_IF_ERROR(mutation.BeginWrite());
   allocator.epoch_values_[value_index] = desired;
   const MetadataPageState current = allocator.epoch_pages_[page_index];
   const std::uint8_t next_slot = current.active_slot_ == 0 ? 1 : 0;
@@ -493,9 +480,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
         : written.status();
   }
   LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FLUSH_AFTER_EPOCH_WRITE_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_WRITE_HOLD_FILE"));
   });
   auto sync = [&]() -> Task<absl::Status> {
     LAVIK_FAULT_INJECT(if (EpochIoFails("sync", device_index)) {
@@ -511,9 +497,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
     co_return synced;
   }
   LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FLUSH_AFTER_EPOCH_SYNC_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_SYNC_HOLD_FILE"));
   });
   allocator.epoch_pages_[page_index] = MetadataPageState{
       .generation_ = next_generation,
@@ -572,21 +557,19 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
 
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
+  LAVIK_CO_RETURN_IF_ERROR(acquired.status());
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
   buffer.size_ = kDirectIoAlignment;
   std::vector<MetadataPageState> next_states = allocator.epoch_pages_;
   const StorageDevice& device = devices_[device_index];
   LAVIK_FAULT_INJECT(if (!mutation.started_) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE"));
   });
   // The allocator lock and buffer admission can suspend. Validate only after
   // those waits, before changing pending metadata or issuing any epoch write.
-  absl::Status authorized = mutation.BeginWrite();
-  if (!authorized.ok()) co_return authorized;
+  LAVIK_CO_RETURN_IF_ERROR(mutation.BeginWrite());
   for (const auto& [value_index, epoch] : values) {
     allocator.epoch_values_[value_index] =
         std::max(epoch, allocator.epoch_values_[value_index]);
@@ -638,9 +621,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
   }
 
   LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FLUSH_AFTER_EPOCH_WRITE_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_WRITE_HOLD_FILE"));
   });
   auto sync = [&]() -> Task<absl::Status> {
     LAVIK_FAULT_INJECT(if (EpochIoFails("sync", device_index)) {
@@ -656,9 +638,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
     co_return synced;
   }
   LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FLUSH_AFTER_EPOCH_SYNC_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
+    LAVIK_CO_RETURN_IF_ERROR(co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FLUSH_AFTER_EPOCH_SYNC_HOLD_FILE"));
   });
   for (std::size_t page_index = 0; page_index < dirty_pages.size();
        ++page_index) {
@@ -701,9 +682,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
                 device_index, value_index, epoch, mutation);
           });
     }
-    if (!persisted.ok()) {
-      co_return persisted;
-    }
+    LAVIK_CO_RETURN_IF_ERROR(persisted);
   }
   co_return absl::OkStatus();
 }
@@ -736,7 +715,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValues(
                 device_index, copied, mutation);
           });
     }
-    if (!persisted.ok()) co_return persisted;
+    LAVIK_CO_RETURN_IF_ERROR(persisted);
   }
   co_return absl::OkStatus();
 }
@@ -839,11 +818,8 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     if (defrag_can_reclaim ||
         active_flushes_.load(std::memory_order_acquire) != 0 ||
         active_extent_reclaims_.load(std::memory_order_acquire) != 0) {
-      absl::Status waited = co_await bycorf::SleepFor(
-          *store.worker_, std::chrono::milliseconds(1));
-      if (!waited.ok()) {
-        co_return waited;
-      }
+      LAVIK_CO_RETURN_IF_ERROR(co_await bycorf::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1)));
       continue;
     }
     // Close the race where the final defrag completed between the active

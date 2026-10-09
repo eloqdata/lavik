@@ -33,6 +33,7 @@
 #include "lavik/memory.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/transaction.h"
 #include "lavik/tx/tx_shard.h"
@@ -291,9 +292,9 @@ absl::StatusOr<BitFieldPlan> ParseBitFieldPlan(const CommandRequest& request) {
     if (args.size() - i < required)
       return absl::InvalidArgumentError("syntax error");
     auto type = ParseBitFieldType(args[i + 1]);
-    if (!type.ok()) return type.status();
+    LAVIK_RETURN_IF_ERROR(type.status());
     auto offset = ParseBitOffset(args[i + 2], true, type->second);
-    if (!offset.ok()) return offset.status();
+    LAVIK_RETURN_IF_ERROR(offset.status());
 
     BitFieldOperation operation{
         .opcode_ = opcode,
@@ -547,9 +548,7 @@ bycorf::Task<std::string> RunBitmapLocked(
             "value is not an integer or out of range");
       }
       if (args.size() == 5) {
-        auto unit = ParseBitmapUnit(args[4]);
-        if (!unit.ok()) return unit.status();
-        bit_unit = *unit;
+        LAVIK_ASSIGN_OR_RETURN(bit_unit, ParseBitmapUnit(args[4]));
       }
       reply = EncodeInteger(CountBitmapBits(old, start, end, bit_unit));
       return storage::CompactValueUpdate{};
@@ -575,9 +574,7 @@ bycorf::Task<std::string> RunBitmapLocked(
             "value is not an integer or out of range");
       }
       if (args.size() == 6) {
-        auto unit = ParseBitmapUnit(args[5]);
-        if (!unit.ok()) return unit.status();
-        bit_unit = *unit;
+        LAVIK_ASSIGN_OR_RETURN(bit_unit, ParseBitmapUnit(args[5]));
         if (!end_given) return absl::InvalidArgumentError("syntax error");
       }
       if (bit_unit && !end_given) {
@@ -841,11 +838,9 @@ bycorf::Task<std::string> RunStringLocked(
       const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
       const bool exat = RedisEqualsIgnoreCase(args[2], "exat");
       const bool pxat = RedisEqualsIgnoreCase(args[2], "pxat");
-      auto parsed = ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
-      if (!parsed.ok()) {
-        return parsed.status();
-      }
-      getex_deadline = *parsed;
+      LAVIK_ASSIGN_OR_RETURN(
+          getex_deadline,
+          ParseExpireAt(args[3], ex || exat, exat || pxat, "getex"));
       captured_args = {"PEXPIREAT", args[1], std::to_string(*getex_deadline)};
       if (replication.has_value()) replication->args_ = captured_args;
       if (*getex_deadline <= RedisUnixTimeMillis()) {
@@ -1269,7 +1264,7 @@ bycorf::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
     auto value = co_await ReadOptionalStringLocked(
         context->request_->db_id_, context->request_->args_[key.arg_index_],
         key.digest_);
-    if (!value.ok()) co_return value.status();
+    LAVIK_CO_RETURN_IF_ERROR(value.status());
     context->inputs_[key.arg_index_] =
         value->has_value() ? std::move((**value).encoded_) : std::string{};
   }
@@ -1313,11 +1308,9 @@ bycorf::Task<absl::Status> BitOpWriteCallback(void* opaque,
 bycorf::Task<absl::Status> BitOpSingleShardCallback(
     void* opaque, const tx::ShardSlice& slice) {
   auto* context = static_cast<BitOpContext*>(opaque);
-  absl::Status read = co_await ReadBitOpSources(context, slice);
-  if (!read.ok()) co_return read;
+  LAVIK_CO_RETURN_IF_ERROR(co_await ReadBitOpSources(context, slice));
   context->output_ = ComputeBitOp(context->operation_, context->inputs_);
-  absl::Status prepared = PrepareBitOpReplication(context);
-  if (!prepared.ok()) co_return prepared;
+  LAVIK_CO_RETURN_IF_ERROR(PrepareBitOpReplication(context));
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ == 2) {
       co_return co_await WriteBitOpDestination(context, key.digest_, nullptr);

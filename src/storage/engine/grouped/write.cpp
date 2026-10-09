@@ -18,6 +18,7 @@
 
 #include "../impl.h"
 #include "dependency_test_hook.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::storage {
 
@@ -130,7 +131,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
     const auto waited = co_await bycorf::SleepFor(
         *store.worker_, std::chrono::microseconds(50));
     co_await store.store_state_mutex_.Lock();
-    if (!waited.ok()) co_return waited;
+    LAVIK_CO_RETURN_IF_ERROR(waited);
   }
 }
 
@@ -189,9 +190,8 @@ StorageEngine::Impl::WriteGroupRecordLocked(
   std::string_view record_payload;
   if (external) {
     RecordPayloadCursor cursor(encoder, std::string_view{});
-    auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
-    if (!written.ok()) co_return written.status();
-    extents = std::move(*written);
+    LAVIK_ASSIGN_OR_CO_RETURN(
+        extents, co_await WriteExtentValueLocked(store, {}, {}, &cursor, key));
     payload = EncodeManifest(*extents);
     record_payload = payload;
     LAVIK_MAYBE_CRASH_AT("group-extents-durable-before-record");
@@ -201,9 +201,7 @@ StorageEngine::Impl::WriteGroupRecordLocked(
     // command-owned bytes can be copied directly into the storage buffer.
     record_payload = prepared_payload;
   } else {
-    auto encoded = EncodeInlineRecordPayload(encoder);
-    if (!encoded.ok()) co_return encoded.status();
-    payload = std::move(*encoded);
+    LAVIK_ASSIGN_OR_CO_RETURN(payload, EncodeInlineRecordPayload(encoder));
     record_payload = payload;
   }
   const GroupRecordWrite identity{

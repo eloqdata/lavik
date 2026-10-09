@@ -22,6 +22,7 @@
 #include <cstring>
 #include <limits>
 
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -102,13 +103,12 @@ absl::Status ValidateEntry(ValueType type, std::uint64_t first,
 
 absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
     ValueType type, std::uint64_t count, std::uint64_t bytes) {
-  auto valid =
+  LAVIK_RETURN_IF_ERROR(
       type == ValueType::kStream
           ? (count != 0 && count <= UINT32_MAX && bytes >= 56
                  ? absl::OkStatus()
                  : absl::InvalidArgumentError("invalid Stream record totals"))
-          : ValidateTotals(type, count, bytes);
-  if (!valid.ok()) return valid;
+          : ValidateTotals(type, count, bytes));
   CollectionCompactEncoder result;
   result.type_ = type;
   result.total_count_ = count;
@@ -153,7 +153,7 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
   for (std::size_t i = 0; i < page.size(); ++i) {
     if (type == ValueType::kStream) {
       auto payload = StreamRecordPayload(page.elements_[i]);
-      if (!payload.ok()) return payload.status();
+      LAVIK_RETURN_IF_ERROR(payload.status());
       const auto bytes = page.elements_[i].size();
       if (bytes > kMaxStringBytes || bytes > UINT64_MAX - result - 4)
         return absl::OutOfRangeError("Stream page size overflow");
@@ -166,10 +166,9 @@ absl::StatusOr<std::uint64_t> CollectionCompactEncoder::MeasurePage(
                                         : page.elements_[i].size();
     const std::uint64_t second =
         type == ValueType::kHash ? page.fields_[i].value_.size() : 0;
-    auto valid = ValidateEntry(
+    LAVIK_RETURN_IF_ERROR(ValidateEntry(
         type, first, second,
-        type == ValueType::kSortedSet ? page.scored_members_[i].score_ : 0);
-    if (!valid.ok()) return valid;
+        type == ValueType::kSortedSet ? page.scored_members_[i].score_ : 0));
     const auto bytes = EntryFraming(type) + first + second;
     if (bytes > std::numeric_limits<std::uint64_t>::max() - result)
       return absl::OutOfRangeError("compact page byte length overflow");
@@ -186,7 +185,7 @@ absl::Status CollectionCompactEncoder::StartPage(const CollectionPage& page) {
     return absl::InvalidArgumentError(
         "compact page type does not match stream");
   auto measured = MeasurePage(page);
-  if (!measured.ok()) return measured.status();
+  LAVIK_RETURN_IF_ERROR(measured.status());
   const auto count = type_ == ValueType::kString ? *measured : page.size();
   if (count > total_count_ - supplied_count_ ||
       *measured > total_bytes_ - supplied_bytes_)
@@ -265,8 +264,7 @@ absl::StatusOr<CollectionCompactDecoder> CollectionCompactDecoder::Create(
   // their wire image has no collection framing for this decoder to parse.
   if (type == ValueType::kString)
     return absl::InvalidArgumentError("String uses raw stream staging");
-  auto valid = ValidateTotals(type, count, bytes);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateTotals(type, count, bytes));
   CollectionCompactDecoder result;
   result.type_ = type;
   result.total_count_ = count;
@@ -312,8 +310,8 @@ absl::Status CollectionCompactDecoder::ReadEntryHeader() {
       type_ == ValueType::kSortedSet ? std::bit_cast<double>(Get(in, 8)) : 0;
   first_bytes_ = Get(in + (type_ == ValueType::kSortedSet ? 8 : 0), 4);
   second_bytes_ = HashWire(type_) ? Get(in + 4, 4) : 0;
-  auto valid = ValidateEntry(type_, first_bytes_, second_bytes_, score_);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(
+      ValidateEntry(type_, first_bytes_, second_bytes_, score_));
   const std::uint64_t body = first_bytes_ + second_bytes_;
   const auto minimum_remaining =
       (total_count_ - parsed_count_ - 1) * EntryFraming(type_);
@@ -347,30 +345,28 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
   auto grow = [this](auto& entries) -> absl::Status {
     if (entries.size() != entries.capacity()) return absl::OkStatus();
     const auto capacity = std::max<std::size_t>(1, entries.capacity() * 2);
-    auto status = Admit(capacity * sizeof(entries[0]));
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(Admit(capacity * sizeof(entries[0])));
     entries.reserve(capacity);
     return absl::OkStatus();
   };
   auto status = type_ == ValueType::kHash        ? grow(page_.fields_)
                 : type_ == ValueType::kSortedSet ? grow(page_.scored_members_)
                                                  : grow(page_.elements_);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(status);
   if (stream_validator_) {
     // Validator identity survives TakePage. Keep its admission separate from
     // the page receipt, which the caller releases after ingesting that page.
     auto key = StreamRecordKey(first_);
-    if (!key.ok()) return key.status();
+    LAVIK_RETURN_IF_ERROR(key.status());
     if (key->size() > (SIZE_MAX - 128) / 4)
       return absl::ResourceExhaustedError("Stream validator size overflow");
     const auto needed = key->size() * 4 + 128;
     if (admission_ && needed > stream_validator_charge_.bytes_) {
-      auto admitted = admission_(needed - stream_validator_charge_.bytes_);
-      if (!admitted.ok()) return admitted;
+      LAVIK_RETURN_IF_ERROR(
+          admission_(needed - stream_validator_charge_.bytes_));
       stream_validator_charge_.bytes_ = needed;
     }
-    auto valid = stream_validator_->Read(first_);
-    if (!valid.ok()) return valid;
+    LAVIK_RETURN_IF_ERROR(stream_validator_->Read(first_));
   }
   if (type_ == ValueType::kHash) {
     page_.fields_.push_back({std::move(first_), std::move(second_)});
@@ -392,7 +388,7 @@ absl::Status CollectionCompactDecoder::CompleteEntry() {
 
 absl::StatusOr<std::size_t> CollectionCompactDecoder::Consume(
     std::string_view input) {
-  if (!status_.ok()) return status_;
+  LAVIK_RETURN_IF_ERROR(status_);
   std::size_t used = 0;
   while (!ready_) {
     if (stage_ == Stage::kDone) {
@@ -447,7 +443,7 @@ absl::StatusOr<std::size_t> CollectionCompactDecoder::Consume(
 
 absl::StatusOr<CollectionPage> CollectionCompactDecoder::TakePage(
     std::size_t* transferred_admission) {
-  if (!status_.ok()) return status_;
+  LAVIK_RETURN_IF_ERROR(status_);
   if (!ready_)
     return absl::FailedPreconditionError("compact stream page is not ready");
   if (admission_ && transferred_admission == nullptr)
@@ -466,7 +462,7 @@ absl::StatusOr<CollectionPage> CollectionCompactDecoder::TakePage(
 }
 
 absl::Status CollectionCompactDecoder::Finish() {
-  if (!status_.ok()) return status_;
+  LAVIK_RETURN_IF_ERROR(status_);
   if (stage_ != Stage::kDone || parsed_count_ != total_count_ ||
       consumed_bytes_ != total_bytes_)
     return Fail(absl::DataLossError("truncated compact stream at EOF"));

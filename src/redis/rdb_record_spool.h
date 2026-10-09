@@ -30,6 +30,7 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/memory.h"
+#include "lavik/status_macros.h"
 
 namespace lavik::rdb {
 
@@ -47,7 +48,7 @@ class RecordSpool {
     if (finished_)
       return absl::FailedPreconditionError("RDB spool already sealed");
     auto record = Allocate(key.size(), value.size());
-    if (!record.ok()) return record.status();
+    LAVIK_RETURN_IF_ERROR(record.status());
     record->key_.assign(key);
     record->value_.assign(value);
     buffered_bytes_ += key.size() + value.size() + 128;
@@ -57,15 +58,14 @@ class RecordSpool {
   absl::Status Finish() {
     if (finished_) return absl::OkStatus();
     auto status = Flush();
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     for (auto& run : runs_) {
       if (!run) continue;
       if (!result_)
         result_ = std::move(run);
       else {
-        auto merged = Merge(std::move(result_), std::move(run));
-        if (!merged.ok()) return merged.status();
-        result_ = std::move(*merged);
+        LAVIK_ASSIGN_OR_RETURN(result_,
+                               Merge(std::move(result_), std::move(run)));
       }
     }
     finished_ = true;
@@ -86,7 +86,7 @@ class RecordSpool {
     std::uint64_t count = 0;
     for (;;) {
       auto row = Read(result_.get());
-      if (!row.ok()) return row.status();
+      LAVIK_RETURN_IF_ERROR(row.status());
       if (!*row || !(**row).key_.starts_with(prefix)) break;
       ++count;
     }
@@ -164,7 +164,7 @@ class RecordSpool {
       value |= std::uint64_t(header[8 + i]) << (8 * i);
     }
     auto record = Allocate(key, value);
-    if (!record.ok()) return record.status();
+    LAVIK_RETURN_IF_ERROR(record.status());
     record->key_.resize(key);
     record->value_.resize(value);
     if (std::fread(record->key_.data(), 1, key, file) != key ||
@@ -181,14 +181,13 @@ class RecordSpool {
   }
   static absl::StatusOr<File> Merge(File a, File b) {
     auto output = Open();
-    if (!output.ok()) return output.status();
+    LAVIK_RETURN_IF_ERROR(output.status());
     auto left = Read(a.get()), right = Read(b.get());
     while (left.ok() && right.ok() && (*left || *right)) {
       const bool take_left =
           !*right || (*left && (**left).key_ <= (**right).key_);
       const auto& record = take_left ? **left : **right;
-      auto status = Write(output->get(), record);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(Write(output->get(), record));
       if (take_left) {
         left->reset();
         left = Read(a.get());
@@ -197,10 +196,9 @@ class RecordSpool {
         right = Read(b.get());
       }
     }
-    if (!left.ok()) return left.status();
-    if (!right.ok()) return right.status();
-    auto status = Seal(output->get());
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(left.status());
+    LAVIK_RETURN_IF_ERROR(right.status());
+    LAVIK_RETURN_IF_ERROR(Seal(output->get()));
     return std::move(*output);
   }
   absl::Status Flush() {
@@ -208,22 +206,21 @@ class RecordSpool {
     std::sort(buffered_.begin(), buffered_.end(),
               [](const auto& a, const auto& b) { return a.key_ < b.key_; });
     auto run = Open();
-    if (!run.ok()) return run.status();
+    LAVIK_RETURN_IF_ERROR(run.status());
     for (const auto& record : buffered_) {
-      auto status = Write(run->get(), record);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(Write(run->get(), record));
     }
     std::vector<Record>().swap(buffered_);
     buffered_bytes_ = 0;
     auto status = Seal(run->get());
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(status);
     for (auto& slot : runs_) {
       if (!slot) {
         slot = std::move(*run);
         return absl::OkStatus();
       }
       run = Merge(std::move(slot), std::move(*run));
-      if (!run.ok()) return run.status();
+      LAVIK_RETURN_IF_ERROR(run.status());
     }
     return absl::ResourceExhaustedError("RDB scratch merge level overflow");
   }

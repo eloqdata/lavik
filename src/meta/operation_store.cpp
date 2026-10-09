@@ -25,6 +25,7 @@
 
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/meta/value_codec.h"
+#include "lavik/status_macros.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::meta {
@@ -714,7 +715,7 @@ namespace {
 
 absl::Status ReadStoreSchemaVersion(MetaReader& r, std::uint16_t expected) {
   auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
+  LAVIK_RETURN_IF_ERROR(version.status());
   if (*version != expected) {
     return MetaFailStopError("unsupported operation store schema version");
   }
@@ -723,7 +724,7 @@ absl::Status ReadStoreSchemaVersion(MetaReader& r, std::uint16_t expected) {
 
 absl::Status ReadLifecycle(MetaReader& r, MetaOperationLifecycle& out) {
   auto tag = r.ReadU8();
-  if (!tag.ok()) return tag.status();
+  LAVIK_RETURN_IF_ERROR(tag.status());
   if (*tag < static_cast<std::uint8_t>(MetaOperationLifecycle::kSubmitted) ||
       *tag > static_cast<std::uint8_t>(MetaOperationLifecycle::kAborted)) {
     return MetaFailStopError("unknown operation lifecycle tag");
@@ -747,39 +748,23 @@ void WriteTerminalReceipt(MetaWriter& w, const MetaTerminalReceipt& receipt) {
 
 absl::StatusOr<MetaTerminalReceipt> ReadTerminalReceipt(MetaReader& r) {
   MetaTerminalReceipt receipt;
-  auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
-  receipt.key_.operation_id_ = *operation_id;
-  auto directive_id = ReadFixedArray<16>(r);
-  if (!directive_id.ok()) return directive_id.status();
-  receipt.key_.directive_id_ = *directive_id;
-  auto attempt_id = ReadFixedArray<16>(r);
-  if (!attempt_id.ok()) return attempt_id.status();
-  receipt.key_.attempt_id_ = *attempt_id;
-  auto directive_revision = r.ReadU64();
-  if (!directive_revision.ok()) return directive_revision.status();
-  receipt.key_.directive_revision_ = *directive_revision;
-  auto recipient_node = r.ReadString(kMetaNodeIdBytes);
-  if (!recipient_node.ok()) return recipient_node.status();
-  receipt.recipient_node_id_ = std::string(*recipient_node);
-  auto recipient_boot = ReadFixedArray<kMetaBootIncarnationBytes>(r);
-  if (!recipient_boot.ok()) return recipient_boot.status();
-  receipt.recipient_boot_id_ = *recipient_boot;
-  auto assignment_id = ReadFixedArray<16>(r);
-  if (!assignment_id.ok()) return assignment_id.status();
-  receipt.assignment_id_ = *assignment_id;
+  LAVIK_ASSIGN_OR_RETURN(receipt.key_.operation_id_, ReadFixedArray<16>(r));
+  LAVIK_ASSIGN_OR_RETURN(receipt.key_.directive_id_, ReadFixedArray<16>(r));
+  LAVIK_ASSIGN_OR_RETURN(receipt.key_.attempt_id_, ReadFixedArray<16>(r));
+  LAVIK_ASSIGN_OR_RETURN(receipt.key_.directive_revision_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(receipt.recipient_node_id_,
+                         r.ReadString(kMetaNodeIdBytes));
+  LAVIK_ASSIGN_OR_RETURN(receipt.recipient_boot_id_,
+                         ReadFixedArray<kMetaBootIncarnationBytes>(r));
+  LAVIK_ASSIGN_OR_RETURN(receipt.assignment_id_, ReadFixedArray<16>(r));
   auto status = r.ReadU8();
-  if (!status.ok()) return status.status();
+  LAVIK_RETURN_IF_ERROR(status.status());
   receipt.status_ = static_cast<MetaDirectiveResultStatus>(*status);
   if (!ValidResultStatus(receipt.status_)) {
     return MetaFailStopError("unknown terminal receipt status");
   }
-  auto result = r.ReadString(kMaxMetaPayloadBytes);
-  if (!result.ok()) return result.status();
-  receipt.result_ = std::string(*result);
-  auto committed_index = r.ReadU64();
-  if (!committed_index.ok()) return committed_index.status();
-  receipt.committed_index_ = *committed_index;
+  LAVIK_ASSIGN_OR_RETURN(receipt.result_, r.ReadString(kMaxMetaPayloadBytes));
+  LAVIK_ASSIGN_OR_RETURN(receipt.committed_index_, r.ReadU64());
   return receipt;
 }
 
@@ -806,58 +791,39 @@ void WriteRecord(MetaWriter& w, const MetaOperationRecord& record) {
 
 absl::StatusOr<MetaOperationRecord> ReadRecord(MetaReader& r) {
   MetaOperationRecord record;
-  auto id = ReadFixedArray<16>(r);
-  if (!id.ok()) return id.status();
-  record.operation_id_ = *id;
-  auto seq = r.ReadU64();
-  if (!seq.ok()) return seq.status();
-  record.operation_seq_ = *seq;
-  auto kind = r.ReadString(kMaxMetaOperationKindBytes);
-  if (!kind.ok()) return kind.status();
-  record.kind_ = std::string(*kind);
-  auto intent = r.ReadString(kMaxMetaPayloadBytes);
-  if (!intent.ok()) return intent.status();
-  record.intent_ = std::string(*intent);
-  auto intent_hash = ReadFixedArray<32>(r);
-  if (!intent_hash.ok()) return intent_hash.status();
-  record.intent_hash_ = *intent_hash;
-  auto replication_history = ReadFixedArray<kMetaReplicationHistoryIdBytes>(r);
-  if (!replication_history.ok()) return replication_history.status();
-  record.replication_history_id_ = *replication_history;
-  if (absl::Status status = ReadLifecycle(r, record.lifecycle_); !status.ok()) {
-    return status;
-  }
-  auto blob = r.ReadString(kMaxMetaPayloadBytes);
-  if (!blob.ok()) return blob.status();
-  record.kind_phase_blob_ = std::string(*blob);
-  auto directives = r.ReadList<MetaCurrentDirective>(
-      kMaxMetaDirectivesPerOperation,
-      [](MetaReader& reader) -> absl::StatusOr<MetaCurrentDirective> {
-        auto spec = ReadMetaDirectiveSpec(reader);
-        if (!spec.ok()) return spec.status();
-        auto revision = reader.ReadU64();
-        if (!revision.ok()) return revision.status();
-        return MetaCurrentDirective{std::move(*spec), *revision};
-      });
-  if (!directives.ok()) return directives.status();
-  record.current_directives_ = std::move(*directives);
-  auto receipts = r.ReadList<MetaTerminalReceipt>(
-      kMaxMetaTerminalReceiptsPerOperation,
-      [](MetaReader& reader) { return ReadTerminalReceipt(reader); });
-  if (!receipts.ok()) return receipts.status();
-  record.terminal_receipts_ = std::move(*receipts);
-  auto revision = r.ReadU64();
-  if (!revision.ok()) return revision.status();
-  record.revision_ = *revision;
-  auto result = r.ReadString(kMaxMetaPayloadBytes);
-  if (!result.ok()) return result.status();
-  record.terminal_result_ = std::string(*result);
-  auto data_loss_possible = r.ReadBool("bool tag must be 0 or 1");
-  if (!data_loss_possible.ok()) return data_loss_possible.status();
-  record.data_loss_possible_ = *data_loss_possible;
-  auto actor = ReadActorContext(r);
-  if (!actor.ok()) return actor.status();
-  record.actor_ = std::move(*actor);
+  LAVIK_ASSIGN_OR_RETURN(record.operation_id_, ReadFixedArray<16>(r));
+  LAVIK_ASSIGN_OR_RETURN(record.operation_seq_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(record.kind_,
+                         r.ReadString(kMaxMetaOperationKindBytes));
+  LAVIK_ASSIGN_OR_RETURN(record.intent_, r.ReadString(kMaxMetaPayloadBytes));
+  LAVIK_ASSIGN_OR_RETURN(record.intent_hash_, ReadFixedArray<32>(r));
+  LAVIK_ASSIGN_OR_RETURN(record.replication_history_id_,
+                         ReadFixedArray<kMetaReplicationHistoryIdBytes>(r));
+  LAVIK_RETURN_IF_ERROR(ReadLifecycle(r, record.lifecycle_));
+  LAVIK_ASSIGN_OR_RETURN(record.kind_phase_blob_,
+                         r.ReadString(kMaxMetaPayloadBytes));
+  LAVIK_ASSIGN_OR_RETURN(
+      record.current_directives_,
+      r.ReadList<MetaCurrentDirective>(
+          kMaxMetaDirectivesPerOperation,
+          [](MetaReader& reader) -> absl::StatusOr<MetaCurrentDirective> {
+            auto spec = ReadMetaDirectiveSpec(reader);
+            LAVIK_RETURN_IF_ERROR(spec.status());
+            auto revision = reader.ReadU64();
+            LAVIK_RETURN_IF_ERROR(revision.status());
+            return MetaCurrentDirective{std::move(*spec), *revision};
+          }));
+  LAVIK_ASSIGN_OR_RETURN(
+      record.terminal_receipts_,
+      r.ReadList<MetaTerminalReceipt>(
+          kMaxMetaTerminalReceiptsPerOperation,
+          [](MetaReader& reader) { return ReadTerminalReceipt(reader); }));
+  LAVIK_ASSIGN_OR_RETURN(record.revision_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(record.terminal_result_,
+                         r.ReadString(kMaxMetaPayloadBytes));
+  LAVIK_ASSIGN_OR_RETURN(record.data_loss_possible_,
+                         r.ReadBool("bool tag must be 0 or 1"));
+  LAVIK_ASSIGN_OR_RETURN(record.actor_, ReadActorContext(r));
   return record;
 }
 
@@ -874,37 +840,24 @@ void WriteSummary(MetaWriter& w, const MetaOperationArchiveSummary& summary) {
 
 absl::StatusOr<MetaOperationArchiveSummary> ReadSummary(MetaReader& r) {
   MetaOperationArchiveSummary summary;
-  auto id = ReadFixedArray<16>(r);
-  if (!id.ok()) return id.status();
-  summary.operation_id_ = *id;
-  auto seq = r.ReadU64();
-  if (!seq.ok()) return seq.status();
-  summary.operation_seq_ = *seq;
-  auto intent_hash = ReadFixedArray<32>(r);
-  if (!intent_hash.ok()) return intent_hash.status();
-  summary.intent_hash_ = *intent_hash;
-  auto actor = ReadActorContext(r);
-  if (!actor.ok()) return actor.status();
-  summary.actor_ = std::move(*actor);
-  if (absl::Status status = ReadLifecycle(r, summary.terminal_lifecycle_);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_ASSIGN_OR_RETURN(summary.operation_id_, ReadFixedArray<16>(r));
+  LAVIK_ASSIGN_OR_RETURN(summary.operation_seq_, r.ReadU64());
+  LAVIK_ASSIGN_OR_RETURN(summary.intent_hash_, ReadFixedArray<32>(r));
+  LAVIK_ASSIGN_OR_RETURN(summary.actor_, ReadActorContext(r));
+  LAVIK_RETURN_IF_ERROR(ReadLifecycle(r, summary.terminal_lifecycle_));
   // Tombstones are terminal by construction.
   if (!IsTerminal(summary.terminal_lifecycle_)) {
     return MetaFailStopError("archive summary is not terminal");
   }
-  auto result = r.ReadString(kMaxMetaPayloadBytes);
-  if (!result.ok()) return result.status();
-  summary.terminal_result_ = std::string(*result);
-  auto data_loss_possible = r.ReadBool("bool tag must be 0 or 1");
-  if (!data_loss_possible.ok()) return data_loss_possible.status();
-  summary.data_loss_possible_ = *data_loss_possible;
-  auto receipts = r.ReadList<MetaTerminalReceipt>(
-      kMaxMetaTerminalReceiptsPerOperation,
-      [](MetaReader& reader) { return ReadTerminalReceipt(reader); });
-  if (!receipts.ok()) return receipts.status();
-  summary.terminal_receipts_ = std::move(*receipts);
+  LAVIK_ASSIGN_OR_RETURN(summary.terminal_result_,
+                         r.ReadString(kMaxMetaPayloadBytes));
+  LAVIK_ASSIGN_OR_RETURN(summary.data_loss_possible_,
+                         r.ReadBool("bool tag must be 0 or 1"));
+  LAVIK_ASSIGN_OR_RETURN(
+      summary.terminal_receipts_,
+      r.ReadList<MetaTerminalReceipt>(
+          kMaxMetaTerminalReceiptsPerOperation,
+          [](MetaReader& reader) { return ReadTerminalReceipt(reader); }));
   std::set<std::tuple<MetaDirectiveId, MetaAttemptId, std::uint64_t>>
       receipt_keys;
   for (const MetaTerminalReceipt& receipt : summary.terminal_receipts_) {
@@ -976,11 +929,8 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
     std::uint32_t max_archived,
     std::uint32_t max_terminal_receipts_per_operation) {
   MetaReader r(bytes);
-  if (absl::Status status =
-          ReadStoreSchemaVersion(r, kMetaOperationStoreFormatVersion);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(
+      ReadStoreSchemaVersion(r, kMetaOperationStoreFormatVersion));
   // The live set (terminal records included) never exceeds the joint bound
   // enforced at submit; the decode cap doubles as the allocation guard.
   const std::uint64_t max_live =
@@ -988,11 +938,11 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
   auto live_records = r.ReadList<MetaOperationRecord>(
       static_cast<std::uint32_t>(max_live),
       [](MetaReader& rr) { return ReadRecord(rr); });
-  if (!live_records.ok()) return live_records.status();
+  LAVIK_RETURN_IF_ERROR(live_records.status());
   auto summaries = r.ReadList<MetaOperationArchiveSummary>(
       max_archived, [](MetaReader& rr) { return ReadSummary(rr); });
-  if (!summaries.ok()) return summaries.status();
-  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(summaries.status());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
 
   MetaOperationStore store(max_active, max_archived,
                            max_terminal_receipts_per_operation);
@@ -1084,15 +1034,12 @@ absl::StatusOr<MetaOperationStore> MetaOperationStore::Deserialize(
 absl::StatusOr<MetaOperationArchiveExport> DecodeMetaOperationArchiveExport(
     std::string_view bytes) {
   MetaReader r(bytes);
-  if (absl::Status status = ReadStoreSchemaVersion(r, kMetaFormatVersion);
-      !status.ok()) {
-    return status;
-  }
+  LAVIK_RETURN_IF_ERROR(ReadStoreSchemaVersion(r, kMetaFormatVersion));
   auto summaries = r.ReadList<MetaOperationArchiveSummary>(
       kMaxMetaArchivedOperationSummaries,
       [](MetaReader& rr) { return ReadSummary(rr); });
-  if (!summaries.ok()) return summaries.status();
-  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(summaries.status());
+  LAVIK_RETURN_IF_ERROR(r.Finish());
   MetaOperationArchiveExport out;
   out.summaries_ = std::move(*summaries);
   return out;

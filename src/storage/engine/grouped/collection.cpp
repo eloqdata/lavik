@@ -26,6 +26,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
+#include "lavik/status_macros.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -110,7 +111,7 @@ absl::Status ValidateEntrySpan(OrderedCollectionKind kind,
     }
     if (kind == OrderedCollectionKind::kStream) {
       auto key = StreamRecordKey(entry.value_);
-      if (!key.ok()) return key.status();
+      LAVIK_RETURN_IF_ERROR(key.status());
       if (i != 0) {
         auto previous = StreamRecordKey(entries[i - 1].value_);
         if (!previous.ok() || *previous >= *key)
@@ -143,8 +144,7 @@ absl::StatusOr<std::size_t> ValidateGroup(const OrderedGroupSnapshot& group) {
                       : group.entries_.empty())) {
     return absl::InvalidArgumentError("invalid ordered page identity or state");
   }
-  auto status = ValidateEntries(group.kind_, group.entries_);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(ValidateEntries(group.kind_, group.entries_));
   if (group.kind_ == OrderedCollectionKind::kString) {
     const auto size = OrderedGroupSize(group);
     if (group.retired_ ||
@@ -331,7 +331,7 @@ absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
   Store(bytes, 64, root.revision_, 8);
   if (root.member_index_) {
     auto members = EncodeGroupedHashRoot(*root.member_index_);
-    if (!members.ok()) return members.status();
+    LAVIK_RETURN_IF_ERROR(members.status());
     bytes.append(*members);
   }
   if (root.stream_length_) {
@@ -363,9 +363,8 @@ absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
       .group_count_ = static_cast<std::uint32_t>(Load(bytes, 56, 4)),
       .revision_ = Load(bytes, 64, 8)};
   if (bytes.size() == kIndexedSortedSetRootBytes) {
-    auto members = DecodeGroupedHashRoot(bytes.substr(kRootBytes));
-    if (!members.ok()) return members.status();
-    root.member_index_ = *members;
+    LAVIK_ASSIGN_OR_RETURN(root.member_index_,
+                           DecodeGroupedHashRoot(bytes.substr(kRootBytes)));
   }
   if (bytes.size() == kGroupedStreamRootBytes)
     root.stream_length_ = Load(bytes, kRootBytes, 8);
@@ -376,7 +375,7 @@ absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
 absl::StatusOr<OrderedGroupEncoder> OrderedGroupEncoder::Create(
     const OrderedGroupSnapshot& group) {
   auto size = ValidateGroup(group);
-  if (!size.ok()) return size.status();
+  LAVIK_RETURN_IF_ERROR(size.status());
   OrderedGroupEncoder encoder;
   encoder.group_ = &group;
   encoder.encoded_bytes_ = *size;
@@ -420,7 +419,7 @@ std::optional<std::string_view> OrderedGroupEncoder::Next() noexcept {
 absl::StatusOr<std::string> EncodeOrderedGroup(
     const OrderedGroupSnapshot& group) {
   auto encoder = OrderedGroupEncoder::Create(group);
-  if (!encoder.ok()) return encoder.status();
+  LAVIK_RETURN_IF_ERROR(encoder.status());
   std::string result;
   result.reserve(encoder->encoded_bytes());
   while (auto part = encoder->Next()) result.append(*part);
@@ -481,7 +480,7 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
 absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
     std::string_view bytes, std::size_t first, std::size_t count) {
   auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
-  if (!metadata.ok()) return metadata.status();
+  LAVIK_RETURN_IF_ERROR(metadata.status());
   if (metadata->kind_ != OrderedCollectionKind::kList || metadata->retired_)
     return absl::DataLossError("List range requires a live List page");
   if (first > metadata->item_count_ || count > metadata->item_count_ - first)
@@ -511,7 +510,7 @@ absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
 absl::StatusOr<std::vector<OrderedCollectionEntryView>>
 DecodeSortedSetGroupViews(std::string_view bytes) {
   auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
-  if (!metadata.ok()) return metadata.status();
+  LAVIK_RETURN_IF_ERROR(metadata.status());
   if (metadata->kind_ != OrderedCollectionKind::kSortedSet ||
       metadata->retired_)
     return absl::DataLossError(
@@ -652,8 +651,8 @@ absl::Status ValidateOrderedEntryBoundary(OrderedCollectionKind kind,
   if (kind == OrderedCollectionKind::kStream) {
     auto last = StreamRecordKey(left.value_);
     auto first = StreamRecordKey(right.value_);
-    if (!last.ok()) return last.status();
-    if (!first.ok()) return first.status();
+    LAVIK_RETURN_IF_ERROR(last.status());
+    LAVIK_RETURN_IF_ERROR(first.status());
     // Payload bytes must not make two records with the same routing key
     // appear ordered across a page boundary.
     if (*last >= *first)
@@ -780,26 +779,23 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
             [](const auto& a, const auto& b) { return a.id_ < b.id_; });
   if (root.kind_ == OrderedCollectionKind::kList) {
     result.ids_.emplace<ListSlots>();
-    auto retired_array = decltype(result.retired_)::From(retired);
-    if (!retired_array.ok()) return retired_array.status();
-    result.retired_ = std::move(*retired_array);
+    LAVIK_ASSIGN_OR_RETURN(result.retired_,
+                           decltype(result.retired_)::From(retired));
     auto& positions = std::get<ListSlots>(result.ids_).positions_;
     for (std::size_t i = 0; i < retired.size(); ++i) {
-      auto status = positions.Set(retired[i].id_, {i, true});
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(positions.Set(retired[i].id_, {i, true}));
     }
-    auto status = result.BuildListSlots(std::move(groups), 0);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(result.BuildListSlots(std::move(groups), 0));
     return result;
   }
   auto group_array = decltype(result.groups_)::From(groups);
-  if (!group_array.ok()) return group_array.status();
+  LAVIK_RETURN_IF_ERROR(group_array.status());
   auto retired_array = decltype(result.retired_)::From(retired);
-  if (!retired_array.ok()) return retired_array.status();
+  LAVIK_RETURN_IF_ERROR(retired_array.status());
   auto id_array = LinearIds::From(ids);
-  if (!id_array.ok()) return id_array.status();
+  LAVIK_RETURN_IF_ERROR(id_array.status());
   auto end_array = FenwickTree::FromCumulative(std::move(ends));
-  if (!end_array.ok()) return end_array.status();
+  LAVIK_RETURN_IF_ERROR(end_array.status());
   result.groups_ = std::move(*group_array);
   result.retired_ = std::move(*retired_array);
   result.linear_ids() = std::move(*id_array);
@@ -902,8 +898,7 @@ absl::Status OrderedGroupDirectory::BuildListSlots(
   auto& list = std::get<ListSlots>(ids_);
   list.head_ = 0;
   for (std::size_t i = 0; i < groups.size(); ++i) {
-    auto status = list.positions_.Set(groups[i].id_, {i, false});
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(list.positions_.Set(groups[i].id_, {i, false}));
   }
   groups.resize(capacity);
   std::vector<std::uint64_t> cumulative;
@@ -912,9 +907,9 @@ absl::Status OrderedGroupDirectory::BuildListSlots(
   for (const auto& group : groups)
     cumulative.push_back(count += group.item_count_);
   auto slots = decltype(groups_)::From(groups);
-  if (!slots.ok()) return slots.status();
+  LAVIK_RETURN_IF_ERROR(slots.status());
   auto ranks = FenwickTree::FromCumulative(std::move(cumulative));
-  if (!ranks.ok()) return ranks.status();
+  LAVIK_RETURN_IF_ERROR(ranks.status());
   groups_ = std::move(*slots);
   ranks_ = std::move(*ranks);
   return absl::OkStatus();
@@ -931,8 +926,7 @@ absl::Status OrderedGroupDirectory::ReplacePages(
         list ? list->positions_.Get(item.id_)->slot_ : *FindIndex(item.id_);
     counts.emplace_back(
         slot, absl::int128(item.item_count_) - groups_[slot].item_count_);
-    auto status = groups_.Set(slot, item);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(groups_.Set(slot, item));
   }
   std::sort(counts.begin(), counts.end());
   // Only boundaries beside changed pages can introduce a score inversion.
@@ -960,7 +954,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
   }
   const auto& list = std::get<ListSlots>(ids_);
   auto analysis = AnalyzeChanges(*this, root, revision, changed);
-  if (!analysis.ok()) return analysis.status();
+  LAVIK_RETURN_IF_ERROR(analysis.status());
   const auto& replacements = analysis->pages_;
   OrderedGroupDirectory result = *this;
   result.root_ = root;
@@ -977,24 +971,20 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
     if (!item.retired_) continue;
     const auto* position = list.positions_.Get(item.id_);
     if (position && position->retired_) {
-      auto status = result.retired_.Set(position->slot_, item);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(result.retired_.Set(position->slot_, item));
     } else {
-      auto status = next_list.positions_.Set(
-          item.id_, {retired_.size() + retirements.size(), true});
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(next_list.positions_.Set(
+          item.id_, {retired_.size() + retirements.size(), true}));
       retirements.push_back(item);
     }
   }
   if (!retirements.empty()) {
-    auto retired = result.retired_.Appended(retirements);
-    if (!retired.ok()) return retired.status();
-    result.retired_ = std::move(*retired);
+    LAVIK_ASSIGN_OR_RETURN(result.retired_,
+                           result.retired_.Appended(retirements));
   }
   std::vector<FenwickTree::CountChange> count_changes;
   if (analysis->same_topology_) {
-    auto status = result.ReplacePages(changed);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(result.ReplacePages(changed));
     return result;
   } else {
     const auto old_groups = groups();
@@ -1080,8 +1070,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
                      old_groups.begin() + begin);
       rebuilt.insert(rebuilt.end(), replacement.begin(), replacement.end());
       rebuilt.insert(rebuilt.end(), old_groups.begin() + end, old_groups.end());
-      auto status = result.BuildListSlots(std::move(rebuilt), capacity);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(
+          result.BuildListSlots(std::move(rebuilt), capacity));
       return result;
     }
     if (begin == 0)
@@ -1097,9 +1087,8 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
       slots[slot] = replacement[i];
       const auto* old = list.positions_.Get(replacement[i].id_);
       if (!old || old->slot_ != slot) {
-        auto status =
-            next_list.positions_.Set(replacement[i].id_, {slot, false});
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(
+            next_list.positions_.Set(replacement[i].id_, {slot, false}));
       }
     }
     for (const auto& [slot, item] : slots) {
@@ -1107,13 +1096,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
         continue;
       count_changes.emplace_back(
           slot, absl::int128(item.item_count_) - groups_[slot].item_count_);
-      auto status = result.groups_.Set(slot, item);
-      if (!status.ok()) return status;
+      LAVIK_RETURN_IF_ERROR(result.groups_.Set(slot, item));
     }
   }
   std::sort(count_changes.begin(), count_changes.end());
-  auto status = result.ranks_.ApplyCounts(count_changes, root.item_count_);
-  if (!status.ok()) return status;
+  LAVIK_RETURN_IF_ERROR(
+      result.ranks_.ApplyCounts(count_changes, root.item_count_));
   return result;
 }
 
@@ -1165,22 +1153,20 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         return absl::DataLossError("String segment byte total overflows");
       result.total_group_bytes_ += item.encoded_bytes_;
     }
-    auto array = decltype(result.groups_)::From(groups);
-    if (!array.ok()) return array.status();
-    result.groups_ = std::move(*array);
+    LAVIK_ASSIGN_OR_RETURN(result.groups_,
+                           decltype(result.groups_)::From(groups));
     return result;
   }
   auto analysis = AnalyzeChanges(*this, root, revision, changed);
-  if (!analysis.ok()) return analysis.status();
+  LAVIK_RETURN_IF_ERROR(analysis.status());
   const auto& replacements = analysis->pages_;
   auto members = members_;
   if (root.member_index_.has_value() != members.has_value())
     return absl::FailedPreconditionError("cannot change member index format");
   if (members && members->root() != *root.member_index_) {
-    auto updated =
-        members->Apply(*root.member_index_, command_sequence, member_changes);
-    if (!updated.ok()) return updated.status();
-    members = std::move(*updated);
+    LAVIK_ASSIGN_OR_RETURN(
+        members,
+        members->Apply(*root.member_index_, command_sequence, member_changes));
   } else if (!member_changes.empty()) {
     return absl::DataLossError("member writes without a new member revision");
   }
@@ -1205,8 +1191,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         !replacements.contains(root.first_group_))
       result.stream_header_ = stream_header_;
     result.total_group_bytes_ = analysis->bytes_;
-    auto status = result.ReplacePages(changed);
-    if (!status.ok()) return status;
+    LAVIK_RETURN_IF_ERROR(result.ReplacePages(changed));
     return result;
   }
   // Foreground updates contain one decided replacement per changed identity.
@@ -1309,12 +1294,12 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         extended.push_back(*suffix[i]);
       }
       auto groups = groups_.Appended(extended);
-      if (!groups.ok()) return groups.status();
+      LAVIK_RETURN_IF_ERROR(groups.status());
       auto ids = linear_ids().Appended(new_ids);
-      if (!ids.ok()) return ids.status();
+      LAVIK_RETURN_IF_ERROR(ids.status());
       auto ranks =
           ranks_.WithSuffix(first, prefixes, prefix_changes, root.item_count_);
-      if (!ranks.ok()) return ranks.status();
+      LAVIK_RETURN_IF_ERROR(ranks.status());
       rebuilt.groups_ = std::move(*groups);
       rebuilt.linear_ids() = std::move(*ids);
       rebuilt.ranks_ = std::move(*ranks);
@@ -1324,23 +1309,20 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
         const auto index = first + i;
         const auto& item = *suffix[i];
         if (i < old_suffix_size) {
-          auto status = rebuilt.groups_.Set(index, item);
-          if (!status.ok()) return status;
+          LAVIK_RETURN_IF_ERROR(rebuilt.groups_.Set(index, item));
         }
         const auto found = std::lower_bound(
             linear_ids().begin(), linear_ids().end(), item.id_,
             [](const auto& entry, auto id) { return entry.first < id; });
         if (found != linear_ids().end() && found->first == item.id_ &&
             found->second != index) {
-          auto status = rebuilt.linear_ids().Set(found - linear_ids().begin(),
-                                                 {item.id_, index});
-          if (!status.ok()) return status;
+          LAVIK_RETURN_IF_ERROR(rebuilt.linear_ids().Set(
+              found - linear_ids().begin(), {item.id_, index}));
         }
       }
       for (const auto& item : changed) {
         if (const auto index = FindIndex(item.id_); index && *index < first) {
-          auto status = rebuilt.groups_.Set(*index, item);
-          if (!status.ok()) return status;
+          LAVIK_RETURN_IF_ERROR(rebuilt.groups_.Set(*index, item));
         }
       }
       if (has_stream_header() && !replacements.contains(root.first_group_)) {
@@ -1422,9 +1404,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     rebuilt.retired_ = retired_;
   } else if (retired_.empty() ||
              retired_.back().id_ < new_retired.front().id_) {
-    auto appended = retired_.Appended(new_retired);
-    if (!appended.ok()) return appended.status();
-    rebuilt.retired_ = std::move(*appended);
+    LAVIK_ASSIGN_OR_RETURN(rebuilt.retired_, retired_.Appended(new_retired));
   } else {
     std::vector<OrderedGroupEntry> retired;
     retired.reserve(retired_.size() + new_retired.size());
@@ -1436,9 +1416,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       retired.push_back(item);
     }
     retired.insert(retired.end(), old, retired_.end());
-    auto array = decltype(retired_)::From(retired);
-    if (!array.ok()) return array.status();
-    rebuilt.retired_ = std::move(*array);
+    LAVIK_ASSIGN_OR_RETURN(rebuilt.retired_, decltype(retired_)::From(retired));
   }
   // The predecessor identity index is already sorted. Its ordinal changes,
   // not its identities. Reindex surviving old pages and merge only the new
@@ -1464,19 +1442,18 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       preserves_ordinals
           ? groups_.Appended(std::span(groups).subspan(groups_.size()))
           : decltype(groups_)::From(groups);
-  if (!group_array.ok()) return group_array.status();
+  LAVIK_RETURN_IF_ERROR(group_array.status());
   if (preserves_ordinals) {
     for (const auto& item : changed) {
       if (const auto position = FindIndex(item.id_)) {
-        auto status = group_array->Set(*position, groups[*position]);
-        if (!status.ok()) return status;
+        LAVIK_RETURN_IF_ERROR(group_array->Set(*position, groups[*position]));
       }
     }
   }
   auto id_array = LinearIds::From(ids);
-  if (!id_array.ok()) return id_array.status();
+  LAVIK_RETURN_IF_ERROR(id_array.status());
   auto end_array = FenwickTree::FromCumulative(std::move(ends));
-  if (!end_array.ok()) return end_array.status();
+  LAVIK_RETURN_IF_ERROR(end_array.status());
   rebuilt.groups_ = std::move(*group_array);
   rebuilt.linear_ids() = std::move(*id_array);
   rebuilt.ranks_ = std::move(*end_array);
@@ -1572,8 +1549,8 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(OrderedGroupSnapshot& left,
   };
   const auto left_bytes = payload_bytes(left.entries_);
   const auto right_bytes = payload_bytes(right.entries_);
-  if (!left_bytes.ok()) return left_bytes.status();
-  if (!right_bytes.ok()) return right_bytes.status();
+  LAVIK_RETURN_IF_ERROR(left_bytes.status());
+  LAVIK_RETURN_IF_ERROR(right_bytes.status());
   if (!left.entries_.empty() && !right.entries_.empty() &&
       *left_bytes <= capacity && *right_bytes <= capacity)
     return false;
@@ -1601,10 +1578,8 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(OrderedGroupSnapshot& left,
     }
   }
   if (cut == 0) return false;
-  auto valid = ValidateEntries(left.kind_, left.entries_);
-  if (!valid.ok()) return valid;
-  valid = ValidateEntries(right.kind_, right.entries_);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateEntries(left.kind_, left.entries_));
+  LAVIK_RETURN_IF_ERROR(ValidateEntries(right.kind_, right.entries_));
   if (!left.entries_.empty() && !right.entries_.empty() &&
       !OrderedEntryLess(left.entries_.back(), right.entries_.front()))
     return absl::InvalidArgumentError("unordered Sorted Set rebalance pair");
@@ -1646,8 +1621,7 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
       (group.previous_ != 0 && group.previous_ == group.next_)) {
     return absl::InvalidArgumentError("invalid ordered split identity");
   }
-  auto valid = ValidateEntries(group.kind_, group.entries_);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateEntries(group.kind_, group.entries_));
   OrderedGroupSplit result{.next_group_id_ = next_group_id, .groups_ = {}};
   std::size_t begin = 0;
   while (begin != group.entries_.size()) {
@@ -1704,8 +1678,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   // The storage adapter allocates the next revision after this pure plan is
   // built. Do not accidentally retain the source's bound on new page writes.
   plan.root_.revision_ = 0;
-  auto valid = ValidateEntries(root.kind_, entries);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateEntries(root.kind_, entries));
 
   const auto& groups = directory.groups();
   // End insertion uses the tail; an insertion at a page boundary belongs to
@@ -1731,7 +1704,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
       return absl::AbortedError("ordered splice loaded a stale page");
     }
     auto page_valid = ValidateGroup(page);
-    if (!page_valid.ok()) return page_valid.status();
+    LAVIK_RETURN_IF_ERROR(page_valid.status());
     if (!loaded.emplace(page.id_, std::move(candidate.snapshot_)).second)
       return absl::InvalidArgumentError("ordered splice repeats a loaded page");
   }
@@ -1760,9 +1733,8 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
       return absl::InvalidArgumentError("ordered splice needs adjacent pages");
     }
     if (i != required_begin && loaded.contains(groups[i - 1].id_)) {
-      auto boundary = ValidateOrderedGroupBoundary(loaded.at(groups[i - 1].id_),
-                                                   loaded.at(groups[i].id_));
-      if (!boundary.ok()) return boundary;
+      LAVIK_RETURN_IF_ERROR(ValidateOrderedGroupBoundary(
+          loaded.at(groups[i - 1].id_), loaded.at(groups[i].id_)));
     }
   }
 
@@ -1796,8 +1768,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     for (auto& addition : entries)
       replacement.entries_.push_back(std::move(addition));
   }
-  valid = ValidateEntries(root.kind_, replacement.entries_);
-  if (!valid.ok()) return valid;
+  LAVIK_RETURN_IF_ERROR(ValidateEntries(root.kind_, replacement.entries_));
   if (root.kind_ != OrderedCollectionKind::kList &&
       !replacement.entries_.empty()) {
     if (begin != 0 &&
@@ -1832,7 +1803,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   if (!replacement.entries_.empty()) {
     auto split = SplitOrderedGroup(std::move(replacement), root.next_group_id_,
                                    target_bytes);
-    if (!split.ok()) return split.status();
+    LAVIK_RETURN_IF_ERROR(split.status());
     plan.root_.next_group_id_ = split->next_group_id_;
     replacement_count = split->groups_.size();
     new_first = split->groups_.front().id_;
