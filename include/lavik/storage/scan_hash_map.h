@@ -2497,8 +2497,7 @@ class ScanHashMap {
     }
     if (std::none_of(tail->entries_.begin(), tail->entries_.end(),
                      [](EntryHandle handle) { return handle != 0; })) {
-      const std::uint32_t child_id = parent->child_;
-      parent->child_ = 0;
+      const std::uint32_t child_id = std::exchange(parent->child_, 0);
       FreeChild(table, child_id);
     }
   }
@@ -2522,8 +2521,7 @@ class ScanHashMap {
     while (bucket != nullptr) {
       const bool chained = Chained(*bucket);
       Bucket* next = chained ? Child(*source, bucket) : nullptr;
-      const std::uint32_t next_id = bucket->child_;
-      bucket->child_ = 0;
+      const std::uint32_t next_id = std::exchange(bucket->child_, 0);
       if (bucket_id != 0) FreeChild(source, bucket_id);
       bucket_id = next_id;
       bucket = next;

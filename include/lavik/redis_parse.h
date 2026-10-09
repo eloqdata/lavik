@@ -130,7 +130,7 @@ inline bool FormatRedisLongDouble(long double value, std::string* output) {
     return false;
   }
   std::size_t length = static_cast<std::size_t>(formatted);
-  if (std::string_view(buffer, length).find('.') != std::string_view::npos) {
+  if (std::string_view(buffer, length).contains('.')) {
     while (length != 0 && buffer[length - 1] == '0') --length;
     if (length != 0 && buffer[length - 1] == '.') --length;
   }

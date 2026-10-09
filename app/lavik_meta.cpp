@@ -526,7 +526,7 @@ int main(int argc, char** argv) {
     }
     ctl_endpoint = std::move(*parsed_ctl);
     ctl_endpoint_text =
-        ctl_endpoint->host_.find(':') == std::string::npos
+        !ctl_endpoint->host_.contains(':')
             ? ctl_endpoint->host_ + ":" + std::to_string(ctl_endpoint->port_)
             : "[" + ctl_endpoint->host_ +
                   "]:" + std::to_string(ctl_endpoint->port_);

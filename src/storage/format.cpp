@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 
 #include "absl/crc/crc32c.h"
 
@@ -933,8 +934,7 @@ bool DecodeReplicationFrameHeader(std::span<const std::byte> input,
   ReplicationFrameHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   std::array<std::byte, sizeof(ReplicationFrameHeader)> encoded{};
-  const std::uint32_t expected = decoded.header_checksum_;
-  decoded.header_checksum_ = 0;
+  const std::uint32_t expected = std::exchange(decoded.header_checksum_, 0);
   std::memcpy(encoded.data(), &decoded, sizeof(decoded));
   if (Crc32c(encoded) != expected) {
     return false;

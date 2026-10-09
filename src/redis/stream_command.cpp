@@ -113,8 +113,7 @@ std::uint64_t ConsumerPendingCount(const Group& group, std::string_view name) {
         group.summary_->consumer_pending_.find(std::string(name));
     return found == group.summary_->consumer_pending_.end() ? 0 : found->second;
   }
-  return std::count_if(group.pending_.begin(), group.pending_.end(),
-                       [&](const Pending& p) { return p.consumer_ == name; });
+  return std::ranges::count(group.pending_, name, &Pending::consumer_);
 }
 
 bool ValidStreamNodes(const Stream& stream) {
@@ -2316,7 +2315,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           } else {
             id.seq_ = 0;
           }
-        } else if (id_text.find('-') == std::string_view::npos) {
+        } else if (!id_text.contains('-')) {
           if (!ParseInt(id_text, &id.ms_))
             return absl::InvalidArgumentError(
                 "Invalid stream ID specified as stream command argument");
@@ -2733,9 +2732,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             integer = 0;
             return NoChange();
           }
-          integer = std::count_if(
-              group->pending_.begin(), group->pending_.end(),
-              [&](const Pending& p) { return p.consumer_ == a[4]; });
+          integer =
+              std::ranges::count(group->pending_, a[4], &Pending::consumer_);
           std::erase_if(group->pending_,
                         [&](const Pending& p) { return p.consumer_ == a[4]; });
           std::erase_if(group->consumers_,

@@ -655,8 +655,7 @@ Task<CommandReply> ExecuteAddReplicaOf(const CommandRequest& request,
 }
 
 std::string ClusterNodeAddress(std::string_view host, std::uint16_t port) {
-  if (host.find(':') != std::string_view::npos &&
-      !(host.starts_with('[') && host.ends_with(']'))) {
+  if (host.contains(':') && !(host.starts_with('[') && host.ends_with(']'))) {
     return absl::StrCat("[", host, "]:", port, "@0");
   }
   return absl::StrCat(host, ":", port, "@0");

@@ -88,7 +88,7 @@ inline std::optional<ClientEndpoint> ParseClientEndpoint(
 inline std::string FormatClientEndpoint(const ClientEndpoint& endpoint,
                                         bool with_transport = false) {
   const std::string address =
-      endpoint.host_.find(':') != std::string::npos
+      endpoint.host_.contains(':')
           ? "[" + endpoint.host_ + "]:" + std::to_string(endpoint.port_)
           : endpoint.host_ + ":" + std::to_string(endpoint.port_);
   return with_transport && endpoint.tagged_

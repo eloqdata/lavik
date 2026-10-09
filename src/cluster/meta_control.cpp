@@ -57,7 +57,7 @@ absl::Status Invalid(std::string message) {
 }
 
 bool IsCanonicalNumericHost(std::string_view host) {
-  const std::string encoded = host.find(':') == std::string_view::npos
+  const std::string encoded = !host.contains(':')
                                   ? absl::StrCat(host, ":1")
                                   : absl::StrCat("[", host, "]:1");
   const auto parsed = lavik::ParseNumericEndpoint(encoded);

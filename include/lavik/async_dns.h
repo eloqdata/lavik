@@ -91,8 +91,7 @@ class ClientDnsCache {
                             sizeof(text), nullptr, 0, NI_NUMERICHOST) == 0) {
             const std::string ip = text;
             const auto parsed = ParseConcreteNumericEndpoint(
-                ip.find(':') == std::string::npos ? ip + ":1"
-                                                  : "[" + ip + "]:1");
+                !ip.contains(':') ? ip + ":1" : "[" + ip + "]:1");
             if (parsed) next[host] = parsed->host_;
           }
         }
