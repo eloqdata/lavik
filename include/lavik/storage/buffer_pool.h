@@ -155,7 +155,8 @@ class RegisteredBufferPool {
   bool buffers_registered() const noexcept { return buffers_registered_; }
   // Registration is immutable after Init, including across lease handoffs.
   // Slot ids identify pool ownership, independently of registration indices.
-  bool buffer_registered(std::uint16_t buffer_id) const noexcept {
+  [[gnu::always_inline]] bool buffer_registered(
+      std::uint16_t buffer_id) const noexcept {
     if (buffer_id == 0) return false;
     if (buffer_id <= write_buffers_.size()) {
       return buffer_id <= registered_write_count_;
@@ -269,11 +270,38 @@ class RegisteredBufferPool {
   std::vector<bool> overflow_read_buffer_in_use_;
 };
 
-inline bool ReadBufferLease::registered() const noexcept {
+// Keep slot lookup and registration checks in the read coroutine: GCC can
+// otherwise outline even these small accessors under Release LTO.
+[[gnu::always_inline]] inline bool ReadBufferLease::registered()
+    const noexcept {
   // Full registration is the common case. Overflow leases have no fixed slot
   // even then; only partial registration needs the per-slot prefix check.
   return pool_ != nullptr && buffer_id() != 0 &&
          (pool_->buffers_registered() || pool_->buffer_registered(buffer_id()));
+}
+
+[[gnu::always_inline]] inline bycorf::FixedBuffer
+ReadBufferLease::registered_buffer() const noexcept {
+  const std::uint16_t id = buffer_id();
+  // The immutable pool table maps release ids to arena registrations. Keeping
+  // this mapping in the pool preserves the compact cross-worker lease.
+  const std::uint16_t index =
+      id == 0
+          ? 0
+          : pool_->read_buffers_[id - pool_->write_buffers_.size() - 1].index_;
+  return {.data_ = data_, .size_ = size_, .index_ = index};
+}
+
+[[gnu::always_inline]] inline bycorf::FixedBuffer ReadBufferLease::io_buffer()
+    const noexcept {
+  if (!valid() || size_ < headroom_bytes_ + tailroom_bytes_) {
+    return {};
+  }
+  return bycorf::FixedBuffer{
+      .data_ = data_ + headroom_bytes_,
+      .size_ = size_ - headroom_bytes_ - tailroom_bytes_,
+      .index_ = registered_buffer().index_,
+  };
 }
 
 inline unsigned ReadBufferLease::owner_worker() const noexcept {

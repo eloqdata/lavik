@@ -103,28 +103,6 @@ ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
 
 ReadBufferLease::~ReadBufferLease() { Reset(); }
 
-bycorf::FixedBuffer ReadBufferLease::registered_buffer() const noexcept {
-  const std::uint16_t id = buffer_id();
-  // The immutable pool table maps release ids to arena registrations. Keeping
-  // this mapping in the pool preserves the compact cross-worker lease.
-  const std::uint16_t index =
-      id == 0
-          ? 0
-          : pool_->read_buffers_[id - pool_->write_buffers_.size() - 1].index_;
-  return {.data_ = data_, .size_ = size_, .index_ = index};
-}
-
-bycorf::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
-  if (!valid() || size_ < headroom_bytes_ + tailroom_bytes_) {
-    return {};
-  }
-  return bycorf::FixedBuffer{
-      .data_ = data_ + headroom_bytes_,
-      .size_ = size_ - headroom_bytes_ - tailroom_bytes_,
-      .index_ = registered_buffer().index_,
-  };
-}
-
 void ReadBufferLease::Reset() noexcept {
   if (pool_ != nullptr) {
     RegisteredBufferPool* pool = std::exchange(pool_, nullptr);
