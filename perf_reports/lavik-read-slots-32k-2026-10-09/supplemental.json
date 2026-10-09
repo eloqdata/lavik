@@ -1,0 +1,26 @@
+[
+  {
+    "label": "fixed-runtime-1024k",
+    "read_payload_kib": 1024,
+    "registered_pool_mib": 256,
+    "qps_samples": [
+      728471.78,
+      709803.67,
+      725369.6
+    ],
+    "median_qps": 725369.6,
+    "median_p999_ms": 10.943
+  },
+  {
+    "label": "fixed-runtime-32k-pool41",
+    "read_payload_kib": 32,
+    "registered_pool_mib": 41,
+    "qps_samples": [
+      712433.81,
+      726706.01,
+      713382.76
+    ],
+    "median_qps": 713382.76,
+    "median_p999_ms": 11.391
+  }
+]
