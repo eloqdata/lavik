@@ -61,6 +61,13 @@ budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
 of headroom and tailroom. These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
+On io_uring, read and write slots share allocations made once at startup, with
+read slots placed first. Large pools span multiple registered regions, split
+at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
+Registration covers these existing allocations; a retry does not move slots
+or allocate a second pool. The configured read size still excludes framing
+headroom and tailroom.
+
 The pool first attempts full registration. If io_uring rejects it, Lavik uses
 the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in KiB) divided
 across runtime workers as a starting budget. It prioritizes read buffers and

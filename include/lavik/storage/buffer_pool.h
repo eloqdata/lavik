@@ -81,10 +81,9 @@ class ReadBufferLease {
                : 0;
   }
 
-  // Entire registered iovec, including framing/alignment headroom and tailroom.
-  bycorf::FixedBuffer registered_buffer() const noexcept {
-    return {.data_ = data_, .size_ = size_, .index_ = buffer_id()};
-  }
+  // Entire slot, including framing/alignment space. Its registration index
+  // may identify a larger arena shared by multiple slots.
+  bycorf::FixedBuffer registered_buffer() const noexcept;
 
   // Aligned region intended as the destination of READ_FIXED.
   bycorf::FixedBuffer io_buffer() const noexcept;
@@ -98,8 +97,8 @@ class ReadBufferLease {
  private:
   friend class RegisteredBufferPool;
   ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
-                  std::size_t headroom_bytes,
-                  std::size_t tailroom_bytes) noexcept;
+                  std::size_t headroom_bytes, std::size_t tailroom_bytes,
+                  std::uint16_t slot_id) noexcept;
   ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
                   std::size_t headroom_bytes, std::size_t tailroom_bytes,
                   std::size_t overflow_id) noexcept;
@@ -144,7 +143,7 @@ class RegisteredBufferPool {
   // select fixed I/O: a partially registered pool can contain both kinds.
   bool buffers_registered() const noexcept { return buffers_registered_; }
   // Registration is immutable after Init, including across lease handoffs.
-  // A slot id identifies the same memory in the pool and registered table.
+  // Slot ids identify pool ownership, independently of registration indices.
   bool buffer_registered(std::uint16_t buffer_id) const noexcept {
     if (buffer_id == 0) return false;
     if (buffer_id <= write_buffers_.size()) {
@@ -246,6 +245,9 @@ class RegisteredBufferPool {
   bycorf::AsyncNotification storage_write_buffer_ready_;
   std::vector<std::byte*> heap_write_buffers_;
   std::vector<std::byte*> free_heap_write_buffers_;
+  // io_uring read/write slots share these allocations, ordered reads first.
+  // SPDK retains individual DMA allocations and leaves this vector empty.
+  std::vector<std::byte*> arenas_;
   std::vector<bycorf::FixedBuffer> read_buffers_;
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;

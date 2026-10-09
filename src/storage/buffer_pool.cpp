@@ -47,17 +47,18 @@ bool IsAligned(std::size_t value, std::size_t alignment) noexcept {
 ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
                                  bycorf::FixedBuffer buffer,
                                  std::size_t headroom_bytes,
-                                 std::size_t tailroom_bytes) noexcept
+                                 std::size_t tailroom_bytes,
+                                 std::uint16_t slot_id) noexcept
     : pool_(pool),
       data_(buffer.data_),
       size_(static_cast<std::uint32_t>(buffer.size_)),
       headroom_bytes_(static_cast<std::uint32_t>(headroom_bytes)),
       tailroom_bytes_(static_cast<std::uint32_t>(tailroom_bytes)),
-      release_token_(buffer.index_) {
+      release_token_(slot_id) {
   assert(buffer.size_ <= std::numeric_limits<std::uint32_t>::max());
   assert(headroom_bytes <= std::numeric_limits<std::uint32_t>::max());
   assert(tailroom_bytes <= std::numeric_limits<std::uint32_t>::max());
-  assert(buffer.index_ != 0);
+  assert(slot_id != 0);
 }
 
 ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
@@ -102,6 +103,17 @@ ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
 
 ReadBufferLease::~ReadBufferLease() { Reset(); }
 
+bycorf::FixedBuffer ReadBufferLease::registered_buffer() const noexcept {
+  const std::uint16_t id = buffer_id();
+  // The immutable pool table maps release ids to arena registrations. Keeping
+  // this mapping in the pool preserves the compact cross-worker lease.
+  const std::uint16_t index =
+      id == 0
+          ? 0
+          : pool_->read_buffers_[id - pool_->write_buffers_.size() - 1].index_;
+  return {.data_ = data_, .size_ = size_, .index_ = index};
+}
+
 bycorf::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
   if (!valid() || size_ < headroom_bytes_ + tailroom_bytes_) {
     return {};
@@ -109,7 +121,7 @@ bycorf::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
   return bycorf::FixedBuffer{
       .data_ = data_ + headroom_bytes_,
       .size_ = size_ - headroom_bytes_ - tailroom_bytes_,
-      .index_ = buffer_id(),
+      .index_ = registered_buffer().index_,
   };
 }
 
@@ -133,17 +145,14 @@ RegisteredBufferPool::~RegisteredBufferPool() {
     sentinel_buffer_ = nullptr;
     sentinel_buffer_bytes_ = 0;
   }
-  for (const bycorf::FixedBuffer& buffer : write_buffers_) {
-    if (buffer.data_ != nullptr &&
-        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
-                  options_.alignment_)) {
+  for (std::byte* arena : arenas_) {
+    bycorf::FreeStorageBuffer(arena, options_.alignment_);
+  }
+  if (arenas_.empty()) {
+    for (const auto& buffer : write_buffers_) {
       bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
-  }
-  for (const bycorf::FixedBuffer& buffer : read_buffers_) {
-    if (buffer.data_ != nullptr &&
-        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
-                  options_.alignment_)) {
+    for (const auto& buffer : read_buffers_) {
       bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
   }
@@ -242,7 +251,6 @@ absl::Status RegisteredBufferPool::Init(
   const std::size_t read_count =
       (options.registered_bytes_ - registered_write_bytes) / read_slot_bytes;
   const std::size_t total_count = registered_write_count + read_count;
-  const std::size_t registration_count = total_count + 1;
   if (read_count >= std::numeric_limits<std::uint16_t>::max() ||
       total_count >= std::numeric_limits<std::uint16_t>::max()) {
     return absl::Status(absl::StatusCode::kOutOfRange,
@@ -250,64 +258,115 @@ absl::Status RegisteredBufferPool::Init(
   }
 
   const std::size_t read_base = registered_write_count + 1;
-  std::vector<iovec> iovecs;
-  iovecs.reserve(registration_count);
-
+  const bool shared_arena = !bycorf::SpdkStorageEnabled();
   const std::size_t sentinel_bytes = options.alignment_;
   auto* sentinel = static_cast<std::byte*>(
       bycorf::AllocateStorageBuffer(sentinel_bytes, options.alignment_));
   if (sentinel == nullptr) {
-    return absl::Status(absl::StatusCode::kResourceExhausted,
-                        "aligned sentinel buffer allocation failed");
+    return absl::ResourceExhaustedError(
+        "aligned storage buffer allocation failed");
   }
   std::fill_n(sentinel, sentinel_bytes, std::byte{0});
+  std::vector<iovec> iovecs;
   iovecs.push_back(iovec{.iov_base = sentinel, .iov_len = sentinel_bytes});
   std::vector<bycorf::FixedBuffer> write_buffers;
-  write_buffers.reserve(registered_write_count);
-  for (std::size_t i = 0; i < registered_write_count; ++i) {
-    auto* data = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
-        options.write_buffer_bytes_, options.alignment_));
-    if (data == nullptr) {
-      bycorf::FreeStorageBuffer(sentinel, options.alignment_);
-      for (const bycorf::FixedBuffer& buffer : write_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
-      }
-      return absl::Status(absl::StatusCode::kResourceExhausted,
-                          "aligned registered-write-buffer allocation failed");
-    }
-    const std::size_t id = i + 1;
-    iovecs.push_back(
-        iovec{.iov_base = data, .iov_len = options.write_buffer_bytes_});
-    write_buffers.push_back(bycorf::FixedBuffer{
-        .data_ = data,
-        .size_ = options.write_buffer_bytes_,
-        .index_ = static_cast<std::uint16_t>(id),
-    });
-  }
-
   std::vector<bycorf::FixedBuffer> read_buffers;
+  write_buffers.reserve(registered_write_count);
   read_buffers.reserve(read_count);
-  for (std::size_t i = 0; i < read_count; ++i) {
-    auto* data = static_cast<std::byte*>(
-        bycorf::AllocateStorageBuffer(read_slot_bytes, options.alignment_));
-    if (data == nullptr) {
-      bycorf::FreeStorageBuffer(sentinel, options.alignment_);
-      for (const bycorf::FixedBuffer& buffer : write_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+  std::vector<std::byte*> arenas;
+  if (shared_arena) {
+    // Read slots precede write slots across shared allocations. Registration
+    // can pin a read-first prefix without changing any pool ownership. Linux
+    // 6.1 limits each iovec to 1 GiB; split on whole-slot boundaries so each
+    // I/O stays within one region. An individually oversized configured slot
+    // still follows the existing registration-failure/ordinary-I/O fallback.
+    constexpr std::size_t kMaxRegisteredBytes = 1024 * kMiB;
+    auto plan_slice = [&](std::size_t bytes) {
+      if (iovecs.size() == 1 || bytes > kMaxRegisteredBytes ||
+          iovecs.back().iov_len > kMaxRegisteredBytes - bytes) {
+        iovecs.push_back(iovec{});
       }
-      for (const bycorf::FixedBuffer& buffer : read_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
-      }
-      return absl::Status(absl::StatusCode::kResourceExhausted,
-                          "aligned registered-read-buffer allocation failed");
+      iovecs.back().iov_len += bytes;
+      return bycorf::FixedBuffer{
+          .data_ = nullptr,
+          .size_ = bytes,
+          .index_ = static_cast<std::uint16_t>(iovecs.size() - 1)};
+    };
+    for (std::size_t i = 0; i < read_count; ++i) {
+      read_buffers.push_back(plan_slice(read_slot_bytes));
     }
-    const std::size_t id = read_base + i;
-    iovecs.push_back(iovec{.iov_base = data, .iov_len = read_slot_bytes});
-    read_buffers.push_back(bycorf::FixedBuffer{
-        .data_ = data,
-        .size_ = read_slot_bytes,
-        .index_ = static_cast<std::uint16_t>(id),
-    });
+    for (std::size_t i = 0; i < registered_write_count; ++i) {
+      write_buffers.push_back(plan_slice(options.write_buffer_bytes_));
+    }
+    for (std::size_t i = 1; i < iovecs.size(); ++i) {
+      auto* arena = static_cast<std::byte*>(
+          bycorf::AllocateStorageBuffer(iovecs[i].iov_len, options.alignment_));
+      if (arena == nullptr) {
+        for (auto* allocated : arenas) {
+          bycorf::FreeStorageBuffer(allocated, options.alignment_);
+        }
+        bycorf::FreeStorageBuffer(sentinel, options.alignment_);
+        return absl::ResourceExhaustedError(
+            "aligned storage arena allocation failed");
+      }
+      arenas.push_back(arena);
+      iovecs[i].iov_base = arena;
+    }
+    std::vector<std::size_t> offsets(iovecs.size(), 0);
+    auto assign_slices = [&](auto& buffers) {
+      for (auto& buffer : buffers) {
+        auto& offset = offsets[buffer.index_];
+        buffer.data_ = arenas[buffer.index_ - 1] + offset;
+        offset += buffer.size_;
+      }
+    };
+    assign_slices(read_buffers);
+    assign_slices(write_buffers);
+  } else {
+    for (std::size_t i = 0; i < registered_write_count; ++i) {
+      auto* data = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
+          options.write_buffer_bytes_, options.alignment_));
+      if (data == nullptr) {
+        bycorf::FreeStorageBuffer(sentinel, options.alignment_);
+        for (const bycorf::FixedBuffer& buffer : write_buffers) {
+          bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+        }
+        return absl::Status(
+            absl::StatusCode::kResourceExhausted,
+            "aligned registered-write-buffer allocation failed");
+      }
+      const std::size_t id = i + 1;
+      iovecs.push_back(
+          iovec{.iov_base = data, .iov_len = options.write_buffer_bytes_});
+      write_buffers.push_back(bycorf::FixedBuffer{
+          .data_ = data,
+          .size_ = options.write_buffer_bytes_,
+          .index_ = static_cast<std::uint16_t>(id),
+      });
+    }
+
+    for (std::size_t i = 0; i < read_count; ++i) {
+      auto* data = static_cast<std::byte*>(
+          bycorf::AllocateStorageBuffer(read_slot_bytes, options.alignment_));
+      if (data == nullptr) {
+        bycorf::FreeStorageBuffer(sentinel, options.alignment_);
+        for (const bycorf::FixedBuffer& buffer : write_buffers) {
+          bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+        }
+        for (const bycorf::FixedBuffer& buffer : read_buffers) {
+          bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+        }
+        return absl::Status(absl::StatusCode::kResourceExhausted,
+                            "aligned registered-read-buffer allocation failed");
+      }
+      const std::size_t id = read_base + i;
+      iovecs.push_back(iovec{.iov_base = data, .iov_len = read_slot_bytes});
+      read_buffers.push_back(bycorf::FixedBuffer{
+          .data_ = data,
+          .size_ = read_slot_bytes,
+          .index_ = static_cast<std::uint16_t>(id),
+      });
+    }
   }
 
   absl::Status status = worker.RegisterBuffers(iovecs);
@@ -345,22 +404,29 @@ absl::Status RegisteredBufferPool::Init(
             const std::size_t reads = std::min<std::uint64_t>(
                 read_count, remaining / read_slot_bytes);
             remaining -= reads * read_slot_bytes;
-            const std::size_t writes = std::min<std::uint64_t>(
-                registered_write_count,
-                remaining / options.write_buffer_bytes_);
+            const std::size_t writes =
+                reads == read_count
+                    ? std::min<std::uint64_t>(
+                          registered_write_count,
+                          remaining / options.write_buffer_bytes_)
+                    : 0;
             if (reads == 0 && writes == 0) break;
             if (reads == read_count && writes == registered_write_count) {
               budget /= 2;  // The full registration already failed.
               continue;
             }
-            // Null, zero-length entries keep unregistered slots' indices
-            // stable. Leases use those same ids for pool release and fixed
-            // I/O; compacting this table would silently change their meaning.
+            // Pin a whole-slot prefix: read slots first, then complete write
+            // slots. Even slots sharing one index can be outside this prefix;
+            // buffer_registered(slot_id) selects ordinary I/O for those slots.
             std::fill(partial.begin(), partial.end(), iovec{});
             partial[0] = iovecs[0];
-            std::copy_n(iovecs.begin() + read_base, reads,
-                        partial.begin() + read_base);
-            std::copy_n(iovecs.begin() + 1, writes, partial.begin() + 1);
+            std::size_t bytes =
+                reads * read_slot_bytes + writes * options.write_buffer_bytes_;
+            for (std::size_t i = 1; i < iovecs.size() && bytes != 0; ++i) {
+              partial[i] = iovecs[i];
+              partial[i].iov_len = std::min(bytes, iovecs[i].iov_len);
+              bytes -= partial[i].iov_len;
+            }
             status = worker.RegisterBuffers(partial);
             if (status.ok()) {
               registered_reads = reads;
@@ -414,6 +480,7 @@ absl::Status RegisteredBufferPool::Init(
   options_ = options;
   sentinel_buffer_ = sentinel;
   sentinel_buffer_bytes_ = sentinel_bytes;
+  arenas_ = std::move(arenas);
   write_buffers_ = std::move(write_buffers);
   read_buffers_ = std::move(read_buffers);
   write_buffer_in_use_.assign(write_buffers_.size(), false);
@@ -503,7 +570,7 @@ ReadBufferLease RegisteredBufferPool::LeaseReadBuffer(std::uint16_t buffer_id) {
   const std::size_t offset = static_cast<std::size_t>(buffer_id - read_base);
   return ReadBufferLease(this, read_buffers_[offset],
                          options_.read_headroom_bytes_,
-                         options_.read_tailroom_bytes_);
+                         options_.read_tailroom_bytes_, buffer_id);
 }
 
 absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(

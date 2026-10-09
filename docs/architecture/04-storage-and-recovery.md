@@ -114,8 +114,10 @@ Active storage paths are existing regular files, Linux raw block devices, or
 Bycorf SPDK storage paths. `Prepare` probes and validates them; it does not
 create, extend, truncate, or preallocate a missing regular file. On the POSIX
 io_uring backend, every worker opens the complete configured path table for
-direct I/O. Buffer-pool capacity is independent of registration success. If
-full io_uring registration fails, a finite memlock allowance permits a
+direct I/O. Its read and write slots share worker-owned allocations;
+multiple slots share a registered region while keeping independent lease and
+release identities. Buffer-pool capacity is independent of registration success.
+If full io_uring registration fails, a finite memlock allowance permits a
 best-effort subset registration, prioritizing read slots. Each lease retains
 its slot identity and immutable registration status; unregistered slots use
 the same aligned memory with plain asynchronous I/O. On SPDK, a

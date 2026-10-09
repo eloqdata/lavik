@@ -269,7 +269,11 @@ class BufferPoolMemlockTest : public ::testing::Test {
     auto status = pool_->Init(*worker_, options_);
     ASSERT_TRUE(status.ok()) << status;
     ASSERT_EQ(pool_->write_buffer_count(), 2);
-    ASSERT_EQ(pool_->read_buffer_count(), 341);
+    ASSERT_EQ(
+        pool_->read_buffer_count(),
+        (options_.registered_bytes_ - 2 * options_.write_buffer_bytes_) /
+            (options_.read_headroom_bytes_ + options_.read_payload_bytes_ +
+             options_.read_tailroom_bytes_));
     ASSERT_FALSE(pool_->buffer_registered(0));
     ASSERT_FALSE(pool_->buffer_registered(65535));
   }
@@ -286,14 +290,16 @@ class BufferPoolMemlockTest : public ::testing::Test {
 
   // Exercise actual O_DIRECT I/O through both registered and ordinary paths.
   // Holding every read lease checks that pool capacity did not silently shrink;
-  // releasing and reacquiring checks that sparse registration kept ids stable.
-  void CheckIo(unsigned expected_writes, unsigned min_reads,
-               unsigned max_reads) {
+  // Releasing and reacquiring checks that a shared registration index never
+  // gets mistaken for a slot's release id.
+  void CheckIo(unsigned expected_writes, unsigned min_reads, unsigned max_reads,
+               unsigned last_region = 1) {
     unsigned registered_writes = 0;
     for (unsigned i = 0; i < pool_->write_buffer_count(); ++i) {
       std::uint16_t id = 0;
       ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&id));
       auto buffer = pool_->write_buffer(id);
+      EXPECT_EQ(buffer.index_, last_region);
       buffer.size_ = 4096;
       std::fill_n(buffer.data_, buffer.size_, std::byte{0x5a});
       Completion written;
@@ -312,6 +318,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
     for (unsigned id = 1; id <= pool_->write_buffer_count(); ++id)
       pool_->ReleaseWriteBuffer(id);
 
+    std::vector<std::byte*> slot_addresses(pool_->read_buffer_count());
     for (unsigned round = 0; round < 2; ++round) {
       unsigned registered_reads = 0;
       std::vector<ReadBufferLease> leases;
@@ -322,9 +329,29 @@ class BufferPoolMemlockTest : public ::testing::Test {
         ASSERT_TRUE(result.ok()) << result.status();
         auto& lease = leases.emplace_back(std::move(*result));
         registered_reads += lease.registered();
-        const auto buffer = lease.io_buffer();
-        EXPECT_EQ(buffer.index_, lease.buffer_id());
-        EXPECT_EQ(lease.registered_buffer().index_, lease.buffer_id());
+        auto buffer = lease.io_buffer();
+        // Use the same 4 KiB file to exercise both small slots and the larger
+        // slots in the multi-arena case, including its final registered region.
+        buffer.size_ = 4096;
+        EXPECT_GE(buffer.index_, 1);
+        EXPECT_LE(buffer.index_, last_region);
+        EXPECT_EQ(lease.registered_buffer().index_, buffer.index_);
+        ASSERT_GE(lease.buffer_id(), 3);
+        ASSERT_LT(lease.buffer_id() - 3, slot_addresses.size());
+        if (round == 0) {
+          EXPECT_EQ(lease.buffer_id(), i + 3);
+          slot_addresses[i] = lease.bytes().data();
+          if (i == 0) EXPECT_EQ(buffer.index_, 1);
+          if (i + 1 == pool_->read_buffer_count())
+            EXPECT_EQ(buffer.index_, last_region);
+          if (i != 0 && buffer.index_ == leases[i - 1].io_buffer().index_) {
+            EXPECT_EQ(lease.bytes().data(),
+                      slot_addresses[i - 1] + leases[i - 1].bytes().size());
+          }
+        } else {
+          EXPECT_EQ(lease.bytes().data(),
+                    slot_addresses[lease.buffer_id() - 3]);
+        }
         Completion read;
         auto status = lease.registered()
                           ? worker_->SubmitReadFixed({0}, buffer, 0, &read)
@@ -342,7 +369,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
       EXPECT_EQ(pool_->available_read_buffers(), 0);
       EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
       leases.clear();
-      EXPECT_EQ(pool_->available_read_buffers(), 341);
+      EXPECT_EQ(pool_->available_read_buffers(), pool_->read_buffer_count());
     }
   }
 
@@ -392,6 +419,43 @@ TEST_F(BufferPoolMemlockTest, InsufficientMemlockKeepsWholeUnregisteredPool) {
   if (IsSkipped()) return;
   ASSERT_FALSE(pool_->buffers_registered());
   ASSERT_NO_FATAL_FAILURE(CheckIo(0, 0, 0));
+}
+
+TEST_F(BufferPoolMemlockTest, MoreSlotsThanKernelRegistrationEntries) {
+  // More than Linux's 16384 registered entries, but only one read arena entry.
+  // Exercise the final slot too: a truncated registration must not pass this.
+  constexpr unsigned kSlots = 16400;
+  options_.registered_bytes_ = 4 * kMiB + kSlots * 12 * kKiB;
+  ASSERT_NO_FATAL_FAILURE(Init(256 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, kSlots, kSlots));
+}
+
+TEST_F(BufferPoolMemlockTest, LargePoolSpansMultipleRegisteredAllocations) {
+  options_.registered_bytes_ = 1024 * kMiB + 32 * kMiB;
+  options_.read_payload_bytes_ = kMiB;
+  const unsigned slots =
+      (options_.registered_bytes_ - 4 * kMiB) / (kMiB + 8 * kKiB);
+  ASSERT_NO_FATAL_FAILURE(Init(1152 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  // Reads span two allocations; both write slots share the second allocation
+  // with its remaining reads. Kernel I/O verifies indices on both sides.
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, slots, slots, 2));
+}
+
+TEST_F(BufferPoolMemlockTest, PartialRegistrationSpansMultipleAllocations) {
+  options_.registered_bytes_ = 1024 * kMiB + 32 * kMiB;
+  options_.read_payload_bytes_ = kMiB;
+  const unsigned slots =
+      (options_.registered_bytes_ - 4 * kMiB) / (kMiB + 8 * kKiB);
+  ASSERT_NO_FATAL_FAILURE(Init(1055 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_FALSE(pool_->buffers_registered());
+  // The last region contains both registered and ordinary write slots, after
+  // all reads. Sharing its registration index must not register the tail slot.
+  ASSERT_NO_FATAL_FAILURE(CheckIo(1, slots, slots, 2));
 }
 
 }  // namespace
