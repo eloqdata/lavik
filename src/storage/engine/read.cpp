@@ -841,9 +841,9 @@ Task<bool> StorageEngine::Impl::ExistsLocked(std::uint8_t db_id,
 
 std::size_t StorageEngine::Impl::DirectGetValueLimit() const noexcept {
   const RegisteredBufferPoolOptions& buffers = options_.buffers_;
-  // Keep the direct-from-disk framing path conservative: with the defaults,
-  // values through 1 MiB - 8 KiB avoid the value copy. Larger values retain
-  // the materializing memmove path below.
+  // Reserve framing space within the configured read payload conservatively.
+  // Values above this bound retain the materializing memmove path below,
+  // including reads that acquired an oversized overflow buffer.
   const std::size_t framing_reserve =
       buffers.read_headroom_bytes_ + buffers.read_tailroom_bytes_;
   return buffers.read_payload_bytes_ > framing_reserve
