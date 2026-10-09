@@ -155,6 +155,100 @@ absl::StatusOr<MetaNodeRole> ReadRole(MetaReader& r) {
   return static_cast<MetaNodeRole>(*role);
 }
 
+// Field lists are in wire order, independent of C++ member layout. Expand
+// them into the existing statements so decode temporaries stay alive until
+// every field succeeds and the command is constructed. There is no runtime
+// descriptor loop or field adapter. Commands with extra validation remain
+// explicit; caps and error precedence still belong to the existing codecs.
+#define LAVIK_META_FIELDS_UpdateNode(FIELD) \
+  FIELD(NodeId, node_id_)                   \
+  FIELD(U64, expected_revision_)            \
+  FIELD(Endpoints, endpoints_)              \
+  FIELD(U64, new_topology_epoch_)
+
+#define LAVIK_META_FIELDS_RetireNode(FIELD) \
+  FIELD(NodeId, node_id_)                   \
+  FIELD(U64, expected_revision_)
+
+#define LAVIK_META_FIELDS_CreateGroup(FIELD) \
+  FIELD(GroupId, group_id_)                  \
+  FIELD(U64, new_topology_epoch_)
+
+#define LAVIK_META_FIELDS_RemoveNodeFromGroup(FIELD) \
+  FIELD(GroupId, group_id_)                          \
+  FIELD(NodeId, node_id_)                            \
+  FIELD(U64, expected_revision_)                     \
+  FIELD(U64, new_topology_epoch_)
+
+#define LAVIK_META_FIELDS_SetGroupReplicationState(FIELD) \
+  FIELD(GroupId, group_id_)                               \
+  FIELD(U64, expected_population_manifest_revision_)      \
+  FIELD(Fixed32, expected_population_manifest_digest_)    \
+  FIELD(U64, new_population_manifest_revision_)           \
+  FIELD(Fixed32, new_population_manifest_digest_)         \
+  FIELD(U64, expected_partition_replication_epoch_)       \
+  FIELD(U64, new_partition_replication_epoch_)            \
+  FIELD(U64, new_topology_epoch_)
+
+#define LAVIK_META_FIELDS_ActivateAuthority(FIELD) \
+  FIELD(GroupId, group_id_)                        \
+  FIELD(U64, expected_term_)                       \
+  FIELD(NodeId, new_owner_)                        \
+  FIELD(U64, new_topology_epoch_)
+
+#define LAVIK_META_FIELDS_PruneAudit(FIELD) FIELD(U64, through_log_index_)
+
+#define LAVIK_META_FIELDS_RetireMetaMember(FIELD) FIELD(U32, server_id_)
+
+#define LAVIK_META_FIELDS_PrunePopulationManifest(FIELD) \
+  FIELD(Fixed32, manifest_digest_)
+
+#define LAVIK_META_WRITE_NodeId(member) \
+  if (auto status = WriteNodeId(w, cmd.member); !status.ok()) return status;
+#define LAVIK_META_WRITE_GroupId(member) \
+  if (auto status = WriteGroupId(w, cmd.member); !status.ok()) return status;
+#define LAVIK_META_WRITE_Endpoints(member) \
+  if (auto status = WriteEndpoints(w, cmd.member); !status.ok()) return status;
+#define LAVIK_META_WRITE_U32(member) w.WriteU32(cmd.member);
+#define LAVIK_META_WRITE_U64(member) w.WriteU64(cmd.member);
+#define LAVIK_META_WRITE_Fixed32(member) WriteFixedArray(w, cmd.member);
+
+#define LAVIK_META_READ_NodeId ReadNodeId(r)
+#define LAVIK_META_READ_GroupId ReadGroupId(r)
+#define LAVIK_META_READ_Endpoints ReadEndpoints(r)
+#define LAVIK_META_READ_U32 r.ReadU32()
+#define LAVIK_META_READ_U64 r.ReadU64()
+#define LAVIK_META_READ_Fixed32 ReadFixedArray<32>(r)
+
+#define LAVIK_META_WRITE_FIELD(kind, member) LAVIK_META_WRITE_##kind(member)
+#define LAVIK_META_READ_FIELD(kind, member)       \
+  auto decoded_##member = LAVIK_META_READ_##kind; \
+  if (!decoded_##member.ok()) return decoded_##member.status();
+#define LAVIK_META_ASSIGN_FIELD(kind, member) \
+  cmd.member = std::move(*decoded_##member);
+
+// These implementation-only macros generate whole function bodies, not
+// caller expressions. Undefine them after the last codec below.
+#define LAVIK_META_COMMAND_CODEC(Type)                                 \
+  absl::Status WriteCommandBody(MetaWriter& w, const Type& cmd) {      \
+    if (auto status = WriteCommandHeader(w, MetaCommandTag::k##Type,   \
+                                         cmd.request_id_, cmd.actor_); \
+        !status.ok())                                                  \
+      return status;                                                   \
+    LAVIK_META_FIELDS_##Type(LAVIK_META_WRITE_FIELD);                  \
+    return absl::OkStatus();                                           \
+  }                                                                    \
+  absl::StatusOr<Type> Read##Type##Body(MetaReader& r) {               \
+    auto header = ReadCommandHeader(r);                                \
+    if (!header.ok()) return header.status();                          \
+    LAVIK_META_FIELDS_##Type(LAVIK_META_READ_FIELD);                   \
+    Type cmd;                                                          \
+    cmd.request_id_ = header->request_id_;                             \
+    cmd.actor_ = std::move(header->actor_);                            \
+    LAVIK_META_FIELDS_##Type(LAVIK_META_ASSIGN_FIELD);                 \
+    return cmd;                                                        \
+  }
+
 // ---------------------------------------------------------------------------
 // Per-command body codecs. Writers return Status for cap failures; readers
 // return StatusOr and every failure is the fail-stop class.
@@ -201,94 +295,11 @@ absl::StatusOr<RegisterNode> ReadRegisterNodeBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const UpdateNode& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kUpdateNode,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
-  w.WriteU64(cmd.expected_revision_);
-  if (auto st = WriteEndpoints(w, cmd.endpoints_); !st.ok()) return st;
+LAVIK_META_COMMAND_CODEC(UpdateNode)
 
-  w.WriteU64(cmd.new_topology_epoch_);
-  return absl::OkStatus();
-}
+LAVIK_META_COMMAND_CODEC(RetireNode)
 
-absl::StatusOr<UpdateNode> ReadUpdateNodeBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
-  auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
-  auto endpoints = ReadEndpoints(r);
-  if (!endpoints.ok()) return endpoints.status();
-
-  auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
-  UpdateNode cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.node_id_ = std::move(*node_id);
-  cmd.expected_revision_ = *expected_revision;
-  cmd.endpoints_ = std::move(*endpoints);
-
-  cmd.new_topology_epoch_ = *topology_epoch;
-  return cmd;
-}
-
-absl::Status WriteCommandBody(MetaWriter& w, const RetireNode& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRetireNode,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
-  w.WriteU64(cmd.expected_revision_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<RetireNode> ReadRetireNodeBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
-  auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
-  RetireNode cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.node_id_ = std::move(*node_id);
-  cmd.expected_revision_ = *expected_revision;
-  return cmd;
-}
-
-absl::Status WriteCommandBody(MetaWriter& w, const CreateGroup& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kCreateGroup,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  w.WriteU64(cmd.new_topology_epoch_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<CreateGroup> ReadCreateGroupBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
-  auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
-  CreateGroup cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.group_id_ = std::move(*group_id);
-  cmd.new_topology_epoch_ = *topology_epoch;
-  return cmd;
-}
+LAVIK_META_COMMAND_CODEC(CreateGroup)
 
 absl::Status WriteCommandBody(MetaWriter& w, const AssignNodeToGroup& cmd) {
   if (std::all_of(cmd.assignment_id_.begin(), cmd.assignment_id_.end(),
@@ -336,39 +347,7 @@ absl::StatusOr<AssignNodeToGroup> ReadAssignNodeToGroupBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const RemoveNodeFromGroup& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRemoveNodeFromGroup,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  if (auto st = WriteNodeId(w, cmd.node_id_); !st.ok()) return st;
-  w.WriteU64(cmd.expected_revision_);
-  w.WriteU64(cmd.new_topology_epoch_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<RemoveNodeFromGroup> ReadRemoveNodeFromGroupBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
-  auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
-  auto expected_revision = r.ReadU64();
-  if (!expected_revision.ok()) return expected_revision.status();
-  auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
-  RemoveNodeFromGroup cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.group_id_ = std::move(*group_id);
-  cmd.node_id_ = std::move(*node_id);
-  cmd.expected_revision_ = *expected_revision;
-  cmd.new_topology_epoch_ = *topology_epoch;
-  return cmd;
-}
+LAVIK_META_COMMAND_CODEC(RemoveNodeFromGroup)
 
 // Slot range bounds ([0, kMetaSlotCount), first <= last) are structural
 // properties of the schema; coverage/overlap across ranges is domain
@@ -438,57 +417,7 @@ absl::StatusOr<SetSlotMap> ReadSetSlotMapBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w,
-                              const SetGroupReplicationState& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetGroupReplicationState,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  w.WriteU64(cmd.expected_population_manifest_revision_);
-  WriteFixedArray(w, cmd.expected_population_manifest_digest_);
-  w.WriteU64(cmd.new_population_manifest_revision_);
-  WriteFixedArray(w, cmd.new_population_manifest_digest_);
-  w.WriteU64(cmd.expected_partition_replication_epoch_);
-  w.WriteU64(cmd.new_partition_replication_epoch_);
-  w.WriteU64(cmd.new_topology_epoch_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<SetGroupReplicationState> ReadSetGroupReplicationStateBody(
-    MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
-  auto expected_manifest = r.ReadU64();
-  if (!expected_manifest.ok()) return expected_manifest.status();
-  auto expected_manifest_digest = ReadFixedArray<32>(r);
-  if (!expected_manifest_digest.ok()) return expected_manifest_digest.status();
-  auto new_manifest = r.ReadU64();
-  if (!new_manifest.ok()) return new_manifest.status();
-  auto new_manifest_digest = ReadFixedArray<32>(r);
-  if (!new_manifest_digest.ok()) return new_manifest_digest.status();
-  auto expected_partition = r.ReadU64();
-  if (!expected_partition.ok()) return expected_partition.status();
-  auto new_partition = r.ReadU64();
-  if (!new_partition.ok()) return new_partition.status();
-  auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
-  SetGroupReplicationState cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.group_id_ = std::move(*group_id);
-  cmd.expected_population_manifest_revision_ = *expected_manifest;
-  cmd.expected_population_manifest_digest_ = *expected_manifest_digest;
-  cmd.new_population_manifest_revision_ = *new_manifest;
-  cmd.new_population_manifest_digest_ = *new_manifest_digest;
-  cmd.expected_partition_replication_epoch_ = *expected_partition;
-  cmd.new_partition_replication_epoch_ = *new_partition;
-  cmd.new_topology_epoch_ = *topology_epoch;
-  return cmd;
-}
+LAVIK_META_COMMAND_CODEC(SetGroupReplicationState)
 
 template <std::size_t N>
 bool IsZero(const std::array<std::uint8_t, N>& value) {
@@ -1742,39 +1671,7 @@ absl::StatusOr<BeginGroupTerm> ReadBeginGroupTermBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const ActivateAuthority& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kActivateAuthority,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = WriteGroupId(w, cmd.group_id_); !st.ok()) return st;
-  w.WriteU64(cmd.expected_term_);
-  if (auto st = WriteNodeId(w, cmd.new_owner_); !st.ok()) return st;
-  w.WriteU64(cmd.new_topology_epoch_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<ActivateAuthority> ReadActivateAuthorityBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto group_id = ReadGroupId(r);
-  if (!group_id.ok()) return group_id.status();
-  auto expected_term = r.ReadU64();
-  if (!expected_term.ok()) return expected_term.status();
-  auto new_owner = ReadNodeId(r);
-  if (!new_owner.ok()) return new_owner.status();
-  auto topology_epoch = r.ReadU64();
-  if (!topology_epoch.ok()) return topology_epoch.status();
-  ActivateAuthority cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.group_id_ = std::move(*group_id);
-  cmd.expected_term_ = *expected_term;
-  cmd.new_owner_ = std::move(*new_owner);
-  cmd.new_topology_epoch_ = *topology_epoch;
-  return cmd;
-}
+LAVIK_META_COMMAND_CODEC(ActivateAuthority)
 
 absl::Status WriteCommandBody(MetaWriter& w, const FenceGroup& cmd) {
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kFenceGroup,
@@ -2149,27 +2046,7 @@ absl::StatusOr<ArchiveOperations> ReadArchiveOperationsBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const PruneAudit& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPruneAudit,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  w.WriteU64(cmd.through_log_index_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<PruneAudit> ReadPruneAuditBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto through = r.ReadU64();
-  if (!through.ok()) return through.status();
-  PruneAudit cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.through_log_index_ = *through;
-  return cmd;
-}
+LAVIK_META_COMMAND_CODEC(PruneAudit)
 
 absl::Status WriteCommandBody(MetaWriter& w, const SetAuditPolicy& cmd) {
   if (auto st = CheckCap("attestation", cmd.attestation_.size(),
@@ -2333,27 +2210,7 @@ absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w, const RetireMetaMember& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kRetireMetaMember,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  w.WriteU32(cmd.server_id_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<RetireMetaMember> ReadRetireMetaMemberBody(MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto server_id = r.ReadU32();
-  if (!server_id.ok()) return server_id.status();
-  RetireMetaMember cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.server_id_ = *server_id;
-  return cmd;
-}
+LAVIK_META_COMMAND_CODEC(RetireMetaMember)
 
 absl::Status WriteCommandBody(MetaWriter& w, const PutPopulationManifest& cmd) {
   if (cmd.entries_.size() > kMetaSlotCount) {
@@ -2397,29 +2254,33 @@ absl::StatusOr<PutPopulationManifest> ReadPutPopulationManifestBody(
   return cmd;
 }
 
-absl::Status WriteCommandBody(MetaWriter& w,
-                              const PrunePopulationManifest& cmd) {
-  if (auto st = WriteCommandHeader(w, MetaCommandTag::kPrunePopulationManifest,
-                                   cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  WriteFixedArray(w, cmd.manifest_digest_);
-  return absl::OkStatus();
-}
+LAVIK_META_COMMAND_CODEC(PrunePopulationManifest)
 
-absl::StatusOr<PrunePopulationManifest> ReadPrunePopulationManifestBody(
-    MetaReader& r) {
-  auto header = ReadCommandHeader(r);
-  if (!header.ok()) return header.status();
-  auto digest = ReadFixedArray<32>(r);
-  if (!digest.ok()) return digest.status();
-  PrunePopulationManifest cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.manifest_digest_ = *digest;
-  return cmd;
-}
+#undef LAVIK_META_COMMAND_CODEC
+#undef LAVIK_META_ASSIGN_FIELD
+#undef LAVIK_META_READ_FIELD
+#undef LAVIK_META_WRITE_FIELD
+#undef LAVIK_META_READ_Fixed32
+#undef LAVIK_META_READ_U64
+#undef LAVIK_META_READ_U32
+#undef LAVIK_META_READ_Endpoints
+#undef LAVIK_META_READ_GroupId
+#undef LAVIK_META_READ_NodeId
+#undef LAVIK_META_WRITE_Fixed32
+#undef LAVIK_META_WRITE_U64
+#undef LAVIK_META_WRITE_U32
+#undef LAVIK_META_WRITE_Endpoints
+#undef LAVIK_META_WRITE_GroupId
+#undef LAVIK_META_WRITE_NodeId
+#undef LAVIK_META_FIELDS_PrunePopulationManifest
+#undef LAVIK_META_FIELDS_RetireMetaMember
+#undef LAVIK_META_FIELDS_PruneAudit
+#undef LAVIK_META_FIELDS_ActivateAuthority
+#undef LAVIK_META_FIELDS_SetGroupReplicationState
+#undef LAVIK_META_FIELDS_RemoveNodeFromGroup
+#undef LAVIK_META_FIELDS_CreateGroup
+#undef LAVIK_META_FIELDS_RetireNode
+#undef LAVIK_META_FIELDS_UpdateNode
 
 }  // namespace
 
