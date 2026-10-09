@@ -43,7 +43,11 @@ struct RegisteredBufferPoolOptions {
   std::size_t registered_bytes_ = 64 * kMiB;
   std::size_t storage_write_buffer_count_ = 4;
   std::size_t write_buffer_bytes_ = 8 * kMiB;
-  std::size_t read_payload_bytes_ = 1 * kMiB;
+  // Cover ordinary compact records and grouped pages, including record headers
+  // and direct-I/O alignment, without reserving a large slot for every small
+  // read. Oversized records and whole-value assembly use reusable overflow
+  // buffers; the group target is not a hard allocation limit.
+  std::size_t read_payload_bytes_ = 32 * kKiB;
   std::size_t read_headroom_bytes_ = 4 * kKiB;
   std::size_t read_tailroom_bytes_ = 4 * kKiB;
   std::size_t alignment_ = 4 * kKiB;

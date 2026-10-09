@@ -24,6 +24,7 @@ Each report provides an English `README.md` and a Simplified Chinese
 
 | Report | Test date | English | 简体中文 |
 |---|---|---|---|
+| 32 KiB registered read slots: SPDK throughput and descriptor-pressure diagnosis | 2026-10-09 | [English](lavik-read-slots-32k-2026-10-09/README.md) | [简体中文](lavik-read-slots-32k-2026-10-09/README.zh-CN.md) |
 | SPDK 48-hour online stability | 2026-08-15 | [English](lavik-spdk-48h-stability-2026-08-15/README.md) | [简体中文](lavik-spdk-48h-stability-2026-08-15/README.zh-CN.md) |
 | One billion keys: SPDK value-size scaling on 16 workers | 2026-08-31 | [English](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.md) | [简体中文](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.zh-CN.md) |
 | SPDK vs. raw io_uring: 500M keys, 2 KiB values | 2026-08-26 | [English](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.md) | [简体中文](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.zh-CN.md) |
