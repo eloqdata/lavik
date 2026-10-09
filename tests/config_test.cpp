@@ -320,6 +320,54 @@ TEST(RedisConfigTest, RejectsInvalidLoggingConfiguration) {
   EXPECT_FALSE(ValidateServerOptions(options).ok());
 }
 
+TEST(RedisConfigTest, ScalarDirectivesPreserveAliasesAndDiagnostics) {
+  ServerOptions options;
+  for (const std::string name : {"shards", "threads", "io-threads"}) {
+    SCOPED_TRACE(name);
+    ASSERT_TRUE(ApplyRedisConfigDirective({name, "7"}, &options).ok());
+    EXPECT_EQ(options.shard_count_, 7u);
+    const auto status = ApplyRedisConfigDirective({name, "0"}, &options);
+    EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_EQ(status.message(), "invalid " + name + " '0'");
+    EXPECT_EQ(options.shard_count_, 7u);
+  }
+  for (const std::string name : {"tls-replication", "max_log_files", "dir"}) {
+    SCOPED_TRACE(name);
+    for (const auto& directive : {std::vector<std::string>{name},
+                                  std::vector<std::string>{name, "1", "2"}}) {
+      const auto status = ApplyRedisConfigDirective(directive, &options);
+      EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+      EXPECT_EQ(status.message(),
+                "wrong number of arguments for '" + name + "' directive");
+    }
+  }
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"TLS-REPLICATION", "YeS"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"tls-replication", "1"}, &options).ok());
+  EXPECT_TRUE(options.tls_replication_);
+  options.requirepass_ = "previous-password";
+  ASSERT_TRUE(ApplyRedisConfigDirective({"requirepass", ""}, &options).ok());
+  EXPECT_TRUE(options.requirepass_.empty());
+}
+
+TEST(RedisConfigTest, ScalarIntegersPreserveWidthAndZeroPolicy) {
+  ServerOptions options;
+  ASSERT_TRUE(ApplyRedisConfigDirective({"port", "65535"}, &options).ok());
+  for (const std::string value : {"65536", "-1", "1x", ""}) {
+    EXPECT_FALSE(ApplyRedisConfigDirective({"port", value}, &options).ok());
+    EXPECT_EQ(options.port_, 65535);
+  }
+  ASSERT_TRUE(ApplyRedisConfigDirective({"port", "0"}, &options).ok());
+  EXPECT_EQ(options.port_, 0);
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"replica-priority", "0"}, &options).ok());
+  EXPECT_EQ(options.replication_options_.replica_priority_, 0u);
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"busy-reply-threshold", "0"}, &options).ok());
+  EXPECT_EQ(options.lua_time_limit_ms_, 0u);
+}
+
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
   ServerOptions options;
   options.max_clients_ = 0;

@@ -90,6 +90,116 @@ absl::Status WrongArgumentCount(std::string_view name) {
       absl::StrCat("wrong number of arguments for '", name, "' directive"));
 }
 
+struct ConfigOption {
+  std::string_view name;
+  absl::Status (*apply)(ServerOptions&, std::string_view, std::string_view,
+                        bool);
+  bool allow_zero;
+};
+
+template <auto Member, auto... Rest>
+auto& ConfigField(auto& options) {
+  if constexpr (sizeof...(Rest) == 0) {
+    return options.*Member;
+  } else {
+    return ConfigField<Rest...>(options.*Member);
+  }
+}
+
+// Member paths keep nested logging/replication fields type-checked. Parsing
+// uses the actual field width and assigns only on success. Keep conversions,
+// multi-field updates, and option-specific validation in explicit handlers.
+template <auto... Members>
+constexpr ConfigOption ScalarOption(std::string_view name,
+                                    bool allow_zero = false) {
+  return {name,
+          [](ServerOptions& options, std::string_view value,
+             std::string_view name, bool allow_zero) -> absl::Status {
+            auto& field = ConfigField<Members...>(options);
+            using T = std::remove_cvref_t<decltype(field)>;
+            if constexpr (std::is_same_v<T, bool>) {
+              auto parsed = ParseYesNo(value, name);
+              if (!parsed.ok()) return parsed.status();
+              field = *parsed;
+            } else if constexpr (std::is_same_v<T, std::string>) {
+              field = value;
+            } else {
+              return ParseUnsigned(value, name, &field, allow_zero);
+            }
+            return absl::OkStatus();
+          },
+          allow_zero};
+}
+
+// Only single-value startup directives belong here. Aliases remain separate
+// entries so diagnostics use the spelling supplied by the caller.
+constexpr ConfigOption kScalarOptions[] = {
+    ScalarOption<&ServerOptions::port_>("port", true),
+    ScalarOption<&ServerOptions::tls_port_>("tls-port", true),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::log_to_stderr_>(
+        "logtostderr"),
+    ScalarOption<&ServerOptions::logging_,
+                 &LoggingOptions::also_log_to_stderr_>("alsologtostderr"),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::log_dir_>(
+        "log-dir"),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::log_dir_>(
+        "log_dir"),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::max_log_size_mb_>(
+        "max-log-size-mb"),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::max_log_size_mb_>(
+        "max_log_size_mb"),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::max_log_files_>(
+        "max-log-files"),
+    ScalarOption<&ServerOptions::logging_, &LoggingOptions::max_log_files_>(
+        "max_log_files"),
+    ScalarOption<&ServerOptions::tls_cert_file_>("tls-cert-file"),
+    ScalarOption<&ServerOptions::tls_key_file_>("tls-key-file"),
+    ScalarOption<&ServerOptions::tls_ca_cert_file_>("tls-ca-cert-file"),
+    ScalarOption<&ServerOptions::requirepass_>("requirepass"),
+    ScalarOption<&ServerOptions::masteruser_>("masteruser"),
+    ScalarOption<&ServerOptions::masterauth_>("masterauth"),
+    ScalarOption<&ServerOptions::load_rdb_file_>("load-rdb"),
+    ScalarOption<&ServerOptions::rdb_dir_>("rdb-dir"),
+    ScalarOption<&ServerOptions::rdb_dir_>("dir"),
+    ScalarOption<&ServerOptions::dbfilename_>("dbfilename"),
+    ScalarOption<&ServerOptions::tls_replication_>("tls-replication"),
+    ScalarOption<&ServerOptions::load_rdb_replace_>("load-rdb-replace"),
+    ScalarOption<&ServerOptions::shutdown_checkpoint_>("shutdown-checkpoint"),
+    ScalarOption<&ServerOptions::shard_count_>("shards"),
+    ScalarOption<&ServerOptions::shard_count_>("threads"),
+    ScalarOption<&ServerOptions::shard_count_>("io-threads"),
+    ScalarOption<&ServerOptions::meta_exclusive_cpu_>("meta-exclusive-cpu"),
+    ScalarOption<&ServerOptions::max_clients_>("maxclients"),
+    ScalarOption<&ServerOptions::announce_ip_>("announce-ip"),
+    ScalarOption<&ServerOptions::node_id_>("node-id"),
+    // Zero follows the corresponding listen port.
+    ScalarOption<&ServerOptions::announce_port_>("announce-port", true),
+    ScalarOption<&ServerOptions::announce_tls_port_>("announce-tls-port", true),
+    ScalarOption<&ServerOptions::replication_options_,
+                 &ReplicationOptions::replica_serve_stale_data_>(
+        "replica-serve-stale-data"),
+    ScalarOption<&ServerOptions::replication_options_,
+                 &ReplicationOptions::replica_read_only_>("replica-read-only"),
+    ScalarOption<&ServerOptions::replication_options_,
+                 &ReplicationOptions::replica_priority_>("replica-priority",
+                                                         true),
+    ScalarOption<&ServerOptions::replication_options_,
+                 &ReplicationOptions::backlog_backpressure_>(
+        "replication-backlog-backpressure"),
+    ScalarOption<&ServerOptions::recv_buffer_count_>("recv-buffers-per-worker",
+                                                     true),
+    ScalarOption<&ServerOptions::slowlog_max_len_>("slowlog-max-len", true),
+    ScalarOption<&ServerOptions::foreground_budget_us_>("foreground-budget-us"),
+    ScalarOption<&ServerOptions::background_budget_us_>("background-budget-us"),
+    ScalarOption<&ServerOptions::spdk_max_completions_per_poll_>(
+        "spdk-max-completions-per-poll", true),
+    ScalarOption<&ServerOptions::storage_write_buffer_count_>(
+        "storage-write-buffers-per-worker"),
+    ScalarOption<&ServerOptions::lua_time_limit_ms_>("lua-time-limit", true),
+    ScalarOption<&ServerOptions::lua_time_limit_ms_>("busy-reply-threshold",
+                                                     true),
+};
+
 char DecodeEscape(char escaped) {
   switch (escaped) {
     case 'n':
@@ -322,6 +432,11 @@ absl::Status ApplyRedisConfigDirective(
   if (directive.empty()) return absl::OkStatus();
 
   const std::string name = absl::AsciiStrToLower(directive.front());
+  for (const ConfigOption& option : kScalarOptions) {
+    if (name != option.name) continue;
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return option.apply(*options, directive[1], name, option.allow_zero);
+  }
   if (name == "bind") {
     if (directive.size() < 2) return WrongArgumentCount(name);
     std::vector<std::string> addresses(directive.begin() + 1, directive.end());
@@ -333,56 +448,6 @@ absl::Status ApplyRedisConfigDirective(
     options->bind_addresses_ = std::move(addresses);
     return absl::OkStatus();
   }
-  if (name == "port") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], "port", &options->port_, true);
-  }
-  if (name == "tls-port") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->tls_port_, true);
-  }
-  if (name == "logtostderr" || name == "alsologtostderr") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    if (name == "logtostderr") {
-      options->logging_.log_to_stderr_ = *enabled;
-    } else {
-      options->logging_.also_log_to_stderr_ = *enabled;
-    }
-    return absl::OkStatus();
-  }
-  if (name == "log-dir" || name == "log_dir") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    options->logging_.log_dir_ = directive[1];
-    return absl::OkStatus();
-  }
-  if (name == "max-log-size-mb" || name == "max_log_size_mb") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name,
-                         &options->logging_.max_log_size_mb_, false);
-  }
-  if (name == "max-log-files" || name == "max_log_files") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->logging_.max_log_files_,
-                         false);
-  }
-  if (name == "tls-cert-file" || name == "tls-key-file" ||
-      name == "tls-ca-cert-file" || name == "requirepass" ||
-      name == "masteruser" || name == "masterauth" || name == "load-rdb" ||
-      name == "rdb-dir" || name == "dir" || name == "dbfilename") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    if (name == "tls-cert-file") options->tls_cert_file_ = directive[1];
-    if (name == "tls-key-file") options->tls_key_file_ = directive[1];
-    if (name == "tls-ca-cert-file") options->tls_ca_cert_file_ = directive[1];
-    if (name == "requirepass") options->requirepass_ = directive[1];
-    if (name == "masteruser") options->masteruser_ = directive[1];
-    if (name == "masterauth") options->masterauth_ = directive[1];
-    if (name == "load-rdb") options->load_rdb_file_ = directive[1];
-    if (name == "rdb-dir" || name == "dir") options->rdb_dir_ = directive[1];
-    if (name == "dbfilename") options->dbfilename_ = directive[1];
-    return absl::OkStatus();
-  }
   if (name == "tls-auth-clients") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     const std::string value = absl::AsciiStrToLower(directive[1]);
@@ -391,38 +456,6 @@ absl::Status ApplyRedisConfigDirective(
           "tls-auth-clients must be 'no', 'optional', or 'yes'");
     }
     options->tls_auth_clients_ = value;
-    return absl::OkStatus();
-  }
-  if (name == "tls-replication") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->tls_replication_ = *enabled;
-    return absl::OkStatus();
-  }
-  if (name == "load-rdb-replace") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->load_rdb_replace_ = *enabled;
-    return absl::OkStatus();
-  }
-  if (name == "shutdown-checkpoint") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->shutdown_checkpoint_ = *enabled;
-    return absl::OkStatus();
-  }
-  if (name == "shards" || name == "threads" || name == "io-threads") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->shard_count_, false);
-  }
-  if (name == "meta-exclusive-cpu") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->meta_exclusive_cpu_ = *enabled;
     return absl::OkStatus();
   }
   if (name == "cpus") {
@@ -436,10 +469,6 @@ absl::Status ApplyRedisConfigDirective(
     }
     options->cpu_ids_ = std::move(cpus);
     return absl::OkStatus();
-  }
-  if (name == "maxclients") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->max_clients_, false);
   }
   if (name == "maxmemory-clients") {
     if (directive.size() != 2) return WrongArgumentCount(name);
@@ -505,65 +534,12 @@ absl::Status ApplyRedisConfigDirective(
                      "client_mode in the Meta creation manifest; "
                      "omit Meta seeds for standalone mode"));
   }
-  if (name == "announce-ip" || name == "node-id" || name == "meta-seed") {
+  if (name == "meta-seed") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    if (name == "announce-ip") {
-      options->announce_ip_ = directive[1];
-    } else if (name == "node-id") {
-      options->node_id_ = directive[1];
-    } else {
-      options->meta_seeds_.push_back(directive[1]);
-    }
-    return absl::OkStatus();
-  }
-  if (name == "announce-port" || name == "announce-tls-port") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    // 0 follows the corresponding listen port (port / tls-port).
-    std::uint16_t port = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &port, true);
-    if (!parsed.ok()) return parsed;
-    if (name == "announce-port") {
-      options->announce_port_ = port;
-    } else {
-      options->announce_tls_port_ = port;
-    }
-    return absl::OkStatus();
-  }
-  if (name == "replica-serve-stale-data") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->replication_options_.replica_serve_stale_data_ = *enabled;
-    return absl::OkStatus();
-  }
-  if (name == "replica-read-only") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto read_only = ParseYesNo(directive[1], name);
-    if (!read_only.ok()) return read_only.status();
-    options->replication_options_.replica_read_only_ = *read_only;
-    return absl::OkStatus();
-  }
-  if (name == "replica-priority") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    unsigned priority = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &priority, true);
-    if (!parsed.ok()) return parsed;
-    options->replication_options_.replica_priority_ = priority;
+    options->meta_seeds_.push_back(directive[1]);
     return absl::OkStatus();
   }
 
-  if (name == "replication-backlog-backpressure") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->replication_options_.backlog_backpressure_ = *enabled;
-    return absl::OkStatus();
-  }
-  if (name == "recv-buffers-per-worker") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->recv_buffer_count_,
-                         true);
-  }
   if (name == "slowlog-log-slower-than") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     absl::Status parsed =
@@ -575,31 +551,16 @@ absl::Status ApplyRedisConfigDirective(
     }
     return absl::OkStatus();
   }
-  if (name == "slowlog-max-len") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->slowlog_max_len_, true);
-  }
-  if (name == "foreground-budget-us" || name == "background-budget-us" ||
-      name == "background-warrant-percent" ||
-      name == "spdk-max-completions-per-poll") {
+  if (name == "background-warrant-percent") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     unsigned value = 0;
-    const bool allow_zero = name == "spdk-max-completions-per-poll";
-    absl::Status parsed = ParseUnsigned(directive[1], name, &value, allow_zero);
+    absl::Status parsed = ParseUnsigned(directive[1], name, &value, false);
     if (!parsed.ok()) return parsed;
-    if (name == "background-warrant-percent" && value > 100) {
+    if (value > 100) {
       return absl::InvalidArgumentError(
           "background-warrant-percent must be between 1 and 100");
     }
-    if (name == "foreground-budget-us") {
-      options->foreground_budget_us_ = value;
-    } else if (name == "background-budget-us") {
-      options->background_budget_us_ = value;
-    } else if (name == "background-warrant-percent") {
-      options->background_warrant_percent_ = value;
-    } else {
-      options->spdk_max_completions_per_poll_ = value;
-    }
+    options->background_warrant_percent_ = value;
     return absl::OkStatus();
   }
   if (name == "replication-snapshot-batch-size") {
@@ -630,14 +591,6 @@ absl::Status ApplyRedisConfigDirective(
     } else {
       options->replication_publish_queue_bytes_ = megabytes * kMiB;
     }
-    return absl::OkStatus();
-  }
-  if (name == "storage-write-buffers-per-worker") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    unsigned count = 0;
-    absl::Status parsed = ParseUnsigned(directive[1], name, &count, false);
-    if (!parsed.ok()) return parsed;
-    options->storage_write_buffer_count_ = count;
     return absl::OkStatus();
   }
   if (name == "storage-read-buffer-kb") {
@@ -673,11 +626,6 @@ absl::Status ApplyRedisConfigDirective(
     }
     options->replication_options_.backlog_size_bytes_ = *bytes;
     return absl::OkStatus();
-  }
-  if (name == "lua-time-limit" || name == "busy-reply-threshold") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->lua_time_limit_ms_,
-                         true);
   }
   return absl::InvalidArgumentError(
       absl::StrCat("unsupported configuration directive '", name, "'"));
