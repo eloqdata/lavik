@@ -659,9 +659,8 @@ bool SortReadsPatternKeys(const CommandRequest& request) {
   auto options = ParseSortOptions(request);
   if (!options.ok()) return false;
   return (options->by_.has_value() && !options->dont_sort_) ||
-         std::any_of(options->gets_.begin(), options->gets_.end(), [](auto p) {
-           return p.find('*') != std::string_view::npos;
-         });
+         std::any_of(options->gets_.begin(), options->gets_.end(),
+                     [](auto p) { return p.contains('*'); });
 }
 
 Task<std::string> ExecuteSortCommandLocked(

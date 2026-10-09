@@ -75,7 +75,7 @@ bool SameEndpoint(const MetaControlEndpoint& left,
 }
 
 std::string EndpointText(std::string_view host, std::uint16_t port) {
-  if (host.find(':') != std::string_view::npos) {
+  if (host.contains(':')) {
     return absl::StrCat("[", host, "]:", port);
   }
   return absl::StrCat(host, ":", port);

@@ -111,7 +111,7 @@ inline std::optional<NumericEndpoint> ParseConcreteNumericEndpoint(
 // Returns the unique host:port spelling for a parsed numeric endpoint. IPv6
 // hosts are bracketed so the address/port boundary remains unambiguous.
 inline std::string FormatNumericEndpoint(const NumericEndpoint& endpoint) {
-  if (endpoint.host_.find(':') != std::string::npos) {
+  if (endpoint.host_.contains(':')) {
     return "[" + endpoint.host_ + "]:" + std::to_string(endpoint.port_);
   }
   return endpoint.host_ + ":" + std::to_string(endpoint.port_);

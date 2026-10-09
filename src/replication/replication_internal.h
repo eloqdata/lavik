@@ -742,8 +742,7 @@ class ReplicaCompletionLatch {
       Unlock();
       return false;
     }
-    Waiter* wake = waiters_head_;
-    waiters_head_ = nullptr;
+    Waiter* wake = std::exchange(waiters_head_, nullptr);
     waiters_tail_ = nullptr;
     Unlock();
 

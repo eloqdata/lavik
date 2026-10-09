@@ -787,8 +787,7 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError("rdb-dir must not be empty");
   }
   if (options.dbfilename_.empty() || options.dbfilename_ == "." ||
-      options.dbfilename_ == ".." ||
-      options.dbfilename_.find('/') != std::string::npos) {
+      options.dbfilename_ == ".." || options.dbfilename_.contains('/')) {
     return absl::InvalidArgumentError(
         "dbfilename must be a plain filename without '/'");
   }

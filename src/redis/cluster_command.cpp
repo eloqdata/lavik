@@ -62,8 +62,7 @@ std::string_view AppendClusterSubcommandError(ReplyBuilder& reply_builder,
 // command.cpp, bracketing bare IPv6 literals. Duplicated because that helper
 // is file-local to command.cpp and command.h cannot export it.
 std::string ClusterNodeAddress(std::string_view host, std::uint16_t port) {
-  if (host.find(':') != std::string_view::npos &&
-      !(host.starts_with('[') && host.ends_with(']'))) {
+  if (host.contains(':') && !(host.starts_with('[') && host.ends_with(']'))) {
     return absl::StrCat("[", host, "]:", port, "@0");
   }
   return absl::StrCat(host, ":", port, "@0");

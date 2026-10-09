@@ -627,7 +627,7 @@ std::string Endpoint(const NodeDescriptor& node, bool connection_tls) {
   const std::uint16_t port = ClientPort(node, connection_tls);
   const std::string_view host = node.host();
   // Bracket IPv6 literals so the "host:port" shape stays unambiguous.
-  if (host.find(':') != std::string_view::npos) {
+  if (host.contains(':')) {
     return absl::StrCat("[", host, "]:", port);
   }
   return absl::StrCat(host, ":", port);
