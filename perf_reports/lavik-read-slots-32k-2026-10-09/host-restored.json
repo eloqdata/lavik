@@ -1,6 +1,0 @@
-{
-  "time": 1791529207.0308008,
-  "hugepages": "0",
-  "vfio_noiommu": "N",
-  "lsblk": "NAME          SIZE SERIAL               FSTYPE MOUNTPOINTS\nnvme0n1       512G SN: 00000            ext4   /mnt/dev\nnvme0n2        30G SN: 00000                   \n\u251c\u2500nvme0n2p1    29G                      ext4   /\n\u251c\u2500nvme0n2p14    4M                             \n\u251c\u2500nvme0n2p15  106M                      vfat   /boot/efi\n\u2514\u2500nvme0n2p16  913M                      ext4   /boot\nnvme1n1       1.7T c08bc35101567ebd0005        \nnvme2n1       1.7T c08bc35101567ebd0004        \nnvme3n1       1.7T c08bc35101567ebd0001        \nnvme4n1       1.7T c08bc35101567ebd0003        \nnvme5n1       1.7T c08bc35101567ebd0002        \nnvme6n1       1.7T c08bc35101567ebd0006        \n"
-}
