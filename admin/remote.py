@@ -834,6 +834,8 @@ def check_no_processes(root):
             continue
         except PermissionError:
             # Other UIDs cannot belong to this unprivileged deployment.
+            # Same-UID processes can still deny procfs inspection. Keep data
+            # when ownership cannot be ruled out, even if argv looks unrelated.
             if proc.stat().st_uid == os.geteuid():
                 raise RuntimeError(f"Cannot inspect owned process {proc.name}")
             continue

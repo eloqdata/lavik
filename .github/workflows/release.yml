@@ -117,8 +117,7 @@ jobs:
           test -s "$package_dir/admin/public/setup.js"
           "$package_dir/lavik-admin" --help
           "$package_dir/runtime/bin/node" --check "$package_dir/admin/server.mjs"
-          "$package_dir/runtime/bin/node" --test ../admin/test/*.test.mjs
-          python3 ../admin/test/remote_test.py
+          # Functional suites run in CI's Admin jobs; check the shipped runtime here.
           "$package_dir/runtime/bin/node" ../admin/test/package-smoke.mjs "$package_dir"
           grep -Fq 'Upstream-Name: OpenSSL' "$package_dir/THIRD_PARTY_NOTICES"
           grep -Fq 'go.etcd.io/raft/v3@' "$package_dir/THIRD_PARTY_NOTICES"

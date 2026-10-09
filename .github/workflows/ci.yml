@@ -49,6 +49,34 @@ jobs:
       - name: Check all maintained sources
         run: pre-commit run clang-format --all-files --show-diff-on-failure
 
+  admin:
+    name: Admin tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          # Match the runtime bundled by scripts/package_admin.sh.
+          node-version: '24.15.0'
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Run Admin JavaScript tests
+        run: node --test admin/test/*.test.mjs
+      - name: Run remote ownership and teardown tests
+        run: python3 admin/test/remote_test.py
+
   build:
     name: Build tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -229,10 +257,11 @@ jobs:
 
   test:
     # Preserve the existing branch-protection check names. Both gates require
-    # every build and shard: failed, skipped, or cancelled work cannot pass.
+    # every build, shard and Admin job: failed, skipped, or cancelled work
+    # cannot pass.
     name: Tests (${{ matrix.arch }})
     if: ${{ always() }}
-    needs: [build, test-shard]
+    needs: [build, test-shard, admin]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     strategy:
@@ -244,6 +273,8 @@ jobs:
         env:
           BUILD_RESULT: ${{ needs.build.result }}
           SHARD_RESULT: ${{ needs.test-shard.result }}
+          ADMIN_RESULT: ${{ needs.admin.result }}
         run: |
           test "$BUILD_RESULT" = success
           test "$SHARD_RESULT" = success
+          test "$ADMIN_RESULT" = success
