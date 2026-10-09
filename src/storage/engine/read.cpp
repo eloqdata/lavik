@@ -448,7 +448,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
       const std::size_t read_bytes =
           (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
       const bool ordinary_buffer =
-          read_bytes <= options_.buffers_.read_payload_bytes_;
+          read_bytes <= options_.buffers_.read_payload_bytes();
       if (!wave.empty() && ordinary_buffer &&
           store.buffers_.available_read_buffers() == 0) {
         break;
@@ -840,15 +840,9 @@ Task<bool> StorageEngine::Impl::ExistsLocked(std::uint8_t db_id,
 }
 
 std::size_t StorageEngine::Impl::DirectGetValueLimit() const noexcept {
-  const RegisteredBufferPoolOptions& buffers = options_.buffers_;
-  // Reserve framing space within the configured read payload conservatively.
-  // Values above this bound retain the materializing memmove path below,
-  // including reads that acquired an oversized overflow buffer.
-  const std::size_t framing_reserve =
-      buffers.read_headroom_bytes_ + buffers.read_tailroom_bytes_;
-  return buffers.read_payload_bytes_ > framing_reserve
-             ? buffers.read_payload_bytes_ - framing_reserve
-             : 0;
+  // Framing margins are already outside the I/O capacity. Do not subtract
+  // them again when selecting the ordinary-slot direct reply path.
+  return options_.buffers_.read_payload_bytes();
 }
 
 absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(

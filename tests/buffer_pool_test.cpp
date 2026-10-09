@@ -16,8 +16,17 @@
 
 #include "lavik/storage/buffer_pool.h"
 
+#include <fcntl.h>
+#include <sys/eventfd.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -192,6 +201,281 @@ TEST(BufferPoolTest, StorageWriteBufferWaiterIsReusable) {
   ASSERT_TRUE(server.Start(options).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+// Change only the soft limit, after Worker startup. Each case restores it and
+// closes its ring before another test can register buffers against the limit.
+class BufferPoolMemlockTest : public ::testing::Test {
+ protected:
+  struct Completion : bycorf::IoCompletion {
+    unsigned calls = 0;
+    int result = -1;
+    void Complete(bycorf::Worker&, int value, unsigned) override {
+      ++calls;
+      result = value;
+    }
+  };
+
+  void SetUp() override {
+    const int rc = getrlimit(RLIMIT_MEMLOCK, &original_limit_);
+    limit_saved_ = rc == 0;
+    ASSERT_EQ(rc, 0);
+    saved_context_ = bycorf::MutableThisWorker();
+    int fd = mkstemp(path_);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, 4096), 0);
+    close(fd);
+    options_.registered_bytes_ = 8 * kMiB;
+    options_.storage_write_buffer_count_ = 2;
+    options_.write_buffer_bytes_ = 2 * kMiB;
+    options_.read_slot_bytes_ = 12 * kKiB;
+  }
+
+  void TearDown() override {
+    // Pool memory stays alive until fixed I/O has drained and the registered
+    // table is gone. Restore the caller's worker context after shutdown.
+    if (worker_) worker_->Shutdown();
+    pool_.reset();
+    if (wake_fd_ >= 0) close(wake_fd_);
+    unlink(path_);
+    if (limit_saved_) EXPECT_EQ(setrlimit(RLIMIT_MEMLOCK, &original_limit_), 0);
+    bycorf::MutableThisWorker() = std::move(saved_context_);
+  }
+
+  void Init(rlim_t limit, unsigned runtime_workers = 1) {
+    if (limit > original_limit_.rlim_max) {
+      GTEST_SKIP() << "test needs a higher memlock hard limit";
+    }
+    cross_core_ = std::make_unique<bycorf::CrossCore>(runtime_workers);
+    wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    ASSERT_GE(wake_fd_, 0);
+    cross_core_->mailbox(0).wake_fd_ = wake_fd_;
+    worker_ = std::make_unique<bycorf::Worker>();
+    worker_->BindCrossCore(0, cross_core_.get());
+    bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+    ASSERT_TRUE(worker_->Init({.recv_buffer_count_ = 0}).ok());
+    ASSERT_TRUE(worker_->RegisterFixedFiles(1).ok());
+    Completion opened;
+    ASSERT_TRUE(
+        worker_->SubmitOpenDirect(path_, O_RDWR | O_DIRECT, 0, {0}, &opened)
+            .ok());
+    ASSERT_NO_FATAL_FAILURE(Drain(opened));
+    ASSERT_EQ(opened.result, 0);
+
+    rlimit reduced = original_limit_;
+    reduced.rlim_cur = limit;
+    ASSERT_EQ(setrlimit(RLIMIT_MEMLOCK, &reduced), 0);
+    pool_ = std::make_unique<RegisteredBufferPool>();
+    auto status = pool_->Init(*worker_, options_);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_EQ(pool_->write_buffer_count(), 2);
+    ASSERT_EQ(pool_->read_buffer_count(),
+              (options_.registered_bytes_ - 2 * options_.write_buffer_bytes_) /
+                  options_.read_slot_bytes_);
+    ASSERT_FALSE(pool_->buffer_registered(0));
+    ASSERT_FALSE(pool_->buffer_registered(65535));
+  }
+
+  void Drain(Completion& completion) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (completion.calls == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      worker_->RunOnce(false);
+    }
+    ASSERT_EQ(completion.calls, 1);
+  }
+
+  // Exercise actual O_DIRECT I/O through both registered and ordinary paths.
+  // Holding every read lease checks that pool capacity did not silently shrink;
+  // Releasing and reacquiring checks that a shared registration index never
+  // gets mistaken for a slot's release id.
+  void CheckIo(unsigned expected_writes, unsigned min_reads, unsigned max_reads,
+               unsigned last_region = 0) {
+    unsigned registered_writes = 0;
+    for (unsigned i = 0; i < pool_->write_buffer_count(); ++i) {
+      std::uint16_t id = 0;
+      ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&id));
+      auto buffer = pool_->write_buffer(id);
+      EXPECT_EQ(buffer.index_, last_region);
+      buffer.size_ = 4096;
+      std::fill_n(buffer.data_, buffer.size_, std::byte{0x5a});
+      Completion written;
+      const bool registered = pool_->buffer_registered(id);
+      registered_writes += registered;
+      auto status = registered
+                        ? worker_->SubmitWriteFixed({0}, buffer, 0, &written)
+                        : worker_->SubmitWrite(
+                              {0}, {buffer.data_, buffer.size_}, 0, &written);
+      ASSERT_TRUE(status.ok()) << status;
+      ASSERT_NO_FATAL_FAILURE(Drain(written));
+      ASSERT_EQ(written.result, 4096);
+      // Keep both write slots held so the next iteration checks the other id.
+    }
+    EXPECT_EQ(registered_writes, expected_writes);
+    for (unsigned id = 1; id <= pool_->write_buffer_count(); ++id)
+      pool_->ReleaseWriteBuffer(id);
+
+    std::vector<std::byte*> slot_addresses(pool_->read_buffer_count());
+    for (unsigned round = 0; round < 2; ++round) {
+      unsigned registered_reads = 0;
+      std::vector<ReadBufferLease> leases;
+      for (unsigned i = 0; i < pool_->read_buffer_count(); ++i) {
+        auto acquire = pool_->AcquireReadBuffer();
+        ASSERT_TRUE(acquire.await_ready());
+        auto result = acquire.await_resume();
+        ASSERT_TRUE(result.ok()) << result.status();
+        auto& lease = leases.emplace_back(std::move(*result));
+        registered_reads += lease.registered();
+        auto buffer = lease.io_buffer();
+        // Use the same 4 KiB file to exercise both small slots and the larger
+        // slots in the multi-arena case, including its final registered region.
+        buffer.size_ = 4096;
+        EXPECT_GE(buffer.index_, 0);
+        EXPECT_LE(buffer.index_, last_region);
+        EXPECT_EQ(lease.registered_buffer().index_, buffer.index_);
+        ASSERT_GE(lease.buffer_id(), 3);
+        ASSERT_LT(lease.buffer_id() - 3, slot_addresses.size());
+        if (round == 0) {
+          EXPECT_EQ(lease.buffer_id(), i + 3);
+          slot_addresses[i] = lease.bytes().data();
+          if (i == 0) EXPECT_EQ(buffer.index_, 0);
+          if (i + 1 == pool_->read_buffer_count())
+            EXPECT_EQ(buffer.index_, last_region);
+          if (i != 0 && buffer.index_ == leases[i - 1].io_buffer().index_) {
+            EXPECT_EQ(lease.bytes().data(),
+                      slot_addresses[i - 1] + leases[i - 1].bytes().size());
+          }
+        } else {
+          EXPECT_EQ(lease.bytes().data(),
+                    slot_addresses[lease.buffer_id() - 3]);
+        }
+        Completion read;
+        auto status = lease.registered()
+                          ? worker_->SubmitReadFixed({0}, buffer, 0, &read)
+                          : worker_->SubmitRead(
+                                {0}, {buffer.data_, buffer.size_}, 0, &read);
+        ASSERT_TRUE(status.ok()) << status;
+        ASSERT_NO_FATAL_FAILURE(Drain(read));
+        ASSERT_EQ(read.result, 4096);
+        EXPECT_TRUE(
+            std::all_of(buffer.data_, buffer.data_ + buffer.size_,
+                        [](std::byte b) { return b == std::byte{0x5a}; }));
+      }
+      EXPECT_GE(registered_reads, min_reads);
+      EXPECT_LE(registered_reads, max_reads);
+      EXPECT_EQ(pool_->available_read_buffers(), 0);
+      EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+      leases.clear();
+      EXPECT_EQ(pool_->available_read_buffers(), pool_->read_buffer_count());
+    }
+  }
+
+  rlimit original_limit_{};
+  bool limit_saved_ = false;
+  bycorf::CurrentWorker saved_context_;
+  std::unique_ptr<bycorf::CrossCore> cross_core_;
+  std::unique_ptr<bycorf::Worker> worker_;
+  std::unique_ptr<RegisteredBufferPool> pool_;
+  RegisteredBufferPoolOptions options_;
+  int wake_fd_ = -1;
+  char path_[64] = "/tmp/lavik-buffer-memlock-XXXXXX";
+};
+
+TEST_F(BufferPoolMemlockTest, FullRegistrationPreservesConfiguredPool) {
+  ASSERT_NO_FATAL_FAILURE(Init(12 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, 341, 341));
+}
+
+TEST_F(BufferPoolMemlockTest, DefaultSlotIncludesFramingAndUsesIndexZero) {
+  options_.read_slot_bytes_ = RegisteredBufferPoolOptions{}.read_slot_bytes_;
+  ASSERT_EQ(options_.read_slot_bytes_, 32 * kKiB);
+  ASSERT_EQ(options_.read_payload_bytes(), 24 * kKiB);
+  ASSERT_NO_FATAL_FAILURE(Init(12 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, 128, 128));
+
+  auto ordinary = pool_->AcquireReadBuffer(24 * kKiB).await_resume();
+  ASSERT_TRUE(ordinary.ok());
+  EXPECT_EQ(ordinary->bytes().size(), 32 * kKiB);
+  EXPECT_EQ(ordinary->io_buffer().size_, 24 * kKiB);
+  EXPECT_EQ(ordinary->io_buffer().index_, 0);
+  EXPECT_TRUE(ordinary->registered());
+  auto overflow = pool_->AcquireReadBuffer(24 * kKiB + 1).await_resume();
+  ASSERT_TRUE(overflow.ok());
+  EXPECT_EQ(overflow->buffer_id(), 0);
+  EXPECT_FALSE(overflow->registered());
+  EXPECT_GE(overflow->io_buffer().size_, 24 * kKiB + 1);
+}
+
+TEST_F(BufferPoolMemlockTest, LowMemlockPrioritizesReadSlots) {
+  ASSERT_NO_FATAL_FAILURE(Init(2 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_FALSE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 1, 170));
+}
+
+TEST_F(BufferPoolMemlockTest, RemainingBudgetRegistersSomeWriteSlots) {
+  ASSERT_NO_FATAL_FAILURE(Init(6 * kMiB + 512 * kKiB));
+  if (IsSkipped()) return;
+  ASSERT_FALSE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(1, 341, 341));
+}
+
+TEST_F(BufferPoolMemlockTest, RetryBudgetAccountsForOtherWorkers) {
+  // Only worker 0 is needed to verify that the retry uses one quarter of the
+  // allowance.
+  ASSERT_NO_FATAL_FAILURE(Init(4 * kMiB, 4));
+  if (IsSkipped()) return;
+  ASSERT_FALSE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 1, 85));
+}
+
+TEST_F(BufferPoolMemlockTest, InsufficientMemlockKeepsWholeUnregisteredPool) {
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  if (IsSkipped()) return;
+  ASSERT_FALSE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 0, 0));
+}
+
+TEST_F(BufferPoolMemlockTest, MoreSlotsThanKernelRegistrationEntries) {
+  // More than Linux's 16384 registered entries, but only one read arena entry.
+  // Exercise the final slot too: a truncated registration must not pass this.
+  constexpr unsigned kSlots = 16400;
+  options_.registered_bytes_ = 4 * kMiB + kSlots * 12 * kKiB;
+  ASSERT_NO_FATAL_FAILURE(Init(256 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, kSlots, kSlots));
+}
+
+TEST_F(BufferPoolMemlockTest, LargePoolSpansMultipleRegisteredAllocations) {
+  options_.registered_bytes_ = 1024 * kMiB + 32 * kMiB;
+  options_.read_slot_bytes_ = kMiB + 8 * kKiB;
+  const unsigned slots =
+      (options_.registered_bytes_ - 4 * kMiB) / (kMiB + 8 * kKiB);
+  ASSERT_NO_FATAL_FAILURE(Init(1152 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  // Reads span two allocations; both write slots share the second allocation
+  // with its remaining reads. Kernel I/O verifies indices on both sides.
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, slots, slots, 1));
+}
+
+TEST_F(BufferPoolMemlockTest, PartialRegistrationSpansMultipleAllocations) {
+  options_.registered_bytes_ = 1024 * kMiB + 32 * kMiB;
+  options_.read_slot_bytes_ = kMiB + 8 * kKiB;
+  const unsigned slots =
+      (options_.registered_bytes_ - 4 * kMiB) / (kMiB + 8 * kKiB);
+  ASSERT_NO_FATAL_FAILURE(Init(1055 * kMiB));
+  if (IsSkipped()) return;
+  ASSERT_FALSE(pool_->buffers_registered());
+  // The last region contains both registered and ordinary write slots, after
+  // all reads. Sharing its registration index must not register the tail slot.
+  ASSERT_NO_FATAL_FAILURE(CheckIo(1, slots, slots, 1));
 }
 
 }  // namespace

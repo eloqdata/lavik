@@ -262,8 +262,9 @@ int main(int argc, char** argv) {
                  "Registered storage write buffers per worker")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  app.add_option("--storage-read-buffer-kb", storage_read_buffer_kb,
-                 "Registered storage read payload size in KiB")
+  app.add_option(
+         "--storage-read-buffer-kb", storage_read_buffer_kb,
+         "Total storage read slot size in KiB, including 8 KiB framing space")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_option("--replication-publish-queue-mb-per-worker",

@@ -52,6 +52,40 @@ For containers, the host kernel must meet this requirement and the container
 policy must allow `io_uring_setup`, `io_uring_enter`, and `io_uring_register`.
 CPU instruction-set and glibc requirements remain separate constraints.
 
+### io_uring storage buffers and memlock
+
+`--registered-buffer-mb-per-worker` sets each data worker's storage-buffer pool
+budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
+8 MiB write buffers by default; the remaining budget supplies read slots.
+`--storage-read-buffer-kb` is the total slot size, including framing space.
+The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
+4 KiB of tailroom. Values must be multiples of 4 KiB and greater than 8 KiB.
+These startup options also work as Redis-style
+configuration directives without the leading `--`.
+
+On io_uring, read and write slots share allocations made once at startup, with
+read slots placed first. Large pools span multiple registered regions, split
+at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
+Registration covers these existing allocations; a retry does not move slots
+or allocate a second pool. The default pool uses one registered region shared
+by 1024 read slots and four write slots; no sentinel entry is reserved.
+
+The pool first attempts full registration. If io_uring rejects it, Lavik uses
+the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in KiB) divided
+across runtime workers as a starting budget. It prioritizes read buffers and
+uses leftover space for whole write buffers. Failed retries reduce this
+registration budget; it is only an estimate because other locked resources
+can consume the allowance. Startup logs report the resulting registered read
+and write counts or complete fallback.
+
+The allocated pool capacity never shrinks. Slots outside the registered subset
+use ordinary asynchronous direct I/O; slot selection automatically chooses
+fixed or ordinary I/O. No additional setting is required, and Lavik does not
+raise the process's memlock limit. If the limit is unlimited or unavailable,
+registration failure uses the ordinary-I/O fallback without estimating a
+smaller budget. SPDK still requires DMA-addressable memory and has no such
+fallback.
+
 ## Local builds
 
 On Ubuntu 24.04 (x86_64 or ARM64), install build packages with the same script

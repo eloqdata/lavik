@@ -851,7 +851,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     }
 
     bool registered() const noexcept {
-      return buffer_id_ != 0 && pool_->buffers_registered();
+      return pool_ != nullptr && pool_->buffer_registered(buffer_id_);
     }
   } block_data{.pool_ = &store.buffers_};
   if (store.buffers_.TryAcquireWriteBuffer(&block_data.buffer_id_)) {

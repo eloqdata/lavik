@@ -47,10 +47,20 @@ struct RegisteredBufferPoolOptions {
   // and direct-I/O alignment, without reserving a large slot for every small
   // read. Oversized records and whole-value assembly use reusable overflow
   // buffers; the group target is not a hard allocation limit.
-  std::size_t read_payload_bytes_ = 32 * kKiB;
+  // Total slot size includes both framing margins.
+  std::size_t read_slot_bytes_ = 32 * kKiB;
   std::size_t read_headroom_bytes_ = 4 * kKiB;
   std::size_t read_tailroom_bytes_ = 4 * kKiB;
   std::size_t alignment_ = 4 * kKiB;
+
+  // Capacity available to disk I/O; zero means the slot cannot fit framing.
+  std::size_t read_payload_bytes() const noexcept {
+    if (read_slot_bytes_ <= read_headroom_bytes_ ||
+        read_slot_bytes_ - read_headroom_bytes_ <= read_tailroom_bytes_) {
+      return 0;
+    }
+    return read_slot_bytes_ - read_headroom_bytes_ - read_tailroom_bytes_;
+  }
 };
 
 class RegisteredBufferPool;
@@ -69,22 +79,22 @@ class ReadBufferLease {
 
   bool valid() const noexcept { return data_ != nullptr; }
   // True only when the slot is backed by a ring-registered iovec, so it gates
-  // fixed-buffer IO. A pool that fell back to unregistered mode at Init keeps
-  // its slot ids but reports false here. Defined after RegisteredBufferPool.
+  // fixed-buffer IO. Partial registration and unregistered fallback preserve
+  // slot ids; registration is checked per slot. Defined after the pool.
   bool registered() const noexcept;
   // Pool ownership is immutable after Init; do not duplicate it in every
   // lease moved through the direct-GET coroutine chain.
   unsigned owner_worker() const noexcept;
+  // Pool release id; fixed I/O uses io_buffer().index_, which can be zero.
   std::uint16_t buffer_id() const noexcept {
     return (release_token_ & kOverflowTokenBit) == 0
                ? static_cast<std::uint16_t>(release_token_)
                : 0;
   }
 
-  // Entire registered iovec, including framing/alignment headroom and tailroom.
-  bycorf::FixedBuffer registered_buffer() const noexcept {
-    return {.data_ = data_, .size_ = size_, .index_ = buffer_id()};
-  }
+  // Entire slot, including framing/alignment space. Its registration index
+  // may identify a larger arena shared by multiple slots.
+  bycorf::FixedBuffer registered_buffer() const noexcept;
 
   // Aligned region intended as the destination of READ_FIXED.
   bycorf::FixedBuffer io_buffer() const noexcept;
@@ -98,8 +108,8 @@ class ReadBufferLease {
  private:
   friend class RegisteredBufferPool;
   ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
-                  std::size_t headroom_bytes,
-                  std::size_t tailroom_bytes) noexcept;
+                  std::size_t headroom_bytes, std::size_t tailroom_bytes,
+                  std::uint16_t slot_id) noexcept;
   ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
                   std::size_t headroom_bytes, std::size_t tailroom_bytes,
                   std::size_t overflow_id) noexcept;
@@ -133,14 +143,25 @@ class RegisteredBufferPool {
   RegisteredBufferPool& operator=(const RegisteredBufferPool&) = delete;
   ~RegisteredBufferPool();
 
+  // Try full registration first. If io_uring rejects it, use the finite
+  // memlock allowance to retry a subset, prioritizing read slots. Pool sizes
+  // never shrink; unregistered slots use ordinary I/O. SPDK does not degrade.
   absl::Status Init(bycorf::Worker& worker,
                     const RegisteredBufferPoolOptions& options = {});
 
   bool initialized() const noexcept { return worker_ != nullptr; }
-  // False when io_uring buffer registration failed at Init and the pool fell
-  // back to plain (non-fixed) IO on the same aligned memory. Immutable after
-  // Init, so cross-worker reads through moved leases need no synchronization.
+  // True only when the entire pool registered. Use buffer_registered(id) to
+  // select fixed I/O: a partially registered pool can contain both kinds.
   bool buffers_registered() const noexcept { return buffers_registered_; }
+  // Registration is immutable after Init, including across lease handoffs.
+  // Slot ids identify pool ownership, independently of registration indices.
+  bool buffer_registered(std::uint16_t buffer_id) const noexcept {
+    if (buffer_id == 0) return false;
+    if (buffer_id <= write_buffers_.size()) {
+      return buffer_id <= registered_write_count_;
+    }
+    return buffer_id - write_buffers_.size() - 1 < registered_read_count_;
+  }
   unsigned owner_worker() const noexcept { return owner_worker_; }
   std::size_t read_buffer_count() const noexcept {
     return read_buffers_.size();
@@ -224,15 +245,18 @@ class RegisteredBufferPool {
   bycorf::CrossCore* cross_core_ = nullptr;
   unsigned owner_worker_ = 0;
   bool buffers_registered_ = false;
+  std::size_t registered_read_count_ = 0;
+  std::size_t registered_write_count_ = 0;
   RegisteredBufferPoolOptions options_{};
-  std::byte* sentinel_buffer_ = nullptr;
-  std::size_t sentinel_buffer_bytes_ = 0;
   std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;
   bycorf::AsyncNotification storage_write_buffer_ready_;
   std::vector<std::byte*> heap_write_buffers_;
   std::vector<std::byte*> free_heap_write_buffers_;
+  // io_uring read/write slots share these allocations, ordered reads first.
+  // SPDK retains individual DMA allocations and leaves this vector empty.
+  std::vector<std::byte*> arenas_;
   std::vector<bycorf::FixedBuffer> read_buffers_;
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;
@@ -246,7 +270,10 @@ class RegisteredBufferPool {
 };
 
 inline bool ReadBufferLease::registered() const noexcept {
-  return buffer_id() != 0 && pool_ != nullptr && pool_->buffers_registered_;
+  // Full registration is the common case. Overflow leases have no fixed slot
+  // even then; only partial registration needs the per-slot prefix check.
+  return pool_ != nullptr && buffer_id() != 0 &&
+         (pool_->buffers_registered() || pool_->buffer_registered(buffer_id()));
 }
 
 inline unsigned ReadBufferLease::owner_worker() const noexcept {
