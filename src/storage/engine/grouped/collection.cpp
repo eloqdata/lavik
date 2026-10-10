@@ -1751,7 +1751,8 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     }
   }
   for (std::size_t i = required_begin; i < required_end; ++i) {
-    if (!loaded.contains(groups[i].id_)) {
+    const auto current = loaded.find(groups[i].id_);
+    if (current == loaded.end()) {
       // List values have no cross-page ordering constraint. The directory
       // already validates links; require a neighbour's payload only if its
       // link actually changes after the split/removal below.
@@ -1759,10 +1760,13 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
         continue;
       return absl::InvalidArgumentError("ordered splice needs adjacent pages");
     }
-    if (i != required_begin && loaded.contains(groups[i - 1].id_)) {
-      auto boundary = ValidateOrderedGroupBoundary(loaded.at(groups[i - 1].id_),
-                                                   loaded.at(groups[i].id_));
-      if (!boundary.ok()) return boundary;
+    if (i != required_begin) {
+      const auto previous = loaded.find(groups[i - 1].id_);
+      if (previous != loaded.end()) {
+        auto boundary =
+            ValidateOrderedGroupBoundary(previous->second, current->second);
+        if (!boundary.ok()) return boundary;
+      }
     }
   }
 
@@ -1845,18 +1849,20 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   if (begin == 0)
     plan.root_.first_group_ = new_first;
   else if (groups[begin - 1].next_ != new_first) {
-    if (!loaded.contains(previous))
+    const auto found = loaded.find(previous);
+    if (found == loaded.end())
       return absl::InvalidArgumentError("ordered splice needs previous page");
-    auto& neighbour = loaded.at(previous);
+    auto& neighbour = found->second;
     neighbour.next_ = new_first;
     plan.writes_.push_back(std::move(neighbour));
   }
   if (end == groups.size())
     plan.root_.last_group_ = new_last;
   else if (groups[end].previous_ != new_last) {
-    if (!loaded.contains(next))
+    const auto found = loaded.find(next);
+    if (found == loaded.end())
       return absl::InvalidArgumentError("ordered splice needs next page");
-    auto& neighbour = loaded.at(next);
+    auto& neighbour = found->second;
     neighbour.previous_ = new_last;
     plan.writes_.push_back(std::move(neighbour));
   }
