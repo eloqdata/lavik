@@ -103,7 +103,7 @@ def run(binary, network, data, directory, iteration, populate):
             while time.monotonic() < ready:
                 assert p.poll() is None, path.read_text()[-5000:]
                 if network == "dpdk" and not tap_ready:
-                    if path.read_text().count("bycorf0: Ethernet address:") < 3:
+                    if path.read_text().count("bycorf0: Ethernet address:") < 2:
                         time.sleep(0.05)
                         continue
                     sp.run(
@@ -140,7 +140,8 @@ def run(binary, network, data, directory, iteration, populate):
                 except FileNotFoundError:
                     pass  # unrelated short-lived descriptors
 
-            assert sum("io_uring" in f for f in rings) == 3, rings
+            # Standalone creates only the two requested data workers.
+            assert sum("io_uring" in f for f in rings) == 2, rings
             if network == "kernel":
                 assert "EAL:" not in path.read_text()
             values = {
@@ -164,7 +165,7 @@ def run(binary, network, data, directory, iteration, populate):
             print(
                 network,
                 iteration,
-                "PASS: data, recovery, 2 shards + control / 3 rings, clean shutdown",
+                "PASS: data, recovery, 2 standalone shards / 2 rings, clean shutdown",
                 flush=True,
             )
         finally:

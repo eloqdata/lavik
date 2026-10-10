@@ -49,23 +49,28 @@ taskset -c "$LAVIK_CPUSET" ./build/lavik \
 
 `LAVIK_CPUSET` and `LAVIK_THREADS` select the CPU set and data shard count.
 `--shards N` is the preferred spelling; `--threads N` and `-t N` remain aliases.
-Lavik starts N data workers plus one final control worker, including in
-standalone mode. The data layout and per-shard budgets continue to use N.
+Lavik starts N data workers. Meta-managed mode adds one final control worker;
+standalone mode has no extra worker. The data layout and per-shard budgets use N.
 
 With pinning enabled, workers cycle over the inherited affinity mask. Use
 `--cpus 2,4,6,8` (or `cpus 2,4,6,8` in a config file) to select a different
 ordered list inside that mask. Four shards then map to CPUs 2,4,6,8 and the
-control worker maps to CPU 2. Supplying N+1 entries specifies the complete
+control worker, when present, maps to CPU 2. Supplying N entries in standalone
+mode or N+1 in Meta-managed mode specifies the complete
 mapping; repeated CPU IDs are supported. `--no-pin-workers` disables pinning
 and cannot be combined with an explicit CPU list. Startup logs show the
 resolved worker count, shard count, control worker ID and CPU mapping.
 `--meta-exclusive-cpu` (config: `meta-exclusive-cpu yes`) defaults to false.
-It reserves the final selected logical CPU for the Meta worker and cycles data
+In standalone mode it is ignored, including with `--no-pin-workers` when no
+explicit CPU list is set. In Meta-managed mode, it reserves the final selected
+logical CPU for the Meta worker and cycles data
 workers over the remaining CPUs. Without an explicit shard count, ten selected
-CPUs produce ten data workers plus Meta by default, or nine data workers plus
+CPUs produce ten data workers in standalone mode. In Meta-managed mode, they
+produce ten data workers plus Meta by default, or nine data workers plus
 Meta with this option. An explicit `--shards N` keeps N data workers, even when
 N exceeds the available data CPUs; none are pinned to the reserved Meta CPU.
-The option requires pinning and at least two selected CPUs; the reserved CPU
+In Meta-managed mode the option requires pinning and at least two selected
+CPUs; the reserved CPU
 must not also appear earlier in an explicit list. This isolates Lavik workers,
 not other processes, IRQs, or SMT siblings. Keep an explicit shard count when
 restarting existing storage: changing automatic sizing can change its layout.

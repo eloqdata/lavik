@@ -2407,13 +2407,16 @@ int RunServer(ServerOptions options) {
 
   bycorf::ServerOptions runtime_options;
   runtime_options.bind_addresses_ = options.bind_addresses_;
-  runtime_options.thread_count_ = options.shard_count_ + 1;
+  // A service-free worker still spins in DPDK poll mode. Only Meta-managed
+  // nodes need the additional control worker.
+  runtime_options.thread_count_ = options.shard_count_ + options.meta_managed_;
   runtime_options.pin_workers_ = options.pin_workers_;
   runtime_options.cpu_ids_ = std::move(*cpu_ids);
-  spdlog::info("runtime workers={} data_shards={} control_worker={} cpus={}",
-               runtime_options.thread_count_, options.shard_count_,
-               options.shard_count_,
-               absl::StrJoin(runtime_options.cpu_ids_, ","));
+  spdlog::info(
+      "runtime workers={} data_shards={} control_worker={} cpus={}",
+      runtime_options.thread_count_, options.shard_count_,
+      options.meta_managed_ ? std::to_string(options.shard_count_) : "none",
+      absl::StrJoin(runtime_options.cpu_ids_, ","));
   runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
   runtime_options.recv_buffer_count_ = options.recv_buffer_count_;
   runtime_options.busy_poll_us_ = options.busy_poll_us_;

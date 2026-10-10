@@ -448,6 +448,13 @@ TEST(RedisConfigTest, AutomaticShardsAndExclusiveMetaCpu) {
   EXPECT_EQ(options.shard_count_, cpus.size());
   auto shared = lavik::ResolveWorkerCpuIds(options);
   ASSERT_TRUE(shared.ok()) << shared.status();
+  EXPECT_EQ(*shared, cpus);
+
+  // CLI automatic sizing precedes RunServer setting meta_managed_.
+  options.meta_seeds_ = {"127.0.0.1:17001"};
+  EXPECT_FALSE(options.meta_managed_);
+  shared = lavik::ResolveWorkerCpuIds(options);
+  ASSERT_TRUE(shared.ok()) << shared.status();
   EXPECT_EQ(shared->size(), cpus.size() + 1);
   EXPECT_EQ(shared->back(), cpus.front());
 
