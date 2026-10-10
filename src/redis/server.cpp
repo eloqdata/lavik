@@ -2407,7 +2407,7 @@ int RunServer(ServerOptions options) {
 
   bycorf::ServerOptions runtime_options;
   runtime_options.bind_addresses_ = options.bind_addresses_;
-  // A service-free worker still polls in DPDK mode. Only Meta-managed nodes
+  // A service-free worker still spins in DPDK poll mode. Only Meta-managed nodes
   // need the additional control worker.
   runtime_options.thread_count_ = options.shard_count_ + options.meta_managed_;
   runtime_options.pin_workers_ = options.pin_workers_;

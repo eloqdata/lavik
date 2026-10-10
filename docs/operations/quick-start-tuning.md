@@ -61,14 +61,16 @@ mapping; repeated CPU IDs are supported. `--no-pin-workers` disables pinning
 and cannot be combined with an explicit CPU list. Startup logs show the
 resolved worker count, shard count, control worker ID and CPU mapping.
 `--meta-exclusive-cpu` (config: `meta-exclusive-cpu yes`) defaults to false.
-It is ignored in standalone mode. In Meta-managed mode, it reserves the final
-selected logical CPU for the Meta worker and cycles data
+In standalone mode it is ignored, including with `--no-pin-workers` when no
+explicit CPU list is set. In Meta-managed mode, it reserves the final selected
+logical CPU for the Meta worker and cycles data
 workers over the remaining CPUs. Without an explicit shard count, ten selected
 CPUs produce ten data workers in standalone mode. In Meta-managed mode, they
 produce ten data workers plus Meta by default, or nine data workers plus
 Meta with this option. An explicit `--shards N` keeps N data workers, even when
 N exceeds the available data CPUs; none are pinned to the reserved Meta CPU.
-The option requires pinning and at least two selected CPUs; the reserved CPU
+In Meta-managed mode the option requires pinning and at least two selected
+CPUs; the reserved CPU
 must not also appear earlier in an explicit list. This isolates Lavik workers,
 not other processes, IRQs, or SMT siblings. Keep an explicit shard count when
 restarting existing storage: changing automatic sizing can change its layout.
