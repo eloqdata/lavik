@@ -33,6 +33,7 @@ TEST(WorkerPlacementTest, CpuPolicyIncludesControlWorkerAndCycles) {
   ASSERT_LT(cpu, CPU_SETSIZE);
   lavik::ServerOptions options;
   options.shard_count_ = 3;
+  options.meta_seeds_ = {"127.0.0.1:17001"};
   options.cpu_ids_ = {cpu};
   auto mapped = lavik::ResolveWorkerCpuIds(options);
   ASSERT_TRUE(mapped.ok()) << mapped.status();
@@ -42,6 +43,25 @@ TEST(WorkerPlacementTest, CpuPolicyIncludesControlWorkerAndCycles) {
   options.pin_workers_ = false;
   EXPECT_FALSE(lavik::ValidateServerOptions(options).ok());
   options.cpu_ids_.clear();
+  ASSERT_TRUE(lavik::ResolveWorkerCpuIds(options).ok());
+  EXPECT_TRUE(lavik::ResolveWorkerCpuIds(options)->empty());
+}
+
+TEST(WorkerPlacementTest, StandaloneHasOnlyDataWorkers) {
+  const unsigned cpu = FirstAllowedCpu();
+  ASSERT_LT(cpu, CPU_SETSIZE);
+  lavik::ServerOptions options;
+  options.shard_count_ = 3;
+  options.cpu_ids_ = {cpu};
+  options.meta_exclusive_cpu_ = true;
+  auto mapped = lavik::ResolveWorkerCpuIds(options);
+  ASSERT_TRUE(mapped.ok()) << mapped.status();
+  EXPECT_EQ(*mapped, (std::vector<unsigned>{cpu, cpu, cpu}));
+  options.shard_count_ = 0;
+  ASSERT_TRUE(lavik::ResolveAutomaticShardCount(&options).ok());
+  EXPECT_EQ(options.shard_count_, 1u);
+  options.cpu_ids_.clear();
+  options.pin_workers_ = false;
   ASSERT_TRUE(lavik::ResolveWorkerCpuIds(options).ok());
   EXPECT_TRUE(lavik::ResolveWorkerCpuIds(options)->empty());
 }

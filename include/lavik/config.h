@@ -70,11 +70,12 @@ absl::Status RewriteRedisConfigFile(const std::string& path,
 absl::Status ValidateServerOptions(const ServerOptions& options);
 
 // Resolve an automatic (zero) shard count after config and CLI overrides.
-// Exclusive Meta placement reserves one selected CPU, including when unpinned
-// placement would otherwise have been requested (that combination is rejected).
+// With Meta seeds configured, exclusive Meta placement reserves one selected
+// CPU and requires pinning. Standalone sizing uses every selected CPU.
 absl::Status ResolveAutomaticShardCount(ServerOptions* options);
 
-// Resolve cyclic shard/control placement against the inherited CPU affinity.
+// Resolve cyclic data worker placement against the inherited CPU affinity.
+// Append a control worker only when Meta seeds are configured.
 // Empty result means unpinned; explicit CPU IDs must be permitted by the OS.
 absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
     const ServerOptions& options);

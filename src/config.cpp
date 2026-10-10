@@ -641,7 +641,8 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
       options.shard_count_ > std::numeric_limits<bycorf::WorkerId>::max() - 1) {
     return absl::InvalidArgumentError("shards exceeds runtime worker capacity");
   }
-  if (options.meta_exclusive_cpu_ && !options.pin_workers_) {
+  if (!options.meta_seeds_.empty() && options.meta_exclusive_cpu_ &&
+      !options.pin_workers_) {
     return absl::InvalidArgumentError(
         "meta-exclusive-cpu requires pin-workers");
   }
@@ -841,7 +842,7 @@ absl::StatusOr<std::vector<unsigned>> SelectedWorkerCpus(
           absl::StrCat("CPU ", cpu, " is outside inherited affinity"));
     }
   }
-  if (options.meta_exclusive_cpu_) {
+  if (!options.meta_seeds_.empty() && options.meta_exclusive_cpu_) {
     if (!options.pin_workers_)
       return absl::InvalidArgumentError(
           "meta-exclusive-cpu requires pin-workers");
@@ -864,27 +865,34 @@ absl::Status ResolveAutomaticShardCount(ServerOptions* options) {
   auto cpus = SelectedWorkerCpus(*options);
   if (!cpus.ok()) return cpus.status();
   options->shard_count_ = static_cast<unsigned>(cpus->size()) -
-                          static_cast<unsigned>(options->meta_exclusive_cpu_);
+                          static_cast<unsigned>(!options->meta_seeds_.empty() &&
+                                                options->meta_exclusive_cpu_);
   return absl::OkStatus();
 }
 
 absl::StatusOr<std::vector<unsigned>> ResolveWorkerCpuIds(
     const ServerOptions& options) {
-  if (!options.pin_workers_ && !options.meta_exclusive_cpu_)
+  if (!options.pin_workers_ &&
+      (options.meta_seeds_.empty() || !options.meta_exclusive_cpu_))
     return std::vector<unsigned>{};
   auto selected = SelectedWorkerCpus(options);
   if (!selected.ok()) return selected.status();
   const auto& cpus = *selected;
-  const auto data_cpu_count = cpus.size() - options.meta_exclusive_cpu_;
+  // Seed configuration is authoritative here: automatic sizing runs before
+  // RunServer derives meta_managed_. Standalone never reserves a control CPU.
+  const bool has_control_worker = !options.meta_seeds_.empty();
+  const bool exclusive = has_control_worker && options.meta_exclusive_cpu_;
+  const auto data_cpu_count = cpus.size() - exclusive;
   std::vector<unsigned> result;
-  const unsigned total = options.shard_count_ + 1;
+  const unsigned total = options.shard_count_ + has_control_worker;
   result.reserve(total);
   for (unsigned worker = 0; worker < options.shard_count_; ++worker) {
     result.push_back(cpus[worker % data_cpu_count]);
   }
-  result.push_back(options.meta_exclusive_cpu_
-                       ? cpus.back()
-                       : cpus[options.shard_count_ % cpus.size()]);
+  if (has_control_worker) {
+    result.push_back(exclusive ? cpus.back()
+                               : cpus[options.shard_count_ % cpus.size()]);
+  }
   return result;
 }
 

@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
       ->check(CLI::PositiveNumber);
   app.add_option("-t,--threads,--shards", options.shard_count_,
                  "Data shard count (default: selected CPUs, reserving one with "
-                 "--meta-exclusive-cpu)")
+                 "--meta-exclusive-cpu in Meta-managed mode)")
       ->default_str("auto")
       ->check(CLI::PositiveNumber);
   app.add_option("--maxclients", options.max_clients_,
@@ -173,9 +173,10 @@ int main(int argc, char** argv) {
   app.add_flag("--pin-workers,!--no-pin-workers", options.pin_workers_,
                "Pin workers cyclically to the selected or inherited CPUs")
       ->capture_default_str();
-  app.add_flag("--meta-exclusive-cpu,!--no-meta-exclusive-cpu",
-               options.meta_exclusive_cpu_,
-               "Reserve the last selected CPU for the Meta worker")
+  app.add_flag(
+         "--meta-exclusive-cpu,!--no-meta-exclusive-cpu",
+         options.meta_exclusive_cpu_,
+         "Reserve the last selected CPU for Meta (ignored in standalone mode)")
       ->capture_default_str();
   app.add_option("--cpus", options.cpu_ids_,
                  "Logical CPU IDs, cycled over workers")

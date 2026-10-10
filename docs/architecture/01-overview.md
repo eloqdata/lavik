@@ -150,14 +150,14 @@ in the [deployment guide](../operations/cluster-deployment.md).
    command/storage bindings, metrics shards, transaction runtime, and Bycorf
    service graph. Meta-managed mode starts the outbound Meta control client
    fenced; no topology or positive authority is restored locally.
-3. The runtime has N data workers and one final control worker, where N is
-   the configured shard count. Redis listeners and connections, metrics,
+3. The runtime has N data workers, where N is the configured shard count.
+   Meta-managed mode adds one final control worker; standalone mode does not. Redis listeners and connections, metrics,
    replication data flows, memory accounting and storage occupy only the data
    prefix. The control worker owns Meta sessions and NodeControl transitions;
-   it remains idle when Meta is not configured. All workers use the same
+   it is absent when Meta is not configured. All workers use the same
    selected network and storage backends. CPU placement cycles over an explicit
    list or the inherited affinity mask, allowing multiple workers on one CPU.
-   Optional exclusive Meta placement
+   In Meta-managed mode, optional exclusive Meta placement
    reserves its final logical CPU and keeps all data workers on the others;
    automatic sizing subtracts that reserved CPU from N.
 4. On every data worker, `RedisService::Run` binds the memory and transaction shards
