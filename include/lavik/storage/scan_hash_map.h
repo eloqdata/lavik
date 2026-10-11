@@ -890,9 +890,10 @@ struct ScanHashMapReadStates {
     WriteGuard() = default;
     WriteGuard(ScanHashMapReadStates* states, std::uint64_t mask, bool all)
         : states_(states), mask_(mask), all_(all) {
-      if (all_) ++states_->structural_writers_;
-      states_->PublishDisabled();
-      states_->Close(mask_);
+      if (all_)
+        states_->CloseStructural();
+      else
+        states_->Close(mask_);
     }
     WriteGuard(const WriteGuard&) = delete;
     WriteGuard& operator=(const WriteGuard&) = delete;
@@ -913,9 +914,10 @@ struct ScanHashMapReadStates {
     }
     void Reset() noexcept {
       if (auto* states = std::exchange(states_, nullptr)) {
-        if (all_) --states->structural_writers_;
-        states->Open(mask_);
-        states->PublishDisabled();
+        if (all_)
+          states->OpenStructural();
+        else
+          states->Open(mask_);
       }
     }
 
@@ -981,18 +983,16 @@ struct ScanHashMapReadStates {
   void BlockResize() noexcept {
     if (resize_blocked_) return;
     resize_blocked_ = true;
-    ++structural_writers_;
-    PublishDisabled();
-    Close(kAll);
+    CloseStructural();
   }
   void EndResize() noexcept {
     if (!resize_blocked_) return;
     resize_blocked_ = false;
-    --structural_writers_;
-    Open(kAll);
-    PublishDisabled();
+    OpenStructural();
   }
   bool Drained(std::uint64_t mask = kAll) const noexcept {
+    if (structural_drained_) return true;
+    const bool all = mask == kAll;
     while (mask != 0) {
       const auto index = std::countr_zero(mask);
       if ((stripes_[index].state_.load(std::memory_order_acquire) &
@@ -1000,10 +1000,25 @@ struct ScanHashMapReadStates {
         return false;
       mask &= mask - 1;
     }
+    // All stripes remain closed until the last structural scope exits. Once
+    // drained, owner mutations and rehash steps can reuse that observation.
+    if (all && structural_writers_ != 0) structural_drained_ = true;
     return true;
   }
 
  private:
+  void CloseStructural() noexcept {
+    if (structural_writers_++ != 0) return;
+    PublishDisabled();
+    Close(kAll);
+  }
+  void OpenStructural() noexcept {
+    assert(structural_writers_ != 0);
+    if (--structural_writers_ != 0) return;
+    structural_drained_ = false;
+    Open(kAll);
+    PublishDisabled();
+  }
   void PublishDisabled() noexcept {
     const bool disabled = !enabled_ || !populated_ || structural_writers_ != 0;
     // Ordinary single-stripe writes must not invalidate the global probe's
@@ -1036,6 +1051,9 @@ struct ScanHashMapReadStates {
   bool populated_ = false;
   bool resize_blocked_ = false;
   bool published_disabled_ = true;
+  // Owner-only. Resize and enclosing mutations share one all-stripe closure;
+  // finishing the last rehash step cannot reopen an enclosing writer's scope.
+  mutable bool structural_drained_ = false;
   unsigned structural_writers_ = 0;
 };
 

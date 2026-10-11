@@ -164,6 +164,63 @@ TEST(IndexReadersTest,
   EXPECT_EQ(std::as_const(map).Find(Digest{0}, "external")->value_, 3);
 }
 
+TEST(IndexReadersTest, NestedStructuralScopesRetainClosureAndRecheckNextDrain) {
+  ConcurrentIndex map(ConcurrentArena());
+  ASSERT_NE(map.InsertNew(Digest{0}, "external", 1, false), nullptr);
+  map.EnableConcurrentReads();
+  auto reader = map.TryRead(Digest{0});
+  ASSERT_TRUE(reader);
+  auto outer = map.CloseAllReaders();
+  auto inner = map.CloseAllReaders();
+  EXPECT_FALSE(outer.ready());
+  EXPECT_FALSE(inner.ready());
+  reader.Reset();
+  ASSERT_TRUE(outer.ready());
+  ASSERT_TRUE(inner.ready());
+  outer.Reset();
+  // A suspended writer can outlive the scope that originally closed the map.
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  auto moved = std::move(inner);
+  EXPECT_TRUE(moved.ready());
+  moved.Reset();
+  reader = map.TryRead(Digest{0});
+  ASSERT_TRUE(reader);
+  auto next = map.CloseAllReaders();
+  EXPECT_FALSE(next.ready());  // A previous drain cannot authorize this scope.
+  reader.Reset();
+  EXPECT_TRUE(next.ready());
+  next.Reset();
+  EXPECT_TRUE(map.TryRead(Digest{0}));
+}
+
+TEST(IndexReadersTest, ExpansionCompletionKeepsEnclosingWriteClosed) {
+  ConcurrentIndex map(ConcurrentArena());
+  for (unsigned i = 0; i < 288; ++i)
+    ASSERT_NE(map.InsertNew(Digest{i}, "external", i, false), nullptr);
+  ASSERT_FALSE(map.rehashing());
+  map.EnableConcurrentReads();
+  {
+    auto write = map.CloseForWrite(Digest{288});
+    ASSERT_TRUE(write.ready());
+    ASSERT_NE(map.InsertNew(Digest{288}, "external", 288, false), nullptr);
+  }
+  ASSERT_TRUE(map.rehashing());
+  for (unsigned step = 0; step < 64 && map.rehashing(); ++step) {
+    auto write = map.CloseForWrite(Digest{0});
+    ASSERT_TRUE(write.ready());
+    ASSERT_NE(map.Find(Digest{0}, "external"), nullptr);
+    // Even Find's final migration must leave every stripe closed until the
+    // enclosing mutation finishes, not just the stripe of the written key.
+    EXPECT_FALSE(map.TryRead(Digest{1}));
+    map.InsertOrAssign(Digest{0}, "external", step, false);
+    EXPECT_TRUE(write.ready());
+    EXPECT_FALSE(map.TryRead(Digest{1}));
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_TRUE(map.TryRead(Digest{1}));
+  EXPECT_EQ(map.allocated_bucket_count(), 64);
+}
+
 TEST(IndexReadersTest, ShrinkWaitsForReadersAndOwnerFindResumesIt) {
   ConcurrentIndex map(ConcurrentArena());
   ASSERT_TRUE(map.PreallocateForExpectedSize(400));  // 64 buckets
