@@ -521,7 +521,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       RecordIndex& index = PartitionFor(*store, identity.partition_id_)
                                .indexes_[identity.db_id_];
       auto index_write = index.CloseForValueUpdate(identity.entry_hash_);
-      if (!index_write.ready()) {
+      if (!index_write.ready()) [[unlikely]] {
         // Keep admission closed across the slow wait. Most flush updates
         // have no registered reader and need no waiting coroutine.
         index_write = co_await AwaitIndexValueWrite(*store->worker_, index,
