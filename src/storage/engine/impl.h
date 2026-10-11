@@ -116,10 +116,16 @@ using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
 inline Task<RecordIndex::WriteGuard> AwaitIndexWrite(
     [[maybe_unused]] Worker& worker, RecordIndex& index, const Digest& digest) {
   auto guard = index.CloseForWrite(digest);
-  while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
+  bool waited = false;
+  while (!guard.ready()) {
+    waited = true;
+    co_await tx::CurrentTxShard().WaitForReaders();
+  }
   // Another owner coroutine may have changed capacity during the wait.
+  // Without suspension CloseForWrite's decision is still current. Avoid
+  // walking the same bucket chain again on every uncontended write.
   // No entry pointer has been obtained yet; upgrade before resolving it.
-  if (index.NeedsStructuralWrite(digest)) {
+  if (waited && index.NeedsStructuralWrite(digest)) {
     guard.Reset();
     guard = index.CloseAllReaders();
     while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();

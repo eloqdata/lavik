@@ -520,8 +520,13 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // applies to the replacement entry's own location.
       RecordIndex& index = PartitionFor(*store, identity.partition_id_)
                                .indexes_[identity.db_id_];
-      auto index_write = co_await AwaitIndexValueWrite(*store->worker_, index,
-                                                       identity.entry_hash_);
+      auto index_write = index.CloseForValueUpdate(identity.entry_hash_);
+      if (!index_write.ready()) {
+        // Keep admission closed across the slow wait. Most flush updates
+        // have no registered reader and need no waiting coroutine.
+        index_write = co_await AwaitIndexValueWrite(*store->worker_, index,
+                                                    identity.entry_hash_);
+      }
       // Detach can run while the reader drain yields. Recheck the population
       // before resolving the saved integer address into this index.
       if (identity.index_generation_ !=

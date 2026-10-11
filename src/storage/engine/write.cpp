@@ -2932,8 +2932,13 @@ acquire_active_stream:
   // after the append stream is locked again and an active block is available.
   RecordIndex::WriteGuard index_write;
   if (index_ptr != nullptr) {
-    index_write =
-        co_await AwaitIndexWrite(*store.worker_, *index_ptr, request.digest_);
+    index_write = index_ptr->CloseForWrite(request.digest_);
+    if (!index_write.ready()) {
+      // Retain the outer closure while the slow path drains readers and
+      // rechecks capacity. Ordinary writes need no extra coroutine frame.
+      index_write =
+          co_await AwaitIndexWrite(*store.worker_, *index_ptr, request.digest_);
+    }
   }
   RecordIndex::Entry* previous_entry = nullptr;
   if (index_ptr != nullptr) {
