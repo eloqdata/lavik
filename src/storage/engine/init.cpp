@@ -911,6 +911,13 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         /*externally_admitted=*/true,
         /*externally_accounted=*/false,
         /*owner_shard=*/i + 1);
+    // Charge the fixed directory to its worker before recovery/admission. Its
+    // address must never change once protected handles can be resolved
+    // remotely.
+    if (!store.record_index_entry_arena_->PreallocateDirectory()) {
+      return absl::ResourceExhaustedError(
+          "cannot preallocate index page directory");
+    }
     store.indirect_keys_.SetEntryArena(store.record_index_entry_arena_);
     const std::size_t partition_count =
         (kLogicalStorageShards + worker_count - 1 - i) / worker_count;

@@ -519,11 +519,19 @@ seed and top-level digests appear only in the one-use checkpoint, never in
 authoritative records or replication protocols.
 
 All partition and logical-database indexes on a worker allocate entries from a
-shared worker-local arena, so sparse indexes share capacity instead of
-stranding it at partition boundaries. A population detached by `FLUSHDB`, a
-replica reset, or a replica abort retains ownership of that arena until
-reclamation finishes. Replica promotion and abort reuse the same worker-local
-detached-index drain as synchronous database flushes, so a completed lifecycle
+shared arena, so sparse indexes share capacity instead of stranding it at
+partition boundaries. Startup allocates its complete page directory, charging
+16 MiB of descriptor storage to each worker before recovery; entry pages remain
+demand-allocated. The directory stays at one address and publishes page layout
+atomically. Handle-to-address resolution can run concurrently with owner-side
+allocation when the caller protects the resolved entry and arena lifetimes;
+it does not pin entries or make the hash tables safe for concurrent access.
+Allocator mutation and index access remain owner-local. Private auxiliary
+arenas retain incremental directory allocation and owner-only access.
+A population detached by `FLUSHDB`, a replica reset, or a replica abort retains
+ownership of that arena until reclamation finishes. Replica promotion and
+abort reuse the same worker-local detached-index drain as synchronous database
+flushes, so a completed lifecycle
 cannot leave old index arenas or record-block live-byte accounting queued for a
 later rebuild. The drain covers the worker FIFO; it is not partitioned by
 replication attempt.
@@ -1156,7 +1164,7 @@ current source code are authoritative for present storage behavior.
 |---|---|
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/lavik/storage/engine.h` |
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
-| Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
+| Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/init.cpp`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped/hash.cpp`, `src/storage/engine/grouped/object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
 | Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |

@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cstddef>
@@ -47,7 +48,7 @@
 
 namespace lavik::storage {
 
-// Worker-local backing store for compact hash-table entry handles. Small pages
+// Single-owner backing store for compact hash-table entry handles. Small pages
 // are carved from 1 MiB spans so mimalloc pays the 64 KiB alignment overhead
 // once per 16 logical pages instead of once per page. Large entries still own
 // dedicated 64 KiB-aligned allocations. Mimalloc remains responsible for OS
@@ -61,6 +62,9 @@ namespace lavik::storage {
 // directory entry and the low 11 bits select a slot in that page. Page IDs may
 // be reused only after the last live slot is gone. Callers must therefore prove
 // bucket membership before resolving an identity retained across suspension.
+// PreallocateDirectory enables concurrent address resolution of protected live
+// entries; allocation, reclamation, and all allocator bookkeeping stay local to
+// the owner. Directory publication alone does not protect an entry's lifetime.
 class ScanHashMapEntryArena {
  public:
   using Handle = std::uint32_t;
@@ -92,6 +96,13 @@ class ScanHashMapEntryArena {
   ScanHashMapEntryArena& operator=(const ScanHashMapEntryArena&) = delete;
   ~ScanHashMapEntryArena();
 
+  // Allocate the complete page directory before publishing this arena to
+  // readers. Success fixes its address until destruction (16 MiB at the default
+  // handle limit); pages remain demand-allocated. Owner-only and idempotent.
+  // Returns false on admission rejection, preserving the existing directory.
+  // Private, owner-only arenas may omit this and retain incremental growth.
+  bool PreallocateDirectory();
+
   // Returns false only when this allocation would need a new page and every
   // encodable page ID is already live. Physical allocator failure is fatal.
   bool CanAllocate(std::size_t bytes) const noexcept;
@@ -104,12 +115,16 @@ class ScanHashMapEntryArena {
   Allocation Allocate(std::size_t bytes);
   void Deallocate(Handle handle) noexcept;
 
-  // Resolve translates a handle read from an occupied live bucket. Debug
-  // builds validate that ownership invariant; release builds rely on it and
-  // do not turn every lookup into defensive arena bookkeeping.
+  // Resolve translates a handle read from an occupied live bucket. After a
+  // successful PreallocateDirectory, it may run concurrently with owner-side
+  // allocation/reclamation of OTHER entries. The caller must publish the handle
+  // safely and keep its entry and the arena alive throughout the call and use
+  // of the returned pointer. This is not a stale-handle validation or pin API.
   void* Resolve(Handle handle) const noexcept;
   // HandleOf accepts an address owned by this arena and returns zero when the
-  // aligned page belongs to a different arena.
+  // aligned page belongs to a different arena. The same concurrent-access and
+  // lifetime requirements as Resolve apply; arbitrary freed pointers are
+  // unsafe.
   Handle HandleOf(const void* pointer) const noexcept;
 
   std::size_t allocated_pages() const noexcept { return allocated_pages_; }
@@ -183,6 +198,7 @@ class ScanHashMapEntryArena {
                               std::uint64_t descriptor) noexcept;
   std::size_t NextDirectoryCapacity() const noexcept;
   bool EnsureDirectoryCapacity();
+  bool ResizeDirectory(std::size_t capacity);
   std::size_t DirectoryGrowthBytesForNextPage() const noexcept;
   std::uint32_t AllocatePageId();
   void ReleasePageId(std::uint32_t page_id) noexcept;
@@ -205,11 +221,15 @@ class ScanHashMapEntryArena {
   // Directory slot zero stays empty so handle zero is the null reference.
   // A normal descriptor packs the 64 KiB-aligned page address with its small
   // block size in the low 16 bits; the large marker reads its variable size
-  // from the page header. The directory is a raw, deliberately uninitialized
-  // array with an explicit growth policy. Fresh IDs advance monotonically, so
-  // only the copied prefix and newly published slot are ever read. Released
-  // slots encode the next free ID in-band, eliminating a second
-  // capacity-growing array while keeping ReleasePage noexcept.
+  // from the page header. PreallocateDirectory fixes this array before remote
+  // readers are admitted; private arenas can instead grow on their owner.
+  // Descriptors use atomic_ref for release/acquire publication of immutable
+  // page layout. Unused slots are zero so HandleOf can reject foreign pages
+  // without reading the owner's mutable page-ID watermark. Freed slots encode
+  // the next free ID in-band. A stable directory does not pin pages.
+  static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
+  static_assert(std::atomic_ref<std::uint64_t>::required_alignment <=
+                alignof(std::uint64_t));
   std::uint64_t* directory_ = nullptr;
   std::size_t directory_capacity_ = 0;
   std::uint32_t next_page_id_ = 1;
@@ -304,6 +324,11 @@ inline ScanHashMapEntryArena::~ScanHashMapEntryArena() {
   }
 }
 
+inline bool ScanHashMapEntryArena::PreallocateDirectory() {
+  const std::size_t capacity = static_cast<std::size_t>(maximum_page_id_) + 1;
+  return directory_capacity_ == capacity || ResizeDirectory(capacity);
+}
+
 inline std::uint8_t ScanHashMapEntryArena::ClassFor(
     std::size_t bytes) noexcept {
   if (bytes > 4096) return kLargeClassMarker;
@@ -331,16 +356,19 @@ inline const std::byte* ScanHashMapEntryArena::SlotAddress(
 
 inline std::uint64_t ScanHashMapEntryArena::DirectoryDescriptor(
     std::uint32_t page_id) const noexcept {
-  assert(page_id != 0 && page_id < next_page_id_);
+  // next_page_id_ is owner-only and can advance during a remote Resolve.
+  // Validate against the fixed capacity, not that mutable high watermark.
+  assert(page_id != 0 && page_id <= maximum_page_id_);
   assert(directory_ != nullptr && page_id < directory_capacity_);
-  return directory_[page_id];
+  return std::atomic_ref(directory_[page_id]).load(std::memory_order_acquire);
 }
 
 inline void ScanHashMapEntryArena::SetDirectoryDescriptor(
     std::uint32_t page_id, std::uint64_t descriptor) noexcept {
   assert(page_id != 0 && page_id < next_page_id_);
   assert(directory_ != nullptr && page_id < directory_capacity_);
-  directory_[page_id] = descriptor;
+  std::atomic_ref(directory_[page_id])
+      .store(descriptor, std::memory_order_release);
 }
 
 inline std::size_t ScanHashMapEntryArena::NextDirectoryCapacity()
@@ -356,7 +384,10 @@ inline std::size_t ScanHashMapEntryArena::NextDirectoryCapacity()
 
 inline bool ScanHashMapEntryArena::EnsureDirectoryCapacity() {
   if (next_page_id_ < directory_capacity_) return true;
-  const std::size_t next_capacity = NextDirectoryCapacity();
+  return ResizeDirectory(NextDirectoryCapacity());
+}
+
+inline bool ScanHashMapEntryArena::ResizeDirectory(std::size_t next_capacity) {
   if (next_capacity <= directory_capacity_ ||
       next_capacity >
           std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t)) {
@@ -366,9 +397,11 @@ inline bool ScanHashMapEntryArena::EnsureDirectoryCapacity() {
       allocation_domain_, next_capacity * sizeof(std::uint64_t),
       alignof(std::uint64_t)));
   if (next == nullptr) return false;
-  // Slot zero is permanently invalid. Copy only descriptors that have been
-  // published; the unused suffix stays uninitialized until fresh IDs consume
-  // it, avoiding vector value-initialization and a capacity-sized memset.
+  // Zero descriptors let HandleOf reject a live pointer owned by another arena
+  // without consulting next_page_id_, which can change on the allocating owner.
+  // This initialization precedes publication of the directory to any reader.
+  std::uninitialized_value_construct_n(next, next_capacity);
+  // Slot zero is permanently invalid; retain all published and recycled IDs.
   if (directory_ != nullptr && next_page_id_ > 1) {
     std::memcpy(next + 1, directory_ + 1,
                 (next_page_id_ - 1) * sizeof(std::uint64_t));
@@ -728,7 +761,7 @@ inline void ScanHashMapEntryArena::Deallocate(Handle handle) noexcept {
 
 inline void* ScanHashMapEntryArena::Resolve(Handle handle) const noexcept {
   const std::uint32_t page_id = handle >> kSlotBits;
-  assert(page_id != 0 && page_id < next_page_id_);
+  assert(page_id != 0 && page_id <= maximum_page_id_);
   const std::uint64_t descriptor = DirectoryDescriptor(page_id);
   const std::uint64_t marker = descriptor & std::uint64_t{0xffff};
   assert(descriptor != 0 && marker != kFreePageMarker);
@@ -764,7 +797,7 @@ inline ScanHashMapEntryArena::Handle ScanHashMapEntryArena::HandleOf(
       (address - data) % page->block_size_ != 0) {
     return 0;
   }
-  if (page->page_id_ >= next_page_id_ ||
+  if (page->page_id_ >= directory_capacity_ ||
       (DirectoryDescriptor(page->page_id_) & ~std::uint64_t{0xffff}) !=
           page_address) {
     return 0;
