@@ -284,8 +284,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           if (state->kind_ == BlockKind::kTransaction) {
             tx_cleaner_dirty_.store(true, std::memory_order_release);
           }
-          if (state->pins_ > 0) {
+          if (state->pin_count() > 0) {
             state->release_pending_ = true;
+            state->CloseRemotePins();
           } else {
             ReleaseStagingBuffer(*store, *state);
             MaybeQueueDefrag(*store, block_id);
@@ -519,6 +520,13 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // applies to the replacement entry's own location.
       RecordIndex& index = PartitionFor(*store, identity.partition_id_)
                                .indexes_[identity.db_id_];
+      auto index_write = co_await AwaitIndexValueWrite(*store->worker_, index,
+                                                       identity.entry_hash_);
+      // Detach can run while the reader drain yields. Recheck the population
+      // before resolving the saved integer address into this index.
+      if (identity.index_generation_ !=
+          store->index_generations_[identity.db_id_])
+        continue;
       RecordIndex::Entry* current_entry = index.FindAddress(
           identity.entry_address_, identity.entry_hash_, identity.entry_tag_);
       if (current_entry == nullptr) {
@@ -588,8 +596,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     if (state->kind_ == BlockKind::kTransaction) {
       tx_cleaner_dirty_.store(true, std::memory_order_release);
     }
-    if (state->pins_ > 0) {
+    if (state->pin_count() > 0) {
       state->release_pending_ = true;
+      state->CloseRemotePins();
       continue;
     }
     ReleaseStagingBuffer(*store, *state);

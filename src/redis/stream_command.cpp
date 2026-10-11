@@ -1273,7 +1273,8 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
   tx::TxShard::Guard guard;
   if (!locked_digest)
     guard = co_await tx::CurrentTxShard().AcquireKey(
-        db, tx::FingerprintOf(digest), tx::LockMode::kShared);
+        db, tx::FingerprintOf(digest), tx::LockMode::kShared,
+        lavik::storage::RedisSlot(key));
   auto source =
       co_await g_storage->ReadValueForTransferLocked(db, key, digest, range);
   if (!source.ok()) co_return source.status();
@@ -1393,7 +1394,8 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
   if (group_read && !locked_digest) {
     delivery_digest = storage::ComputeDigest(key);
     delivery_guard = co_await tx::CurrentTxShard().AcquireKey(
-        db_id, tx::FingerprintOf(delivery_digest), tx::LockMode::kExclusive);
+        db_id, tx::FingerprintOf(delivery_digest), tx::LockMode::kExclusive,
+        lavik::storage::RedisSlot(key));
     locked_digest = &delivery_digest;
   }
   const storage::MutationPrecondition mutation_precondition =
@@ -2153,7 +2155,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       inspection_digest = storage::ComputeDigest(a[2]);
       inspection_guard = co_await tx::CurrentTxShard().AcquireKey(
           request.db_id_, tx::FingerprintOf(inspection_digest),
-          tx::LockMode::kShared);
+          tx::LockMode::kShared, lavik::storage::RedisSlot(a[2]));
       digest = &inspection_digest;
     }
     auto prepared = co_await PrepareStreamRangeReply(

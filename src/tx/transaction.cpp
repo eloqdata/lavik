@@ -27,7 +27,7 @@ using bycorf::Task;
 
 void Transaction::AddKey(unsigned owner, std::uint8_t db,
                          const storage::Digest& digest, std::uint32_t arg_index,
-                         LockMode mode) {
+                         LockMode mode, std::uint16_t slot) {
   assert(shards_.empty() && "AddKey after Seal");
   keys_.push_back(TxKey{
       .digest_ = digest,
@@ -35,6 +35,7 @@ void Transaction::AddKey(unsigned owner, std::uint8_t db,
       .arg_index_ = arg_index,
       .mode_ = mode,
       .db_ = db,
+      .slot_ = slot,
   });
   owners_.push_back(static_cast<std::uint16_t>(owner));
 }
@@ -75,12 +76,14 @@ void Transaction::Seal() {
           if (key.mode_ == LockMode::kExclusive) {
             lock_refs_[j].mode_ = LockMode::kExclusive;
           }
+          if (lock_refs_[j].slot_ != key.slot_)
+            lock_refs_[j].slot_ = storage::kLogicalStorageShards;
           merged = true;
           break;
         }
       }
       if (!merged) {
-        lock_refs_.push_back(KeyRef{key.fp_, key.mode_, key.db_});
+        lock_refs_.push_back(KeyRef{key.fp_, key.mode_, key.db_, key.slot_});
       }
     }
     sd.lock_count_ =

@@ -528,7 +528,7 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     tx::Transaction transaction;
     for (std::size_t i = 0; i < keys.size(); ++i) {
       transaction.AddKey(keys[i].owner_, request.db_id_, keys[i].digest_, i,
-                         keys[i].mode_);
+                         keys[i].mode_, storage::RedisSlot(keys[i].name_));
     }
     transaction.Seal();
     std::unique_ptr<ReplicationTransactionGuard> replication;

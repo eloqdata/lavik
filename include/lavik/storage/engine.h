@@ -1603,6 +1603,12 @@ class StorageEngine {
   bycorf::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
   void SetReplicaLoading(bool loading) noexcept;
 
+  // Connection-worker optimization for a standalone GET. The caller holds
+  // request/DB population admission through completion. nullopt requests the
+  // ordinary owner path; a present result is final (including not-found).
+  bycorf::Task<std::optional<absl::StatusOr<DiskValue>>> TryRemoteGet(
+      std::uint8_t db_id, std::string_view key, std::uint16_t slot);
+
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
   // routed_partition_id reuses a route computed for this exact key before its

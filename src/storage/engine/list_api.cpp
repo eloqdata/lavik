@@ -26,7 +26,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPush(
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await ListPushLocked(db_id, key, digest, values, nullptr,
                                     replication, mutation_precondition);
 }
@@ -60,7 +61,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteList(
                          operation.kind_ == ListOperationKind::kPosition;
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
-      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await ExecuteListLocked(db_id, key, digest, operation, nullptr,
                                        replication, mutation_precondition);
 }

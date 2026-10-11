@@ -146,7 +146,8 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaCollection(
   state->decoder_.emplace(std::move(*decoder));
   const auto digest = ComputeDigest(stage.key_);
   state->key_hold_ = co_await tx::CurrentTxShard().AcquireKey(
-      stage.db_id_, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      stage.db_id_, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(stage.key_));
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   auto current = co_await FindVerifiedEntry(

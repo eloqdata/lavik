@@ -946,6 +946,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
               .subspan(offset, options_.database_count_);
       partition_store.replication_epoch_ =
           epoch_values_[kLogicalDatabaseCount + partition];
+      remote_replication_epochs_[partition].store(
+          partition_store.replication_epoch_, std::memory_order_release);
       partition_store.replica_candidate_epoch_ =
           partition_store.replication_epoch_;
     }
@@ -1084,6 +1086,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
 Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   WorkerStore& store = *stores_[worker.id()];
   store.worker_ = &worker;
+  store.engine_ = this;
 
   absl::Status status = store.buffers_.Init(worker, options_.buffers_);
   if (status.ok()) {
@@ -1989,6 +1992,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       co_await store.store_state_mutex_.Lock();
       {
         UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+        auto index_write = co_await AwaitIndexWrite(
+            *store.worker_, partition.indexes_[expired.db_id_],
+            expired.digest_);
         auto resolved = co_await FindVerifiedEntry(
             store, partition.indexes_[expired.db_id_], expired.digest_,
             expired.key_);
@@ -2056,6 +2062,20 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     Fail(status);
     co_return status;
   }
+  auto& shard = tx::CurrentTxShard();
+  shard.BindReadAdmission({&store,
+                           [](void* ctx, const tx::KeyRef& key) {
+                             ChangeReadIntent(ctx, key, true);
+                           },
+                           [](void* ctx, const tx::KeyRef& key) {
+                             ChangeReadIntent(ctx, key, false);
+                           },
+                           &ReadIntentReady});
+  for (auto& index : store.partition_indexes_) {
+    index.SetReaderNotifier(&store, &NotifyIndexReaders);
+    index.EnableConcurrentReads();
+  }
+  store.remote_reads_ready_.store(true, std::memory_order_release);
   worker.SpawnRoot(PeriodicFlush(&store));
   worker.SpawnBackground(ActiveExpiration(&store));
   // The scheduler lives until shutdown, including OFF and incomplete FULL.
@@ -2066,8 +2086,55 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   co_return absl::OkStatus();
 }
 
+void StorageEngine::Impl::NotifyIndexReaders(void* context) noexcept {
+  auto& store = *static_cast<WorkerStore*>(context);
+  // Notifications name worker-lifetime state, never a suspended frame. The
+  // server drains all workers and I/O before destroying any WorkerStore.
+  bycorf::PostNotification(bycorf::ThisWorker().cross_core_,
+                           store.worker_->id(),
+                           {nullptr, 0, [](void*, std::uint64_t) noexcept {
+                              tx::CurrentTxShard().ReadersDrained();
+                            }});
+}
+
+void StorageEngine::Impl::ChangeReadIntent(void* context, const tx::KeyRef& key,
+                                           bool close) {
+  auto& store = *static_cast<WorkerStore*>(context);
+  auto change = [&](RecordIndex& index) {
+    if (close)
+      index.CloseReadIntent(key.fp_);
+    else
+      index.ReleaseReadIntent(key.fp_);
+  };
+  if (key.db_ >= store.engine_->options_.database_count_) return;
+  if (key.slot_ < kLogicalStorageShards) {
+    change(store.engine_->PartitionFor(store, key.slot_).indexes_[key.db_]);
+  } else {
+    // Legacy/internal callers without a route are conservative. A full digest
+    // collision merged from different slots also takes this bounded path.
+    for (auto& partition : store.partitions_)
+      change(partition.indexes_[key.db_]);
+  }
+}
+
+bool StorageEngine::Impl::ReadIntentReady(void* context,
+                                          const tx::KeyRef& key) {
+  auto& store = *static_cast<WorkerStore*>(context);
+  if (key.db_ >= store.engine_->options_.database_count_) return true;
+  if (key.slot_ < kLogicalStorageShards)
+    return store.engine_->PartitionFor(store, key.slot_)
+        .indexes_[key.db_]
+        .ReadIntentReady(key.fp_);
+  for (const auto& partition : store.partitions_)
+    if (!partition.indexes_[key.db_].ReadIntentReady(key.fp_)) return false;
+  return true;
+}
+
 void StorageEngine::Impl::FinalizeWorker(unsigned worker_id) noexcept {
   assert(worker_id < stores_.size());
+  tx::CurrentTxShard().BindReadAdmission({});
+  stores_[worker_id]->remote_reads_ready_.store(false,
+                                                std::memory_order_release);
   if (abandon_worker_state_on_finalize_.load(std::memory_order_acquire)) {
     // Worker::Shutdown has already drained IO and closed io_uring/SPDK state,
     // and detached coroutine frames were destroyed before this callback. The

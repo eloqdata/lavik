@@ -40,6 +40,11 @@ class ExpirationAuthorityTestPeer {
  public:
   using WorkerCache = StorageEngine::Impl::WorkerStore;
 
+  static RecordIndex& IndexFor(StorageEngine& storage, std::string_view key) {
+    auto* impl = storage.impl_.get();
+    return impl->PartitionForKey(impl->CurrentStore(), key).indexes_[0];
+  }
+
   static std::shared_ptr<const void> CachedGrant(const StorageEngine& storage,
                                                  WorkerCache& cache) {
     return storage.impl_->CurrentExpirationAuthority(cache);
@@ -269,6 +274,9 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
     if (!result_.ok()) co_return Finish();
     expiration_paused_ = true;
 
+    result_ = co_await ExerciseIndexReaderDrain(worker);
+    if (!result_.ok()) co_return Finish();
+
     result_ =
         storage_->SetExpirationAuthorityUntil(FarFutureExpirationDeadline());
     if (!result_.ok()) co_return Finish();
@@ -313,6 +321,56 @@ class FiniteExpirationAuthorityService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  struct ReaderDrainProbe {
+    std::atomic<bool> finished{false};
+    bool owner_progress = false;
+  };
+
+  static bycorf::Task<absl::Status> ReleaseBlockedReader(
+      bycorf::Worker* worker, lavik::storage::RecordIndex* index,
+      lavik::storage::Digest digest, std::shared_ptr<ReaderDrainProbe> probe,
+      lavik::storage::ScanHashMapReadGuard reader) {
+    while (!probe->finished.load()) {
+      if ((index->read_states()[digest.value_ & 31].state_.load() &
+           lavik::storage::ScanHashMapReadState::kClosed) != 0) {
+        probe->owner_progress = true;
+        reader.Reset();
+        co_return absl::OkStatus();
+      }
+      co_await bycorf::Yield(*worker);
+    }
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseIndexReaderDrain(bycorf::Worker& worker) {
+    constexpr std::string_view key = "index-reader-drain";
+    auto seeded = co_await storage_->Set(0, key, "before");
+    if (!seeded.ok()) co_return seeded.status();
+    auto& index =
+        lavik::storage::ExpirationAuthorityTestPeer::IndexFor(*storage_, key);
+    const auto digest = lavik::storage::ComputeDigest(key);
+    auto probe = std::make_shared<ReaderDrainProbe>();
+    auto reader = index.TryRead(digest);
+    if (!reader) co_return absl::InternalError("test reader admission failed");
+    worker.Spawn(ReleaseBlockedReader(&worker, &index, digest, probe,
+                                      std::move(reader)));
+    auto replaced = co_await storage_->Set(0, key, "after");
+    probe->finished.store(true);
+    if (!replaced.ok()) co_return replaced.status();
+    if (!probe->owner_progress)
+      co_return absl::InternalError(
+          "index writer did not yield while draining readers");
+    auto loaded = co_await storage_->Get(0, key);
+    if (!loaded.ok()) co_return loaded.status();
+    const auto bytes = loaded->value_bytes();
+    if (std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                         bytes.size()) != "after")
+      co_return absl::InternalError(
+          "index writer did not publish after reader drain");
+    auto removed = co_await storage_->Delete(0, key);
+    co_return removed.status();
+  }
+
   bycorf::Task<absl::Status> SeedExpired(std::string_view key) {
     auto seeded = co_await storage_->Set(
         0, key, "value", lavik::storage::SetOptions{.expire_at_ms_ = 1});

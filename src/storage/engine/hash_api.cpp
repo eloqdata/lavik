@@ -41,7 +41,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHash(
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
-                                 : tx::LockMode::kShared);
+                                 : tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await ExecuteHashLocked(db_id, key, digest, operation, nullptr,
                                        replication, mutation_precondition);
 }
@@ -55,7 +56,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSet(
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
-                                 : tx::LockMode::kShared);
+                                 : tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await ExecuteSetLocked(db_id, key, digest, operation, nullptr,
                                       replication, mutation_precondition);
 }

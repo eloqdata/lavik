@@ -634,6 +634,11 @@ void StorageEngine::SetReplicaLoading(bool loading) noexcept {
   impl_->SetReplicaLoading(loading);
 }
 
+Task<std::optional<absl::StatusOr<DiskValue>>> StorageEngine::TryRemoteGet(
+    std::uint8_t db_id, std::string_view key, std::uint16_t slot) {
+  return impl_->TryRemoteGet(db_id, key, slot);
+}
+
 Task<absl::StatusOr<DiskValue>> StorageEngine::Get(
     std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace,
     std::optional<std::uint16_t> routed_partition_id) {

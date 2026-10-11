@@ -150,7 +150,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   // Transaction callers already own this guard and must not reacquire it.
   auto key_lock = acquire_key_lock ? co_await tx::CurrentTxShard().AcquireKey(
                                          db_id, tx::FingerprintOf(digest),
-                                         tx::LockMode::kExclusive)
+                                         tx::LockMode::kExclusive,
+                                         lavik::storage::RedisSlot(key))
                                    : tx::TxShard::Guard{};
   if (acquire_key_lock && trace != nullptr) {
     trace->key_lock_acquired_ns_ = SetTraceNowNanos();
@@ -255,7 +256,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpiration(
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await UpdateExpirationLocked(db_id, key, digest, expire_at_ms,
                                             condition, nullptr, replication,
                                             mutation_precondition);
@@ -357,7 +359,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::Delete(
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await DeleteLocked(db_id, key, digest, nullptr, replication,
                                   mutation_precondition);
 }
@@ -422,7 +425,8 @@ Task<absl::StatusOr<RestoreRawResult>> StorageEngine::Impl::RestoreRawValue(
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await RestoreRawValueLocked(db_id, key, digest, value, replace,
                                            nullptr, replication,
                                            mutation_precondition);
@@ -1018,6 +1022,12 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
   WorkerStore& store = CurrentStore();
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  std::vector<RecordIndex::WriteGuard> index_writes;
+  index_writes.reserve(store.partition_indexes_.size());
+  for (auto& index : store.partition_indexes_)
+    index_writes.push_back(index.CloseAllReaders());
+  for (auto& guard : index_writes)
+    while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
   auto found = store.tx_undo_.find(txid);
   if (found == store.tx_undo_.end()) {
     co_return absl::OkStatus();
@@ -1731,7 +1741,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
     // and explicit pin keep allocation identity stable while this coroutine
     // exclusively owns the buffer/cursor. Only private bytes and device IO
     // are touched outside store state; body-before-header durability is intact.
-    ++state.pins_;
+    state.PinLocal();
     auto write_extent = [&]() -> Task<absl::Status> {
       LAVIK_FAULT_INJECT(if (extent_index == 0) {
         const auto paused = co_await PauseGroupedWriteForTest(
@@ -1858,8 +1868,8 @@ StorageEngine::Impl::WriteExtentValueLocked(
     // allocate the IO coroutine frame. No destructor attempts an async lock.
     co_await store.store_state_mutex_.Lock();
     assert(state.allocation_epoch_ == reserved->allocation_epoch_ &&
-           state.pins_ != 0);
-    --state.pins_;
+           state.pin_count() != 0);
+    UnpinBlock(store, state, reserved->block_id_);
     release_buffer();
     if (exception) {
       reclaim_allocated();
@@ -2920,11 +2930,18 @@ acquire_active_stream:
   // can replace this key, or FLUSHDB/replica reset can replace its index,
   // during that gap. Capture and validate the current physical record only
   // after the append stream is locked again and an active block is available.
+  RecordIndex::WriteGuard index_write;
+  if (index_ptr != nullptr) {
+    index_write =
+        co_await AwaitIndexWrite(*store.worker_, *index_ptr, request.digest_);
+  }
   RecordIndex::Entry* previous_entry = nullptr;
   if (index_ptr != nullptr) {
     previous_entry = index_ptr->Find(request.digest_, request.key_);
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
+      index_write.Reset();
+      index_write = co_await AwaitAllIndexReaders(*store.worker_, *index_ptr);
       auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
                                                  request.digest_, request.key_);
       if (!resolved.ok()) {
@@ -3043,6 +3060,19 @@ acquire_active_stream:
   if (!active_stream().has_value() ||
       active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
     goto acquire_active_stream;
+  }
+  // Earlier captures may have yielded and changed shared overflow capacity.
+  // If admission must widen, close it now and retry from stable identities
+  // after draining; no bytes or entry mutations have been published yet.
+  RecordIndex::WriteGuard structural_index_write;
+  if (index_ptr != nullptr && previous_entry == nullptr &&
+      index_ptr->NeedsStructuralWrite(request.digest_)) {
+    structural_index_write = index_ptr->CloseAllReaders();
+    if (!structural_index_write.ready()) {
+      while (!structural_index_write.ready())
+        co_await tx::CurrentTxShard().WaitForReaders();
+      goto acquire_active_stream;
+    }
   }
   const bool has_index_extra = request.expire_at_ms_ != 0;
   const bool needs_index_allocation =

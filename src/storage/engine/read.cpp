@@ -226,6 +226,88 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
   co_return std::optional<std::string>{};
 }
 
+Task<std::optional<absl::StatusOr<DiskValue>>>
+StorageEngine::Impl::TryRemoteGet(std::uint8_t db_id, std::string_view key,
+                                  std::uint16_t slot) {
+  const unsigned owner = slot % worker_count_;
+  auto& local = CurrentStore();
+  if (owner == local.worker_->id() || db_id >= options_.database_count_ ||
+      replica_loading_.load(std::memory_order_acquire) ||
+      replica_recovery_fenced_.load(std::memory_order_acquire) ||
+      request_serving_fenced_until_restart_.load(std::memory_order_acquire))
+    co_return std::nullopt;
+  auto& source = *stores_[owner];
+  if (!source.remote_reads_ready_.load(std::memory_order_acquire))
+    co_return std::nullopt;
+  const auto generation =
+      source.remote_population_generation_.load(std::memory_order_acquire);
+  if (generation & 1) co_return std::nullopt;
+  const auto db_epoch = DbEpoch(db_id);
+  const auto replication_epoch =
+      remote_replication_epochs_[slot].load(std::memory_order_acquire);
+  const auto current = [&] {
+    return source.remote_population_generation_.load(
+               std::memory_order_acquire) == generation &&
+           DbEpoch(db_id) == db_epoch &&
+           remote_replication_epochs_[slot].load(std::memory_order_acquire) ==
+               replication_epoch &&
+           !replica_loading_.load(std::memory_order_acquire) &&
+           !replica_recovery_fenced_.load(std::memory_order_acquire) &&
+           !request_serving_fenced_until_restart_.load(
+               std::memory_order_acquire);
+  };
+  const auto digest = ComputeDigest(key);
+  auto& index = PartitionFor(source, slot).indexes_[db_id];
+  auto reader = index.TryRead(digest);
+  if (!reader) co_return std::nullopt;
+  const auto* entry = std::as_const(index).Find(digest, key);
+  if (!current()) co_return std::nullopt;
+  if (entry && !entry->key_complete()) co_return std::nullopt;
+  if (entry == nullptr || entry->value_.kind() == RecordKind::kTombstone) {
+    co_return std::optional<absl::StatusOr<DiskValue>>(
+        absl::NotFoundError("key not found"));
+  }
+  // Cold representations and expiration retain the complete owner state
+  // machine (including expiry scheduling and indirect-key collision checks).
+  if (!entry->key_complete() || entry->value_.grouped() ||
+      entry->value_.external() || entry->value_.in_memory() ||
+      entry->value_.value_type() != ValueType::kString || IsExpiredNow(*entry))
+    co_return std::nullopt;
+  const RecordLocation location = MaterializeIndexLocation(*entry);
+  if (location.block_owner() != owner) co_return std::nullopt;
+  // io_uring opens every configured file on every worker. Only SPDK builds
+  // the controller-specific qpair owner directory.
+  if (bycorf::SpdkStorageEnabled()) {
+    const auto device = DeviceIndexForBlock(location.block_id());
+    if (!std::binary_search(device_owners_[device].begin(),
+                            device_owners_[device].end(),
+                            static_cast<std::uint16_t>(local.worker_->id())))
+      co_return std::nullopt;
+  }
+  auto& block = BlockStateAt(location.block_id());
+  if (!block.TryRemotePin()) co_return std::nullopt;
+  struct Pin {
+    Impl* engine;
+    BlockState& block;
+    unsigned owner;
+    std::uint64_t block_id;
+    ~Pin() { engine->UnpinRemoteBlock(block, owner, block_id); }
+  } pin{this, block, owner, location.block_id()};
+  if (block.owner_.load(std::memory_order_acquire) != owner ||
+      block.allocation_epoch_ != location.allocation_epoch() || !current())
+    co_return std::nullopt;
+  // The only index-to-I/O handoff: no suspension or borrowed entry survives it.
+  reader.Reset();
+  auto loaded = co_await LoadValueLocal(
+      local, db_id, key, location, replication_epoch, nullptr, db_epoch, true);
+  if (!current() || (!loaded.ok() && absl::IsAborted(loaded.status())))
+    co_return std::nullopt;
+  if (!loaded.ok())
+    co_return std::optional<absl::StatusOr<DiskValue>>(loaded.status());
+  co_return std::optional<absl::StatusOr<DiskValue>>(
+      EncodeDiskValue(std::move(*loaded)));
+}
+
 // Keep optimistic-read admission out of the already large command dispatcher.
 // LTO otherwise duplicates this wrapper and expands unrelated command cases,
 // increasing their instruction-cache footprint even though only GET uses it.
@@ -257,7 +339,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
   tx::TxShard::Guard key_lock;
   if (acquire_key_lock) {
     key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+        lavik::storage::RedisSlot(key));
   }
   WorkerStore& store = CurrentStore();
   auto& partition = routed_partition_id.has_value()
@@ -271,7 +354,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
         // Verifying an out-of-index key suspends before we know this is the
         // requested key, so there is no lock-free linearization point yet.
         key_lock = co_await tx::CurrentTxShard().AcquireKey(
-            db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+            db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+            lavik::storage::RedisSlot(key));
         optimistic_read = false;
         continue;
       }
@@ -316,7 +400,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       // retire its physical record before the I/O path pins it. Do not turn
       // that race into a spurious nil; take the original lock path and reread.
       key_lock = co_await tx::CurrentTxShard().AcquireKey(
-          db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+          db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+          lavik::storage::RedisSlot(key));
       optimistic_read = false;
       continue;
     }
@@ -404,17 +489,15 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
           lease_(std::move(lease)),
           record_headroom_(record_headroom),
           read_bytes_(read_bytes) {
-      ++state_->pins_;
+      state_->PinLocal();
     }
 
     PendingRead(const PendingRead&) = delete;
     PendingRead& operator=(const PendingRead&) = delete;
 
     ~PendingRead() {
-      --state_->pins_;
-      if (state_->pins_ == 0 && state_->release_pending_) {
-        StorageEngine::Impl::ReleaseStagingBuffer(*store_, *state_);
-      }
+      store_->engine_->UnpinBlock(*store_, *state_,
+                                  candidate_.location_.block_id());
     }
 
     WorkerStore* store_ = nullptr;
@@ -597,7 +680,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLength(
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await StringLengthLocked(db_id, key, digest);
 }
 
@@ -649,7 +733,8 @@ Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadata(
     co_return absl::InvalidArgumentError("invalid logical database");
   const auto digest = ComputeDigest(key);
   auto hold = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await ReadKeyMetadataLocked(db_id, key, digest);
 }
 
@@ -693,7 +778,8 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpiration(std::uint8_t db_id,
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await GetExpirationLocked(db_id, key, digest);
 }
 
@@ -782,7 +868,8 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValue(
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await ReadRawValueLocked(db_id, key, digest);
 }
 
@@ -810,7 +897,8 @@ Task<bool> StorageEngine::Impl::Exists(std::uint8_t db_id,
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_return co_await ExistsLocked(db_id, key, digest);
 }
 
@@ -1030,7 +1118,7 @@ StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
     ready_ = absl::AbortedError("stale or missing external extent");
     return;
   }
-  ++state->pins_;
+  state->PinLocal();
   pinned_ = state;
   read_bytes_ = AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
   buffer_wait_.emplace(&store.buffers_, read_bytes_);
@@ -1038,7 +1126,7 @@ StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
 }
 
 StorageEngine::Impl::ReadExtentAwaitable::~ReadExtentAwaitable() {
-  if (pinned_) --pinned_->pins_;
+  if (pinned_) engine_.UnpinBlock(store_, *pinned_, ref_.block_id_);
 }
 
 void StorageEngine::Impl::ReadExtentAwaitable::FinishBufferWait() {
@@ -1335,9 +1423,10 @@ StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValue(
 StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValueLocal(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch) {
+    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
+    bool remotely_pinned) {
   return LoadValueAwaitable(*this, store, db_id, key, location,
-                            replication_epoch, trace, expected_db_epoch);
+                            replication_epoch, trace, expected_db_epoch, remotely_pinned);
 }
 
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
@@ -1374,7 +1463,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch)
+    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
+    bool remotely_pinned)
     : engine_(engine),
       store_(store),
       key_(key),
@@ -1382,6 +1472,7 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       trace_(trace),
       replication_epoch_(replication_epoch),
       expected_db_epoch_(expected_db_epoch),
+      remotely_pinned_(remotely_pinned),
       db_id_(db_id) {
   PrepareLocal();
 }
@@ -1391,9 +1482,7 @@ StorageEngine::Impl::LoadValueAwaitable::~LoadValueAwaitable() { Unpin(); }
 void StorageEngine::Impl::LoadValueAwaitable::Unpin() {
   auto* state = std::exchange(pinned_, nullptr);
   if (!state) return;
-  --state->pins_;
-  if (state->pins_ == 0 && state->release_pending_)
-    ReleaseStagingBuffer(store_, *state);
+  engine_.UnpinBlock(store_, *state, location_.block_id());
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
@@ -1437,13 +1526,13 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   // Resolve staging memory only after acquiring the buffer: waiting can let
   // flush/defrag retire it. The staged copy itself never suspends, so only
   // disk I/O needs a physical pin.
-  auto* state = engine_.FindBlockState(store_, location_.block_id());
-  if (!state || !state->allocated_ || state->freeing_ ||
-      state->allocation_epoch_ != location_.allocation_epoch()) {
+  auto* state = remotely_pinned_ ? nullptr : engine_.FindBlockState(store_, location_.block_id());
+  if (!remotely_pinned_ && (!state || !state->allocated_ || state->freeing_ ||
+      state->allocation_epoch_ != location_.allocation_epoch())) {
     ready_.emplace(absl::AbortedError("stale index block epoch"));
     return;
   }
-  if (location_.in_memory() && state->in_memory_) [[unlikely]] {
+  if (!remotely_pinned_ && location_.in_memory() && state->in_memory_) [[unlikely]] {
     auto buffer = engine_.StagingBufferFor(store_, *state);
     if (!buffer.data_ ||
         location_.record_offset() + location_.total_disk_bytes() >
@@ -1468,7 +1557,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
         "record exceeds registered read buffer capacity"));
     return;
   }
-  ++state->pins_;
+  if (state) state->PinLocal();
   pinned_ = state;
   if (trace_) trace_->disk_read_ = true;
 }

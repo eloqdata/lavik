@@ -441,6 +441,8 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store,
         if (!TombRaiderRoundValid(round, &store)) {
           co_return absl::OkStatus();  // forfeit the round
         }
+        auto index_write = co_await AwaitAllIndexReaders(*store.worker_, index);
+        if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
           if (entry.value_.kind() == RecordKind::kTombstone ||
               (entry.value_.kind() == RecordKind::kValue &&
@@ -448,6 +450,7 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store,
             entry.value_.set_unclaimed(true);
           }
         });
+        index_write.Reset();
         if (++steps % 256 == 0) {
           co_await bycorf::Yield(*store.worker_);
         }
@@ -466,6 +469,10 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
     }
     auto& partition = PartitionForKey(store, claim.key_);
     if (partition.replication_epoch_ == claim.replication_epoch_) {
+      auto index_write = co_await AwaitIndexValueWrite(
+          *store.worker_, partition.indexes_[claim.db_id_],
+          claim.digest_.value_);
+      if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[claim.db_id_], claim.digest_, claim.key_);
 #if LAVIK_FAULTS_ENABLED
@@ -871,6 +878,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
         if (!TombRaiderRoundValid(round, &store)) {
           co_return absl::OkStatus();
         }
+        auto index_write = co_await AwaitAllIndexReaders(*store.worker_, index);
+        if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
         cursor = index.Scan(cursor, [&](RecordIndex::Entry& entry) {
           if (!entry.value_.unclaimed()) {
             return;
@@ -897,6 +906,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
             });
           }
         });
+        index_write.Reset();
         if (++steps % 256 == 0) {
           co_await bycorf::Yield(*store.worker_);
         }
@@ -947,12 +957,16 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         candidate.db_id_, tx::FingerprintOf(candidate.digest_),
-        tx::LockMode::kExclusive);
+        tx::LockMode::kExclusive, lavik::storage::RedisSlot(candidate.key_));
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
     co_await store.store_state_mutex_.Lock();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
     auto& partition = PartitionForKey(store, candidate.key_);
+    auto index_write = co_await AwaitIndexWrite(
+        *store.worker_, partition.indexes_[candidate.db_id_],
+        candidate.digest_);
+    if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
     auto resolved =
         co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                    candidate.digest_, candidate.key_);

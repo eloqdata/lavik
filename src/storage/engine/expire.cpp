@@ -336,7 +336,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   auto& partition = PartitionFor(store, candidate.partition_id_);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       candidate.db_id_, tx::FingerprintOf(candidate.digest_),
-      tx::LockMode::kExclusive);
+      tx::LockMode::kExclusive, lavik::storage::RedisSlot(candidate.key_));
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   auto resolved =
@@ -385,6 +385,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   // Append may release store_state_mutex_ while acquiring space or pinning
   // transaction dependencies. The key hold excludes logical writes, but GC
   // may replace the index entry and the group's physical coordinates.
+  auto index_write = co_await AwaitIndexWrite(
+      *store.worker_, partition.indexes_[candidate.db_id_], candidate.digest_);
   resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                  candidate.digest_, candidate.key_);

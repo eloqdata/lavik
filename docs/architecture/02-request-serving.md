@@ -198,6 +198,9 @@ owner routing.
 The selected database is request data, never ambient worker state. Storage
 chooses an owner from the key's Redis hash-slot partition. Commands with one
 owner can execute locally or through one Bycorf cross-worker submission.
+Eligible standalone disk GETs first try an admitted index snapshot and physical
+read on the connection worker; contention or unsupported storage representations
+fall back to owner dispatch. Transaction callbacks retain owner routing.
 Commands needing atomic access to several keys build a `tx::Transaction` and
 execute one or more shard callbacks. Global commands explicitly collect from or
 coordinate all workers.

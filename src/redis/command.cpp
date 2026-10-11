@@ -3653,7 +3653,8 @@ Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
     const std::shared_ptr<NegativeRandomStreamState>& state) {
   auto begin = [state]() -> Task<absl::StatusOr<std::uint64_t>> {
     tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
-        state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared);
+        state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared,
+        lavik::storage::RedisSlot(state->key_));
     storage::HashOperation operation;
     operation.kind_ = state->options_.hash_ && state->options_.with_values_
                           ? storage::HashOperationKind::kGetAll
@@ -4154,7 +4155,8 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
   tx::TxShard::Guard guard;
   if (!locked)
     guard = co_await tx::CurrentTxShard().AcquireKey(
-        db, tx::FingerprintOf(digest), tx::LockMode::kShared);
+        db, tx::FingerprintOf(digest), tx::LockMode::kShared,
+        lavik::storage::RedisSlot(key));
   auto value = co_await g_storage->ReadValueForTransferLocked(db, key, digest);
   guard = {};
   if (!value.ok()) co_return value.status();
@@ -5807,7 +5809,8 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
     transaction.AddKey(ShardForKey(args[argument]), request.db_id_,
                        storage::ComputeDigest(args[argument]),
                        static_cast<std::uint32_t>(argument),
-                       tx::LockMode::kExclusive);
+                       tx::LockMode::kExclusive,
+                       storage::RedisSlot(args[argument]));
   }
   transaction.Seal();
   ClusterShardValidatorContext cluster_validator;
@@ -6000,10 +6003,11 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
 
   tx::Transaction transaction;
   transaction.AddKey(ShardForKey(args[1]), request.db_id_,
-                     storage::ComputeDigest(args[1]), 1, tx::LockMode::kShared);
+                     storage::ComputeDigest(args[1]), 1, tx::LockMode::kShared,
+                     storage::RedisSlot(args[1]));
   transaction.AddKey(ShardForKey(args[2]), options->destination_db_,
                      storage::ComputeDigest(args[2]), 2,
-                     tx::LockMode::kExclusive);
+                     tx::LockMode::kExclusive, storage::RedisSlot(args[2]));
   transaction.Seal();
   ClusterShardValidatorContext cluster_validator;
   InstallClusterShardValidator(transaction, request, cluster_validator);
@@ -6114,7 +6118,8 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
     transaction.AddKey(ShardForKey(args[argument]), request.db_id_,
                        storage::ComputeDigest(args[argument]),
                        static_cast<std::uint32_t>(argument),
-                       tx::LockMode::kExclusive);
+                       tx::LockMode::kExclusive,
+                       storage::RedisSlot(args[argument]));
   }
   transaction.Seal();
   ClusterShardValidatorContext cluster_validator;
@@ -6272,7 +6277,8 @@ Task<CommandReply> ExecuteMultiKey(
   for (std::size_t i = keys->first_; i <= keys->last_; i += keys->step_) {
     txn.AddKey(ShardForKey(args[i]), request.db_id_,
                storage::ComputeDigest(args[i]), static_cast<std::uint32_t>(i),
-               write ? tx::LockMode::kExclusive : tx::LockMode::kShared);
+               write ? tx::LockMode::kExclusive : tx::LockMode::kShared,
+               storage::RedisSlot(args[i]));
   }
   txn.Seal();
   ClusterShardValidatorContext cluster_validator;
@@ -8318,7 +8324,8 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
       transaction->AddKey(
           ShardForKey(key), request.db_id_, storage::ComputeDigest(key),
           static_cast<std::uint32_t>(i),
-          read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+          read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+          storage::RedisSlot(key));
     }
     transaction->Seal();
     if (!read_only) {
@@ -10318,9 +10325,11 @@ Task<CommandReply> ExecuteExecBody(
       }
     } else {
       tx::Transaction txn;
-      for (const auto& keys : cmd_keys) {
-        for (const ExecKey& key : keys) {
-          txn.AddKey(key.owner_, key.db_, key.digest_, key.arg_, key.mode_);
+      for (std::size_t command_index = 0; command_index < cmd_keys.size();
+           ++command_index) {
+        for (const ExecKey& key : cmd_keys[command_index]) {
+          txn.AddKey(key.owner_, key.db_, key.digest_, key.arg_, key.mode_,
+                     storage::RedisSlot(queued[command_index].args_[key.arg_]));
         }
       }
       for (const auto& watched : ctx.watched_) {
@@ -10335,7 +10344,7 @@ Task<CommandReply> ExecuteExecBody(
         }
         if (!covered) {
           txn.AddKey(watched.owner_, watched.db_, watched.digest_, 0,
-                     tx::LockMode::kShared);
+                     tx::LockMode::kShared, storage::RedisSlot(watched.key_));
         }
       }
       txn.Seal();
@@ -13107,6 +13116,27 @@ Task<CommandReply> ExecuteCommandBody(
         const unsigned target =
             routed ? request.RoutedPartitionId() % g_storage->worker_count()
                    : ShardForKey(args[1]);
+        if (request.kind_ == CommandKind::kGet && args.size() == 2 &&
+            target != ThisWorker().id_) {
+          auto fast = co_await g_storage->TryRemoteGet(
+              request.db_id_, args[1],
+              routed ? request.RoutedPartitionId()
+                     : storage::RedisSlot(args[1]));
+          if (fast) {
+            if (const char* error = CommandServingGenerationError(request);
+                error)
+              co_return BuiltReply(reply_builder.AppendError(error));
+            CommandReply reply;
+            if (fast->ok())
+              reply.disk_value_ = std::move(**fast);
+            else if (absl::IsNotFound(fast->status()))
+              reply.encoded_ = reply_builder.AppendNull();
+            else
+              reply.encoded_ =
+                  AppendStorageError(reply_builder, fast->status());
+            co_return reply;
+          }
+        }
 #if LAVIK_ENABLE_TRACE
         if (request.kind_ == CommandKind::kGet) {
           ReadLatencyTrace trace;

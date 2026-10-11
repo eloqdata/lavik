@@ -88,12 +88,12 @@ Every worker has one ordinary and one transaction append stream. Physical
 streams are per worker, not per logical partition, so active 8 MiB staging
 buffers scale with workers rather than with 16,384 slots. A worker also owns the
 `BlockState` objects assigned to it, including committed and live byte counts,
-pins, staging identity, flush state, and defrag state. The runtime owner and
-allocation epoch form immutable identity after publication and are the only
-fields a key-index owner may read directly. The owner is published atomically
-after epoch initialization, so an acquire owner read makes the immutable epoch
-visible without an extra worker hop. Other state remains owner-local and other
-workers use Bycorf cross-core submissions to read or mutate it.
+staging identity, flush state, and defrag state. Runtime owner and allocation
+epoch form immutable identity after publication. A shared atomic pin word
+protects physical lifetime and closes admission to connection-worker reads
+while maintenance owns the block. The owner is published atomically after
+epoch initialization. Other mutable block fields remain owner-local; remote
+workers submit accounting and maintenance work to that owner.
 
 Append-stream creation and rollover are single-flight within each stream. A
 writer may release owner-local store state while physical allocation waits,
@@ -526,14 +526,28 @@ demand-allocated. The directory stays at one address and publishes page layout
 atomically. Handle-to-address resolution can run concurrently with owner-side
 allocation when the caller protects the resolved entry and arena lifetimes;
 it does not pin entries or make the hash tables safe for concurrent access.
-Allocator mutation and index access remain owner-local. Private auxiliary
-arenas retain incremental directory allocation and owner-only access.
+Allocator mutation remains owner-local. Private auxiliary arenas retain
+incremental directory allocation and owner-only access.
 Each primary key index reserves 32 cache-line-isolated atomic read-admission
 states, including while empty. Its bucket arrays remain demand-allocated,
 start at 32 buckets, and never shrink below 32 while nonempty; checkpoint
-recovery applies the same floor. The states remain closed and do not yet admit
-remote index readers. Grouped-object and auxiliary maps retain their existing
-owner-only layout and bucket sizing.
+recovery applies the same floor. Reader admission is explicitly enabled only
+for a published map with a fixed arena directory and an externally protected
+map lifetime. A remote reader registers atomically in the low-hash stripe,
+performs only const lookup, and releases its guard before suspending. Writers
+close the affected stripe and suspend their owner coroutine until existing
+readers drain, then resolve entry identities again before mutation. The last
+reader of a closed stripe notifies the owner; transaction arbitration and
+structural writers recheck readiness there.
+Shared overflow-directory growth and population replacement close all stripes.
+Resizing closes admission before changing table layout, defers behind existing
+readers, and stays closed through the final table switch and old-table release.
+Owner lookups and periodic maintenance retry deferred resizing; nesting keeps
+resize completion from reopening another writer's scope. Recovery and detached
+populations remain private, and grouped-object and auxiliary maps retain their
+owner-only layout and bucket sizing. Transaction intents retain stripe closure
+through queued and executing work, so a remote index snapshot cannot observe
+an intermediate multi-key mutation.
 A population detached by `FLUSHDB`, a replica reset, or a replica abort retains
 ownership of that arena until reclamation finishes. Replica promotion and
 abort reuse the same worker-local detached-index drain as synchronous database
@@ -648,7 +662,27 @@ need a staging buffer to commit.
 
 ### Reads and pins
 
-An ordinary single-key GET may resolve its complete inline-key index entry
+A standalone GET can read directly on its connection worker after ordinary
+request, database and serving-generation admission. It takes a short index
+reader guard on the key owner, snapshots a complete-key plain String location,
+then pins the block and validates its allocation identity before dropping the
+index guard. Only durable, non-grouped, non-external records whose block owner
+is also their key owner qualify, and the connection worker must have device
+I/O access. Closed index/block admission, unsupported representations, expired
+entries, and concurrent admission contention return to the normal owner route.
+Index misses use the same transaction and population admission checks.
+
+The index snapshot orders the GET before a subsequently admitted writer. The
+block pin survives I/O and cancellation cleanup, so writes can append and retire
+old live-byte accounting while the read finishes. Defrag closes remote pin
+admission before inspecting the count; the last pin on a pending block asks its
+owner to reconsider reclamation. Local fallback reads retain their existing pin
+rules. Database/replication epoch and population-generation changes invalidate
+an in-flight fast read. Worker shutdown drains I/O and destroys suspended frames
+on all workers before destroying any remotely referenced index, arena or block
+state.
+
+An owner-local ordinary single-key GET may resolve its complete inline-key index entry
 without registering a shared transaction lock when that logical database's
 lock table is empty. The empty-table observation and index lookup do not
 suspend, so the lookup is the read's linearization point. A multi-shard writer

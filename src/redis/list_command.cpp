@@ -733,7 +733,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   for (std::size_t arg : key_args) {
     txn.AddKey(ShardForKey(args[arg]), request.db_id_,
                storage::ComputeDigest(args[arg]),
-               static_cast<std::uint32_t>(arg), tx::LockMode::kExclusive);
+               static_cast<std::uint32_t>(arg), tx::LockMode::kExclusive,
+               storage::RedisSlot(args[arg]));
   }
   txn.Seal();
   ClusterShardValidatorContext cluster_validator;

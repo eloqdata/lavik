@@ -74,6 +74,15 @@ has two counter layers:
 - holds cover callbacks that are currently executing or suspended and tell the
   queue when a conflicting predecessor has actually drained.
 
+Storage binds admission hooks to each shard. Recording a key intent closes its
+index reader stripe before hold acquisition, and releasing or cancelling that
+intent releases the closure. Closures nest across keys sharing a stripe and
+structural index writers. Existing remote index readers must drain before the
+callback takes its holds; the same ordered and bypass queues handle this wait.
+The last reader of a closed stripe sends a worker notification that repolls
+eligibility rather than resuming all transaction frames. An already pinned disk
+read holds no index reader registration, so it does not delay a later writer.
+
 The queue contains both plain acquisition waiters and persistent transaction
 entries. It is sorted by scheduling id. Plain waiters are removed before their
 coroutine resumes; transaction entries retain their position until a releasing
@@ -86,9 +95,9 @@ reaches the front.
    allocating a scheduling id because only one owner participates.
 2. `Execute` submits to that owner and acquires the deduplicated key set through
    `TxShard::AcquireKeys` if the transaction does not already retain a guard.
-3. Acquisition records every intent. If all intents are immediately compatible,
+3. Acquisition records every intent. If all intents are immediately compatible and index readers have drained,
    it acquires holds and continues without touching the global id counter or
-   shard queue. If any intent conflicts, the awaiter keeps all recorded intents,
+   shard queue. If an intent conflicts or readers remain, the awaiter keeps all recorded intents,
    allocates an id, inserts a plain waiter, and suspends until it is the
    hold-compatible queue head.
 4. The shard entry hook runs once, then the callback runs. A releasing execution

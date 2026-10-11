@@ -70,7 +70,7 @@ Task<absl::Status> StorageEngine::Impl::PinFullSyncExtents(
           state->allocation_epoch_ != ref.allocation_epoch_) {
         co_return absl::AbortedError("stale full-sync value extent");
       }
-      ++state->pins_;
+      state->PinLocal();
       co_return absl::OkStatus();
     };
     absl::Status status;
@@ -104,8 +104,8 @@ Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
       BlockState* state = FindBlockState(extent_store, ref.block_id_);
       if (state != nullptr && state->allocated_ &&
           state->allocation_epoch_ == ref.allocation_epoch_ &&
-          state->pins_ != 0) {
-        --state->pins_;
+          state->pin_count() != 0) {
+        UnpinBlock(extent_store, *state, ref.block_id_);
       }
       co_return absl::OkStatus();
     };
@@ -177,7 +177,8 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
   {
     const Digest digest = ComputeDigest(*key);
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+        lavik::storage::RedisSlot(*key));
     const std::string& coverage_key = *key;
     auto capture = partition.fullsync_subscribers_.find(session_id);
     const auto active_session = store.fullsync_sessions_.find(session_id);
@@ -346,7 +347,8 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
     std::uint64_t session_id, const SnapshotRecord& requested) {
   const Digest digest = ComputeDigest(requested.key_);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      requested.db_id_, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      requested.db_id_, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(requested.key_));
   auto& index = partition.indexes_[requested.db_id_];
   auto resolved =
       co_await FindVerifiedEntry(store, index, digest, requested.key_);
@@ -1381,6 +1383,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
     std::uint64_t persisted_replication_epoch, bool replica_lock_held) {
   WorkerStore& store = CurrentStore();
+  WorkerStore::PopulationReadFence population_fence(store);
   std::unique_ptr<UnlockGuard> replica_unlock;
   if (!replica_lock_held) {
     co_await store.replica_apply_mutex_.Lock();
@@ -1457,6 +1460,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   }
   tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
   partition.replication_epoch_ = next_epoch;
+  remote_replication_epochs_[partition_id].store(next_epoch,
+                                                 std::memory_order_release);
   partition.mutation_sequence_ = 0;
   for (auto& [session_id, capture] : partition.fullsync_subscribers_) {
     ClearFullSyncCapture(store, session_id, capture);
@@ -1491,6 +1496,7 @@ StorageEngine::Impl::ResetReplicaPartitions(
                            "replica reset batch is empty");
   }
   WorkerStore& store = CurrentStore();
+  WorkerStore::PopulationReadFence population_fence(store);
   co_await store.replica_apply_mutex_.Lock();
   UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
   std::array<bool, kLogicalStorageShards> seen{};
@@ -1571,6 +1577,8 @@ StorageEngine::Impl::ResetReplicaPartitions(
     sync->local_db_epochs_ = local_db_epochs;
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
+      auto index_write = co_await AwaitAllIndexReaders(
+          *store.worker_, partition.indexes_[db_id]);
       QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                          &partition.grouped_objects_[db_id]);
       partition.fullsync_coverage_bytes_[db_id] = 0;
@@ -1585,6 +1593,8 @@ StorageEngine::Impl::ResetReplicaPartitions(
     }
     partition.replica_candidate_epoch_ = epoch_updates[index].second;
     partition.replication_epoch_ = epoch_updates[index].second;
+    remote_replication_epochs_[reset.partition_id_].store(
+        partition.replication_epoch_, std::memory_order_release);
     partition.mutation_sequence_ = 0;
     partition.replica_value_stage_.reset();
     partition.replica_sync_ = std::move(sync);
@@ -1645,6 +1655,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
     std::span<const std::uint16_t> partition_ids) {
   if (partition_ids.empty()) co_return absl::OkStatus();
   WorkerStore& store = CurrentStore();
+  WorkerStore::PopulationReadFence population_fence(store);
   co_await store.replica_apply_mutex_.Lock();
   UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
 
@@ -1678,6 +1689,8 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
     auto& partition = PartitionFor(store, partition_ids[i]);
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
+      auto index_write = co_await AwaitAllIndexReaders(
+          *store.worker_, partition.indexes_[db_id]);
       QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                          &partition.grouped_objects_[db_id]);
       partition.fullsync_coverage_bytes_[db_id] = 0;
@@ -1691,6 +1704,8 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
     }
     partition.replica_candidate_epoch_ = epoch_updates[i].second;
     partition.replication_epoch_ = epoch_updates[i].second;
+    remote_replication_epochs_[partition_ids[i]].store(
+        partition.replication_epoch_, std::memory_order_release);
     partition.mutation_sequence_ = 0;
     partition.replica_value_stage_.reset();
   }
@@ -1798,7 +1813,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReplicaCommandNeedsApply(
   }
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   auto& partition = PartitionFor(store, partition_id);
@@ -2031,7 +2047,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecordsLocked(
     const SnapshotRecord& applied = *effective;
     const Digest digest = ComputeDigest(applied.key_);
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        applied.db_id_, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+        applied.db_id_, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+        lavik::storage::RedisSlot(applied.key_));
     co_await store.store_state_mutex_.Lock();
     UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
     sync = partition.replica_sync_.get();
@@ -2384,6 +2401,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto discard = [this, target, session_id]() -> Task<absl::Status> {
       WorkerStore& store = *stores_[target];
+      WorkerStore::PopulationReadFence population_fence(store);
       {
         co_await store.replica_apply_mutex_.Lock();
         UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
@@ -2397,6 +2415,8 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
           for (std::uint8_t db_id = 0; db_id < options_.database_count_;
                ++db_id) {
             ++partition.grouped_generations_[db_id];
+            auto index_write = co_await AwaitAllIndexReaders(
+                *store.worker_, partition.indexes_[db_id]);
             QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                                &partition.grouped_objects_[db_id]);
             partition.fullsync_coverage_bytes_[db_id] = 0;

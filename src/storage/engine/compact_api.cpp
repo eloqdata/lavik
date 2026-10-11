@@ -63,7 +63,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
-      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await ExecuteCompactLocked(
       db_id, key, digest, value_type, read_only, callback, nullptr, now_ms,
       replication, false, mutation_precondition, std::move(access));

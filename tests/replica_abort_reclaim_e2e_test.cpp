@@ -751,6 +751,14 @@ class ReplicaAbortReclaimService final : public bycorf::Service {
         session_id, partition, db_id, 0, 1, 1,
         lavik::storage::kReplicationTransferBytes);
     if (!batch.ok()) co_return batch.status();
+    // A one-bucket scan may be empty: primary indexes retain the reader
+    // stripe floor even when this partition contains only one key.
+    while (batch->records_.empty() && batch->cursor_ != 0) {
+      batch = co_await storage_->SnapshotPartition(
+          session_id, partition, db_id, batch->cursor_, 1, 1,
+          lavik::storage::kReplicationTransferBytes);
+      if (!batch.ok()) co_return batch.status();
+    }
     if (batch->records_.size() != 1 || batch->records_.front().key_ != key ||
         batch->records_.front().source_id_ == 0) {
       co_return absl::FailedPreconditionError(

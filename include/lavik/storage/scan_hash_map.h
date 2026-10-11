@@ -103,6 +103,12 @@ class ScanHashMapEntryArena {
   // Private, owner-only arenas may omit this and retain incremental growth.
   bool PreallocateDirectory();
 
+  // Owner-only capability check before publishing concurrent arena users.
+  bool directory_preallocated() const noexcept {
+    return directory_capacity_ ==
+           static_cast<std::size_t>(maximum_page_id_) + 1;
+  }
+
   // Returns false only when this allocation would need a new page and every
   // encodable page ID is already live. Physical allocator failure is fatal.
   bool CanAllocate(std::size_t bytes) const noexcept;
@@ -827,33 +833,236 @@ struct ScanHashMapInlineEntryPolicy {
   }
 };
 
-// One cache line per stripe prevents unrelated buckets' readers from writing
-// the same line. The high bit closes admission; lower bits are reserved for
-// short-lived index readers. Storage starts closed: reserving these words does
-// not by itself make ScanHashMap operations safe for concurrent access.
+// Reader registration and closure share one word, so a writer cannot miss a
+// reader entering between its zero-count check and the first mutation.
 struct alignas(64) ScanHashMapReadState {
   static constexpr std::uint32_t kClosed = std::uint32_t{1} << 31;
   static constexpr std::uint32_t kReadersMask = kClosed - 1;
   std::atomic<std::uint32_t> state_{kClosed};
+  // Owner-only nesting includes suspended writer scopes. Releasing one scope
+  // must not reopen a stripe still closed by another writer or a resize.
+  std::uint32_t writers_ = 0;
+  // Immutable after reader admission is published.
+  void* notify_context_ = nullptr;
+  void (*notify_)(void*) noexcept = nullptr;
 };
 static_assert(sizeof(ScanHashMapReadState) == 64);
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 
-template <std::size_t Count>
-struct ScanHashMapReadStates {
-  std::array<ScanHashMapReadState, Count> stripes_{};
+class ScanHashMapReadGuard {
+ public:
+  ScanHashMapReadGuard() = default;
+  explicit ScanHashMapReadGuard(ScanHashMapReadState* state) : state_(state) {}
+  ScanHashMapReadGuard(const ScanHashMapReadGuard&) = delete;
+  ScanHashMapReadGuard& operator=(const ScanHashMapReadGuard&) = delete;
+  ScanHashMapReadGuard(ScanHashMapReadGuard&& other) noexcept
+      : state_(std::exchange(other.state_, nullptr)) {}
+  ScanHashMapReadGuard& operator=(ScanHashMapReadGuard&& other) noexcept {
+    Reset();
+    state_ = std::exchange(other.state_, nullptr);
+    return *this;
+  }
+  ~ScanHashMapReadGuard() { Reset(); }
+  explicit operator bool() const noexcept { return state_ != nullptr; }
+  void Reset() noexcept {
+    if (auto* state = std::exchange(state_, nullptr)) {
+      const auto notify = state->notify_;
+      void* context = state->notify_context_;
+      const auto old = state->state_.fetch_sub(1, std::memory_order_acq_rel);
+      assert((old & ScanHashMapReadState::kReadersMask) != 0);
+      if (old == (ScanHashMapReadState::kClosed | 1) && notify) notify(context);
+    }
+  }
+
+ private:
+  ScanHashMapReadState* state_ = nullptr;
 };
 
-// Owner-only maps retain their original footprint and alignment.
+template <std::size_t Count>
+struct ScanHashMapReadStates {
+  static_assert(Count > 0 && Count <= 64 && std::has_single_bit(Count));
+  static constexpr std::uint64_t kAll = ~std::uint64_t{0} >> (64 - Count);
+  static constexpr auto kClosed = ScanHashMapReadState::kClosed;
+  static constexpr auto kReadersMask = ScanHashMapReadState::kReadersMask;
+
+  class WriteGuard {
+   public:
+    WriteGuard() = default;
+    WriteGuard(ScanHashMapReadStates* states, std::uint64_t mask, bool all)
+        : states_(states), mask_(mask), all_(all) {
+      if (all_) ++states_->structural_writers_;
+      states_->PublishDisabled();
+      states_->Close(mask_);
+    }
+    WriteGuard(const WriteGuard&) = delete;
+    WriteGuard& operator=(const WriteGuard&) = delete;
+    WriteGuard(WriteGuard&& other) noexcept
+        : states_(std::exchange(other.states_, nullptr)),
+          mask_(other.mask_),
+          all_(other.all_) {}
+    WriteGuard& operator=(WriteGuard&& other) noexcept {
+      Reset();
+      states_ = std::exchange(other.states_, nullptr);
+      mask_ = other.mask_;
+      all_ = other.all_;
+      return *this;
+    }
+    ~WriteGuard() { Reset(); }
+    bool ready() const noexcept {
+      return states_ == nullptr || states_->Drained(mask_);
+    }
+    void Reset() noexcept {
+      if (auto* states = std::exchange(states_, nullptr)) {
+        if (all_) --states->structural_writers_;
+        states->Open(mask_);
+        states->PublishDisabled();
+      }
+    }
+
+   private:
+    ScanHashMapReadStates* states_ = nullptr;
+    std::uint64_t mask_ = 0;
+    bool all_ = false;
+  };
+
+  std::array<ScanHashMapReadState, Count> stripes_{};
+
+  ScanHashMapReadGuard TryRead(std::uint64_t hash) noexcept {
+    if (disabled_.load(std::memory_order_acquire)) return {};
+    auto& state = stripes_[hash & (Count - 1)].state_;
+    auto old = state.load(std::memory_order_relaxed);
+    if ((old & kClosed) != 0 || (old & kReadersMask) == kReadersMask) return {};
+    // One attempt: reader contention falls back rather than spinning on a
+    // connection worker. No table or entry may be touched before this CAS.
+    if (!state.compare_exchange_strong(old, old + 1, std::memory_order_acquire,
+                                       std::memory_order_relaxed))
+      return {};
+    return ScanHashMapReadGuard(&stripes_[hash & (Count - 1)]);
+  }
+  void CloseIntent(std::uint64_t hash) noexcept {
+    Close(std::uint64_t{1} << (hash & (Count - 1)));
+  }
+  void OpenIntent(std::uint64_t hash) noexcept {
+    Open(std::uint64_t{1} << (hash & (Count - 1)));
+  }
+  bool IntentReady(std::uint64_t hash) const noexcept {
+    return Drained(std::uint64_t{1} << (hash & (Count - 1)));
+  }
+  void SetNotifier(void* context, void (*notify)(void*) noexcept) {
+    assert(!enabled_);
+    for (auto& stripe : stripes_) {
+      stripe.notify_context_ = context;
+      stripe.notify_ = notify;
+    }
+  }
+  WriteGuard Write(std::uint64_t hash) noexcept {
+    if (!enabled_) return {};
+    return WriteGuard(this, std::uint64_t{1} << (hash & (Count - 1)), false);
+  }
+  WriteGuard WriteAll() noexcept {
+    if (!enabled_) return {};
+    return WriteGuard(this, kAll, true);
+  }
+  // Enable only on a published, lifetime-protected map and a fixed arena.
+  // Initial recovery and detached populations remain owner-only.
+  void Enable() noexcept {
+    assert(!enabled_ && Drained(kAll));
+    enabled_ = true;
+    for (auto& stripe : stripes_) {
+      if (stripe.writers_ == 0)
+        stripe.state_.fetch_and(~kClosed, std::memory_order_release);
+    }
+    PublishDisabled();
+  }
+  void SetPopulated(bool populated) noexcept {
+    populated_ = populated;
+    PublishDisabled();
+  }
+  void BlockResize() noexcept {
+    if (resize_blocked_) return;
+    resize_blocked_ = true;
+    ++structural_writers_;
+    PublishDisabled();
+    Close(kAll);
+  }
+  void EndResize() noexcept {
+    if (!resize_blocked_) return;
+    resize_blocked_ = false;
+    --structural_writers_;
+    Open(kAll);
+    PublishDisabled();
+  }
+  bool Drained(std::uint64_t mask = kAll) const noexcept {
+    while (mask != 0) {
+      const auto index = std::countr_zero(mask);
+      if ((stripes_[index].state_.load(std::memory_order_acquire) &
+           kReadersMask) != 0)
+        return false;
+      mask &= mask - 1;
+    }
+    return true;
+  }
+
+ private:
+  void PublishDisabled() noexcept {
+    const bool disabled = !enabled_ || !populated_ || structural_writers_ != 0;
+    // Ordinary single-stripe writes must not invalidate the global probe's
+    // cache line. Only population/structural admission transitions publish it.
+    if (disabled != published_disabled_) {
+      disabled_.store(disabled, std::memory_order_release);
+      published_disabled_ = disabled;
+    }
+  }
+  void Close(std::uint64_t mask) noexcept {
+    while (mask != 0) {
+      auto& stripe = stripes_[std::countr_zero(mask)];
+      if (stripe.writers_++ == 0)
+        stripe.state_.fetch_or(kClosed, std::memory_order_acq_rel);
+      mask &= mask - 1;
+    }
+  }
+  void Open(std::uint64_t mask) noexcept {
+    while (mask != 0) {
+      auto& stripe = stripes_[std::countr_zero(mask)];
+      assert(stripe.writers_ != 0);
+      if (--stripe.writers_ == 0 && enabled_)
+        stripe.state_.fetch_and(~kClosed, std::memory_order_release);
+      mask &= mask - 1;
+    }
+  }
+  // Keep the global probe off the per-stripe reader/writer counter lines.
+  alignas(64) std::atomic<bool> disabled_{true};
+  bool enabled_ = false;
+  bool populated_ = false;
+  bool resize_blocked_ = false;
+  bool published_disabled_ = true;
+  unsigned structural_writers_ = 0;
+};
+
+// Owner-only maps retain their original footprint and alignment. Their write
+// guards compile to empty objects and perform no atomic operations.
 template <>
-struct ScanHashMapReadStates<0> {};
+struct ScanHashMapReadStates<0> {
+  struct WriteGuard {
+    bool ready() const noexcept { return true; }
+    void Reset() noexcept {}
+  };
+  WriteGuard Write(std::uint64_t) noexcept { return {}; }
+  WriteGuard WriteAll() noexcept { return {}; }
+  void SetPopulated(bool) noexcept {}
+  void BlockResize() noexcept {}
+  void EndResize() noexcept {}
+  bool Drained() const noexcept { return true; }
+};
 
 // Cached hashes retain the 32 address bits needed by the largest direct bucket
 // table. MaxBucketExponent is configurable so tests can exercise saturation
 // without allocating 2^32 buckets; production uses the full uint32_t range.
 // ReadStripeCount reserves optional fixed admission state and sets the minimum
 // nonempty table size so each bucket belongs to exactly one hash-selected
-// stripe. This is layout support only; callers still serialize all map access.
+// stripe. Mutations remain owner-only; remote readers use TryRead and const
+// lookup while holding the returned guard. Writers close and drain before
+// calling synchronous mutations; missed integration fails closed.
 template <typename Value,
           unsigned MaxBucketExponent =
               std::numeric_limits<std::uint32_t>::digits,
@@ -862,6 +1071,8 @@ template <typename Value,
 class ScanHashMap {
  public:
   using EntryHandle = ScanHashMapEntryArena::Handle;
+  using WriteGuard =
+      typename ScanHashMapReadStates<ReadStripeCount>::WriteGuard;
   // Digest arguments for inline keys must equal ComputeDigest(key). Entries do
   // not retain a bucket hash, so rehash and pointer-only mutation reconstruct
   // it from the live key. External entries retain the supplied digest tail.
@@ -1076,14 +1287,75 @@ class ScanHashMap {
 
   ~ScanHashMap() { Clear(); }
 
-  // Fixed-address state belongs to this map object, not its entry population;
-  // it is not transferred by move or Detach. All stripes remain closed until
-  // the storage layer integrates reader admission and every mutation path.
-  // Move, clear, detach, and destruction require quiescent readers.
-  auto& read_states() noexcept
+  // Admission belongs to the map object, not a detached entry population.
+  // The caller protects this object's lifetime before TryRead and through the
+  // guard's destruction. Read guards must not cross a coroutine suspension.
+  ScanHashMapReadGuard TryRead(const Digest& digest) noexcept
     requires(ReadStripeCount != 0)
   {
-    return read_states_.stripes_;
+    return read_states_.TryRead(Hash(digest));
+  }
+  // Recovery/private maps stay disabled. Enable only after fixing the arena
+  // directory and publishing a stable, externally protected map lifetime.
+  void EnableConcurrentReads() noexcept
+    requires(ReadStripeCount != 0)
+  {
+    assert(arena_ != nullptr && arena_->directory_preallocated());
+    read_states_.Enable();
+  }
+  // Owner-only transaction intent admission; paired through cancellation and
+  // final release, including time spent queued or suspended between hops.
+  void CloseReadIntent(std::uint64_t hash)
+    requires(ReadStripeCount != 0)
+  {
+    read_states_.CloseIntent(hash);
+  }
+  void ReleaseReadIntent(std::uint64_t hash)
+    requires(ReadStripeCount != 0)
+  {
+    read_states_.OpenIntent(hash);
+  }
+  bool ReadIntentReady(std::uint64_t hash) const
+    requires(ReadStripeCount != 0)
+  {
+    return read_states_.IntentReady(hash);
+  }
+  void SetReaderNotifier(void* context, void (*notify)(void*) noexcept)
+    requires(ReadStripeCount != 0)
+  {
+    read_states_.SetNotifier(context, notify);
+  }
+
+  // Owner-only. The guard closes admission immediately; ready() is polled by
+  // the caller's coroutine before it re-finds any entry or mutates the map.
+  // Potential insertions that allocate shared directory state need all stripes.
+  WriteGuard CloseForWrite(const Digest& digest) noexcept {
+    return NeedsStructuralWrite(digest) ? read_states_.WriteAll()
+                                        : read_states_.Write(Hash(digest));
+  }
+  WriteGuard CloseForValueUpdate(std::uint64_t hash) noexcept {
+    return read_states_.Write(hash);
+  }
+  WriteGuard CloseAllReaders() noexcept { return read_states_.WriteAll(); }
+  bool NeedsStructuralWrite(const Digest& digest) const noexcept {
+    if constexpr (ReadStripeCount == 0) return false;
+    // Keep an enclosing mutation globally closed if its Find finishes rehash.
+    // Otherwise that final step could reopen unrelated readers before a later
+    // insertion grows the shared overflow directory.
+    if (Rehashing() || resize_pending_ || !tables_[0].buckets_) return true;
+    if (!Rehashing() &&
+        tables_[0].used_ + 1 >
+            BucketCount(tables_[0]) * kTargetEntriesPerBucket &&
+        tables_[0].exponent_ < MaxBucketExponent)
+      return true;
+    const Table& table = Rehashing() ? tables_[1] : tables_[0];
+    const Bucket* bucket = &table.buckets_[Hash(digest) & BucketMask(table)];
+    while (bucket != nullptr) {
+      for (auto handle : bucket->entries_)
+        if (handle == 0) return false;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    }
+    return true;  // AllocateChild may change the shared overflow vector.
   }
   const auto& read_states() const noexcept
     requires(ReadStripeCount != 0)
@@ -1201,6 +1473,8 @@ class ScanHashMap {
   // deliberately not converted into this validation result and remains fatal to
   // the process.
   bool PreallocateForExpectedSize(std::size_t expected_entries) {
+    auto write = CloseAllReaders();
+    RequireDrained(write);
     assert(empty() && !has_allocated_storage());
     if (expected_entries == 0) return true;
 
@@ -1220,6 +1494,7 @@ class ScanHashMap {
     prepared.exponent_ = static_cast<std::uint8_t>(exponent);
     if (!prepared.AllocateBuckets(std::size_t{1} << exponent)) return false;
     tables_[0] = std::move(prepared);
+    read_states_.SetPopulated(true);
     return true;
   }
 
@@ -1334,6 +1609,8 @@ class ScanHashMap {
                       Entry** replaced) {
     assert(existing != nullptr);
     assert(replaced != nullptr);
+    auto write = read_states_.Write(Hash(digest));
+    RequireDrained(write);
     *replaced = nullptr;
     if (existing->can_assign(value)) {
       existing->assign(value);
@@ -1370,6 +1647,8 @@ class ScanHashMap {
 
   InsertResult InsertOrAssign(const Digest& digest, std::string_view key,
                               const Value& value, bool key_complete = true) {
+    auto write = CloseForWrite(digest);
+    RequireDrained(write);
     if (Entry* existing = Find(digest, key); existing != nullptr) {
       // The inline policy never changes representation. Specialized policies
       // use ReplaceValue when a new value changes the concrete entry type.
@@ -1399,6 +1678,8 @@ class ScanHashMap {
 
   Entry* InsertNew(const Digest& digest, std::string_view key,
                    const Value& value, bool key_complete = true) {
+    auto write = CloseForWrite(digest);
+    RequireDrained(write);
     EnsureArena();
     EnsureTable();
     MaybeStartExpansion();
@@ -1429,6 +1710,8 @@ class ScanHashMap {
   // value replacement (including a tombstone) does not. Maintain() finishes
   // reclamation when foreground traffic stops. Entry addresses stay stable.
   bool Erase(const Digest& digest, std::string_view key) {
+    auto write = read_states_.Write(Hash(digest));
+    RequireDrained(write);
     AdvanceRehashIfNeeded();
     const std::uint64_t hash = Hash(digest);
     const std::uint8_t tag = HashTag(hash);
@@ -1468,6 +1751,8 @@ class ScanHashMap {
     }
     AdvanceRehashIfNeeded();
     const std::uint64_t hash = EntryHash(*entry);
+    auto write = read_states_.Write(hash);
+    RequireDrained(write);
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
@@ -1497,10 +1782,16 @@ class ScanHashMap {
 
   // Performs at most one source-chain migration, or starts a smaller table.
   // Owners may call this between Scan calls to reclaim buckets without new
-  // requests. Returns false when settled or blocked by memory admission; a
+  // requests. Returns false when settled or blocked by readers or memory
+  // admission; a
   // blocked attempt leaves entries intact and can be retried later. Like a
   // mutation, this invalidates StableScanCursor but preserves Entry addresses.
   bool Maintain() {
+    if (ReadStripeCount != 0 && resize_pending_ && !shrink_pending_ &&
+        !Rehashing()) {
+      if (!read_states_.Drained()) return false;
+      MaybeStartExpansion();
+    }
     if (Rehashing()) return RehashStep();
     return shrink_pending_ && MaybeStartShrink();
   }
@@ -1634,10 +1925,15 @@ class ScanHashMap {
   }
 
   void Clear() noexcept {
+    auto write = CloseAllReaders();
+    RequireDrained(write);
+    read_states_.SetPopulated(false);
     DestroyTable(tables_[0], true);
     DestroyTable(tables_[1], true);
     rehash_index_ = kNotRehashing;
     shrink_pending_ = false;
+    resize_pending_ = false;
+    read_states_.EndResize();
   }
 
   // Moves every entry out into the returned map and leaves *this empty and
@@ -1652,10 +1948,18 @@ class ScanHashMap {
   // before dereferencing; this class does not track that, since the useful
   // granularity is whatever set of maps the caller detaches together.
   ScanHashMap Detach() noexcept {
+    auto write = CloseAllReaders();
+    RequireDrained(write);
     ScanHashMap detached(arena_);
     detached.tables_ = std::exchange(tables_, {});
     detached.rehash_index_ = std::exchange(rehash_index_, kNotRehashing);
     detached.shrink_pending_ = std::exchange(shrink_pending_, false);
+    detached.resize_pending_ = std::exchange(resize_pending_, false);
+    if (detached.Rehashing() || detached.resize_pending_)
+      detached.read_states_.BlockResize();
+    detached.read_states_.SetPopulated(detached.has_allocated_storage());
+    read_states_.SetPopulated(false);
+    read_states_.EndResize();
     return detached;
   }
 
@@ -2072,6 +2376,21 @@ class ScanHashMap {
     return ReverseBits(cursor);
   }
 
+  static void RequireDrained(const WriteGuard& guard) noexcept {
+    // Synchronous map methods cannot suspend or spin. Storage must await its
+    // outer guard before calling them; a missed mutation boundary fails closed.
+    if (!guard.ready()) std::terminate();
+  }
+  bool BeginResize() noexcept {
+    read_states_.BlockResize();
+    resize_pending_ = !read_states_.Drained();
+    return !resize_pending_;
+  }
+  void EndResize() noexcept {
+    resize_pending_ = false;
+    read_states_.EndResize();
+  }
+
   bool Rehashing() const noexcept { return rehash_index_ != kNotRehashing; }
 
   // RehashStep is intentionally large and stays out of line. Keep its common
@@ -2082,6 +2401,9 @@ class ScanHashMap {
   [[gnu::always_inline]] void AdvanceRehashIfNeeded() {
     if (Rehashing()) [[unlikely]] {
       RehashStep();
+    } else if (ReadStripeCount != 0 && resize_pending_ && !shrink_pending_)
+        [[unlikely]] {
+      MaybeStartExpansion();
     } else if (shrink_pending_) [[unlikely]] {
       MaybeStartShrink();
     }
@@ -2093,6 +2415,7 @@ class ScanHashMap {
       tables_[0] = Table(arena_->allocation_domain());
       if (!tables_[0].AllocateBuckets(kMinimumBucketCount)) std::terminate();
       tables_[0].exponent_ = kMinimumBucketExponent;
+      read_states_.SetPopulated(true);
     }
   }
 
@@ -2111,6 +2434,7 @@ class ScanHashMap {
     if (tables_[0].exponent_ >= MaxBucketExponent) {
       return;
     }
+    if (!BeginResize()) return;
     assert(arena_ != nullptr);
     tables_[1] = Table(arena_->allocation_domain());
     tables_[1].exponent_ = tables_[0].exponent_ + 1;
@@ -2124,23 +2448,31 @@ class ScanHashMap {
   bool MaybeStartShrink() {
     if (Rehashing()) return false;
     if (empty()) {
+      if (!BeginResize()) return false;
       const bool released = has_allocated_storage();
       tables_ = {};
       shrink_pending_ = false;
+      read_states_.SetPopulated(false);
+      EndResize();
       return released;
     }
     const std::size_t buckets = BucketCount(tables_[0]);
     if (buckets <= kMinimumBucketCount ||
         size() >= buckets * kShrinkEntriesPerBucket) {
       shrink_pending_ = false;
+      EndResize();
       return false;
     }
+    if (!BeginResize()) return false;
     Table prepared(arena_->allocation_domain());
     prepared.exponent_ = tables_[0].exponent_ - 1;
     // Deletion has no enclosing growth permit, even for a primary index.
     // Reserve the temporary old+new footprint before publishing the target;
     // rejection must never turn a successful Erase into a failed command.
-    if (!prepared.AllocateBuckets(buckets / 2, true)) return false;
+    if (!prepared.AllocateBuckets(buckets / 2, true)) {
+      EndResize();
+      return false;
+    }
     tables_[1] = std::move(prepared);
     rehash_index_ = 0;
     return true;
@@ -2148,6 +2480,7 @@ class ScanHashMap {
 
   bool RehashStep() {
     if (!Rehashing()) return false;
+    assert(read_states_.Drained());
 
     // A source chain can split into only two target chains when the direct
     // table doubles, or merge into one target chain when it halves. Prepare
@@ -2169,6 +2502,7 @@ class ScanHashMap {
       tables_[0] = std::move(tables_[1]);
       tables_[1] = Table(arena_->allocation_domain());
       rehash_index_ = kNotRehashing;
+      EndResize();
     }
     return true;
   }
@@ -2697,16 +3031,26 @@ class ScanHashMap {
   }
 
   void MoveFrom(ScanHashMap&& other) noexcept {
+    auto write = CloseAllReaders();
+    auto source_write = other.CloseAllReaders();
+    RequireDrained(write);
+    RequireDrained(source_write);
     arena_ = std::move(other.arena_);
     tables_ = std::move(other.tables_);
     rehash_index_ = std::exchange(other.rehash_index_, kNotRehashing);
     shrink_pending_ = std::exchange(other.shrink_pending_, false);
+    resize_pending_ = std::exchange(other.resize_pending_, false);
+    if (Rehashing() || resize_pending_) read_states_.BlockResize();
+    read_states_.SetPopulated(has_allocated_storage());
     other.tables_ = {};
+    other.read_states_.SetPopulated(false);
+    other.read_states_.EndResize();
   }
 
   std::array<Table, 2> tables_{};
   std::size_t rehash_index_ = kNotRehashing;
   bool shrink_pending_ = false;
+  bool resize_pending_ = false;
   std::shared_ptr<ScanHashMapEntryArena> arena_;
   [[no_unique_address]] ScanHashMapReadStates<ReadStripeCount> read_states_;
 };
