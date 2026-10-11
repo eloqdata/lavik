@@ -559,9 +559,12 @@ struct RecordIndexEntryPolicy {
   }
 };
 
+// Only the primary key index reserves read stripes. Keeping every allocated
+// table at least this large makes hash & 31 a stable stripe across resizing;
+// auxiliary and grouped-object maps retain their owner-only layout.
 using RecordIndex =
     ScanHashMap<RecordLocation, std::numeric_limits<std::uint32_t>::digits,
-                RecordIndexEntryPolicy>;
+                RecordIndexEntryPolicy, 32>;
 
 static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
 static_assert(sizeof(RecordLocationCore) == 32);

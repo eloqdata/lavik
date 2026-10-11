@@ -528,6 +528,12 @@ allocation when the caller protects the resolved entry and arena lifetimes;
 it does not pin entries or make the hash tables safe for concurrent access.
 Allocator mutation and index access remain owner-local. Private auxiliary
 arenas retain incremental directory allocation and owner-only access.
+Each primary key index reserves 32 cache-line-isolated atomic read-admission
+states, including while empty. Its bucket arrays remain demand-allocated,
+start at 32 buckets, and never shrink below 32 while nonempty; checkpoint
+recovery applies the same floor. The states remain closed and do not yet admit
+remote index readers. Grouped-object and auxiliary maps retain their existing
+owner-only layout and bucket sizing.
 A population detached by `FLUSHDB`, a replica reset, or a replica abort retains
 ownership of that arena until reclamation finishes. Replica promotion and
 abort reuse the same worker-local detached-index drain as synchronous database

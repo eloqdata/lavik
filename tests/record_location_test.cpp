@@ -24,6 +24,74 @@
 namespace lavik::storage {
 namespace {
 
+TEST(RecordIndexTest, BucketFloorSurvivesGrowthShrinkAndPopulationReplacement) {
+  RecordIndex index;
+  auto* states = index.read_states().data();
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+  ASSERT_TRUE(index.PreallocateForExpectedSize(0));
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+
+  // Admission must cover the larger first bucket array, even before the arena
+  // or any entry has been allocated.
+  ScanHashMap<RecordLocation, std::numeric_limits<std::uint32_t>::digits,
+              RecordIndexEntryPolicy>
+      owner_only;
+  const auto digest = ComputeDigest("keep");
+  EXPECT_EQ(
+      index.RequiredAllocationBytes(digest, "keep", true, false, true),
+      owner_only.RequiredAllocationBytes(digest, "keep", true, false, true) +
+          31 * 64);
+  ASSERT_NE(index.InsertNew(digest, "keep", RecordLocation{}), nullptr);
+  ASSERT_EQ(index.allocated_bucket_count(), 32);
+  for (unsigned i = 0; i < 400; ++i) {
+    const auto key = "grow-" + std::to_string(i);
+    ASSERT_NE(index.InsertNew(ComputeDigest(key), key, RecordLocation{}),
+              nullptr);
+  }
+  for (unsigned step = 0; step < 1024 && index.Maintain(); ++step) {
+  }
+  ASSERT_FALSE(index.rehashing());
+  EXPECT_EQ(index.allocated_bucket_count(), 64);
+  for (unsigned i = 0; i < 400; ++i) {
+    const auto key = "grow-" + std::to_string(i);
+    ASSERT_TRUE(index.Erase(ComputeDigest(key), key));
+  }
+  for (unsigned step = 0; step < 1024 && index.Maintain(); ++step) {
+  }
+  EXPECT_FALSE(index.rehashing());
+  EXPECT_EQ(index.allocated_bucket_count(), 32);
+  EXPECT_NE(index.Find(digest, "keep"), nullptr);
+  EXPECT_EQ(index.read_states().data(), states);
+
+  auto detached = index.Detach();
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+  EXPECT_EQ(index.read_states().data(), states);
+  RecordIndex moved(std::move(detached));
+  EXPECT_EQ(moved.allocated_bucket_count(), 32);
+  EXPECT_NE(moved.Find(digest, "keep"), nullptr);
+  ASSERT_TRUE(index.PreallocateForExpectedSize(1));
+  EXPECT_EQ(index.allocated_bucket_count(), 32);
+  index.Clear();
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+  EXPECT_EQ(index.read_states().data(), states);
+}
+
+TEST(RecordIndexTest, ReadStatesAreClosedAndCacheLineIsolated) {
+  // Worker startup keeps indexes in a vector: its allocator must preserve the
+  // over-alignment as well as spacing within each fixed stripe array.
+  std::vector<RecordIndex> indexes(2);
+  for (const auto& index : indexes) {
+    ASSERT_EQ(index.read_states().size(), 32);
+    for (const auto& stripe : index.read_states()) {
+      EXPECT_EQ(reinterpret_cast<std::uintptr_t>(&stripe) % 64, 0);
+      EXPECT_EQ(stripe.state_.load(std::memory_order_relaxed),
+                ScanHashMapReadState::kClosed);
+    }
+    EXPECT_EQ(sizeof(index.read_states()), 32 * 64);
+    EXPECT_EQ(index.allocated_bucket_count(), 0);
+  }
+}
+
 TEST(RecoveryMemoryTest, DividesTemporaryBatchTargetAcrossWorkers) {
   EXPECT_EQ(RecoveryWorkerBatchTargetBytes(0),
             kRecoveryProcessBatchTargetBytes);

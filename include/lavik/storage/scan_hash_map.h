@@ -827,13 +827,38 @@ struct ScanHashMapInlineEntryPolicy {
   }
 };
 
+// One cache line per stripe prevents unrelated buckets' readers from writing
+// the same line. The high bit closes admission; lower bits are reserved for
+// short-lived index readers. Storage starts closed: reserving these words does
+// not by itself make ScanHashMap operations safe for concurrent access.
+struct alignas(64) ScanHashMapReadState {
+  static constexpr std::uint32_t kClosed = std::uint32_t{1} << 31;
+  static constexpr std::uint32_t kReadersMask = kClosed - 1;
+  std::atomic<std::uint32_t> state_{kClosed};
+};
+static_assert(sizeof(ScanHashMapReadState) == 64);
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+
+template <std::size_t Count>
+struct ScanHashMapReadStates {
+  std::array<ScanHashMapReadState, Count> stripes_{};
+};
+
+// Owner-only maps retain their original footprint and alignment.
+template <>
+struct ScanHashMapReadStates<0> {};
+
 // Cached hashes retain the 32 address bits needed by the largest direct bucket
 // table. MaxBucketExponent is configurable so tests can exercise saturation
 // without allocating 2^32 buckets; production uses the full uint32_t range.
+// ReadStripeCount reserves optional fixed admission state and sets the minimum
+// nonempty table size so each bucket belongs to exactly one hash-selected
+// stripe. This is layout support only; callers still serialize all map access.
 template <typename Value,
           unsigned MaxBucketExponent =
               std::numeric_limits<std::uint32_t>::digits,
-          typename EntryPolicy = ScanHashMapInlineEntryPolicy<Value>>
+          typename EntryPolicy = ScanHashMapInlineEntryPolicy<Value>,
+          std::size_t ReadStripeCount = 0>
 class ScanHashMap {
  public:
   using EntryHandle = ScanHashMapEntryArena::Handle;
@@ -843,6 +868,13 @@ class ScanHashMap {
   static_assert(MaxBucketExponent <=
                 std::numeric_limits<std::uint32_t>::digits);
   static_assert(MaxBucketExponent < std::numeric_limits<std::size_t>::digits);
+  static_assert(ReadStripeCount == 0 || std::has_single_bit(ReadStripeCount));
+  static constexpr std::size_t kReadStripeCount = ReadStripeCount;
+  static constexpr std::size_t kMinimumBucketCount =
+      ReadStripeCount == 0 ? 1 : ReadStripeCount;
+  static constexpr unsigned kMinimumBucketExponent =
+      std::countr_zero(kMinimumBucketCount);
+  static_assert(kMinimumBucketExponent <= MaxBucketExponent);
 
   using StoredValue = typename EntryPolicy::StoredValue;
   using EntryExtra = typename EntryPolicy::Extra;
@@ -1044,6 +1076,21 @@ class ScanHashMap {
 
   ~ScanHashMap() { Clear(); }
 
+  // Fixed-address state belongs to this map object, not its entry population;
+  // it is not transferred by move or Detach. All stripes remain closed until
+  // the storage layer integrates reader admission and every mutation path.
+  // Move, clear, detach, and destruction require quiescent readers.
+  auto& read_states() noexcept
+    requires(ReadStripeCount != 0)
+  {
+    return read_states_.stripes_;
+  }
+  const auto& read_states() const noexcept
+    requires(ReadStripeCount != 0)
+  {
+    return read_states_.stripes_;
+  }
+
   // Binds an empty map to a worker-shared arena. Sharing keeps slab occupancy
   // independent of the 16,384 partition and 16 database boundaries. Detached
   // maps retain shared ownership so asynchronous FLUSHDB reclamation cannot
@@ -1091,7 +1138,8 @@ class ScanHashMap {
     if (!inserting) return required;
 
     if (!tables_[0].buckets_) {
-      return add(required, sizeof(Bucket) + kSlowPathBookkeepingAllowance);
+      return add(required, kMinimumBucketCount * sizeof(Bucket) +
+                               kSlowPathBookkeepingAllowance);
     }
     if (!Rehashing() &&
         tables_[0].used_ + 1 >
@@ -1140,7 +1188,8 @@ class ScanHashMap {
     return tables_[0].buckets_ || tables_[1].buckets_;
   }
 
-  // Allocates the final direct-bucket table for an empty map whose population
+  // Allocates the final direct-bucket table (respecting the configured minimum)
+  // for an empty map whose population
   // is known exactly, such as an offline recovery checkpoint. Normal inserts
   // deliberately grow incrementally because their eventual population is not
   // known; recovery can avoid repeatedly allocating, walking, and retaining
@@ -1158,8 +1207,9 @@ class ScanHashMap {
     const std::size_t required_buckets =
         expected_entries / kTargetEntriesPerBucket +
         (expected_entries % kTargetEntriesPerBucket != 0);
-    const std::size_t exponent =
-        required_buckets <= 1 ? 0 : std::bit_width(required_buckets - 1);
+    const std::size_t exponent = std::max<std::size_t>(
+        kMinimumBucketExponent,
+        required_buckets <= 1 ? 0 : std::bit_width(required_buckets - 1));
     if (exponent > MaxBucketExponent ||
         exponent >= std::numeric_limits<std::size_t>::digits) {
       return false;
@@ -1374,7 +1424,8 @@ class ScanHashMap {
   // emits a whole chain per cursor position, so an owner-serialized cursor
   // scan does not miss an entry that exists throughout while erases occur
   // between Scan calls. Scan and mutation are not thread-safe concurrently.
-  // Actual removal enables best-effort shrinking below 25% occupancy; a
+  // Actual removal enables best-effort shrinking below 25% occupancy, down to
+  // the configured bucket floor (or no buckets when empty); a
   // value replacement (including a tombstone) does not. Maintain() finishes
   // reclamation when foreground traffic stops. Entry addresses stay stable.
   bool Erase(const Digest& digest, std::string_view key) {
@@ -2040,8 +2091,8 @@ class ScanHashMap {
     if (!tables_[0].buckets_) {
       assert(arena_ != nullptr);
       tables_[0] = Table(arena_->allocation_domain());
-      if (!tables_[0].AllocateBuckets(1)) std::terminate();
-      tables_[0].exponent_ = 0;
+      if (!tables_[0].AllocateBuckets(kMinimumBucketCount)) std::terminate();
+      tables_[0].exponent_ = kMinimumBucketExponent;
     }
   }
 
@@ -2079,7 +2130,8 @@ class ScanHashMap {
       return released;
     }
     const std::size_t buckets = BucketCount(tables_[0]);
-    if (buckets <= 1 || size() >= buckets * kShrinkEntriesPerBucket) {
+    if (buckets <= kMinimumBucketCount ||
+        size() >= buckets * kShrinkEntriesPerBucket) {
       shrink_pending_ = false;
       return false;
     }
@@ -2656,10 +2708,13 @@ class ScanHashMap {
   std::size_t rehash_index_ = kNotRehashing;
   bool shrink_pending_ = false;
   std::shared_ptr<ScanHashMapEntryArena> arena_;
+  [[no_unique_address]] ScanHashMapReadStates<ReadStripeCount> read_states_;
 };
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-std::uint8_t ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+std::uint8_t
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy, ReadStripeCount>::Entry::
     EncodedKeyMetadataBytes(std::uint32_t encoded) noexcept {
   std::uint8_t bytes = 1;
   while (encoded >= 0x80) {
@@ -2669,10 +2724,13 @@ std::uint8_t ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::
   return bytes;
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-std::uint8_t
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::EncodeKeyMetadata(
-    std::byte* output, std::uint32_t logical_size, bool key_complete) noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+std::uint8_t ScanHashMap<
+    Value, MaxBucketExponent, EntryPolicy,
+    ReadStripeCount>::Entry::EncodeKeyMetadata(std::byte* output,
+                                               std::uint32_t logical_size,
+                                               bool key_complete) noexcept {
   assert(output != nullptr);
   assert(logical_size <= kMaxLogicalKeySize);
   std::uint32_t encoded =
@@ -2689,10 +2747,12 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::EncodeKeyMetadata(
   return bytes;
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::KeyMetadata
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::DecodeKeyMetadata(
-    const std::byte* input) noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                     ReadStripeCount>::Entry::KeyMetadata
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy, ReadStripeCount>::Entry::
+    DecodeKeyMetadata(const std::byte* input) noexcept {
   assert(input != nullptr);
   std::uint32_t encoded = 0;
   for (std::uint8_t index = 0; index < 5; ++index) {
@@ -2713,19 +2773,25 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::DecodeKeyMetadata(
   return {};
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-std::size_t ScanHashMap<Value, MaxBucketExponent,
-                        EntryPolicy>::Entry::tail_bytes() const noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+std::size_t ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                        ReadStripeCount>::Entry::tail_bytes() const noexcept {
   const KeyMetadata metadata = DecodeKeyMetadata(tail());
   return metadata.encoded_bytes_ +
          (metadata.key_complete_ ? metadata.logical_size_ : sizeof(Digest));
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Allocation
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
-    ScanHashMapEntryArena& arena, const Digest& digest, std::string_view key,
-    const Value& value, bool key_complete) {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                     ReadStripeCount>::Entry::Allocation
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+            ReadStripeCount>::Entry::Create(ScanHashMapEntryArena& arena,
+                                            const Digest& digest,
+                                            std::string_view key,
+                                            const Value& value,
+                                            bool key_complete) {
   if (key.size() > kMaxLogicalKeySize) {
     return {};
   }
@@ -2771,10 +2837,13 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
   return {.entry_ = entry, .handle_ = allocation.handle_};
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Allocation
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
-    ScanHashMapEntryArena& arena, const Entry& source, const Value& value) {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                     ReadStripeCount>::Entry::Allocation
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy, ReadStripeCount>::Entry::
+    CreateReplacement(ScanHashMapEntryArena& arena, const Entry& source,
+                      const Value& value) {
   const std::size_t tail_bytes = source.tail_bytes();
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
@@ -2804,29 +2873,36 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
   return {.entry_ = entry, .handle_ = allocation.handle_};
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::EntryExtra*
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::extra() noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                     ReadStripeCount>::EntryExtra*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+            ReadStripeCount>::Entry::extra() noexcept {
   return &static_cast<ExtendedEntry*>(this)->extra_;
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-const typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::EntryExtra*
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::extra()
-    const noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+const typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                           ReadStripeCount>::EntryExtra*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+            ReadStripeCount>::Entry::extra() const noexcept {
   return &static_cast<const ExtendedEntry*>(this)->extra_;
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-std::byte*
-ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::tail() noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                       ReadStripeCount>::Entry::tail() noexcept {
   return reinterpret_cast<std::byte*>(this) +
          (has_extra() ? sizeof(ExtendedEntry) : sizeof(Entry));
 }
 
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-const std::byte* ScanHashMap<Value, MaxBucketExponent,
-                             EntryPolicy>::Entry::tail() const noexcept {
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+const std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                             ReadStripeCount>::Entry::tail() const noexcept {
   return reinterpret_cast<const std::byte*>(this) +
          (has_extra() ? sizeof(ExtendedEntry) : sizeof(Entry));
 }
