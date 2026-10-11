@@ -247,11 +247,12 @@ ScanHashMapEntryArena::BuildClassSizes() noexcept {
 
 constexpr std::array<std::uint8_t, 513>
 ScanHashMapEntryArena::BuildClassLookup() noexcept {
+  constexpr auto sizes = BuildClassSizes();
   std::array<std::uint8_t, 513> lookup{};
   for (std::size_t units = 0; units < lookup.size(); ++units) {
     const std::size_t bytes = units * 8;
     std::size_t index = 0;
-    while (index + 1 < kClassSizes.size() && kClassSizes[index] < bytes) {
+    while (index + 1 < sizes.size() && sizes[index] < bytes) {
       ++index;
     }
     lookup[units] = static_cast<std::uint8_t>(index);
@@ -259,11 +260,13 @@ ScanHashMapEntryArena::BuildClassLookup() noexcept {
   return lookup;
 }
 
-inline const std::array<std::uint16_t, ScanHashMapEntryArena::kSmallClassCount>
+inline constexpr std::array<std::uint16_t,
+                            ScanHashMapEntryArena::kSmallClassCount>
     ScanHashMapEntryArena::kClassSizes =
         ScanHashMapEntryArena::BuildClassSizes();
-inline const std::array<std::uint8_t, 513> ScanHashMapEntryArena::kClassLookup =
-    ScanHashMapEntryArena::BuildClassLookup();
+inline constexpr std::array<std::uint8_t, 513>
+    ScanHashMapEntryArena::kClassLookup =
+        ScanHashMapEntryArena::BuildClassLookup();
 
 inline ScanHashMapEntryArena::ScanHashMapEntryArena(
     std::uint32_t maximum_page_id, bool externally_admitted,
