@@ -4646,7 +4646,8 @@ class StorageEngine::Impl {
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
-  // Populated only for SPDK: workers owning a qpair for each controller.
+  // Populated only for SPDK: sorted qpair workers for each device's controller.
+  // Includes spare-qpair readers beyond the weighted home write assignment.
   std::vector<std::vector<std::uint16_t>> device_owners_;
   // Which worker owns each block, by device and local block id. A record
   // carries its block's owner in its index entry, but an extent reference has

@@ -2290,8 +2290,6 @@ absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
       controller.workers_.push_back(static_cast<std::uint16_t>(worker));
       for (const std::size_t device_index : controller.devices_) {
         stores_[worker]->home_devices_.push_back(device_index);
-        device_owners_[device_index].push_back(
-            static_cast<std::uint16_t>(worker));
       }
     };
 
@@ -2302,13 +2300,16 @@ absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
       }
     }
 
-    for (std::size_t device_index = 0; device_index < devices_.size();
-         ++device_index) {
-      auto& owners = device_owners_[device_index];
-      std::sort(owners.begin(), owners.end());
-      assert(!owners.empty());
-      device_allocators_[device_index]->owner_ =
-          owners[devices_[device_index].id_ % owners.size()];
+    for (std::size_t i = 0; i < controllers.size(); ++i) {
+      const auto& home_workers = controllers[i]->workers_;
+      assert(!home_workers.empty());
+      for (const std::size_t device_index : controllers[i]->devices_) {
+        device_owners_[device_index] = planned->controller_qpair_workers_[i];
+        // Extra read access must not move the device's allocator or alter its
+        // weighted home assignment. Every home worker also owns a qpair.
+        device_allocators_[device_index]->owner_ =
+            home_workers[devices_[device_index].id_ % home_workers.size()];
+      }
     }
     for (auto& store : stores_) {
       if (store->home_devices_.empty()) {
@@ -2317,16 +2318,23 @@ absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
       }
       store->home_device_allocations_.assign(store->home_devices_.size(), 0);
     }
-    for (const ControllerPlan* controller : controllers) {
-      std::string workers;
+    for (std::size_t i = 0; i < controllers.size(); ++i) {
+      const ControllerPlan* controller = controllers[i];
+      std::string home_workers;
       for (const std::uint16_t worker : controller->workers_) {
-        if (!workers.empty()) workers += ',';
-        workers += std::to_string(worker);
+        if (!home_workers.empty()) home_workers += ',';
+        home_workers += std::to_string(worker);
+      }
+      std::string qpair_workers;
+      for (const std::uint16_t worker : planned->controller_qpair_workers_[i]) {
+        if (!qpair_workers.empty()) qpair_workers += ',';
+        qpair_workers += std::to_string(worker);
       }
       spdlog::info(
-          "SPDK controller={} io-qpairs={} foreground-weight={} owners=[{}]",
+          "SPDK controller={} io-qpairs={} foreground-weight={} "
+          "home-workers=[{}] qpair-workers=[{}]",
           controller->id_, controller->io_queue_count_, controller->weight_,
-          workers);
+          home_workers, qpair_workers);
     }
     return absl::OkStatus();
   } else {

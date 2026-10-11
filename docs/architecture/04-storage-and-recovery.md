@@ -80,9 +80,9 @@ Storage separates three ownership domains:
 - Each device has one allocator owner, which serializes that device's ready and
   cold-free pools, scan bitmap, fixed metadata page generations, epoch mirrors,
   and allocation-epoch counter. io_uring initially assigns this role as
-  `device_index % worker_count`. SPDK selects it from the controller's qpair
-  owners, so metadata and allocation I/O never route to a worker that cannot
-  open the namespace.
+  `device_index % worker_count`. SPDK selects it from the controller's home
+  workers, all of which hold a qpair, so metadata and allocation I/O never
+  route to a worker that cannot open the namespace.
 
 Every worker has one ordinary and one transaction append stream. Physical
 streams are per worker, not per logical partition, so active 8 MiB staging
@@ -122,6 +122,11 @@ best-effort subset registration, prioritizing read slots. Each lease retains
 its slot identity and immutable registration status; unregistered slots use
 the same aligned memory with plain asynchronous I/O. On SPDK, a
 worker opens only namespaces whose physical controller assigned it a qpair.
+Weighted home-device assignment controls write placement independently of
+qpair access. Each controller reserves qpairs for its home workers, then
+assigns its remaining capacity to other workers, up to one qpair per worker.
+A controller with enough qpairs is therefore directly accessible from every
+connection worker. Namespaces on that controller share each worker's qpair.
 SPDK also requires DMA buffer registration and fails initialization when that
 registration or controller-qpair coverage is insufficient.
 
@@ -368,10 +373,10 @@ zeroes stale checkpoint bitmap state when no checkpoint is usable.
 `InitializeWorker` creates the worker's aligned buffer pool, registers the
 fixed-file table, and opens the paths accessible on that backend. Before worker
 startup, io_uring assigns weighted home devices for foreground allocation.
-SPDK groups namespaces by physical controller, weights controllers by usable
-foreground blocks, and distributes available controller qpairs across workers;
-startup fails unless every controller and every worker can be covered. Worker
-barriers then coordinate one parallel recovery rather than independent
+SPDK groups namespaces by physical controller, assigns weighted home devices,
+and expands qpair access with the remaining controller capacity; startup fails
+unless every controller and every worker can be covered. Worker barriers then
+coordinate one parallel recovery rather than independent
 worker-local boots. Request readiness follows successful completion of the
 complete recovery and allocator-cleanup sequence; the exact moment a listening
 socket exists is not the readiness boundary.
@@ -818,9 +823,10 @@ The persistent allocation bitmap is the recovery authority, not merely an
 allocation hint. Device allocators activate ready IDs in batches and preserve
 eight allocatable blocks per device for defrag. Each worker first balances
 foreground allocations across its weighted home devices. io_uring can then
-fall back to every other configured device; SPDK cannot leave the namespaces of
-controllers for which that worker owns qpairs. Foreground allocation may wait
-while an active flush, extent reclaim, or runnable defrag can still return
+fall back to every other configured device; SPDK allocates only from its home
+devices, even when spare qpairs give it read access to other controllers.
+Foreground allocation may wait while an active flush, extent reclaim, or
+runnable defrag can still return
 space; it reports exhaustion only after a stable observation with no progress
 in flight. A queued defrag while defrag is paused is deliberately not counted
 as runnable progress, so a full-device write reports exhaustion instead of
