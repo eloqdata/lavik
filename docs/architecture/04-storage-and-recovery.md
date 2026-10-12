@@ -674,8 +674,11 @@ then pins the block and validates its allocation identity before dropping the
 index guard. Only durable, non-grouped, non-external records whose block owner
 is also their key owner qualify, and the connection worker must have device
 I/O access. Closed index/block admission, unsupported representations, expired
-entries, and concurrent admission contention return to the normal owner route.
-Index misses use the same transaction and population admission checks.
+entries, concurrent admission contention, and an exhausted connection-worker
+read-buffer pool return to the normal owner route. An admitted fast read submits
+I/O directly from an awaitable in the requesting coroutine; completion resumes
+that same coroutine for record and population validation, without a child read
+coroutine. Index misses use the same transaction and population admission checks.
 
 The index snapshot orders the GET before a subsequently admitted writer. The
 block pin survives I/O and cancellation cleanup, so writes can append and retire
@@ -1212,7 +1215,7 @@ current source code are authoritative for present storage behavior.
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
 | Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/init.cpp`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped/hash.cpp`, `src/storage/engine/grouped/object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
-| Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_index.h` |
+| Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_location.h`, `include/lavik/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | System-state manifest, catalog COW extents, full-sync fence, population token, promotion base, and one-use shutdown certificate | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |

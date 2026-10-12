@@ -2199,8 +2199,7 @@ class StorageEngine::Impl {
                   std::uint64_t block_id);
   void UnpinRemoteBlock(BlockState& state, unsigned owner,
                         std::uint64_t block_id);
-  Task<std::optional<absl::StatusOr<DiskValue>>> TryRemoteGet(
-      std::uint8_t db_id, std::string_view key, std::uint16_t slot);
+  void PrepareRemoteGet(RemoteGetAwaitable& result);
   void FinalizeWorker(unsigned worker_id) noexcept;
   bool AbandonWorkerStateForProcessExit() noexcept;
 
@@ -3351,6 +3350,8 @@ class StorageEngine::Impl {
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
+  friend class RemoteGetTestPeer;
+  friend class StorageEngine::RemoteGetAwaitable;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -3454,8 +3455,7 @@ class StorageEngine::Impl {
     LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
                        std::string_view key, RecordLocation location,
                        std::uint64_t replication_epoch, ReadLatencyTrace* trace,
-                       std::optional<std::uint64_t> expected_db_epoch,
-                       bool remotely_pinned = false);
+                       std::optional<std::uint64_t> expected_db_epoch);
     ~LoadValueAwaitable();
 
     bool await_ready() const noexcept { return ready_ && !slow_.valid(); }
@@ -3491,7 +3491,6 @@ class StorageEngine::Impl {
     ReadLatencyTrace* trace_;
     std::uint64_t replication_epoch_;
     std::optional<std::uint64_t> expected_db_epoch_;
-    bool remotely_pinned_ = false;
     std::uint64_t aligned_offset_ = 0;
     std::size_t file_id_ = 0;
     std::size_t record_headroom_ = 0;
@@ -3568,6 +3567,13 @@ class StorageEngine::Impl {
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
+
+  // Validates the pinned remote record in the connection task after I/O.
+  // Remote admission/fallback is separate from owner-local relocation retries.
+  absl::StatusOr<LoadedValue> DecodeRemoteValue(
+      ReadBufferLease lease, std::uint8_t db_id, std::string_view key,
+      RecordLocation location, std::uint64_t replication_epoch,
+      std::size_t record_headroom, std::uint64_t expected_db_epoch);
 
   void QueueExpiredCandidate(WorkerStore& store, std::uint16_t partition_id,
                              std::uint8_t db_id,
@@ -3990,8 +3996,7 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       ReadLatencyTrace* trace = nullptr,
-      std::optional<std::uint64_t> expected_db_epoch = std::nullopt,
-      bool remotely_pinned = false);
+      std::optional<std::uint64_t> expected_db_epoch = std::nullopt);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {
