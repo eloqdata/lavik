@@ -885,13 +885,8 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
                                    Digest digest, RecordLocation location,
                                    ExtentManifest extents,
                                    ReadLatencyTrace* trace,
-                                   GroupedObject::Handle grouped_snapshot,
                                    std::optional<absl::Status> failure) {
-  if (location.grouped()) {
-    co_return co_await LoadGroupedValue(key_store, partition, db_id, key,
-                                        digest, location,
-                                        std::move(grouped_snapshot));
-  }
+  assert(!location.grouped());
   // The caller already resolved the key's partition for the index lookup.
   // Reuse it across retries instead of recomputing the Redis slot.
   const std::uint64_t replication_epoch = partition.replication_epoch_;
@@ -977,131 +972,155 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
   }
 }
 
-Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
-    WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::byte* destination) {
-  BlockState* state = FindBlockState(store, ref.block_id_);
-  if (state == nullptr || !state->allocated_ || state->freeing_ ||
-      state->kind_ != BlockKind::kPayloadExtent ||
-      state->allocation_epoch_ != ref.allocation_epoch_) {
-    co_return absl::Status(absl::StatusCode::kAborted,
-                           "stale or missing external extent");
-  }
-  ++state->pins_;
-  struct ExtentPin {
-    BlockState* state_;
-    ~ExtentPin() { --state_->pins_; }
-  } pin{state};
-  const std::size_t read_bytes =
-      AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-  auto temp_acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  if (!temp_acquired.ok()) {
-    co_return temp_acquired.status();
-  }
-  ReadBufferLease temp = std::move(*temp_acquired);
-  FixedBuffer io = temp.io_buffer();
-  io.size_ = read_bytes;
-  const auto [file_id, block_offset] = FileOffset(ref.block_id_);
-  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                         io, temp.registered(), block_offset);
-  if (!read.ok()) {
-    co_return read.status();
-  }
-  if (*read != read_bytes) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "short extent block read");
-  }
-  BlockHeader header{};
-  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                  io.data_, kBlockHeaderBytes),
-                              &header) ||
-      header.kind_ != BlockKind::kPayloadExtent ||
-      header.block_id_ != ref.block_id_ ||
-      header.allocation_epoch_ != ref.allocation_epoch_ ||
-      header.extent_index_ != extent_index ||
-      header.extent_payload_bytes_ != ref.payload_bytes_ ||
-      header.extent_payload_checksum_ != ref.payload_checksum_) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "extent header does not match manifest");
-  }
-  const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
-                                                  ref.payload_bytes_);
-  if (Crc32c(payload) != ref.payload_checksum_) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "extent payload checksum mismatch");
-  }
-  std::memcpy(destination, payload.data(), payload.size());
-  co_return absl::OkStatus();
-}
-
-Task<absl::Status> StorageEngine::Impl::ReadExtentOnOwner(
+StorageEngine::Impl::ReadExtentAwaitable StorageEngine::Impl::ReadExtentOnOwner(
     ExtentRef ref, std::uint32_t extent_index, std::byte* destination) {
-  const unsigned owner = BlockOwner(ref.block_id_);
-  // The block may be recycled after manifest validation. Recheck its owner
-  // before routing, and let ReadExtentInto validate the allocation epoch.
-  if (owner >= worker_count_)
-    co_return absl::AbortedError("stale or missing external extent");
-  if (owner == bycorf::ThisWorker().id_)
-    co_return co_await ReadExtentInto(*stores_[owner], ref, extent_index,
-                                      destination);
-  co_return co_await bycorf::SubmitTaskTo(
-      owner, [this, owner, ref, extent_index, destination]() {
-        return ReadExtentInto(*stores_[owner], ref, extent_index, destination);
-      });
+  return ReadExtentAwaitable(*this, CurrentStore(), ref, extent_index, 0,
+                             std::span(destination, ref.payload_bytes_), true);
 }
 
-Task<absl::Status> StorageEngine::Impl::ReadExtentSlice(
+StorageEngine::Impl::ReadExtentAwaitable StorageEngine::Impl::ReadExtentSlice(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
     std::size_t source_offset, std::span<std::byte> destination) {
+  return ReadExtentAwaitable(*this, store, ref, extent_index, source_offset,
+                             destination);
+}
+
+Task<absl::Status>
+StorageEngine::Impl::ReadExtentAwaitable::RemoteRead::operator()() {
+  // SubmitTaskTo requires a Task on the physical owner. The local awaitable
+  // below supplies the I/O and pool continuation without another loader frame.
+  co_return co_await engine_->ReadExtentSlice(*engine_->stores_[owner_], ref_,
+                                              extent_index_, source_offset_,
+                                              destination_);
+}
+
+StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
+    Impl& engine, WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
+    std::size_t source_offset, std::span<std::byte> destination, bool route)
+    : engine_(engine),
+      store_(store),
+      ref_(ref),
+      extent_index_(extent_index),
+      source_offset_(source_offset),
+      destination_(destination) {
   if (source_offset > ref.payload_bytes_ ||
       destination.size() > ref.payload_bytes_ - source_offset) {
-    co_return absl::InvalidArgumentError("extent slice is out of range");
+    ready_ = absl::InvalidArgumentError("extent slice is out of range");
+    return;
   }
-  BlockState* state = FindBlockState(store, ref.block_id_);
-  if (state == nullptr || !state->allocated_ || state->freeing_ ||
+  if (route) {
+    const unsigned owner = engine.BlockOwner(ref.block_id_);
+    if (owner >= engine.worker_count_) {
+      ready_ = absl::AbortedError("stale or missing external extent");
+      return;
+    }
+    if (owner != store.worker_->id()) {
+      remote_.emplace(bycorf::SubmitTaskTo(
+          owner, RemoteRead{&engine, owner, ref, extent_index, source_offset,
+                            destination}));
+      return;
+    }
+  }
+  // Recheck the physical owner and incarnation after routing. Retain the
+  // extent pin across pool waiting as well as I/O, matching manifest reads.
+  auto* state = engine.FindBlockState(store, ref.block_id_);
+  if (!state || !state->allocated_ || state->freeing_ ||
       state->kind_ != BlockKind::kPayloadExtent ||
       state->allocation_epoch_ != ref.allocation_epoch_) {
-    co_return absl::AbortedError("stale or missing external extent");
+    ready_ = absl::AbortedError("stale or missing external extent");
+    return;
   }
   ++state->pins_;
-  struct ExtentPin {
-    BlockState* state_;
-    ~ExtentPin() { --state_->pins_; }
-  } pin{state};
-  const std::size_t read_bytes =
-      AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease buffer = std::move(*acquired);
-  FixedBuffer io = buffer.io_buffer();
-  io.size_ = read_bytes;
-  const auto [file_id, block_offset] = FileOffset(ref.block_id_);
-  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                         io, buffer.registered(), block_offset);
-  if (!read.ok()) co_return read.status();
-  if (*read != read_bytes) {
-    co_return absl::InternalError("short extent block read");
+  pinned_ = state;
+  read_bytes_ = AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
+  buffer_wait_.emplace(&store.buffers_, read_bytes_);
+  if (buffer_wait_->await_ready()) FinishBufferWait();
+}
+
+StorageEngine::Impl::ReadExtentAwaitable::~ReadExtentAwaitable() {
+  if (pinned_) --pinned_->pins_;
+}
+
+void StorageEngine::Impl::ReadExtentAwaitable::FinishBufferWait() {
+  auto acquired = buffer_wait_->await_resume();
+  buffer_wait_.reset();
+  if (!acquired.ok())
+    ready_ = acquired.status();
+  else
+    lease_ = std::move(*acquired);
+}
+
+void StorageEngine::Impl::ReadExtentAwaitable::BufferReady(
+    bycorf::RemoteWork* work) {
+  auto& read = *static_cast<ReadExtentAwaitable*>(work);
+  read.FinishBufferWait();
+  if (read.ready_ || !read.SubmitRead(read.awaiting_))
+    read.store_.worker_->Enqueue(read.awaiting_);
+}
+
+bool StorageEngine::Impl::ReadExtentAwaitable::await_suspend(
+    std::coroutine_handle<> awaiting) {
+  if (remote_) {
+    remote_->await_suspend(awaiting);
+    return true;
   }
+  if (buffer_wait_) {
+    awaiting_ = awaiting;
+    run_fn_ = &BufferReady;
+    task_class_ = store_.worker_->IsBackground(awaiting)
+                      ? bycorf::TaskClass::kBackground
+                      : bycorf::CurrentTaskClass();
+    if (buffer_wait_->SuspendWith(*this)) return true;
+    FinishBufferWait();
+    if (ready_) return false;
+  }
+  return SubmitRead(awaiting);
+}
+
+bool StorageEngine::Impl::ReadExtentAwaitable::SubmitRead(
+    std::coroutine_handle<> awaiting) {
+  auto buffer = lease_.io_buffer();
+  buffer.size_ = read_bytes_;
+  const auto [file_id, offset] = engine_.FileOffset(ref_.block_id_);
+  return Suspend(
+      awaiting, lease_.registered()
+                    ? store_.worker_->SubmitReadFixed(store_.files_[file_id],
+                                                      buffer, offset, this)
+                    : store_.worker_->SubmitRead(
+                          store_.files_[file_id],
+                          std::span(buffer.data_, buffer.size_), offset, this));
+}
+
+absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
+  if (remote_) return remote_->await_resume();
+  if (ready_) return std::move(*ready_);
+  auto read =
+      Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
+  if (!read.ok()) return read.status();
+  store_.worker_->RecordStorageReadCompletion(*read);
+  if (static_cast<std::size_t>(*read) != read_bytes_)
+    return absl::InternalError("short extent block read");
+  const auto buffer = lease_.io_buffer();
   BlockHeader header{};
   if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                  io.data_, kBlockHeaderBytes),
+                                  buffer.data_, kBlockHeaderBytes),
                               &header) ||
       header.kind_ != BlockKind::kPayloadExtent ||
-      header.block_id_ != ref.block_id_ ||
-      header.allocation_epoch_ != ref.allocation_epoch_ ||
-      header.extent_index_ != extent_index ||
-      header.extent_payload_bytes_ != ref.payload_bytes_ ||
-      header.extent_payload_checksum_ != ref.payload_checksum_) {
-    co_return absl::InternalError("extent header does not match manifest");
-  }
-  const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
-                                                  ref.payload_bytes_);
-  if (Crc32c(payload) != ref.payload_checksum_) {
-    co_return absl::InternalError("extent payload checksum mismatch");
-  }
-  std::memcpy(destination.data(), payload.data() + source_offset,
-              destination.size());
-  co_return absl::OkStatus();
+      header.block_id_ != ref_.block_id_ ||
+      header.allocation_epoch_ != ref_.allocation_epoch_ ||
+      header.extent_index_ != extent_index_ ||
+      header.extent_payload_bytes_ != ref_.payload_bytes_ ||
+      header.extent_payload_checksum_ != ref_.payload_checksum_)
+    return absl::InternalError("extent header does not match manifest");
+  const auto payload = std::span<const std::byte>(
+      buffer.data_ + kBlockHeaderBytes, ref_.payload_bytes_);
+  // Even a partial read validates the entire extent before publishing bytes.
+  // This runs in the resumed task's budget, never on the I/O completion poller.
+  if (Crc32c(payload) != ref_.payload_checksum_)
+    return absl::InternalError("extent payload checksum mismatch");
+  std::memcpy(destination_.data(), payload.data() + source_offset_,
+              destination_.size());
+  return absl::OkStatus();
 }
 
 Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadOutOfIndexKey(
@@ -1337,21 +1356,25 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       replication_epoch_(partition.replication_epoch_),
       expected_db_epoch_(engine.EffectiveRecordDbEpoch(partition, db_id)),
       db_id_(db_id) {
-  if (location.grouped() || location.external() ||
-      location.block_owner() != store.worker_->id() || !PrepareLocal()) {
+  if (location.grouped()) {
+    // The grouped task owns its graph/version protocol. Keep its borrowed
+    // digest in this awaitable, not in the constructor's argument lifetime.
+    slow_ = engine.LoadGroupedValue(store, partition, db_id, key, digest_,
+                                    location, std::move(grouped_snapshot));
+  } else if (location.external() ||
+             location.block_owner() != store.worker_->id()) {
     slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
-                                 std::move(extents), trace,
-                                 std::move(grouped_snapshot));
-  } else if (ready_ && absl::IsAborted(ready_->status())) {
-    Retry(ready_->status());
+                                 std::move(extents), trace);
+  } else {
+    PrepareLocal();
+    if (ready_ && absl::IsAborted(ready_->status())) Retry(ready_->status());
   }
 }
 
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
-    ReadBufferLease lease)
+    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch)
     : engine_(engine),
       store_(store),
       key_(key),
@@ -1359,13 +1382,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       trace_(trace),
       replication_epoch_(replication_epoch),
       expected_db_epoch_(expected_db_epoch),
-      db_id_(db_id),
-      lease_(std::move(lease)) {
-  if (!PrepareLocal()) {
-    slow_ = engine.LoadValueLocalWaiting(store, db_id, key, location,
-                                         replication_epoch, trace,
-                                         expected_db_epoch, read_bytes_);
-  }
+      db_id_(db_id) {
+  PrepareLocal();
 }
 
 StorageEngine::Impl::LoadValueAwaitable::~LoadValueAwaitable() { Unpin(); }
@@ -1378,16 +1396,16 @@ void StorageEngine::Impl::LoadValueAwaitable::Unpin() {
     ReleaseStagingBuffer(store_, *state);
 }
 
-bool StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
+void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_VALUE_READ_KEY",
                                              key_)) {
     ready_.emplace(absl::InternalError("injected value payload read failure"));
-    return true;
+    return;
   });
   if (location_.external()) {
     ready_.emplace(
         absl::InternalError("external value was dispatched as inline"));
-    return true;
+    return;
   }
   const auto [file_id, block_offset] = engine_.FileOffset(location_.block_id());
   file_id_ = file_id;
@@ -1401,11 +1419,14 @@ bool StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   if (!lease_.valid()) {
     if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
     auto acquire = store_.buffers_.AcquireReadBuffer(read_bytes_);
-    if (!acquire.await_ready()) return false;
+    if (!acquire.await_ready()) {
+      buffer_wait_.emplace(&store_.buffers_, read_bytes_);
+      return;
+    }
     auto acquired = acquire.await_resume();
     if (!acquired.ok()) {
       ready_.emplace(acquired.status());
-      return true;
+      return;
     }
     lease_ = std::move(*acquired);
   }
@@ -1420,7 +1441,7 @@ bool StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   if (!state || !state->allocated_ || state->freeing_ ||
       state->allocation_epoch_ != location_.allocation_epoch()) {
     ready_.emplace(absl::AbortedError("stale index block epoch"));
-    return true;
+    return;
   }
   if (location_.in_memory() && state->in_memory_) [[unlikely]] {
     auto buffer = engine_.StagingBufferFor(store_, *state);
@@ -1428,7 +1449,7 @@ bool StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
         location_.record_offset() + location_.total_disk_bytes() >
             buffer.size_) {
       ready_.emplace(absl::InternalError("invalid in-memory location"));
-      return true;
+      return;
     }
     if (trace_) {
       trace_->io_submit_ns_ = trace_->buffer_acquired_ns_;
@@ -1440,17 +1461,16 @@ bool StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
       ready_.emplace(payload.status());
     else
       ready_.emplace(FinishRecord(data, *payload, true));
-    return true;
+    return;
   }
   if (read_bytes_ > lease_.io_buffer().size_) {
     ready_.emplace(absl::OutOfRangeError(
         "record exceeds registered read buffer capacity"));
-    return true;
+    return;
   }
   ++state->pins_;
   pinned_ = state;
   if (trace_) trace_->disk_read_ = true;
-  return true;
 }
 
 bool StorageEngine::Impl::LoadValueAwaitable::PopulationChanged() const {
@@ -1467,15 +1487,52 @@ void StorageEngine::Impl::LoadValueAwaitable::Retry(absl::Status failure) {
   // Inline reads have no extent manifest. Seed the failure so the slow path
   // resolves the index before any further I/O and preserves corruption errors
   // when the index still endorses the failed physical record.
-  slow_ =
-      engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
-                            location_, {}, trace_, nullptr, std::move(failure));
+  slow_ = engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
+                                location_, {}, trace_, std::move(failure));
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::FinishBufferWait() {
+  auto acquired = buffer_wait_->await_resume();
+  buffer_wait_.reset();
+  if (PopulationChanged()) {
+    ready_.emplace(absl::NotFoundError("key not found"));
+  } else if (!acquired.ok()) {
+    ready_.emplace(acquired.status());
+  } else {
+    lease_ = std::move(*acquired);
+    PrepareLocal();
+    if (partition_ && ready_ && absl::IsAborted(ready_->status()))
+      Retry(ready_->status());
+  }
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::BufferReady(
+    bycorf::RemoteWork* work) {
+  auto& read = *static_cast<LoadValueAwaitable*>(work);
+  read.FinishBufferWait();
+  auto next = read.SuspendRead(read.awaiting_);
+  if (next != std::noop_coroutine()) read.store_.worker_->Enqueue(next);
 }
 
 std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::await_suspend(
     std::coroutine_handle<> awaiting) {
+  if (buffer_wait_) {
+    awaiting_ = awaiting;
+    run_fn_ = &BufferReady;
+    task_class_ = store_.worker_->IsBackground(awaiting)
+                      ? bycorf::TaskClass::kBackground
+                      : bycorf::CurrentTaskClass();
+    if (buffer_wait_->SuspendWith(*this)) return std::noop_coroutine();
+    FinishBufferWait();
+  }
+  return SuspendRead(awaiting);
+}
+
+std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
+    std::coroutine_handle<> awaiting) {
   if (slow_.valid())
     return std::move(slow_).operator co_await().await_suspend(awaiting);
+  if (ready_) return awaiting;
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
   if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
@@ -1540,21 +1597,6 @@ StorageEngine::Impl::LoadValueAwaitable::await_resume() {
     payload_ = *parsed;
   }
   return FinishRecord(data, *payload_, false);
-}
-
-Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadValueLocalWaiting(
-    WorkerStore& store, std::uint8_t db_id, std::string_view key,
-    RecordLocation location, std::uint64_t replication_epoch,
-    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
-    std::size_t read_bytes) {
-  // Register exactly one waiter and pass its assigned lease into the same
-  // physical reader. Retrying acquisition would lose the pool's FIFO handoff.
-  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  if (!acquired.ok()) co_return acquired.status();
-  co_return co_await LoadValueAwaitable(
-      *this, store, db_id, key, location, replication_epoch, trace,
-      expected_db_epoch, std::move(*acquired));
 }
 
 absl::StatusOr<StorageEngine::Impl::LoadValueAwaitable::Payload>

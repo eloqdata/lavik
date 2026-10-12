@@ -5,6 +5,8 @@
 
 #include <sys/eventfd.h>
 
+#include <chrono>
+
 #include "../src/storage/engine/impl.h"
 #include "gtest/gtest.h"
 
@@ -16,6 +18,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
  protected:
   using Awaitable = StorageEngine::Impl::LoadValueAwaitable;
   using Result = Awaitable::Result;
+  using ExtentRead = StorageEngine::Impl::ReadExtentAwaitable;
 
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
@@ -150,15 +153,98 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     co_return read.await_resume();
   }
   Task<Result> AwaitRead() { co_return co_await Read(); }
-  auto Start(Task<Result>& task, bool background = false) {
+  Task<Result> AwaitExisting(Awaitable& read) { co_return co_await read; }
+  Task<absl::Status> AwaitExtent(ExtentRead& read) { co_return co_await read; }
+  bool BufferWaitIsBackground(Awaitable& read) {
+    return read.task_class_ == bycorf::TaskClass::kBackground;
+  }
+  bool HasRemote(const ExtentRead& read) { return read.remote_.has_value(); }
+  auto ExtentSlice(ExtentRef ref, std::size_t offset,
+                   std::span<std::byte> destination) {
+    return storage_.impl_->ReadExtentSlice(Store(), ref, 0, offset,
+                                           destination);
+  }
+  auto ExtentOnOwner(ExtentRef ref, std::span<std::byte> destination) {
+    return storage_.impl_->ReadExtentOnOwner(ref, 0, destination.data());
+  }
+
+  // Use a real fixed-file read for pool -> I/O handoff, rather than completing
+  // the request before the continuation actually submits it.
+  void InstallDiskImage(std::span<const std::byte> bytes) {
+    char path[] = "/tmp/lavik-awaitable-XXXXXX";
+    const int fd = mkstemp(path);
+    ASSERT_GE(fd, 0);
+    const auto offset = storage_.impl_->FileOffset(1).second;
+    const auto written = pwrite(fd, bytes.data(), bytes.size(), offset);
+    close(fd);
+    ASSERT_EQ(written, static_cast<ssize_t>(bytes.size()));
+    struct Opened : bycorf::IoCompletion {
+      bool done_ = false;
+      int result_ = -1;
+      void Complete(bycorf::Worker&, int result, unsigned) override {
+        result_ = result;
+        done_ = true;
+      }
+    } opened;
+    ASSERT_TRUE(worker_.RegisterFixedFiles(1).ok());
+    auto submitted =
+        worker_.SubmitOpenDirect(path, O_RDONLY | O_DIRECT, 0, {0}, &opened);
+    if (submitted.ok()) {
+      const auto until =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!opened.done_ && std::chrono::steady_clock::now() < until)
+        worker_.RunOnce(false);
+    }
+    unlink(path);
+    ASSERT_TRUE(submitted.ok()) << submitted;
+    ASSERT_TRUE(opened.done_);
+    ASSERT_EQ(opened.result_, 0);
+  }
+  void InstallRecord() {
+    std::vector<std::byte> bytes(
+        AlignDirect(location_.record_offset() + location_.total_disk_bytes()));
+    Encode(bytes.data() + location_.record_offset());
+    InstallDiskImage(bytes);
+  }
+  ExtentRef ExtentReference() {
+    return {1, 7, static_cast<std::uint32_t>(value_.size()),
+            Crc32c(std::as_bytes(std::span(value_)))};
+  }
+  void InstallExtent(bool corrupt = false) {
+    block_.kind_ = BlockKind::kPayloadExtent;
+    auto ref = ExtentReference();
+    std::vector<std::byte> bytes(
+        AlignDirect(kBlockHeaderBytes + value_.size()));
+    BlockHeader header;
+    header.block_id_ = 1;
+    header.allocation_epoch_ = 7;
+    header.kind_ = BlockKind::kPayloadExtent;
+    header.layout_worker_count_ = 1;
+    header.committed_bytes_ = kBlockHeaderBytes + value_.size();
+    header.extent_payload_bytes_ = value_.size();
+    header.extent_payload_checksum_ = ref.payload_checksum_;
+    EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                                  bytes.data(), kBlockHeaderSlotBytes));
+    std::memcpy(bytes.data() + kBlockHeaderBytes, value_.data(), value_.size());
+    // Corrupt beyond the slice returned by the test, inside the actual payload.
+    if (corrupt) bytes[kBlockHeaderBytes + value_.size() - 1] ^= std::byte{1};
+    InstallDiskImage(bytes);
+  }
+
+  template <typename T>
+  auto Start(Task<T>& task, bool background = false) {
     auto handle = std::move(task).operator co_await().await_suspend(
         std::noop_coroutine());
     if (background) worker_.RegisterBackground(handle);
     handle.resume();
     return handle;
   }
-  void Drain(Task<Result>& task) {
-    for (int i = 0; i < 100 && !task.done(); ++i) worker_.RunOnce(false);
+  template <typename T>
+  void Drain(Task<T>& task) {
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!task.done() && std::chrono::steady_clock::now() < until)
+      worker_.RunOnce(false);
     ASSERT_TRUE(task.done());
   }
   bool HelperIsBackground(Awaitable& read) {
@@ -200,18 +286,154 @@ TEST_F(LoadValueAwaitableTestPeer, UnawaitedReadReleasesPinAndBuffer) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(LoadValueAwaitableTestPeer, BufferWaitResumesWithAssignedLease) {
+TEST_F(LoadValueAwaitableTestPeer, BufferWaitUsesAssignedLeaseWithoutHelper) {
   Stage();
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
-  auto task = AwaitRead();
+  auto read = Read();
+  EXPECT_FALSE(HasHelper(read));
+  auto task = AwaitExisting(read);
+  Start(task, true);
+  EXPECT_FALSE(task.done());
+  EXPECT_TRUE(BufferWaitIsBackground(read));
+  EXPECT_EQ(block_.pins_, 0);
+  held->Reset();
+  // Handoff schedules the continuation; no decoding or nested resume occurs
+  // inside the buffer owner's release stack.
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectValue(std::move(task).TakeResult());
+  EXPECT_FALSE(HasHelper(read));
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
+  Stage();
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  auto first = Read();
+  auto second = Read();
+  auto first_task = AwaitExisting(first);
+  auto second_task = AwaitExisting(second);
+  Start(first_task);
+  Start(second_task);
+  held->Reset();
+  ASSERT_NO_FATAL_FAILURE(Drain(first_task));
+  EXPECT_FALSE(second_task.done());
+  // Taking/destroying the first result hands its sole slot to the second.
+  ExpectValue(std::move(first_task).TakeResult());
+  ASSERT_NO_FATAL_FAILURE(Drain(second_task));
+  ExpectValue(std::move(second_task).TakeResult());
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, BufferWaitContinuesIntoRealDiskIo) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  auto read = Read();
+  auto task = AwaitExisting(read);
   Start(task);
   EXPECT_FALSE(task.done());
-  EXPECT_EQ(block_.pins_, 0);
   held->Reset();
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   ExpectValue(std::move(task).TakeResult());
+  EXPECT_FALSE(HasHelper(read));
+}
+
+TEST_F(LoadValueAwaitableTestPeer, PopulationChangeDuringBufferWaitSkipsIo) {
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  auto read = Read();
+  auto task = AwaitExisting(read);
+  Start(task);
+  Invalidate(true);
+  held->Reset();
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsNotFound(std::move(task).TakeResult().status()));
+  EXPECT_FALSE(HasHelper(read));
+  EXPECT_EQ(block_.pins_, 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, RelocationDuringBufferWaitUsesNewLocation) {
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  auto read = Read();
+  auto task = AwaitExisting(read);
+  Start(task, true);
+  EXPECT_EQ(block_.pins_, 0);
+  // No physical pointer was retained while waiting: recycle before handoff.
+  block_.Reset(0, 8);
+  block_.allocated_ = true;
+  header_.allocation_epoch_ = 8;
+  location_ = RecordLocation(1, 9, 8, 0, value_.size(), location_.metadata_);
+  Stage();
+  IndexLocation();
+  held->Reset();
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectValue(std::move(task).TakeResult());
+  EXPECT_TRUE(HasHelper(read));
+  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, ExtentReadWaitsAndRoutesLocallyWithoutTask) {
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  std::vector<std::byte> output(value_.size());
+  {
+    auto read = ExtentOnOwner(ExtentReference(), output);
+    EXPECT_FALSE(HasRemote(read));
+    EXPECT_FALSE(read.await_ready());
+    EXPECT_EQ(block_.pins_, 1);
+    auto task = AwaitExtent(read);
+    Start(task, true);
+    held->Reset();
+    EXPECT_FALSE(task.done());
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    auto status = std::move(task).TakeResult();
+    EXPECT_TRUE(status.ok()) << status;
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                               output.size()),
+              value_);
+  }
+  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
+  ASSERT_NO_FATAL_FAILURE(InstallExtent(true));
+  std::array<std::byte, 2> output{std::byte{0x55}, std::byte{0x55}};
+  {
+    auto read = ExtentSlice(ExtentReference(), 0, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    auto status = std::move(task).TakeResult();
+    EXPECT_TRUE(absl::IsInternal(status)) << status;
+    EXPECT_EQ(status.message(), "extent payload checksum mismatch");
+    EXPECT_EQ(output[0], std::byte{0x55});
+    EXPECT_EQ(output[1], std::byte{0x55});
+  }
+  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, ExtentSliceReturnsRequestedBytes) {
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  std::array<std::byte, 3> output{};
+  auto read = ExtentSlice(ExtentReference(), 2, output);
+  auto task = AwaitExtent(read);
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  auto status = std::move(task).TakeResult();
+  EXPECT_TRUE(status.ok()) << status;
+  EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                             output.size()),
+            std::string_view(value_).substr(2, output.size()));
 }
 
 TEST_F(LoadValueAwaitableTestPeer, CompletionTransfersLeaseAndReleasesPin) {

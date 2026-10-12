@@ -468,12 +468,18 @@ bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() const noexcept {
 
 bool RegisteredBufferPool::AcquireReadAwaiter::await_suspend(
     std::coroutine_handle<> awaiting) {
-  if (pool_ == nullptr || !pool_->initialized() ||
-      minimum_payload_bytes_ > pool_->options_.read_payload_bytes() ||
-      !pool_->free_read_buffers_.empty()) {
-    return false;
-  }
+  if (await_ready()) return false;
   awaiting_ = awaiting;
+  pool_->read_waiters_.push_back(this);
+  return true;
+}
+
+bool RegisteredBufferPool::AcquireReadAwaiter::SuspendWith(
+    bycorf::RemoteWork& continuation) {
+  if (await_ready()) return false;
+  continuation_ = &continuation;
+  continuation.origin_ = pool_->owner_worker_;
+  continuation.reply_deferred_ = true;
   pool_->read_waiters_.push_back(this);
   return true;
 }
@@ -717,7 +723,9 @@ void RegisteredBufferPool::ReleaseLocal(std::uint16_t buffer_id) noexcept {
     AcquireReadAwaiter* waiter = read_waiters_.front();
     read_waiters_.pop_front();
     waiter->assigned_buffer_id_ = buffer_id;
-    if (worker_ != nullptr) {
+    if (waiter->continuation_ != nullptr) {
+      bycorf::PostRequest(cross_core_, owner_worker_, waiter->continuation_);
+    } else if (worker_ != nullptr) {
       worker_->Enqueue(waiter->awaiting_);
     }
     return;
