@@ -606,7 +606,12 @@ void StorageEngine::Impl::ReleaseFlushedStagingBuffer(WorkerStore& store,
   // observation (release here) or sees the closed bit and notifies the owner.
   // Checking first can strand release_pending_ with zero pins and no wakeup.
   state.CloseRemotePins();
-  if (state.pin_count() != 0) {
+  const auto pins = state.pin_count();
+  // Tests complete the last remote read after the count snapshot, before the
+  // release/defer decision. Keep this boundary tied to the real observation.
+  LAVIK_FAULT_INJECT(if (staging_release_count_test_hook_)
+                         staging_release_count_test_hook_(););
+  if (pins != 0) {
     state.release_pending_ = true;
     return;
   }

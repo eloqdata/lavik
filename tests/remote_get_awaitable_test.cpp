@@ -102,7 +102,9 @@ class RemoteGetTestPeer : public testing::Test {
     );
   }
 
-  void CheckFlushedBufferRelease(bool unpin_first) {
+  enum class UnpinPoint { kBeforeRelease, kAfterCount, kAfterRelease };
+
+  void CheckFlushedBufferRelease(UnpinPoint point) {
     auto& engine = *storage_.impl_;
     auto& store = *engine.stores_[0];
     block_.Reset(0, 7);
@@ -121,13 +123,29 @@ class RemoteGetTestPeer : public testing::Test {
       engine.UnpinRemoteBlock(block_, 0, 1);
       bycorf::SetThisWorker(0, &cross_core_, &worker_);
     };
-    if (unpin_first) unpin();
+    if (point == UnpinPoint::kBeforeRelease) unpin();
+#if LAVIK_FAULTS_ENABLED
+    bool injected = false;
+    if (point == UnpinPoint::kAfterCount) {
+      engine.staging_release_count_test_hook_ = [&] {
+        injected = true;
+        unpin();
+      };
+    }
+#endif
     engine.ReleaseFlushedStagingBuffer(store, block_, 1);
-    if (!unpin_first) {
+#if LAVIK_FAULTS_ENABLED
+    engine.staging_release_count_test_hook_ = {};
+    if (point == UnpinPoint::kAfterCount) {
+      ASSERT_TRUE(injected);
+      EXPECT_EQ(block_.pin_count(), 0);
+    }
+#endif
+    if (point != UnpinPoint::kBeforeRelease) {
       EXPECT_TRUE(block_.release_pending_);
       EXPECT_FALSE(block_.TryRemotePin());
       EXPECT_EQ(Pool().available_write_buffers(), 0);
-      unpin();
+      if (point == UnpinPoint::kAfterRelease) unpin();
       // A one-way notification alone must finish the release; no later local
       // read/unpin or maintenance pass is allowed to rescue a lost wakeup.
       const auto until =
@@ -320,8 +338,15 @@ TEST_F(RemoteGetTestPeer, CorruptShortAndFailedReadsReleaseResources) {
 }
 
 TEST_F(RemoteGetTestPeer, FlushReturnsStagingBufferAcrossLastRemoteUnpin) {
-  ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(true));
-  ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(false));
+  ASSERT_NO_FATAL_FAILURE(
+      CheckFlushedBufferRelease(UnpinPoint::kBeforeRelease));
+  ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(UnpinPoint::kAfterRelease));
+#if LAVIK_FAULTS_ENABLED
+  // The owner has observed one pin, but the reader exits before it can mark
+  // release_pending_. Moving CloseRemotePins after the count strands the slot
+  // here: the reader saw an open gate and did not post a notification.
+  ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(UnpinPoint::kAfterCount));
+#endif
 }
 
 }  // namespace lavik::storage

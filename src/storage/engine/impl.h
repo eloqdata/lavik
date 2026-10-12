@@ -4857,6 +4857,11 @@ class StorageEngine::Impl {
   std::array<AsyncMutex, kLogicalDatabaseCount> replica_db_epoch_mutexes_;
   std::atomic<unsigned> active_defrags_{0};
   std::atomic<unsigned> pending_defrags_{0};
+#if LAVIK_FAULTS_ENABLED
+  // Synchronous owner-side injection after a staging-release pin snapshot.
+  // Models a remote unpin without OS scheduling; absent in production builds.
+  std::function<void()> staging_release_count_test_hook_;
+#endif
   std::atomic<unsigned> active_flushes_{0};
   // Extent reclaims in flight (from the moment they are spawned): the block
   // allocator must not report the device full while one may still free space.
