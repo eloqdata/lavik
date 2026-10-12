@@ -929,6 +929,8 @@ struct ScanHashMapReadStates {
 
   std::array<ScanHashMapReadState, Count> stripes_{};
 
+  void Prefetch() const noexcept { __builtin_prefetch(&disabled_, 0, 3); }
+
   ScanHashMapReadGuard TryRead(std::uint64_t hash) noexcept {
     if (disabled_.load(std::memory_order_acquire)) return {};
     auto& state = stripes_[hash & (Count - 1)].state_;
@@ -1308,6 +1310,16 @@ class ScanHashMap {
   // Admission belongs to the map object, not a detached entry population.
   // The caller protects this object's lifetime before TryRead and through the
   // guard's destruction. Read guards must not cross a coroutine suspension.
+  // Address-only hints on the lifetime-protected map. Do not follow bucket
+  // or arena pointers before reader admission: a concurrent resize may own
+  // those populations. Hashing the key can overlap these two metadata loads.
+  void PrefetchRead() const noexcept
+    requires(ReadStripeCount != 0)
+  {
+    __builtin_prefetch(&tables_[0], 0, 3);
+    read_states_.Prefetch();
+  }
+
   ScanHashMapReadGuard TryRead(const Digest& digest) noexcept
     requires(ReadStripeCount != 0)
   {

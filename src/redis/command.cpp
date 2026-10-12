@@ -13113,15 +13113,14 @@ Task<CommandReply> ExecuteCommandBody(
         // cluster reads learned the same route during admission. Deriving the
         // worker from the retained slot is cheaper than hashing args[1] again.
         const bool routed = request.HasRoutedPartitionFor(1);
-        const unsigned target =
-            routed ? request.RoutedPartitionId() % g_storage->worker_count()
-                   : ShardForKey(args[1]);
+        const std::uint16_t slot =
+            routed ? request.RoutedPartitionId() : storage::RedisSlot(args[1]);
+        const unsigned target = slot % g_storage->worker_count();
         if (request.kind_ == CommandKind::kGet && args.size() == 2 &&
             target != ThisWorker().id_) {
-          auto fast = co_await g_storage->TryRemoteGet(
-              request.db_id_, args[1],
-              routed ? request.RoutedPartitionId()
-                     : storage::RedisSlot(args[1]));
+          // Reuse the route hash for admission on the connection worker.
+          auto fast =
+              co_await g_storage->TryRemoteGet(request.db_id_, args[1], slot);
           if (fast) {
             if (const char* error = CommandServingGenerationError(request);
                 error)

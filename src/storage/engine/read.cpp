@@ -256,8 +256,9 @@ StorageEngine::Impl::TryRemoteGet(std::uint8_t db_id, std::string_view key,
            !request_serving_fenced_until_restart_.load(
                std::memory_order_acquire);
   };
-  const auto digest = ComputeDigest(key);
   auto& index = PartitionFor(source, slot).indexes_[db_id];
+  index.PrefetchRead();
+  const auto digest = ComputeDigest(key);
   auto reader = index.TryRead(digest);
   if (!reader) co_return std::nullopt;
   const auto* entry = std::as_const(index).Find(digest, key);
