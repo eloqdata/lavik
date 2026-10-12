@@ -2936,8 +2936,7 @@ acquire_active_stream:
     if (!index_write.ready()) [[unlikely]] {
       // Retain the outer closure while the slow path drains readers and
       // rechecks capacity. Ordinary writes need no extra coroutine frame.
-      index_write =
-          co_await AwaitIndexWrite(*store.worker_, *index_ptr, request.digest_);
+      index_write = co_await AwaitIndexWrite(*index_ptr, request.digest_);
     }
   }
   RecordIndex::Entry* previous_entry = nullptr;
@@ -2946,7 +2945,9 @@ acquire_active_stream:
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
       index_write.Reset();
-      index_write = co_await AwaitAllIndexReaders(*store.worker_, *index_ptr);
+      index_write = index_ptr->CloseAllReaders();
+      if (!index_write.ready()) [[unlikely]]
+        index_write = co_await AwaitIndexReaders(std::move(index_write));
       auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
                                                  request.digest_, request.key_);
       if (!resolved.ok()) {

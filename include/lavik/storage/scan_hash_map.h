@@ -1373,12 +1373,11 @@ class ScanHashMap {
     // Otherwise that final step could reopen unrelated readers before a later
     // insertion grows the shared overflow directory.
     if (Rehashing() || resize_pending_ || !tables_[0].buckets_) return true;
-    if (!Rehashing() &&
-        tables_[0].used_ + 1 >
+    if (tables_[0].used_ + 1 >
             BucketCount(tables_[0]) * kTargetEntriesPerBucket &&
         tables_[0].exponent_ < MaxBucketExponent)
       return true;
-    const Table& table = Rehashing() ? tables_[1] : tables_[0];
+    const Table& table = tables_[0];
     const Bucket* bucket = &table.buckets_[Hash(digest) & BucketMask(table)];
     while (bucket != nullptr) {
       for (auto handle : bucket->entries_)

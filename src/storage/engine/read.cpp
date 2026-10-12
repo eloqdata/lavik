@@ -286,8 +286,8 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
   }
   // Cold representations and expiration retain the complete owner state
   // machine (including expiry scheduling and indirect-key collision checks).
-  if (!entry->key_complete() || entry->value_.grouped() ||
-      entry->value_.external() || entry->value_.in_memory() ||
+  if (entry->value_.grouped() || entry->value_.external() ||
+      entry->value_.in_memory() ||
       entry->value_.value_type() != ValueType::kString || IsExpiredNow(*entry))
     return;
   const RecordLocation location = MaterializeIndexLocation(*entry);
@@ -1832,70 +1832,36 @@ StorageEngine::Impl::LoadValueAwaitable::await_resume() {
   return FinishRecord(data, *payload_, false);
 }
 
-absl::StatusOr<StorageEngine::Impl::LoadValueAwaitable::Payload>
+absl::StatusOr<StorageEngine::Impl::RecordPayload>
 StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
     const std::byte* data) const {
-  RecordHeader record{};
-  std::string_view disk_key;
-  if (!DecodeRecordHeader(std::span(data, location_.total_disk_bytes()),
-                          &record, &disk_key) ||
-      record.db_id_ != db_id_ || (!record.key_indirect_ && disk_key != key_) ||
-      record.kind_ != RecordKind::kValue ||
-      record.db_epoch_ != (expected_db_epoch_ ? *expected_db_epoch_
-                                              : engine_.DbEpoch(db_id_)) ||
-      record.mutation_sequence_ != location_.mutation_sequence_ ||
-      record.replication_epoch_ != replication_epoch_ ||
-      record.allocation_epoch_ != location_.allocation_epoch() ||
-      record.expire_at_ms_ != location_.expire_at_ms_ ||
-      record.value_type_ != location_.value_type() ||
-      record.external_ != location_.external() ||
-      record.key_indirect_ != location_.key_indirect() ||
-      record.logical_size_ != location_.logical_size_ ||
-      record.total_disk_bytes_ != location_.total_disk_bytes()) {
-    return absl::AbortedError("record does not match in-memory location");
-  }
-  if (record.key_indirect_ && record.key_bytes_ != key_.size())
-    return absl::AbortedError("record key does not match location");
-  if (record.value_type_ == ValueType::kString && !record.grouped_ &&
-      !record.auxiliary_group_ && record.payload_bytes_ != record.logical_size_)
-    return absl::InternalError("inline value length does not match metadata");
-  return Payload{record.txid_, record.header_bytes_, record.payload_bytes_,
-                 record.payload_checksum_};
+  return ParseValueRecord(
+      data, db_id_, key_, location_,
+      expected_db_epoch_ ? *expected_db_epoch_ : engine_.DbEpoch(db_id_),
+      replication_epoch_);
 }
 
 StorageEngine::Impl::LoadValueAwaitable::Result
 StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
-                                                      Payload payload,
+                                                      RecordPayload payload,
                                                       bool staged) {
-  const auto* value = data + payload.offset_;
-  if (Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
-    return absl::InternalError("record value checksum mismatch");
-  if (staged || payload.bytes_ > engine_.DirectGetValueLimit()) {
-    std::memmove(lease_.io_buffer().data_, value, payload.bytes_);
-    value = lease_.io_buffer().data_;
-  }
-  const auto offset = static_cast<std::size_t>(value - lease_.bytes().data());
-  if (trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
-  return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
+  auto loaded = engine_.FinishValueRecord(lease_, data, payload, staged);
+  if (loaded.ok() && trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
+  return loaded;
 }
 
-absl::StatusOr<StorageEngine::Impl::LoadedValue>
-StorageEngine::Impl::DecodeRemoteValue(ReadBufferLease lease,
-                                       std::uint8_t db_id, std::string_view key,
-                                       RecordLocation location,
-                                       std::uint64_t replication_epoch,
-                                       std::size_t record_headroom,
-                                       std::uint64_t expected_db_epoch) {
-  const FixedBuffer io = lease.io_buffer();
+absl::StatusOr<StorageEngine::Impl::RecordPayload>
+StorageEngine::Impl::ParseValueRecord(const std::byte* data, std::uint8_t db_id,
+                                      std::string_view key,
+                                      const RecordLocation& location,
+                                      std::uint64_t db_epoch,
+                                      std::uint64_t replication_epoch) {
   RecordHeader record{};
   std::string_view disk_key;
-  const std::byte* record_data = io.data_ + record_headroom;
-  std::span<const std::byte> record_bytes(record_data,
-                                          location.total_disk_bytes());
-  if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
+  if (!DecodeRecordHeader(std::span(data, location.total_disk_bytes()), &record,
+                          &disk_key) ||
       record.db_id_ != db_id || (!record.key_indirect_ && disk_key != key) ||
-      record.kind_ != RecordKind::kValue ||
-      record.db_epoch_ != expected_db_epoch ||
+      record.kind_ != RecordKind::kValue || record.db_epoch_ != db_epoch ||
       record.mutation_sequence_ != location.mutation_sequence_ ||
       record.replication_epoch_ != replication_epoch ||
       record.allocation_epoch_ != location.allocation_epoch() ||
@@ -1905,33 +1871,44 @@ StorageEngine::Impl::DecodeRemoteValue(ReadBufferLease lease,
       record.key_indirect_ != location.key_indirect() ||
       record.logical_size_ != location.logical_size_ ||
       record.total_disk_bytes_ != location.total_disk_bytes()) {
-    return absl::Status(absl::StatusCode::kAborted,
-                        "record does not match in-memory location");
+    return absl::AbortedError("record does not match in-memory location");
   }
-  const std::byte* payload_data = record_data + record.header_bytes_;
-  if (record.key_indirect_ && record.key_bytes_ != key.size()) {
-    return absl::Status(absl::StatusCode::kAborted,
-                        "record key does not match location");
-  }
-  const std::size_t value_bytes = record.payload_bytes_;
+  if (record.key_indirect_ && record.key_bytes_ != key.size())
+    return absl::AbortedError("record key does not match location");
   if (record.value_type_ == ValueType::kString && !record.grouped_ &&
-      !record.auxiliary_group_ && value_bytes != record.logical_size_) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "inline value length does not match metadata");
+      !record.auxiliary_group_ && record.payload_bytes_ != record.logical_size_)
+    return absl::InternalError("inline value length does not match metadata");
+  return RecordPayload{record.txid_, record.header_bytes_,
+                       record.payload_bytes_, record.payload_checksum_};
+}
+
+absl::StatusOr<StorageEngine::Impl::LoadedValue>
+StorageEngine::Impl::FinishValueRecord(ReadBufferLease& lease,
+                                       const std::byte* data,
+                                       RecordPayload payload, bool staged) {
+  const auto* value = data + payload.offset_;
+  if (Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
+    return absl::InternalError("record value checksum mismatch");
+  if (staged || payload.bytes_ > DirectGetValueLimit()) {
+    std::memmove(lease.io_buffer().data_, value, payload.bytes_);
+    value = lease.io_buffer().data_;
   }
-  if (Crc32c(std::span<const std::byte>(payload_data, record.payload_bytes_)) !=
-      record.payload_checksum_) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "record value checksum mismatch");
-  }
-  const std::byte* framed_value = payload_data;
-  if (value_bytes > DirectGetValueLimit()) {
-    std::memmove(io.data_, payload_data, value_bytes);
-    framed_value = io.data_;
-  }
-  const std::size_t value_offset =
-      static_cast<std::size_t>(framed_value - lease.bytes().data());
-  return LoadedValue{std::move(lease), value_offset, value_bytes, record.txid_};
+  const auto offset = static_cast<std::size_t>(value - lease.bytes().data());
+  return LoadedValue{std::move(lease), offset, payload.bytes_, payload.txid_};
+}
+
+absl::StatusOr<StorageEngine::Impl::LoadedValue>
+StorageEngine::Impl::DecodeRemoteValue(ReadBufferLease lease,
+                                       std::uint8_t db_id, std::string_view key,
+                                       RecordLocation location,
+                                       std::uint64_t replication_epoch,
+                                       std::size_t record_headroom,
+                                       std::uint64_t expected_db_epoch) {
+  const auto* data = lease.io_buffer().data_ + record_headroom;
+  auto payload = ParseValueRecord(data, db_id, key, location, expected_db_epoch,
+                                  replication_epoch);
+  if (!payload.ok()) return payload.status();
+  return FinishValueRecord(lease, data, *payload, false);
 }
 
 }  // namespace lavik::storage

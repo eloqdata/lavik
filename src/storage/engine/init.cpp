@@ -1993,8 +1993,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       {
         UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
         auto index_write = co_await AwaitIndexWrite(
-            *store.worker_, partition.indexes_[expired.db_id_],
-            expired.digest_);
+            partition.indexes_[expired.db_id_], expired.digest_);
         auto resolved = co_await FindVerifiedEntry(
             store, partition.indexes_[expired.db_id_], expired.digest_,
             expired.key_);

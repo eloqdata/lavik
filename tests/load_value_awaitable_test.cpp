@@ -424,6 +424,9 @@ TEST_F(LoadValueAwaitableTestPeer, ErrorsReleaseResources) {
       header_.payload_checksum_ ^= 1;
       ASSERT_NO_FATAL_FAILURE(Complete(read, completion));
       header_.payload_checksum_ ^= 1;
+      // A full CQE parses metadata only; CRC failure is discovered when the
+      // caller resumes, not while the I/O poller is processing completions.
+      if (completion == 4096) EXPECT_FALSE(read.await_ready());
       EXPECT_FALSE(read.await_resume().ok());
     }
     EXPECT_EQ(block_.pin_count(), 0);

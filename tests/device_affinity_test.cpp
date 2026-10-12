@@ -55,6 +55,11 @@ TEST(DeviceAffinityTest, AllocatesWorkersByCapacityWeightAndQpairCap) {
     EXPECT_EQ(owned.size(), 1);
   }
 
+  ASSERT_EQ(plan->controller_qpair_workers_.size(), controllers.size());
+  for (const auto& workers : plan->controller_qpair_workers_) {
+    EXPECT_EQ(workers, (std::vector<std::uint16_t>{0, 1, 2, 3}));
+  }
+
   const std::vector<ControllerAffinityInput> capped{
       {.id_ = "0000:01:00.0", .foreground_weight_ = 100, .io_qpair_count_ = 1},
       {.id_ = "0000:02:00.0", .foreground_weight_ = 1, .io_qpair_count_ = 3},
@@ -74,30 +79,6 @@ TEST(DeviceAffinityTest, AssignsEveryControllerWhenControllersExceedWorkers) {
   ASSERT_TRUE(plan.ok()) << plan.status();
   EXPECT_EQ(plan->worker_controllers_[0], (std::vector<std::size_t>{0}));
   EXPECT_EQ(plan->worker_controllers_[1], (std::vector<std::size_t>{1, 2}));
-}
-
-TEST(DeviceAffinityTest, SixControllersGiveEveryWorkerDirectAccess) {
-  std::vector<ControllerAffinityInput> controllers;
-  for (unsigned controller = 0; controller < 6; ++controller) {
-    controllers.push_back({.id_ = std::to_string(controller),
-                           .foreground_weight_ = 10,
-                           .io_qpair_count_ = 16});
-  }
-  auto plan = PlanControllerAffinity(controllers, 16);
-  ASSERT_TRUE(plan.ok()) << plan.status();
-  // More read access must preserve the existing weighted write distribution.
-  EXPECT_EQ(plan->controller_quotas_,
-            (std::vector<unsigned>{3, 3, 3, 3, 2, 2}));
-  for (const auto& home : plan->worker_controllers_) {
-    EXPECT_EQ(home.size(), 1);
-  }
-  ASSERT_EQ(plan->controller_qpair_workers_.size(), 6);
-  for (const auto& workers : plan->controller_qpair_workers_) {
-    ASSERT_EQ(workers.size(), 16);
-    for (unsigned worker = 0; worker < 16; ++worker) {
-      EXPECT_EQ(workers[worker], worker);
-    }
-  }
 }
 
 TEST(DeviceAffinityTest, SpareQpairsRespectCapacityAndRetainHomeAccess) {

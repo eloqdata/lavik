@@ -518,8 +518,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (!index_write.ready()) [[unlikely]] {
         // Keep admission closed across the slow wait. Most flush updates
         // have no registered reader and need no waiting coroutine.
-        index_write = co_await AwaitIndexValueWrite(*store->worker_, index,
-                                                    identity.entry_hash_);
+        index_write = co_await AwaitIndexReaders(std::move(index_write));
       }
       // Detach can run while the reader drain yields. Recheck the population
       // before resolving the saved integer address into this index.

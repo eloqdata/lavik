@@ -14,23 +14,6 @@ import time
 import defrag_payload_e2e as support
 
 
-class Client(support.Client):
-    def response(self):
-        head = self.stream.readline()
-        assert head.endswith(b"\r\n"), head
-        assert not head.startswith(b"-"), head
-        if head.startswith(b"*"):
-            return [self.response() for _ in range(int(head[1:-2]))]
-        if head.startswith(b"$"):
-            size = int(head[1:-2])
-            if size < 0:
-                return None
-            data = self.stream.read(size)
-            assert self.stream.read(2) == b"\r\n"
-            return data
-        return head[1:-2]
-
-
 def stats(client):
     return dict(
         line.split(b":", 1)
@@ -75,19 +58,16 @@ def check():
         missing = [b"{" + key + b"}:missing" for key in keys[:100]]
         assert admin.batch([[b"GET", key] for key in missing]) == [None] * len(missing)
 
-        def read():
-            client = Client(port)
+        def read(count, allowed):
+            client = support.Client(port)
             try:
-                for i in range(6000):
-                    assert client.batch([[b"GET", keys[i % 1000]]])[0] in (
-                        before,
-                        after,
-                    )
+                for i in range(count):
+                    assert client.batch([[b"GET", keys[i % 1000]]])[0] in allowed
             finally:
                 client.close()
 
         def write():
-            client = Client(port)
+            client = support.Client(port)
             try:
                 # Retire enough of the first sealed blocks to overlap reads
                 # with the ordinary defrag admission and last-unpin retry.
@@ -101,22 +81,15 @@ def check():
                 client.close()
 
         with ThreadPoolExecutor(max_workers=5) as pool:
-            tasks = [pool.submit(read) for _ in range(4)] + [pool.submit(write)]
+            tasks = [pool.submit(read, 6000, (before, after)) for _ in range(4)]
+            tasks.append(pool.submit(write))
             for task in tasks:
                 task.result()
 
         # Clear while requests are arriving. Either generation is valid for
         # an overlapping GET, but stale bytes must never reappear after FLUSHDB.
-        def read_during_flush():
-            client = Client(port)
-            try:
-                for i in range(1000):
-                    assert client.batch([[b"GET", keys[i]]])[0] in (None, before, after)
-            finally:
-                client.close()
-
         with ThreadPoolExecutor(max_workers=2) as pool:
-            task = pool.submit(read_during_flush)
+            task = pool.submit(read, 1000, (None, before, after))
             assert admin.batch([[b"FLUSHDB"]]) == [b"OK"]
             task.result()
         for batch in support.chunks(keys[:1000]):

@@ -48,6 +48,9 @@ class Client:
     def response(self):
         head = self.stream.readline()
         assert head.endswith(b"\r\n"), head
+        if head[:1] == b"*":
+            size = int(head[1:-2])
+            return None if size == -1 else [self.response() for _ in range(size)]
         if head[:1] == b"$":
             size = int(head[1:-2])
             if size == -1:

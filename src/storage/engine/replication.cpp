@@ -1577,8 +1577,9 @@ StorageEngine::Impl::ResetReplicaPartitions(
     sync->local_db_epochs_ = local_db_epochs;
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
-      auto index_write = co_await AwaitAllIndexReaders(
-          *store.worker_, partition.indexes_[db_id]);
+      auto index_write = partition.indexes_[db_id].CloseAllReaders();
+      if (!index_write.ready()) [[unlikely]]
+        index_write = co_await AwaitIndexReaders(std::move(index_write));
       QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                          &partition.grouped_objects_[db_id]);
       partition.fullsync_coverage_bytes_[db_id] = 0;
@@ -1689,8 +1690,9 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
     auto& partition = PartitionFor(store, partition_ids[i]);
     for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
       ++partition.grouped_generations_[db_id];
-      auto index_write = co_await AwaitAllIndexReaders(
-          *store.worker_, partition.indexes_[db_id]);
+      auto index_write = partition.indexes_[db_id].CloseAllReaders();
+      if (!index_write.ready()) [[unlikely]]
+        index_write = co_await AwaitIndexReaders(std::move(index_write));
       QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                          &partition.grouped_objects_[db_id]);
       partition.fullsync_coverage_bytes_[db_id] = 0;
@@ -2415,8 +2417,9 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
           for (std::uint8_t db_id = 0; db_id < options_.database_count_;
                ++db_id) {
             ++partition.grouped_generations_[db_id];
-            auto index_write = co_await AwaitAllIndexReaders(
-                *store.worker_, partition.indexes_[db_id]);
+            auto index_write = partition.indexes_[db_id].CloseAllReaders();
+            if (!index_write.ready()) [[unlikely]]
+              index_write = co_await AwaitIndexReaders(std::move(index_write));
             QueueDetachedIndex(store, partition.indexes_[db_id], db_id,
                                &partition.grouped_objects_[db_id]);
             partition.fullsync_coverage_bytes_[db_id] = 0;

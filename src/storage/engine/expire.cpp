@@ -386,7 +386,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   // transaction dependencies. The key hold excludes logical writes, but GC
   // may replace the index entry and the group's physical coordinates.
   auto index_write = co_await AwaitIndexWrite(
-      *store.worker_, partition.indexes_[candidate.db_id_], candidate.digest_);
+      partition.indexes_[candidate.db_id_], candidate.digest_);
   resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
                                  candidate.digest_, candidate.key_);
