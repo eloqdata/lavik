@@ -1612,8 +1612,15 @@ class StorageEngine {
   // Admission runs synchronously; immediately co_await the result on this
   // worker, keeping key and request admission alive through completion. The
   // fast path submits I/O without a child Task; buffer contention falls back.
+  // Trace builds optionally borrow caller-owned timing state through
+  // completion.
   RemoteGetAwaitable TryRemoteGet(std::uint8_t db_id, std::string_view key,
-                                  std::uint16_t slot);
+                                  std::uint16_t slot
+#if LAVIK_ENABLE_TRACE
+                                  ,
+                                  ReadLatencyTrace* trace = nullptr
+#endif
+  );
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
@@ -1995,7 +2002,12 @@ class StorageEngine::RemoteGetAwaitable {
   };
 
   RemoteGetAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
-                     std::uint16_t slot);
+                     std::uint16_t slot
+#if LAVIK_ENABLE_TRACE
+                     ,
+                     ReadLatencyTrace* trace
+#endif
+  );
   bool Current(const Impl& engine) const noexcept;
 
   Result ready_;
@@ -2012,7 +2024,32 @@ class StorageEngine::RemoteGetAwaitable {
   // including when an admitted awaitable is destroyed without being awaited.
   Pin pin_;
   ReadBufferLease lease_;
+#if LAVIK_ENABLE_TRACE
+  // Timestamp the actual CQE before the connection is scheduled again. This
+  // trace-only completion leaves the production I/O awaitable and frame intact.
+  class TracedReadIo : public bycorf::OneShotIoAwaitable {
+   public:
+    TracedReadIo(bycorf::Worker& worker, bycorf::FixedFile file,
+                 bycorf::FixedBuffer buffer, std::uint64_t offset,
+                 bycorf::SizeIoAwaitable::Operation operation,
+                 ReadLatencyTrace* trace);
+    bool await_suspend(std::coroutine_handle<> awaiting);
+    absl::StatusOr<std::size_t> await_resume();
+    void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
+
+   private:
+    bycorf::Worker& worker_;
+    bycorf::FixedFile file_;
+    bycorf::FixedBuffer buffer_;
+    std::uint64_t offset_;
+    bool fixed_;
+    ReadLatencyTrace* trace_;
+  };
+  ReadLatencyTrace* trace_;
+  std::optional<TracedReadIo> io_;
+#else
   std::optional<bycorf::SizeIoAwaitable> io_;
+#endif
 };
 
 }  // namespace lavik::storage

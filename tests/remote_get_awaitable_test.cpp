@@ -93,7 +93,54 @@ class RemoteGetTestPeer : public testing::Test {
   }
 
   RegisteredBufferPool& Pool() { return storage_.impl_->stores_[0]->buffers_; }
-  auto Read() { return storage_.TryRemoteGet(0, key_, 1); }
+  auto Read() {
+    return storage_.TryRemoteGet(0, key_, 1
+#if LAVIK_ENABLE_TRACE
+                                 ,
+                                 &trace_
+#endif
+    );
+  }
+
+  void CheckFlushedBufferRelease(bool unpin_first) {
+    auto& engine = *storage_.impl_;
+    auto& store = *engine.stores_[0];
+    block_.Reset(0, 7);
+    block_.allocated_ = true;
+    block_.committed_bytes_ = kBlockHeaderBytes + 4096;
+    block_.live_bytes_ =
+        4096;  // No defrag: only the flush may return this slot.
+    block_.staging_slot_ = store.staging_slots_.size();
+    store.staging_slots_.emplace_back();
+    ASSERT_TRUE(Pool().TryAcquireWriteBuffer(
+        &store.staging_slots_.back().write_buffer_id_));
+    ASSERT_EQ(Pool().available_write_buffers(), 0);
+    ASSERT_TRUE(block_.TryRemotePin());
+    auto unpin = [&] {
+      bycorf::SetThisWorker(1, &cross_core_, &owner_);
+      engine.UnpinRemoteBlock(block_, 0, 1);
+      bycorf::SetThisWorker(0, &cross_core_, &worker_);
+    };
+    if (unpin_first) unpin();
+    engine.ReleaseFlushedStagingBuffer(store, block_, 1);
+    if (!unpin_first) {
+      EXPECT_TRUE(block_.release_pending_);
+      EXPECT_FALSE(block_.TryRemotePin());
+      EXPECT_EQ(Pool().available_write_buffers(), 0);
+      unpin();
+      // A one-way notification alone must finish the release; no later local
+      // read/unpin or maintenance pass is allowed to rescue a lost wakeup.
+      const auto until =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (block_.release_pending_ &&
+             std::chrono::steady_clock::now() < until)
+        worker_.RunOnce(false);
+    }
+    EXPECT_EQ(block_.pin_count(), 0);
+    EXPECT_FALSE(block_.release_pending_);
+    EXPECT_EQ(block_.staging_slot_, 0);
+    EXPECT_EQ(Pool().available_write_buffers(), 1);
+  }
 
   void Complete(Awaitable& read, int bytes = -1) {
     ASSERT_TRUE(read.io_.has_value());
@@ -153,15 +200,28 @@ class RemoteGetTestPeer : public testing::Test {
   std::string key_;
   std::string value_ = "remote value";
   RecordHeader header_;
+#if LAVIK_ENABLE_TRACE
+  ReadLatencyTrace trace_;
+#endif
 };
 
 TEST_F(RemoteGetTestPeer, SynchronousMissAndClosedIndexFallback) {
   {
-    auto read = storage_.TryRemoteGet(0, "absent", 1);
+    auto read = storage_.TryRemoteGet(0, "absent", 1
+#if LAVIK_ENABLE_TRACE
+                                      ,
+                                      &trace_
+#endif
+    );
     ASSERT_TRUE(read.await_ready());
     auto result = read.await_resume();
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(absl::IsNotFound(result->status()));
+#if LAVIK_ENABLE_TRACE
+    EXPECT_NE(trace_.lookup_done_ns_, 0);
+    EXPECT_FALSE(trace_.hit_);
+    EXPECT_FALSE(trace_.disk_read_);
+#endif
   }
   auto writer = index_.CloseAllReaders();
   auto read = Read();
@@ -199,7 +259,18 @@ TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {
     auto read = Read();
     ASSERT_FALSE(read.await_ready());
     ASSERT_NO_FATAL_FAILURE(Complete(read));
+#if LAVIK_ENABLE_TRACE
+    EXPECT_NE(trace_.lookup_done_ns_, 0);
+    EXPECT_TRUE(trace_.hit_);
+    EXPECT_NE(trace_.buffer_acquired_ns_, 0);
+    const auto completed = trace_.io_complete_ns_;
+    EXPECT_NE(completed, 0);
+#endif
     result = read.await_resume();
+#if LAVIK_ENABLE_TRACE
+    EXPECT_EQ(trace_.io_complete_ns_, completed);
+    EXPECT_GE(trace_.decode_done_ns_, completed);
+#endif
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->status();
     auto bytes = result->value().value_bytes();
@@ -246,6 +317,11 @@ TEST_F(RemoteGetTestPeer, CorruptShortAndFailedReadsReleaseResources) {
     EXPECT_EQ(block_.pin_count(), 0);
     EXPECT_EQ(Pool().available_read_buffers(), 1);
   }
+}
+
+TEST_F(RemoteGetTestPeer, FlushReturnsStagingBufferAcrossLastRemoteUnpin) {
+  ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(true));
+  ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(false));
 }
 
 }  // namespace lavik::storage

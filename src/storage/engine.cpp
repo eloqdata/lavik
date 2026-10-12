@@ -635,8 +635,18 @@ void StorageEngine::SetReplicaLoading(bool loading) noexcept {
 }
 
 StorageEngine::RemoteGetAwaitable StorageEngine::TryRemoteGet(
-    std::uint8_t db_id, std::string_view key, std::uint16_t slot) {
-  return RemoteGetAwaitable(*impl_, db_id, key, slot);
+    std::uint8_t db_id, std::string_view key, std::uint16_t slot
+#if LAVIK_ENABLE_TRACE
+    ,
+    ReadLatencyTrace* trace
+#endif
+) {
+  return RemoteGetAwaitable(*impl_, db_id, key, slot
+#if LAVIK_ENABLE_TRACE
+                            ,
+                            trace
+#endif
+  );
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Get(

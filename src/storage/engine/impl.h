@@ -3416,6 +3416,9 @@ class StorageEngine::Impl {
                                const BlockState& state) const;
 
   static void ReleaseStagingBuffer(WorkerStore& store, BlockState& state);
+  // Retires a sealed, durable staging buffer after draining remote pins.
+  void ReleaseFlushedStagingBuffer(WorkerStore& store, BlockState& state,
+                                   std::uint64_t block_id);
 
   struct LoadedValue {
     ReadBufferLease lease_;

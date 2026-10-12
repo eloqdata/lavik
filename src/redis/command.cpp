@@ -13116,31 +13116,57 @@ Task<CommandReply> ExecuteCommandBody(
         const std::uint16_t slot =
             routed ? request.RoutedPartitionId() : storage::RedisSlot(args[1]);
         const unsigned target = slot % g_storage->worker_count();
+#if LAVIK_ENABLE_TRACE
+        ReadLatencyTrace trace;
+        if (request.kind_ == CommandKind::kGet) {
+          trace.request_start_ns_ = ReadTraceNowNanos();
+          // Remote describes key ownership, even when this worker issues I/O.
+          trace.remote_ = target != ThisWorker().id_;
+        }
+#endif
         if (request.kind_ == CommandKind::kGet && args.size() == 2 &&
             target != ThisWorker().id_) {
           // Reuse the route hash for admission on the connection worker.
+#if LAVIK_ENABLE_TRACE
+          trace.owner_start_ns_ = trace.request_start_ns_;
+#endif
           auto fast =
-              co_await g_storage->TryRemoteGet(request.db_id_, args[1], slot);
+              co_await g_storage->TryRemoteGet(request.db_id_, args[1], slot
+#if LAVIK_ENABLE_TRACE
+                                               ,
+                                               &trace
+#endif
+              );
           if (fast) {
+            CommandReply reply;
             if (const char* error = CommandServingGenerationError(request);
                 error)
-              co_return BuiltReply(reply_builder.AppendError(error));
-            CommandReply reply;
-            if (fast->ok())
+              reply.encoded_ = reply_builder.AppendError(error);
+            else if (fast->ok())
               reply.disk_value_ = std::move(**fast);
             else if (absl::IsNotFound(fast->status()))
               reply.encoded_ = reply_builder.AppendNull();
             else
               reply.encoded_ =
                   AppendStorageError(reply_builder, fast->status());
+#if LAVIK_ENABLE_TRACE
+            trace.owner_done_ns_ = ReadTraceNowNanos();
+            trace.origin_resume_ns_ = trace.owner_done_ns_;
+            reply.read_trace_ = trace;
+#endif
             co_return reply;
           }
+#if LAVIK_ENABLE_TRACE
+          // Keep attempted fast-read time in total/route-out latency, but let
+          // the owner result determine hit/disk flags and its stage timings.
+          const auto started = trace.request_start_ns_;
+          trace = {};
+          trace.request_start_ns_ = started;
+          trace.remote_ = true;
+#endif
         }
 #if LAVIK_ENABLE_TRACE
         if (request.kind_ == CommandKind::kGet) {
-          ReadLatencyTrace trace;
-          trace.request_start_ns_ = ReadTraceNowNanos();
-          trace.remote_ = target != ThisWorker().id_;
           CommandReply reply;
           if (trace.remote_) {
             reply = co_await SubmitTaskTo(

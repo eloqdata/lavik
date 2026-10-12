@@ -229,8 +229,20 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
 StorageEngine::RemoteGetAwaitable::RemoteGetAwaitable(Impl& engine,
                                                       std::uint8_t db_id,
                                                       std::string_view key,
-                                                      std::uint16_t slot)
-    : key_(key), slot_(slot), db_id_(db_id) {
+                                                      std::uint16_t slot
+#if LAVIK_ENABLE_TRACE
+                                                      ,
+                                                      ReadLatencyTrace* trace
+#endif
+                                                      )
+    : key_(key),
+      slot_(slot),
+      db_id_(db_id)
+#if LAVIK_ENABLE_TRACE
+      ,
+      trace_(trace)
+#endif
+{
   engine.PrepareRemoteGet(*this);
 }
 
@@ -263,6 +275,9 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
   auto reader = index.TryRead(digest);
   if (!reader) return;
   const auto* entry = std::as_const(index).Find(digest, key);
+#if LAVIK_ENABLE_TRACE
+  if (result.trace_) result.trace_->lookup_done_ns_ = ReadTraceNowNanos();
+#endif
   if (!result.Current(*this)) return;
   if (entry && !entry->key_complete()) return;
   if (entry == nullptr || entry->value_.kind() == RecordKind::kTombstone) {
@@ -316,6 +331,12 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
   // Admission is only an optimization. If the local bounded pool is busy,
   // let the owner path wait for its buffer rather than adding a child task or
   // retaining a remote pin in a second asynchronous state machine.
+#if LAVIK_ENABLE_TRACE
+  if (result.trace_) {
+    result.trace_->hit_ = true;
+    result.trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
+  }
+#endif
   auto acquire = local.buffers_.AcquireReadBuffer(result.read_bytes_);
   if (!acquire.await_ready()) return;
   auto acquired = acquire.await_resume();
@@ -324,6 +345,12 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
     return;
   }
   result.lease_ = std::move(*acquired);
+#if LAVIK_ENABLE_TRACE
+  if (result.trace_) {
+    result.trace_->buffer_acquired_ns_ = ReadTraceNowNanos();
+    result.trace_->heap_read_buffer_ = result.lease_.buffer_id() == 0;
+  }
+#endif
   auto buffer = result.lease_.io_buffer();
   assert(result.read_bytes_ <= buffer.size_);
   buffer.size_ = result.read_bytes_;
@@ -331,8 +358,54 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
                      aligned_offset,
                      result.lease_.registered()
                          ? bycorf::SizeIoAwaitable::Operation::kReadFixed
-                         : bycorf::SizeIoAwaitable::Operation::kRead);
+                         : bycorf::SizeIoAwaitable::Operation::kRead
+#if LAVIK_ENABLE_TRACE
+                     ,
+                     result.trace_
+#endif
+  );
 }
+
+#if LAVIK_ENABLE_TRACE
+StorageEngine::RemoteGetAwaitable::TracedReadIo::TracedReadIo(
+    bycorf::Worker& worker, bycorf::FixedFile file, bycorf::FixedBuffer buffer,
+    std::uint64_t offset, bycorf::SizeIoAwaitable::Operation operation,
+    ReadLatencyTrace* trace)
+    : worker_(worker),
+      file_(file),
+      buffer_(buffer),
+      offset_(offset),
+      fixed_(operation == bycorf::SizeIoAwaitable::Operation::kReadFixed),
+      trace_(trace) {}
+
+bool StorageEngine::RemoteGetAwaitable::TracedReadIo::await_suspend(
+    std::coroutine_handle<> awaiting) {
+  if (trace_) {
+    trace_->disk_read_ = true;
+    trace_->io_submit_ns_ = ReadTraceNowNanos();
+  }
+  auto status = fixed_ ? worker_.SubmitReadFixed(file_, buffer_, offset_, this)
+                       : worker_.SubmitRead(
+                             file_, std::span(buffer_.data_, buffer_.size_),
+                             offset_, this);
+  if (!status.ok() && trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  return Suspend(awaiting, std::move(status));
+}
+
+void StorageEngine::RemoteGetAwaitable::TracedReadIo::Complete(
+    bycorf::Worker& worker, int result, unsigned flags) {
+  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  OneShotIoAwaitable::Complete(worker, result, flags);
+}
+
+absl::StatusOr<std::size_t>
+StorageEngine::RemoteGetAwaitable::TracedReadIo::await_resume() {
+  auto result = Resume(fixed_ ? "fixed-buffer read failed" : "read failed");
+  if (!result.ok()) return result.status();
+  worker_.RecordStorageReadCompletion(*result);
+  return static_cast<std::size_t>(*result);
+}
+#endif
 
 StorageEngine::RemoteGetAwaitable::Pin::~Pin() {
   if (engine_ != nullptr) {
@@ -371,6 +444,9 @@ StorageEngine::RemoteGetAwaitable::await_resume() {
   auto loaded =
       engine.DecodeRemoteValue(std::move(lease_), db_id_, key_, location_,
                                replication_epoch_, record_headroom_, db_epoch_);
+#if LAVIK_ENABLE_TRACE
+  if (trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
+#endif
   if (!Current(engine) || (!loaded.ok() && absl::IsAborted(loaded.status())))
     return std::nullopt;
   if (!loaded.ok()) return loaded.status();

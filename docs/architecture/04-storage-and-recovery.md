@@ -684,11 +684,13 @@ The index snapshot orders the GET before a subsequently admitted writer. The
 block pin survives I/O and cancellation cleanup, so writes can append and retire
 old live-byte accounting while the read finishes. Defrag closes remote pin
 admission before inspecting the count; the last pin on a pending block asks its
-owner to reconsider reclamation. Local fallback reads retain their existing pin
-rules. Database/replication epoch and population-generation changes invalidate
-an in-flight fast read. Worker shutdown drains I/O and destroys suspended frames
-on all workers before destroying any remotely referenced index, arena or block
-state.
+owner to reconsider reclamation. Flush uses the same close-before-count order
+when retiring a sealed staging buffer: either it releases the buffer immediately
+or the last pin notifies the owner to finish the release. Local fallback reads
+retain their existing pin rules. Database/replication epoch and population-generation
+changes invalidate an in-flight fast read. Worker shutdown drains I/O and destroys
+suspended frames on all workers before destroying any remotely referenced index,
+arena or block state.
 
 An owner-local ordinary single-key GET may resolve its complete inline-key index entry
 without registering a shared transaction lock when that logical database's

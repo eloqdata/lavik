@@ -284,13 +284,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           if (state->kind_ == BlockKind::kTransaction) {
             tx_cleaner_dirty_.store(true, std::memory_order_release);
           }
-          if (state->pin_count() > 0) {
-            state->release_pending_ = true;
-            state->CloseRemotePins();
-          } else {
-            ReleaseStagingBuffer(*store, *state);
-            MaybeQueueDefrag(*store, block_id);
-          }
+          ReleaseFlushedStagingBuffer(*store, *state, block_id);
         }
         continue;
       }
@@ -601,14 +595,23 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     if (state->kind_ == BlockKind::kTransaction) {
       tx_cleaner_dirty_.store(true, std::memory_order_release);
     }
-    if (state->pin_count() > 0) {
-      state->release_pending_ = true;
-      state->CloseRemotePins();
-      continue;
-    }
-    ReleaseStagingBuffer(*store, *state);
-    MaybeQueueDefrag(*store, pending->block_id_);
+    ReleaseFlushedStagingBuffer(*store, *state, pending->block_id_);
   }
+}
+
+void StorageEngine::Impl::ReleaseFlushedStagingBuffer(WorkerStore& store,
+                                                      BlockState& state,
+                                                      std::uint64_t block_id) {
+  // Close before checking the count: a last remote unpin either precedes this
+  // observation (release here) or sees the closed bit and notifies the owner.
+  // Checking first can strand release_pending_ with zero pins and no wakeup.
+  state.CloseRemotePins();
+  if (state.pin_count() != 0) {
+    state.release_pending_ = true;
+    return;
+  }
+  ReleaseStagingBuffer(store, state);
+  MaybeQueueDefrag(store, block_id);
 }
 
 bool StorageEngine::Impl::IsActiveBlock(const WorkerStore& store,
