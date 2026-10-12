@@ -649,12 +649,15 @@ rereads. Transaction-owned reads always use that locked path directly.
 Tombstones and expired values are invisible; an expired observation can enqueue
 a bounded active-expiration candidate. A staged location is copied or framed
 from its write buffer. A disk location is read on its physical block owner into
-an aligned lease. For a complete inline String already on its key owner's disk,
-GET can submit the read from an awaitable embedded in its existing request task,
-without child loader coroutines. The awaitable owns the block pin and buffer
-through completion and validates the record and population before returning it.
-Buffer contention, staged data, other representations, and stale physical
-locations retain the complete loader and its backpressure/relocation handling.
+an aligned lease. `LoadValue` and its single-location `LoadValueLocal` share an
+awaitable embedded in the caller's task. Local inline reads, including staged
+copies, use that task directly when a buffer is available. The awaitable owns
+the disk-read pin and buffer through completion and validates record identity,
+checksums, and population before returning it. Buffer contention retains pool
+backpressure; cross-owner, external, grouped, and relocation reads use lazy
+helper tasks. A stale logical read resolves the current same-mutation location
+before resuming its caller, while a single-location read returns the stale
+status to its enclosing representation-specific retry loop.
 
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size

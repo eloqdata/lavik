@@ -3257,7 +3257,7 @@ class StorageEngine::Impl {
  private:
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
-  friend class DirectValueReadTestPeer;
+  friend class LoadValueAwaitableTestPeer;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -3343,52 +3343,69 @@ class StorageEngine::Impl {
     }
   };
 
-  // Opportunistic, owner-local disk read embedded in GetWithLockState's frame.
-  // nullopt selects LoadValue's complete representation/relocation state
-  // machine.
-  class DirectValueRead {
+  // The awaitable lives in the caller's frame. Ordinary local reads suspend
+  // that caller directly; only buffer waits and multi-step logical reads need
+  // a lazy helper Task. Local mode returns stale-location errors to its caller,
+  // while logical mode resolves same-mutation relocations before returning.
+  class LoadValueAwaitable final : public bycorf::OneShotIoAwaitable {
    public:
-    using Result = std::optional<absl::StatusOr<LoadedValue>>;
-    DirectValueRead(Impl& engine, WorkerStore& store,
-                    WorkerStore::PartitionStore& partition, std::uint8_t db_id,
-                    std::string_view key, RecordLocation location,
-                    ReadLatencyTrace* trace);
-    DirectValueRead(const DirectValueRead&) = delete;
-    DirectValueRead& operator=(const DirectValueRead&) = delete;
-    DirectValueRead(DirectValueRead&&) = delete;
-    DirectValueRead& operator=(DirectValueRead&&) = delete;
+    using Result = absl::StatusOr<LoadedValue>;
+    LoadValueAwaitable(Impl& engine, WorkerStore& store,
+                       WorkerStore::PartitionStore& partition,
+                       std::uint8_t db_id, std::string_view key,
+                       const Digest& digest, RecordLocation location,
+                       ExtentManifest extents, ReadLatencyTrace* trace,
+                       GroupedObject::Handle grouped_snapshot);
+    LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
+                       std::string_view key, RecordLocation location,
+                       std::uint64_t replication_epoch, ReadLatencyTrace* trace,
+                       std::optional<std::uint64_t> expected_db_epoch,
+                       ReadBufferLease lease = {});
+    ~LoadValueAwaitable();
 
-    bool await_ready() const noexcept { return !io_.has_value(); }
-    bool await_suspend(std::coroutine_handle<> awaiting) {
-      if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
-      return io_->await_suspend(awaiting);
-    }
+    bool await_ready() const noexcept { return ready_ && !slow_.valid(); }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
     Result await_resume();
+    void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
 
    private:
-    friend class DirectValueReadTestPeer;
-    struct Pin {
-      WorkerStore* store_ = nullptr;
-      BlockState* state_ = nullptr;
-      ~Pin();
+    friend class LoadValueAwaitableTestPeer;
+    struct Payload {
+      std::uint64_t txid_;
+      std::uint32_t offset_;
+      std::uint32_t bytes_;
+      std::uint32_t checksum_;
     };
 
+    // False means the pool is exhausted, without registering a buffer waiter.
+    bool PrepareLocal();
+    absl::StatusOr<Payload> ParseRecord(const std::byte* data) const;
+    Result FinishRecord(const std::byte* data, Payload payload, bool staged);
+    bool PopulationChanged() const;
+    void Unpin();
+    void Retry(absl::Status failure);
+
     Impl& engine_;
-    WorkerStore::PartitionStore& partition_;
+    WorkerStore& store_;
+    WorkerStore::PartitionStore* partition_ = nullptr;
     std::string_view key_;
+    Digest digest_{};
     RecordLocation location_;
     ReadLatencyTrace* trace_;
     std::uint64_t replication_epoch_;
-    std::uint64_t db_epoch_;
+    std::optional<std::uint64_t> expected_db_epoch_;
+    std::uint64_t aligned_offset_ = 0;
+    std::size_t file_id_ = 0;
     std::size_t record_headroom_ = 0;
     std::size_t read_bytes_ = 0;
     std::uint8_t db_id_;
-    Result ready_;
-    // The completion and lease die before the pin. Runtime shutdown drains
-    // I/O before destroying suspended frames; no continuation is heap-owned.
-    Pin pin_;
+    BlockState* pinned_ = nullptr;
+    std::optional<Payload> payload_;
+    std::optional<Result> ready_;
+    // Runtime shutdown drains I/O before destroying suspended frames. The
+    // helper, when present, owns its own physical read and buffer waiter.
     ReadBufferLease lease_;
-    std::optional<bycorf::SizeIoAwaitable> io_;
+    Task<Result> slow_;
   };
 
   // Owns the page lease while a grouped reader inspects its checked envelope.
@@ -3409,12 +3426,6 @@ class StorageEngine::Impl {
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
-
-  // Shared synchronous validation for ordinary and direct disk reads.
-  absl::StatusOr<LoadedValue> DecodeLoadedValue(
-      ReadBufferLease lease, std::uint8_t db_id, std::string_view key,
-      RecordLocation location, std::uint64_t replication_epoch,
-      std::size_t record_headroom, std::uint64_t expected_db_epoch);
 
   void QueueExpiredCandidate(WorkerStore& store, std::uint16_t partition_id,
                              std::uint8_t db_id,
@@ -3781,12 +3792,27 @@ class StorageEngine::Impl {
       WorkerStore& store, RecordIndex& index, const Digest& digest,
       std::string_view key, const RecordLocation& verified_location);
 
-  Task<absl::StatusOr<LoadedValue>> LoadValue(
+  LoadValueAwaitable LoadValue(
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       RecordLocation location, ExtentManifest extents,
       ReadLatencyTrace* trace = nullptr,
       GroupedObject::Handle grouped_snapshot = nullptr);
+
+  // Used only for multi-step reads or an aborted direct read. A supplied
+  // failure enters relocation resolution without reading the stale bytes again.
+  Task<absl::StatusOr<LoadedValue>> LoadValueSlow(
+      WorkerStore& key_store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, Digest digest,
+      RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
+      GroupedObject::Handle grouped_snapshot = nullptr,
+      std::optional<absl::Status> failure = std::nullopt);
+
+  Task<absl::StatusOr<LoadedValue>> LoadValueLocalWaiting(
+      WorkerStore& store, std::uint8_t db_id, std::string_view key,
+      RecordLocation location, std::uint64_t replication_epoch,
+      ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
+      std::size_t read_bytes);
 
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
@@ -3826,7 +3852,7 @@ class StorageEngine::Impl {
       ExtentManifest extents, ReadLatencyTrace* trace,
       bool grouped_payload = false);
 
-  Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
+  LoadValueAwaitable LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       ReadLatencyTrace* trace = nullptr,

@@ -306,18 +306,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       trace->lookup_done_ns_ = ReadTraceNowNanos();
     }
 
-    // Snapshot all entry-owned state before the direct I/O can suspend.
-    const auto location = MaterializeIndexLocation(*found);
-    auto extents = ExtentsFor(store, found);
-    auto direct = co_await DirectValueRead(*this, store, partition, db_id, key,
-                                           location, trace);
-    absl::StatusOr<LoadedValue> loaded;
-    if (direct.has_value()) {
-      loaded = std::move(*direct);
-    } else {
-      loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                  location, std::move(extents), trace);
-    }
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     MaterializeIndexLocation(*found),
+                                     ExtentsFor(store, found), trace);
     if (optimistic_read && !loaded.ok() &&
         (loaded.status().code() == absl::StatusCode::kNotFound ||
          loaded.status().code() == absl::StatusCode::kAborted)) {
@@ -335,103 +326,6 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
 
     co_return EncodeDiskValue(std::move(*loaded));
   }
-}
-
-StorageEngine::Impl::DirectValueRead::DirectValueRead(
-    Impl& engine, WorkerStore& store, WorkerStore::PartitionStore& partition,
-    std::uint8_t db_id, std::string_view key, RecordLocation location,
-    ReadLatencyTrace* trace)
-    : engine_(engine),
-      partition_(partition),
-      key_(key),
-      location_(location),
-      trace_(trace),
-      replication_epoch_(partition.replication_epoch_),
-      db_epoch_(engine.DbEpoch(db_id)),
-      db_id_(db_id) {
-  // Keep candidate populations, staged data and other representations on the
-  // complete loader. The index lookup and this admission never suspend, so a
-  // validated local block cannot be recycled before its pin is acquired.
-  if (location.grouped() || location.external() || location.key_indirect() ||
-      location.in_memory() || location.block_owner() != store.worker_->id() ||
-      partition.replica_sync_ != nullptr)
-    return;
-  LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_VALUE_READ_KEY",
-                                             key)) {
-    ready_.emplace(absl::InternalError("injected value payload read failure"));
-    return;
-  });
-  const auto [file_id, block_offset] = engine.FileOffset(location.block_id());
-  const auto absolute_offset = block_offset + location.record_offset();
-  const auto mask = static_cast<std::uint64_t>(engine.direct_io_alignment_ - 1);
-  const auto aligned_offset = absolute_offset & ~mask;
-  record_headroom_ = absolute_offset - aligned_offset;
-  read_bytes_ = (record_headroom_ + location.total_disk_bytes() +
-                 engine.direct_io_alignment_ - 1) &
-                ~mask;
-  if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
-  auto acquire = store.buffers_.AcquireReadBuffer(read_bytes_);
-  // Preserve bounded buffer backpressure through LoadValue's existing waiter
-  // when exhausted. The common path needs only the caller's I/O continuation.
-  if (!acquire.await_ready()) return;
-  auto acquired = acquire.await_resume();
-  if (!acquired.ok()) {
-    ready_.emplace(acquired.status());
-    return;
-  }
-  lease_ = std::move(*acquired);
-  if (trace_) {
-    trace_->buffer_acquired_ns_ = ReadTraceNowNanos();
-    trace_->heap_read_buffer_ = lease_.buffer_id() == 0;
-  }
-  auto* state = engine.FindBlockState(store, location.block_id());
-  if (state == nullptr || !state->allocated_ || state->freeing_ ||
-      state->allocation_epoch_ != location.allocation_epoch())
-    return;
-  ++state->pins_;
-  pin_.store_ = &store;
-  pin_.state_ = state;
-  if (trace_) trace_->disk_read_ = true;
-  auto buffer = lease_.io_buffer();
-  assert(read_bytes_ <= buffer.size_);
-  buffer.size_ = read_bytes_;
-  io_.emplace(*store.worker_, store.files_[file_id], buffer, aligned_offset,
-              lease_.registered()
-                  ? bycorf::SizeIoAwaitable::Operation::kReadFixed
-                  : bycorf::SizeIoAwaitable::Operation::kRead);
-}
-
-StorageEngine::Impl::DirectValueRead::Pin::~Pin() {
-  if (state_ == nullptr) return;
-  --state_->pins_;
-  if (state_->pins_ == 0 && state_->release_pending_)
-    ReleaseStagingBuffer(*store_, *state_);
-}
-
-StorageEngine::Impl::DirectValueRead::Result
-StorageEngine::Impl::DirectValueRead::await_resume() {
-  if (!io_) return std::move(ready_);
-  auto read = io_->await_resume();
-  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
-  // Replica resets do not acquire individual key locks. Match LoadValue's
-  // population check before publishing either bytes or an I/O error.
-  if (partition_.replication_epoch_ != replication_epoch_ ||
-      engine_.DbEpoch(db_id_) != db_epoch_)
-    return absl::NotFoundError("key not found");
-  if (!read.ok()) {
-    if (absl::IsAborted(read.status())) return std::nullopt;
-    return read.status();
-  }
-  if (*read != read_bytes_)
-    return absl::InternalError("short compact record read");
-  auto loaded = engine_.DecodeLoadedValue(std::move(lease_), db_id_, key_,
-                                          location_, replication_epoch_,
-                                          record_headroom_, db_epoch_);
-  // A relocation or mismatched physical record must go through LoadValue's
-  // same-mutation retry and corruption checks, also for transaction-owned GET.
-  if (!loaded.ok() && absl::IsAborted(loaded.status())) return std::nullopt;
-  if (trace_ && loaded.ok()) trace_->decode_done_ns_ = ReadTraceNowNanos();
-  return loaded;
 }
 
 Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
@@ -985,12 +879,14 @@ absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadValue(WorkerStore& key_store,
-                               WorkerStore::PartitionStore& partition,
-                               std::uint8_t db_id, std::string_view key,
-                               const Digest& digest, RecordLocation location,
-                               ExtentManifest extents, ReadLatencyTrace* trace,
-                               GroupedObject::Handle grouped_snapshot) {
+StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
+                                   WorkerStore::PartitionStore& partition,
+                                   std::uint8_t db_id, std::string_view key,
+                                   Digest digest, RecordLocation location,
+                                   ExtentManifest extents,
+                                   ReadLatencyTrace* trace,
+                                   GroupedObject::Handle grouped_snapshot,
+                                   std::optional<absl::Status> failure) {
   if (location.grouped()) {
     co_return co_await LoadGroupedValue(key_store, partition, db_id, key,
                                         digest, location,
@@ -1007,9 +903,8 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
           : std::nullopt;
   while (true) {
     assert(location.block_owner() < worker_count_);
-    // Every branch below assigns `loaded` before it is observed. Keep the
-    // required placeholder message-free so the common local GET path does not
-    // construct and then immediately discard an error payload.
+    // Every branch assigns `loaded` before it is observed; the placeholder
+    // does not need an allocated error message.
     absl::StatusOr<LoadedValue> loaded;
 
     // An external value's manifest is already decoded in this index entry,
@@ -1017,7 +912,10 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
     // and let each extent go straight to its block's owner, rather than
     // hopping to the record's owner first and having it acquire the output
     // buffer from its pool and hand the lease back across workers.
-    if (location.external()) {
+    if (failure) {
+      loaded = std::move(*failure);
+      failure.reset();
+    } else if (location.external()) {
       loaded = co_await LoadExternalValueLocal(key_store, location,
                                                std::move(extents), trace);
     } else if (location.block_owner() == key_store.worker_->id()) {
@@ -1405,235 +1303,305 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   co_return LoadedValue{std::move(output), value_offset, output_offset};
 }
 
-Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadValueLocal(
+StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValue(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
+    GroupedObject::Handle grouped_snapshot) {
+  return LoadValueAwaitable(*this, store, partition, db_id, key, digest,
+                            location, std::move(extents), trace,
+                            std::move(grouped_snapshot));
+}
+
+StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValueLocal(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
     ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch) {
-  LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_VALUE_READ_KEY",
-                                             key)) co_return absl::
-                         InternalError("injected value payload read failure"););
-  if (location.external()) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "external value was dispatched as inline");
-  }
-  // TODO: Coalesce concurrent reads of the same aligned disk page. Key an
-  // in-flight table by
-  // (file_id, aligned offset, aligned length), submit one read, and fan the
-  // decoded result out to all waiting coroutines. In-flight operations must
-  // retain values/leases, never flat_hash_map iterators or element pointers.
-  const auto [file_id, block_offset] = FileOffset(location.block_id());
-  const std::uint64_t absolute_offset = block_offset + location.record_offset();
-  const std::uint64_t direct_io_mask =
-      static_cast<std::uint64_t>(direct_io_alignment_ - 1);
-  const std::uint64_t aligned_offset = absolute_offset & ~direct_io_mask;
-  const std::size_t record_headroom =
-      static_cast<std::size_t>(absolute_offset - aligned_offset);
-  const std::size_t record_span = record_headroom + location.total_disk_bytes();
-  const std::size_t read_bytes =
-      (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
-
-  // Acquire the output buffer before resolving any block state. This is the
-  // only suspension the staged-copy path would otherwise have, and it used
-  // to sit between reading the staging pointer and using it, so that path
-  // needed a pin to stop a flush from handing the staging buffer back. With
-  // the acquisition hoisted, the staged copy runs straight through on a
-  // worker that cannot preempt it, and only the disk read below pins. The
-  // disk sizing covers the staged copy too: read_bytes is at least
-  // total_disk_bytes, which is header plus payload.
-  if (trace != nullptr) {
-    trace->buffer_acquire_start_ns_ = ReadTraceNowNanos();
-  }
-  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
-  ReadBufferLease lease = std::move(*acquired);
-  if (trace != nullptr) {
-    trace->buffer_acquired_ns_ = ReadTraceNowNanos();
-    trace->heap_read_buffer_ = lease.buffer_id() == 0;
-  }
-
-  BlockState* state = FindBlockState(store, location.block_id());
-  if (state == nullptr || !state->allocated_ || state->freeing_ ||
-      state->allocation_epoch_ != location.allocation_epoch()) {
-    co_return absl::Status(absl::StatusCode::kAborted,
-                           "stale index block epoch");
-  }
-
-  // Only records appended since the last flush live in a staging buffer, so
-  // on a read-mostly workload this branch is rare. Keep the disk read on the
-  // straight-line path.
-  if (location.in_memory() && state->in_memory_) [[unlikely]] {
-    auto in_mem_buffer = StagingBufferFor(store, *state);
-    if (!in_mem_buffer.data_ || in_mem_buffer.size_ == 0 ||
-        location.record_offset() + location.total_disk_bytes() >
-            in_mem_buffer.size_) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "invalid in-memory location");
-    }
-    if (trace != nullptr) {
-      trace->io_submit_ns_ = trace->buffer_acquired_ns_;
-      trace->io_complete_ns_ = trace->buffer_acquired_ns_;
-    }
-    FixedBuffer io = lease.io_buffer();
-    if (location.external()) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "external value requires extent loading");
-    }
-    const std::byte* record_bytes =
-        in_mem_buffer.data_ + location.record_offset();
-    RecordHeader record{};
-    std::string_view disk_key;
-    if (!DecodeRecordHeader(std::span<const std::byte>(
-                                record_bytes, location.total_disk_bytes()),
-                            &record, &disk_key) ||
-        record.db_id_ != db_id || (!record.key_indirect_ && disk_key != key) ||
-        record.kind_ != RecordKind::kValue ||
-        record.db_epoch_ != expected_db_epoch.value_or(DbEpoch(db_id)) ||
-        record.mutation_sequence_ != location.mutation_sequence_ ||
-        record.replication_epoch_ != replication_epoch ||
-        record.allocation_epoch_ != location.allocation_epoch() ||
-        record.expire_at_ms_ != location.expire_at_ms_ ||
-        record.value_type_ != location.value_type() ||
-        record.external_ != location.external() ||
-        record.key_indirect_ != location.key_indirect() ||
-        location.logical_size_ != record.logical_size_ ||
-        location.total_disk_bytes() != record.total_disk_bytes_) {
-      co_return absl::Status(absl::StatusCode::kAborted,
-                             "record does not match in-memory location");
-    }
-    const std::byte* payload_data = record_bytes + record.header_bytes_;
-    if (record.key_indirect_ && record.key_bytes_ != key.size()) {
-      co_return absl::Status(absl::StatusCode::kAborted,
-                             "record key does not match location");
-    }
-    const std::size_t value_bytes = record.payload_bytes_;
-    if (record.value_type_ == ValueType::kString && !record.grouped_ &&
-        !record.auxiliary_group_ && value_bytes != record.logical_size_) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "inline value length does not match metadata");
-    }
-    std::memcpy(io.data_, payload_data, value_bytes);
-    if (Crc32c(std::span<const std::byte>(
-            payload_data, record.payload_bytes_)) != record.payload_checksum_) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "record value checksum mismatch");
-    }
-    if (trace != nullptr) {
-      trace->decode_done_ns_ = ReadTraceNowNanos();
-    }
-    const std::size_t value_offset =
-        static_cast<std::size_t>(io.data_ - lease.bytes().data());
-    co_return LoadedValue{std::move(lease), value_offset, value_bytes,
-                          record.txid_};
-  }
-
-  // Only the disk read suspends while holding the BlockState pointer, so it
-  // is the only path that has to keep the state alive with a pin.
-  ++state->pins_;
-  struct PinGuard {
-    WorkerStore* store_ = nullptr;
-    BlockState* state_ = nullptr;
-    ~PinGuard() {
-      if (state_ == nullptr) {
-        return;
-      }
-      --state_->pins_;
-      if (state_->pins_ == 0 && state_->release_pending_) {
-        ReleaseStagingBuffer(*store_, *state_);
-      }
-    }
-  } pin{&store, state};
-
-  if (trace != nullptr) {
-    trace->disk_read_ = true;
-  }
-  FixedBuffer io = lease.io_buffer();
-  if (read_bytes > io.size_) {
-    co_return absl::Status(absl::StatusCode::kOutOfRange,
-                           "record exceeds registered read buffer capacity");
-  }
-  FixedBuffer record_buffer = io;
-  record_buffer.size_ = read_bytes;
-  if (trace != nullptr) {
-    trace->io_submit_ns_ = ReadTraceNowNanos();
-  }
-  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                         record_buffer, lease.registered(),
-                                         aligned_offset);
-  if (trace != nullptr) {
-    trace->io_complete_ns_ = ReadTraceNowNanos();
-  }
-  if (!read.ok()) {
-    co_return read.status();
-  }
-  if (*read != read_bytes) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "short compact record read");
-  }
-
-  auto loaded = DecodeLoadedValue(std::move(lease), db_id, key, location,
-                                  replication_epoch, record_headroom,
-                                  expected_db_epoch.value_or(DbEpoch(db_id)));
-  if (trace != nullptr && loaded.ok())
-    trace->decode_done_ns_ = ReadTraceNowNanos();
-  co_return loaded;
+  return LoadValueAwaitable(*this, store, db_id, key, location,
+                            replication_epoch, trace, expected_db_epoch);
 }
 
-absl::StatusOr<StorageEngine::Impl::LoadedValue>
-StorageEngine::Impl::DecodeLoadedValue(ReadBufferLease lease,
-                                       std::uint8_t db_id, std::string_view key,
-                                       RecordLocation location,
-                                       std::uint64_t replication_epoch,
-                                       std::size_t record_headroom,
-                                       std::uint64_t expected_db_epoch) {
-  const FixedBuffer io = lease.io_buffer();
+StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
+    Impl& engine, WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
+    GroupedObject::Handle grouped_snapshot)
+    : engine_(engine),
+      store_(store),
+      // Grouped snapshots have their own population/pin protocol.
+      partition_(location.grouped() ? nullptr : &partition),
+      key_(key),
+      digest_(digest),
+      location_(location),
+      trace_(trace),
+      replication_epoch_(partition.replication_epoch_),
+      expected_db_epoch_(engine.EffectiveRecordDbEpoch(partition, db_id)),
+      db_id_(db_id) {
+  if (location.grouped() || location.external() ||
+      location.block_owner() != store.worker_->id() || !PrepareLocal()) {
+    slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
+                                 std::move(extents), trace,
+                                 std::move(grouped_snapshot));
+  } else if (ready_ && absl::IsAborted(ready_->status())) {
+    Retry(ready_->status());
+  }
+}
+
+StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
+    Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
+    RecordLocation location, std::uint64_t replication_epoch,
+    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
+    ReadBufferLease lease)
+    : engine_(engine),
+      store_(store),
+      key_(key),
+      location_(location),
+      trace_(trace),
+      replication_epoch_(replication_epoch),
+      expected_db_epoch_(expected_db_epoch),
+      db_id_(db_id),
+      lease_(std::move(lease)) {
+  if (!PrepareLocal()) {
+    slow_ = engine.LoadValueLocalWaiting(store, db_id, key, location,
+                                         replication_epoch, trace,
+                                         expected_db_epoch, read_bytes_);
+  }
+}
+
+StorageEngine::Impl::LoadValueAwaitable::~LoadValueAwaitable() { Unpin(); }
+
+void StorageEngine::Impl::LoadValueAwaitable::Unpin() {
+  auto* state = std::exchange(pinned_, nullptr);
+  if (!state) return;
+  --state->pins_;
+  if (state->pins_ == 0 && state->release_pending_)
+    ReleaseStagingBuffer(store_, *state);
+}
+
+bool StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
+  LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_VALUE_READ_KEY",
+                                             key_)) {
+    ready_.emplace(absl::InternalError("injected value payload read failure"));
+    return true;
+  });
+  if (location_.external()) {
+    ready_.emplace(
+        absl::InternalError("external value was dispatched as inline"));
+    return true;
+  }
+  const auto [file_id, block_offset] = engine_.FileOffset(location_.block_id());
+  file_id_ = file_id;
+  const auto absolute = block_offset + location_.record_offset();
+  const auto mask =
+      static_cast<std::uint64_t>(engine_.direct_io_alignment_ - 1);
+  aligned_offset_ = absolute & ~mask;
+  record_headroom_ = absolute - aligned_offset_;
+  read_bytes_ =
+      (record_headroom_ + location_.total_disk_bytes() + mask) & ~mask;
+  if (!lease_.valid()) {
+    if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
+    auto acquire = store_.buffers_.AcquireReadBuffer(read_bytes_);
+    if (!acquire.await_ready()) return false;
+    auto acquired = acquire.await_resume();
+    if (!acquired.ok()) {
+      ready_.emplace(acquired.status());
+      return true;
+    }
+    lease_ = std::move(*acquired);
+  }
+  if (trace_) {
+    trace_->buffer_acquired_ns_ = ReadTraceNowNanos();
+    trace_->heap_read_buffer_ = lease_.buffer_id() == 0;
+  }
+  // Resolve staging memory only after acquiring the buffer: waiting can let
+  // flush/defrag retire it. The staged copy itself never suspends, so only
+  // disk I/O needs a physical pin.
+  auto* state = engine_.FindBlockState(store_, location_.block_id());
+  if (!state || !state->allocated_ || state->freeing_ ||
+      state->allocation_epoch_ != location_.allocation_epoch()) {
+    ready_.emplace(absl::AbortedError("stale index block epoch"));
+    return true;
+  }
+  if (location_.in_memory() && state->in_memory_) [[unlikely]] {
+    auto buffer = engine_.StagingBufferFor(store_, *state);
+    if (!buffer.data_ ||
+        location_.record_offset() + location_.total_disk_bytes() >
+            buffer.size_) {
+      ready_.emplace(absl::InternalError("invalid in-memory location"));
+      return true;
+    }
+    if (trace_) {
+      trace_->io_submit_ns_ = trace_->buffer_acquired_ns_;
+      trace_->io_complete_ns_ = trace_->buffer_acquired_ns_;
+    }
+    const auto* data = buffer.data_ + location_.record_offset();
+    auto payload = ParseRecord(data);
+    if (!payload.ok())
+      ready_.emplace(payload.status());
+    else
+      ready_.emplace(FinishRecord(data, *payload, true));
+    return true;
+  }
+  if (read_bytes_ > lease_.io_buffer().size_) {
+    ready_.emplace(absl::OutOfRangeError(
+        "record exceeds registered read buffer capacity"));
+    return true;
+  }
+  ++state->pins_;
+  pinned_ = state;
+  if (trace_) trace_->disk_read_ = true;
+  return true;
+}
+
+bool StorageEngine::Impl::LoadValueAwaitable::PopulationChanged() const {
+  return partition_ && (partition_->replication_epoch_ != replication_epoch_ ||
+                        engine_.EffectiveRecordDbEpoch(*partition_, db_id_) !=
+                            *expected_db_epoch_);
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::Retry(absl::Status failure) {
+  assert(partition_ && absl::IsAborted(failure));
+  Unpin();
+  lease_.Reset();
+  ready_.reset();
+  // Inline reads have no extent manifest. Seed the failure so the slow path
+  // resolves the index before any further I/O and preserves corruption errors
+  // when the index still endorses the failed physical record.
+  slow_ =
+      engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
+                            location_, {}, trace_, nullptr, std::move(failure));
+}
+
+std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::await_suspend(
+    std::coroutine_handle<> awaiting) {
+  if (slow_.valid())
+    return std::move(slow_).operator co_await().await_suspend(awaiting);
+  auto buffer = lease_.io_buffer();
+  buffer.size_ = read_bytes_;
+  if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
+  auto status =
+      lease_.registered()
+          ? store_.worker_->SubmitReadFixed(store_.files_[file_id_], buffer,
+                                            aligned_offset_, this)
+          : store_.worker_->SubmitRead(store_.files_[file_id_],
+                                       std::span(buffer.data_, buffer.size_),
+                                       aligned_offset_, this);
+  if (Suspend(awaiting, status)) return std::noop_coroutine();
+  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  if (partition_ && absl::IsAborted(status)) {
+    Retry(std::move(status));
+    return std::move(slow_).operator co_await().await_suspend(awaiting);
+  }
+  return awaiting;
+}
+
+void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
+                                                       int bytes,
+                                                       unsigned flags) {
+  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  if (bytes >= 0) worker.RecordStorageReadCompletion(bytes);
+  if (partition_ && !PopulationChanged() && bytes >= 0 &&
+      static_cast<std::size_t>(bytes) == read_bytes_) {
+    // Only metadata is examined on the completion poller. CRC and large-value
+    // copies stay in the caller's scheduled slice. A stale identity must select
+    // the retry continuation before the caller's co_await can finish.
+    auto parsed = ParseRecord(lease_.io_buffer().data_ + record_headroom_);
+    if (parsed.ok())
+      payload_ = *parsed;
+    else if (absl::IsAborted(parsed.status())) {
+      Retry(parsed.status());
+      auto child =
+          std::move(slow_).operator co_await().await_suspend(awaiting_);
+      // CQEs are polled outside the parent's task class. Preserve background
+      // scheduling when a backup/maintenance read starts its retry here.
+      if (worker.IsBackground(awaiting_)) worker.RegisterBackground(child);
+      worker.Enqueue(child);
+      return;
+    } else
+      ready_.emplace(parsed.status());
+  }
+  OneShotIoAwaitable::Complete(worker, bytes, flags);
+}
+
+StorageEngine::Impl::LoadValueAwaitable::Result
+StorageEngine::Impl::LoadValueAwaitable::await_resume() {
+  if (PopulationChanged()) return absl::NotFoundError("key not found");
+  if (slow_.valid()) return std::move(slow_).TakeResult();
+  if (ready_) return std::move(*ready_);
+  auto read =
+      Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
+  if (!read.ok()) return read.status();
+  if (static_cast<std::size_t>(*read) != read_bytes_)
+    return absl::InternalError("short compact record read");
+  const auto* data = lease_.io_buffer().data_ + record_headroom_;
+  if (!payload_) {
+    auto parsed = ParseRecord(data);
+    if (!parsed.ok()) return parsed.status();
+    payload_ = *parsed;
+  }
+  return FinishRecord(data, *payload_, false);
+}
+
+Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
+StorageEngine::Impl::LoadValueLocalWaiting(
+    WorkerStore& store, std::uint8_t db_id, std::string_view key,
+    RecordLocation location, std::uint64_t replication_epoch,
+    ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch,
+    std::size_t read_bytes) {
+  // Register exactly one waiter and pass its assigned lease into the same
+  // physical reader. Retrying acquisition would lose the pool's FIFO handoff.
+  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+  if (!acquired.ok()) co_return acquired.status();
+  co_return co_await LoadValueAwaitable(
+      *this, store, db_id, key, location, replication_epoch, trace,
+      expected_db_epoch, std::move(*acquired));
+}
+
+absl::StatusOr<StorageEngine::Impl::LoadValueAwaitable::Payload>
+StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
+    const std::byte* data) const {
   RecordHeader record{};
   std::string_view disk_key;
-  const std::byte* record_data = io.data_ + record_headroom;
-  std::span<const std::byte> record_bytes(record_data,
-                                          location.total_disk_bytes());
-  if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
-      record.db_id_ != db_id || (!record.key_indirect_ && disk_key != key) ||
+  if (!DecodeRecordHeader(std::span(data, location_.total_disk_bytes()),
+                          &record, &disk_key) ||
+      record.db_id_ != db_id_ || (!record.key_indirect_ && disk_key != key_) ||
       record.kind_ != RecordKind::kValue ||
-      record.db_epoch_ != expected_db_epoch ||
-      record.mutation_sequence_ != location.mutation_sequence_ ||
-      record.replication_epoch_ != replication_epoch ||
-      record.allocation_epoch_ != location.allocation_epoch() ||
-      record.expire_at_ms_ != location.expire_at_ms_ ||
-      record.value_type_ != location.value_type() ||
-      record.external_ != location.external() ||
-      record.key_indirect_ != location.key_indirect() ||
-      record.logical_size_ != location.logical_size_ ||
-      record.total_disk_bytes_ != location.total_disk_bytes()) {
-    return absl::Status(absl::StatusCode::kAborted,
-                        "record does not match in-memory location");
+      record.db_epoch_ !=
+          expected_db_epoch_.value_or(engine_.DbEpoch(db_id_)) ||
+      record.mutation_sequence_ != location_.mutation_sequence_ ||
+      record.replication_epoch_ != replication_epoch_ ||
+      record.allocation_epoch_ != location_.allocation_epoch() ||
+      record.expire_at_ms_ != location_.expire_at_ms_ ||
+      record.value_type_ != location_.value_type() ||
+      record.external_ != location_.external() ||
+      record.key_indirect_ != location_.key_indirect() ||
+      record.logical_size_ != location_.logical_size_ ||
+      record.total_disk_bytes_ != location_.total_disk_bytes()) {
+    return absl::AbortedError("record does not match in-memory location");
   }
-  const std::byte* payload_data = record_data + record.header_bytes_;
-  if (record.key_indirect_ && record.key_bytes_ != key.size()) {
-    return absl::Status(absl::StatusCode::kAborted,
-                        "record key does not match location");
-  }
-  const std::size_t value_bytes = record.payload_bytes_;
+  if (record.key_indirect_ && record.key_bytes_ != key_.size())
+    return absl::AbortedError("record key does not match location");
   if (record.value_type_ == ValueType::kString && !record.grouped_ &&
-      !record.auxiliary_group_ && value_bytes != record.logical_size_) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "inline value length does not match metadata");
+      !record.auxiliary_group_ && record.payload_bytes_ != record.logical_size_)
+    return absl::InternalError("inline value length does not match metadata");
+  return Payload{record.txid_, record.header_bytes_, record.payload_bytes_,
+                 record.payload_checksum_};
+}
+
+StorageEngine::Impl::LoadValueAwaitable::Result
+StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
+                                                      Payload payload,
+                                                      bool staged) {
+  const auto* value = data + payload.offset_;
+  if (Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
+    return absl::InternalError("record value checksum mismatch");
+  if (staged || payload.bytes_ > engine_.DirectGetValueLimit()) {
+    std::memmove(lease_.io_buffer().data_, value, payload.bytes_);
+    value = lease_.io_buffer().data_;
   }
-  if (Crc32c(std::span<const std::byte>(payload_data, record.payload_bytes_)) !=
-      record.payload_checksum_) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "record value checksum mismatch");
-  }
-  const std::byte* framed_value = payload_data;
-  if (value_bytes > DirectGetValueLimit()) {
-    std::memmove(io.data_, payload_data, value_bytes);
-    framed_value = io.data_;
-  }
-  const std::size_t value_offset =
-      static_cast<std::size_t>(framed_value - lease.bytes().data());
-  return LoadedValue{std::move(lease), value_offset, value_bytes, record.txid_};
+  const auto offset = static_cast<std::size_t>(value - lease_.bytes().data());
+  if (trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
+  return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
 }
 
 }  // namespace lavik::storage

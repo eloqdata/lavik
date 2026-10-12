@@ -1944,7 +1944,7 @@ class StorageEngine {
  private:
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
-  friend class DirectValueReadTestPeer;
+  friend class LoadValueAwaitableTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
