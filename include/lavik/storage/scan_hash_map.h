@@ -1221,6 +1221,21 @@ class ScanHashMap {
     return FindAddressImpl<false>(address, hash, 0);
   }
 
+  // Owner-only hints for batches of independent address lookups. These do not
+  // resolve entries or establish membership; the eventual FindAddress must
+  // still validate the current table population and exact live address.
+  void PrefetchAddressMetadata() const noexcept {
+    __builtin_prefetch(&tables_[0], 0, 3);
+  }
+
+  void PrefetchAddress(std::uint32_t hash) const noexcept {
+    for (int t = 0, count = Rehashing() ? 2 : 1; t < count; ++t) {
+      const Table& table = tables_[t];
+      if (table.buckets_)
+        __builtin_prefetch(&table.buckets_[hash & BucketMask(table)], 0, 3);
+    }
+  }
+
   // Optional bucket fingerprint for FindAddress. Capture it from the same
   // immutable key digest as AddressHash while the entry is still live.
   static std::uint8_t AddressTag(const Digest& digest) noexcept {
@@ -2320,15 +2335,24 @@ class ScanHashMap {
       }
       const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
       while (bucket != nullptr) {
-        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-          if (Occupied(*bucket, slot)) {
-            if constexpr (FilterTag) {
-              if (bucket->hashes_[slot] != tag) continue;
-            }
+        if constexpr (FilterTag) {
+          // Flush receipts already retain the key's tag. Use the same SIMD
+          // filter as key lookup, but still validate a live handle and exact
+          // address: tags collide and holes retain stale fingerprint bytes.
+          for (std::uint32_t matches = MatchingTags(*bucket, tag); matches != 0;
+               matches &= matches - 1) {
+            const std::size_t slot = std::countr_zero(matches);
+            if (!Occupied(*bucket, slot)) continue;
             const Entry* entry = Resolve(bucket->entries_[slot]);
-            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+            if (reinterpret_cast<std::uintptr_t>(entry) == address)
               return entry;
-            }
+          }
+        } else {
+          for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+            if (!Occupied(*bucket, slot)) continue;
+            const Entry* entry = Resolve(bucket->entries_[slot]);
+            if (reinterpret_cast<std::uintptr_t>(entry) == address)
+              return entry;
           }
         }
         bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;

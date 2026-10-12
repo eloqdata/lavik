@@ -487,7 +487,29 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // header both fdatasync'd above), so the versions they superseded are no
     // longer anyone's durable copy and can leave their blocks' accounting.
     std::vector<RetiredRecord> retired_records;
-    for (const RecordIdentity& identity : pending->staged_records_) {
+    const auto prefetch_index = [&](std::size_t position, bool bucket) {
+      if (position >= pending->staged_records_.size()) return;
+      const auto& future = pending->staged_records_[position];
+      if (future.entry_address_ == 0 ||
+          future.index_generation_ != store->index_generations_[future.db_id_])
+        return;
+      const auto& index =
+          PartitionFor(*store, future.partition_id_).indexes_[future.db_id_];
+      if (bucket)
+        index.PrefetchAddress(future.entry_hash_);
+      else
+        index.PrefetchAddressMetadata();
+    };
+    for (std::size_t position = 0; position < pending->staged_records_.size();
+         ++position) {
+      // Batch receipts expose independent random lookups. Warm fixed map
+      // metadata first, then its bucket while processing
+      // earlier receipts. All hints stay on the owning worker and retain no
+      // entry pointer; generation, live membership and physical-boundary
+      // checks still follow.
+      prefetch_index(position + 16, false);
+      prefetch_index(position + 8, true);
+      const RecordIdentity& identity = pending->staged_records_[position];
       if (identity.retired_extents_ != nullptr) {
         SpawnExtentReclaim(*store, identity.retired_extents_);
       }
