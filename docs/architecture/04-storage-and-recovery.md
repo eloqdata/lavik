@@ -649,7 +649,12 @@ rereads. Transaction-owned reads always use that locked path directly.
 Tombstones and expired values are invisible; an expired observation can enqueue
 a bounded active-expiration candidate. A staged location is copied or framed
 from its write buffer. A disk location is read on its physical block owner into
-an aligned lease.
+an aligned lease. For a complete inline String already on its key owner's disk,
+GET can submit the read from an awaitable embedded in its existing request task,
+without child loader coroutines. The awaitable owns the block pin and buffer
+through completion and validates the record and population before returning it.
+Buffer contention, staged data, other representations, and stale physical
+locations retain the complete loader and its backpressure/relocation handling.
 
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size

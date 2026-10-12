@@ -1766,6 +1766,7 @@ if (BUILD_TESTING)
     tests/rdb_test.cpp
     tests/rdb_collection_test.cpp
     tests/record_location_test.cpp
+    tests/direct_value_read_test.cpp
     tests/request_gate_test.cpp
     tests/replication_command_test.cpp
     tests/replication_group_test.cpp

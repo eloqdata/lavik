@@ -3257,6 +3257,7 @@ class StorageEngine::Impl {
  private:
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
+  friend class DirectValueReadTestPeer;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -3342,6 +3343,54 @@ class StorageEngine::Impl {
     }
   };
 
+  // Opportunistic, owner-local disk read embedded in GetWithLockState's frame.
+  // nullopt selects LoadValue's complete representation/relocation state
+  // machine.
+  class DirectValueRead {
+   public:
+    using Result = std::optional<absl::StatusOr<LoadedValue>>;
+    DirectValueRead(Impl& engine, WorkerStore& store,
+                    WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+                    std::string_view key, RecordLocation location,
+                    ReadLatencyTrace* trace);
+    DirectValueRead(const DirectValueRead&) = delete;
+    DirectValueRead& operator=(const DirectValueRead&) = delete;
+    DirectValueRead(DirectValueRead&&) = delete;
+    DirectValueRead& operator=(DirectValueRead&&) = delete;
+
+    bool await_ready() const noexcept { return !io_.has_value(); }
+    bool await_suspend(std::coroutine_handle<> awaiting) {
+      if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
+      return io_->await_suspend(awaiting);
+    }
+    Result await_resume();
+
+   private:
+    friend class DirectValueReadTestPeer;
+    struct Pin {
+      WorkerStore* store_ = nullptr;
+      BlockState* state_ = nullptr;
+      ~Pin();
+    };
+
+    Impl& engine_;
+    WorkerStore::PartitionStore& partition_;
+    std::string_view key_;
+    RecordLocation location_;
+    ReadLatencyTrace* trace_;
+    std::uint64_t replication_epoch_;
+    std::uint64_t db_epoch_;
+    std::size_t record_headroom_ = 0;
+    std::size_t read_bytes_ = 0;
+    std::uint8_t db_id_;
+    Result ready_;
+    // The completion and lease die before the pin. Runtime shutdown drains
+    // I/O before destroying suspended frames; no continuation is heap-owned.
+    Pin pin_;
+    ReadBufferLease lease_;
+    std::optional<bycorf::SizeIoAwaitable> io_;
+  };
+
   // Owns the page lease while a grouped reader inspects its checked envelope.
   // Views into loaded_.value() must not outlive this object.
   struct LoadedHashGroupPayload {
@@ -3360,6 +3409,12 @@ class StorageEngine::Impl {
   std::size_t DirectGetValueLimit() const noexcept;
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
+
+  // Shared synchronous validation for ordinary and direct disk reads.
+  absl::StatusOr<LoadedValue> DecodeLoadedValue(
+      ReadBufferLease lease, std::uint8_t db_id, std::string_view key,
+      RecordLocation location, std::uint64_t replication_epoch,
+      std::size_t record_headroom, std::uint64_t expected_db_epoch);
 
   void QueueExpiredCandidate(WorkerStore& store, std::uint16_t partition_id,
                              std::uint8_t db_id,
