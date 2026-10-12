@@ -2945,9 +2945,7 @@ acquire_active_stream:
     if (previous_entry != nullptr && !previous_entry->key_complete())
         [[unlikely]] {
       index_write.Reset();
-      index_write = index_ptr->CloseAllReaders();
-      if (!index_write.ready()) [[unlikely]]
-        index_write = co_await AwaitIndexReaders(std::move(index_write));
+      index_write = co_await AwaitAllIndexReaders(*index_ptr);
       auto resolved = co_await FindVerifiedEntry(store, *index_ptr,
                                                  request.digest_, request.key_);
       if (!resolved.ok()) {

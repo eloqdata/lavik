@@ -441,9 +441,7 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store,
         if (!TombRaiderRoundValid(round, &store)) {
           co_return absl::OkStatus();  // forfeit the round
         }
-        auto index_write = index.CloseAllReaders();
-        if (!index_write.ready()) [[unlikely]]
-          index_write = co_await AwaitIndexReaders(std::move(index_write));
+        auto index_write = co_await AwaitAllIndexReaders(index);
         if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
           if (entry.value_.kind() == RecordKind::kTombstone ||
@@ -471,10 +469,8 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
     }
     auto& partition = PartitionForKey(store, claim.key_);
     if (partition.replication_epoch_ == claim.replication_epoch_) {
-      auto index_write = partition.indexes_[claim.db_id_].CloseForValueUpdate(
-          claim.digest_.value_);
-      if (!index_write.ready()) [[unlikely]]
-        index_write = co_await AwaitIndexReaders(std::move(index_write));
+      auto index_write = co_await AwaitIndexValueWrite(
+          partition.indexes_[claim.db_id_], claim.digest_.value_);
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[claim.db_id_], claim.digest_, claim.key_);
@@ -881,9 +877,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store,
         if (!TombRaiderRoundValid(round, &store)) {
           co_return absl::OkStatus();
         }
-        auto index_write = index.CloseAllReaders();
-        if (!index_write.ready()) [[unlikely]]
-          index_write = co_await AwaitIndexReaders(std::move(index_write));
+        auto index_write = co_await AwaitAllIndexReaders(index);
         if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
         cursor = index.Scan(cursor, [&](RecordIndex::Entry& entry) {
           if (!entry.value_.unclaimed()) {

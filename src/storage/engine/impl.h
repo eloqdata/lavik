@@ -133,10 +133,15 @@ inline Task<RecordIndex::WriteGuard> AwaitIndexWrite(RecordIndex& index,
   co_return std::move(guard);
 }
 
-// The caller checks ready() before entering this slow path, so uncontended
-// mutations keep their existing guard without allocating a waiting coroutine.
-inline Task<RecordIndex::WriteGuard> AwaitIndexReaders(
-    RecordIndex::WriteGuard guard) {
+inline Task<RecordIndex::WriteGuard> AwaitIndexValueWrite(RecordIndex& index,
+                                                          std::uint64_t hash) {
+  auto guard = index.CloseForValueUpdate(hash);
+  while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
+  co_return std::move(guard);
+}
+
+inline Task<RecordIndex::WriteGuard> AwaitAllIndexReaders(RecordIndex& index) {
+  auto guard = index.CloseAllReaders();
   while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
   co_return std::move(guard);
 }
@@ -3434,24 +3439,6 @@ class StorageEngine::Impl {
     }
   };
 
-  struct RecordPayload {
-    std::uint64_t txid_;
-    std::uint32_t offset_;
-    std::uint32_t bytes_;
-    std::uint32_t checksum_;
-  };
-
-  // Metadata-only validation may run on the I/O completion poller. CRC and
-  // payload movement must stay in FinishValueRecord on the caller's task.
-  static absl::StatusOr<RecordPayload> ParseValueRecord(
-      const std::byte* data, std::uint8_t db_id, std::string_view key,
-      const RecordLocation& location, std::uint64_t db_epoch,
-      std::uint64_t replication_epoch);
-  absl::StatusOr<LoadedValue> FinishValueRecord(ReadBufferLease& lease,
-                                                const std::byte* data,
-                                                RecordPayload payload,
-                                                bool staged);
-
   // The awaitable lives in the caller's frame. Ordinary local reads suspend
   // that caller directly, including through pool backpressure. Only multi-step
   // logical reads need a lazy helper Task. Local mode returns stale-location
@@ -3480,14 +3467,19 @@ class StorageEngine::Impl {
 
    private:
     friend class LoadValueAwaitableTestPeer;
+    struct Payload {
+      std::uint64_t txid_;
+      std::uint32_t offset_;
+      std::uint32_t bytes_;
+      std::uint32_t checksum_;
+    };
 
     void PrepareLocal();
     void FinishBufferWait();
     static void BufferReady(bycorf::RemoteWork* work);
     std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
-    absl::StatusOr<RecordPayload> ParseRecord(const std::byte* data) const;
-    Result FinishRecord(const std::byte* data, RecordPayload payload,
-                        bool staged);
+    absl::StatusOr<Payload> ParseRecord(const std::byte* data) const;
+    Result FinishRecord(const std::byte* data, Payload payload, bool staged);
     bool PopulationChanged() const;
     void Unpin();
     void Retry(absl::Status failure);
@@ -3507,7 +3499,7 @@ class StorageEngine::Impl {
     std::size_t read_bytes_ = 0;
     std::uint8_t db_id_;
     BlockState* pinned_ = nullptr;
-    std::optional<RecordPayload> payload_;
+    std::optional<Payload> payload_;
     std::optional<Result> ready_;
     // Runtime shutdown drains I/O before destroying suspended frames. The
     // waiter retains its assigned slot until the scheduled continuation runs.
