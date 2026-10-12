@@ -52,7 +52,6 @@ def run(root):
         )
         C.wait_cluster_ready(meta, "publication fixture READY", 20)
         baseline = time.monotonic()
-        accepted = sum(e[2] == 2 and e[4][0] == 1 for e in proxy.snapshot())
         hold.touch()
         # Unassigned active nodes are still part of the global routing
         # directory. Grow a real update past the single-frame size, without
@@ -90,16 +89,32 @@ def run(root):
                 e[2] == 6 and e[4][:16] == old_object for e in proxy.snapshot()
             ),
         )
+        aborted = next(
+            e for e in proxy.snapshot() if e[2] == 6 and e[4][:16] == old_object
+        )
+
+        # Applied completes the replacement. READY can require a later lease
+        # renewal, whose expired Grant correctly retires the session. Check
+        # the replacement's own connection rather than counting all handshakes
+        # through that unrelated readiness wait.
+        def replacement_applied():
+            return next(
+                (
+                    e
+                    for e in proxy.snapshot()
+                    if e[1] and e[2] == 7 and e[3] > aborted[3]
+                ),
+                None,
+            )
+
+        H.wait_until("replacement received FullStateApplied", 10, replacement_applied)
+        assert replacement_applied()[0] is chunk[0], (
+            "projection replacement reconnected the Data session"
+        )
         C.wait_cluster_ready(meta, "replacement projection READY", 20)
         events = proxy.snapshot()
         assert not any(e[2] == 5 and e[4][:16] == old_object for e in events), (
             "superseded transfer reached TransferEnd"
-        )
-        assert any(e[1] and e[2] == 7 and e[3] > chunk[3] for e in events), (
-            "replacement never received FullStateApplied"
-        )
-        assert sum(e[2] == 2 and e[4][0] == 1 for e in events) == accepted, (
-            "projection replacement reconnected the Data session"
         )
         assert not proxy.errors, proxy.errors
         H.log(
