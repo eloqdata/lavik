@@ -51,7 +51,9 @@ worker-local client record separately tracks data exposed by
 `CLIENT`, including RESP version, client library name/version, subscription
 counts, blocking state, and replication-session identity. All disconnect paths
 return through one cleanup point which unregisters client, monitor, Pub/Sub, and
-WATCH state.
+WATCH state. Peer EOF remains latched across asynchronous command work;
+registering a blocking waiter after EOF immediately cancels it, including
+waiters created by commands already buffered when the peer disconnected.
 
 Meta-managed serving boundaries retire ordinary client connections, including
 idle, blocking and Pub/Sub sessions. After authority admission closes, each
@@ -198,6 +200,9 @@ owner routing.
 The selected database is request data, never ambient worker state. Storage
 chooses an owner from the key's Redis hash-slot partition. Commands with one
 owner can execute locally or through one Bycorf cross-worker submission.
+Eligible standalone disk GETs first try an admitted index snapshot and physical
+read on the connection worker; contention or unsupported storage representations
+fall back to owner dispatch. Transaction callbacks retain owner routing.
 Commands needing atomic access to several keys build a `tx::Transaction` and
 execute one or more shard callbacks. Global commands explicitly collect from or
 coordinate all workers.

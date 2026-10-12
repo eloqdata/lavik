@@ -145,6 +145,59 @@ TestTask RunImmediate(TxShard& shard, LockFp fp, LockMode mode,
   order.push_back(std::string(name) + ":done");
 }
 
+TEST(TxLockTest, ReaderDrainResumesQueueAndRetainsAllIntentClosures) {
+  struct Admission {
+    std::array<unsigned, 32> intents{};
+    std::array<unsigned, 32> readers{};
+  } state;
+  TxShard shard;
+  std::atomic<std::uint64_t> counter{1};
+  shard.BindTxidCounter(&counter);
+  shard.BindReadAdmission(
+      {&state,
+       [](void* ctx, const KeyRef& key) {
+         ++static_cast<Admission*>(ctx)->intents[key.fp_ & 31];
+       },
+       [](void* ctx, const KeyRef& key) {
+         --static_cast<Admission*>(ctx)->intents[key.fp_ & 31];
+       },
+       [](void* ctx, const KeyRef& key) {
+         return static_cast<Admission*>(ctx)->readers[key.fp_ & 31] == 0;
+       }});
+  state.readers[0] = 2;
+  std::vector<std::string> order;
+  ManualEvent io;
+  RunWithIo(shard, 0, LockMode::kExclusive, io, order, "writer");
+  RunImmediate(shard, 0, LockMode::kShared, order, "reader");
+  EXPECT_TRUE(order.empty());
+  EXPECT_EQ(state.intents[0], 2);
+  RunImmediate(shard, 1, LockMode::kExclusive, order, "unrelated");
+  EXPECT_EQ(order.size(), 2);
+  --state.readers[0];
+  shard.ReadersDrained();
+  EXPECT_EQ(order.size(), 2);
+  --state.readers[0];
+  shard.ReadersDrained();
+  ASSERT_EQ(order.size(), 3);
+  EXPECT_EQ(order.back(), "writer:start");
+  EXPECT_EQ(state.intents[0], 2);
+  io.Fire();
+  EXPECT_EQ(order.back(), "reader:done");
+  EXPECT_EQ(state.intents[0], 0);
+  EXPECT_TRUE(shard.CanReadOptimistically(0));
+  state.readers[0] = 1;
+  {
+    auto cancelled = shard.AcquireKey(0, 0, LockMode::kExclusive);
+    ASSERT_FALSE(cancelled.await_ready());
+    cancelled.await_suspend(std::noop_coroutine());
+    EXPECT_EQ(state.intents[0], 1);
+  }
+  EXPECT_EQ(state.intents[0], 0);
+  EXPECT_TRUE(shard.CanReadOptimistically(0));
+  state.readers[0] = 0;
+  shard.ReadersDrained();  // No pointer into the destroyed awaiter remains.
+}
+
 TEST(TxLockTest, QueuesConflictsWithoutBlockingOtherKeys) {
   TxShard shard;  // unbound: Poll resumes inline
   std::atomic<std::uint64_t> counter{1};

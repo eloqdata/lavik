@@ -284,12 +284,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           if (state->kind_ == BlockKind::kTransaction) {
             tx_cleaner_dirty_.store(true, std::memory_order_release);
           }
-          if (state->pins_ > 0) {
-            state->release_pending_ = true;
-          } else {
-            ReleaseStagingBuffer(*store, *state);
-            MaybeQueueDefrag(*store, block_id);
-          }
+          ReleaseFlushedStagingBuffer(*store, *state, block_id);
         }
         continue;
       }
@@ -487,7 +482,29 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // header both fdatasync'd above), so the versions they superseded are no
     // longer anyone's durable copy and can leave their blocks' accounting.
     std::vector<RetiredRecord> retired_records;
-    for (const RecordIdentity& identity : pending->staged_records_) {
+    const auto prefetch_index = [&](std::size_t position, bool bucket) {
+      if (position >= pending->staged_records_.size()) return;
+      const auto& future = pending->staged_records_[position];
+      if (future.entry_address_ == 0 ||
+          future.index_generation_ != store->index_generations_[future.db_id_])
+        return;
+      const auto& index =
+          PartitionFor(*store, future.partition_id_).indexes_[future.db_id_];
+      if (bucket)
+        index.PrefetchAddress(future.entry_hash_);
+      else
+        index.PrefetchAddressMetadata();
+    };
+    for (std::size_t position = 0; position < pending->staged_records_.size();
+         ++position) {
+      // Batch receipts expose independent random lookups. Warm fixed map
+      // metadata first, then its bucket while processing
+      // earlier receipts. All hints stay on the owning worker and retain no
+      // entry pointer; generation, live membership and physical-boundary
+      // checks still follow.
+      prefetch_index(position + 16, false);
+      prefetch_index(position + 8, true);
+      const RecordIdentity& identity = pending->staged_records_[position];
       if (identity.retired_extents_ != nullptr) {
         SpawnExtentReclaim(*store, identity.retired_extents_);
       }
@@ -519,6 +536,18 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // applies to the replacement entry's own location.
       RecordIndex& index = PartitionFor(*store, identity.partition_id_)
                                .indexes_[identity.db_id_];
+      auto index_write = index.CloseForValueUpdate(identity.entry_hash_);
+      if (!index_write.ready()) [[unlikely]] {
+        // Keep admission closed across the slow wait. Most flush updates
+        // have no registered reader and need no waiting coroutine.
+        index_write =
+            co_await AwaitIndexValueWrite(index, identity.entry_hash_);
+      }
+      // Detach can run while the reader drain yields. Recheck the population
+      // before resolving the saved integer address into this index.
+      if (identity.index_generation_ !=
+          store->index_generations_[identity.db_id_])
+        continue;
       RecordIndex::Entry* current_entry = index.FindAddress(
           identity.entry_address_, identity.entry_hash_, identity.entry_tag_);
       if (current_entry == nullptr) {
@@ -588,13 +617,28 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     if (state->kind_ == BlockKind::kTransaction) {
       tx_cleaner_dirty_.store(true, std::memory_order_release);
     }
-    if (state->pins_ > 0) {
-      state->release_pending_ = true;
-      continue;
-    }
-    ReleaseStagingBuffer(*store, *state);
-    MaybeQueueDefrag(*store, pending->block_id_);
+    ReleaseFlushedStagingBuffer(*store, *state, pending->block_id_);
   }
+}
+
+void StorageEngine::Impl::ReleaseFlushedStagingBuffer(WorkerStore& store,
+                                                      BlockState& state,
+                                                      std::uint64_t block_id) {
+  // Close before checking the count: a last remote unpin either precedes this
+  // observation (release here) or sees the closed bit and notifies the owner.
+  // Checking first can strand release_pending_ with zero pins and no wakeup.
+  state.CloseRemotePins();
+  const auto pins = state.pin_count();
+  // Tests complete the last remote read after the count snapshot, before the
+  // release/defer decision. Keep this boundary tied to the real observation.
+  LAVIK_FAULT_INJECT(if (staging_release_count_test_hook_)
+                         staging_release_count_test_hook_(););
+  if (pins != 0) {
+    state.release_pending_ = true;
+    return;
+  }
+  ReleaseStagingBuffer(store, state);
+  MaybeQueueDefrag(store, block_id);
 }
 
 bool StorageEngine::Impl::IsActiveBlock(const WorkerStore& store,

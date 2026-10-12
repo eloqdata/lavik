@@ -48,7 +48,8 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
       operation.kind_ != SortedSetOperationKind::kRemoveRange;
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
-      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await ExecuteSortedSetLocked(db_id, key, digest, operation,
                                             nullptr, replication,
                                             mutation_precondition);

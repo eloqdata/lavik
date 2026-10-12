@@ -25,17 +25,54 @@
 #include <future>
 #include <thread>
 
+#include "../src/redis/blocking_wait.h"
 #include "absl/cleanup/cleanup.h"
 #include "bycorf/runtime/foreign_executor.h"
 #include "bycorf/runtime/runtime.h"
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 #include "lavik/command.h"
+#include "lavik/metrics.h"
 #include "lavik/session.h"
+#include "lavik/tx/tx_shard.h"
 
 namespace lavik {
 namespace {
 using namespace std::chrono_literals;
+
+TEST(ClientRetirementTest, LateBlockingRegistrationObservesDisconnect) {
+  auto saved = std::move(bycorf::MutableThisWorker());
+  bycorf::CrossCore cross_core(1);
+  bycorf::Worker worker;
+  bycorf::SetThisWorker(0, &cross_core, &worker);
+  absl::Cleanup restore = [&] {
+    bycorf::MutableThisWorker() = std::move(saved);
+  };
+  SetServerInfo("127.0.0.1", 0, 1, "");
+  InitWorkerMetrics(1);
+  if (tx::TxRuntime::Get() == nullptr) tx::TxRuntime::Create(1);
+  for (unsigned state = 0; state < 3; ++state) {
+    ConnectionContext context;
+    context.wait_peer_disconnected_ = state == 1;
+    context.closing_ = state == 2;
+    RegisterClientConnection(1, -1, "late-waiter", false, false, 0, &context);
+    absl::Cleanup unregister = [] { UnregisterClientConnection(1); };
+    // Force cancellation before registration, when the disconnect callback
+    // cannot find a waiter. Both keyed and keyless waits share this registry.
+    EXPECT_FALSE(CancelBlockedClientOnCurrentWorker(1));
+    auto task = RegisterClientBlockingWait(1);
+    std::move(task)
+        .operator co_await()
+        .await_suspend(std::noop_coroutine())
+        .resume();
+    ASSERT_TRUE(task.done());
+    auto result = std::move(task).TakeResult();
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(BlockingWaitState(**result),
+              state == 0 ? BlockingWakeReason::kWaiting
+                         : BlockingWakeReason::kCancelled);
+  }
+}
 
 TEST(ClientRetirementTest,
      DelayedNotificationClosesReconnectsButPreservesInternalConnections) {

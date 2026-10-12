@@ -503,7 +503,8 @@ TEST(GroupedRdbStreamE2e, ZsetRestoreBatchesPreserveOrderAndRollback) {
   };
   PrivateDisk disk;
   {
-    Server server(disk, 2, {}, {}, false, 2, "128M");
+    // Include the fixed 16 MiB arena directory per worker in the budget.
+    Server server(disk, 2, {}, {}, false, 2, "176M");
     Client client(server.port());
     for (unsigned mode = 0; mode < 4; ++mode) {
       SCOPED_TRACE(mode);

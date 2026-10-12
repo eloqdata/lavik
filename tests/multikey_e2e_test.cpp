@@ -885,7 +885,7 @@ int main(int argc, char** argv) {
     }
 
     // Force one logical partition owned by each of the four server workers to
-    // grow beyond one bucket. Its stateless hash-table cursor uses low
+    // exercise multiple buckets. Its stateless hash-table cursor uses low
     // bucket-index bits, which the global SCAN cursor must preserve while
     // crossing worker ownership boundaries between client calls.
     {
@@ -912,7 +912,7 @@ int main(int argc, char** argv) {
       std::string collected;
       std::string cursor = "0";
       std::array<bool, 4> saw_local_cursor{};
-      std::size_t calls = 0;
+      const auto scan_deadline = std::chrono::steady_clock::now() + 10s;
       do {
         const std::string reply = client.Command(
             {"SCAN", cursor, "MATCH", "scan-packed:*", "COUNT", "1"});
@@ -935,7 +935,10 @@ int main(int argc, char** argv) {
           saw_local_cursor[partition_id % saw_local_cursor.size()] = true;
         }
         collected += reply.substr(cursor_end);
-        if (++calls >= 1000) {
+        // COUNT bounds visited buckets, not matching keys. Sparse indexes
+        // retain the reader-stripe bucket floor, so a fixed request-count
+        // bound would reject a valid terminating scan of the whole DB.
+        if (std::chrono::steady_clock::now() >= scan_deadline) {
           Fail("packed-cursor SCAN did not terminate");
         }
       } while (cursor != "0");

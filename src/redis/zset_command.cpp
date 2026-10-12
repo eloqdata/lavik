@@ -665,7 +665,8 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     transaction.AddKey(
         g_storage->OwnerForKey(request.args_[argument]), request.db_id_,
         storage::ComputeDigest(request.args_[argument]),
-        static_cast<std::uint32_t>(argument), tx::LockMode::kExclusive);
+        static_cast<std::uint32_t>(argument), tx::LockMode::kExclusive,
+        storage::RedisSlot(request.args_[argument]));
   }
   transaction.Seal();
   // Cluster owner-side re-check: pops mutate, so the validator
@@ -2664,15 +2665,15 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   tx::Transaction transaction;
   if (context.store_) {
     const std::size_t destination = context.store_shape_->destination_arg_;
-    transaction.AddKey(g_storage->OwnerForKey(args[destination]),
-                       request.db_id_,
-                       storage::ComputeDigest(args[destination]), destination,
-                       tx::LockMode::kExclusive);
+    transaction.AddKey(
+        g_storage->OwnerForKey(args[destination]), request.db_id_,
+        storage::ComputeDigest(args[destination]), destination,
+        tx::LockMode::kExclusive, storage::RedisSlot(args[destination]));
   }
   for (std::size_t i = context.first_source_; i <= context.last_source_; ++i) {
     transaction.AddKey(g_storage->OwnerForKey(args[i]), request.db_id_,
                        storage::ComputeDigest(args[i]), i,
-                       tx::LockMode::kShared);
+                       tx::LockMode::kShared, storage::RedisSlot(args[i]));
   }
   transaction.Seal();
   // Cluster owner-side re-check: only STORE forms mutate.

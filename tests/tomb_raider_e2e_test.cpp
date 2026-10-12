@@ -160,6 +160,16 @@ class TombRaiderTestPeer {
       status = co_await SealForSweep(storage);
       if (!status.ok()) co_return status;
       auto* source = impl->FindBlockState(store, block);
+      // Flush completion schedules retired-record accounting on the owner;
+      // it does not join that detached task. Wait for the actual fixture
+      // invariant, especially for the multi-batch prefix-claim scenario.
+      const auto accounting_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (source != nullptr && source->live_bytes_ != 0 &&
+             std::chrono::steady_clock::now() < accounting_deadline) {
+        co_await bycorf::Yield(worker);
+        source = impl->FindBlockState(store, block);
+      }
       if (source == nullptr || source->live_bytes_ != 0)
         co_return absl::FailedPreconditionError(
             "old records block is not empty");
@@ -182,15 +192,18 @@ class TombRaiderTestPeer {
       std::optional<bycorf::Task<absl::Status>> retirement;
       bycorf::AsyncNotification retired;
       struct ReaderPin {
+        StorageEngine::Impl* impl_;
+        StorageEngine::Impl::WorkerStore* store_;
+        std::uint64_t block_;
         BlockState* state_ = nullptr;
         void Reset() {
           if (state_ != nullptr) {
-            --state_->pins_;
+            impl_->UnpinBlock(*store_, *state_, block_);
             state_ = nullptr;
           }
         }
         ~ReaderPin() { Reset(); }
-      } pin;
+      } pin{impl, &store, block};
       const auto begin_retirement = [&]() -> absl::Status {
         if (retirement.has_value()) return absl::OkStatus();
         auto task = impl->CleanBlockLocked(store, block);
@@ -220,7 +233,7 @@ class TombRaiderTestPeer {
         co_await store.store_state_mutex_.Lock();
         status = begin_retirement();
         if (status.ok() && !retirement->done()) {
-          ++source->pins_;
+          source->PinLocal();
           pin.state_ = source;
         } else if (status.ok()) {
           status = absl::FailedPreconditionError(
@@ -234,7 +247,7 @@ class TombRaiderTestPeer {
           status =
               co_await bycorf::SleepFor(worker, std::chrono::milliseconds(1));
         }
-        if (status.ok() && (!source->freeing_ || source->pins_ != 1 ||
+        if (status.ok() && (!source->freeing_ || source->pin_count() != 1 ||
                             store.pending_record_block_retirements_ != 0))
           status = absl::FailedPreconditionError(
               "reader pin did not hold the freeing window");

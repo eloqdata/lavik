@@ -35,12 +35,18 @@ struct ControllerAffinityInput {
 };
 
 struct ControllerAffinityPlan {
+  // Home assignments control write placement independently of I/O access.
   std::vector<unsigned> controller_quotas_;
   std::vector<std::vector<std::size_t>> worker_controllers_;
+  // Sorted worker IDs with a qpair, including every home worker. Namespaces
+  // on the same controller share this assignment and one qpair per worker.
+  std::vector<std::vector<std::uint16_t>> controller_qpair_workers_;
 };
 
 // Inputs must be in stable controller-id order. The returned indexes refer to
-// that order, making the same topology deterministic across restarts.
+// that order, making the same topology deterministic across restarts. Preserve
+// weighted home placement, then use spare qpairs to widen direct I/O access up
+// to min(controller capacity, worker count), without changing write placement.
 inline absl::StatusOr<ControllerAffinityPlan> PlanControllerAffinity(
     std::span<const ControllerAffinityInput> controllers,
     unsigned worker_count) {
@@ -145,6 +151,43 @@ inline absl::StatusOr<ControllerAffinityPlan> PlanControllerAffinity(
       plan.worker_controllers_[worker].push_back(controller);
       *lightest += controllers[controller].foreground_weight_;
     }
+  }
+  plan.controller_qpair_workers_.resize(controllers.size());
+  std::vector<unsigned> worker_qpair_counts(worker_count, 0);
+  for (unsigned worker = 0; worker < worker_count; ++worker) {
+    for (const std::size_t controller : plan.worker_controllers_[worker]) {
+      plan.controller_qpair_workers_[controller].push_back(worker);
+      ++worker_qpair_counts[worker];
+    }
+  }
+  for (std::size_t controller = 0; controller < controllers.size();
+       ++controller) {
+    auto& workers = plan.controller_qpair_workers_[controller];
+    const unsigned cap =
+        std::min(controllers[controller].io_qpair_count_, worker_count);
+    if (workers.size() == cap) continue;
+
+    std::vector<unsigned> candidates;
+    for (unsigned worker = 0; worker < worker_count; ++worker) {
+      if (!std::binary_search(workers.begin(), workers.end(), worker)) {
+        candidates.push_back(worker);
+      }
+    }
+    // Home qpairs are reserved first, so additional access cannot starve a
+    // writer. Spread limited spare capacity across workers deterministically.
+    std::sort(candidates.begin(), candidates.end(),
+              [&worker_qpair_counts](unsigned left, unsigned right) {
+                if (worker_qpair_counts[left] != worker_qpair_counts[right]) {
+                  return worker_qpair_counts[left] < worker_qpair_counts[right];
+                }
+                return left < right;
+              });
+    const std::size_t extra = cap - workers.size();
+    for (std::size_t i = 0; i < extra; ++i) {
+      workers.push_back(candidates[i]);
+      ++worker_qpair_counts[candidates[i]];
+    }
+    std::sort(workers.begin(), workers.end());
   }
   return plan;
 }

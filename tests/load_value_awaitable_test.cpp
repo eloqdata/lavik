@@ -33,6 +33,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     engine.stores_.push_back(
         std::make_unique<StorageEngine::Impl::WorkerStore>());
     auto& store = *engine.stores_[0];
+    store.engine_ = &engine;
     store.worker_ = &worker_;
     store.partitions_.resize(1);
     store.partition_indexes_.resize(kLogicalDatabaseCount);
@@ -271,7 +272,7 @@ TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
   Start(first_task, true);
   Start(second_task);
   EXPECT_TRUE(BufferWaitIsBackground(first));
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   held->Reset();
   // Handoff schedules I/O; it must not resume inside the release stack.
   EXPECT_FALSE(first_task.done());
@@ -298,7 +299,7 @@ TEST_F(LoadValueAwaitableTestPeer, PopulationChangeDuringBufferWaitSkipsIo) {
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   EXPECT_TRUE(absl::IsNotFound(std::move(task).TakeResult().status()));
   EXPECT_FALSE(HasHelper(read));
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
@@ -308,7 +309,7 @@ TEST_F(LoadValueAwaitableTestPeer, RelocationDuringBufferWaitUsesNewLocation) {
   auto read = Read();
   auto task = AwaitExisting(read);
   Start(task, true);
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   // No physical pointer was retained while waiting: recycle before handoff.
   block_.Reset(0, 8);
   block_.allocated_ = true;
@@ -320,7 +321,7 @@ TEST_F(LoadValueAwaitableTestPeer, RelocationDuringBufferWaitUsesNewLocation) {
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   ExpectValue(std::move(task).TakeResult());
   EXPECT_TRUE(HasHelper(read));
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
@@ -332,7 +333,7 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentWaitRetainsPinAndReturnsSlice) {
   {
     auto read = ExtentSlice(ExtentReference(), 2, output);
     EXPECT_FALSE(read.await_ready());
-    EXPECT_EQ(block_.pins_, 1);
+    EXPECT_EQ(block_.pin_count(), 1);
     auto task = AwaitExtent(read);
     Start(task, true);
     held->Reset();
@@ -344,7 +345,7 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentWaitRetainsPinAndReturnsSlice) {
                                output.size()),
               std::string_view(value_).substr(2, output.size()));
   }
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
@@ -362,7 +363,7 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
     EXPECT_EQ(output[0], std::byte{0x55});
     EXPECT_EQ(output[1], std::byte{0x55});
   }
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
@@ -375,7 +376,7 @@ TEST_F(LoadValueAwaitableTestPeer, CompletionTransfersLeaseAndReleasesPin) {
     result = read.await_resume();
     ExpectValue(*result);
   }
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 0);
   result.reset();
   EXPECT_EQ(Pool().available_read_buffers(), 1);
@@ -397,7 +398,7 @@ TEST_F(LoadValueAwaitableTestPeer, PopulationChangesDiscardCompletedRead) {
         EXPECT_FALSE(HasHelper(read));
         EXPECT_TRUE(absl::IsNotFound(read.await_resume().status()));
       }
-      EXPECT_EQ(block_.pins_, 0);
+      EXPECT_EQ(block_.pin_count(), 0);
       EXPECT_EQ(Pool().available_read_buffers(), 1);
       if (database)
         ++header_.db_epoch_;
@@ -423,9 +424,12 @@ TEST_F(LoadValueAwaitableTestPeer, ErrorsReleaseResources) {
       header_.payload_checksum_ ^= 1;
       ASSERT_NO_FATAL_FAILURE(Complete(read, completion));
       header_.payload_checksum_ ^= 1;
+      // A full CQE parses metadata only; CRC failure is discovered when the
+      // caller resumes, not while the I/O poller is processing completions.
+      if (completion == 4096) EXPECT_FALSE(read.await_ready());
       EXPECT_FALSE(read.await_resume().ok());
     }
-    EXPECT_EQ(block_.pins_, 0);
+    EXPECT_EQ(block_.pin_count(), 0);
     EXPECT_EQ(Pool().available_read_buffers(), 1);
   }
 }
@@ -447,7 +451,7 @@ TEST_F(LoadValueAwaitableTestPeer,
   ASSERT_NO_FATAL_FAILURE(Complete(read));
   EXPECT_FALSE(task.done());
   EXPECT_TRUE(HelperIsBackground(read));
-  EXPECT_EQ(block_.pins_, 0);
+  EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
   --header_.allocation_epoch_;
   // The new physical record has the same logical mutation and lives in staging.

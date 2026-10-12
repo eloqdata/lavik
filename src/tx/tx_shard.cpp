@@ -127,6 +127,7 @@ void TxShard::Poll() {
     // point after resumption).
     committed_txid_ = std::max(committed_txid_, head->txid_);
     AcquireHolds(head->keys_);
+    head->holds_acquired_ = true;
     ++queued_runs_;
     // Remove before resuming: once resumed, the waiter (living in the
     // suspended coroutine's frame) is no longer referenced by the queue.

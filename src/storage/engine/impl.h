@@ -110,6 +110,42 @@ class UnlockGuard {
 
 using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
 
+// These waits yield only the owner coroutine. Remote readers never suspend
+// while registered, so draining does not depend on store-state/key locks held
+// by the caller. Call before resolving entries, and revalidate after any wait.
+inline Task<RecordIndex::WriteGuard> AwaitIndexWrite(RecordIndex& index,
+                                                     const Digest& digest) {
+  auto guard = index.CloseForWrite(digest);
+  bool waited = false;
+  while (!guard.ready()) {
+    waited = true;
+    co_await tx::CurrentTxShard().WaitForReaders();
+  }
+  // Another owner coroutine may have changed capacity during the wait.
+  // Without suspension CloseForWrite's decision is still current. Avoid
+  // walking the same bucket chain again on every uncontended write.
+  // No entry pointer has been obtained yet; upgrade before resolving it.
+  if (waited && index.NeedsStructuralWrite(digest)) {
+    guard.Reset();
+    guard = index.CloseAllReaders();
+    while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
+  }
+  co_return std::move(guard);
+}
+
+inline Task<RecordIndex::WriteGuard> AwaitIndexValueWrite(RecordIndex& index,
+                                                          std::uint64_t hash) {
+  auto guard = index.CloseForValueUpdate(hash);
+  while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
+  co_return std::move(guard);
+}
+
+inline Task<RecordIndex::WriteGuard> AwaitAllIndexReaders(RecordIndex& index) {
+  auto guard = index.CloseAllReaders();
+  while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
+  co_return std::move(guard);
+}
+
 // Metadata is changed only on the UUID's logical owner. Physical record blocks
 // hold shared references until their allocation bits are durably cleared, even
 // after DEL/expiry or rollback removes their records from the user index.
@@ -300,7 +336,32 @@ struct alignas(32) BlockState {
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t committed_bytes_ = 0;
   std::uint32_t live_bytes_ = 0;
-  std::uint32_t pins_ = 0;
+  static constexpr std::uint32_t kRemoteClosed = std::uint32_t{1} << 31;
+  static constexpr std::uint32_t kPinMask = kRemoteClosed - 1;
+  std::atomic<std::uint32_t> pins_{kRemoteClosed};
+  std::uint32_t pin_count() const noexcept {
+    return pins_.load(std::memory_order_acquire) & kPinMask;
+  }
+  // The owner already validated allocation/freeing state without suspending.
+  // Local fallback reads may pin during defrag; only remote admission closes.
+  void PinLocal() noexcept {
+    [[maybe_unused]] const auto old =
+        pins_.fetch_add(1, std::memory_order_relaxed);
+    assert((old & kPinMask) != kPinMask);
+  }
+  bool TryRemotePin() noexcept {
+    auto state = pins_.load(std::memory_order_relaxed);
+    return !(state & kRemoteClosed) && (state & kPinMask) != kPinMask &&
+           pins_.compare_exchange_strong(state, state + 1,
+                                         std::memory_order_acquire,
+                                         std::memory_order_relaxed);
+  }
+  void CloseRemotePins() noexcept {
+    pins_.fetch_or(kRemoteClosed, std::memory_order_acq_rel);
+  }
+  void OpenRemotePins() noexcept {
+    pins_.fetch_and(kPinMask, std::memory_order_release);
+  }
   // Written only by the owner as it claims or releases the block; read by
   // anyone that needs to know where to dispatch. kUnownedBlock means free.
   std::atomic<std::uint16_t> owner_{kUnownedBlock};
@@ -329,7 +390,8 @@ struct alignas(32) BlockState {
     allocation_epoch_ = new_allocation_epoch;
     committed_bytes_ = 0;
     live_bytes_ = 0;
-    pins_ = 0;
+    pins_.store(new_owner == kUnownedBlock ? kRemoteClosed : 0,
+                std::memory_order_release);
     writer_id_ = 0;
     layout_worker_count_ = 0;
     staging_slot_ = 0;
@@ -1559,6 +1621,26 @@ class StorageEngine::Impl {
  public:
   struct FullSyncCollection;
   struct WorkerStore {
+    Impl* engine_ = nullptr;
+    bycorf::AsyncNotification block_pin_progress_;
+    std::atomic<bool> remote_reads_ready_{false};
+    std::atomic<std::uint64_t> remote_population_generation_{0};
+    unsigned remote_population_holds_ = 0;
+    // Worker-owned, nestable population fence. Snapshot readers compare this
+    // generation before/after lookup and after I/O; it never guards raw data.
+    struct PopulationReadFence {
+      WorkerStore& store_;
+      explicit PopulationReadFence(WorkerStore& store) : store_(store) {
+        if (store_.remote_population_holds_++ == 0)
+          store_.remote_population_generation_.fetch_add(
+              1, std::memory_order_release);
+      }
+      ~PopulationReadFence() {
+        if (--store_.remote_population_holds_ == 0)
+          store_.remote_population_generation_.fetch_add(
+              1, std::memory_order_release);
+      }
+    };
     struct PendingTxCommit {
       std::uint64_t txid_ = 0;
       std::vector<TxShardWrites> writes_;
@@ -2108,6 +2190,15 @@ class StorageEngine::Impl {
   absl::Status Prepare(unsigned worker_count);
 
   Task<absl::Status> InitializeWorker(Worker& worker);
+  static void NotifyIndexReaders(void* context) noexcept;
+  static void ChangeReadIntent(void* context, const tx::KeyRef& key,
+                               bool close);
+  static bool ReadIntentReady(void* context, const tx::KeyRef& key);
+  void UnpinBlock(WorkerStore& store, BlockState& state,
+                  std::uint64_t block_id);
+  void UnpinRemoteBlock(BlockState& state, unsigned owner,
+                        std::uint64_t block_id);
+  void PrepareRemoteGet(RemoteGetAwaitable& result);
   void FinalizeWorker(unsigned worker_id) noexcept;
   bool AbandonWorkerStateForProcessExit() noexcept;
 
@@ -3258,6 +3349,8 @@ class StorageEngine::Impl {
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
+  friend class RemoteGetTestPeer;
+  friend class StorageEngine::RemoteGetAwaitable;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -3322,6 +3415,9 @@ class StorageEngine::Impl {
                                const BlockState& state) const;
 
   static void ReleaseStagingBuffer(WorkerStore& store, BlockState& state);
+  // Retires a sealed, durable staging buffer after draining remote pins.
+  void ReleaseFlushedStagingBuffer(WorkerStore& store, BlockState& state,
+                                   std::uint64_t block_id);
 
   struct LoadedValue {
     ReadBufferLease lease_;
@@ -3474,6 +3570,13 @@ class StorageEngine::Impl {
 
   absl::StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded);
 
+  // Validates the pinned remote record in the connection task after I/O.
+  // Remote admission/fallback is separate from owner-local relocation retries.
+  absl::StatusOr<LoadedValue> DecodeRemoteValue(
+      ReadBufferLease lease, std::uint8_t db_id, std::string_view key,
+      RecordLocation location, std::uint64_t replication_epoch,
+      std::size_t record_headroom, std::uint64_t expected_db_epoch);
+
   void QueueExpiredCandidate(WorkerStore& store, std::uint16_t partition_id,
                              std::uint8_t db_id,
                              const RecordIndex::Entry& entry,
@@ -3555,8 +3658,11 @@ class StorageEngine::Impl {
   }
 
   void DestroyBlockState(WorkerStore& store, std::uint64_t block_id) {
+    auto& state = BlockStateAt(block_id);
+    state.CloseRemotePins();
+    assert(state.pin_count() == 0);
     store.tx_blocks_.erase(block_id);
-    BlockStateAt(block_id).Reset(kUnownedBlock);
+    state.Reset(kUnownedBlock);
   }
 
   // Walks this worker's blocks. The array is shared, so ownership is filtered
@@ -3661,10 +3767,10 @@ class StorageEngine::Impl {
   Task<absl::Status> PersistCheckpointRoot(const CheckpointRoot& root);
 
   // Takes the database out of service on this worker. Everything here is O(the
-  // partition count) and runs without suspending, so the caller's FLUSHDB gate
-  // stays closed for a bounded time no matter how many keys the database holds.
+  // partition count). Close/drain remote readers asynchronously before the
+  // non-suspending population replacement, under the caller's FLUSHDB gate.
   // Retiring the detached entries is left to ReclaimDetachedIndexes.
-  void DetachDbLocal(WorkerStore& store, std::uint8_t db_id);
+  Task<absl::Status> DetachDbLocal(WorkerStore& store, std::uint8_t db_id);
 
   // Retires entries detached by database flush or a replica population
   // transition: subtracts what they contributed to their blocks, then frees
@@ -4553,7 +4659,8 @@ class StorageEngine::Impl {
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
-  // Populated only for SPDK: workers owning a qpair for each controller.
+  // Populated only for SPDK: sorted qpair workers for each device's controller.
+  // Includes spare-qpair readers beyond the weighted home write assignment.
   std::vector<std::vector<std::uint16_t>> device_owners_;
   // Which worker owns each block, by device and local block id. A record
   // carries its block's owner in its index entry, but an extent reference has
@@ -4731,6 +4838,8 @@ class StorageEngine::Impl {
   std::int64_t recovery_started_ms_ = 0;
   static constexpr std::size_t kDefragReserveBlocksPerDevice = 8;
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};
+  std::array<std::atomic<std::uint64_t>, kLogicalStorageShards>
+      remote_replication_epochs_{};
   // Runtime translation installed with a promoted replica root. Source DB
   // epochs can be lower than this node's pre-existing local epoch.
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount>
@@ -4747,6 +4856,11 @@ class StorageEngine::Impl {
   std::array<AsyncMutex, kLogicalDatabaseCount> replica_db_epoch_mutexes_;
   std::atomic<unsigned> active_defrags_{0};
   std::atomic<unsigned> pending_defrags_{0};
+#if LAVIK_FAULTS_ENABLED
+  // Synchronous owner-side injection after a staging-release pin snapshot.
+  // Models a remote unpin without OS scheduling; absent in production builds.
+  std::function<void()> staging_release_count_test_hook_;
+#endif
   std::atomic<unsigned> active_flushes_{0};
   // Extent reclaims in flight (from the moment they are spawned): the block
   // allocator must not report the device full while one may still free space.

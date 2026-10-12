@@ -15,6 +15,7 @@
  */
 
 #include <atomic>
+#include <latch>
 #include <limits>
 #include <thread>
 
@@ -23,6 +24,314 @@
 
 namespace lavik::storage {
 namespace {
+
+TEST(RecordIndexTest, BucketFloorSurvivesGrowthShrinkAndPopulationReplacement) {
+  RecordIndex index;
+  auto* states = index.read_states().data();
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+  ASSERT_TRUE(index.PreallocateForExpectedSize(0));
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+
+  // Admission must cover the larger first bucket array, even before the arena
+  // or any entry has been allocated.
+  ScanHashMap<RecordLocation, std::numeric_limits<std::uint32_t>::digits,
+              RecordIndexEntryPolicy>
+      owner_only;
+  const auto digest = ComputeDigest("keep");
+  EXPECT_EQ(
+      index.RequiredAllocationBytes(digest, "keep", true, false, true),
+      owner_only.RequiredAllocationBytes(digest, "keep", true, false, true) +
+          31 * 64);
+  ASSERT_NE(index.InsertNew(digest, "keep", RecordLocation{}), nullptr);
+  ASSERT_EQ(index.allocated_bucket_count(), 32);
+  for (unsigned i = 0; i < 400; ++i) {
+    const auto key = "grow-" + std::to_string(i);
+    ASSERT_NE(index.InsertNew(ComputeDigest(key), key, RecordLocation{}),
+              nullptr);
+  }
+  for (unsigned step = 0; step < 1024 && index.Maintain(); ++step) {
+  }
+  ASSERT_FALSE(index.rehashing());
+  EXPECT_EQ(index.allocated_bucket_count(), 64);
+  for (unsigned i = 0; i < 400; ++i) {
+    const auto key = "grow-" + std::to_string(i);
+    ASSERT_TRUE(index.Erase(ComputeDigest(key), key));
+  }
+  for (unsigned step = 0; step < 1024 && index.Maintain(); ++step) {
+  }
+  EXPECT_FALSE(index.rehashing());
+  EXPECT_EQ(index.allocated_bucket_count(), 32);
+  EXPECT_NE(index.Find(digest, "keep"), nullptr);
+  EXPECT_EQ(index.read_states().data(), states);
+
+  auto detached = index.Detach();
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+  EXPECT_EQ(index.read_states().data(), states);
+  RecordIndex moved(std::move(detached));
+  EXPECT_EQ(moved.allocated_bucket_count(), 32);
+  EXPECT_NE(moved.Find(digest, "keep"), nullptr);
+  ASSERT_TRUE(index.PreallocateForExpectedSize(1));
+  EXPECT_EQ(index.allocated_bucket_count(), 32);
+  index.Clear();
+  EXPECT_EQ(index.allocated_bucket_count(), 0);
+  EXPECT_EQ(index.read_states().data(), states);
+}
+
+TEST(RecordIndexTest, ReadStatesAreClosedAndCacheLineIsolated) {
+  // Worker startup keeps indexes in a vector: its allocator must preserve the
+  // over-alignment as well as spacing within each fixed stripe array.
+  std::vector<RecordIndex> indexes(2);
+  for (const auto& index : indexes) {
+    ASSERT_EQ(index.read_states().size(), 32);
+    for (const auto& stripe : index.read_states()) {
+      EXPECT_EQ(reinterpret_cast<std::uintptr_t>(&stripe) % 64, 0);
+      EXPECT_EQ(stripe.state_.load(std::memory_order_relaxed),
+                ScanHashMapReadState::kClosed);
+    }
+    EXPECT_EQ(sizeof(index.read_states()), 32 * 64);
+    EXPECT_EQ(index.allocated_bucket_count(), 0);
+  }
+}
+
+// Production only enables primary RecordIndex readers. This compact test map
+// exercises the same protocol with directly inspectable payloads.
+using ConcurrentIndex =
+    ScanHashMap<std::uint64_t, 32, ScanHashMapInlineEntryPolicy<std::uint64_t>,
+                32>;
+
+std::shared_ptr<ScanHashMapEntryArena> ConcurrentArena() {
+  auto arena = std::make_shared<ScanHashMapEntryArena>(63);
+  EXPECT_TRUE(arena->PreallocateDirectory());
+  return arena;
+}
+
+TEST(IndexReadersTest, LastReaderNotifiesOnceAndIntentSurvivesResizeScope) {
+  ConcurrentIndex map(ConcurrentArena());
+  ASSERT_NE(map.InsertNew(Digest{0}, "key", 1, false), nullptr);
+  unsigned notifications = 0;
+  map.SetReaderNotifier(&notifications, [](void* ctx) noexcept {
+    ++*static_cast<unsigned*>(ctx);
+  });
+  map.EnableConcurrentReads();
+  auto first = map.TryRead(Digest{0});
+  auto last = map.TryRead(Digest{0});
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(last);
+  map.CloseReadIntent(0);
+  {
+    auto structural = map.CloseAllReaders();
+    EXPECT_FALSE(structural.ready());
+    first.Reset();
+    EXPECT_EQ(notifications, 0);
+    last.Reset();
+    EXPECT_EQ(notifications, 1);
+    EXPECT_TRUE(structural.ready());
+  }
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  map.ReleaseReadIntent(0);
+  EXPECT_TRUE(map.TryRead(Digest{0}));
+  EXPECT_EQ(notifications, 1);
+}
+
+TEST(IndexReadersTest,
+     StripeClosureAndNestedGlobalClosureDrainExistingReaders) {
+  ConcurrentIndex map(ConcurrentArena());
+  ASSERT_NE(map.InsertNew(Digest{0}, "external", 1, false), nullptr);
+  ASSERT_NE(map.InsertNew(Digest{1}, "external", 2, false), nullptr);
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  map.EnableConcurrentReads();
+  auto read = map.TryRead(Digest{0});
+  ASSERT_TRUE(read);
+  auto writer = map.CloseForValueUpdate(0);
+  EXPECT_FALSE(writer.ready());
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  EXPECT_TRUE(map.TryRead(Digest{1}));
+  auto all = map.CloseAllReaders();
+  EXPECT_FALSE(all.ready());
+  EXPECT_FALSE(map.TryRead(Digest{1}));
+  auto moved = std::move(read);
+  EXPECT_FALSE(read);
+  moved.Reset();
+  ASSERT_TRUE(writer.ready());
+  ASSERT_TRUE(all.ready());
+  all.Reset();
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  EXPECT_TRUE(map.TryRead(Digest{1}));
+  map.InsertOrAssign(Digest{0}, "external", 3, false);
+  writer.Reset();
+  auto verified = map.TryRead(Digest{0});
+  ASSERT_TRUE(verified);
+  EXPECT_EQ(std::as_const(map).Find(Digest{0}, "external")->value_, 3);
+}
+
+TEST(IndexReadersTest, NestedStructuralScopesRetainClosureAndRecheckNextDrain) {
+  ConcurrentIndex map(ConcurrentArena());
+  ASSERT_NE(map.InsertNew(Digest{0}, "external", 1, false), nullptr);
+  map.EnableConcurrentReads();
+  auto reader = map.TryRead(Digest{0});
+  ASSERT_TRUE(reader);
+  auto outer = map.CloseAllReaders();
+  auto inner = map.CloseAllReaders();
+  EXPECT_FALSE(outer.ready());
+  EXPECT_FALSE(inner.ready());
+  reader.Reset();
+  ASSERT_TRUE(outer.ready());
+  ASSERT_TRUE(inner.ready());
+  outer.Reset();
+  // A suspended writer can outlive the scope that originally closed the map.
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  auto moved = std::move(inner);
+  EXPECT_TRUE(moved.ready());
+  moved.Reset();
+  reader = map.TryRead(Digest{0});
+  ASSERT_TRUE(reader);
+  auto next = map.CloseAllReaders();
+  EXPECT_FALSE(next.ready());  // A previous drain cannot authorize this scope.
+  reader.Reset();
+  EXPECT_TRUE(next.ready());
+  next.Reset();
+  EXPECT_TRUE(map.TryRead(Digest{0}));
+}
+
+TEST(IndexReadersTest, ExpansionCompletionKeepsEnclosingWriteClosed) {
+  ConcurrentIndex map(ConcurrentArena());
+  for (unsigned i = 0; i < 288; ++i)
+    ASSERT_NE(map.InsertNew(Digest{i}, "external", i, false), nullptr);
+  ASSERT_FALSE(map.rehashing());
+  map.EnableConcurrentReads();
+  {
+    auto write = map.CloseForWrite(Digest{288});
+    ASSERT_TRUE(write.ready());
+    ASSERT_NE(map.InsertNew(Digest{288}, "external", 288, false), nullptr);
+  }
+  ASSERT_TRUE(map.rehashing());
+  for (unsigned step = 0; step < 64 && map.rehashing(); ++step) {
+    auto write = map.CloseForWrite(Digest{0});
+    ASSERT_TRUE(write.ready());
+    ASSERT_NE(map.Find(Digest{0}, "external"), nullptr);
+    // Even Find's final migration must leave every stripe closed until the
+    // enclosing mutation finishes, not just the stripe of the written key.
+    EXPECT_FALSE(map.TryRead(Digest{1}));
+    map.InsertOrAssign(Digest{0}, "external", step, false);
+    EXPECT_TRUE(write.ready());
+    EXPECT_FALSE(map.TryRead(Digest{1}));
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_TRUE(map.TryRead(Digest{1}));
+  EXPECT_EQ(map.allocated_bucket_count(), 64);
+}
+
+TEST(IndexReadersTest, ShrinkWaitsForReadersAndOwnerFindResumesIt) {
+  ConcurrentIndex map(ConcurrentArena());
+  ASSERT_TRUE(map.PreallocateForExpectedSize(400));  // 64 buckets
+  for (unsigned i = 0; i < 4; ++i)
+    ASSERT_NE(map.InsertNew(Digest{i}, "external", i, false), nullptr);
+  map.EnableConcurrentReads();
+  auto read = map.TryRead(Digest{0});
+  ASSERT_TRUE(read);
+  const auto* pinned = std::as_const(map).Find(Digest{0}, "external");
+  ASSERT_NE(pinned, nullptr);
+  // Erasing another stripe is allowed; shrinking the shared table must wait.
+  ASSERT_TRUE(map.Erase(Digest{1}, "external"));
+  EXPECT_FALSE(map.rehashing());
+  EXPECT_EQ(map.allocated_bucket_count(), 64);
+  EXPECT_FALSE(map.Maintain());
+  EXPECT_EQ(std::as_const(map).Find(Digest{0}, "external"), pinned);
+  EXPECT_FALSE(map.TryRead(Digest{2}));
+  read.Reset();
+  EXPECT_NE(map.Find(Digest{2}, "external"), nullptr);
+  EXPECT_TRUE(map.rehashing());
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  // A still-active ordinary writer must survive the end of global rehash.
+  auto writer = map.CloseForValueUpdate(0);
+  for (unsigned step = 0; step < 128 && map.Maintain(); ++step) {
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_EQ(map.allocated_bucket_count(), 32);
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  EXPECT_TRUE(map.TryRead(Digest{2}));
+  writer.Reset();
+  EXPECT_TRUE(map.TryRead(Digest{0}));
+}
+
+TEST(IndexReadersTest, SharedOverflowGrowthAndDetachRequireAllReadersToDrain) {
+  ConcurrentIndex map(ConcurrentArena());
+  // Twelve entries fill bucket zero without triggering table growth.
+  for (unsigned i = 0; i < 12; ++i)
+    ASSERT_NE(map.InsertNew(Digest{i * 32}, "external", i, false), nullptr);
+  ASSERT_NE(map.InsertNew(Digest{1}, "external", 1, false), nullptr);
+  map.EnableConcurrentReads();
+  auto reader = map.TryRead(Digest{1});
+  ASSERT_TRUE(reader);
+  auto writer = map.CloseForWrite(Digest{12 * 32});
+  EXPECT_FALSE(writer.ready());
+  EXPECT_FALSE(map.TryRead(Digest{2}));
+  reader.Reset();
+  ASSERT_TRUE(writer.ready());
+  ASSERT_NE(map.InsertNew(Digest{12 * 32}, "external", 12, false), nullptr);
+  writer.Reset();
+  reader = map.TryRead(Digest{1});
+  ASSERT_TRUE(reader);
+  auto detach = map.CloseAllReaders();
+  EXPECT_FALSE(detach.ready());
+  reader.Reset();
+  ASSERT_TRUE(detach.ready());
+  auto old = map.Detach();
+  detach.Reset();
+  EXPECT_FALSE(map.TryRead(Digest{1}));  // empty population
+  EXPECT_FALSE(old.TryRead(Digest{1}));  // detached maps are private
+  ASSERT_NE(map.InsertNew(Digest{1}, "external", 99, false), nullptr);
+  EXPECT_TRUE(map.TryRead(Digest{1}));
+  old.Clear();
+}
+
+TEST(IndexReadersTest, ConcurrentReadersNeverObservePartialEntryReplacement) {
+  auto arena = ConcurrentArena();
+  RecordIndex map(arena);
+  const auto digest = ComputeDigest("live");
+  ASSERT_NE(map.InsertNew(digest, "live", RecordLocation{}), nullptr);
+  map.EnableConcurrentReads();
+  std::atomic<bool> bad{false};
+  std::latch ready(2);
+  auto loop = [&](std::stop_token stop) {
+    bool announced = false;
+    while (!stop.stop_requested()) {
+      auto read = map.TryRead(digest);
+      if (!read) continue;
+      const auto* entry = std::as_const(map).Find(digest, "live");
+      if (entry == nullptr ||
+          entry->value_.mutation_sequence_ != entry->value_.logical_size())
+        bad.store(true);
+      if (!announced) {
+        ready.count_down();
+        announced = true;
+      }
+    }
+  };
+  std::jthread first(loop), second(loop);
+  ready.wait();
+  for (unsigned i = 1; i <= 2000; ++i) {
+    auto write = map.CloseForWrite(digest);
+    while (!write.ready()) std::this_thread::yield();
+    auto* entry = map.Find(digest, "live");
+    RecordLocation next;
+    next.mutation_sequence_ = i;
+    next.logical_size_ = i;
+    next.expire_at_ms_ = i % 2 == 0 ? 123 : 0;
+    RecordIndex::Entry* retired = nullptr;
+    auto* replacement = map.ReplaceValue(entry, next, digest, &retired);
+    if (replacement == nullptr) {
+      bad.store(true);
+      break;
+    }
+    map.DestroyDetached(retired);
+  }
+  first.request_stop();
+  second.request_stop();
+  first.join();
+  second.join();
+  EXPECT_FALSE(bad.load());
+}
 
 TEST(RecoveryMemoryTest, DividesTemporaryBatchTargetAcrossWorkers) {
   EXPECT_EQ(RecoveryWorkerBatchTargetBytes(0),

@@ -176,7 +176,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
       co_await store.store_state_mutex_.Lock();
       UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
       for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-        if (changed[db_id]) DetachDbLocal(store, db_id);
+        if (changed[db_id]) co_await DetachDbLocal(store, db_id);
       }
       co_return absl::OkStatus();
     };
@@ -220,7 +220,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(
       WorkerStore& store = *stores_[target];
       co_await store.store_state_mutex_.Lock();
       UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-      DetachDbLocal(store, db_id);
+      co_await DetachDbLocal(store, db_id);
       co_return absl::OkStatus();
     };
     // if/else, not ?:, to keep the two co_awaits in separate full
@@ -281,10 +281,16 @@ Task<absl::Status> StorageEngine::Impl::AdvanceDbEpoch(std::uint8_t db_id,
   co_return co_await ReclaimDetachedAllWorkers(/*wait=*/true);
 }
 
-void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
-                                        std::uint8_t db_id) {
+Task<absl::Status> StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
+                                                      std::uint8_t db_id) {
   // Epoch metadata covers all 16 DBs even when runtime indexes cover DB0 only.
-  if (db_id >= options_.database_count_) return;
+  if (db_id >= options_.database_count_) co_return absl::OkStatus();
+  std::vector<RecordIndex::WriteGuard> index_writes;
+  index_writes.reserve(store.partitions_.size());
+  for (auto& partition : store.partitions_)
+    index_writes.push_back(partition.indexes_[db_id].CloseAllReaders());
+  for (auto& guard : index_writes)
+    while (!guard.ready()) co_await tx::CurrentTxShard().WaitForReaders();
   // FLUSHDB invalidates every watcher of this database, including watches
   // on keys that never existed (Redis semantics).
   tx::CurrentTxShard().MarkAllWatched(db_id);
@@ -331,6 +337,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
     }
   }
   store.live_key_count_[db_id] = 0;
+  co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::QueueDetachedIndex(WorkerStore& store,

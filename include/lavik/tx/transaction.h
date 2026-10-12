@@ -44,6 +44,7 @@ struct TxKey {
   std::uint32_t arg_index_ = 0;
   LockMode mode_ = LockMode::kShared;
   std::uint8_t db_ = 0;
+  std::uint16_t slot_ = storage::kLogicalStorageShards;
 };
 
 // The per-shard view handed to a shard callback: this shard's keys in
@@ -95,7 +96,8 @@ class Transaction {
 
   // Owner is the key's home worker (StorageEngine::OwnerForKey).
   void AddKey(unsigned owner, std::uint8_t db, const storage::Digest& digest,
-              std::uint32_t arg_index, LockMode mode);
+              std::uint32_t arg_index, LockMode mode,
+              std::uint16_t slot = storage::kLogicalStorageShards);
 
   // Groups keys by shard and builds the deduplicated lock sets. No keys may
   // be added afterwards (spans into the internal vectors are handed out).

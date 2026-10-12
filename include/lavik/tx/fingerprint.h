@@ -51,6 +51,8 @@ struct KeyRef {
   LockFp fp_ = 0;
   LockMode mode_ = LockMode::kShared;
   std::uint8_t db_ = 0;
+  // Unknown-slot callers conservatively gate every local slot of this DB.
+  std::uint16_t slot_ = storage::kLogicalStorageShards;
 };
 
 }  // namespace lavik::tx

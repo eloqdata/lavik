@@ -97,7 +97,8 @@ StorageEngine::Impl::RestoreCollectionValue(
     const MutationPrecondition* mutation_precondition) {
   const auto digest = ComputeDigest(key);
   auto hold = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(key));
   co_return co_await RestoreCollectionValueLocked(
       db_id, key, digest, type, expire_at_ms, replace, expected_items,
       std::move(reader), nullptr, replication, mutation_precondition);

@@ -40,6 +40,7 @@
 #include "lavik/set_trace.h"
 #include "lavik/storage/buffer_pool.h"
 #include "lavik/storage/collection_page.h"
+#include "lavik/storage/detail/record_location.h"
 #include "lavik/storage/format.h"
 #include "lavik/storage/sorted_set.h"
 
@@ -1603,6 +1604,24 @@ class StorageEngine {
   bycorf::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
   void SetReplicaLoading(bool loading) noexcept;
 
+  class RemoteGetAwaitable;
+
+  // Connection-worker optimization for a standalone GET. The caller holds
+  // request/DB population admission through completion. nullopt requests the
+  // ordinary owner path; a present result is final (including not-found).
+  // Admission runs synchronously; immediately co_await the result on this
+  // worker, keeping key and request admission alive through completion. The
+  // fast path submits I/O without a child Task; buffer contention falls back.
+  // Trace builds optionally borrow caller-owned timing state through
+  // completion.
+  RemoteGetAwaitable TryRemoteGet(std::uint8_t db_id, std::string_view key,
+                                  std::uint16_t slot
+#if LAVIK_ENABLE_TRACE
+                                  ,
+                                  ReadLatencyTrace* trace = nullptr
+#endif
+  );
+
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
   // routed_partition_id reuses a route computed for this exact key before its
@@ -1945,8 +1964,92 @@ class StorageEngine {
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
+  friend class RemoteGetTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+// Owns a remote block pin and the I/O completion inline in the caller's frame.
+// No child coroutine or separately allocated continuation is needed. Like the
+// runtime's one-shot I/O awaitables, it cannot move after publishing its
+// address to the device, and shutdown must drain I/O before destroying its
+// parent.
+class StorageEngine::RemoteGetAwaitable {
+ public:
+  using Result = std::optional<absl::StatusOr<DiskValue>>;
+
+  RemoteGetAwaitable(RemoteGetAwaitable&&) = delete;
+  RemoteGetAwaitable& operator=(RemoteGetAwaitable&&) = delete;
+  RemoteGetAwaitable(const RemoteGetAwaitable&) = delete;
+  RemoteGetAwaitable& operator=(const RemoteGetAwaitable&) = delete;
+
+  bool await_ready() const noexcept { return !io_.has_value(); }
+  bool await_suspend(std::coroutine_handle<> awaiting) {
+    return io_->await_suspend(awaiting);
+  }
+  Result await_resume();
+
+ private:
+  friend class StorageEngine;
+  friend class StorageEngine::Impl;
+  friend class RemoteGetTestPeer;
+
+  struct Pin {
+    Impl* engine_ = nullptr;
+    std::uint64_t block_id_ = 0;
+    unsigned owner_ = 0;
+    ~Pin();
+  };
+
+  RemoteGetAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
+                     std::uint16_t slot
+#if LAVIK_ENABLE_TRACE
+                     ,
+                     ReadLatencyTrace* trace
+#endif
+  );
+  bool Current(const Impl& engine) const noexcept;
+
+  Result ready_;
+  std::string_view key_;
+  RecordLocation location_;
+  std::uint64_t generation_ = 0;
+  std::uint64_t db_epoch_ = 0;
+  std::uint64_t replication_epoch_ = 0;
+  std::size_t record_headroom_ = 0;
+  std::size_t read_bytes_ = 0;
+  std::uint16_t slot_ = 0;
+  std::uint8_t db_id_ = 0;
+  // Reverse destruction releases the completion and buffer before the pin,
+  // including when an admitted awaitable is destroyed without being awaited.
+  Pin pin_;
+  ReadBufferLease lease_;
+#if LAVIK_ENABLE_TRACE
+  // Timestamp the actual CQE before the connection is scheduled again. This
+  // trace-only completion leaves the production I/O awaitable and frame intact.
+  class TracedReadIo : public bycorf::OneShotIoAwaitable {
+   public:
+    TracedReadIo(bycorf::Worker& worker, bycorf::FixedFile file,
+                 bycorf::FixedBuffer buffer, std::uint64_t offset,
+                 bycorf::SizeIoAwaitable::Operation operation,
+                 ReadLatencyTrace* trace);
+    bool await_suspend(std::coroutine_handle<> awaiting);
+    absl::StatusOr<std::size_t> await_resume();
+    void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
+
+   private:
+    bycorf::Worker& worker_;
+    bycorf::FixedFile file_;
+    bycorf::FixedBuffer buffer_;
+    std::uint64_t offset_;
+    bool fixed_;
+    ReadLatencyTrace* trace_;
+  };
+  ReadLatencyTrace* trace_;
+  std::optional<TracedReadIo> io_;
+#else
+  std::optional<bycorf::SizeIoAwaitable> io_;
+#endif
 };
 
 }  // namespace lavik::storage

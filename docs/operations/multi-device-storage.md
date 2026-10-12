@@ -180,7 +180,19 @@ stream allocates on demand and does not reserve standby capacity.
 - With more usable devices than workers, devices are greedily grouped to keep
   aggregate group weights balanced. A worker chooses within its group by the
   lowest allocated-blocks/weight ratio.
-- Allocation falls back to other devices when the preferred device is full.
+- On io_uring, allocation falls back to other devices when the preferred device
+  is full. SPDK allocation stays within the worker's home devices.
+
+SPDK groups namespaces by physical controller. Home assignments follow the
+foreground capacity weights, bounded by each controller's available qpair
+count. Qpair access is broader than write affinity: after covering home
+workers, each controller assigns spare qpairs to other workers, preferring
+those with fewer qpairs, up to one per worker. For six controllers with 16
+available qpairs each and 16 workers, every worker opens all six controllers
+(96 qpairs total), while retaining its weighted home write placement. Multiple
+namespaces on one controller share a worker's qpair. Startup logs show
+`home-workers` and `qpair-workers` separately. If a controller has fewer qpairs
+than workers, connection-worker GET falls back when its worker lacks access.
 
 The standby request starts immediately after an ordinary active block is
 installed, and starts again after rollover consumes that standby. Appends do

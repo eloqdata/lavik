@@ -75,7 +75,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
                              "extent reclaim found a record block");
     }
     state->live_bytes_ = 0;
-    if (state->pins_ != 0 || state->freeing_) {
+    if (state->pin_count() != 0 || state->freeing_) {
       store.store_state_mutex_.Unlock(*store.worker_);
       absl::Status waited = co_await bycorf::SleepFor(
           *store.worker_, std::chrono::milliseconds(1));
@@ -143,16 +143,55 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtents(
   co_return absl::OkStatus();
 }
 
+void StorageEngine::Impl::UnpinBlock(WorkerStore& store, BlockState& state,
+                                     std::uint64_t block_id) {
+  const auto old = state.pins_.fetch_sub(1, std::memory_order_acq_rel);
+  assert((old & BlockState::kPinMask) != 0);
+  if ((old & BlockState::kPinMask) != 1) return;
+  if (old & BlockState::kRemoteClosed)
+    store.block_pin_progress_.NotifyAll(*store.worker_);
+  if (state.release_pending_) ReleaseStagingBuffer(store, state);
+  MaybeQueueDefrag(store, block_id);
+}
+
+void StorageEngine::Impl::UnpinRemoteBlock(BlockState& state, unsigned owner,
+                                           std::uint64_t block_id) {
+  const auto old = state.pins_.fetch_sub(1, std::memory_order_acq_rel);
+  assert((old & BlockState::kPinMask) != 0);
+  if (old != (BlockState::kRemoteClosed | 1)) return;
+  // This is only a maintenance hint, not an allocation-specific release.
+  // Re-evaluate the current allocation on its owner, so a delayed message is
+  // harmless even after reuse. The stable store context needs no heap receipt
+  // that could leak when teardown drains I/O after the event loops stop.
+  bycorf::PostNotification(
+      bycorf::ThisWorker().cross_core_, owner,
+      {stores_[owner].get(), block_id,
+       [](void* ctx, std::uint64_t id) noexcept {
+         auto& store = *static_cast<WorkerStore*>(ctx);
+         auto& engine = *store.engine_;
+         store.block_pin_progress_.NotifyAll(*store.worker_);
+         auto* state = engine.FindBlockState(store, id);
+         if (!state || state->pin_count() != 0) return;
+         if (state->release_pending_) ReleaseStagingBuffer(store, *state);
+         engine.MaybeQueueDefrag(store, id);
+       }});
+}
+
 void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
                                            std::uint64_t block_id) {
   BlockState* state = FindBlockState(store, block_id);
   if (state == nullptr || !state->allocated_ || state->defrag_queued_ ||
-      state->defragging_ || state->pins_ != 0 || state->in_memory_ ||
+      state->defragging_ || state->freeing_ || state->release_pending_)
+    return;
+  if (state->in_memory_ ||
       (state->kind_ != BlockKind::kRecords &&
        state->kind_ != BlockKind::kIndirectKeys) ||
       state->flush_queued_ || state->flush_in_progress_ ||
       IsActiveBlock(store, block_id) ||
       state->committed_bytes_ <= kBlockHeaderBytes) {
+    // A deferred staging-buffer release may have closed admission even for
+    // a block that is not a compaction candidate. Do not strand it closed.
+    state->OpenRemotePins();
     return;
   }
   const std::uint64_t used = state->committed_bytes_ - kBlockHeaderBytes;
@@ -160,8 +199,13 @@ void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
   // is exactly 1000 * live < 501 * used for positive used. Both products fit
   // in uint64_t, so candidate checks need no division or rounding change.
   if (static_cast<std::uint64_t>(state->live_bytes_) * 1000 >= used * 501) {
+    state->OpenRemotePins();
     return;
   }
+  // Mark pending maintenance before testing the count. The last remote
+  // unpin then posts the retry that used to be lost for overwritten blocks.
+  state->CloseRemotePins();
+  if (state->pin_count() != 0) return;
   state->defrag_queued_ = true;
   store.defrag_queue_.push_back(block_id);
   RequestDefrag(store);
@@ -767,9 +811,23 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
     co_return absl::OkStatus();
   }
   BlockState& source = *source_ptr;
+  source.CloseRemotePins();
+  struct Reopen {
+    Impl* engine_;
+    WorkerStore& store_;
+    std::uint64_t id_;
+    std::uint64_t epoch_;
+    ~Reopen() {
+      auto* state = engine_->FindBlockState(store_, id_);
+      if (state && state->allocation_epoch_ == epoch_ && !state->freeing_ &&
+          !state->defragging_ && !state->defrag_queued_ &&
+          state->pin_count() == 0)
+        state->OpenRemotePins();
+    }
+  } reopen{this, store, block_id, source.allocation_epoch_};
   if (!source.allocated_ || source.defragging_ || source.in_memory_ ||
-      source.pins_ != 0 || source.flush_queued_ || source.flush_in_progress_ ||
-      IsActiveBlock(store, block_id)) {
+      source.pin_count() != 0 || source.flush_queued_ ||
+      source.flush_in_progress_ || IsActiveBlock(store, block_id)) {
     co_return absl::OkStatus();
   }
   source.defragging_ = true;
@@ -1102,15 +1160,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
 
 Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(
     WorkerStore& store, std::uint64_t block_id, BlockState& source) {
-  while (source.pins_ != 0) {
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) {
-      source.freeing_ = false;
-      source.defragging_ = false;
-      co_return waited;
-    }
-  }
+  source.CloseRemotePins();
+  while (source.pin_count() != 0) co_await store.block_pin_progress_.Wait();
 
   // The durable allocation bitmap is authoritative during recovery. Retire
   // the runtime state before publishing the block to cold_free so another

@@ -511,11 +511,22 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
       IsActiveBlock(store, block.block_id_) || active_transaction ||
       source->in_memory_ || source->flush_queued_ ||
       source->flush_in_progress_ || source->defragging_ || source->freeing_ ||
-      source->pins_ != 0) {
+      source->pin_count() != 0) {
     store.store_state_mutex_.Unlock(*store.worker_);
     co_return absl::FailedPreconditionError(
         "transaction block changed before promotion");
   }
+  source->CloseRemotePins();
+  if (source->pin_count() != 0) {
+    source->OpenRemotePins();
+    store.store_state_mutex_.Unlock(*store.worker_);
+    co_return absl::FailedPreconditionError(
+        "transaction block has remote readers");
+  }
+  struct RemoteAdmission {
+    BlockState& state_;
+    ~RemoteAdmission() { state_.OpenRemotePins(); }
+  } remote_admission{*source};
   const bool has_live_records = tx_block->second.live_tagged_bytes_ != 0;
   source->defragging_ = true;
   const auto [file_id, offset] = FileOffset(block.block_id_);
@@ -573,7 +584,7 @@ Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
 
     // Reads and undo dependencies can still acquire references after
     // inspection.
-    if (state->pins_ != 0 || found->second.live_tagged_bytes_ != 0 ||
+    if (state->pin_count() != 0 || found->second.live_tagged_bytes_ != 0 ||
         found->second.dependency_pins_ != 0)
       co_return absl::FailedPreconditionError(
           "transaction block is still referenced");

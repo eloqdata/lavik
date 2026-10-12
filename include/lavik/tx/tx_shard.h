@@ -28,6 +28,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "bycorf/runtime/sync.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/intent_lock.h"
 #include "lavik/tx/tx_queue.h"
@@ -41,8 +42,10 @@ namespace lavik::tx {
 // Per-worker transaction scheduling context: the VLL lock tables (one per
 // logical DB), the txid-ordered queue, and the poll loop that starts the
 // queue head once it is hold-compatible. All state is single-threaded on the
-// owning worker; the only shared word in the system is TxRuntime::next_txid,
-// touched exclusively by contended or multi-shard acquisitions.
+// owning worker. Storage admission hooks close atomic index reader stripes
+// for each intent; drain notifications return here to resume eligible work.
+// TxRuntime::next_txid is touched only by contended or multi-shard
+// acquisitions.
 class TxShard {
  public:
   class Awaiter;
@@ -103,7 +106,21 @@ class TxShard {
     Awaiter(const Awaiter&) = delete;
     Awaiter& operator=(const Awaiter&) = delete;
 
+    ~Awaiter() {
+      if (!owns_intents_) return;
+      // Cancellation may destroy the frame while readers still block its
+      // queue entry, or after Poll granted holds but before it resumed.
+      if (granted_ || waiter_.holds_acquired_) {
+        shard_->Release(keys_);
+      } else {
+        if (waiter_.txid_ != 0) shard_->queue_.Remove(&waiter_);
+        shard_->ReleaseIntents(keys_);
+        shard_->Poll();
+      }
+    }
+
     bool await_ready() {
+      owns_intents_ = true;
       granted_ = shard_->TryFastPath(keys_);
       return granted_;
     }
@@ -115,7 +132,10 @@ class TxShard {
       shard_->Enqueue(&waiter_);
     }
 
-    Guard await_resume() noexcept { return Guard(shard_, keys_); }
+    Guard await_resume() noexcept {
+      owns_intents_ = false;
+      return Guard(shard_, keys_);
+    }
 
    private:
     TxShard* shard_;
@@ -123,8 +143,18 @@ class TxShard {
     std::span<const KeyRef> keys_;
     TxWaiter waiter_;
     bool granted_ = false;
+    bool owns_intents_ = false;
   };
 
+  // Owner-local hooks bind storage reader admission to the full intent
+  // lifetime.
+  struct ReadAdmission {
+    void* context_ = nullptr;
+    void (*close_)(void*, const KeyRef&) = nullptr;
+    void (*open_)(void*, const KeyRef&) = nullptr;
+    bool (*ready_)(void*, const KeyRef&) = nullptr;
+  };
+  void BindReadAdmission(ReadAdmission admission) { admission_ = admission; }
   TxShard() = default;
   TxShard(const TxShard&) = delete;
   TxShard& operator=(const TxShard&) = delete;
@@ -141,9 +171,10 @@ class TxShard {
   Awaiter AcquireKeys(std::span<const KeyRef> keys) {
     return Awaiter(this, keys);
   }
-  Awaiter AcquireKey(std::uint8_t db_id, LockFp fp, LockMode mode) {
+  Awaiter AcquireKey(std::uint8_t db_id, LockFp fp, LockMode mode,
+                     std::uint16_t slot = storage::kLogicalStorageShards) {
     assert(db_id < storage::kLogicalDatabaseCount);
-    return Awaiter(this, KeyRef{fp, mode, db_id});
+    return Awaiter(this, KeyRef{fp, mode, db_id, slot});
   }
 
   bool CanReadOptimistically(std::uint8_t db_id) const noexcept {
@@ -163,6 +194,12 @@ class TxShard {
   // while it is hold-compatible. Called after every release and by the queue
   // machinery; safe to call at any time.
   void Poll();
+  // Last-reader messages are hints. Only Poll decides which transactions run.
+  void ReadersDrained() {
+    if (worker_) reader_progress_.NotifyAll(*worker_);
+    Poll();
+  }
+  auto WaitForReaders() { return reader_progress_.Wait(); }
 
   // Shard-local WATCH registrations (push model): every real keyspace
   // modification marks the watchers of that fingerprint; EXEC checks its own
@@ -244,6 +281,7 @@ class TxShard {
   bool AcquireIntents(std::span<const KeyRef> keys) {
     bool granted = true;
     for (const KeyRef& key : keys) {
+      if (admission_.close_) admission_.close_(admission_.context_, key);
       granted &= locks_[key.db_].AcquireIntent(key.fp_, key.mode_);
     }
     return granted;
@@ -251,11 +289,13 @@ class TxShard {
   void ReleaseIntents(std::span<const KeyRef> keys) {
     for (const KeyRef& key : keys) {
       locks_[key.db_].ReleaseIntent(key.fp_, key.mode_);
+      if (admission_.open_) admission_.open_(admission_.context_, key);
     }
   }
   bool CanHoldAll(std::span<const KeyRef> keys) const {
     for (const KeyRef& key : keys) {
-      if (!locks_[key.db_].CanHold(key.fp_, key.mode_)) {
+      if ((admission_.ready_ && !admission_.ready_(admission_.context_, key)) ||
+          !locks_[key.db_].CanHold(key.fp_, key.mode_)) {
         return false;
       }
     }
@@ -284,12 +324,22 @@ class TxShard {
 
  private:
   friend class Awaiter;
+  ReadAdmission admission_;
+  bycorf::AsyncNotification reader_progress_;
 
   bool TryFastPath(std::span<const KeyRef> keys) {
     if (keys.size() == 1) {
       const KeyRef& key = keys.front();
+      if (admission_.close_) admission_.close_(admission_.context_, key);
+      // A reader drain uses the existing intent/queue path without installing
+      // a hold early. Schedule-time intent compatibility remains unchanged.
+      const bool readers_ready =
+          !admission_.ready_ || admission_.ready_(admission_.context_, key);
       const bool granted =
-          locks_[key.db_].AcquireIntentAndHoldIfGranted(key.fp_, key.mode_);
+          readers_ready
+              ? locks_[key.db_].AcquireIntentAndHoldIfGranted(key.fp_,
+                                                              key.mode_)
+              : (locks_[key.db_].AcquireIntent(key.fp_, key.mode_), false);
       if (granted) {
         ++fastpath_runs_;
       }
@@ -297,7 +347,7 @@ class TxShard {
     }
     // Intents are recorded even when not granted: they block later barging
     // while this acquisition waits in the queue.
-    if (!AcquireIntents(keys)) {
+    if (!AcquireIntents(keys) || !CanHoldAll(keys)) {
       return false;
     }
     // Granted => sole/compatible intent owner => (holds ⊆ intents) no
@@ -321,6 +371,7 @@ class TxShard {
     if (keys.size() == 1) {
       const KeyRef& key = keys.front();
       locks_[key.db_].ReleaseHoldAndIntent(key.fp_, key.mode_);
+      if (admission_.open_) admission_.open_(admission_.context_, key);
       Poll();
       return;
     }

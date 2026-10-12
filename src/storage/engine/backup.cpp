@@ -266,10 +266,10 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
           state->allocation_epoch_ != pin.allocation_epoch_ ||
           (pin.extent_ && state->kind_ != BlockKind::kPayloadExtent) ||
           (!pin.extent_ && state->kind_ == BlockKind::kPayloadExtent) ||
-          state->pins_ == std::numeric_limits<std::uint32_t>::max()) {
+          state->pin_count() == BlockState::kPinMask) {
         co_return absl::AbortedError("stale RDB snapshot block");
       }
-      ++state->pins_;
+      state->PinLocal();
       co_return absl::OkStatus();
     };
     absl::Status status;
@@ -291,11 +291,8 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       BlockState* state = FindBlockState(block_store, pin.block_id_);
       if (state != nullptr && state->allocated_ &&
           state->allocation_epoch_ == pin.allocation_epoch_ &&
-          state->pins_ != 0) {
-        --state->pins_;
-        if (state->pins_ == 0 && state->release_pending_) {
-          ReleaseStagingBuffer(block_store, *state);
-        }
+          state->pin_count() != 0) {
+        UnpinBlock(block_store, *state, pin.block_id_);
       }
       co_return absl::OkStatus();
     };
@@ -342,11 +339,8 @@ Task<absl::Status> StorageEngine::Impl::ReleaseRdbSnapshotValue(
       BlockState* state = FindBlockState(block_store, pin.block_id_);
       if (state != nullptr && state->allocated_ &&
           state->allocation_epoch_ == pin.allocation_epoch_ &&
-          state->pins_ != 0) {
-        --state->pins_;
-        if (state->pins_ == 0 && state->release_pending_) {
-          ReleaseStagingBuffer(block_store, *state);
-        }
+          state->pin_count() != 0) {
+        UnpinBlock(block_store, *state, pin.block_id_);
       }
       co_return absl::OkStatus();
     };
@@ -564,7 +558,8 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
   using Phase = SavedValue::Phase;
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
+      lavik::storage::RedisSlot(key));
   auto* capture = partition.rdb_snapshot_ ? &*partition.rdb_snapshot_ : nullptr;
   if (capture == nullptr || capture->session_id_ != session_id ||
       !store.rdb_snapshot_ || store.rdb_snapshot_->id_ != session_id ||
@@ -1202,7 +1197,7 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
             const auto* block = engine->FindBlockState(physical, pin.block_id_);
             co_return block != nullptr && block->allocated_ &&
                     block->allocation_epoch_ == pin.allocation_epoch_
-                ? block->pins_
+                ? block->pin_count()
                 : 0;
           };
           // if/else, not ?:, to keep the two co_awaits in separate full

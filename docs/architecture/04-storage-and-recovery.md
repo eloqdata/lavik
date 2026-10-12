@@ -80,20 +80,20 @@ Storage separates three ownership domains:
 - Each device has one allocator owner, which serializes that device's ready and
   cold-free pools, scan bitmap, fixed metadata page generations, epoch mirrors,
   and allocation-epoch counter. io_uring initially assigns this role as
-  `device_index % worker_count`. SPDK selects it from the controller's qpair
-  owners, so metadata and allocation I/O never route to a worker that cannot
-  open the namespace.
+  `device_index % worker_count`. SPDK selects it from the controller's home
+  workers, all of which hold a qpair, so metadata and allocation I/O never
+  route to a worker that cannot open the namespace.
 
 Every worker has one ordinary and one transaction append stream. Physical
 streams are per worker, not per logical partition, so active 8 MiB staging
 buffers scale with workers rather than with 16,384 slots. A worker also owns the
 `BlockState` objects assigned to it, including committed and live byte counts,
-pins, staging identity, flush state, and defrag state. The runtime owner and
-allocation epoch form immutable identity after publication and are the only
-fields a key-index owner may read directly. The owner is published atomically
-after epoch initialization, so an acquire owner read makes the immutable epoch
-visible without an extra worker hop. Other state remains owner-local and other
-workers use Bycorf cross-core submissions to read or mutate it.
+staging identity, flush state, and defrag state. Runtime owner and allocation
+epoch form immutable identity after publication. A shared atomic pin word
+protects physical lifetime and closes admission to connection-worker reads
+while maintenance owns the block. The owner is published atomically after
+epoch initialization. Other mutable block fields remain owner-local; remote
+workers submit accounting and maintenance work to that owner.
 
 Append-stream creation and rollover are single-flight within each stream. A
 writer may release owner-local store state while physical allocation waits,
@@ -122,6 +122,11 @@ best-effort subset registration, prioritizing read slots. Each lease retains
 its slot identity and immutable registration status; unregistered slots use
 the same aligned memory with plain asynchronous I/O. On SPDK, a
 worker opens only namespaces whose physical controller assigned it a qpair.
+Weighted home-device assignment controls write placement independently of
+qpair access. Each controller reserves qpairs for its home workers, then
+assigns its remaining capacity to other workers, up to one qpair per worker.
+A controller with enough qpairs is therefore directly accessible from every
+connection worker. Namespaces on that controller share each worker's qpair.
 SPDK also requires DMA buffer registration and fails initialization when that
 registration or controller-qpair coverage is insufficient.
 
@@ -368,10 +373,10 @@ zeroes stale checkpoint bitmap state when no checkpoint is usable.
 `InitializeWorker` creates the worker's aligned buffer pool, registers the
 fixed-file table, and opens the paths accessible on that backend. Before worker
 startup, io_uring assigns weighted home devices for foreground allocation.
-SPDK groups namespaces by physical controller, weights controllers by usable
-foreground blocks, and distributes available controller qpairs across workers;
-startup fails unless every controller and every worker can be covered. Worker
-barriers then coordinate one parallel recovery rather than independent
+SPDK groups namespaces by physical controller, assigns weighted home devices,
+and expands qpair access with the remaining controller capacity; startup fails
+unless every controller and every worker can be covered. Worker barriers then
+coordinate one parallel recovery rather than independent
 worker-local boots. Request readiness follows successful completion of the
 complete recovery and allocator-cleanup sequence; the exact moment a listening
 socket exists is not the readiness boundary.
@@ -519,11 +524,39 @@ seed and top-level digests appear only in the one-use checkpoint, never in
 authoritative records or replication protocols.
 
 All partition and logical-database indexes on a worker allocate entries from a
-shared worker-local arena, so sparse indexes share capacity instead of
-stranding it at partition boundaries. A population detached by `FLUSHDB`, a
-replica reset, or a replica abort retains ownership of that arena until
-reclamation finishes. Replica promotion and abort reuse the same worker-local
-detached-index drain as synchronous database flushes, so a completed lifecycle
+shared arena, so sparse indexes share capacity instead of stranding it at
+partition boundaries. Startup allocates its complete page directory, charging
+16 MiB of descriptor storage to each worker before recovery; entry pages remain
+demand-allocated. The directory stays at one address and publishes page layout
+atomically. Handle-to-address resolution can run concurrently with owner-side
+allocation when the caller protects the resolved entry and arena lifetimes;
+it does not pin entries or make the hash tables safe for concurrent access.
+Allocator mutation remains owner-local. Private auxiliary arenas retain
+incremental directory allocation and owner-only access.
+Each primary key index reserves 32 cache-line-isolated atomic read-admission
+states, including while empty. Its bucket arrays remain demand-allocated,
+start at 32 buckets, and never shrink below 32 while nonempty; checkpoint
+recovery applies the same floor. Reader admission is explicitly enabled only
+for a published map with a fixed arena directory and an externally protected
+map lifetime. A remote reader registers atomically in the low-hash stripe,
+performs only const lookup, and releases its guard before suspending. Writers
+close the affected stripe and suspend their owner coroutine until existing
+readers drain, then resolve entry identities again before mutation. The last
+reader of a closed stripe notifies the owner; transaction arbitration and
+structural writers recheck readiness there.
+Shared overflow-directory growth and population replacement close all stripes.
+Resizing closes admission before changing table layout, defers behind existing
+readers, and stays closed through the final table switch and old-table release.
+Owner lookups and periodic maintenance retry deferred resizing; nesting keeps
+resize completion from reopening another writer's scope. Recovery and detached
+populations remain private, and grouped-object and auxiliary maps retain their
+owner-only layout and bucket sizing. Transaction intents retain stripe closure
+through queued and executing work, so a remote index snapshot cannot observe
+an intermediate multi-key mutation.
+A population detached by `FLUSHDB`, a replica reset, or a replica abort retains
+ownership of that arena until reclamation finishes. Replica promotion and
+abort reuse the same worker-local detached-index drain as synchronous database
+flushes, so a completed lifecycle
 cannot leave old index arenas or record-block live-byte accounting queued for a
 later rebuild. The drain covers the worker FIFO; it is not partitioned by
 replication attempt.
@@ -634,7 +667,32 @@ need a staging buffer to commit.
 
 ### Reads and pins
 
-An ordinary single-key GET may resolve its complete inline-key index entry
+A standalone GET can read directly on its connection worker after ordinary
+request, database and serving-generation admission. It takes a short index
+reader guard on the key owner, snapshots a complete-key plain String location,
+then pins the block and validates its allocation identity before dropping the
+index guard. Only durable, non-grouped, non-external records whose block owner
+is also their key owner qualify, and the connection worker must have device
+I/O access. Closed index/block admission, unsupported representations, expired
+entries, concurrent admission contention, and an exhausted connection-worker
+read-buffer pool return to the normal owner route. An admitted fast read submits
+I/O directly from an awaitable in the requesting coroutine; completion resumes
+that same coroutine for record and population validation, without a child read
+coroutine. Index misses use the same transaction and population admission checks.
+
+The index snapshot orders the GET before a subsequently admitted writer. The
+block pin survives I/O and cancellation cleanup, so writes can append and retire
+old live-byte accounting while the read finishes. Defrag closes remote pin
+admission before inspecting the count; the last pin on a pending block asks its
+owner to reconsider reclamation. Flush uses the same close-before-count order
+when retiring a sealed staging buffer: either it releases the buffer immediately
+or the last pin notifies the owner to finish the release. Local fallback reads
+retain their existing pin rules. Database/replication epoch and population-generation
+changes invalidate an in-flight fast read. Worker shutdown drains I/O and destroys
+suspended frames on all workers before destroying any remotely referenced index,
+arena or block state.
+
+An owner-local ordinary single-key GET may resolve its complete inline-key index entry
 without registering a shared transaction lock when that logical database's
 lock table is empty. The empty-table observation and index lookup do not
 suspend, so the lookup is the read's linearization point. A multi-shard writer
@@ -770,9 +828,10 @@ The persistent allocation bitmap is the recovery authority, not merely an
 allocation hint. Device allocators activate ready IDs in batches and preserve
 eight allocatable blocks per device for defrag. Each worker first balances
 foreground allocations across its weighted home devices. io_uring can then
-fall back to every other configured device; SPDK cannot leave the namespaces of
-controllers for which that worker owns qpairs. Foreground allocation may wait
-while an active flush, extent reclaim, or runnable defrag can still return
+fall back to every other configured device; SPDK allocates only from its home
+devices, even when spare qpairs give it read access to other controllers.
+Foreground allocation may wait while an active flush, extent reclaim, or
+runnable defrag can still return
 space; it reports exhaustion only after a stable observation with no progress
 in flight. A queued defrag while defrag is paused is deliberately not counted
 as runnable progress, so a full-device write reports exhaustion instead of
@@ -1156,9 +1215,9 @@ current source code are authoritative for present storage behavior.
 |---|---|
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/lavik/storage/engine.h` |
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
-| Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
+| Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/init.cpp`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped/hash.cpp`, `src/storage/engine/grouped/object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
-| Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_index.h` |
+| Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_location.h`, `include/lavik/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | System-state manifest, catalog COW extents, full-sync fence, population token, promotion base, and one-use shutdown certificate | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |

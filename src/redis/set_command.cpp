@@ -714,7 +714,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
                                        : tx::LockMode::kShared;
     transaction.AddKey(g_storage->OwnerForKey(args[i]), request.db_id_,
                        storage::ComputeDigest(args[i]),
-                       static_cast<std::uint32_t>(i), lock_mode);
+                       static_cast<std::uint32_t>(i), lock_mode,
+                       storage::RedisSlot(args[i]));
   }
   transaction.Seal();
   // Cluster owner-side re-check: the admission was captured at dispatch time;

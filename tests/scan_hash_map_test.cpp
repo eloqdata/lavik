@@ -19,8 +19,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <latch>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "lavik/memory.h"
@@ -588,6 +590,143 @@ TEST(ScanHashMapTest, DirectoryCapacityDoesNotInflateEmptyArena) {
   // array starts at 32 KiB and grows only as page IDs are consumed. An empty
   // map must not embed that maximum in every arena instance.
   EXPECT_LT(sizeof(ScanHashMapEntryArena), 1024);
+}
+
+TEST(ScanHashMapTest, PreallocatedDirectoryIsChargedBeforeAllocatingPages) {
+  ASSERT_TRUE(lavik::InitMemoryLimit(64 * 1024 * 1024, 1).ok());
+  lavik::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+    }
+  } restore;
+  const auto before = lavik::WorkerMemoryAccountingBytes(0);
+  {
+    ScanHashMapEntryArena arena;
+    ASSERT_TRUE(arena.PreallocateDirectory());
+    const auto directory_bytes = lavik::WorkerMemoryAccountingBytes(0) - before;
+    EXPECT_GE(directory_bytes, 16 * 1024 * 1024);
+    EXPECT_EQ(arena.allocated_pages(), 0);
+    EXPECT_EQ(arena.allocated_spans(), 0);
+    ASSERT_TRUE(arena.PreallocateDirectory());
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0) - before, directory_bytes);
+
+    const auto page_bytes = arena.AllocationBytesIfNewPage(64);
+    auto allocation = arena.Allocate(64);
+    ASSERT_NE(allocation.pointer_, nullptr);
+    EXPECT_EQ(arena.Resolve(allocation.handle_), allocation.pointer_);
+    arena.Deallocate(allocation.handle_);
+    EXPECT_EQ(arena.AllocationBytesIfNewPage(64), page_bytes);
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0) - before, directory_bytes);
+  }
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), before);
+}
+
+TEST(ScanHashMapTest,
+     HandleOfRejectsForeignPagesWithUnpublishedDirectorySlots) {
+  ScanHashMapEntryArena owner(2);
+  ScanHashMapEntryArena fixed(2);
+  ScanHashMapEntryArena growing;
+  ASSERT_TRUE(fixed.PreallocateDirectory());
+  auto first = owner.Allocate(8192);
+  auto second = owner.Allocate(8192);
+  ASSERT_NE(first.pointer_, nullptr);
+  ASSERT_NE(second.pointer_, nullptr);
+  EXPECT_EQ(fixed.HandleOf(first.pointer_), 0);
+  EXPECT_EQ(fixed.HandleOf(second.pointer_), 0);
+  EXPECT_EQ(growing.HandleOf(second.pointer_), 0);
+  auto local = growing.Allocate(32);
+  ASSERT_NE(local.pointer_, nullptr);
+  EXPECT_EQ(growing.HandleOf(first.pointer_), 0);
+  EXPECT_EQ(growing.HandleOf(second.pointer_), 0);
+  growing.Deallocate(local.handle_);
+  owner.Deallocate(first.handle_);
+  owner.Deallocate(second.handle_);
+}
+
+TEST(ScanHashMapTest, ConcurrentResolveSurvivesOtherPageAllocationAndReuse) {
+  ScanHashMapEntryArena arena(1023);
+  ASSERT_TRUE(arena.PreallocateDirectory());
+  std::vector<ScanHashMapEntryArena::Allocation> live;
+  for (std::size_t bytes : {32, 256, 4096, 8192}) {
+    auto allocation = arena.Allocate(bytes);
+    ASSERT_NE(allocation.pointer_, nullptr);
+    std::construct_at(static_cast<std::uint64_t*>(allocation.pointer_), bytes);
+    live.push_back(allocation);
+  }
+
+  // These handles remain live until both readers join. The owner mutates page
+  // high watermarks, free lists, and other slots (including slots in the same
+  // small pages); readers may only inspect the protected entries and layout.
+  std::latch ready(2);
+  std::atomic<bool> mismatch{false};
+  std::atomic<std::size_t> reads{0};
+  auto read = [&](std::stop_token stop) {
+    ready.count_down();
+    while (!stop.stop_requested()) {
+      for (const auto& entry : live) {
+        if (arena.Resolve(entry.handle_) != entry.pointer_ ||
+            arena.HandleOf(entry.pointer_) != entry.handle_) {
+          mismatch.store(true, std::memory_order_relaxed);
+        }
+      }
+      reads.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  std::jthread first(read);
+  std::jthread second(read);
+  ready.wait();
+  for (unsigned round = 0; round < 32; ++round) {
+    std::vector<ScanHashMapEntryArena::Handle> transient;
+    for (unsigned i = 0; i < 2048; ++i) {
+      auto allocation = arena.Allocate(i % 16 == 0 ? 8192 : 4096);
+      ASSERT_NE(allocation.pointer_, nullptr);
+      transient.push_back(allocation.handle_);
+    }
+    for (auto handle : transient) arena.Deallocate(handle);
+  }
+  first.request_stop();
+  second.request_stop();
+  first.join();
+  second.join();
+  EXPECT_FALSE(mismatch.load());
+  EXPECT_GT(reads.load(), 0);
+  for (const auto& entry : live) arena.Deallocate(entry.handle_);
+}
+
+TEST(ScanHashMapTest, ConcurrentResolveObservesNewAndReusedPageLayouts) {
+  ScanHashMapEntryArena arena(3);
+  ASSERT_TRUE(arena.PreallocateDirectory());
+  std::atomic<ScanHashMapEntryArena::Handle> published{0};
+  std::atomic<bool> mismatch{false};
+  std::jthread reader([&](std::stop_token stop) {
+    while (!stop.stop_requested()) {
+      auto handle = published.load(std::memory_order_acquire);
+      if (handle == 0) {
+        std::this_thread::yield();
+        continue;
+      }
+      auto* value = static_cast<std::uint64_t*>(arena.Resolve(handle));
+      if (*value != handle || arena.HandleOf(value) != handle)
+        mismatch.store(true, std::memory_order_relaxed);
+      // The owner may reclaim this entry only after this acknowledgement.
+      published.store(0, std::memory_order_release);
+    }
+  });
+  for (unsigned i = 0; i < 1024; ++i) {
+    auto allocation = arena.Allocate(i % 2 == 0 ? 32 : 8192);
+    ASSERT_NE(allocation.pointer_, nullptr);
+    std::construct_at(static_cast<std::uint64_t*>(allocation.pointer_),
+                      allocation.handle_);
+    published.store(allocation.handle_, std::memory_order_release);
+    while (published.load(std::memory_order_acquire) != 0)
+      std::this_thread::yield();
+    arena.Deallocate(allocation.handle_);
+  }
+  reader.request_stop();
+  reader.join();
+  EXPECT_FALSE(mismatch.load());
 }
 
 TEST(ScanHashMapTest, PreallocatesSettledTableForKnownPopulation) {

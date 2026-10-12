@@ -1685,10 +1685,12 @@ if (BUILD_TESTING)
       NAME cluster_integration.replication_manager_control_api
       COMMAND lavik_cluster_replication_manager_integration_test
     )
+    # Allow repeated server recovery across the full suite on Debug CI runners.
+    # Individual operation waits remain bounded inside each test.
     set_tests_properties(
       cluster_integration.replication_manager_control_api PROPERTIES
       LABELS cluster-integration
-      TIMEOUT 90
+      TIMEOUT 180
       RUN_SERIAL TRUE
     )
 
@@ -1767,6 +1769,7 @@ if (BUILD_TESTING)
     tests/rdb_collection_test.cpp
     tests/record_location_test.cpp
     tests/load_value_awaitable_test.cpp
+    tests/remote_get_awaitable_test.cpp
     tests/request_gate_test.cpp
     tests/replication_command_test.cpp
     tests/replication_group_test.cpp
@@ -2150,6 +2153,14 @@ endforeach()
     set_tests_properties(lavik_extent_recovery_e2e PROPERTIES TIMEOUT 600)
 
     add_test(
+      NAME lavik_remote_get_e2e
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/remote_get_e2e.py
+              $<TARGET_FILE:lavik>
+    )
+    set_tests_properties(lavik_remote_get_e2e PROPERTIES TIMEOUT 180)
+
+    add_test(
       NAME lavik_defrag_payload_e2e
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/defrag_payload_e2e.py
@@ -2235,8 +2246,10 @@ endforeach()
       NAME lavik_grouped_ordered_write_e2e
       COMMAND lavik_grouped_ordered_write_e2e_test $<TARGET_FILE:lavik>
     )
+    # This aggregate suite repeatedly starts and recovers storage, including
+    # large RDB and crash-recovery cases on Debug CI runners.
     set_tests_properties(lavik_grouped_ordered_write_e2e PROPERTIES
-      TIMEOUT 1200 RUN_SERIAL TRUE
+      TIMEOUT 1800 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_list_e2e_test

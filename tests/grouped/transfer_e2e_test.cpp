@@ -176,10 +176,11 @@ TEST(GroupedTransferE2e, FullImageScratchOomPreservesValuesAndMetadataReads) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    // Each worker has less than the 9 MiB reply itself. Reject the full image
-    // even when a read retains just one copy, rather than relying on mutation
+    // After its fixed 16 MiB arena directory, each worker has less than the
+    // 9 MiB reply left in its 21.6 MiB steady-state quota. Reject the full
+    // image even when a read retains just one copy, without relying on mutation
     // scratch multipliers to make an otherwise affordable reply fail.
-    Server server(disk, 4, {}, {}, false, 2, "32M");
+    Server server(disk, 4, {}, {}, false, 2, "96M");
     Client client(server.port());
     for (const std::vector<std::string> command :
          {std::vector<std::string>{"HGETALL", "hash"},

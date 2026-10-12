@@ -1339,7 +1339,8 @@ bycorf::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
                          request.kind_ == CommandKind::kSubstr;
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       request.db_id_, tx::FingerprintOf(digest),
-      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(request.args_[1]));
   const storage::MutationPrecondition mutation_precondition =
       ClusterMutationPrecondition(request);
   co_return co_await ExecuteStringCommandLocked(
@@ -1382,7 +1383,8 @@ bycorf::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
                          request.kind_ != CommandKind::kBitField;
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       request.db_id_, tx::FingerprintOf(digest),
-      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+      lavik::storage::RedisSlot(request.args_[1]));
   const storage::MutationPrecondition mutation_precondition =
       ClusterMutationPrecondition(request);
   co_return co_await ExecuteBitmapCommandLocked(
@@ -1408,12 +1410,14 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   tx::Transaction transaction;
   transaction.AddKey(g_storage->OwnerForKey(request.args_[2]), request.db_id_,
                      storage::ComputeDigest(request.args_[2]), 2,
-                     tx::LockMode::kExclusive);
+                     tx::LockMode::kExclusive,
+                     storage::RedisSlot(request.args_[2]));
   for (std::size_t argument = 3; argument < request.args_.size(); ++argument) {
     transaction.AddKey(
         g_storage->OwnerForKey(request.args_[argument]), request.db_id_,
         storage::ComputeDigest(request.args_[argument]),
-        static_cast<std::uint32_t>(argument), tx::LockMode::kShared);
+        static_cast<std::uint32_t>(argument), tx::LockMode::kShared,
+        storage::RedisSlot(request.args_[argument]));
   }
   transaction.Seal();
   // The transaction validator rejects stale authority before each mutating
@@ -1549,7 +1553,8 @@ bycorf::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
     transaction.AddKey(
         g_storage->OwnerForKey(request.args_[argument]), request.db_id_,
         storage::ComputeDigest(request.args_[argument]),
-        static_cast<std::uint32_t>(argument), tx::LockMode::kShared);
+        static_cast<std::uint32_t>(argument), tx::LockMode::kShared,
+        storage::RedisSlot(request.args_[argument]));
   }
   transaction.Seal();
   absl::Status status = co_await transaction.Schedule();
