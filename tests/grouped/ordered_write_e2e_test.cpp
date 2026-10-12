@@ -543,13 +543,14 @@ TEST(IndirectKeyE2e, RemoteGroupedReadsRespectParentKeyOwnership) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    // Each logical owner retains two 16 MiB side-index keys. Its 48 MiB
-    // retained-memory quota fits the pages, but not another complete key copy.
+    // Each logical owner retains two 16 MiB side-index keys plus its fixed
+    // 16 MiB arena directory. Its 57.6 MiB steady-state quota fits the pages,
+    // but not another complete key copy.
     // Hash remote reads still own a key copy and must reject that allocation.
     // Ordered remote reads borrow the caller's key across the awaited hop, so
     // they must succeed with only page scratch. Client request buffers have a
     // separate budget so they cannot mask this storage admission check.
-    Server limited(disk, 3, {}, {}, false, 2, "160M", {}, "128M");
+    Server limited(disk, 3, {}, {}, false, 2, "192M", {}, "128M");
     limited.PreserveOnFailure();
     Client client(limited.port());
     unsigned rejected_hash = 0;

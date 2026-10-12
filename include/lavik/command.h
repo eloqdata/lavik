@@ -665,6 +665,8 @@ void SetClientName(std::uint64_t id, std::string name) noexcept;
 void SetClientRespVersion(std::uint64_t id, RespVersion version) noexcept;
 void SetClientPubSubCounts(std::uint64_t id, std::size_t subscriptions,
                            std::size_t pattern_subscriptions) noexcept;
+// Updates CLIENT state. After registering a waiter, setting blocked also
+// cancels it if EOF or connection retirement already occurred.
 void SetClientBlocked(std::uint64_t id, bool blocked) noexcept;
 void UnregisterClientConnection(std::uint64_t id) noexcept;
 

@@ -1305,8 +1305,8 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
       [](void* context) noexcept {
         auto* connection = static_cast<ConnectionContext*>(context);
         // A command may be suspended before registering its blocking waiter.
-        // Preserve peer EOF for WAIT without retiring buffered commands or
-        // changing Pub/Sub's existing connection lifecycle.
+        // Preserve peer EOF for late waiters without retiring buffered commands
+        // or changing Pub/Sub's existing connection lifecycle.
         connection->wait_peer_disconnected_ = true;
         (void)CancelBlockedClientOnCurrentWorker(connection->conn_id_);
       },

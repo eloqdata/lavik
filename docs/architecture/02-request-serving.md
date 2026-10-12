@@ -51,7 +51,9 @@ worker-local client record separately tracks data exposed by
 `CLIENT`, including RESP version, client library name/version, subscription
 counts, blocking state, and replication-session identity. All disconnect paths
 return through one cleanup point which unregisters client, monitor, Pub/Sub, and
-WATCH state.
+WATCH state. Peer EOF remains latched across asynchronous command work;
+registering a blocking waiter after EOF immediately cancels it, including
+waiters created by commands already buffered when the peer disconnected.
 
 Meta-managed serving boundaries retire ordinary client connections, including
 idle, blocking and Pub/Sub sessions. After authority admission closes, each

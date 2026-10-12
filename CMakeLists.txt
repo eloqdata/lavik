@@ -1685,10 +1685,12 @@ if (BUILD_TESTING)
       NAME cluster_integration.replication_manager_control_api
       COMMAND lavik_cluster_replication_manager_integration_test
     )
+    # Allow repeated server recovery across the full suite on Debug CI runners.
+    # Individual operation waits remain bounded inside each test.
     set_tests_properties(
       cluster_integration.replication_manager_control_api PROPERTIES
       LABELS cluster-integration
-      TIMEOUT 90
+      TIMEOUT 180
       RUN_SERIAL TRUE
     )
 
@@ -2244,8 +2246,10 @@ endforeach()
       NAME lavik_grouped_ordered_write_e2e
       COMMAND lavik_grouped_ordered_write_e2e_test $<TARGET_FILE:lavik>
     )
+    # This aggregate suite repeatedly starts and recovers storage, including
+    # large RDB and crash-recovery cases on Debug CI runners.
     set_tests_properties(lavik_grouped_ordered_write_e2e PROPERTIES
-      TIMEOUT 1200 RUN_SERIAL TRUE
+      TIMEOUT 1800 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_list_e2e_test

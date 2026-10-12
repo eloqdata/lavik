@@ -11640,7 +11640,15 @@ void SetClientBlocked(std::uint64_t id, bool blocked) noexcept {
   const auto found = std::find_if(
       g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
       [id](const auto& client) { return client.id_ == id; });
-  if (found != g_worker_clients[worker].end()) found->blocked_ = blocked;
+  if (found == g_worker_clients[worker].end()) return;
+  found->blocked_ = blocked;
+  // EOF or retirement may precede registration while a buffered command is
+  // suspended on another worker. The waiter is now in the local registry, so
+  // replay cancellation before it can sleep indefinitely.
+  if (blocked && found->context_ != nullptr &&
+      (found->context_->closing_ || found->context_->wait_peer_disconnected_)) {
+    (void)CancelBlockedClientOnCurrentWorker(id);
+  }
 }
 
 void UnregisterClientConnection(std::uint64_t id) noexcept {
