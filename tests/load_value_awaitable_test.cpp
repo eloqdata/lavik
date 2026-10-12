@@ -17,8 +17,6 @@ namespace lavik::storage {
 class LoadValueAwaitableTestPeer : public testing::Test {
  protected:
   using Awaitable = StorageEngine::Impl::LoadValueAwaitable;
-  using LocalAwaitable = StorageEngine::Impl::LoadValueLocalAwaitable;
-  static_assert(sizeof(LocalAwaitable) < sizeof(Awaitable));
   using Result = Awaitable::Result;
   using ExtentRead = StorageEngine::Impl::ReadExtentAwaitable;
 
@@ -86,21 +84,17 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   auto ReadLocal() {
     return storage_.impl_->LoadValueLocal(Store(), 0, key_, location_, 1);
   }
-  bool HasHelper(const Awaitable& read) { return read.logical_.slow_.valid(); }
+  bool HasHelper(const Awaitable& read) { return read.slow_.valid(); }
 
   void Encode(std::byte* data) {
     ASSERT_TRUE(EncodeRecordHeader(header_, key_,
                                    std::span(data, header_.header_bytes_)));
     std::memcpy(data + header_.header_bytes_, value_.data(), value_.size());
   }
-  template <typename Read>
-  void Complete(Read& read, int bytes = -1) {
+  void Complete(Awaitable& read, int bytes = -1) {
     ASSERT_NE(read.pinned_, nullptr);
     Encode(read.lease_.io_buffer().data_ + read.record_headroom_);
     read.Complete(worker_, bytes == -1 ? read.read_bytes_ : bytes, 0);
-  }
-  void RewriteRecord(LocalAwaitable& read) {
-    Encode(read.lease_.io_buffer().data_ + read.record_headroom_);
   }
   void Stage() {
     location_.set_in_memory(true);
@@ -158,13 +152,9 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     co_await Arm{read};
     co_return read.await_resume();
   }
-  template <typename Read>
-  Task<Result> AwaitExisting(Read& read) {
-    co_return co_await read;
-  }
+  Task<Result> AwaitExisting(Awaitable& read) { co_return co_await read; }
   Task<absl::Status> AwaitExtent(ExtentRead& read) { co_return co_await read; }
-  template <typename Read>
-  bool BufferWaitIsBackground(Read& read) {
+  bool BufferWaitIsBackground(Awaitable& read) {
     return read.task_class_ == bycorf::TaskClass::kBackground;
   }
   auto ExtentSlice(ExtentRef ref, std::size_t offset,
@@ -254,7 +244,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   }
   bool HelperIsBackground(Awaitable& read) {
     return worker_.IsBackground(
-        std::move(read.logical_.slow_).operator co_await().handle_);
+        std::move(read.slow_).operator co_await().handle_);
   }
 
   bycorf::CurrentWorker saved_context_;
@@ -274,7 +264,7 @@ TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
-  auto first = ReadLocal();
+  auto first = Read();
   auto second = Read();
   auto first_task = AwaitExisting(first);
   auto second_task = AwaitExisting(second);
@@ -292,6 +282,7 @@ TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
   ExpectValue(std::move(first_task).TakeResult());
   ASSERT_NO_FATAL_FAILURE(Drain(second_task));
   ExpectValue(std::move(second_task).TakeResult());
+  EXPECT_FALSE(HasHelper(first));
   EXPECT_FALSE(HasHelper(second));
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
@@ -440,23 +431,11 @@ TEST_F(LoadValueAwaitableTestPeer, ErrorsReleaseResources) {
 }
 
 TEST_F(LoadValueAwaitableTestPeer, LocalReadReturnsStaleLocationToItsCaller) {
-  {
-    block_.freeing_ = true;
-    auto read = ReadLocal();
-    ASSERT_TRUE(read.await_ready());
-    EXPECT_TRUE(absl::IsAborted(read.await_resume().status()));
-  }
-  block_.freeing_ = false;
-  {
-    auto read = ReadLocal();
-    ASSERT_NO_FATAL_FAILURE(Complete(read));
-    // Physical reads parse in the caller, not on the completion poller.
-    ++header_.allocation_epoch_;
-    RewriteRecord(read);
-    EXPECT_TRUE(absl::IsAborted(read.await_resume().status()));
-  }
-  EXPECT_EQ(block_.pins_, 0);
-  EXPECT_EQ(Pool().available_read_buffers(), 1);
+  block_.freeing_ = true;
+  auto read = ReadLocal();
+  ASSERT_TRUE(read.await_ready());
+  EXPECT_FALSE(HasHelper(read));
+  EXPECT_TRUE(absl::IsAborted(read.await_resume().status()));
 }
 
 TEST_F(LoadValueAwaitableTestPeer,

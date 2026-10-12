@@ -306,43 +306,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       trace->lookup_done_ns_ = ReadTraceNowNanos();
     }
 
-    const auto location = MaterializeIndexLocation(*found);
-    const auto replication_epoch = partition.replication_epoch_;
-    const bool candidate = partition.replica_sync_ != nullptr;
-    const auto db_epoch =
-        candidate ? EffectiveRecordDbEpoch(partition, db_id) : DbEpoch(db_id);
-    auto population_changed = [&] {
-      // Starting a candidate changes the partition epoch, so a read admitted
-      // outside recovery needs only the served DB epoch on its success path.
-      return partition.replication_epoch_ != replication_epoch ||
-             (candidate ? EffectiveRecordDbEpoch(partition, db_id)
-                        : DbEpoch(db_id)) != db_epoch;
-    };
-    absl::StatusOr<LoadedValue> loaded;
-    if (!location.grouped() && !location.external() &&
-        location.block_owner() == store.worker_->id() && !candidate) {
-      // This single-location type has no logical dispatcher or completion-side
-      // parsing. The temporary releases its pin before an exceptional retry.
-      loaded = co_await LoadValueLocal(store, db_id, key, location,
-                                       replication_epoch, trace, db_epoch);
-      if (absl::IsAborted(loaded.status()) && !population_changed())
-          [[unlikely]] {
-        loaded = co_await LoadValueSlow(store, partition, db_id, key, digest,
-                                        location, {}, trace, loaded.status());
-      }
-    } else if (location.grouped()) {
-      loaded = co_await LoadGroupedValue(store, partition, db_id, key, digest,
-                                         location, nullptr);
-    } else {
-      // Only cold representations create a task. Keeping the full logical
-      // awaitable out of this branch also keeps its state out of GET's frame.
-      loaded =
-          co_await LoadValueSlow(store, partition, db_id, key, digest, location,
-                                 ExtentsFor(store, found), trace);
-    }
-    // FLUSHDB/reset can run during I/O or any multi-step representation/retry.
-    if (population_changed()) [[unlikely]]
-      loaded = absl::NotFoundError("key not found");
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     MaterializeIndexLocation(*found),
+                                     ExtentsFor(store, found), trace);
     if (optimistic_read && !loaded.ok() &&
         (loaded.status().code() == absl::StatusCode::kNotFound ||
          loaded.status().code() == absl::StatusCode::kAborted)) {
@@ -1366,29 +1332,25 @@ StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValue(
                             std::move(grouped_snapshot));
 }
 
-StorageEngine::Impl::LoadValueLocalAwaitable
-StorageEngine::Impl::LoadValueLocal(
+StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValueLocal(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
     ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch) {
-  return LoadValueLocalAwaitable(*this, store, db_id, key, location,
-                                 replication_epoch, trace, expected_db_epoch);
+  return LoadValueAwaitable(*this, store, db_id, key, location,
+                            replication_epoch, trace, expected_db_epoch);
 }
 
-template <bool Logical>
-StorageEngine::Impl::ValueReadAwaitable<Logical>::ValueReadAwaitable(
+StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
     GroupedObject::Handle grouped_snapshot)
-  requires(Logical)
-    : logical_{.partition_ = location.grouped() ? nullptr : &partition,
-               .digest_ = digest,
-               .payload_ = {},
-               .slow_ = {}},
-      engine_(engine),
+    : engine_(engine),
       store_(store),
+      // Grouped snapshots have their own population/pin protocol.
+      partition_(location.grouped() ? nullptr : &partition),
       key_(key),
+      digest_(digest),
       location_(location),
       trace_(trace),
       replication_epoch_(partition.replication_epoch_),
@@ -1397,25 +1359,22 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::ValueReadAwaitable(
   if (location.grouped()) {
     // The grouped task owns its graph/version protocol. Keep its borrowed
     // digest in this awaitable, not in the constructor's argument lifetime.
-    logical_.slow_ =
-        engine.LoadGroupedValue(store, partition, db_id, key, logical_.digest_,
-                                location, std::move(grouped_snapshot));
+    slow_ = engine.LoadGroupedValue(store, partition, db_id, key, digest_,
+                                    location, std::move(grouped_snapshot));
   } else if (location.external() ||
              location.block_owner() != store.worker_->id()) {
-    logical_.slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest,
-                                          location, std::move(extents), trace);
+    slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
+                                 std::move(extents), trace);
   } else {
     PrepareLocal();
     if (ready_ && absl::IsAborted(ready_->status())) Retry(ready_->status());
   }
 }
 
-template <bool Logical>
-StorageEngine::Impl::ValueReadAwaitable<Logical>::ValueReadAwaitable(
+StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
     ReadLatencyTrace* trace, std::optional<std::uint64_t> expected_db_epoch)
-  requires(!Logical)
     : engine_(engine),
       store_(store),
       key_(key),
@@ -1427,13 +1386,9 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::ValueReadAwaitable(
   PrepareLocal();
 }
 
-template <bool Logical>
-StorageEngine::Impl::ValueReadAwaitable<Logical>::~ValueReadAwaitable() {
-  Unpin();
-}
+StorageEngine::Impl::LoadValueAwaitable::~LoadValueAwaitable() { Unpin(); }
 
-template <bool Logical>
-void StorageEngine::Impl::ValueReadAwaitable<Logical>::Unpin() {
+void StorageEngine::Impl::LoadValueAwaitable::Unpin() {
   auto* state = std::exchange(pinned_, nullptr);
   if (!state) return;
   --state->pins_;
@@ -1441,8 +1396,7 @@ void StorageEngine::Impl::ValueReadAwaitable<Logical>::Unpin() {
     ReleaseStagingBuffer(store_, *state);
 }
 
-template <bool Logical>
-void StorageEngine::Impl::ValueReadAwaitable<Logical>::PrepareLocal() {
+void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_VALUE_READ_KEY",
                                              key_)) {
     ready_.emplace(absl::InternalError("injected value payload read failure"));
@@ -1519,67 +1473,48 @@ void StorageEngine::Impl::ValueReadAwaitable<Logical>::PrepareLocal() {
   if (trace_) trace_->disk_read_ = true;
 }
 
-template <bool Logical>
-bool StorageEngine::Impl::ValueReadAwaitable<Logical>::PopulationChanged() const
-  requires(Logical)
-{
-  return logical_.partition_ &&
-         (logical_.partition_->replication_epoch_ != replication_epoch_ ||
-          engine_.EffectiveRecordDbEpoch(*logical_.partition_, db_id_) !=
-              *expected_db_epoch_);
+bool StorageEngine::Impl::LoadValueAwaitable::PopulationChanged() const {
+  return partition_ && (partition_->replication_epoch_ != replication_epoch_ ||
+                        engine_.EffectiveRecordDbEpoch(*partition_, db_id_) !=
+                            *expected_db_epoch_);
 }
 
-template <bool Logical>
-void StorageEngine::Impl::ValueReadAwaitable<Logical>::Retry(
-    absl::Status failure)
-  requires(Logical)
-{
-  assert(logical_.partition_ && absl::IsAborted(failure));
+void StorageEngine::Impl::LoadValueAwaitable::Retry(absl::Status failure) {
+  assert(partition_ && absl::IsAborted(failure));
   Unpin();
   lease_.Reset();
   ready_.reset();
   // Inline reads have no extent manifest. Seed the failure so the slow path
   // resolves the index before any further I/O and preserves corruption errors
   // when the index still endorses the failed physical record.
-  logical_.slow_ = engine_.LoadValueSlow(store_, *logical_.partition_, db_id_,
-                                         key_, logical_.digest_, location_, {},
-                                         trace_, std::move(failure));
+  slow_ = engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
+                                location_, {}, trace_, std::move(failure));
 }
 
-template <bool Logical>
-void StorageEngine::Impl::ValueReadAwaitable<Logical>::FinishBufferWait() {
+void StorageEngine::Impl::LoadValueAwaitable::FinishBufferWait() {
   auto acquired = buffer_wait_->await_resume();
   buffer_wait_.reset();
-  if constexpr (Logical) {
-    if (PopulationChanged()) {
-      ready_.emplace(absl::NotFoundError("key not found"));
-      return;
-    }
-  }
-  if (!acquired.ok()) {
+  if (PopulationChanged()) {
+    ready_.emplace(absl::NotFoundError("key not found"));
+  } else if (!acquired.ok()) {
     ready_.emplace(acquired.status());
   } else {
     lease_ = std::move(*acquired);
     PrepareLocal();
-    if constexpr (Logical) {
-      if (logical_.partition_ && ready_ && absl::IsAborted(ready_->status()))
-        Retry(ready_->status());
-    }
+    if (partition_ && ready_ && absl::IsAborted(ready_->status()))
+      Retry(ready_->status());
   }
 }
 
-template <bool Logical>
-void StorageEngine::Impl::ValueReadAwaitable<Logical>::BufferReady(
+void StorageEngine::Impl::LoadValueAwaitable::BufferReady(
     bycorf::RemoteWork* work) {
-  auto& read = *static_cast<ValueReadAwaitable*>(work);
+  auto& read = *static_cast<LoadValueAwaitable*>(work);
   read.FinishBufferWait();
   auto next = read.SuspendRead(read.awaiting_);
   if (next != std::noop_coroutine()) read.store_.worker_->Enqueue(next);
 }
 
-template <bool Logical>
-std::coroutine_handle<>
-StorageEngine::Impl::ValueReadAwaitable<Logical>::await_suspend(
+std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::await_suspend(
     std::coroutine_handle<> awaiting) {
   if (buffer_wait_) {
     awaiting_ = awaiting;
@@ -1593,16 +1528,10 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::await_suspend(
   return SuspendRead(awaiting);
 }
 
-template <bool Logical>
-std::coroutine_handle<>
-StorageEngine::Impl::ValueReadAwaitable<Logical>::SuspendRead(
+std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
     std::coroutine_handle<> awaiting) {
-  if constexpr (Logical) {
-    if (logical_.slow_.valid())
-      return std::move(logical_.slow_)
-          .operator co_await()
-          .await_suspend(awaiting);
-  }
+  if (slow_.valid())
+    return std::move(slow_).operator co_await().await_suspend(awaiting);
   if (ready_) return awaiting;
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
@@ -1616,56 +1545,47 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::SuspendRead(
                                        aligned_offset_, this);
   if (Suspend(awaiting, status)) return std::noop_coroutine();
   if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
-  if constexpr (Logical) {
-    if (logical_.partition_ && absl::IsAborted(status)) {
-      Retry(std::move(status));
-      return std::move(logical_.slow_)
-          .operator co_await()
-          .await_suspend(awaiting);
-    }
+  if (partition_ && absl::IsAborted(status)) {
+    Retry(std::move(status));
+    return std::move(slow_).operator co_await().await_suspend(awaiting);
   }
   return awaiting;
 }
 
-template <bool Logical>
-void StorageEngine::Impl::ValueReadAwaitable<Logical>::Complete(
-    bycorf::Worker& worker, int bytes, unsigned flags) {
+void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
+                                                       int bytes,
+                                                       unsigned flags) {
   if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
   if (bytes >= 0) worker.RecordStorageReadCompletion(bytes);
-  if constexpr (Logical) {
-    if (logical_.partition_ && bytes >= 0 &&
-        static_cast<std::size_t>(bytes) == read_bytes_) {
-      // Only metadata is examined on the completion poller. CRC and large-value
-      // copies stay in the caller's scheduled slice. A stale identity must
-      // select the retry continuation before the caller's co_await can finish.
-      auto parsed = ParseRecord(lease_.io_buffer().data_ + record_headroom_);
-      if (parsed.ok())
-        logical_.payload_ = *parsed;
-      else if (absl::IsAborted(parsed.status()) && !PopulationChanged()) {
-        Retry(parsed.status());
-        auto child = std::move(logical_.slow_)
-                         .operator co_await()
-                         .await_suspend(awaiting_);
-        // CQEs are polled outside the parent's task class. Preserve background
-        // scheduling when a backup/maintenance read starts its retry here.
-        if (worker.IsBackground(awaiting_)) worker.RegisterBackground(child);
-        worker.Enqueue(child);
-        return;
-      } else
-        ready_.emplace(parsed.status());
-    }
+  if (partition_ && bytes >= 0 &&
+      static_cast<std::size_t>(bytes) == read_bytes_) {
+    // Only metadata is examined on the completion poller. CRC and large-value
+    // copies stay in the caller's scheduled slice. A stale identity must select
+    // the retry continuation before the caller's co_await can finish.
+    auto parsed = ParseRecord(lease_.io_buffer().data_ + record_headroom_);
+    if (parsed.ok())
+      payload_ = *parsed;
+    else if (absl::IsAborted(parsed.status()) && !PopulationChanged()) {
+      Retry(parsed.status());
+      auto child =
+          std::move(slow_).operator co_await().await_suspend(awaiting_);
+      // CQEs are polled outside the parent's task class. Preserve background
+      // scheduling when a backup/maintenance read starts its retry here.
+      if (worker.IsBackground(awaiting_)) worker.RegisterBackground(child);
+      worker.Enqueue(child);
+      return;
+    } else
+      ready_.emplace(parsed.status());
   }
   OneShotIoAwaitable::Complete(worker, bytes, flags);
 }
 
-template <bool Logical>
-typename StorageEngine::Impl::ValueReadAwaitable<Logical>::Result
-StorageEngine::Impl::ValueReadAwaitable<Logical>::await_resume() {
-  if constexpr (Logical) {
-    // Fence after the scheduling gap; completion only fences before retries.
-    if (PopulationChanged()) return absl::NotFoundError("key not found");
-    if (logical_.slow_.valid()) return std::move(logical_.slow_).TakeResult();
-  }
+StorageEngine::Impl::LoadValueAwaitable::Result
+StorageEngine::Impl::LoadValueAwaitable::await_resume() {
+  // Fence successful reads here, after the scheduling gap following the CQE.
+  // Completion only needs this check when deciding whether to start a retry.
+  if (PopulationChanged()) return absl::NotFoundError("key not found");
+  if (slow_.valid()) return std::move(slow_).TakeResult();
   if (ready_) return std::move(*ready_);
   auto read =
       Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
@@ -1673,18 +1593,16 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::await_resume() {
   if (static_cast<std::size_t>(*read) != read_bytes_)
     return absl::InternalError("short compact record read");
   const auto* data = lease_.io_buffer().data_ + record_headroom_;
-  if constexpr (Logical) {
-    if (logical_.payload_) return FinishRecord(data, *logical_.payload_, false);
+  if (!payload_) {
+    auto parsed = ParseRecord(data);
+    if (!parsed.ok()) return parsed.status();
+    payload_ = *parsed;
   }
-  auto parsed = ParseRecord(data);
-  if (!parsed.ok()) return parsed.status();
-  return FinishRecord(data, *parsed, false);
+  return FinishRecord(data, *payload_, false);
 }
 
-template <bool Logical>
-absl::StatusOr<
-    typename StorageEngine::Impl::ValueReadAwaitable<Logical>::Payload>
-StorageEngine::Impl::ValueReadAwaitable<Logical>::ParseRecord(
+absl::StatusOr<StorageEngine::Impl::LoadValueAwaitable::Payload>
+StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
     const std::byte* data) const {
   RecordHeader record{};
   std::string_view disk_key;
@@ -1714,10 +1632,10 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::ParseRecord(
                  record.payload_checksum_};
 }
 
-template <bool Logical>
-typename StorageEngine::Impl::ValueReadAwaitable<Logical>::Result
-StorageEngine::Impl::ValueReadAwaitable<Logical>::FinishRecord(
-    const std::byte* data, Payload payload, bool staged) {
+StorageEngine::Impl::LoadValueAwaitable::Result
+StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
+                                                      Payload payload,
+                                                      bool staged) {
   const auto* value = data + payload.offset_;
   if (Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
     return absl::InternalError("record value checksum mismatch");
@@ -1729,9 +1647,5 @@ StorageEngine::Impl::ValueReadAwaitable<Logical>::FinishRecord(
   if (trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
   return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
 }
-
-// Keep the shared implementation out of every loader caller's translation unit.
-template class StorageEngine::Impl::ValueReadAwaitable<false>;
-template class StorageEngine::Impl::ValueReadAwaitable<true>;
 
 }  // namespace lavik::storage

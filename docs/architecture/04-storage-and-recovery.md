@@ -649,22 +649,17 @@ rereads. Transaction-owned reads always use that locked path directly.
 Tombstones and expired values are invisible; an expired observation can enqueue
 a bounded active-expiration candidate. A staged location is copied or framed
 from its write buffer. A disk location is read on its physical block owner into
-an aligned lease. `LoadValue` and its single-location `LoadValueLocal` use
-separate awaitable types embedded in the caller's task, sharing physical I/O
-and validation code. Local inline reads, including staged copies, use that
-task directly. Buffer contention retains the pool's FIFO handoff and schedules
-an owner-local continuation under the caller's task class; it does not require
-a waiter coroutine. Each awaitable owns its disk-read pin and buffer through
-completion.
-
-Ordinary owner-local GET uses the single-location reader. Its I/O completion
-only wakes the caller; the resumed task validates the record and fences the
-population, entering logical relocation resolution only on a stale-location
-error. Candidate replica populations and other representations use the full
-logical loader, which resolves same-mutation relocations before returning to
-its caller. Representation-specific readers use the single-location result
-inside their own retry loops. Grouped reads enter their graph reader directly;
-cross-owner, external, and relocation flows use lazy helper tasks.
+an aligned lease. `LoadValue` and its single-location `LoadValueLocal` share an
+awaitable embedded in the caller's task. Local inline reads, including staged
+copies, use that task directly. Buffer contention retains the pool's FIFO
+handoff and schedules an owner-local continuation under the caller's task class;
+it does not require a waiter coroutine. The awaitable owns the disk-read pin
+and buffer through completion and validates record identity, checksums, and
+population before returning it. Grouped reads enter their graph reader directly;
+cross-owner, external, and relocation flows use lazy helper tasks. A stale
+logical read resolves the current same-mutation location before resuming its
+caller, while a single-location read returns the stale status to its enclosing
+representation-specific retry loop.
 
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size

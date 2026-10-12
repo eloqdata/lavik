@@ -3343,34 +3343,28 @@ class StorageEngine::Impl {
     }
   };
 
-  // Both types share physical I/O and pool handoff, but single-location reads
-  // have no logical dispatch/retry state or completion-side parsing. Their
-  // caller fences the population and decides whether to retry a stale location.
-  template <bool Logical>
-  class ValueReadAwaitable final : public bycorf::OneShotIoAwaitable,
+  // The awaitable lives in the caller's frame. Ordinary local reads suspend
+  // that caller directly, including through pool backpressure. Only multi-step
+  // logical reads need a lazy helper Task. Local mode returns stale-location
+  // errors to its caller, while logical mode resolves same-mutation relocations
+  // before returning.
+  class LoadValueAwaitable final : public bycorf::OneShotIoAwaitable,
                                    private bycorf::RemoteWork {
    public:
     using Result = absl::StatusOr<LoadedValue>;
-    ValueReadAwaitable(Impl& engine, WorkerStore& store,
+    LoadValueAwaitable(Impl& engine, WorkerStore& store,
                        WorkerStore::PartitionStore& partition,
                        std::uint8_t db_id, std::string_view key,
                        const Digest& digest, RecordLocation location,
                        ExtentManifest extents, ReadLatencyTrace* trace,
-                       GroupedObject::Handle grouped_snapshot)
-      requires(Logical);
-    ValueReadAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
+                       GroupedObject::Handle grouped_snapshot);
+    LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
                        std::string_view key, RecordLocation location,
                        std::uint64_t replication_epoch, ReadLatencyTrace* trace,
-                       std::optional<std::uint64_t> expected_db_epoch)
-      requires(!Logical);
-    ~ValueReadAwaitable();
+                       std::optional<std::uint64_t> expected_db_epoch);
+    ~LoadValueAwaitable();
 
-    bool await_ready() const noexcept {
-      if constexpr (Logical)
-        return ready_ && !logical_.slow_.valid();
-      else
-        return ready_.has_value();
-    }
+    bool await_ready() const noexcept { return ready_ && !slow_.valid(); }
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
     Result await_resume();
     void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
@@ -3390,25 +3384,15 @@ class StorageEngine::Impl {
     std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
     absl::StatusOr<Payload> ParseRecord(const std::byte* data) const;
     Result FinishRecord(const std::byte* data, Payload payload, bool staged);
-    bool PopulationChanged() const
-      requires(Logical);
+    bool PopulationChanged() const;
     void Unpin();
-    void Retry(absl::Status failure)
-      requires(Logical);
-
-    struct LogicalState {
-      WorkerStore::PartitionStore* partition_ = nullptr;
-      Digest digest_{};
-      std::optional<Payload> payload_;
-      Task<Result> slow_;
-    };
-    struct PhysicalState {};
-    [[no_unique_address]] std::conditional_t<Logical, LogicalState,
-                                             PhysicalState> logical_;
+    void Retry(absl::Status failure);
 
     Impl& engine_;
     WorkerStore& store_;
+    WorkerStore::PartitionStore* partition_ = nullptr;
     std::string_view key_;
+    Digest digest_{};
     RecordLocation location_;
     ReadLatencyTrace* trace_;
     std::uint64_t replication_epoch_;
@@ -3419,15 +3403,14 @@ class StorageEngine::Impl {
     std::size_t read_bytes_ = 0;
     std::uint8_t db_id_;
     BlockState* pinned_ = nullptr;
+    std::optional<Payload> payload_;
     std::optional<Result> ready_;
     // Runtime shutdown drains I/O before destroying suspended frames. The
     // waiter retains its assigned slot until the scheduled continuation runs.
     ReadBufferLease lease_;
     std::optional<RegisteredBufferPool::AcquireReadAwaiter> buffer_wait_;
+    Task<Result> slow_;
   };
-
-  using LoadValueAwaitable = ValueReadAwaitable<true>;
-  using LoadValueLocalAwaitable = ValueReadAwaitable<false>;
 
   // One physical extent read, including buffer waiting and slice validation,
   // embedded in the caller. Routing adds a runtime task bridge only when the
@@ -3905,7 +3888,7 @@ class StorageEngine::Impl {
       ExtentManifest extents, ReadLatencyTrace* trace,
       bool grouped_payload = false);
 
-  LoadValueLocalAwaitable LoadValueLocal(
+  LoadValueAwaitable LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       ReadLatencyTrace* trace = nullptr,
