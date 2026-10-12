@@ -1170,7 +1170,10 @@ TEST(GroupedRecoveryE2e, CheckpointAccountsForReassignedPhysicalOwners) {
     EXPECT_NE(recovered.Log().find("loaded shutdown checkpoint generation="),
               std::string::npos)
         << recovered.Log();
-    EXPECT_EQ(recovered.Log().find("falling back"), std::string::npos)
+    // A kernel may independently fall back from provided-buffer receive.
+    // Only checkpoint recovery falling back to a record scan is a failure.
+    EXPECT_EQ(recovered.Log().find("falling back to record scan"),
+              std::string::npos)
         << recovered.Log();
     EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}), value);
     EXPECT_EQ(recovered.Command({"SET", "string", value}), "+OK");

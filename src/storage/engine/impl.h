@@ -3257,6 +3257,7 @@ class StorageEngine::Impl {
  private:
   friend class ExpirationAuthorityTestPeer;
   friend class TombRaiderTestPeer;
+  friend class LoadValueAwaitableTestPeer;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;
@@ -3340,6 +3341,118 @@ class StorageEngine::Impl {
       }
       return buffer.subspan(value_offset_, value_bytes_);
     }
+  };
+
+  // The awaitable lives in the caller's frame. Ordinary local reads suspend
+  // that caller directly, including through pool backpressure. Only multi-step
+  // logical reads need a lazy helper Task. Local mode returns stale-location
+  // errors to its caller, while logical mode resolves same-mutation relocations
+  // before returning.
+  class LoadValueAwaitable final : public bycorf::OneShotIoAwaitable,
+                                   private bycorf::RemoteWork {
+   public:
+    using Result = absl::StatusOr<LoadedValue>;
+    LoadValueAwaitable(Impl& engine, WorkerStore& store,
+                       WorkerStore::PartitionStore& partition,
+                       std::uint8_t db_id, std::string_view key,
+                       const Digest& digest, RecordLocation location,
+                       ExtentManifest extents, ReadLatencyTrace* trace,
+                       GroupedObject::Handle grouped_snapshot);
+    LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
+                       std::string_view key, RecordLocation location,
+                       std::uint64_t replication_epoch, ReadLatencyTrace* trace,
+                       std::optional<std::uint64_t> expected_db_epoch);
+    ~LoadValueAwaitable();
+
+    bool await_ready() const noexcept { return ready_ && !slow_.valid(); }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
+    Result await_resume();
+    void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
+
+   private:
+    friend class LoadValueAwaitableTestPeer;
+    struct Payload {
+      std::uint64_t txid_;
+      std::uint32_t offset_;
+      std::uint32_t bytes_;
+      std::uint32_t checksum_;
+    };
+
+    void PrepareLocal();
+    void FinishBufferWait();
+    static void BufferReady(bycorf::RemoteWork* work);
+    std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
+    absl::StatusOr<Payload> ParseRecord(const std::byte* data) const;
+    Result FinishRecord(const std::byte* data, Payload payload, bool staged);
+    bool PopulationChanged() const;
+    void Unpin();
+    void Retry(absl::Status failure);
+
+    Impl& engine_;
+    WorkerStore& store_;
+    WorkerStore::PartitionStore* partition_ = nullptr;
+    std::string_view key_;
+    Digest digest_{};
+    RecordLocation location_;
+    ReadLatencyTrace* trace_;
+    std::uint64_t replication_epoch_;
+    std::optional<std::uint64_t> expected_db_epoch_;
+    std::uint64_t aligned_offset_ = 0;
+    std::size_t file_id_ = 0;
+    std::size_t record_headroom_ = 0;
+    std::size_t read_bytes_ = 0;
+    std::uint8_t db_id_;
+    BlockState* pinned_ = nullptr;
+    std::optional<Payload> payload_;
+    std::optional<Result> ready_;
+    // Runtime shutdown drains I/O before destroying suspended frames. The
+    // waiter retains its assigned slot until the scheduled continuation runs.
+    ReadBufferLease lease_;
+    std::optional<RegisteredBufferPool::AcquireReadAwaiter> buffer_wait_;
+    Task<Result> slow_;
+  };
+
+  // One physical extent read, including buffer waiting and slice validation,
+  // embedded in the caller. Routing adds a runtime task bridge only when the
+  // block belongs to another worker; local reads need no child coroutine.
+  class ReadExtentAwaitable final : public bycorf::OneShotIoAwaitable,
+                                    private bycorf::RemoteWork {
+   public:
+    ReadExtentAwaitable(Impl& engine, WorkerStore& store, ExtentRef ref,
+                        std::uint32_t extent_index, std::size_t source_offset,
+                        std::span<std::byte> destination, bool route = false);
+    ~ReadExtentAwaitable();
+    bool await_ready() const noexcept { return ready_.has_value(); }
+    bool await_suspend(std::coroutine_handle<> awaiting);
+    absl::Status await_resume();
+
+   private:
+    friend class LoadValueAwaitableTestPeer;
+    struct RemoteRead {
+      Impl* engine_;
+      unsigned owner_;
+      ExtentRef ref_;
+      std::uint32_t extent_index_;
+      std::size_t source_offset_;
+      std::span<std::byte> destination_;
+      Task<absl::Status> operator()();
+    };
+    void FinishBufferWait();
+    static void BufferReady(bycorf::RemoteWork* work);
+    bool SubmitRead(std::coroutine_handle<> awaiting);
+
+    Impl& engine_;
+    WorkerStore& store_;
+    ExtentRef ref_;
+    std::uint32_t extent_index_;
+    std::size_t source_offset_;
+    std::span<std::byte> destination_;
+    std::size_t read_bytes_ = 0;
+    BlockState* pinned_ = nullptr;
+    std::optional<absl::Status> ready_;
+    ReadBufferLease lease_;
+    std::optional<RegisteredBufferPool::AcquireReadAwaiter> buffer_wait_;
+    std::optional<bycorf::SubmitTaskAwaiter<RemoteRead>> remote_;
   };
 
   // Owns the page lease while a grouped reader inspects its checked envelope.
@@ -3726,12 +3839,20 @@ class StorageEngine::Impl {
       WorkerStore& store, RecordIndex& index, const Digest& digest,
       std::string_view key, const RecordLocation& verified_location);
 
-  Task<absl::StatusOr<LoadedValue>> LoadValue(
+  LoadValueAwaitable LoadValue(
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       RecordLocation location, ExtentManifest extents,
       ReadLatencyTrace* trace = nullptr,
       GroupedObject::Handle grouped_snapshot = nullptr);
+
+  // Used only for multi-step reads or an aborted direct read. A supplied
+  // failure enters relocation resolution without reading the stale bytes again.
+  Task<absl::StatusOr<LoadedValue>> LoadValueSlow(
+      WorkerStore& key_store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, Digest digest,
+      RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
+      std::optional<absl::Status> failure = std::nullopt);
 
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
@@ -3752,26 +3873,22 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       RecordLocation location, GroupedObject::Handle snapshot);
 
-  // Reads one extent block's payload into `destination`. Runs on the worker
-  // that owns that block, which is not necessarily the one holding the
-  // manifest, so everything it needs is passed by value.
-  Task<absl::Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
-                                    std::uint32_t extent_index,
-                                    std::byte* destination);
-  Task<absl::Status> ReadExtentOnOwner(ExtentRef ref,
-                                       std::uint32_t extent_index,
-                                       std::byte* destination);
-  Task<absl::Status> ReadExtentSlice(WorkerStore& store, ExtentRef ref,
-                                     std::uint32_t extent_index,
-                                     std::size_t source_offset,
-                                     std::span<std::byte> destination);
+  // Reads an entire extent on its physical owner into caller-owned storage.
+  // Local routing returns the physical awaitable without a wrapper task.
+  ReadExtentAwaitable ReadExtentOnOwner(ExtentRef ref,
+                                        std::uint32_t extent_index,
+                                        std::byte* destination);
+  ReadExtentAwaitable ReadExtentSlice(WorkerStore& store, ExtentRef ref,
+                                      std::uint32_t extent_index,
+                                      std::size_t source_offset,
+                                      std::span<std::byte> destination);
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
       ExtentManifest extents, ReadLatencyTrace* trace,
       bool grouped_payload = false);
 
-  Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
+  LoadValueAwaitable LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       ReadLatencyTrace* trace = nullptr,

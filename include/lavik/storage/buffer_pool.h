@@ -32,6 +32,7 @@
 namespace bycorf {
 class CrossCore;
 class Worker;
+struct RemoteWork;
 }  // namespace bycorf
 
 namespace lavik::storage {
@@ -208,12 +209,20 @@ class RegisteredBufferPool {
     bool await_suspend(std::coroutine_handle<> awaiting);
     absl::StatusOr<ReadBufferLease> await_resume();
 
+    // Queue an owner-local continuation when a slot is handed off. This uses
+    // the worker's scheduled work queue (including its task-class budget),
+    // never runs inline in Release(), and sends no cross-worker reply. The
+    // caller supplies run_fn_/task_class_ and keeps both objects alive until
+    // that callback consumes the assigned lease through await_resume().
+    bool SuspendWith(bycorf::RemoteWork& continuation);
+
    private:
     friend class RegisteredBufferPool;
 
     RegisteredBufferPool* pool_ = nullptr;
     std::size_t minimum_payload_bytes_ = 0;
     std::coroutine_handle<> awaiting_{};
+    bycorf::RemoteWork* continuation_ = nullptr;
     std::uint16_t assigned_buffer_id_ = 0;
   };
 
