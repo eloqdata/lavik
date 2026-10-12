@@ -832,7 +832,6 @@ std::shared_ptr<CanonicalReceiveCharge> TryReserveCanonical(
 
 struct ReplicaTransactionArrival {
   std::uint64_t id_ = 0;
-  std::uint8_t db_id_ = 0;
   std::vector<unsigned> participants_;
   std::vector<std::string> command_args_;
   std::vector<NativeHistoryRecord> canonical_records_;
@@ -841,12 +840,15 @@ struct ReplicaTransactionArrival {
   // preserve the source partial order. Transactions with disjoint flow sets
   // deliberately have no dependency and may apply concurrently.
   std::vector<std::shared_ptr<ReplicaTransactionArrival>> predecessors_;
+  // Keep the small transaction state together to avoid separate alignment
+  // gaps before the owning containers and completion state.
   unsigned payload_flow_ = 0;
   bool payload_arrived_ = false;
+  std::uint8_t db_id_ = 0;
+  bool applying_ = false;
   std::vector<bool> arrived_;
   std::vector<std::uint64_t> lsns_;
   std::size_t arrival_count_ = 0;
-  bool applying_ = false;
   absl::Status status_ =
       absl::UnknownError("replicated transaction has not completed");
   // This cross-worker latch is producer-resolved rather than arrival-counted:

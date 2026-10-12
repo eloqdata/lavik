@@ -114,8 +114,8 @@ class ReplicationCommandCapture {
 };
 
 struct CapturedBlockingNotification {
-  std::uint8_t db_id_ = 0;
   std::string key_;
+  std::uint8_t db_id_ = 0;
   storage::ValueType value_type_ = storage::ValueType::kNone;
 };
 

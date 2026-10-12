@@ -71,7 +71,7 @@ void BlockingNotificationCapture::Record(std::uint8_t db_id, std::string key,
   const unsigned worker_id = bycorf::ThisWorker().id_;
   assert(worker_id < per_worker_.size());
   per_worker_[worker_id].push_back(
-      CapturedBlockingNotification{db_id, std::move(key), value_type});
+      CapturedBlockingNotification{std::move(key), db_id, value_type});
 }
 
 std::vector<CapturedBlockingNotification> BlockingNotificationCapture::Take() {

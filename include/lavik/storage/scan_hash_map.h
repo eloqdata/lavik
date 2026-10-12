@@ -2086,8 +2086,9 @@ class ScanHashMap {
   // allocate temporary plan storage, but failure occurs before either table is
   // mutated and simply leaves this rehash step pending.
   struct RehashMove {
-    EntryHandle handle_ = 0;
+    // The pointer precedes the small fields to keep the inline plan compact.
     Bucket* target_bucket_ = nullptr;
+    EntryHandle handle_ = 0;
     std::uint8_t target_slot_ = 0;
     std::uint8_t tag_ = 0;
     std::uint8_t split_ = 0;

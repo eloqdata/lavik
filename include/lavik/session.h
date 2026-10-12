@@ -95,12 +95,13 @@ struct ConnectionContext {
     std::string key_;
     storage::Digest digest_;
     tx::LockFp fp_ = 0;
-    std::uint16_t owner_ = 0;
-    std::uint8_t db_ = 0;
     // WATCH is an observation of one logical population, not just one key's
     // liveness. EXEC treats a serving-generation change as a modification even
     // when the replacement happens to contain the same key state.
     std::uint64_t serving_generation_ = 0;
+    // Keep the small fields together so WATCH vectors stay densely strided.
+    std::uint16_t owner_ = 0;
+    std::uint8_t db_ = 0;
     bool serving_generation_valid_ = false;
     // Liveness observed on the owning shard at WATCH time; EXEC compares it
     // against the key's own current liveness, so fingerprint collisions can
@@ -109,12 +110,12 @@ struct ConnectionContext {
   };
   std::uint64_t conn_id_ = 0;
   int socket_fd_ = -1;
+  bool close_after_pubsub_ = false;
   std::string peer_address_;
   std::string client_name_;
   std::vector<WatchedKey> watched_;
   std::shared_ptr<MonitorSession> monitor_session_;
   std::shared_ptr<PubSubSession> pubsub_session_;
-  bool close_after_pubsub_ = false;
 
   void ResetMulti() {
     in_multi_ = false;

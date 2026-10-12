@@ -94,11 +94,10 @@ void CheckApplied(const SortedFixture& fixture,
           .lsn_ = 2,
           .item_count_ = page.entries_.size(),
           .record_token_ = page.id_,
-          .retired_ = page.retired_,
           .min_score_ =
               page.entries_.empty() ? 0 : page.entries_.front().score_,
-          .max_score_ =
-              page.entries_.empty() ? 0 : page.entries_.back().score_}});
+          .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_,
+          .retired_ = page.retired_}});
   }
   plan.root_.revision_ = 2;
   plan.root_.member_index_ = grouped_test::MemberRoot(plan.root_);

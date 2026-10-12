@@ -91,7 +91,9 @@ class RespCommandParser {
   bool Account(std::size_t bytes);
   void ResetCommand();
 
+  // Group byte-sized parser state to avoid padding in each connection frame.
   State state_ = State::kArrayStart;
+  char argument_type_ = '$';
   std::string length_text_;
   RespCommand command_;
   std::string current_argument_;
@@ -100,7 +102,6 @@ class RespCommandParser {
   std::size_t terminator_bytes_ = 0;
   std::size_t command_bytes_ = 0;
   std::size_t query_buffer_limit_ = kDefaultClientQueryBufferLimit;
-  char argument_type_ = '$';
 };
 
 // Convenience wrapper for callers that already hold one complete contiguous
