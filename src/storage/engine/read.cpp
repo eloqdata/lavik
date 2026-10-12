@@ -1557,7 +1557,7 @@ void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
                                                        unsigned flags) {
   if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
   if (bytes >= 0) worker.RecordStorageReadCompletion(bytes);
-  if (partition_ && !PopulationChanged() && bytes >= 0 &&
+  if (partition_ && bytes >= 0 &&
       static_cast<std::size_t>(bytes) == read_bytes_) {
     // Only metadata is examined on the completion poller. CRC and large-value
     // copies stay in the caller's scheduled slice. A stale identity must select
@@ -1565,7 +1565,7 @@ void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
     auto parsed = ParseRecord(lease_.io_buffer().data_ + record_headroom_);
     if (parsed.ok())
       payload_ = *parsed;
-    else if (absl::IsAborted(parsed.status())) {
+    else if (absl::IsAborted(parsed.status()) && !PopulationChanged()) {
       Retry(parsed.status());
       auto child =
           std::move(slow_).operator co_await().await_suspend(awaiting_);
@@ -1582,6 +1582,8 @@ void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
 
 StorageEngine::Impl::LoadValueAwaitable::Result
 StorageEngine::Impl::LoadValueAwaitable::await_resume() {
+  // Fence successful reads here, after the scheduling gap following the CQE.
+  // Completion only needs this check when deciding whether to start a retry.
   if (PopulationChanged()) return absl::NotFoundError("key not found");
   if (slow_.valid()) return std::move(slow_).TakeResult();
   if (ready_) return std::move(*ready_);
@@ -1608,8 +1610,8 @@ StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
                           &record, &disk_key) ||
       record.db_id_ != db_id_ || (!record.key_indirect_ && disk_key != key_) ||
       record.kind_ != RecordKind::kValue ||
-      record.db_epoch_ !=
-          expected_db_epoch_.value_or(engine_.DbEpoch(db_id_)) ||
+      record.db_epoch_ != (expected_db_epoch_ ? *expected_db_epoch_
+                                              : engine_.DbEpoch(db_id_)) ||
       record.mutation_sequence_ != location_.mutation_sequence_ ||
       record.replication_epoch_ != replication_epoch_ ||
       record.allocation_epoch_ != location_.allocation_epoch() ||

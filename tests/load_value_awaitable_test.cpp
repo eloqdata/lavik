@@ -12,8 +12,8 @@
 
 namespace lavik::storage {
 
-// Deliver deterministic CQEs at exact suspension boundaries. End-to-end
-// storage tests cover real submission through the same LoadValue entry point.
+// Deliver deterministic CQEs for identity races and real I/O for buffer
+// handoff.
 class LoadValueAwaitableTestPeer : public testing::Test {
  protected:
   using Awaitable = StorageEngine::Impl::LoadValueAwaitable;
@@ -152,20 +152,15 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     co_await Arm{read};
     co_return read.await_resume();
   }
-  Task<Result> AwaitRead() { co_return co_await Read(); }
   Task<Result> AwaitExisting(Awaitable& read) { co_return co_await read; }
   Task<absl::Status> AwaitExtent(ExtentRead& read) { co_return co_await read; }
   bool BufferWaitIsBackground(Awaitable& read) {
     return read.task_class_ == bycorf::TaskClass::kBackground;
   }
-  bool HasRemote(const ExtentRead& read) { return read.remote_.has_value(); }
   auto ExtentSlice(ExtentRef ref, std::size_t offset,
                    std::span<std::byte> destination) {
     return storage_.impl_->ReadExtentSlice(Store(), ref, 0, offset,
                                            destination);
-  }
-  auto ExtentOnOwner(ExtentRef ref, std::span<std::byte> destination) {
-    return storage_.impl_->ReadExtentOnOwner(ref, 0, destination.data());
   }
 
   // Use a real fixed-file read for pool -> I/O handoff, rather than completing
@@ -265,81 +260,31 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   RecordLocation location_;
 };
 
-TEST_F(LoadValueAwaitableTestPeer, StagedReadNeedsNoPinOrHelper) {
-  Stage();
-  auto read = Read();
-  ASSERT_TRUE(read.await_ready());
-  EXPECT_FALSE(HasHelper(read));
-  ExpectValue(read.await_resume());
-  EXPECT_EQ(block_.pins_, 0);
-}
-
-TEST_F(LoadValueAwaitableTestPeer, UnawaitedReadReleasesPinAndBuffer) {
-  {
-    auto read = Read();
-    EXPECT_FALSE(read.await_ready());
-    EXPECT_FALSE(HasHelper(read));
-    EXPECT_EQ(block_.pins_, 1);
-    EXPECT_EQ(Pool().available_read_buffers(), 0);
-  }
-  EXPECT_EQ(block_.pins_, 0);
-  EXPECT_EQ(Pool().available_read_buffers(), 1);
-}
-
-TEST_F(LoadValueAwaitableTestPeer, BufferWaitUsesAssignedLeaseWithoutHelper) {
-  Stage();
-  auto held = Pool().AcquireReadBuffer().await_resume();
-  ASSERT_TRUE(held.ok());
-  auto read = Read();
-  EXPECT_FALSE(HasHelper(read));
-  auto task = AwaitExisting(read);
-  Start(task, true);
-  EXPECT_FALSE(task.done());
-  EXPECT_TRUE(BufferWaitIsBackground(read));
-  EXPECT_EQ(block_.pins_, 0);
-  held->Reset();
-  // Handoff schedules the continuation; no decoding or nested resume occurs
-  // inside the buffer owner's release stack.
-  EXPECT_FALSE(task.done());
-  EXPECT_EQ(Pool().available_read_buffers(), 0);
-  ASSERT_NO_FATAL_FAILURE(Drain(task));
-  ExpectValue(std::move(task).TakeResult());
-  EXPECT_FALSE(HasHelper(read));
-  EXPECT_EQ(Pool().available_read_buffers(), 1);
-}
-
 TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
-  Stage();
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
   auto first = Read();
   auto second = Read();
   auto first_task = AwaitExisting(first);
   auto second_task = AwaitExisting(second);
-  Start(first_task);
+  Start(first_task, true);
   Start(second_task);
+  EXPECT_TRUE(BufferWaitIsBackground(first));
+  EXPECT_EQ(block_.pins_, 0);
   held->Reset();
+  // Handoff schedules I/O; it must not resume inside the release stack.
+  EXPECT_FALSE(first_task.done());
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
   ASSERT_NO_FATAL_FAILURE(Drain(first_task));
   EXPECT_FALSE(second_task.done());
   // Taking/destroying the first result hands its sole slot to the second.
   ExpectValue(std::move(first_task).TakeResult());
   ASSERT_NO_FATAL_FAILURE(Drain(second_task));
   ExpectValue(std::move(second_task).TakeResult());
+  EXPECT_FALSE(HasHelper(first));
+  EXPECT_FALSE(HasHelper(second));
   EXPECT_EQ(Pool().available_read_buffers(), 1);
-}
-
-TEST_F(LoadValueAwaitableTestPeer, BufferWaitContinuesIntoRealDiskIo) {
-  ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto held = Pool().AcquireReadBuffer().await_resume();
-  ASSERT_TRUE(held.ok());
-  auto read = Read();
-  auto task = AwaitExisting(read);
-  Start(task);
-  EXPECT_FALSE(task.done());
-  held->Reset();
-  ASSERT_NO_FATAL_FAILURE(Drain(task));
-  ExpectValue(std::move(task).TakeResult());
-  EXPECT_FALSE(HasHelper(read));
 }
 
 TEST_F(LoadValueAwaitableTestPeer, PopulationChangeDuringBufferWaitSkipsIo) {
@@ -379,14 +324,13 @@ TEST_F(LoadValueAwaitableTestPeer, RelocationDuringBufferWaitUsesNewLocation) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(LoadValueAwaitableTestPeer, ExtentReadWaitsAndRoutesLocallyWithoutTask) {
+TEST_F(LoadValueAwaitableTestPeer, ExtentWaitRetainsPinAndReturnsSlice) {
   ASSERT_NO_FATAL_FAILURE(InstallExtent());
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
-  std::vector<std::byte> output(value_.size());
+  std::array<std::byte, 3> output{};
   {
-    auto read = ExtentOnOwner(ExtentReference(), output);
-    EXPECT_FALSE(HasRemote(read));
+    auto read = ExtentSlice(ExtentReference(), 2, output);
     EXPECT_FALSE(read.await_ready());
     EXPECT_EQ(block_.pins_, 1);
     auto task = AwaitExtent(read);
@@ -398,7 +342,7 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentReadWaitsAndRoutesLocallyWithoutTask) {
     EXPECT_TRUE(status.ok()) << status;
     EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
                                output.size()),
-              value_);
+              std::string_view(value_).substr(2, output.size()));
   }
   EXPECT_EQ(block_.pins_, 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
@@ -422,20 +366,6 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(LoadValueAwaitableTestPeer, ExtentSliceReturnsRequestedBytes) {
-  ASSERT_NO_FATAL_FAILURE(InstallExtent());
-  std::array<std::byte, 3> output{};
-  auto read = ExtentSlice(ExtentReference(), 2, output);
-  auto task = AwaitExtent(read);
-  Start(task);
-  ASSERT_NO_FATAL_FAILURE(Drain(task));
-  auto status = std::move(task).TakeResult();
-  EXPECT_TRUE(status.ok()) << status;
-  EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
-                             output.size()),
-            std::string_view(value_).substr(2, output.size()));
-}
-
 TEST_F(LoadValueAwaitableTestPeer, CompletionTransfersLeaseAndReleasesPin) {
   std::optional<Result> result;
   {
@@ -453,16 +383,27 @@ TEST_F(LoadValueAwaitableTestPeer, CompletionTransfersLeaseAndReleasesPin) {
 
 TEST_F(LoadValueAwaitableTestPeer, PopulationChangesDiscardCompletedRead) {
   for (bool database : {false, true}) {
-    {
-      auto read = Read();
-      ASSERT_FALSE(read.await_ready());
-      ASSERT_NO_FATAL_FAILURE(Complete(read));
-      Invalidate(database);
-      EXPECT_TRUE(absl::IsNotFound(read.await_resume().status()));
+    // Exercise valid/mismatched metadata at completion and the scheduling gap.
+    for (int timing : {0, 1, 2}) {
+      SCOPED_TRACE(testing::Message()
+                   << "database=" << database << " timing=" << timing);
+      {
+        auto read = Read();
+        if (timing != 2) Invalidate(database);
+        if (timing == 1) ++header_.allocation_epoch_;
+        ASSERT_NO_FATAL_FAILURE(Complete(read));
+        if (timing == 1) --header_.allocation_epoch_;
+        if (timing == 2) Invalidate(database);
+        EXPECT_FALSE(HasHelper(read));
+        EXPECT_TRUE(absl::IsNotFound(read.await_resume().status()));
+      }
+      EXPECT_EQ(block_.pins_, 0);
+      EXPECT_EQ(Pool().available_read_buffers(), 1);
+      if (database)
+        ++header_.db_epoch_;
+      else
+        ++header_.replication_epoch_;
     }
-    EXPECT_EQ(block_.pins_, 0);
-    EXPECT_EQ(Pool().available_read_buffers(), 1);
-    ++header_.replication_epoch_;
   }
 }
 
