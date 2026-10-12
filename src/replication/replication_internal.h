@@ -373,15 +373,14 @@ std::vector<std::string_view> SplitWords(std::string_view line);
 
 std::string EncodeRespCommand(std::span<const std::string> args);
 
-TcpStream::WriteAllAwaitable WriteText(TcpStream& stream,
-                                       std::string_view text);
+Task<absl::Status> WriteText(TcpStream& stream, std::string_view text);
 
-TcpStream::WriteAllAwaitable WriteText(TcpStream& stream, const char* text);
+Task<absl::Status> WriteText(TcpStream& stream, const char* text);
 
-// Writes borrow their payload until completion. Force temporary command/reply
-// buffers into a caller-owned local instead of allowing a string_view to
-// outlive them.
-TcpStream::WriteAllAwaitable WriteText(TcpStream&, std::string&&) = delete;
+// A Task starts after the call expression has finished. Force temporary
+// command/reply buffers into a caller-owned local instead of allowing a
+// string_view to outlive them.
+Task<absl::Status> WriteText(TcpStream&, std::string&&) = delete;
 
 std::uint32_t DataFrameCrc32c(std::string_view first,
                               std::string_view second = {}) noexcept;

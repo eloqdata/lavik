@@ -706,12 +706,11 @@ std::uint32_t DataFrameCrc32c(std::string_view first,
   return static_cast<std::uint32_t>(crc);
 }
 
-TcpStream::WriteAllAwaitable WriteText(TcpStream& stream, const char* text) {
+Task<absl::Status> WriteText(TcpStream& stream, const char* text) {
   return WriteText(stream, std::string_view(text));
 }
 
-TcpStream::WriteAllAwaitable WriteText(TcpStream& stream,
-                                       std::string_view text) {
+Task<absl::Status> WriteText(TcpStream& stream, std::string_view text) {
   return stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(text.data()), text.size()));
 }
