@@ -64,9 +64,9 @@ SPDK NVMe namespaces, so capacity scales with storage.
 
 - **NVMe storage, beyond in-memory throughput.**
   In the 10-million-key
-  benchmark, Lavik's peak GET throughput was **3.6% higher than Redis and
-  4.8% higher than Valkey**. Its peak SET throughput was **2.2% higher than
-  Redis and 15.9% higher than Valkey**.
+  benchmark, Lavik v0.1.0's peak GET throughput was **12.5% higher than Redis and
+  18.1% higher than Valkey**. Its peak SET throughput was **2.2% higher than
+  Redis and 20.3% higher than Valkey**.
   See [in-memory comparisons](#in-memory-redis-and-valkey) for full results.
 
 - **Put multiple CPU cores to work in one server.** Worker threads own their
@@ -326,28 +326,27 @@ Valkey holding 1 million keys entirely in memory, with **100 times as much data*
 
 #### 16 vCPUs: 10 million keys
 
-The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#10m-keys--1-kib-in-memory-controls)
+The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 used an AMD EPYC 9V74 server with approximately 126 GiB RAM and
 **10 million keys with 1 KiB values** (about 10 GB). The
-[Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release used SPDK with six raw NVMe
-devices and separately loaded datasets. Redis 8.8.0 and Valkey 9.1.0 held
-the complete dataset in memory. Tests swept 80–1,280 connections with
-pipeline=1 and 30-second measurement windows, selecting each in-memory
-system's best measured I/O-thread setting per command.
+[Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0) release used SPDK
+with six NVMe devices, 16 pinned workers and defrag enabled. Redis 8.10.2
+and Valkey 9.1.2 held the complete dataset in memory. All three systems were
+freshly measured on 2026-10-13 with 80–1,280 connections, pipeline=1 and
+30-second measurement windows. Each Redis/Valkey command uses its best
+measured I/O-thread configuration across the complete connection sweep.
 
-![Lavik SPDK versus tuned in-memory Redis and Valkey](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/memory-qps.svg)
+![Lavik v0.1.0 SPDK with 10M and 1B keys versus Redis 8.10.2 and Valkey 9.1.2](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-qps.svg)
 
-| System | Peak GET QPS | GET p99 | Peak SET QPS | SET p99 |
-|---|---:|---:|---:|---:|
-| Lavik SPDK | 1,012,180 | 3.599 ms | 930,465 | 4.799 ms |
-| Redis 8.8.0 | 976,801 | 4.671 ms | 910,426 | 4.831 ms |
-| Valkey 9.1.0 | 965,697 | 4.543 ms | 802,519 | 4.383 ms |
+For the 10M dataset, Lavik peaked at **1,145,772 GET QPS** and **971,950 SET QPS**,
+both at 1,280 connections. Redis/Valkey had AOF and automatic RDB saves disabled
+with `appendonly no` and `save ""`; their measured writes were memory-only.
 
-Lavik SPDK's GET peak occurred at 640 connections and its SET
-peak at 1,280. Redis and Valkey had AOF and
-automatic RDB saves disabled. Their controls reuse an earlier sweep on the same
-hosts; all Lavik points were measured with the release package. This 10 GB
-test is independent of the larger storage-tier benchmark above.
+The chart also includes Lavik's independently loaded **1B-key, 1TB** group,
+which peaked at **1,069,126 GET QPS** and **817,113 SET QPS**. That group uses
+60-second windows and distinct client seeds, while the 10M group uses
+30-second windows and default client seeds. These are single-run observations;
+the report includes latency charts, configuration differences and run commands.
 
 ## Important notes
 
