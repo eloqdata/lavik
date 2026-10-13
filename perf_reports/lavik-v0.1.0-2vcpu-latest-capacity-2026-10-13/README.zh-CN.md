@@ -140,15 +140,13 @@ NVME_NSID=1
 sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_EAL_ARGS="-a ${NVME_BDF}" BYCORF_DPDK_MEMORY_MB=2048 \
   taskset -c 0-1 "$LAVIK_BIN" \
-  --network=kernel --storage=spdk --bind="$SERVER_IP" --port=6379 \
-  --metrics-port=0 --threads=2 --pin-workers --maxclients=10000 \
-  --busy-poll-us=20 --foreground-budget-us=1000 --background-budget-us=10 \
-  --background-warrant-percent=1 --tomb-raider-interval-ms=0 \
-  --spdk-max-completions-per-poll=16 --spdk-foreground-pre-poll-us=5 \
-  --defrag-max-active-per-device=8 --defrag-sleep-ms=0 \
-  --defrag-record-sleep-us=0 --log-dir="$PWD/lavik-logs" \
+  --storage=spdk --bind="$SERVER_IP" \
+  --tomb-raider-interval-ms=0 --spdk-max-completions-per-poll=16 \
+  --log-dir="$PWD/lavik-logs" \
   --data-file="spdk://${NVME_BDF}/${NVME_NSID}"
 ```
+
+以上省略 v0.1.0 的默认参数；`taskset -c 0-1` 下默认启动两个绑定 CPU 的 worker。`BYCORF_DPDK_MEMORY_MB=2048` 设置 SPDK 使用的 EAL 内存为 2 GiB，网络仍为默认的内核 TCP。保留的调优项将 tombstone 扫描间隔从默认一天改为关闭、SPDK completion cap 从默认 8 改为 16。
 
 Redis 和 Valkey 分别测试 1、2 个 I/O 线程，每次只运行一个服务端：
 

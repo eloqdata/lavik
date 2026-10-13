@@ -140,15 +140,13 @@ NVME_NSID=1
 sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
   env BYCORF_EAL_ARGS="-a ${NVME_BDF}" BYCORF_DPDK_MEMORY_MB=2048 \
   taskset -c 0-1 "$LAVIK_BIN" \
-  --network=kernel --storage=spdk --bind="$SERVER_IP" --port=6379 \
-  --metrics-port=0 --threads=2 --pin-workers --maxclients=10000 \
-  --busy-poll-us=20 --foreground-budget-us=1000 --background-budget-us=10 \
-  --background-warrant-percent=1 --tomb-raider-interval-ms=0 \
-  --spdk-max-completions-per-poll=16 --spdk-foreground-pre-poll-us=5 \
-  --defrag-max-active-per-device=8 --defrag-sleep-ms=0 \
-  --defrag-record-sleep-us=0 --log-dir="$PWD/lavik-logs" \
+  --storage=spdk --bind="$SERVER_IP" \
+  --tomb-raider-interval-ms=0 --spdk-max-completions-per-poll=16 \
+  --log-dir="$PWD/lavik-logs" \
   --data-file="spdk://${NVME_BDF}/${NVME_NSID}"
 ```
+
+The command omits v0.1.0 defaults; under `taskset -c 0-1`, Lavik automatically starts two pinned workers. `BYCORF_DPDK_MEMORY_MB=2048` sets the EAL memory used by SPDK to 2 GiB; networking remains the default kernel TCP. The retained tuning options disable the default daily tombstone sweep and raise the SPDK completion cap from 8 to 16.
 
 Test Redis and Valkey with one and two I/O threads, running only one server at a time:
 
