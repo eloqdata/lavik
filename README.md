@@ -27,7 +27,6 @@ in-memory services.
 
 **Keep the Redis interface. Break the memory-capacity ceiling.**
 
-[![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?style=for-the-badge&logo=cplusplus)](CMakeLists.txt)
 [![Redis Compatible](https://img.shields.io/badge/Redis-Compatible-DC382D?style=for-the-badge&logo=redis&logoColor=white)](tests/valkey/README.md)
 [![Linux](https://img.shields.io/badge/Linux-x86__64%20%7C%20aarch64-FCC624?style=for-the-badge&logo=linux&logoColor=black)](docs/operations/building-and-packaging.md)
 [![NVMe](https://img.shields.io/badge/Storage-io__uring%20%7C%20SPDK-5C2D91?style=for-the-badge)](docs/architecture/04-storage-and-recovery.md)
@@ -55,7 +54,18 @@ SPDK NVMe namespaces, so capacity scales with storage.
 - **Use multiple cores and scale to a cluster.** Parallel workers, replication,
   Redis Cluster routing, and [Prometheus metrics](docs/operations/metrics.md).
 
-## Performance at a glance
+## Benchmark
+
+Browse the [performance reports](perf_reports/README.md) for full results,
+test configurations, and methodology in English and Simplified Chinese.
+
+<a id="in-memory-redis-and-valkey"></a>
+
+### In-memory Redis and Valkey: more data, higher throughput
+
+<a id="performance-at-a-glance"></a>
+
+#### 2 vCPUs
 
 **100× the data, comparable peak throughput—on the same 2-vCPU machine.**
 Lavik v0.1.0 served **100M keys (95.37 GiB of values)** from NVMe on a
@@ -70,9 +80,159 @@ across connection counts.
 · [16-vCPU results](#16-vcpus)
 · [Disk-backed comparisons](#disk-backed-kv-systems)
 
+#### 16 vCPUs
+
+The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
+tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
+Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
+on an Azure Standard_L16aos_v4 VM.
+
+<img src="perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency" width="800">
+
+At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
+peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
+GET was **12.5% faster than Redis and 18.1% faster than Valkey**;
+SET was **2.2% and 20.3% faster**, respectively.
+
+With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
+**817,113 SET QPS**—throughput comparable to Redis and Valkey holding
+10 million keys in memory, with **100 times as much data**.
+
+### Disk-backed KV systems
+
+Our [Redis-compatible storage-tier benchmark](perf_reports/lavik-vs-dragonfly-tiering-2026-08-11/README.md)
+compares Lavik with Garnet, Dragonfly, Pika, Apache Kvrocks,
+Tendis, and KeyDB On Flash. Server and client ran on separate Azure
+`Standard_L16s_v3` VMs. Each backend used two NVMe drives and **200 million
+keys with uniformly random 1–4 KB values**, measured with 80 connections over
+300 seconds per workload, without a QPS limit. Results below are from the
+report's August 12, 2026 rerun.
+
+![Read, mixed, and write throughput across Redis-compatible storage tiers](perf_reports/charts/tiering-throughput.svg)
+
+| System / storage backend | Read-only QPS | Write-only QPS | 1:1 read/write QPS |
+|---|---:|---:|---:|
+| **Lavik SPDK** | **310,387** | **392,284** | **352,442** |
+| **Lavik io_uring — raw devices** | **278,925** | **393,733** | **328,831** |
+| **Lavik io_uring — XFS files** | **272,727** | **385,324** | **326,110** |
+| Garnet Storage Tier | 205,297 | 361,960 | 209,366 |
+| Dragonfly Tiered Storage | 187,653 | 199,234 | 207,248 |
+| Pika | 86,669 | 79,537 | 75,324 |
+| Apache Kvrocks | 70,672 | 110,167 | 88,084 |
+| Tendis | 68,860 | 160,642 | 102,213 |
+| KeyDB On Flash | 6,146 | 5,395 | 5,197 |
+
+Across these read, write, and mixed workloads, **Lavik SPDK delivered
+2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis**. Its read
+throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
+**1.97× and 1.08×**, respectively.
+
+The [1 TB storage-tier test](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#1b-keys--1-kib-storage-tier-controls)
+used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
+drives. The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release with SPDK peaked
+at **952,560 GET QPS**, or **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
+Its **764,939 SET QPS** was **1.42× Dragonfly's and 1.02× Garnet's**.
+These compare each system's highest measured point within its concurrency
+sweep and are separate from the dual-NVMe table above. Lavik SPDK
+used freshly loaded datasets; the controls reuse measurements from an earlier
+sweep on the same hosts. Garnet's post-measurement full key-count scan
+was omitted after its formal tests completed, as documented in the report.
+
+In the August 12 dual-NVMe test, Lavik SPDK's read p99 was **0.455 ms**,
+versus 2.303 ms for Garnet and 2.911 ms for Dragonfly. These results use each system's recorded
+cache, warmup, and persistence settings; uniform random access is unfavorable
+to KeyDB On Flash's hot-tier design. The report documents those differences
+and reproduction commands. Its separate Azure Managed Redis test used a
+different dataset and duration and is excluded from this chart and table.
+
+See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
+covering workloads A/B/C/D and their tail latencies.
+
 ## Installation
 
-### Prerequisites
+### Download a release
+
+Start with a prebuilt package from [Releases](https://github.com/eloqdata/lavik/releases/latest).
+Packages are available for **Linux x86_64 and ARM64 (aarch64)**. Use `minimal`
+for kernel TCP and io_uring, or the standard package for DPDK/SPDK support.
+See [platform requirements](#release-hardware-and-platform-requirements) below;
+both variants require Linux 6.1 or newer with io_uring enabled.
+
+For the minimal v0.1.0 release on Ubuntu 24.04:
+
+```bash
+set -e
+sudo apt-get update
+sudo apt-get install -y curl ca-certificates
+
+VERSION=v0.1.0
+ARCH="$(uname -m)"             # x86_64 or aarch64
+PACKAGE="lavik-${VERSION}-linux-${ARCH}-minimal"
+RELEASE_URL="https://github.com/eloqdata/lavik/releases/download/${VERSION}"
+curl -fLO "${RELEASE_URL}/${PACKAGE}.tar.gz"
+curl -fLO "${RELEASE_URL}/${PACKAGE}.tar.gz.sha256"
+sha256sum --check "${PACKAGE}.tar.gz.sha256"
+tar -xzf "${PACKAGE}.tar.gz"
+sudo install -m 0755 "${PACKAGE}/lavik" "${PACKAGE}/lavik-meta" \
+  "${PACKAGE}/lavik-ctl" /usr/local/bin/
+lavik --version
+```
+
+For DPDK/SPDK, download the package without the `-minimal` suffix and install
+its runtime dependencies (`libnuma1` and `libuuid1` on Ubuntu). See the
+[SPDK storage guide](docs/operations/spdk-storage.md) for device setup.
+Development builds are available from [Nightly](https://github.com/eloqdata/lavik/releases/tag/nightly).
+After installing, continue to [Quick Start](#quick-start).
+
+### Release hardware and platform requirements
+
+| Package | Backends included | x86_64 CPU target | ARM64 CPU target |
+|---|---|---|---|
+| `lavik-<version>-linux-<arch>-minimal.tar.gz` | Kernel TCP and io_uring | Compiler default (`x86-64` with the CI toolchain) | Compiler default |
+| `lavik-<version>-linux-<arch>.tar.gz` | Kernel TCP/io_uring, DPDK networking, and SPDK storage | `x86-64-v2` | `armv8-a+crc` |
+
+Nightly uses `nightly` as the filename version so download URLs stay stable.
+The archive's `VERSION` and `REVISION` files identify the source build.
+Executable names are the same in both variants: `lavik`, `lavik-meta`, and
+`lavik-ctl`. Minimal rejects `--network=dpdk` and `--storage=spdk` with a
+configuration error; `--network=kernel` and `--storage=uring` remain available.
+
+Neither CI variant uses `-march=native`. On x86, the standard package requires
+all x86-64-v2 features, including SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT,
+CMPXCHG16B, and LAHF/SAHF in 64-bit mode. CPUs or VMs lacking any of these
+features must use `minimal`. On ARM64, the standard package additionally
+requires the CRC32 instruction extension. The requirement applies to the
+package even when bypass is not selected at startup.
+
+Prebuilt packages use these CPU targets for portability across supported
+machines. To enable additional CPU optimizations available on your deployment
+machine, [build from source](#build-from-source) there with
+`./scripts/configure_release.sh`, which uses `-march=native`, followed by
+`cmake --build build --parallel`. Performance gains
+depend on the workload and toolchain; the resulting binaries may not run on
+CPUs with fewer instruction-set features.
+
+Both variants require **Linux 6.1 or newer** with usable io_uring for `lavik`
+and `lavik-meta`, including when DPDK/SPDK is selected. Worker initialization
+requires `IORING_SETUP_DEFER_TASKRUN`, introduced in Linux 6.1, with no fallback
+to older kernels. This is the API compatibility floor, not a tested-kernel
+matrix; see [Kernel requirements](docs/operations/building-and-packaging.md#kernel-requirements).
+CI builds on Ubuntu 24.04; artifacts also require a compatible glibc and are
+not intended for older glibc environments.
+The standard package additionally needs the NUMA and UUID runtime libraries
+(`libnuma1` and `libuuid1` on Ubuntu). It defaults to kernel TCP/io_uring;
+DPDK/SPDK must be explicitly selected and provisioned. Its bundled DPDK network
+drivers are TAP, ring, and virtio, so it does not support every physical NIC.
+SPDK mode requires an SPDK-accessible NVMe device. Follow the
+[SPDK storage guide](docs/operations/spdk-storage.md) for device binding,
+hugepage setup, a release-package launch command, and host restoration.
+
+See [Building and packaging](docs/operations/building-and-packaging.md)
+for dependency setup, standard-package builds, and compatibility details.
+
+### Build from source
+
+#### Build prerequisites
 
 The standard io_uring build requires:
 
@@ -89,7 +249,7 @@ sudo apt-get update
 sudo apt-get install -y git
 ```
 
-### Build from source
+#### Compile and install
 
 ```bash
 git clone https://github.com/eloqdata/lavik.git
@@ -143,52 +303,6 @@ x86_64 and ARM64. Download the four archives and their SHA-256 files from
 updated after successful builds of the latest main. CI artifacts are also
 retained for 30 days.
 
-### Release hardware and platform requirements
-
-| Package | Backends included | x86_64 CPU target | ARM64 CPU target |
-|---|---|---|---|
-| `lavik-<version>-linux-<arch>-minimal.tar.gz` | Kernel TCP and io_uring | Compiler default (`x86-64` with the CI toolchain) | Compiler default |
-| `lavik-<version>-linux-<arch>.tar.gz` | Kernel TCP/io_uring, DPDK networking, and SPDK storage | `x86-64-v2` | `armv8-a+crc` |
-
-Nightly uses `nightly` as the filename version so download URLs stay stable.
-The archive's `VERSION` and `REVISION` files identify the source build.
-Executable names are the same in both variants: `lavik`, `lavik-meta`, and
-`lavik-ctl`. Minimal rejects `--network=dpdk` and `--storage=spdk` with a
-configuration error; `--network=kernel` and `--storage=uring` remain available.
-
-Neither CI variant uses `-march=native`. On x86, the standard package requires
-all x86-64-v2 features, including SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT,
-CMPXCHG16B, and LAHF/SAHF in 64-bit mode. CPUs or VMs lacking any of these
-features must use `minimal`. On ARM64, the standard package additionally
-requires the CRC32 instruction extension. The requirement applies to the
-package even when bypass is not selected at startup.
-
-Prebuilt packages use these CPU targets for portability across supported
-machines. To enable additional CPU optimizations available on your deployment
-machine, [build from source](#build-from-source) there with
-`./scripts/configure_release.sh`, which uses `-march=native`, followed by
-`cmake --build build --parallel`. Performance gains
-depend on the workload and toolchain; the resulting binaries may not run on
-CPUs with fewer instruction-set features.
-
-Both variants require **Linux 6.1 or newer** with usable io_uring for `lavik`
-and `lavik-meta`, including when DPDK/SPDK is selected. Worker initialization
-requires `IORING_SETUP_DEFER_TASKRUN`, introduced in Linux 6.1, with no fallback
-to older kernels. This is the API compatibility floor, not a tested-kernel
-matrix; see [Kernel requirements](docs/operations/building-and-packaging.md#kernel-requirements).
-CI builds on Ubuntu 24.04; artifacts also require a compatible glibc and are
-not intended for older glibc environments.
-The standard package additionally needs the NUMA and UUID runtime libraries
-(`libnuma1` and `libuuid1` on Ubuntu). It defaults to kernel TCP/io_uring;
-DPDK/SPDK must be explicitly selected and provisioned. Its bundled DPDK network
-drivers are TAP, ring, and virtio, so it does not support every physical NIC.
-SPDK mode requires an SPDK-accessible NVMe device. Follow the
-[SPDK storage guide](docs/operations/spdk-storage.md) for device binding,
-hugepage setup, a release-package launch command, and host restoration.
-
-See [Building and packaging](docs/operations/building-and-packaging.md)
-for dependency setup, standard-package builds, and compatibility details.
-
 ## Quick Start
 
 For deployment beyond the basic example below:
@@ -204,7 +318,7 @@ For a throwaway local instance, provision a file and start the server:
 mkdir -p /tmp/lavik-quickstart
 fallocate -l 1G /tmp/lavik-quickstart/lavik.data
 
-./build/lavik \
+lavik \
   --data-file /tmp/lavik-quickstart/lavik.data
 ```
 
@@ -226,99 +340,6 @@ redis-cli HGETALL user:42
 
 Stop the server with `Ctrl-C`. See [Multi-Device Storage](docs/operations/multi-device-storage.md)
 for persistent files, raw devices, and storage expansion.
-
-## Benchmark
-
-**Lavik delivers multi-fold throughput gains over several disk-backed KV
-systems.** The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) benchmarks compare
-throughput and tail latency against Redis, Valkey, Dragonfly, and Garnet.
-
-Browse the [performance reports](perf_reports/README.md) for full results in
-English and Simplified Chinese.
-
-### Disk-backed KV systems
-
-Our [Redis-compatible storage-tier benchmark](perf_reports/lavik-vs-dragonfly-tiering-2026-08-11/README.md)
-compares Lavik with Garnet, Dragonfly, Pika, Apache Kvrocks,
-Tendis, and KeyDB On Flash. Server and client ran on separate Azure
-`Standard_L16s_v3` VMs. Each backend used two NVMe drives and **200 million
-keys with uniformly random 1–4 KB values**, measured with 80 connections over
-300 seconds per workload, without a QPS limit. Results below are from the
-report's August 12, 2026 rerun.
-
-![Read, mixed, and write throughput across Redis-compatible storage tiers](perf_reports/charts/tiering-throughput.svg)
-
-| System / storage backend | Read-only QPS | Write-only QPS | 1:1 read/write QPS |
-|---|---:|---:|---:|
-| **Lavik SPDK** | **310,387** | **392,284** | **352,442** |
-| **Lavik io_uring — raw devices** | **278,925** | **393,733** | **328,831** |
-| **Lavik io_uring — XFS files** | **272,727** | **385,324** | **326,110** |
-| Garnet Storage Tier | 205,297 | 361,960 | 209,366 |
-| Dragonfly Tiered Storage | 187,653 | 199,234 | 207,248 |
-| Pika | 86,669 | 79,537 | 75,324 |
-| Apache Kvrocks | 70,672 | 110,167 | 88,084 |
-| Tendis | 68,860 | 160,642 | 102,213 |
-| KeyDB On Flash | 6,146 | 5,395 | 5,197 |
-
-Across these read, write, and mixed workloads, **Lavik SPDK delivered
-2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis**. Its read
-throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
-**1.97× and 1.08×**, respectively.
-
-The [1 TB storage-tier test](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#1b-keys--1-kib-storage-tier-controls)
-used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
-drives. The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release with SPDK peaked
-at **952,560 GET QPS**, or **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
-Its **764,939 SET QPS** was **1.42× Dragonfly's and 1.02× Garnet's**.
-These compare each system's highest measured point within its concurrency
-sweep and are separate from the dual-NVMe table above. Lavik SPDK
-used freshly loaded datasets; the controls reuse measurements from an earlier
-sweep on the same hosts. Garnet's post-measurement full key-count scan
-was omitted after its formal tests completed, as documented in the report.
-
-In the August 12 dual-NVMe test, Lavik SPDK's read p99 was **0.455 ms**,
-versus 2.303 ms for Garnet and 2.911 ms for Dragonfly. These results use each system's recorded
-cache, warmup, and persistence settings; uniform random access is unfavorable
-to KeyDB On Flash's hot-tier design. The report documents those differences
-and reproduction commands. Its separate Azure Managed Redis test used a
-different dataset and duration and is excluded from this chart and table.
-
-See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
-covering workloads A/B/C/D and their tail latencies.
-
-<a id="in-memory-redis-and-valkey"></a>
-
-### In-memory Redis and Valkey: more data, higher throughput
-
-#### 2 vCPUs
-
-The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
-compares Lavik v0.1.0 with Redis 8.10.2 and Valkey 9.1.2 on the same Azure
-L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**, using 1 KiB values.
-
-See the [throughput and tail-latency chart above](#performance-at-a-glance).
-
-Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
-**215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
-Valkey holding 1 million keys entirely in memory, with **100 times as much data**.
-
-#### 16 vCPUs
-
-The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
-tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
-Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
-on an Azure Standard_L16aos_v4 VM.
-
-<img src="perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency" width="800">
-
-At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
-peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
-GET was **12.5% faster than Redis and 18.1% faster than Valkey**;
-SET was **2.2% and 20.3% faster**, respectively.
-
-With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
-**817,113 SET QPS**—throughput comparable to Redis and Valkey holding
-10 million keys in memory, with **100 times as much data**.
 
 ## Compatibility and operational notes
 
