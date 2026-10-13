@@ -324,6 +324,8 @@ L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**, using 1 KiB values.
 
 ![2 vCPUs: Lavik with 1M and 100M keys versus Redis and Valkey with 1M keys](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/throughput.svg)
 
+![2 vCPUs: GET and SET p99.9 latency](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/latency.svg)
+
 Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
 **215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
 Valkey holding 1 million keys entirely in memory, with **100 times as much data**.
@@ -336,6 +338,8 @@ Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
 on an Azure Standard_L16aos_v4 VM.
 
 ![16 vCPUs: Lavik with 10M and 1B keys versus Redis and Valkey with 10M keys](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-qps.svg)
+
+![16 vCPUs: GET and SET p99.9 latency](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-p999.svg)
 
 At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
 peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
