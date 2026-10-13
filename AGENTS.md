@@ -33,6 +33,9 @@ limitations under the License.
 
 ## Repository documentation
 
+- When documenting tests or benchmarks, omit parameters that match the tested
+  version's defaults from report prose and run commands. Record only non-default
+  settings; verify defaults against the tested version before omitting them.
 - Operations: before changing build or packaging, metrics and monitoring,
   storage provisioning or maintenance, or IRQ tuning, read the
   [operations index](docs/operations/README.md) and the relevant linked guide.
