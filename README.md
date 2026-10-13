@@ -314,7 +314,7 @@ covering workloads A/B/C/D and their tail latencies.
 
 ### In-memory Redis and Valkey
 
-#### 2 vCPUs: 1 million and 100 million keys
+#### 2 vCPUs: 100× more data, comparable throughput
 
 The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 ([简体中文](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md))
