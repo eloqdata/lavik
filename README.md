@@ -324,7 +324,7 @@ Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
 **215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
 Valkey holding 1 million keys entirely in memory, with **100 times as much data**.
 
-#### 16 vCPUs: 10 million keys
+#### 16 vCPUs: 100× more data, comparable throughput
 
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
@@ -334,8 +334,9 @@ on an Azure Standard_L16aos_v4 VM.
 ![Lavik v0.1.0 SPDK with 10M and 1B keys versus Redis 8.10.2 and Valkey 9.1.2](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-qps.svg)
 
 For the 10M dataset, Lavik peaked at **1,145,772 GET QPS** and **971,950 SET QPS**.
-The chart also includes Lavik's **1B-key, 1TB** dataset, which peaked at
-**1,069,126 GET QPS** and **817,113 SET QPS**.
+With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
+**817,113 SET QPS**—throughput comparable to Redis and Valkey holding
+10 million keys in memory, with **100 times as much data**.
 
 ## Important notes
 
