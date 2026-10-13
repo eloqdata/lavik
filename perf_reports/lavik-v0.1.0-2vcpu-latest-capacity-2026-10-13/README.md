@@ -10,16 +10,16 @@ Test date: 2026-10-13. All four curves are freshly measured on the same Azure L2
 
 At 100M keys, Lavik reached peak GET / SET rates of 215,463 / 195,879 ops/s, retaining 100.0% / 95.2% of its 1M-key peaks. These are independently selected peak points at potentially different loads; matched-concurrency results follow below.
 
-| Command | Product / keys | Workers or IO threads | Peak connections | Peak ops/s | p99.9 at peak (ms) |
-|---|---|---|---|---|---|
-| GET | Lavik 0.1.0 / 1M | 2 | 160 | 215,521 | 1.239 |
-| GET | Lavik 0.1.0 / 100M | 2 | 320 | 215,463 | 2.495 |
-| GET | Redis 8.10.2 / 1M | 2 | 640 | 199,444 | 6.815 |
-| GET | Valkey 9.1.2 / 1M | 2 | 160 | 226,514 | 1.231 |
-| SET | Lavik 0.1.0 / 1M | 2 | 640 | 205,820 | 9.279 |
-| SET | Lavik 0.1.0 / 100M | 2 | 640 | 195,879 | 10.495 |
-| SET | Redis 8.10.2 / 1M | 2 | 320 | 176,491 | 2.863 |
-| SET | Valkey 9.1.2 / 1M | 2 | 160 | 193,305 | 1.279 |
+| Command | Product / keys | Workers or IO threads | Peak connections | Peak ops/s |
+|---|---|---|---|---|
+| GET | Lavik 0.1.0 / 1M | 2 | 160 | 215,521 |
+| GET | Lavik 0.1.0 / 100M | 2 | 320 | 215,463 |
+| GET | Redis 8.10.2 / 1M | 2 | 640 | 199,444 |
+| GET | Valkey 9.1.2 / 1M | 2 | 160 | 226,514 |
+| SET | Lavik 0.1.0 / 1M | 2 | 640 | 205,820 |
+| SET | Lavik 0.1.0 / 100M | 2 | 640 | 195,879 |
+| SET | Redis 8.10.2 / 1M | 2 | 320 | 176,491 |
+| SET | Valkey 9.1.2 / 1M | 2 | 160 | 193,305 |
 
 Redis and Valkey each test IO=1 and IO=2. For each command, the main plot uses the setting with the higher peak and shows its entire sweep; it does not splice settings point by point. Both Lavik datasets use two workers.
 
