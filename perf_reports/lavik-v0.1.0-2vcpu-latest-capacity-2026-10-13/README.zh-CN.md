@@ -226,4 +226,4 @@ done
 check_data
 ```
 
-每组结束后检查 GET 全部命中、连接错误为零，且 DBSIZE 保持不变。汇总结果见 [results.csv](results.csv)。
+每组结束后检查 GET 全部命中、连接错误为零，且 DBSIZE 保持不变。

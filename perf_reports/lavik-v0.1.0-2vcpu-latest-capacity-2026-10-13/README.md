@@ -226,4 +226,4 @@ done
 check_data
 ```
 
-After each configuration, check that all GETs hit, connection errors are zero, and DBSIZE is unchanged. Summary measurements are in [results.csv](results.csv).
+After each configuration, check that all GETs hit, connection errors are zero, and DBSIZE is unchanged.
