@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <memory>
+
 #include "impl.h"
 #include "lavik/fault_pause.h"
 
@@ -358,7 +360,13 @@ void StorageEngine::Impl::QueueDetachedIndex(WorkerStore& store,
 Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     WorkerStore& store) {
   while (!store.detached_indexes_.empty()) {
-    DetachedIndex detached = std::move(store.detached_indexes_.front());
+    // RecordIndex contains cache-line-aligned reader state. Keep the detached
+    // object out of the coroutine frame: Task's frame pool only guarantees
+    // max_align_t alignment. Aligned new preserves the index's alignment and
+    // unique ownership keeps it alive across the reclamation awaits.
+    auto detached_owner = std::make_unique<DetachedIndex>(
+        std::move(store.detached_indexes_.front()));
+    DetachedIndex& detached = *detached_owner;
     store.detached_indexes_.pop_front();
 
     struct BlockDelta {
