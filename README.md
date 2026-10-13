@@ -48,53 +48,31 @@ SPDK NVMe namespaces, so capacity scales with storage.
 
 ## Highlights
 
-- **Grow your dataset beyond RAM.** Keep a compact key index in memory and put
-  the data on NVMe. Lavik serves datasets with hundreds of millions of keys
-  without requiring every value to fit in DRAM, making storage capacity the
-  main lever for dataset growth. Deploy on preallocated files, raw block
-  devices, or directly on NVMe through SPDK.
+- **Grow beyond RAM.** Keep a compact key index in memory and values on NVMe;
+  serve hundreds of millions of keys from files, raw devices, or SPDK storage.
+- **In-memory-class throughput.** With 10M keys, Lavik v0.1.0 reached
+  **1.15M GET QPS** and **972K SET QPS**, exceeding Redis and Valkey's peak
+  throughput in that test. See [full results](#in-memory-redis-and-valkey).
+- **Keep your Redis tools.** RESP2/RESP3, familiar data structures, Lua,
+  transactions, Pub/Sub, authentication, TLS, and RDB import/export.
+- **Use multiple cores and scale to a cluster.** Parallel workers, atomic
+  cross-worker operations, replication, Redis Cluster routing, and
+  [Prometheus metrics](docs/operations/metrics.md).
 
-- **Multiples of the throughput of disk-backed alternatives.** In the
-  **one-billion-key, 1 TB** test, [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) reached **952,560 GET QPS**:
-  **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
-  In the broader 200-million-key comparison, Lavik SPDK delivered
-  **2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis** across
-  the tested read, write, and mixed workloads.
-  See [disk-backed comparisons](#disk-backed-kv-systems).
+## Performance at a glance
 
-- **NVMe storage, beyond in-memory throughput.**
-  In the 10-million-key
-  benchmark, Lavik v0.1.0's peak GET throughput was **12.5% higher than Redis and
-  18.1% higher than Valkey**. Its peak SET throughput was **2.2% higher than
-  Redis and 20.3% higher than Valkey**.
-  See [in-memory comparisons](#in-memory-redis-and-valkey) for full results.
+**100× the data, comparable peak throughput—on the same 2-vCPU machine.**
+Lavik v0.1.0 served **100M keys (95.37 GiB of values)** from NVMe on a
+**2-vCPU / 16-GiB** Azure VM, reaching **215K GET ops/s and 196K SET ops/s**.
+Redis 8.10.2 and Valkey 9.1.2 held **1M keys** in memory on the same VM;
+all values were **1 KiB**. The chart shows throughput and p99.9 latency
+across connection counts.
 
-- **Put multiple CPU cores to work in one server.** Worker threads own their
-  data partitions and execute requests in parallel. A C++23 coroutine runtime
-  overlaps network and storage I/O, while CPU affinity and asynchronous
-  io_uring access keep the serving path tuned for modern multicore NVMe hosts.
-  The [startup tuning script](docs/operations/quick-start-tuning.md) generates
-  a CPU plan for your machine.
+<img src="perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
 
-- **Keep the Redis tools and data structures you know.** Use RESP2/RESP3
-  clients with Strings, Lists, Hashes, Sets, Sorted Sets, and Streams. Build
-  application logic with pipelining, Pub/Sub, Lua scripts, and Functions;
-  connect with authentication and TLS. Redis-compatible RDB import/export and
-  PSYNC replication provide migration paths for existing data, with
-  compatibility exercised by the vendored Valkey test suites.
-
-- **Atomic operations across worker partitions.** Multi-key commands,
-  `MULTI`/`EXEC`, `WATCH`, and declared-key Lua/Function calls coordinate access
-  across workers inside a node. Applications can combine related changes
-  atomically while the server processes independent work in parallel. Cluster
-  mode retains Redis Cluster's same-slot requirement for multi-key commands.
-
-- **From a local process to a replicated cluster.** Redis Cluster routing,
-  native replication, and a Raft-backed Meta control plane provide partitioned
-  serving and coordinated failover. Prometheus metrics, `INFO`, and `SLOWLOG`
-  expose operational health through familiar tools. The
-  [cluster quick start](docs/operations/cluster-deployment.md) launches three
-  Meta nodes and two primary/replica groups with one bootstrap command.
+[2-vCPU test details and methodology](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
+· [16-vCPU results](#16-vcpus)
+· [Disk-backed comparisons](#disk-backed-kv-systems)
 
 ## Installation
 
@@ -322,7 +300,7 @@ The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-
 compares Lavik v0.1.0 with Redis 8.10.2 and Valkey 9.1.2 on the same Azure
 L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**, using 1 KiB values.
 
-<img src="perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency" width="800">
+See the [throughput and tail-latency chart above](#performance-at-a-glance).
 
 Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
 **215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
