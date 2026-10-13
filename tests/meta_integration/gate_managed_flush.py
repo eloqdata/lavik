@@ -700,8 +700,22 @@ def replication_recovery(root, full=False):
                         hold.unlink(missing_ok=True)
         finally:
             failure.unlink(missing_ok=True)
-        for i in range(64):
-            assert writer.call("SET", f"new-{i}", "new") == "OK"
+
+        def write_after_recovery():
+            # History invalidation reconnects Meta and retires ordinary clients.
+            # Even a fresh socket can race that sweep. Retry these idempotent
+            # writes on a new connection until authority is usable again.
+            recovered = Client(source)
+            try:
+                for i in range(64):
+                    assert recovered.call("SET", f"new-{i}", "new") == "OK"
+                return True
+            finally:
+                recovered.close()
+
+        H.wait_until(
+            "post-flush writes survive source recovery", 30, write_after_recovery
+        )
 
         def matches():
             reader = Client(target)
