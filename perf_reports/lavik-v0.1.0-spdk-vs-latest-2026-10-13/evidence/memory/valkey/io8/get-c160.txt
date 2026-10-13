@@ -1,93 +1,0 @@
-============== Configuration values: ==============
-server = 10.84.1.4
-port = 6379
-uri = 
-unix socket = (null)
-address family = Unspecified
-protocol = redis
-tls = no
-cert = (null)
-key = (null)
-cacert = (null)
-tls_skip_verify = no
-sni = (null)
-out_file = (null)
-client_stats = (null)
-run_count = 1
-debug = 0
-requests = 0
-rate_limit = 0
-clients = 10
-threads = 16
-test_time = 30
-ratio = 1:10
-pipeline = 1
-transaction = no
-data_size = 1024
-data_offset = 0
-random_data = no
-data_size_range = 0-0
-data_size_list = 
-data_size_pattern = R
-expiry_range = 0-0
-data_import = (null)
-data_verify = no
-verify_only = no
-generate_keys = no
-key_prefix = 
-key_minimum = 1
-key_maximum = 10000000
-key_pattern = R:R
-key_stddev = 0.000000
-key_median = 0.000000
-reconnect_interval = 0
-retry_on_error = no
-max_retries = -1
-retry_backoff_ms = 0
-retry_backoff_factor = 0.000000
-retry_on = 
-max_retry_queue = 0
-failed_keys_file = 
-connection_timeout = 0
-connection_stage_timeout = 30
-thread_conn_start_min_jitter_micros = 0
-thread_conn_start_max_jitter_micros = 0
-multi_key_get = 0
-authenticate = 
-select-db = 0
-no-expiry = no
-wait-ratio = 0:0
-num-slaves = 0-0
-wait-timeout = 0-0
-json-out-file = /opt/benchmark/release010-latest/suite/memory/valkey/io8/get-c160.json
-print-all-runs = no
-prometheus-port = -1
-prometheus-bind-addr = 127.0.0.1
-prometheus-run-labels = 
-prometheus-latency-buckets = default
-===================================================
-Json file /opt/benchmark/release010-latest/suite/memory/valkey/io8/get-c160.json created...
-Writing results to stdout
-[RUN #1] Preparing benchmark client...
-[RUN #1] Launching threads now...
-[RUN #1 3%,   0 secs] 16 threads 10 conns:      675817 ops,  676024 (avg:  676024) ops/sec, 682.68MB/sec (avg: 682.68MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 7%,   1 secs] 16 threads 10 conns:     1356227 ops,  680321 (avg:  678173) ops/sec, 687.01MB/sec (avg: 684.85MB/sec),  0.23 (avg:  0.24) msec latency[RUN #1 10%,   2 secs] 16 threads 10 conns:     2034299 ops,  677977 (avg:  678108) ops/sec, 684.65MB/sec (avg: 684.78MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 13%,   4 secs] 16 threads 10 conns:     2703881 ops,  669498 (avg:  675955) ops/sec, 676.09MB/sec (avg: 682.61MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 17%,   5 secs] 16 threads 10 conns:     3377287 ops,  673313 (avg:  675427) ops/sec, 679.94MB/sec (avg: 682.07MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 20%,   6 secs] 16 threads 10 conns:     4048179 ops,  670793 (avg:  674654) ops/sec, 677.39MB/sec (avg: 681.29MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 23%,   7 secs] 16 threads 10 conns:     4716075 ops,  667809 (avg:  673676) ops/sec, 674.38MB/sec (avg: 680.31MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 27%,   8 secs] 16 threads 10 conns:     5384754 ops,  668600 (avg:  673042) ops/sec, 675.18MB/sec (avg: 679.66MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 30%,   9 secs] 16 threads 10 conns:     6047802 ops,  662959 (avg:  671921) ops/sec, 669.48MB/sec (avg: 678.53MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 33%,  10 secs] 16 threads 10 conns:     6716172 ops,  668278 (avg:  671557) ops/sec, 674.85MB/sec (avg: 678.16MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 37%,  11 secs] 16 threads 10 conns:     7388344 ops,  671918 (avg:  671590) ops/sec, 678.52MB/sec (avg: 678.20MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 40%,  12 secs] 16 threads 10 conns:     8054929 ops,  666489 (avg:  671165) ops/sec, 673.04MB/sec (avg: 677.77MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 43%,  13 secs] 16 threads 10 conns:     8720089 ops,  665066 (avg:  670696) ops/sec, 671.61MB/sec (avg: 677.29MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 47%,  14 secs] 16 threads 10 conns:     9383066 ops,  662865 (avg:  670136) ops/sec, 669.38MB/sec (avg: 676.73MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 50%,  15 secs] 16 threads 10 conns:    10049118 ops,  665955 (avg:  669857) ops/sec, 672.50MB/sec (avg: 676.45MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 53%,  16 secs] 16 threads 10 conns:    10710604 ops,  661320 (avg:  669324) ops/sec, 667.82MB/sec (avg: 675.91MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 57%,  17 secs] 16 threads 10 conns:    11370305 ops,  659486 (avg:  668745) ops/sec, 665.97MB/sec (avg: 675.32MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 60%,  18 secs] 16 threads 10 conns:    12034664 ops,  664272 (avg:  668496) ops/sec, 670.81MB/sec (avg: 675.07MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 63%,  19 secs] 16 threads 10 conns:    12695646 ops,  660896 (avg:  668096) ops/sec, 667.40MB/sec (avg: 674.67MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 67%,  20 secs] 16 threads 10 conns:    13359370 ops,  663527 (avg:  667868) ops/sec, 670.05MB/sec (avg: 674.44MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 70%,  21 secs] 16 threads 10 conns:    14018683 ops,  659220 (avg:  667456) ops/sec, 665.70MB/sec (avg: 674.02MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 73%,  22 secs] 16 threads 10 conns:    14684952 ops,  666170 (avg:  667398) ops/sec, 672.72MB/sec (avg: 673.96MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 77%,  23 secs] 16 threads 10 conns:    15347771 ops,  662742 (avg:  667195) ops/sec, 669.26MB/sec (avg: 673.76MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 80%,  24 secs] 16 threads 10 conns:    16011581 ops,  663654 (avg:  667048) ops/sec, 670.18MB/sec (avg: 673.61MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 83%,  25 secs] 16 threads 10 conns:    16672667 ops,  660964 (avg:  666804) ops/sec, 667.46MB/sec (avg: 673.36MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 87%,  26 secs] 16 threads 10 conns:    17333970 ops,  661207 (avg:  666589) ops/sec, 667.71MB/sec (avg: 673.15MB/sec),  0.24 (avg:  0.24) msec latency[RUN #1 90%,  27 secs] 16 threads 10 conns:    17981968 ops,  647886 (avg:  665896) ops/sec, 654.26MB/sec (avg: 672.45MB/sec),  0.25 (avg:  0.24) msec latency[RUN #1 93%,  28 secs] 16 threads 10 conns:    18629040 ops,  646959 (avg:  665220) ops/sec, 653.32MB/sec (avg: 671.76MB/sec),  0.25 (avg:  0.24) msec latency[RUN #1 97%,  29 secs] 16 threads 10 conns:    19273983 ops,  644888 (avg:  664519) ops/sec, 651.23MB/sec (avg: 671.06MB/sec),  0.25 (avg:  0.24) msec latency[RUN #1 100%,  30 secs] 12 threads 10 conns:    19919520 ops,  644888 (avg:  663967) ops/sec, 651.23MB/sec (avg: 670.50MB/sec),  0.25 (avg:  0.24) msec latency[RUN #1 100%,  30 secs]  0 threads 10 conns:    19919877 ops,  644888 (avg:  663973) ops/sec, 651.23MB/sec (avg: 670.50MB/sec),  0.25 (avg:  0.24) msec latency
-
-
-CPU Utilization Summary
-  Total CPU time:   296.657s  (user 52.647s, sys 244.010s)
-  Wall time:        30.008s
-  Cores used:       9.886   (avg 61.8% across 16 worker threads)
-  Peak utilization: 1020.8%
-16        Threads
-10        Connections per thread
-30        Seconds
-
-
-ALL STATS
-============================================================================================================================================
-Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
---------------------------------------------------------------------------------------------------------------------------------------------
-Gets       663980.38    663980.38         0.00         0.24072         0.22300         0.55100         0.79100         1.40700    686603.19 
-Totals     663980.38    663980.38         0.00         0.24072         0.22300         0.55100         0.79100         1.40700   1373206.39 
-Saving JSON output file: /opt/benchmark/release010-latest/suite/memory/valkey/io8/get-c160.json
-Json file closed.

@@ -1,93 +1,0 @@
-============== Configuration values: ==============
-server = 10.84.1.4
-port = 6379
-uri = 
-unix socket = (null)
-address family = Unspecified
-protocol = redis
-tls = no
-cert = (null)
-key = (null)
-cacert = (null)
-tls_skip_verify = no
-sni = (null)
-out_file = (null)
-client_stats = (null)
-run_count = 1
-debug = 0
-requests = 0
-rate_limit = 0
-clients = 40
-threads = 16
-test_time = 10
-ratio = 1:10
-pipeline = 1
-transaction = no
-data_size = 1024
-data_offset = 0
-random_data = no
-data_size_range = 0-0
-data_size_list = 
-data_size_pattern = R
-expiry_range = 0-0
-data_import = (null)
-data_verify = no
-verify_only = no
-generate_keys = no
-key_prefix = 
-key_minimum = 1
-key_maximum = 10000000
-key_pattern = R:R
-key_stddev = 0.000000
-key_median = 0.000000
-reconnect_interval = 0
-retry_on_error = no
-max_retries = -1
-retry_backoff_ms = 0
-retry_backoff_factor = 0.000000
-retry_on = 
-max_retry_queue = 0
-failed_keys_file = 
-connection_timeout = 0
-connection_stage_timeout = 30
-thread_conn_start_min_jitter_micros = 0
-thread_conn_start_max_jitter_micros = 0
-multi_key_get = 0
-authenticate = 
-select-db = 0
-no-expiry = no
-wait-ratio = 0:0
-num-slaves = 0-0
-wait-timeout = 0-0
-json-out-file = /opt/benchmark/release010-latest/suite/memory/valkey/io16/warmup.json
-print-all-runs = no
-prometheus-port = -1
-prometheus-bind-addr = 127.0.0.1
-prometheus-run-labels = 
-prometheus-latency-buckets = default
-===================================================
-Json file /opt/benchmark/release010-latest/suite/memory/valkey/io16/warmup.json created...
-Writing results to stdout
-[RUN #1] Preparing benchmark client...
-[RUN #1] Launching threads now...
-[RUN #1 10%,   1 secs] 16 threads 40 conns:      345187 ops,  342881 (avg:  342881) ops/sec, 346.25MB/sec (avg: 346.25MB/sec),  1.86 (avg:  1.86) msec latency[RUN #1 20%,   2 secs] 16 threads 40 conns:     1181999 ops,  836642 (avg:  588959) ops/sec, 844.88MB/sec (avg: 594.76MB/sec),  0.77 (avg:  1.08) msec latency[RUN #1 30%,   3 secs] 16 threads 40 conns:     2128882 ops,  946696 (avg:  707946) ops/sec, 956.02MB/sec (avg: 714.91MB/sec),  0.67 (avg:  0.90) msec latency[RUN #1 40%,   4 secs] 16 threads 40 conns:     3094695 ops,  965619 (avg:  772259) ops/sec, 975.12MB/sec (avg: 779.86MB/sec),  0.66 (avg:  0.83) msec latency[RUN #1 50%,   5 secs] 16 threads 40 conns:     4026982 ops,  932122 (avg:  804190) ops/sec, 941.29MB/sec (avg: 812.10MB/sec),  0.69 (avg:  0.79) msec latency[RUN #1 60%,   6 secs] 16 threads 40 conns:     4978329 ops,  951171 (avg:  828660) ops/sec, 960.53MB/sec (avg: 836.81MB/sec),  0.67 (avg:  0.77) msec latency[RUN #1 70%,   7 secs] 16 threads 40 conns:     5893778 ops,  915281 (avg:  841022) ops/sec, 924.28MB/sec (avg: 849.30MB/sec),  0.70 (avg:  0.76) msec latency[RUN #1 80%,   8 secs] 16 threads 40 conns:     6814298 ops,  920284 (avg:  850923) ops/sec, 929.33MB/sec (avg: 859.29MB/sec),  0.69 (avg:  0.75) msec latency[RUN #1 90%,   9 secs] 16 threads 40 conns:     7741954 ops,  927388 (avg:  859413) ops/sec, 936.51MB/sec (avg: 867.87MB/sec),  0.69 (avg:  0.74) msec latency[RUN #1 100%,  10 secs]  4 threads 40 conns:     8633757 ops,  927388 (avg:  863010) ops/sec, 936.51MB/sec (avg: 871.50MB/sec),  0.69 (avg:  0.74) msec latency[RUN #1 100%,  10 secs]  0 threads 40 conns:     8633801 ops,  927388 (avg:  863007) ops/sec, 936.51MB/sec (avg: 871.50MB/sec),  0.69 (avg:  0.74) msec latency
-
-
-CPU Utilization Summary
-  Total CPU time:   120.150s  (user 21.730s, sys 98.420s)
-  Wall time:        10.012s
-  Cores used:       12.001   (avg 75.0% across 16 worker threads)
-  Peak utilization: 1328.5%
-16        Threads
-40        Connections per thread
-10        Seconds
-
-
-ALL STATS
-============================================================================================================================================
-Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
---------------------------------------------------------------------------------------------------------------------------------------------
-Gets       863071.64    863071.64         0.00         0.74115         0.57500         3.96700         5.15100         8.44700    892480.17 
-Totals     863071.64    863071.64         0.00         0.74115         0.57500         3.96700         5.15100         8.44700   1784960.35 
-Saving JSON output file: /opt/benchmark/release010-latest/suite/memory/valkey/io16/warmup.json
-Json file closed.

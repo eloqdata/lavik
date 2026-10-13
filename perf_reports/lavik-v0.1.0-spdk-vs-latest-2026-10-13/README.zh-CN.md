@@ -8,13 +8,13 @@
 
 ## 吞吐对比：Lavik 10M / 1B 与 Redis / Valkey
 
-![Lavik 10M / 1B, Redis and Valkey throughput](combined-qps.png)
+![Lavik 10M / 1B, Redis and Valkey throughput](combined-qps.svg)
 
 四组均展示 80–1280 连接。10M 组每点 30 秒，使用默认客户端随机种子；1B 组每点 60 秒，使用独立客户端随机种子。数据规模、时长及随机种子设置存在差异。
 
 ## p99.9 延迟对比
 
-![Lavik 10M / 1B, Redis and Valkey p99.9 latency](combined-p999.png)
+![Lavik 10M / 1B, Redis and Valkey p99.9 latency](combined-p999.svg)
 
 延迟为客户端完整测量窗口的 p99.9，单位为毫秒，越低越好。使用与吞吐图相同的 I/O 线程配置；横轴为 log₂ 连接数刻度。
 
@@ -46,29 +46,138 @@
 - Redis/Valkey 使用发布的 8.10.2 / 9.1.2 固定 commit 编译，分配器为 jemalloc 5.3.0。各自新灌数据并生成 SHA 校验的 RDB；每档 I/O 线程从该基线启动。AOF、自动快照关闭，其他配置保留产品默认值。
 - 10M 组：memtier 2.5.1，16 线程、pipeline=1、不限速；十进制 key 1..10,000,000、无前缀；均匀随机 GET 或覆盖 SET；value=1,024 B。连接数 80/160/320/640/1280，每点 30 秒，每档服务端配置先 GET 预热 10 秒。按原 10M 方法保留默认相关客户端随机种子。
 - 1B 组使用十进制 key 1..1,000,000,000、均匀随机 GET 或覆盖 SET；80/160/320/640/1280 连接，每点 60 秒，各客户端使用 distinct seed，不额外 GET 预热；沿用原报告存储组方法，并启用 shutdown checkpoint。1.024 TB 为 value 原始载荷，不包含 key、索引与存储格式开销。
-- 每档服务端配置前后核验精确 DBSIZE 和五个样本 value 长度。全部正式 GET miss=0，全部正式点连接错误=0。延迟为完整测量窗口的客户端分位数；服务端 CPU 采样包围额外的准备/INFO 工作，只作诊断。
+- 每档服务端配置前后核验精确 DBSIZE 和五个样本 value 长度。全部正式 GET miss=0，全部正式点连接错误=0。延迟为完整测量窗口的客户端分位数；
 - 每点仅测一次，未估计置信区间或运行间波动；产品按顺序而非交错执行。线程职责不同，Lavik 持久化与纯内存对照的保证也不同。此次客户端型号、CPU 以及 Lavik 构建与历史报告存在差异，不能将跨报告的变化全部归因于 Lavik 代码。
-
-## 证据与离线复现
-
-[全部 120 个测量点](results.csv) · [校验结果](validation.json) · [发布元数据](release.json) · [对照构建身份](evidence/builds.json) · [版本选择](latest-release-selection.json) · [服务端清单](server-inventory.json) · [客户端清单](client-inventory.json) · [网络路径](network-path.json) · [原始证据清单](SHA256SUMS)
-
-`evidence/` 包含采集脚本、每点命令数组、memtier JSON/文本、测量前后宿主/INFO 快照、配置前后精确记录数及样本长度、驱动切换和干净停止状态。不包含私钥、下载的可执行文件或生成的数据库。
-
-```sh
-python3 perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/verify_results.py
-python3 perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/build_assets.py
-```
-
-校验脚本使用 Python 3.11+，可离线执行；绘图需要 Matplotlib 3.11.2，导出 SVG、PNG。采集脚本针对这批宿主，包含对六张白名单临时盘的清理步骤，不可对任意磁盘直接运行。
 
 ## Redis / Valkey 持久化配置
 
-灌入、预热和正式测量期间均关闭周期性 RDB 与 AOF。显式配置已保存为 [redis-valkey-persistence.conf](redis-valkey-persistence.conf)：
+周期性 RDB 和 AOF 在灌入、预热及正式测量期间均关闭。配置文件：[redis-valkey-persistence.conf](redis-valkey-persistence.conf)。
 
 ```conf
 save ""
 appendonly no
 ```
 
-采集命令通过等效参数 `--save "" --appendonly no` 应用配置；完整命令见 `evidence/memory/{redis,valkey}/io*/server-command.json`。每个产品首次灌入 10M 数据后，仅在正式窗口之外手动执行一次 `SAVE`，生成经校验的 RDB 基线，供切换 I/O 线程数时重启恢复。启动时读取该基线不会开启周期性快照。每档 I/O 线程扫描前后，CONFIG GET 核验 save 为空、appendonly=no；INFO persistence 核验没有后台保存、AOF 未开启，返回值保存在 persistence-before.json 和 persistence-after.json。正式测量期间的写入仅在内存中完成。
+每个产品首次灌入 10M 数据后，仅在正式窗口之外手动执行一次 `SAVE`，供各 I/O 线程配置重启恢复同一基线。启动时读取该 RDB 不会开启周期性快照。正式测量期间写入仅在内存中完成。
+
+## 运行命令
+
+以下 Bash 命令对应实测参数；请按部署环境调整路径、地址和 PCI 身份。一次只运行一个数据库和一个压测客户端。每轮使用独立结果目录。
+
+### Lavik SPDK
+
+按 [SPDK 存储指南](../../docs/operations/spdk-storage.md)核验六张专用临时 NVMe、准备 VFIO 和 8 GiB hugepages。10M 和 1B 两组各从空盘独立灌入；不得覆盖系统盘或已有业务数据。完成后干净停止 Lavik、恢复内核驱动及 hugepage 预留，再测试内存数据库。以下为 10M 启动命令：
+
+```bash
+sudo env 'BYCORF_EAL_ARGS=-a 2401:00:00.0 -a 221c:00:00.0 -a 7f10:00:00.0 -a 399c:00:00.0 -a c0ef:00:00.0 -a 6319:00:00.0' BYCORF_DPDK_MEMORY_MB=8192 taskset \
+  -c 0-15 /mnt/dev/benchmark/release010/downloads/lavik-v0.1.0-linux-x86_64/lavik \
+  --network=kernel \
+  --storage=spdk \
+  --bind=10.84.1.4 \
+  --port=6379 \
+  --metrics-port=0 \
+  --threads=16 \
+  --pin-workers \
+  --maxclients=10000 \
+  --busy-poll-us=20 \
+  --foreground-budget-us=1000 \
+  --background-budget-us=10 \
+  --background-warrant-percent=1 \
+  --tomb-raider-interval-ms=0 \
+  --spdk-max-completions-per-poll=16 \
+  --spdk-foreground-pre-poll-us=5 \
+  --defrag-max-active-per-device=8 \
+  --defrag-sleep-ms=0 \
+  --defrag-record-sleep-us=0 \
+  --log-dir=/mnt/dev/benchmark/release010-latest/suite/memory/lavik-spdk/logs \
+  --data-file=spdk://2401:00:00.0/1 \
+  --data-file=spdk://221c:00:00.0/1 \
+  --data-file=spdk://7f10:00:00.0/1 \
+  --data-file=spdk://399c:00:00.0/1 \
+  --data-file=spdk://c0ef:00:00.0/1 \
+  --data-file=spdk://6319:00:00.0/1
+```
+
+1B 组使用相同参数，增加 `--shutdown-checkpoint`，并将日志目录改为 `suite/storage/lavik-spdk/logs`。启动后等待恢复及后台初始化完成，使用 `CONFIG GET defrag-paused` 核验为 `no`；各正式点前后再次核验。
+
+### Redis / Valkey
+
+使用 jemalloc 5.3.0，构建命令为 `make -j16 BUILD_TLS=no`。Redis 8.10.2 对应提交 `498ecd0d6d007db11ddb3aea9428552598a78622`，Valkey 9.1.2 对应 `7f1dffedff6de73058b2c2a389422b6ecd56c8fb`。首次灌入使用 16 I/O 线程。
+
+```bash
+# On the server; start one product/configuration at a time.
+PRODUCT=redis                    # redis or valkey
+IO_THREADS=16                    # tested: 1, 2, 4, 8, 16
+DATA_DIR=/mnt/dev/benchmark/release010-latest/suite/data/$PRODUCT
+mkdir -p "$DATA_DIR"
+ulimit -n 65535
+taskset -c 0-15 "/mnt/dev/benchmark/release010-latest/downloads/$PRODUCT/src/$PRODUCT-server" \
+  --bind 10.84.1.4 --protected-mode no --port 6379 --daemonize no \
+  --dir "$DATA_DIR" --dbfilename dump.rdb --save "" --appendonly no \
+  --maxmemory 0 --maxclients 10000 --io-threads "$IO_THREADS"
+```
+
+图中 Redis GET/SET 使用 16 I/O 线程，Valkey GET 使用 16、SET 使用 8。它们来自完整的 1/2/4/8/16 线程扫描，每个命令选择单个峰值最高的配置。
+
+### 灌入、预热和连接数扫描
+
+```bash
+# On the client: memtier_benchmark 2.5.1.
+KEYS=10000000                    # 1000000000 only for the Lavik 1B group
+SECONDS_PER_POINT=30
+SEED=()
+if [ "$KEYS" -eq 1000000000 ]; then
+  SECONDS_PER_POINT=60
+  SEED=(--distinct-client-seed)
+fi
+mkdir -p results
+ulimit -n 65535
+COMMON=(--server=10.84.1.4 --port=6379 --protocol=redis
+  --threads=16 --pipeline=1 --key-minimum=1 --key-maximum="$KEYS"
+  --key-prefix= --data-size=1024 --hide-histogram
+  --print-percentiles=50,99,99.9,99.99 --show-config)
+
+# Once per fresh dataset; each key is written once across 640 clients.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=40 \
+  --json-out-file=results/fill.json --requests="$((KEYS / 640))" \
+  --ratio=1:0 --key-pattern=P:P
+redis-cli -h 10.84.1.4 -p 6379 --raw DBSIZE
+redis-cli -h 10.84.1.4 -p 6379 STRLEN 1
+```
+
+对于 Redis/Valkey，首次灌入后执行下列基线命令；然后以 1、2、4、8、16 I/O 线程依次启动，每档等待 RDB 加载结束、DBSIZE=10000000，核验持久化配置，再执行下一段预热及测量。每档结束使用 `SHUTDOWN NOSAVE`，保持同一 `dump.rdb` 不变；不要重新灌入或在测量中执行 SAVE。Lavik 不执行这些 RDB 基线命令。
+
+```bash
+redis-cli -h 10.84.1.4 -p 6379 SAVE
+redis-cli -h 10.84.1.4 -p 6379 SHUTDOWN NOSAVE
+# On the server, record/check the unchanged RDB baseline hash:
+sha256sum "$DATA_DIR/dump.rdb"
+# After each restart, run these checks from the client:
+redis-cli -h 10.84.1.4 -p 6379 CONFIG GET save
+redis-cli -h 10.84.1.4 -p 6379 CONFIG GET appendonly
+redis-cli -h 10.84.1.4 -p 6379 INFO persistence
+```
+
+```bash
+# Run once for Lavik 10M and once per Redis/Valkey I/O-thread configuration.
+# The Lavik 1B group has no additional GET warmup.
+if [ "$KEYS" -eq 10000000 ]; then
+  taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=40 \
+    --json-out-file=results/warmup.json --test-time=10 \
+    --command='GET __key__' --command-key-pattern=R --command-is-read
+fi
+for OP in GET SET; do
+  COMMAND=(--command='GET __key__' --command-key-pattern=R --command-is-read)
+  if [ "$OP" = SET ]; then
+    COMMAND=(--command='SET __key__ __data__' --command-key-pattern=R)
+  fi
+  for CONNECTIONS in 80 160 320 640 1280; do
+    taskset -c 0-15 memtier_benchmark "${COMMON[@]}" \
+      --clients="$((CONNECTIONS / 16))" \
+      --json-out-file="results/$OP-c$CONNECTIONS.json" \
+      --test-time="$SECONDS_PER_POINT" "${COMMAND[@]}" "${SEED[@]}" \
+      > "results/$OP-c$CONNECTIONS.txt" 2>&1
+  done
+done
+redis-cli -h 10.84.1.4 -p 6379 --raw DBSIZE
+```

@@ -8,13 +8,13 @@ In the 10M group, Lavik's peak GET was **1145.8k QPS** at 1280 connections (p99.
 
 ## Throughput: Lavik 10M / 1B versus Redis / Valkey
 
-![Lavik 10M / 1B, Redis and Valkey throughput](combined-qps.png)
+![Lavik 10M / 1B, Redis and Valkey throughput](combined-qps.svg)
 
 All four series cover 80–1280 connections. The 10M group uses 30 seconds per point and default client seeds; the 1B group uses 60 seconds and distinct client seeds. Dataset size, duration and seed settings differ.
 
 ## p99.9 latency comparison
 
-![Lavik 10M / 1B, Redis and Valkey p99.9 latency](combined-p999.png)
+![Lavik 10M / 1B, Redis and Valkey p99.9 latency](combined-p999.svg)
 
 Latency is client-observed p99.9 over each full measurement window, in milliseconds; lower is better. The I/O-thread configurations match the throughput chart. The connection axis uses a log₂ scale.
 
@@ -46,29 +46,138 @@ Full-batch acquisition span (including per-point setup/snapshots): 2026-10-13 11
 - Redis/Valkey are built from their pinned 8.10.2 / 9.1.2 release commits with jemalloc 5.3.0. Each product loads a fresh 10M dataset and saves a hash-verified RDB. Each I/O-thread configuration starts from that baseline, with AOF and scheduled snapshots disabled. Other settings retain product defaults.
 - 10M group: memtier 2.5.1, 16 client threads, pipeline 1, no rate limit; decimal keys 1..10,000,000 without prefixes; uniform random GET or overwriting SET, 1,024 B values. Connections 80/160/320/640/1280; 30 seconds per point; 10-second GET warmup per server configuration. The original 10M method's default correlated client seeds are retained.
 - The 1B group uses decimal keys 1..1,000,000,000, uniformly random GET or overwriting SET, and 80/160/320/640/1280 connections, 60 seconds per point, distinct client seeds, and no extra GET warmup, following the original storage-group method. Shutdown checkpoint is enabled. The 1.024 TB raw value payload excludes keys and storage/index overhead.
-- Exact DBSIZE and five sampled value lengths are checked before and after each server configuration. All measured GETs have zero misses; all formal points have zero connection errors. The latency percentiles are whole-window client measurements. Server CPU columns enclose setup/INFO overhead and are diagnostics, not exact-window CPU utilization.
+- Exact DBSIZE and five sampled value lengths are checked before and after each server configuration. All measured GETs have zero misses; all formal points have zero connection errors. The latency percentiles are whole-window client measurements.
 - Each point is measured once; confidence intervals and run-to-run variability are not estimated. Products run sequentially, not interleaved. Thread roles differ, and Lavik persistence differs from the memory-only peer configurations. The new client CPU/model and release build differ from historical reports, so historical performance changes cannot be attributed solely to Lavik code.
-
-## Evidence and offline reproduction
-
-[All 120 points](results.csv) · [Validation](validation.json) · [Release](release.json) · [Peer build identity](evidence/builds.json) · [Version selection](latest-release-selection.json) · [Server inventory](server-inventory.json) · [Client inventory](client-inventory.json) · [Network path](network-path.json) · [Raw evidence manifest](SHA256SUMS)
-
-The `evidence/` directory contains acquisition scripts, per-point command arrays, memtier JSON/text, enclosing-window host/INFO snapshots, before/after exact counts and sampled value lengths, driver changes and clean-stop status. Private keys, executable downloads and generated databases are excluded.
-
-```sh
-python3 perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/verify_results.py
-python3 perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/build_assets.py
-```
-
-The verifier uses Python 3.11+ and runs offline. Figures require Matplotlib 3.11.2 and are exported as SVG and PNG. Acquisition scripts are host-specific and can erase only the six explicitly allowlisted scratch devices; do not run them on arbitrary disks.
 
 ## Redis / Valkey persistence configuration
 
-Periodic RDB snapshots and AOF are both disabled throughout load, warmup and measurement. The explicit settings are committed in [redis-valkey-persistence.conf](redis-valkey-persistence.conf):
+Periodic RDB snapshots and AOF are disabled throughout loading, warmup and measurement. Configuration: [redis-valkey-persistence.conf](redis-valkey-persistence.conf).
 
 ```conf
 save ""
 appendonly no
 ```
 
-The acquisition commands apply the equivalent `--save "" --appendonly no`; full commands are archived under `evidence/memory/{redis,valkey}/io*/server-command.json`. One manual `SAVE` runs after each product’s initial 10M fill, outside every formal window, to create the validated RDB baseline used when restarting with another I/O-thread count. Reading that baseline at startup does not enable periodic snapshots. Before and after each I/O-thread sweep, CONFIG GET confirms save is empty and appendonly is no; INFO persistence confirms no background save and no AOF. The effective values are archived in persistence-before.json and persistence-after.json. Measured writes are memory-only.
+One manual `SAVE` runs after each product’s initial 10M fill, outside measured windows, so every I/O-thread configuration restarts from the same baseline. Reading the RDB does not enable periodic snapshots. Measured writes are memory-only.
+
+## Run commands
+
+These Bash commands use the measured settings; adapt paths, addresses and PCI identities to the deployment. Run one database and one load generator at a time. Use a separate result directory for each configuration.
+
+### Lavik SPDK
+
+Follow the [SPDK storage guide](../../docs/operations/spdk-storage.md) to verify six dedicated scratch NVMe devices and prepare VFIO and 8 GiB hugepages. Independently load the 10M and 1B groups on empty media; do not overwrite system disks or existing application data. After a clean Lavik stop, restore kernel drivers and hugepage reservations before testing the memory databases. The 10M launch command is:
+
+```bash
+sudo env 'BYCORF_EAL_ARGS=-a 2401:00:00.0 -a 221c:00:00.0 -a 7f10:00:00.0 -a 399c:00:00.0 -a c0ef:00:00.0 -a 6319:00:00.0' BYCORF_DPDK_MEMORY_MB=8192 taskset \
+  -c 0-15 /mnt/dev/benchmark/release010/downloads/lavik-v0.1.0-linux-x86_64/lavik \
+  --network=kernel \
+  --storage=spdk \
+  --bind=10.84.1.4 \
+  --port=6379 \
+  --metrics-port=0 \
+  --threads=16 \
+  --pin-workers \
+  --maxclients=10000 \
+  --busy-poll-us=20 \
+  --foreground-budget-us=1000 \
+  --background-budget-us=10 \
+  --background-warrant-percent=1 \
+  --tomb-raider-interval-ms=0 \
+  --spdk-max-completions-per-poll=16 \
+  --spdk-foreground-pre-poll-us=5 \
+  --defrag-max-active-per-device=8 \
+  --defrag-sleep-ms=0 \
+  --defrag-record-sleep-us=0 \
+  --log-dir=/mnt/dev/benchmark/release010-latest/suite/memory/lavik-spdk/logs \
+  --data-file=spdk://2401:00:00.0/1 \
+  --data-file=spdk://221c:00:00.0/1 \
+  --data-file=spdk://7f10:00:00.0/1 \
+  --data-file=spdk://399c:00:00.0/1 \
+  --data-file=spdk://c0ef:00:00.0/1 \
+  --data-file=spdk://6319:00:00.0/1
+```
+
+For 1B, use the same settings, add `--shutdown-checkpoint`, and change the log directory to `suite/storage/lavik-spdk/logs`. Wait for startup and background initialization, then check that `CONFIG GET defrag-paused` returns `no`; repeat this check before and after each measured point.
+
+### Redis / Valkey
+
+Build with jemalloc 5.3.0 using `make -j16 BUILD_TLS=no`. Redis 8.10.2 uses commit `498ecd0d6d007db11ddb3aea9428552598a78622`; Valkey 9.1.2 uses `7f1dffedff6de73058b2c2a389422b6ecd56c8fb`. Use 16 I/O threads for the initial fill.
+
+```bash
+# On the server; start one product/configuration at a time.
+PRODUCT=redis                    # redis or valkey
+IO_THREADS=16                    # tested: 1, 2, 4, 8, 16
+DATA_DIR=/mnt/dev/benchmark/release010-latest/suite/data/$PRODUCT
+mkdir -p "$DATA_DIR"
+ulimit -n 65535
+taskset -c 0-15 "/mnt/dev/benchmark/release010-latest/downloads/$PRODUCT/src/$PRODUCT-server" \
+  --bind 10.84.1.4 --protected-mode no --port 6379 --daemonize no \
+  --dir "$DATA_DIR" --dbfilename dump.rdb --save "" --appendonly no \
+  --maxmemory 0 --maxclients 10000 --io-threads "$IO_THREADS"
+```
+
+The figures use Redis 16 I/O threads for GET/SET, Valkey 16 for GET and 8 for SET. Each command selects one peak-QPS configuration from the complete 1/2/4/8/16-thread sweep.
+
+### Load, warmup and connection sweep
+
+```bash
+# On the client: memtier_benchmark 2.5.1.
+KEYS=10000000                    # 1000000000 only for the Lavik 1B group
+SECONDS_PER_POINT=30
+SEED=()
+if [ "$KEYS" -eq 1000000000 ]; then
+  SECONDS_PER_POINT=60
+  SEED=(--distinct-client-seed)
+fi
+mkdir -p results
+ulimit -n 65535
+COMMON=(--server=10.84.1.4 --port=6379 --protocol=redis
+  --threads=16 --pipeline=1 --key-minimum=1 --key-maximum="$KEYS"
+  --key-prefix= --data-size=1024 --hide-histogram
+  --print-percentiles=50,99,99.9,99.99 --show-config)
+
+# Once per fresh dataset; each key is written once across 640 clients.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=40 \
+  --json-out-file=results/fill.json --requests="$((KEYS / 640))" \
+  --ratio=1:0 --key-pattern=P:P
+redis-cli -h 10.84.1.4 -p 6379 --raw DBSIZE
+redis-cli -h 10.84.1.4 -p 6379 STRLEN 1
+```
+
+For Redis/Valkey, run the baseline commands below after the initial fill. Restart in turn with 1, 2, 4, 8 and 16 I/O threads; wait for RDB loading and DBSIZE=10000000, verify persistence settings, then run the warmup and measurement block. End each configuration with `SHUTDOWN NOSAVE` so the same `dump.rdb` remains unchanged. Do not refill or run SAVE during measurement. Skip these RDB baseline commands for Lavik.
+
+```bash
+redis-cli -h 10.84.1.4 -p 6379 SAVE
+redis-cli -h 10.84.1.4 -p 6379 SHUTDOWN NOSAVE
+# On the server, record/check the unchanged RDB baseline hash:
+sha256sum "$DATA_DIR/dump.rdb"
+# After each restart, run these checks from the client:
+redis-cli -h 10.84.1.4 -p 6379 CONFIG GET save
+redis-cli -h 10.84.1.4 -p 6379 CONFIG GET appendonly
+redis-cli -h 10.84.1.4 -p 6379 INFO persistence
+```
+
+```bash
+# Run once for Lavik 10M and once per Redis/Valkey I/O-thread configuration.
+# The Lavik 1B group has no additional GET warmup.
+if [ "$KEYS" -eq 10000000 ]; then
+  taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=40 \
+    --json-out-file=results/warmup.json --test-time=10 \
+    --command='GET __key__' --command-key-pattern=R --command-is-read
+fi
+for OP in GET SET; do
+  COMMAND=(--command='GET __key__' --command-key-pattern=R --command-is-read)
+  if [ "$OP" = SET ]; then
+    COMMAND=(--command='SET __key__ __data__' --command-key-pattern=R)
+  fi
+  for CONNECTIONS in 80 160 320 640 1280; do
+    taskset -c 0-15 memtier_benchmark "${COMMON[@]}" \
+      --clients="$((CONNECTIONS / 16))" \
+      --json-out-file="results/$OP-c$CONNECTIONS.json" \
+      --test-time="$SECONDS_PER_POINT" "${COMMAND[@]}" "${SEED[@]}" \
+      > "results/$OP-c$CONNECTIONS.txt" 2>&1
+  done
+done
+redis-cli -h 10.84.1.4 -p 6379 --raw DBSIZE
+```

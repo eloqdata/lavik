@@ -1,93 +1,0 @@
-============== Configuration values: ==============
-server = 10.84.1.4
-port = 6379
-uri = 
-unix socket = (null)
-address family = Unspecified
-protocol = redis
-tls = no
-cert = (null)
-key = (null)
-cacert = (null)
-tls_skip_verify = no
-sni = (null)
-out_file = (null)
-client_stats = (null)
-run_count = 1
-debug = 0
-requests = 0
-rate_limit = 0
-clients = 40
-threads = 16
-test_time = 10
-ratio = 1:10
-pipeline = 1
-transaction = no
-data_size = 1024
-data_offset = 0
-random_data = no
-data_size_range = 0-0
-data_size_list = 
-data_size_pattern = R
-expiry_range = 0-0
-data_import = (null)
-data_verify = no
-verify_only = no
-generate_keys = no
-key_prefix = 
-key_minimum = 1
-key_maximum = 10000000
-key_pattern = R:R
-key_stddev = 0.000000
-key_median = 0.000000
-reconnect_interval = 0
-retry_on_error = no
-max_retries = -1
-retry_backoff_ms = 0
-retry_backoff_factor = 0.000000
-retry_on = 
-max_retry_queue = 0
-failed_keys_file = 
-connection_timeout = 0
-connection_stage_timeout = 30
-thread_conn_start_min_jitter_micros = 0
-thread_conn_start_max_jitter_micros = 0
-multi_key_get = 0
-authenticate = 
-select-db = 0
-no-expiry = no
-wait-ratio = 0:0
-num-slaves = 0-0
-wait-timeout = 0-0
-json-out-file = /opt/benchmark/release010-latest/suite/memory/valkey/io4/warmup.json
-print-all-runs = no
-prometheus-port = -1
-prometheus-bind-addr = 127.0.0.1
-prometheus-run-labels = 
-prometheus-latency-buckets = default
-===================================================
-Json file /opt/benchmark/release010-latest/suite/memory/valkey/io4/warmup.json created...
-Writing results to stdout
-[RUN #1] Preparing benchmark client...
-[RUN #1] Launching threads now...
-[RUN #1 10%,   1 secs] 16 threads 40 conns:      304461 ops,  304386 (avg:  304386) ops/sec, 307.38MB/sec (avg: 307.38MB/sec),  2.10 (avg:  2.10) msec latency[RUN #1 20%,   2 secs] 16 threads 40 conns:      744614 ops,  440066 (avg:  372224) ops/sec, 444.40MB/sec (avg: 375.89MB/sec),  1.45 (avg:  1.72) msec latency[RUN #1 30%,   3 secs] 16 threads 40 conns:     1185147 ops,  440458 (avg:  394968) ops/sec, 444.79MB/sec (avg: 398.85MB/sec),  1.45 (avg:  1.62) msec latency[RUN #1 40%,   4 secs] 16 threads 40 conns:     1628680 ops,  443009 (avg:  406987) ops/sec, 447.37MB/sec (avg: 410.99MB/sec),  1.44 (avg:  1.57) msec latency[RUN #1 50%,   5 secs] 16 threads 40 conns:     2065540 ops,  435420 (avg:  412687) ops/sec, 439.70MB/sec (avg: 416.75MB/sec),  1.47 (avg:  1.55) msec latency[RUN #1 60%,   6 secs] 16 threads 40 conns:     2508993 ops,  442549 (avg:  417668) ops/sec, 446.90MB/sec (avg: 421.78MB/sec),  1.44 (avg:  1.53) msec latency[RUN #1 70%,   7 secs] 16 threads 40 conns:     2948394 ops,  439322 (avg:  420759) ops/sec, 443.65MB/sec (avg: 424.90MB/sec),  1.46 (avg:  1.52) msec latency[RUN #1 80%,   8 secs] 16 threads 40 conns:     3391967 ops,  443494 (avg:  423599) ops/sec, 447.86MB/sec (avg: 427.77MB/sec),  1.44 (avg:  1.51) msec latency[RUN #1 90%,   9 secs] 16 threads 40 conns:     3836184 ops,  444141 (avg:  425879) ops/sec, 448.51MB/sec (avg: 430.07MB/sec),  1.44 (avg:  1.50) msec latency[RUN #1 100%,  10 secs]  9 threads 40 conns:     4274696 ops,  444141 (avg:  427286) ops/sec, 448.51MB/sec (avg: 431.49MB/sec),  1.44 (avg:  1.50) msec latency[RUN #1 100%,  10 secs]  0 threads 40 conns:     4274776 ops,  444141 (avg:  427283) ops/sec, 448.51MB/sec (avg: 431.49MB/sec),  1.44 (avg:  1.50) msec latency
-
-
-CPU Utilization Summary
-  Total CPU time:   72.834s  (user 16.415s, sys 56.419s)
-  Wall time:        10.014s
-  Cores used:       7.273   (avg 45.5% across 16 worker threads)
-  Peak utilization: 755.6%
-Saving JSON output file: /opt/benchmark/release010-latest/suite/memory/valkey/io4/warmup.json
-Json file closed.
-16        Threads
-40        Connections per thread
-10        Seconds
-
-
-ALL STATS
-============================================================================================================================================
-Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
---------------------------------------------------------------------------------------------------------------------------------------------
-Gets       427322.35    427322.35         0.00         1.49698         1.43900         4.06300         5.40700         8.31900    441884.30 
-Totals     427322.35    427322.35         0.00         1.49698         1.43900         4.06300         5.40700         8.31900    883768.60 
