@@ -12375,32 +12375,6 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
             : "BUSY Redis is busy running a script. You can only call SCRIPT "
               "KILL or SHUTDOWN NOSAVE."));
   }
-  if (cluster::MetaManaged()) {
-    if (!request.replication_origin_ &&
-        cluster::GetClientMode() == ClientMode::kSingle) {
-      // Composite execution shares standalone's locks and effects, with one
-      // Group proof retained through publication. WAIT observes the common
-      // Group replication history without holding mutation admission while
-      // replicas catch up. Keep unrelated deferred command families explicit.
-      const auto flags = request.spec_ == nullptr ? 0u : request.spec_->flags_;
-      const bool database_inspection =
-          kind == CommandKind::kDbSize || kind == CommandKind::kScan ||
-          kind == CommandKind::kRandomKey || kind == CommandKind::kKeys;
-      const bool keyless_data =
-          (flags & kCmdUsesDbGate) != 0 && (flags & kCmdNoKeys) != 0 &&
-          !database_inspection && kind != CommandKind::kFunction &&
-          !IsLuaInvocationCommand(request);
-      const bool deferred =
-          ((flags & kCmdDynamicWrite) != 0 && kind != CommandKind::kFunction &&
-           !IsLuaInvocationCommand(request)) ||
-          keyless_data;
-      if (deferred && !script_kill && !function_kill && !function_stats) {
-        if (ctx.in_multi_) ctx.multi_dirty_ = true;
-        co_return BuiltReply(reply_builder.AppendError(
-            "ERR command is not yet supported in Meta-managed Single mode"));
-      }
-    }
-  }
   if (g_replication != nullptr && !LoadingAllowedCommand(request)) {
     const auto state = g_replication->dataset_read_state();
     if (state != ReplicationManager::DatasetReadState::kReadable) [[unlikely]] {
