@@ -634,17 +634,18 @@ void StorageEngine::SetReplicaLoading(bool loading) noexcept {
   impl_->SetReplicaLoading(loading);
 }
 
-StorageEngine::RemoteGetAwaitable StorageEngine::TryRemoteGet(
-    std::uint8_t db_id, std::string_view key, std::uint16_t slot
+StorageEngine::RemoteReadAwaitable StorageEngine::TryRemoteRead(
+    std::uint8_t db_id, std::string_view key, std::uint16_t slot,
+    ValueType type, bool metadata_only
 #if LAVIK_ENABLE_TRACE
     ,
     ReadLatencyTrace* trace
 #endif
 ) {
-  return RemoteGetAwaitable(*impl_, db_id, key, slot
+  return RemoteReadAwaitable(*impl_, db_id, key, slot, type, metadata_only
 #if LAVIK_ENABLE_TRACE
-                            ,
-                            trace
+                             ,
+                             trace
 #endif
   );
 }

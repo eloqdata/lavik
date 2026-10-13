@@ -226,7 +226,61 @@ absl::StatusOr<OrderedCollectionMutationPlan> PrepareListGroups(
       .writes_ = std::move(split->groups_)};
 }
 
+absl::StatusOr<ListResult> ReadListSnapshot(
+    const std::vector<std::string>& elements, ListResult result,
+    const ListOperation& operation) {
+  switch (operation.kind_) {
+    case ListOperationKind::kIndex:
+      if (auto position = NormalizeIndex(operation.first_, elements.size()))
+        result.values_.push_back(elements[*position]);
+      return result;
+    case ListOperationKind::kRange: {
+      const auto [begin, end] =
+          NormalizeRange(operation.first_, operation.second_, elements.size());
+      for (std::uint64_t i = begin; i < end; ++i)
+        result.values_.push_back(elements[i]);
+      return result;
+    }
+    case ListOperationKind::kPosition: {
+      const ListPositionPlan plan = NormalizeListPosition(operation);
+      std::uint64_t matches = 0;
+      const std::uint64_t inspect =
+          std::min<std::uint64_t>(plan.comparison_limit_, elements.size());
+      for (std::uint64_t step = 0;
+           step < inspect && result.positions_.size() < plan.return_limit_;
+           ++step) {
+        const std::size_t position =
+            plan.reverse_ ? elements.size() - 1 - step : step;
+        if (elements[position] == operation.value_ &&
+            ++matches >= plan.wanted_rank_) {
+          result.positions_.push_back(position);
+        }
+      }
+      return result;
+    }
+    case ListOperationKind::kLength:
+      return result;
+    default:
+      return absl::InvalidArgumentError("compact List read cannot mutate");
+  }
+}
+
 }  // namespace
+
+absl::StatusOr<ListResult> ReadCompactList(const CompactReadResult& value,
+                                           const ListOperation& operation) {
+  if (!value.ok()) return value.status();
+  ListResult result;
+  result.key_exists_ = value->has_value();
+  result.length_ = *value ? (**value).logical_size_ : 0;
+  std::vector<std::string> elements;
+  if (*value && operation.kind_ != ListOperationKind::kLength) {
+    auto decoded = DecodeList((**value).encoded_, (**value).logical_size_);
+    if (!decoded.ok()) return decoded.status();
+    elements = std::move(*decoded);
+  }
+  return ReadListSnapshot(elements, std::move(result), operation);
+}
 
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -431,6 +485,9 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     elements = std::move(*decoded);
   }
 
+  if (read_only)
+    co_return ReadListSnapshot(elements, std::move(result), operation);
+
   switch (operation.kind_) {
     case ListOperationKind::kPushLeft:
     case ListOperationKind::kPushRight:
@@ -474,17 +531,6 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       }
       result.changed_ = count != 0;
       break;
-    }
-    case ListOperationKind::kIndex:
-      if (auto position = NormalizeIndex(operation.first_, elements.size()))
-        result.values_.push_back(elements[*position]);
-      co_return result;
-    case ListOperationKind::kRange: {
-      const auto [begin, end] =
-          NormalizeRange(operation.first_, operation.second_, elements.size());
-      for (std::uint64_t i = begin; i < end; ++i)
-        result.values_.push_back(elements[i]);
-      co_return result;
     }
     case ListOperationKind::kSet: {
       if (!exists) co_return absl::NotFoundError("no such key");
@@ -552,23 +598,6 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       elements = std::move(kept);
       break;
     }
-    case ListOperationKind::kPosition: {
-      const ListPositionPlan plan = NormalizeListPosition(operation);
-      std::uint64_t matches = 0;
-      const std::uint64_t inspect =
-          std::min<std::uint64_t>(plan.comparison_limit_, elements.size());
-      for (std::uint64_t step = 0;
-           step < inspect && result.positions_.size() < plan.return_limit_;
-           ++step) {
-        const std::size_t position =
-            plan.reverse_ ? elements.size() - 1 - step : step;
-        if (elements[position] == operation.value_ &&
-            ++matches >= plan.wanted_rank_) {
-          result.positions_.push_back(position);
-        }
-      }
-      co_return result;
-    }
     case ListOperationKind::kMoveWithin: {
       if (elements.empty()) co_return result;
       const bool source_left = operation.first_ != 0;
@@ -589,6 +618,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     }
     case ListOperationKind::kLength:
       co_return result;
+    default:
+      co_return absl::InternalError("read operation reached List mutation");
   }
 
   result.length_ = elements.size();

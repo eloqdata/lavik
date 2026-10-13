@@ -226,27 +226,28 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
   co_return std::optional<std::string>{};
 }
 
-StorageEngine::RemoteGetAwaitable::RemoteGetAwaitable(Impl& engine,
-                                                      std::uint8_t db_id,
-                                                      std::string_view key,
-                                                      std::uint16_t slot
+StorageEngine::RemoteReadAwaitable::RemoteReadAwaitable(
+    Impl& engine, std::uint8_t db_id, std::string_view key, std::uint16_t slot,
+    ValueType type, bool metadata_only
 #if LAVIK_ENABLE_TRACE
-                                                      ,
-                                                      ReadLatencyTrace* trace
+    ,
+    ReadLatencyTrace* trace
 #endif
-                                                      )
+    )
     : key_(key),
       slot_(slot),
-      db_id_(db_id)
+      db_id_(db_id),
+      type_(type),
+      metadata_only_(metadata_only)
 #if LAVIK_ENABLE_TRACE
       ,
       trace_(trace)
 #endif
 {
-  engine.PrepareRemoteGet(*this);
+  engine.PrepareRemoteRead(*this);
 }
 
-void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
+void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   const auto db_id = result.db_id_;
   const auto key = result.key_;
   const auto slot = result.slot_;
@@ -287,10 +288,24 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
   // Cold representations and expiration retain the complete owner state
   // machine (including expiry scheduling and indirect-key collision checks).
   if (entry->value_.grouped() || entry->value_.external() ||
-      entry->value_.in_memory() ||
-      entry->value_.value_type() != ValueType::kString || IsExpiredNow(*entry))
+      entry->value_.in_memory() || entry->value_.value_type() != result.type_ ||
+      IsExpiredNow(*entry))
     return;
   const RecordLocation location = MaterializeIndexLocation(*entry);
+  if (result.metadata_only_) {
+    result.ready_.emplace(
+        CompactReadValue{.lease_ = {},
+                         .logical_size_ = location.logical_size_,
+                         .expire_at_ms_ = location.expire_at_ms_});
+    return;
+  }
+  // Whole-value Stream/GEO callbacks rely on the owner's bounded inline
+  // workspace allowance. Larger workspaces retain its admission path.
+  if ((result.type_ == ValueType::kStream ||
+       result.type_ == ValueType::kSortedSet) &&
+      (location.total_disk_bytes() >= kCompactWorkspaceInputBytes ||
+       location.logical_size_ > kCompactWorkspaceInputEntries))
+    return;
   if (location.block_owner() != owner) return;
   // io_uring opens every configured file on every worker. Only SPDK builds
   // the controller-specific qpair owner directory.
@@ -367,7 +382,7 @@ void StorageEngine::Impl::PrepareRemoteGet(RemoteGetAwaitable& result) {
 }
 
 #if LAVIK_ENABLE_TRACE
-StorageEngine::RemoteGetAwaitable::TracedReadIo::TracedReadIo(
+StorageEngine::RemoteReadAwaitable::TracedReadIo::TracedReadIo(
     bycorf::Worker& worker, bycorf::FixedFile file, bycorf::FixedBuffer buffer,
     std::uint64_t offset, bycorf::SizeIoAwaitable::Operation operation,
     ReadLatencyTrace* trace)
@@ -378,7 +393,7 @@ StorageEngine::RemoteGetAwaitable::TracedReadIo::TracedReadIo(
       fixed_(operation == bycorf::SizeIoAwaitable::Operation::kReadFixed),
       trace_(trace) {}
 
-bool StorageEngine::RemoteGetAwaitable::TracedReadIo::await_suspend(
+bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
     std::coroutine_handle<> awaiting) {
   if (trace_) {
     trace_->disk_read_ = true;
@@ -392,14 +407,14 @@ bool StorageEngine::RemoteGetAwaitable::TracedReadIo::await_suspend(
   return Suspend(awaiting, std::move(status));
 }
 
-void StorageEngine::RemoteGetAwaitable::TracedReadIo::Complete(
+void StorageEngine::RemoteReadAwaitable::TracedReadIo::Complete(
     bycorf::Worker& worker, int result, unsigned flags) {
   if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
   OneShotIoAwaitable::Complete(worker, result, flags);
 }
 
 absl::StatusOr<std::size_t>
-StorageEngine::RemoteGetAwaitable::TracedReadIo::await_resume() {
+StorageEngine::RemoteReadAwaitable::TracedReadIo::await_resume() {
   auto result = Resume(fixed_ ? "fixed-buffer read failed" : "read failed");
   if (!result.ok()) return result.status();
   worker_.RecordStorageReadCompletion(*result);
@@ -407,14 +422,14 @@ StorageEngine::RemoteGetAwaitable::TracedReadIo::await_resume() {
 }
 #endif
 
-StorageEngine::RemoteGetAwaitable::Pin::~Pin() {
+StorageEngine::RemoteReadAwaitable::Pin::~Pin() {
   if (engine_ != nullptr) {
     engine_->UnpinRemoteBlock(engine_->BlockStateAt(block_id_), owner_,
                               block_id_);
   }
 }
 
-bool StorageEngine::RemoteGetAwaitable::Current(
+bool StorageEngine::RemoteReadAwaitable::Current(
     const Impl& engine) const noexcept {
   return engine.stores_[pin_.owner_]->remote_population_generation_.load(
              std::memory_order_acquire) == generation_ &&
@@ -427,8 +442,8 @@ bool StorageEngine::RemoteGetAwaitable::Current(
              std::memory_order_acquire);
 }
 
-StorageEngine::RemoteGetAwaitable::Result
-StorageEngine::RemoteGetAwaitable::await_resume() {
+StorageEngine::RemoteReadAwaitable::Result
+StorageEngine::RemoteReadAwaitable::await_resume() {
   if (!io_) {
     if (pin_.engine_ != nullptr && !Current(*pin_.engine_)) return std::nullopt;
     return std::move(ready_);
@@ -450,7 +465,12 @@ StorageEngine::RemoteGetAwaitable::await_resume() {
   if (!Current(engine) || (!loaded.ok() && absl::IsAborted(loaded.status())))
     return std::nullopt;
   if (!loaded.ok()) return loaded.status();
-  return engine.EncodeDiskValue(std::move(*loaded));
+  return CompactReadValue{
+      .lease_ = std::move(loaded->lease_),
+      .value_offset_ = static_cast<std::uint32_t>(loaded->value_offset_),
+      .value_bytes_ = static_cast<std::uint32_t>(loaded->value_bytes_),
+      .logical_size_ = location_.logical_size_,
+      .expire_at_ms_ = location_.expire_at_ms_};
 }
 
 // Keep optimistic-read admission out of the already large command dispatcher.
@@ -1080,9 +1100,17 @@ std::size_t StorageEngine::Impl::DirectGetValueLimit() const noexcept {
 
 absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
     LoadedValue loaded) {
-  ReadBufferLease lease = std::move(loaded.lease_);
-  const std::size_t value_offset = loaded.value_offset_;
-  const std::size_t value_bytes = loaded.value_bytes_;
+  return CompactReadValue{
+      .lease_ = std::move(loaded.lease_),
+      .value_offset_ = static_cast<std::uint32_t>(loaded.value_offset_),
+      .value_bytes_ = static_cast<std::uint32_t>(loaded.value_bytes_)}
+      .IntoDiskValue();
+}
+
+absl::StatusOr<DiskValue> CompactReadValue::IntoDiskValue() && {
+  ReadBufferLease lease = std::move(lease_);
+  const std::size_t value_offset = value_offset_;
+  const std::size_t value_bytes = value_bytes_;
   std::span<std::byte> buffer = lease.bytes();
   char length[32];
   auto [end, error] =

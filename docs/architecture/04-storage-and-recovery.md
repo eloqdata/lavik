@@ -667,20 +667,35 @@ need a staging buffer to commit.
 
 ### Reads and pins
 
-A standalone GET can read directly on its connection worker after ordinary
-request, database and serving-generation admission. It takes a short index
-reader guard on the key owner, snapshots a complete-key plain String location,
-then pins the block and validates its allocation identity before dropping the
-index guard. Only durable, non-grouped, non-external records whose block owner
-is also their key owner qualify, and the connection worker must have device
-I/O access. Closed index/block admission, unsupported representations, expired
-entries, concurrent admission contention, and an exhausted connection-worker
-read-buffer pool return to the normal owner route. An admitted fast read submits
-I/O directly from an awaitable in the requesting coroutine; completion resumes
-that same coroutine for record and population validation, without a child read
-coroutine. Index misses use the same transaction and population admission checks.
+Standalone single-key reads explicitly admitted by the command table can
+read directly on their connection worker after ordinary request, database and
+serving-generation admission. GET and read-only Hash, Set, List, Sorted Set/GEO
+and Stream commands share this path. Transaction-owned reads, multi-key reads
+and blocking operations retain their owner-side coordination. Repeated random
+replies retain their existing bounded snapshot streamer.
 
-The index snapshot orders the GET before a subsequently admitted writer. The
+A short index reader guard on the key owner protects a complete-key compact
+location snapshot. Payload reads pin the block and validate its allocation
+identity before dropping the index guard. Only durable, non-grouped,
+non-external records of the expected type whose block owner is also their key
+owner qualify, and the connection worker must have device I/O access. Length
+commands can answer from the same protected index metadata without a block pin
+or payload buffer. Closed admission, unsupported representations, expired
+entries, concurrent admission contention, and an exhausted connection-worker
+read-buffer pool return to the normal owner route. Stream and Sorted Set
+whole-value callbacks exceeding the bounded inline workspace also retain the
+owner's scratch-admission path. Index misses use the same transaction and
+population admission checks.
+
+An admitted payload read submits I/O directly from an awaitable in the
+requesting coroutine. Completion validates the record and population and
+transfers a buffer lease over the immutable encoded payload. GET adds bulk
+framing in that buffer; collection handlers share their compact evaluation and
+reply logic with owner reads, retaining owned results through reply streaming.
+Command parsing precedes consumption of any captured read error. No borrowed
+index entry survives suspension.
+
+The index snapshot orders the read before a subsequently admitted writer. The
 block pin survives I/O and cancellation cleanup, so writes can append and retire
 old live-byte accounting while the read finishes. Defrag closes remote pin
 admission before inspecting the count; the last pin on a pending block asks its
@@ -688,9 +703,9 @@ owner to reconsider reclamation. Flush uses the same close-before-count order
 when retiring a sealed staging buffer: either it releases the buffer immediately
 or the last pin notifies the owner to finish the release. Local fallback reads
 retain their existing pin rules. Database/replication epoch and population-generation
-changes invalidate an in-flight fast read. Worker shutdown drains I/O and destroys
-suspended frames on all workers before destroying any remotely referenced index,
-arena or block state.
+changes invalidate an in-flight payload read. Worker shutdown drains I/O and
+destroys suspended frames on all workers before destroying any remotely
+referenced index, arena or block state.
 
 An owner-local ordinary single-key GET may resolve its complete inline-key index entry
 without registering a shared transaction lock when that logical database's

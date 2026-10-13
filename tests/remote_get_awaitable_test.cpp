@@ -15,7 +15,7 @@ namespace lavik::storage {
 // admission exactly between snapshot and completion, and inspect every lease.
 class RemoteGetTestPeer : public testing::Test {
  protected:
-  using Awaitable = StorageEngine::RemoteGetAwaitable;
+  using Awaitable = StorageEngine::RemoteReadAwaitable;
 
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
@@ -94,12 +94,25 @@ class RemoteGetTestPeer : public testing::Test {
 
   RegisteredBufferPool& Pool() { return storage_.impl_->stores_[0]->buffers_; }
   auto Read() {
-    return storage_.TryRemoteGet(0, key_, 1
+    return storage_.TryRemoteRead(0, key_, 1, ValueType::kString, false
 #if LAVIK_ENABLE_TRACE
-                                 ,
-                                 &trace_
+                                  ,
+                                  &trace_
 #endif
     );
+  }
+
+  void Publish(ValueType type, bool grouped = false, bool staged = false,
+               bool external = false) {
+    header_.value_type_ = type;
+    header_.logical_size_ = type == ValueType::kString ? value_.size() : 2;
+    const auto metadata = RecordLocation::PackedMetadata::Encode(
+        kBlockHeaderBytes + 8, header_.total_disk_bytes_, 1, staged, external,
+        false, false, false, false, RecordKind::kValue, type, false, grouped);
+    auto writer = index_.CloseAllReaders();
+    auto* entry = index_.Find(ComputeDigest(key_), key_);
+    ASSERT_NE(entry, nullptr);
+    entry->assign(RecordLocation(1, 9, 7, 0, header_.logical_size_, metadata));
   }
 
   enum class UnpinPoint { kBeforeRelease, kAfterCount, kAfterRelease };
@@ -225,10 +238,10 @@ class RemoteGetTestPeer : public testing::Test {
 
 TEST_F(RemoteGetTestPeer, SynchronousMissAndClosedIndexFallback) {
   {
-    auto read = storage_.TryRemoteGet(0, "absent", 1
+    auto read = storage_.TryRemoteRead(0, "absent", 1, ValueType::kString, false
 #if LAVIK_ENABLE_TRACE
-                                      ,
-                                      &trace_
+                                       ,
+                                       &trace_
 #endif
     );
     ASSERT_TRUE(read.await_ready());
@@ -291,14 +304,87 @@ TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {
 #endif
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->status();
-    auto bytes = result->value().value_bytes();
-    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                               bytes.size()),
-              value_);
+    EXPECT_EQ(result->value().view().encoded_, value_);
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 0);
   result.reset();
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(RemoteGetTestPeer, CollectionPayloadsRetainMetadataAndLease) {
+  for (auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
+                    ValueType::kSortedSet, ValueType::kStream}) {
+    Publish(type);
+    Awaitable::Result result;
+    {
+      auto read = storage_.TryRemoteRead(0, key_, 1, type);
+      ASSERT_FALSE(read.await_ready()) << static_cast<int>(type);
+      EXPECT_EQ(block_.pin_count(), 1);
+      // The index reader has already drained; the pin alone protects I/O.
+      auto writer = index_.CloseAllReaders();
+      ASSERT_NO_FATAL_FAILURE(Complete(read));
+      result = read.await_resume();
+      ASSERT_TRUE(result && result->ok());
+      EXPECT_EQ(result->value().view().encoded_, value_);
+      EXPECT_EQ(result->value().view().logical_size_, 2);
+    }
+    EXPECT_EQ(block_.pin_count(), 0);
+    EXPECT_EQ(Pool().available_read_buffers(), 0);
+    result.reset();
+    EXPECT_EQ(Pool().available_read_buffers(), 1);
+  }
+}
+
+TEST_F(RemoteGetTestPeer, MetadataDoesNotAcquirePinOrBuffer) {
+  for (auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
+                    ValueType::kSortedSet, ValueType::kStream}) {
+    Publish(type);
+    auto held = Pool().AcquireReadBuffer().await_resume();
+    ASSERT_TRUE(held.ok());
+    auto read = storage_.TryRemoteRead(0, key_, 1, type, true);
+    ASSERT_TRUE(read.await_ready());
+    auto result = read.await_resume();
+    ASSERT_TRUE(result && result->ok());
+    EXPECT_EQ(result->value().view().logical_size_, 2);
+    EXPECT_TRUE(result->value().view().encoded_.empty());
+    EXPECT_EQ(block_.pin_count(), 0);
+  }
+}
+
+TEST_F(RemoteGetTestPeer, UnsupportedRepresentationsAndWrongTypeFallBack) {
+  for (auto type : {ValueType::kHash, ValueType::kSet, ValueType::kList,
+                    ValueType::kSortedSet, ValueType::kStream}) {
+    for (unsigned representation = 0; representation < 4; ++representation) {
+      Publish(type, representation == 1, representation == 2,
+              representation == 3);
+      auto read = storage_.TryRemoteRead(
+          0, key_, 1, representation == 0 ? ValueType::kString : type);
+      ASSERT_TRUE(read.await_ready());
+      EXPECT_FALSE(read.await_resume());
+      EXPECT_EQ(block_.pin_count(), 0);
+      EXPECT_EQ(Pool().available_read_buffers(), 1);
+    }
+  }
+}
+
+TEST_F(RemoteGetTestPeer, StringReplyTransfersLeaseWithoutCopying) {
+  std::optional<DiskValue> reply;
+  {
+    auto read = Read();
+    ASSERT_NO_FATAL_FAILURE(Complete(read));
+    auto result = read.await_resume();
+    ASSERT_TRUE(result && result->ok());
+    const auto payload = result->value().view().encoded_;
+    auto encoded = std::move(result->value()).IntoDiskValue();
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    EXPECT_EQ(reinterpret_cast<const char*>(encoded->value_bytes().data()),
+              payload.data());
+    reply.emplace(std::move(*encoded));
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
+  reply.reset();
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 

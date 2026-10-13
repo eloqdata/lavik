@@ -842,6 +842,44 @@ struct CompactValueView {
   const StreamInspection* stream_inspection_ = nullptr;
 };
 
+// An immutable compact payload whose buffer can outlive its physical block
+// pin. Moving it transfers the lease without copying the encoded collection.
+struct CompactReadValue {
+  ReadBufferLease lease_;
+  std::uint32_t value_offset_ = 0;
+  std::uint32_t value_bytes_ = 0;
+  std::uint64_t logical_size_ = 0;
+  std::uint64_t expire_at_ms_ = 0;
+
+  CompactValueView view() const noexcept {
+    return {.encoded_ = lease_.valid()
+                            ? std::string_view(
+                                  reinterpret_cast<const char*>(
+                                      lease_.bytes().data() + value_offset_),
+                                  value_bytes_)
+                            : std::string_view{},
+            .logical_size_ = logical_size_,
+            .expire_at_ms_ = expire_at_ms_};
+  }
+  // Adds RESP bulk framing in the same buffer and transfers its lease to the
+  // reply. Only String GET uses this; collections interpret view() instead.
+  absl::StatusOr<DiskValue> IntoDiskValue() &&;
+};
+
+// A missing key is a successful empty view. The view borrows a caller-held
+// lease; errors are consumed after command parsing to preserve error order.
+using CompactReadResult = absl::StatusOr<std::optional<CompactValueView>>;
+
+// Evaluate a read against one checked, immutable compact snapshot, without
+// consulting worker-owned storage. Replies own any retained strings.
+absl::StatusOr<HashResult> ReadCompactHash(const CompactReadResult& value,
+                                           const HashOperation& operation,
+                                           ValueType type);
+absl::StatusOr<ListResult> ReadCompactList(const CompactReadResult& value,
+                                           const ListOperation& operation);
+absl::StatusOr<SortedSetResult> ReadCompactSortedSet(
+    const CompactReadResult& value, const SortedSetOperation& operation);
+
 struct StreamTrimRequest {
   std::optional<std::uint64_t> max_length_;
   std::array<std::uint64_t, 2> min_id_{};
@@ -954,6 +992,11 @@ struct CompactAccessOptions {
 
 using CompactValueCallback = std::function<absl::StatusOr<CompactValueUpdate>(
     std::optional<CompactValueView>)>;
+
+// Runs a callback on a remote snapshot admitted to the bounded compact
+// workspace. The callback must return no mutation and retain no input views.
+absl::Status ApplyCompactRead(const CompactReadResult& value,
+                              const CompactValueCallback& callback);
 
 enum class ExpirationCondition : std::uint8_t {
   kNone,
@@ -1604,21 +1647,26 @@ class StorageEngine {
   bycorf::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
   void SetReplicaLoading(bool loading) noexcept;
 
-  class RemoteGetAwaitable;
+  class RemoteReadAwaitable;
 
-  // Connection-worker optimization for a standalone GET. The caller holds
-  // request/DB population admission through completion. nullopt requests the
-  // ordinary owner path; a present result is final (including not-found).
+  // Connection-worker optimization for a standalone single-key read. The caller
+  // holds request/DB population admission through completion. nullopt requests
+  // the ordinary owner path; a present result is final (including not-found).
   // Admission runs synchronously; immediately co_await the result on this
   // worker, keeping key and request admission alive through completion. The
   // fast path submits I/O without a child Task; buffer contention falls back.
+  // type selects the expected compact encoding. metadata_only returns length
+  // and expiry from the index with an empty payload and no buffer/block pin.
+  // Never use this for reads inside EXEC/Lua or a multi-key transaction.
   // Trace builds optionally borrow caller-owned timing state through
   // completion.
-  RemoteGetAwaitable TryRemoteGet(std::uint8_t db_id, std::string_view key,
-                                  std::uint16_t slot
+  RemoteReadAwaitable TryRemoteRead(std::uint8_t db_id, std::string_view key,
+                                    std::uint16_t slot,
+                                    ValueType type = ValueType::kString,
+                                    bool metadata_only = false
 #if LAVIK_ENABLE_TRACE
-                                  ,
-                                  ReadLatencyTrace* trace = nullptr
+                                    ,
+                                    ReadLatencyTrace* trace = nullptr
 #endif
   );
 
@@ -1974,14 +2022,14 @@ class StorageEngine {
 // runtime's one-shot I/O awaitables, it cannot move after publishing its
 // address to the device, and shutdown must drain I/O before destroying its
 // parent.
-class StorageEngine::RemoteGetAwaitable {
+class StorageEngine::RemoteReadAwaitable {
  public:
-  using Result = std::optional<absl::StatusOr<DiskValue>>;
+  using Result = std::optional<absl::StatusOr<CompactReadValue>>;
 
-  RemoteGetAwaitable(RemoteGetAwaitable&&) = delete;
-  RemoteGetAwaitable& operator=(RemoteGetAwaitable&&) = delete;
-  RemoteGetAwaitable(const RemoteGetAwaitable&) = delete;
-  RemoteGetAwaitable& operator=(const RemoteGetAwaitable&) = delete;
+  RemoteReadAwaitable(RemoteReadAwaitable&&) = delete;
+  RemoteReadAwaitable& operator=(RemoteReadAwaitable&&) = delete;
+  RemoteReadAwaitable(const RemoteReadAwaitable&) = delete;
+  RemoteReadAwaitable& operator=(const RemoteReadAwaitable&) = delete;
 
   bool await_ready() const noexcept { return !io_.has_value(); }
   bool await_suspend(std::coroutine_handle<> awaiting) {
@@ -2001,11 +2049,11 @@ class StorageEngine::RemoteGetAwaitable {
     ~Pin();
   };
 
-  RemoteGetAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
-                     std::uint16_t slot
+  RemoteReadAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
+                      std::uint16_t slot, ValueType type, bool metadata_only
 #if LAVIK_ENABLE_TRACE
-                     ,
-                     ReadLatencyTrace* trace
+                      ,
+                      ReadLatencyTrace* trace
 #endif
   );
   bool Current(const Impl& engine) const noexcept;
@@ -2020,6 +2068,8 @@ class StorageEngine::RemoteGetAwaitable {
   std::size_t read_bytes_ = 0;
   std::uint16_t slot_ = 0;
   std::uint8_t db_id_ = 0;
+  ValueType type_ = ValueType::kString;
+  bool metadata_only_ = false;
   // Reverse destruction releases the completion and buffer before the pin,
   // including when an admitted awaitable is destroyed without being awaited.
   Pin pin_;

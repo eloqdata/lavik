@@ -413,10 +413,13 @@ std::string_view StorageError(ReplyBuilder& builder,
              : builder.AppendError("ERR " + std::string(status.message()));
 }
 
-Task<absl::Status> RunCompact(const CommandRequest& request,
-                              const storage::Digest* digest,
-                              storage::TxShardWrites* tx, bool read_only,
-                              const storage::CompactValueCallback& callback) {
+Task<absl::Status> RunCompact(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, bool read_only,
+    const storage::CompactValueCallback& callback,
+    const storage::CompactReadResult* compact = nullptr) {
+  if (compact != nullptr)
+    co_return storage::ApplyCompactRead(*compact, callback);
   const std::string_view key = request.args_[1];
   auto replication = tx == nullptr && !read_only
                          ? PrepareReplicationCommand(request)
@@ -436,7 +439,10 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
 
 Task<absl::StatusOr<storage::SortedSetResult>> RunSortedSet(
     const CommandRequest& request, const storage::Digest* digest,
-    storage::TxShardWrites* tx, const storage::SortedSetOperation& operation) {
+    storage::TxShardWrites* tx, const storage::SortedSetOperation& operation,
+    const storage::CompactReadResult* compact = nullptr) {
+  if (compact != nullptr)
+    co_return storage::ReadCompactSortedSet(*compact, operation);
   const bool read_only =
       operation.kind_ != storage::SortedSetOperationKind::kAdd &&
       operation.kind_ != storage::SortedSetOperationKind::kRemove &&
@@ -1069,10 +1075,10 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
   return absl::OkStatus();
 }
 
-Task<CommandReply> ExecuteImpl(const CommandRequest& request,
-                               const storage::Digest* digest,
-                               storage::TxShardWrites* tx,
-                               ReplyBuilder& builder) {
+Task<CommandReply> ExecuteImpl(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, ReplyBuilder& builder,
+    const storage::CompactReadResult* compact = nullptr) {
   const auto& a = request.args_;
 
   absl::Status syntax = ValidateZSetSyntax(request);
@@ -1180,7 +1186,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         .increment_ = incr,
         .prepare_unlocked_ = request.kind_ == CommandKind::kZAdd ||
                              request.kind_ == CommandKind::kZIncrBy};
-    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    auto result =
+        co_await RunSortedSet(request, digest, tx, operation, compact);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
     if (result->changed_ != 0) NotifyZSetBlockingKey(request, a[1]);
     if (incr) {
@@ -1389,7 +1396,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       return NoChange();
     };
     absl::Status status =
-        co_await RunCompact(request, digest, tx, true, callback);
+        co_await RunCompact(request, digest, tx, true, callback, compact);
     if (!status.ok()) co_return Built(StorageError(builder, status));
     if (center_missing) {
       co_return Built(
@@ -1452,7 +1459,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         .entries_ = {},
         .members_ = members,
         .prepare_unlocked_ = request.kind_ == CommandKind::kZRem};
-    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    auto result =
+        co_await RunSortedSet(request, digest, tx, operation, compact);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
     if (request.kind_ == CommandKind::kZCard)
       co_return Built(builder.AppendInteger(result->length_));
@@ -1540,7 +1548,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       operation.reverse_ = request.kind_ == CommandKind::kZPopMax;
       operation.pop_count_ = count;
     }
-    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    auto result =
+        co_await RunSortedSet(request, digest, tx, operation, compact);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
     const bool scan = operation.kind_ == storage::SortedSetOperationKind::kScan;
     if (!scan && result->changed_ != 0 && result->length_ != 0)
@@ -1603,7 +1612,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                                   high->exclusive_};
       }
     }
-    auto result = co_await RunSortedSet(request, digest, tx, operation);
+    auto result =
+        co_await RunSortedSet(request, digest, tx, operation, compact);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
     if (range_remove) co_return Built(builder.AppendInteger(result->changed_));
     if (operation.kind_ == storage::SortedSetOperationKind::kCount)
@@ -1637,8 +1647,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     auto result = co_await RunSortedSet(
         request, digest, tx,
         storage::SortedSetOperation{
-            .kind_ = storage::SortedSetOperationKind::kRandom,
-            .count_ = count});
+            .kind_ = storage::SortedSetOperationKind::kRandom, .count_ = count},
+        compact);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
     if (a.size() == 2)
       co_return Built(
@@ -2511,9 +2521,10 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
   co_return result;
 }
 
-Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
-                                      ReplyBuilder& reply_builder) {
-  return ExecuteImpl(request, nullptr, nullptr, reply_builder);
+Task<CommandReply> ExecuteZSetCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact) {
+  return ExecuteImpl(request, nullptr, nullptr, reply_builder, compact);
 }
 
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(

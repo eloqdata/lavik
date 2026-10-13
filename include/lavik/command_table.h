@@ -76,6 +76,10 @@ struct CommandSpec {
   std::int8_t last_key_ = 0;
   std::uint8_t key_step_ = 1;
   std::uint32_t flags_ = 0;
+  // Explicit opt-in: the handler can evaluate one immutable compact value on
+  // the connection worker. Transaction-owned dispatch never uses this path.
+  storage::ValueType remote_read_type_ = storage::ValueType::kNone;
+  bool remote_read_metadata_ = false;
 };
 
 // Case-insensitive lookup; nullptr when the command is unknown.

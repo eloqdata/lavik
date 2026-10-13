@@ -501,7 +501,188 @@ absl::StatusOr<MemoryReservation> ReserveInputs(
   return budget.Reserve(1);
 }
 
+absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
+    std::optional<CompactValueView> value, const SortedSetOperation& operation,
+    Members& members, SortedSetResult& result,
+    std::optional<MemoryReservation>& compact_admission) {
+  // ExecuteCompactLocked owns decode/re-encode admission, including the
+  // bounded inline workspace that lets shrinking commands run at
+  // maxmemory. Range removal adds no input members or retained reply;
+  // larger/indirect/external values still pass that layer's admission.
+  if (operation.kind_ != SortedSetOperationKind::kRemoveRange) {
+    GroupedScratchBudget budget;
+    auto status = budget.AddBytes(value ? value->encoded_.size() : 0);
+    if (!status.ok()) return status;
+    for (const auto& entry : operation.entries_) {
+      status = budget.AddBytes(entry.member_.size() + 256);
+      if (!status.ok()) return status;
+    }
+    if (value) {
+      if (value->logical_size_ > std::numeric_limits<std::size_t>::max() / 256)
+        return absl::ResourceExhaustedError(
+            "Sorted Set compact count overflow");
+      status = budget.AddBytes(value->logical_size_ * 256);
+      if (!status.ok()) return status;
+    }
+    auto admission = budget.Reserve(4);
+    if (!admission.ok()) return admission.status();
+    compact_admission.emplace(std::move(*admission));
+  }
+  std::vector<OrderedCollectionEntry> entries;
+  if (value) {
+    auto decoded =
+        DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
+                                  value->encoded_, value->logical_size_);
+    if (!decoded.ok()) return decoded.status();
+    entries = std::move(*decoded);
+  }
+  result.key_exists_ = value.has_value();
+  result.length_ = entries.size();
+  if (operation.kind_ == SortedSetOperationKind::kScan) {
+    ScanBoundary boundary;
+    auto prepared = boundary.Prepare(operation, entries.size());
+    if (!prepared.ok()) return prepared;
+    for (const auto& entry : entries)
+      boundary.Observe(entry, operation.scan_cursor_);
+    for (const auto& entry : entries) {
+      auto emitted = boundary.Emit(entry, operation, &result);
+      if (!emitted.ok()) return emitted;
+    }
+    ScanBoundary::Sort(&result);
+    return CompactValueUpdate{};
+  }
+  if (operation.kind_ == SortedSetOperationKind::kRandom) {
+    RandomSelection selection;
+    auto status =
+        selection.Prepare(entries.size(), operation.count_, true, &result);
+    if (!status.ok()) return status;
+    for (const auto [rank, slot] : selection.draws_) {
+      auto copied = CopyOutput(entries[rank]);
+      if (!copied.ok()) return copied.status();
+      result.members_[slot] = std::move(*copied);
+    }
+    return CompactValueUpdate{};
+  }
+  if (operation.kind_ == SortedSetOperationKind::kRemoveRange) {
+    const auto [first, end] =
+        RankSlice(operation.first_, operation.last_, entries.size());
+    std::size_t rank = 0;
+    result.changed_ = std::erase_if(entries, [&](const auto& entry) {
+      const auto at = rank++;
+      return operation.range_mode_ == SortedSetRangeMode::kRank
+                 ? at >= first && at < end
+                 : Matches(entry, operation);
+    });
+    result.length_ = entries.size();
+    if (result.changed_ == 0) return CompactValueUpdate{};
+    if (entries.empty()) {
+      CompactValueUpdate erased;
+      erased.changed_ = erased.erase_ = true;
+      return erased;
+    }
+    auto encoded =
+        EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+    if (!encoded.ok()) return encoded.status();
+    return CompactValueUpdate{.changed_ = true,
+                              .encoded_ = std::move(*encoded),
+                              .logical_size_ = entries.size(),
+                              .expire_at_ms_ = std::nullopt};
+  }
+  if (operation.kind_ == SortedSetOperationKind::kPop) {
+    const auto count =
+        std::min<std::uint64_t>(operation.pop_count_, entries.size());
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto at = operation.reverse_ ? entries.size() - 1 - i : i;
+      auto copied = CopyOutput(entries[at]);
+      if (!copied.ok()) return copied.status();
+      auto appended = AppendOutput(std::move(*copied), &result);
+      if (!appended.ok()) return appended;
+    }
+    result.changed_ = count;
+    result.length_ -= count;
+    if (count == 0) return CompactValueUpdate{};
+    if (operation.reverse_)
+      entries.erase(entries.end() - count, entries.end());
+    else
+      entries.erase(entries.begin(), entries.begin() + count);
+    if (entries.empty()) {
+      CompactValueUpdate erased;
+      erased.changed_ = erased.erase_ = true;
+      return erased;
+    }
+    auto encoded =
+        EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+    if (!encoded.ok()) return encoded.status();
+    return CompactValueUpdate{.changed_ = true,
+                              .encoded_ = std::move(*encoded),
+                              .logical_size_ = entries.size(),
+                              .expire_at_ms_ = std::nullopt};
+  }
+  if (ScanRead(operation)) {
+    auto read = ReadCompact(entries, operation, &result);
+    if (!read.ok()) return read;
+    return CompactValueUpdate{};
+  }
+  for (const auto& entry : entries) {
+    auto found = members.find(entry.value_);
+    if (found != members.end()) {
+      if (found->second.before_)
+        return absl::DataLossError("duplicate persisted Sorted Set member");
+      found->second.before_ = found->second.after_ = entry.score_;
+    }
+  }
+  auto status = ApplyInputs(operation, &members, &result);
+  if (!status.ok()) return status;
+  if (ReadOnly(operation) || result.changed_ == 0) return CompactValueUpdate{};
+  std::erase_if(entries, [&](const auto& entry) {
+    const auto member = members.find(entry.value_);
+    return member != members.end() && member->second.touched_;
+  });
+  for (const auto& [member, state] : members) {
+    if (state.touched_ && state.after_)
+      entries.push_back({std::string(member), *state.after_});
+  }
+  std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+  if (entries.empty()) {
+    CompactValueUpdate erased;
+    erased.changed_ = erased.erase_ = true;
+    return erased;
+  }
+  auto encoded =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+  if (!encoded.ok()) return encoded.status();
+  return CompactValueUpdate{.changed_ = true,
+                            .encoded_ = std::move(*encoded),
+                            .logical_size_ = entries.size(),
+                            .expire_at_ms_ = std::nullopt};
+}
+
 }  // namespace
+
+absl::StatusOr<SortedSetResult> ReadCompactSortedSet(
+    const CompactReadResult& value, const SortedSetOperation& operation) {
+  if (!value.ok()) return value.status();
+  const auto valid = Validate(operation);
+  if (!valid.ok()) return valid;
+  if (!ReadOnly(operation))
+    return absl::InvalidArgumentError("compact Sorted Set read cannot mutate");
+  SortedSetResult result;
+  result.key_exists_ = value->has_value();
+  result.length_ = *value ? (**value).logical_size_ : 0;
+  if (operation.kind_ == SortedSetOperationKind::kLength) return result;
+  auto input_admission = ReserveInputs(operation);
+  if (!input_admission.ok()) return input_admission.status();
+  Members members;
+  const auto prepared = PrepareMembers(operation, &members);
+  if (!prepared.ok()) return prepared;
+  std::optional<MemoryReservation> compact_admission;
+  const auto status = ApplyCompactRead(value, [&](auto view) {
+    return ApplyCompactSortedSet(view, operation, members, result,
+                                 compact_admission);
+  });
+  if (!status.ok()) return status;
+  return result;
+}
 
 Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ExecuteSortedSetLocked(
@@ -624,158 +805,8 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   std::optional<MemoryReservation> compact_admission;
   auto callback = [&](std::optional<CompactValueView> value)
       -> absl::StatusOr<CompactValueUpdate> {
-    // ExecuteCompactLocked owns decode/re-encode admission, including the
-    // bounded inline workspace that lets shrinking commands run at
-    // maxmemory. Range removal adds no input members or retained reply;
-    // larger/indirect/external values still pass that layer's admission.
-    if (operation.kind_ != SortedSetOperationKind::kRemoveRange) {
-      GroupedScratchBudget budget;
-      auto status = budget.AddBytes(value ? value->encoded_.size() : 0);
-      if (!status.ok()) return status;
-      for (const auto& entry : operation.entries_) {
-        status = budget.AddBytes(entry.member_.size() + 256);
-        if (!status.ok()) return status;
-      }
-      if (value) {
-        if (value->logical_size_ >
-            std::numeric_limits<std::size_t>::max() / 256)
-          return absl::ResourceExhaustedError(
-              "Sorted Set compact count overflow");
-        status = budget.AddBytes(value->logical_size_ * 256);
-        if (!status.ok()) return status;
-      }
-      auto admission = budget.Reserve(4);
-      if (!admission.ok()) return admission.status();
-      compact_admission.emplace(std::move(*admission));
-    }
-    std::vector<OrderedCollectionEntry> entries;
-    if (value) {
-      auto decoded =
-          DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
-                                    value->encoded_, value->logical_size_);
-      if (!decoded.ok()) return decoded.status();
-      entries = std::move(*decoded);
-    }
-    result.key_exists_ = value.has_value();
-    result.length_ = entries.size();
-    if (operation.kind_ == SortedSetOperationKind::kScan) {
-      ScanBoundary boundary;
-      auto prepared = boundary.Prepare(operation, entries.size());
-      if (!prepared.ok()) return prepared;
-      for (const auto& entry : entries)
-        boundary.Observe(entry, operation.scan_cursor_);
-      for (const auto& entry : entries) {
-        auto emitted = boundary.Emit(entry, operation, &result);
-        if (!emitted.ok()) return emitted;
-      }
-      ScanBoundary::Sort(&result);
-      return CompactValueUpdate{};
-    }
-    if (operation.kind_ == SortedSetOperationKind::kRandom) {
-      RandomSelection selection;
-      auto status =
-          selection.Prepare(entries.size(), operation.count_, true, &result);
-      if (!status.ok()) return status;
-      for (const auto [rank, slot] : selection.draws_) {
-        auto copied = CopyOutput(entries[rank]);
-        if (!copied.ok()) return copied.status();
-        result.members_[slot] = std::move(*copied);
-      }
-      return CompactValueUpdate{};
-    }
-    if (operation.kind_ == SortedSetOperationKind::kRemoveRange) {
-      const auto [first, end] =
-          RankSlice(operation.first_, operation.last_, entries.size());
-      std::size_t rank = 0;
-      result.changed_ = std::erase_if(entries, [&](const auto& entry) {
-        const auto at = rank++;
-        return operation.range_mode_ == SortedSetRangeMode::kRank
-                   ? at >= first && at < end
-                   : Matches(entry, operation);
-      });
-      result.length_ = entries.size();
-      if (result.changed_ == 0) return CompactValueUpdate{};
-      if (entries.empty()) {
-        CompactValueUpdate erased;
-        erased.changed_ = erased.erase_ = true;
-        return erased;
-      }
-      auto encoded =
-          EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
-      if (!encoded.ok()) return encoded.status();
-      return CompactValueUpdate{.changed_ = true,
-                                .encoded_ = std::move(*encoded),
-                                .logical_size_ = entries.size(),
-                                .expire_at_ms_ = std::nullopt};
-    }
-    if (operation.kind_ == SortedSetOperationKind::kPop) {
-      const auto count =
-          std::min<std::uint64_t>(operation.pop_count_, entries.size());
-      for (std::size_t i = 0; i < count; ++i) {
-        const auto at = operation.reverse_ ? entries.size() - 1 - i : i;
-        auto copied = CopyOutput(entries[at]);
-        if (!copied.ok()) return copied.status();
-        auto appended = AppendOutput(std::move(*copied), &result);
-        if (!appended.ok()) return appended;
-      }
-      result.changed_ = count;
-      result.length_ -= count;
-      if (count == 0) return CompactValueUpdate{};
-      if (operation.reverse_)
-        entries.erase(entries.end() - count, entries.end());
-      else
-        entries.erase(entries.begin(), entries.begin() + count);
-      if (entries.empty()) {
-        CompactValueUpdate erased;
-        erased.changed_ = erased.erase_ = true;
-        return erased;
-      }
-      auto encoded =
-          EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
-      if (!encoded.ok()) return encoded.status();
-      return CompactValueUpdate{.changed_ = true,
-                                .encoded_ = std::move(*encoded),
-                                .logical_size_ = entries.size(),
-                                .expire_at_ms_ = std::nullopt};
-    }
-    if (ScanRead(operation)) {
-      auto read = ReadCompact(entries, operation, &result);
-      if (!read.ok()) return read;
-      return CompactValueUpdate{};
-    }
-    for (const auto& entry : entries) {
-      auto found = members.find(entry.value_);
-      if (found != members.end()) {
-        if (found->second.before_)
-          return absl::DataLossError("duplicate persisted Sorted Set member");
-        found->second.before_ = found->second.after_ = entry.score_;
-      }
-    }
-    auto status = ApplyInputs(operation, &members, &result);
-    if (!status.ok()) return status;
-    if (ReadOnly(operation) || result.changed_ == 0)
-      return CompactValueUpdate{};
-    std::erase_if(entries, [&](const auto& entry) {
-      const auto member = members.find(entry.value_);
-      return member != members.end() && member->second.touched_;
-    });
-    for (const auto& [member, state] : members) {
-      if (state.touched_ && state.after_)
-        entries.push_back({std::string(member), *state.after_});
-    }
-    std::sort(entries.begin(), entries.end(), OrderedEntryLess);
-    if (entries.empty()) {
-      CompactValueUpdate erased;
-      erased.changed_ = erased.erase_ = true;
-      return erased;
-    }
-    auto encoded =
-        EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
-    if (!encoded.ok()) return encoded.status();
-    return CompactValueUpdate{.changed_ = true,
-                              .encoded_ = std::move(*encoded),
-                              .logical_size_ = entries.size(),
-                              .expire_at_ms_ = std::nullopt};
+    return ApplyCompactSortedSet(value, operation, members, result,
+                                 compact_admission);
   };
   // kAdd also implements ZINCRBY and GEOADD, so the operation kind alone is
   // insufficient: only explicit single-key command admission opts in.

@@ -4239,11 +4239,11 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
       .chunks_ = [state] { return state->Next(); }};
 }
 
-Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
-                                         ReplyBuilder& reply_builder,
-                                         ReadLatencyTrace* read_trace = nullptr,
-                                         SetLatencyTrace* set_trace = nullptr,
-                                         bool recheck_after_dispatch = false) {
+Task<CommandReply> ExecuteStorageCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    ReadLatencyTrace* read_trace = nullptr,
+    SetLatencyTrace* set_trace = nullptr, bool recheck_after_dispatch = false,
+    const storage::CompactReadResult* compact = nullptr) {
   // ExecuteCommandBody revalidates the population fence after acquiring the
   // DB gate. Local reads reach this entry without another wait; only a
   // dispatched read needs to repeat that fence for changes while its worker
@@ -4454,7 +4454,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     case CommandKind::kLRem:
     case CommandKind::kLTrim:
     case CommandKind::kLPos:
-      co_return co_await ExecuteSingleListCommand(request, reply_builder);
+      co_return co_await ExecuteSingleListCommand(request, reply_builder,
+                                                  compact);
 
     case CommandKind::kHSet:
     case CommandKind::kHMSet:
@@ -4473,7 +4474,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     case CommandKind::kHIncrByFloat:
     case CommandKind::kHRandField:
     case CommandKind::kHScan:
-      co_return co_await ExecuteHashCommand(request, reply_builder);
+      co_return co_await ExecuteHashCommand(request, reply_builder, compact);
 
     case CommandKind::kSAdd:
     case CommandKind::kSCard:
@@ -4484,7 +4485,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     case CommandKind::kSRandMember:
     case CommandKind::kSRem:
     case CommandKind::kSScan:
-      co_return co_await ExecuteSetCommand(request, reply_builder);
+      co_return co_await ExecuteSetCommand(request, reply_builder, compact);
 
     case CommandKind::kZAdd:
     case CommandKind::kZCard:
@@ -4516,7 +4517,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     case CommandKind::kGeoRadiusRo:
     case CommandKind::kGeoRadiusByMemberRo:
     case CommandKind::kGeoSearch:
-      co_return co_await ExecuteZSetCommand(request, reply_builder);
+      co_return co_await ExecuteZSetCommand(request, reply_builder, compact);
 
     case CommandKind::kXAdd:
     case CommandKind::kXDel:
@@ -4533,7 +4534,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     case CommandKind::kXInfo:
     case CommandKind::kXRead:
     case CommandKind::kXReadGroup:
-      co_return co_await ExecuteStreamCommand(request, reply_builder);
+      co_return co_await ExecuteStreamCommand(request, reply_builder, 0,
+                                              compact);
 
     case CommandKind::kStrlen: {
       if (args.size() != 2) {
@@ -12978,20 +12980,6 @@ Task<CommandReply> ExecuteCommandBody(
       co_return co_await ExecuteBlockingZSetCommand(request, reply_builder,
                                                     client_id);
 
-    case CommandKind::kXGroup:
-    case CommandKind::kXInfo:
-      if (args.size() >= 3) {
-        const unsigned target = ShardForKey(args[2]);
-        if (target != ThisWorker().id_) {
-          co_return co_await SubmitTaskTo(
-              target, [&request, &reply_builder]() -> Task<CommandReply> {
-                co_return co_await ExecuteStorageCommand(
-                    request, reply_builder, nullptr, nullptr, true);
-              });
-        }
-      }
-      co_return co_await ExecuteStorageCommand(request, reply_builder);
-
     case CommandKind::kXRead:
     case CommandKind::kXReadGroup:
       // The Stream handler parses the movable key list and dispatches each
@@ -12999,6 +12987,8 @@ Task<CommandReply> ExecuteCommandBody(
       co_return co_await ExecuteStreamCommand(request, reply_builder,
                                               client_id);
 
+    case CommandKind::kXGroup:
+    case CommandKind::kXInfo:
     case CommandKind::kGet:
     case CommandKind::kGetDel:
     case CommandKind::kGetEx:
@@ -13115,14 +13105,16 @@ Task<CommandReply> ExecuteCommandBody(
     case CommandKind::kPExpireTime:
     case CommandKind::kDump:
     case CommandKind::kRestore:
-    case CommandKind::kType:
-      if (args.size() >= 2) {
+    case CommandKind::kType: {
+      const std::size_t key_arg = request.spec_ ? request.spec_->first_key_ : 1;
+      if (key_arg != 0 && args.size() > key_arg) {
         // Single-key source writes are already on this computed owner, while
         // cluster reads learned the same route during admission. Deriving the
-        // worker from the retained slot is cheaper than hashing args[1] again.
-        const bool routed = request.HasRoutedPartitionFor(1);
-        const std::uint16_t slot =
-            routed ? request.RoutedPartitionId() : storage::RedisSlot(args[1]);
+        // worker from the retained slot is cheaper than hashing args[key_arg]
+        // again.
+        const bool routed = request.HasRoutedPartitionFor(key_arg);
+        const std::uint16_t slot = routed ? request.RoutedPartitionId()
+                                          : storage::RedisSlot(args[key_arg]);
         const unsigned target = slot % g_storage->worker_count();
 #if LAVIK_ENABLE_TRACE
         ReadLatencyTrace trace;
@@ -13132,31 +13124,47 @@ Task<CommandReply> ExecuteCommandBody(
           trace.remote_ = target != ThisWorker().id_;
         }
 #endif
-        if (request.kind_ == CommandKind::kGet && args.size() == 2 &&
-            target != ThisWorker().id_) {
+        if (target != ThisWorker().id_ && request.spec_ != nullptr &&
+            request.spec_->remote_read_type_ != storage::ValueType::kNone) {
           // Reuse the route hash for admission on the connection worker.
 #if LAVIK_ENABLE_TRACE
           trace.owner_start_ns_ = trace.request_start_ns_;
 #endif
-          auto fast =
-              co_await g_storage->TryRemoteGet(request.db_id_, args[1], slot
+          auto fast = co_await g_storage->TryRemoteRead(
+              request.db_id_, args[key_arg], slot,
+              request.spec_->remote_read_type_,
+              request.spec_->remote_read_metadata_
 #if LAVIK_ENABLE_TRACE
-                                               ,
-                                               &trace
+              ,
+              &trace
 #endif
-              );
+          );
           if (fast) {
             CommandReply reply;
             if (const char* error = CommandServingGenerationError(request);
                 error)
               reply.encoded_ = reply_builder.AppendError(error);
-            else if (fast->ok())
-              reply.disk_value_ = std::move(**fast);
-            else if (absl::IsNotFound(fast->status()))
-              reply.encoded_ = reply_builder.AppendNull();
-            else
-              reply.encoded_ =
-                  AppendStorageError(reply_builder, fast->status());
+            else if (request.kind_ == CommandKind::kGet) {
+              auto value =
+                  fast->ok()
+                      ? std::move(**fast).IntoDiskValue()
+                      : absl::StatusOr<storage::DiskValue>(fast->status());
+              if (value.ok())
+                reply.disk_value_ = std::move(*value);
+              else if (absl::IsNotFound(value.status()))
+                reply.encoded_ = reply_builder.AppendNull();
+              else
+                reply.encoded_ =
+                    AppendStorageError(reply_builder, value.status());
+            } else {
+              storage::CompactReadResult compact = std::nullopt;
+              if (fast->ok())
+                compact = (**fast).view();
+              else if (!absl::IsNotFound(fast->status()))
+                compact = fast->status();
+              reply = co_await ExecuteStorageCommand(
+                  request, reply_builder, nullptr, nullptr, false, &compact);
+            }
 #if LAVIK_ENABLE_TRACE
             trace.owner_done_ns_ = ReadTraceNowNanos();
             trace.origin_resume_ns_ = trace.owner_done_ns_;
@@ -13234,6 +13242,7 @@ Task<CommandReply> ExecuteCommandBody(
         }
       }
       co_return co_await ExecuteStorageCommand(request, reply_builder);
+    }
 
     case CommandKind::kFlushDb:
     case CommandKind::kFlushAll:

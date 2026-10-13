@@ -66,10 +66,10 @@ bool EqualsIgnoreCase(std::string_view left, std::string_view lower) {
   return true;
 }
 
-Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
-                                          const storage::Digest* digest,
-                                          storage::TxShardWrites* tx,
-                                          ReplyBuilder& reply_builder) {
+Task<CommandReply> ExecuteHashCommandImpl(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact = nullptr) {
   const auto& args = request.args_;
   if (request.kind_ == CommandKind::kHIncrBy ||
       request.kind_ == CommandKind::kHIncrByFloat) {
@@ -207,7 +207,10 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
   absl::StatusOr<storage::HashResult> result;
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
-  if (digest == nullptr) {
+  if (compact != nullptr) {
+    result = storage::ReadCompactHash(*compact, operation,
+                                      storage::ValueType::kHash);
+  } else if (digest == nullptr) {
     const storage::MutationPrecondition mutation_precondition =
         ClusterMutationPrecondition(request);
     result = co_await g_storage->ExecuteHash(
@@ -323,9 +326,11 @@ void InitHashCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
 }
 
-Task<CommandReply> ExecuteHashCommand(const CommandRequest& request,
-                                      ReplyBuilder& reply_builder) {
-  return ExecuteHashCommandImpl(request, nullptr, nullptr, reply_builder);
+Task<CommandReply> ExecuteHashCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact) {
+  return ExecuteHashCommandImpl(request, nullptr, nullptr, reply_builder,
+                                compact);
 }
 
 Task<CommandReply> ExecuteHashCommandLocked(const CommandRequest& request,

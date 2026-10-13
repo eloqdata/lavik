@@ -225,6 +225,14 @@ refused. Multi-key commands, `MULTI`/`EXEC` unions, and Lua declared keys all
 obey the single-slot constraint. The worker mapping inside the owning node is
 unchanged. See [Cluster data plane](06-cluster-data-plane.md).
 
+Standalone collection reads can use a command-table opt-in to capture one
+compact value on the connection worker before the owner hop. Their existing
+handlers parse arguments and evaluate that immutable payload without accessing
+owner-local state; GET frames its String payload directly. Ineligible records
+fall back to the owner, while EXEC/Lua and multi-key operations keep their
+transactional paths. The shared admission and physical lifetime contract is
+specified in [Storage reads and pins](04-storage-and-recovery.md#reads-and-pins).
+
 MGET acquires all requested keys in one shared-lock transaction and preserves
 their argument positions in the assembled reply. Each participating shard
 passes its local keys to `StorageEngine::BatchGetLocked`. Ordinary-size compact
