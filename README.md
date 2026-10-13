@@ -349,9 +349,8 @@ for the command suites exercised by the project. Operational differences include
 - Redis-style configuration files may enable automatic RDB snapshots with
   `save <seconds> <changes>` pairs; `save ""` disables them. Lavik keeps
   automatic snapshots disabled when no `save` directive is present.
-- Native high availability uses Lavik Meta; external Redis Sentinel control
-  of Lavik HA is outside the supported deployment model. See
-  [replication](docs/architecture/05-replication.md).
+- Lavik Meta manages native replication and automatic failover. See the
+  [cluster deployment guide](docs/operations/cluster-deployment.md).
 - A replication restart can require a full synchronization.
 - Raw block and SPDK paths require exclusive device ownership.
 
