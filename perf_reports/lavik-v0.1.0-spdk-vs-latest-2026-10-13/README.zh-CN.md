@@ -6,15 +6,11 @@
 
 10M 组的 Lavik GET 峰值为 **1145.8k QPS**（1280 连接，p99.9 **7.135 ms**）；SET 峰值为 **972.0k QPS**（1280 连接，p99.9 **7.199 ms**）。这些是单次测量结果。图中展示吞吐和 p99.9 延迟随连接数的变化。
 
-## 吞吐对比：Lavik 10M / 1B 与 Redis / Valkey
+## 吞吐与 p99.9 延迟对比：Lavik 10M / 1B 与 Redis / Valkey
 
-![Lavik 10M / 1B, Redis and Valkey throughput](combined-qps.svg)
+<img src="combined.svg" alt="GET and SET throughput and p99.9 latency" width="800">
 
 四组均展示 80–1280 连接。10M 组每点 30 秒，使用默认客户端随机种子；1B 组每点 60 秒，使用独立客户端随机种子。数据规模、时长及随机种子设置存在差异。
-
-## p99.9 延迟对比
-
-![Lavik 10M / 1B, Redis and Valkey p99.9 latency](combined-p999.svg)
 
 延迟为客户端完整测量窗口的 p99.9，单位为毫秒，越低越好。使用与吞吐图相同的 I/O 线程配置；横轴为 log₂ 连接数刻度。
 

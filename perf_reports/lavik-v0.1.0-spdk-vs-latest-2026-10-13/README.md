@@ -6,15 +6,11 @@ Test date: 2026-10-13. The downloaded **Lavik v0.1.0 standard x86_64 release** w
 
 In the 10M group, Lavik's peak GET was **1145.8k QPS** at 1280 connections (p99.9 **7.135 ms**); peak SET was **972.0k QPS** at 1280 connections (p99.9 **7.199 ms**). These are single-run observations. The charts show throughput and p99.9 latency across connection counts.
 
-## Throughput: Lavik 10M / 1B versus Redis / Valkey
+## Throughput and p99.9 latency: Lavik 10M / 1B versus Redis / Valkey
 
-![Lavik 10M / 1B, Redis and Valkey throughput](combined-qps.svg)
+<img src="combined.svg" alt="GET and SET throughput and p99.9 latency" width="800">
 
 All four series cover 80–1280 connections. The 10M group uses 30 seconds per point and default client seeds; the 1B group uses 60 seconds and distinct client seeds. Dataset size, duration and seed settings differ.
-
-## p99.9 latency comparison
-
-![Lavik 10M / 1B, Redis and Valkey p99.9 latency](combined-p999.svg)
 
 Latency is client-observed p99.9 over each full measurement window, in milliseconds; lower is better. The I/O-thread configurations match the throughput chart. The connection axis uses a log₂ scale.
 
