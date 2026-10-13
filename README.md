@@ -312,9 +312,11 @@ different dataset and duration and is excluded from this chart and table.
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
 
-### In-memory Redis and Valkey
+<a id="in-memory-redis-and-valkey"></a>
 
-#### 2 vCPUs: 100× more data, comparable throughput
+### In-memory Redis and Valkey: 100× more data, comparable throughput
+
+#### 2 vCPUs
 
 The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 compares Lavik v0.1.0 with Redis 8.10.2 and Valkey 9.1.2 on the same Azure
@@ -326,7 +328,7 @@ Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
 **215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
 Valkey holding 1 million keys entirely in memory, with **100 times as much data**.
 
-#### 16 vCPUs: 100× more data, comparable throughput
+#### 16 vCPUs
 
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
