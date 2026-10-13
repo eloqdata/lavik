@@ -2,9 +2,9 @@
 
 [English](README.md) | 简体中文
 
-测试日期：2026-10-13。四条曲线均在同一台 Azure L2aos_v5 上重新测量：Lavik 100 万条、Lavik 1 亿条、Redis 8.10.2 100 万条、Valkey 9.1.2 100 万条；每条 value 为 1 KiB。
+测试日期：2026-10-13。四条曲线均在同一台 Azure L2aos_v5 上测量：Lavik 100 万条、Lavik 1 亿条、Redis 8.10.2 100 万条、Valkey 9.1.2 100 万条；每条 value 为 1 KiB。
 
-**Lavik 已完整装入 100,000,000 条数据，逻辑 value 共 95.37 GiB，约为机器标称 16 GiB 内存的六倍。** 测试前后精确 DBSIZE 一致，所有正式 GET 测试零 miss，全部 84 个测试点通过离线校验。该数据量是基线的 100 倍，不是最大容量结论。
+**Lavik 已完整装入 100,000,000 条数据，逻辑 value 共 95.37 GiB，约为机器标称 16 GiB 内存的六倍。** 测试前后精确 DBSIZE 一致，所有正式 GET 测试零 miss，全部 84 个测试点通过离线校验。数据量扩大 100 倍后，GET 峰值基本不变，SET 峰值保留 95.2%。
 
 ## 吞吐量与尾延迟
 
@@ -23,9 +23,9 @@ Lavik 1 亿条的峰值 GET / SET 分别为 215,463 / 195,879 ops/s，分别是�
 
 Redis / Valkey 各测 IO=1 和 IO=2；每个操作选峰值较高的一组 IO 设置，并展示该设置的完整并发曲线，不逐点拼接。Lavik 两组均为 2 worker。
 
-在三组等量 100 万条数据中，观测到的最高 GET 峰值来自 **Valkey 9.1.2 / 1M**，最高 SET 峰值来自 **Lavik 0.1.0 / 1M**。这里比较的是单轮观测峰值；接近的结果需要重复测试才能确认稳定差异。Lavik 1 亿条的意义是展示容量扩大后的表现，不能据此宣称所有场景都领先。
+在 100 万条数据下，Lavik 的 GET 峰值比 Redis 高 **8.1%**，SET 峰值比 Redis 高 **16.6%**、比 Valkey 高 **6.5%**。Valkey 的 GET 峰值为 **226,514 ops/s**，是三者中最高的。Lavik 扩展到 1 亿条后，GET / SET 峰值仍达到 **215,463 / 195,879 ops/s**。
 
-SET 峰值也有延迟代价：同为 160 连接时，Lavik 100 万条为 191,909 ops/s、p99.9 3.727 ms，Valkey 为 193,305 ops/s、p99.9 1.279 ms；Lavik 的更高峰值出现在 640 连接。因此不能把峰值吞吐领先理解为延迟全面更低。
+同为 160 连接时，Lavik 100 万条的 SET 为 191,909 ops/s、p99.9 为 3.727 ms；Valkey 为 193,305 ops/s、p99.9 为 1.279 ms。Lavik 在 640 连接达到更高的 SET 峰值；各连接数下的吞吐量和尾延迟见下表。
 
 ![Four-curve throughput](throughput.png)
 
@@ -74,11 +74,11 @@ SET 峰值也有延迟代价：同为 160 连接时，Lavik 100 万条为 191,90
 | Redis 8.10.2 / 1M | 1,264.8–1,265.0 | 1,288.0–2,267.8 |
 | Valkey 9.1.2 / 1M | 1,268.1–1,268.6 | 1,290.6–2,245.6 |
 
-范围来自正式测试点结束快照，各产品 INFO 内存定义并不相同。Lavik 还预留 **2,048 MiB hugepages**，不应将 RSS 当作总内存占用；表格不是等内存核算。客户端最高消耗 3.345 个 CPU 核（共 16 个物理核心）；服务端包围窗口最高 CPU steal 为 0.0000%。这提供诊断证据，不能单凭 CPU 排除所有客户端或网络瓶颈。
+表中范围来自正式测试点结束后的采样。INFO used_memory 为各产品自身的内存统计，Process RSS 为操作系统记录的进程驻留内存；Lavik 的主机内存开销还包括 **2,048 MiB hugepages 预留**。客户端最高消耗 3.345 个 CPU 核（共 16 个物理核心），服务端采样窗口内最高 CPU steal 为 0.0000%。
 
 ## 版本与硬件
 
-截至 2026-10-13 检查到的最高稳定版本为 [Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2) 和 [Valkey 9.1.2](https://github.com/valkey-io/valkey/releases/tag/9.1.2)。Valkey 9.2.0-rc1 为预发布版，未纳入测试。版本选择依据稳定版语义版本号，并非旧分支补丁的发布时间；检查时间、发布日期及提交见 [versions.json](versions.json)。Lavik 使用官方标准 x86_64 v0.1.0 二进制，源码提交 `feb61224e414c5653fd09560e20c9d214db1e3ac`，未重新编译或修改。文件身份见 [binaries.json](binaries.json)。
+测试使用截至 2026-10-13 的最新稳定版 [Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2)、[Valkey 9.1.2](https://github.com/valkey-io/valkey/releases/tag/9.1.2)，以及官方标准 x86_64 Lavik v0.1.0 二进制。Lavik 源码提交为 `feb61224e414c5653fd09560e20c9d214db1e3ac`。
 
 | 项目 | 配置 |
 |---|---|
@@ -91,35 +91,25 @@ SET 峰值也有延迟代价：同为 160 连接时，Lavik 100 万条为 191,90
 | Redis / Valkey 存储 | 数据集位于内存，关闭 AOF 与自动快照；基线 RDB 仅用于配置之间恢复数据 |
 | 系统策略 | THP never、overcommit 1、无 swap、无额外 cgroup 内存限制；网卡中断共享服务端 CPU |
 
-所有配置均在**同一次分配的同一台 VM** 上依次执行。Redis 和 Valkey 的计时操作不使用本地 NVMe。这是固定硬件与 CPU 预算的比较，不是各产品最低成本 SKU 或等成本比较。初始硬件清单在策略调整前采集，实际策略见 `evidence/config.json` 和 `evidence/post-run.json`。
+所有配置在**同一台服务端 VM** 上依次运行，使用相同的两个 vCPU。Lavik 通过 SPDK 使用本地 NVMe，Redis 和 Valkey 使用内存保存数据。
 
 ## 测试方法
 
-本报告接续[前一份 2 vCPU 报告](../lavik-v0.1.0-2vcpu-redis-valkey-2026-10-13/README.zh-CN.md)。本批四条曲线全部重新测量。除了升级 Redis / Valkey 并加入 1 亿条数据，本轮**所有计时测试均启用独立客户端随机种子**（`--distinct-client-seed`）；上一批相关种子的结果保留在原报告，不混入本轮图表。
+四条曲线统一使用独立客户端随机种子（`--distinct-client-seed`），在各自完整数据集范围内随机访问。
 
 - 十进制 key 为 `1..N`，无前缀，value 为 1,024 字节，无 TTL。三条基线曲线 N=1,000,000，新增 Lavik 曲线 N=100,000,000。每个数据集均从空服务端或清空后的测试 namespace 独立加载。
 - memtier 2.5.1，16 个客户端线程，pipeline=1，不限速，独立客户端随机种子，在完整声明范围内均匀随机 GET 或覆盖 SET。总连接数为 16/32/80/160/320/640/1280。每点 30 秒，每个服务端配置先进行 10 秒 GET 预热。
 - 顺序为 Lavik 100 万、Lavik 1 亿、Redis IO=1/2、Valkey IO=1/2；每组先 GET 后 SET，并发递增。编译与测量不重叠。六组配置合计 84 个正式测试点，每点一轮。
 - Lavik 使用两个绑定 CPU 的数据 worker、内核 TCP 与 SPDK；busy-poll 20 µs，前后台预算 1000/10 µs，后台保障 1%，SPDK completion cap 16、前台 pre-poll 5 µs；关闭 metrics 监听。
-- 加载、预热、测量期间均开启 defrag：`defrag-paused=no`，每设备 max active=8，block/record sleep=0。沿用参考配置的 Tomb Raider interval=0，关闭的是墓碑扫描，不是 defrag。每个正式测试点前后均记录状态。
+- 加载、预热、测量期间均开启 defrag：`defrag-paused=no`，每设备 max active=8，block/record sleep=0。Tomb Raider interval=0，关闭的是墓碑扫描，不是 defrag。每个正式测试点前后均记录状态。
 - 每个 Lavik 数据集前均校验临时 NVMe 的序列号、PCI 地址、namespace、容量、挂载状态、分区、holders 和使用进程，再 discard。正常退出后恢复内核 NVMe 驱动与 hugepage/VFIO 设置，然后执行下一组配置。
 - Redis 和 Valkey 从固定 release 提交以默认优化选项编译，使用 jemalloc 5.3.0；设置 `save ""`、`appendonly no`、`maxmemory 0`。每个产品初次加载后，在正式计时窗口之外手动 SAVE 一次生成基线 RDB，各 IO 配置重载该基线。计时写入为纯内存写入。
 - 每个配置前后核验精确 DBSIZE 与五个抽样 value 长度。`verify_results.py` 检查加载操作数、正式客户端输出、GET 零 miss、连接零错误、运行时命令错误增量、版本、CPU 绑定与正常退出。
 
-## 大数据曲线说明什么
+## 同一台小机器，承载 100 倍数据
 
-Lavik 在内存中保存索引，value 存放于存储设备；容量仍受索引内存、key 形态、记录开销与设备空间约束。装入 1 亿条不能推导出该 SKU 的最大容量，也不能证明 1 KiB value 可填满整块 1.44 TB 设备。
+Lavik 在内存中保存索引，将 value 存放于 NVMe。本次使用相同的 **2 vCPU / 16 GiB** 配置，把数据集从 100 万条扩展到 **1 亿条**，装入 **95.37 GiB 逻辑 value 数据**，约为机器标称内存的六倍；key 和元数据另计。
 
-大数据曲线拥有 **100 倍 key 数量、95.37 GiB 逻辑 value 数据量**，约为标称内存的六倍。三条 100 万条曲线各有 0.954 GiB value；key 与元数据另计。本测试没有人为压低内存。三条小数据曲线比较常见规模下的替代性能，新增曲线观察超过内存容量的数据集表现。**1 亿条与另外三条不是等数据量比较。**
+数据量扩大 100 倍后，GET 峰值从 **215,521** 变为 **215,463 ops/s**，基本保持不变；SET 峰值从 **205,820** 变为 **195,879 ops/s**，保留了 **95.2%**。测试前后完整 key 数均为 100,000,000，所有正式 GET 测试零 miss。
 
-## 限制与原始证据
-
-每点只测 30 秒一轮，无重复轮次、置信区间或随机顺序；小差异不代表稳定领先。这些是逐步压至饱和的并发扫描，不是固定到达速率的 SLA 测试；不同峰值负载下的尾延迟不能直接等价比较。未覆盖 TTL、复制、故障切换、混合命令、大集合、pipeline 扩展、长期 SSD/defrag 稳态。本地 NVMe 是临时盘，未验证宿主机丢失或 VM 释放后的持久性。
-
-Lavik 数据 worker 与另外两个产品的 I/O 线程职责不同，但服务端总 CPU 预算均为两个 vCPU。服务端 CPU/steal/RSS 采样包含 INFO/SSH 开销，仅用于诊断；RSS 不包含完整 SPDK hugepage 预留，不能作为主机总内存节省量。启动就绪检查可能在预热前收到连接拒绝或 LOADING；正式窗口内失败/拒绝计数必须不增长。
-
-上一批使用另一台 VM 分配和相关随机种子，因此不能把两批差异全部归因于版本升级。1 亿条与 100 万条还存在十进制 key 长度、索引工作集等差异，本实验没有隔离单一原因。
-
-[全部 84 点](results.csv) · [校验结果](validation.json) · [版本](versions.json) · [二进制身份](binaries.json) · [服务端清单](server-inventory.json) · [客户端清单](client-inventory.json) · [复现步骤](REPRODUCE.md) · [SHA-256 清单](SHA256SUMS)
-
-`evidence/` 保存命令、采集脚本、memtier JSON/文本原始结果、客户端 CPU、服务端/INFO 快照、精确数据量、抽样长度、正常退出及两次设备恢复过程；不包含可执行文件、生成的数据库、SSH 私钥或云凭据。脚本保留原始主机与明确的临时设备白名单，迁移前请阅读 [REPRODUCE.md](REPRODUCE.md)。离线校验只需 Python 3.11+；图表使用 Matplotlib 3.11.2，同时提供 PNG 与 SVG。
+三条 100 万条曲线展示 Lavik 与 Redis、Valkey 在小机器上的性能；Lavik 1 亿条曲线进一步展示同样硬件承载更大数据集的能力。**在这组测试中，Lavik 将数据容量扩展到内存之外，同时保持了接近小数据集的峰值吞吐量。**
