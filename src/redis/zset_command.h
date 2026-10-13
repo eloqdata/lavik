@@ -41,8 +41,12 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest);
 
-Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
-                                      ReplyBuilder& reply_builder);
+// A supplied compact snapshot bypasses storage only for standalone read-only
+// commands. Its payload lease must outlive the returned task; replies own any
+// data retained after completion. A null snapshot uses ordinary owner storage.
+Task<CommandReply> ExecuteZSetCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact = nullptr);
 Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,
                                             const storage::Digest& digest,
                                             storage::TxShardWrites* tx,

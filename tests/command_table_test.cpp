@@ -1125,3 +1125,20 @@ TEST(CommandTableTest, ClusterArityLeavesSubcommandChecksToTheHandler) {
   CheckArity("cluster", 3, true);
   CheckArity("cluster", 6, true);
 }
+
+TEST(CommandTableTest, RemoteReadsAreExplicitSingleKeyReadOnlyCommands) {
+  for (const auto& spec : lavik::CommandSpecs()) {
+    if (spec.remote_read_type_ == lavik::storage::ValueType::kNone) {
+      EXPECT_FALSE(spec.remote_read_metadata_) << spec.name_;
+      continue;
+    }
+    EXPECT_NE(spec.flags_ & lavik::kCmdReadOnly, 0) << spec.name_;
+    EXPECT_NE(spec.flags_ & lavik::kCmdUsesDbGate, 0) << spec.name_;
+    EXPECT_EQ(spec.flags_ & (lavik::kCmdWrite | lavik::kCmdDynamicWrite |
+                             lavik::kCmdMayBlock | lavik::kCmdMultiShard),
+              0)
+        << spec.name_;
+    EXPECT_GT(spec.first_key_, 0) << spec.name_;
+    EXPECT_EQ(spec.first_key_, spec.last_key_) << spec.name_;
+  }
+}

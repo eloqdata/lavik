@@ -24,8 +24,12 @@ class ReplyBuilder;
 
 void InitSetCommandStorage(storage::StorageEngine* engine);
 
-Task<CommandReply> ExecuteSetCommand(const CommandRequest& request,
-                                     ReplyBuilder& reply_builder);
+// A supplied compact snapshot bypasses storage only for standalone read-only
+// commands. Its payload lease must outlive the returned task; replies own any
+// data retained after completion. A null snapshot uses ordinary owner storage.
+Task<CommandReply> ExecuteSetCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact = nullptr);
 
 Task<CommandReply> ExecuteSetCommandLocked(const CommandRequest& request,
                                            const storage::Digest& digest,

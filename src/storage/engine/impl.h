@@ -2198,7 +2198,7 @@ class StorageEngine::Impl {
                   std::uint64_t block_id);
   void UnpinRemoteBlock(BlockState& state, unsigned owner,
                         std::uint64_t block_id);
-  void PrepareRemoteGet(RemoteGetAwaitable& result);
+  void PrepareRemoteRead(RemoteReadAwaitable& result);
   void FinalizeWorker(unsigned worker_id) noexcept;
   bool AbandonWorkerStateForProcessExit() noexcept;
 
@@ -3350,7 +3350,7 @@ class StorageEngine::Impl {
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
-  friend class StorageEngine::RemoteGetAwaitable;
+  friend class StorageEngine::RemoteReadAwaitable;
 
   struct DurableSystemState {
     std::uint64_t generation_ = 0;

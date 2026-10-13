@@ -865,11 +865,12 @@ std::size_t KeyIndex(CommandKind kind) {
   return kind == CommandKind::kXGroup || kind == CommandKind::kXInfo ? 2 : 1;
 }
 
-Task<absl::Status> RunCompact(const CommandRequest& request,
-                              const storage::Digest* digest,
-                              storage::TxShardWrites* tx, bool read_only,
-                              const storage::CompactValueCallback& callback,
-                              storage::ReplicationCommandAppend* replication) {
+Task<absl::Status> RunCompact(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, bool read_only,
+    const storage::CompactValueCallback& callback,
+    storage::ReplicationCommandAppend* replication,
+    const storage::CompactReadResult* compact = nullptr) {
   const std::string_view key = request.args_[KeyIndex(request.kind_)];
   std::optional<MemoryReservation> append_admission;
   if (request.kind_ == CommandKind::kXAdd) {
@@ -1087,6 +1088,8 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
     }
     if (valid) access.stream_group_ = std::move(group);
   }
+  if (compact != nullptr)
+    co_return storage::ApplyCompactRead(*compact, callback);
   if (!digest) {
     const storage::MutationPrecondition mutation_precondition =
         ClusterMutationPrecondition(request);
@@ -1267,21 +1270,34 @@ Task<absl::StatusOr<std::shared_ptr<StreamRangeReplyState>>>
 PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
                         const storage::Digest* locked_digest,
                         const storage::StreamRangeAccess& range,
-                        RespVersion version) {
-  const auto digest =
-      locked_digest ? *locked_digest : storage::ComputeDigest(key);
+                        RespVersion version,
+                        const storage::CompactReadResult* compact = nullptr) {
   tx::TxShard::Guard guard;
-  if (!locked_digest)
-    guard = co_await tx::CurrentTxShard().AcquireKey(
-        db, tx::FingerprintOf(digest), tx::LockMode::kShared,
-        lavik::storage::RedisSlot(key));
-  auto source =
-      co_await g_storage->ReadValueForTransferLocked(db, key, digest, range);
-  if (!source.ok()) co_return source.status();
-  if (source->metadata_.value_type_ != storage::ValueType::kStream)
-    co_return absl::InvalidArgumentError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
-  const auto compact_bytes = source->metadata_.encoded_.size();
+  absl::StatusOr<storage::TransferValue> source;
+  std::optional<storage::CompactValueView> compact_view;
+  if (compact != nullptr) {
+    if (!compact->ok()) co_return compact->status();
+    compact_view = **compact;
+    if (!compact_view) co_return absl::NotFoundError("key not found");
+  } else {
+    const auto digest =
+        locked_digest ? *locked_digest : storage::ComputeDigest(key);
+    if (!locked_digest)
+      guard = co_await tx::CurrentTxShard().AcquireKey(
+          db, tx::FingerprintOf(digest), tx::LockMode::kShared,
+          lavik::storage::RedisSlot(key));
+    source =
+        co_await g_storage->ReadValueForTransferLocked(db, key, digest, range);
+    if (!source.ok()) co_return source.status();
+    if (source->metadata_.value_type_ != storage::ValueType::kStream)
+      co_return absl::InvalidArgumentError(
+          "WRONGTYPE Operation against a key holding the wrong kind of value");
+    if (!source->reader_)
+      compact_view = storage::CompactValueView{
+          .encoded_ = source->metadata_.encoded_,
+          .logical_size_ = source->metadata_.logical_size_};
+  }
+  const auto compact_bytes = compact_view ? compact_view->encoded_.size() : 0;
   if (compact_bytes > (SIZE_MAX - sizeof(StreamRangeReplyState) - 4096) / 12)
     co_return absl::ResourceExhaustedError(
         "Stream reply snapshot size overflow");
@@ -1293,10 +1309,8 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
   state->state_charge_.Adopt(&*reservation, bytes);
   state->range_ = range;
   state->version_ = version;
-  if (!source->reader_) {
-    auto decoded = Decode(storage::CompactValueView{
-        .encoded_ = source->metadata_.encoded_,
-        .logical_size_ = source->metadata_.logical_size_});
+  if (compact_view) {
+    auto decoded = Decode(compact_view);
     if (!decoded.ok()) co_return decoded.status();
     state->compact_ = std::move(decoded->entries_);
     if (range.reverse_)
@@ -1311,9 +1325,10 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
   co_return state;
 }
 
-Task<CommandReply> ExecuteStreamRangeReply(const CommandRequest& request,
-                                           const storage::Digest* digest,
-                                           ReplyBuilder& builder) {
+Task<CommandReply> ExecuteStreamRangeReply(
+    const CommandRequest& request, const storage::Digest* digest,
+    ReplyBuilder& builder,
+    const storage::CompactReadResult* compact = nullptr) {
   const auto& a = request.args_;
   storage::StreamRangeAccess range;
   range.reverse_ = request.kind_ == CommandKind::kXRevRange;
@@ -1344,8 +1359,8 @@ Task<CommandReply> ExecuteStreamRangeReply(const CommandRequest& request,
     if (count <= 0) co_return Built(builder.AppendNullArray());
     range.count_ = count;
   }
-  auto state = co_await PrepareStreamRangeReply(request.db_id_, a[1], digest,
-                                                range, request.resp_version_);
+  auto state = co_await PrepareStreamRangeReply(
+      request.db_id_, a[1], digest, range, request.resp_version_, compact);
   if (!state.ok()) {
     if (state.status().code() == absl::StatusCode::kNotFound)
       co_return Built(builder.AppendArrayHeader(0));
@@ -1956,15 +1971,16 @@ Task<CommandReply> ExecuteRead(
   }
 }
 
-Task<CommandReply> ExecuteImpl(const CommandRequest& request,
-                               const storage::Digest* digest,
-                               storage::TxShardWrites* tx,
-                               ReplyBuilder& builder,
-                               std::uint64_t client_id = 0) {
+Task<CommandReply> ExecuteImpl(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, ReplyBuilder& builder,
+    std::uint64_t client_id = 0,
+    const storage::CompactReadResult* compact = nullptr) {
   const auto& a = request.args_;
   if (request.kind_ == CommandKind::kXRange ||
       request.kind_ == CommandKind::kXRevRange)
-    co_return co_await ExecuteStreamRangeReply(request, digest, builder);
+    co_return co_await ExecuteStreamRangeReply(request, digest, builder,
+                                               compact);
   if (request.kind_ == CommandKind::kXGroup && a.size() >= 2 &&
       (EqualCi(a[1], kRestoreGroupSubcommand) ||
        EqualCi(a[1], kLegacyRestoreGroupSubcommand))) {
@@ -2151,7 +2167,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   storage::Digest inspection_digest;
   std::shared_ptr<StreamRangeReplyState> info_entries;
   if (xinfo_full) {
-    if (!digest) {
+    if (!digest && compact == nullptr) {
       inspection_digest = storage::ComputeDigest(a[2]);
       inspection_guard = co_await tx::CurrentTxShard().AcquireKey(
           request.db_id_, tx::FingerprintOf(inspection_digest),
@@ -2162,7 +2178,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         request.db_id_, a[2], digest,
         storage::StreamRangeAccess{.count_ = xinfo_count == 0 ? UINT64_MAX
                                                               : xinfo_count},
-        request.resp_version_);
+        request.resp_version_, compact);
     if (!prepared.ok())
       co_return Built(StorageError(builder, prepared.status()));
     info_entries = std::move(*prepared);
@@ -3028,7 +3044,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
 
   absl::Status status =
       co_await RunCompact(request, digest, tx, read_only, callback,
-                          replication ? &*replication : nullptr);
+                          replication ? &*replication : nullptr, compact);
   if (!status.ok()) co_return Built(StorageError(builder, status));
   if (!captured_group_args.empty()) {
     CaptureReplicationCommand(request, std::move(captured_group_args));
@@ -3356,10 +3372,11 @@ void InitStreamCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
 }
 
-Task<CommandReply> ExecuteStreamCommand(const CommandRequest& request,
-                                        ReplyBuilder& reply_builder,
-                                        std::uint64_t client_id) {
-  return ExecuteImpl(request, nullptr, nullptr, reply_builder, client_id);
+Task<CommandReply> ExecuteStreamCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, const storage::CompactReadResult* compact) {
+  return ExecuteImpl(request, nullptr, nullptr, reply_builder, client_id,
+                     compact);
 }
 Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               const storage::Digest& digest,

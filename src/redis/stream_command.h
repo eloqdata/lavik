@@ -34,9 +34,13 @@ struct StreamExecKey {
   std::uint16_t arg_ = 0;
 };
 
-Task<CommandReply> ExecuteStreamCommand(const CommandRequest& request,
-                                        ReplyBuilder& reply_builder,
-                                        std::uint64_t client_id = 0);
+// A supplied compact snapshot bypasses storage only for standalone read-only
+// commands. Its payload lease must outlive the returned task; replies own any
+// data retained after completion. A null snapshot uses ordinary owner storage.
+Task<CommandReply> ExecuteStreamCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id = 0,
+    const storage::CompactReadResult* compact = nullptr);
 Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               const storage::Digest& digest,
                                               storage::TxShardWrites* tx,

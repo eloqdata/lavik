@@ -53,6 +53,16 @@ absl::StatusOr<OrderedCollectionMutationPlan> PrepareOrderedGroups(
 
 }  // namespace
 
+absl::Status ApplyCompactRead(const CompactReadResult& value,
+                              const CompactValueCallback& callback) {
+  if (!value.ok()) return value.status();
+  auto result = callback(*value);
+  if (!result.ok()) return result.status();
+  if (result->changed_)
+    return absl::InternalError("read-only compact operation mutated");
+  return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
     bool read_only, const CompactValueCallback& callback, std::uint64_t now_ms,

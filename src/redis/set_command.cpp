@@ -91,10 +91,10 @@ void AppendBulkArray(ReplyBuilder& builder,
   }
 }
 
-Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
-                                         const storage::Digest* digest,
-                                         storage::TxShardWrites* tx,
-                                         ReplyBuilder& reply_builder) {
+Task<CommandReply> ExecuteSetCommandImpl(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact = nullptr) {
   const auto& args = request.args_;
   if (request.kind_ == CommandKind::kSPop) {
     MarkReplicationCommandHandled(request);
@@ -184,7 +184,10 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
   absl::StatusOr<storage::HashResult> result;
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
-  if (digest == nullptr) {
+  if (compact != nullptr) {
+    result =
+        storage::ReadCompactHash(*compact, operation, storage::ValueType::kSet);
+  } else if (digest == nullptr) {
     const storage::MutationPrecondition mutation_precondition =
         ClusterMutationPrecondition(request);
     result = co_await g_storage->ExecuteSet(
@@ -638,9 +641,11 @@ void InitSetCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
 }
 
-Task<CommandReply> ExecuteSetCommand(const CommandRequest& request,
-                                     ReplyBuilder& reply_builder) {
-  return ExecuteSetCommandImpl(request, nullptr, nullptr, reply_builder);
+Task<CommandReply> ExecuteSetCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact) {
+  return ExecuteSetCommandImpl(request, nullptr, nullptr, reply_builder,
+                               compact);
 }
 
 Task<CommandReply> ExecuteSetCommandLocked(const CommandRequest& request,

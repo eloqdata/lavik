@@ -342,10 +342,10 @@ void InitListCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
 }
 
-Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
-                                                const storage::Digest* digest,
-                                                storage::TxShardWrites* tx,
-                                                ReplyBuilder& reply_builder) {
+Task<CommandReply> ExecuteSingleListCommandImpl(
+    const CommandRequest& request, const storage::Digest* digest,
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact = nullptr) {
   const auto& args = request.args_;
   storage::ListOperation op;
   switch (request.kind_) {
@@ -479,7 +479,9 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
   absl::StatusOr<storage::ListResult> result;
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
-  if (digest == nullptr) {
+  if (compact != nullptr) {
+    result = storage::ReadCompactList(*compact, op);
+  } else if (digest == nullptr) {
     const storage::MutationPrecondition mutation_precondition =
         ClusterMutationPrecondition(request);
     result = co_await g_storage->ExecuteList(
@@ -567,9 +569,11 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
   co_return BuiltReply(reply_builder.AppendError("ERR unreachable List reply"));
 }
 
-Task<CommandReply> ExecuteSingleListCommand(const CommandRequest& request,
-                                            ReplyBuilder& reply_builder) {
-  return ExecuteSingleListCommandImpl(request, nullptr, nullptr, reply_builder);
+Task<CommandReply> ExecuteSingleListCommand(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    const storage::CompactReadResult* compact) {
+  return ExecuteSingleListCommandImpl(request, nullptr, nullptr, reply_builder,
+                                      compact);
 }
 
 Task<CommandReply> ExecuteSingleListCommandLocked(const CommandRequest& request,
