@@ -8,7 +8,7 @@ Aerospike uses default performance settings and original host policy. Lavik uses
 
 Measured unlimited total-throughput differences relative to Aerospike: A **+4.36%**, B **+25.13%**, C **+28.76%**, D **+25.56%**.
 
-Bars use the left total-QPS axis; lines use the right per-operation p99.9-latency axis (ms). Each figure uses its own axis ranges. Reads and writes are measured separately; C has no writes. Operation cells in the tables show **operation QPS; p99 / p99.9 (ms)**.
+Each figure shows total QPS above and per-operation p99.9 latency (ms) below, both as grouped bars. Color identifies the database; solid bars are READ and hatched bars are writes. C has no writes. Axis ranges differ between rate settings. Operation cells in the tables show **operation QPS; p99 / p99.9 (ms)**.
 
 ## 100K target
 
@@ -94,22 +94,201 @@ Lavik is the unmodified standard release package: `v0.1.0 / feb61224e414c5653fd0
 - Lavik defrag is enabled throughout load, recovery, warmup and measurement, with 8 active jobs/device and no additional sleep. `CONFIG GET defrag-paused` and `DEFRAG STATUS` are captured per phase. Tomb Raider and active expiration use release defaults in this YCSB group. Periodic 100 ms flushing is not a per-write synchronous durability guarantee.
 - CPU numbers are logical CPUs: workers 0–11 occupy six physical cores and system/IRQ CPUs 12–15 occupy two separate physical cores (SMT2). Source-based routing sends replies from 10.84.1.4 through eth1/table 101; the management interface is not the benchmark reply path.
 - QPS = successful operations / actual YCSB RunTime. Total QPS sums successful reads and writes. Each operation's p99/p99.9 comes from its complete-window ordinary HDR histogram, not an average of interval percentiles; intended histograms remain in raw logs. Equal YCSB worker counts do not imply equal TCP connection counts.
-- Three setup attempts failed before any records were inserted: missing Aerospike runtime directories, a missing `python` launcher alias, then listener readiness preceding partition ownership. Their logs are retained under `evidence/setup-failure-*`. Runtime prerequisites were completed and readiness now waits for all 4096 master partitions. The Java bindings and database performance settings were unchanged. None of these setup attempts is a measured window.
-- The custom YCSB source is `eloqdata/YCSB@a47bf01c4f197d2ff2eecbbebd9743da5a1cae47`, with the recorded LAVIK.HREPLACE command-name patch. The exact binding source and JAR hashes are archived.
+- The client uses [eloqdata/YCSB](https://github.com/eloqdata/YCSB) commit `a47bf01c4f197d2ff2eecbbebd9743da5a1cae47`. In RedisClient.java and RedisClientTest.java, replace `KEYLANE.HREPLACE` with `LAVIK.HREPLACE` and `keylane.hreplace` with `lavik.hreplace` before building. The bindings use Aerospike Java client 3.1.2 and Jedis 3.9.0.
 - One five-minute measurement per cell; run-to-run variability and confidence intervals are not estimated. Product order is fixed. CPU allocation, host policies, caches and persistence differ between the two requested deployments, so the result is not a single-variable comparison.
 
 - Aerospike: 2026-10-13T09:54:41Z – 2026-10-13T10:35:42Z (UTC), 8 measured windows.
 - Lavik: 2026-10-13T10:39:09Z – 2026-10-13T11:20:04Z (UTC), 8 measured windows.
 
-At completion the original CPU/IRQ policy is restored, Lavik has stopped cleanly, and Aerospike has recovered with its final data verified. These counts describe the end of the YCSB matrix. After complete evidence archival and offline verification, the six scratch devices were rebuilt with authorization for the subsequent latest-peer and Lavik 1B batch; the YCSB datasets are no longer retained.
+## Run commands
 
-## Evidence and reproduction
+These Bash commands use the measured settings; adapt paths, addresses and NIC PCI identity to the deployment. Start with two independent, fully zeroed empty raw RAID0 partitions, exposed as `aerospike-device` and `lavik-device`. Run databases sequentially and load each once. Preserve the original host policy for Aerospike, then apply Lavik isolation; restore the original values afterward.
 
-[Results JSON](results.json) · [Operation CSV](summary.csv) · [Binary identity](binaries.json) · [Server inventory](server-inventory.json) · [Client inventory](client-inventory.json) · [Network path](network-path.json) · [YCSB source](evidence/client-source/source.json) · [Client JAR hashes](evidence/client-jars.sha256) · [All phases](evidence/phases.json) · [Runner](evidence/runner.py) · [Host policy](evidence/host_policy.py) · [Client commands](evidence/ycsb_client.py) · [Effective Aerospike configuration](evidence/aerospike.conf) · [Storage](evidence/storage-after.json) · [Completion](evidence/complete.json) · [Checksums](SHA256SUMS)
+### Aerospike configuration
 
-```sh
-python3 perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/verify_report.py
-python3 perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/build_assets.py
+Save as `/mnt/dev/benchmark/release010/ycsb/aerospike.conf`:
+
+```conf
+# Single-node YCSB device namespace. Performance settings use server defaults.
+service {
+    cluster-name ycsb-default-20261013
+}
+logging {
+    console {
+        context any info
+    }
+}
+network {
+    service {
+        address 10.84.1.4
+        port 3000
+    }
+    heartbeat {
+        address 127.0.0.1
+        mode mesh
+        port 3002
+    }
+    fabric {
+        address 127.0.0.1
+        port 3001
+    }
+    admin {
+        address 127.0.0.1
+        port 3003
+    }
+}
+namespace ycsb {
+    replication-factor 1
+    storage-engine device {
+        device /mnt/dev/benchmark/release010/ycsb/aerospike-device
+    }
+}
 ```
 
-Offline verification needs Python 3.11+; figure generation needs Matplotlib 3.11.2. The verifier checks both fresh loads, all 32 phases, 16 measured windows, 28 operation rows, per-phase host/database policy, both language tables and archived file hashes. It never starts databases or opens raw devices. A live rerun needs new scratch media and unused D insert ranges. Private keys, executable downloads and generated databases are not included.
+### Start the databases
+
+Start Aerospike first. After its complete matrix, stop Aerospike, apply the CPU/IRQ isolation below, then start Lavik. Create the required log and runtime directories before starting.
+
+```bash
+sudo systemd-run \
+  --unit aerospike-ycsb-default-20261013.service \
+  --collect \
+  -p TimeoutStopSec=300 \
+  -p StandardOutput=append:/mnt/dev/benchmark/release010/ycsb/aerospike-server.stdout \
+  -p StandardError=inherit \
+  -p SendSIGKILL=no \
+  -p LimitNOFILE=100000 /mnt/dev/benchmark/release010/aerospike-package/usr/bin/asd \
+  --config-file /mnt/dev/benchmark/release010/ycsb/aerospike.conf \
+  --foreground
+```
+
+```bash
+sudo systemd-run \
+  --unit lavik-ycsb-tuned-20261013.service \
+  --collect \
+  -p TimeoutStopSec=300 \
+  -p StandardOutput=append:/mnt/dev/benchmark/release010/ycsb/hreplace-server.stdout \
+  -p StandardError=inherit \
+  -p SendSIGKILL=no \
+  --slice=lavik-bench.slice \
+  -p AllowedCPUs=0-11 \
+  -p CPUAffinity=0-11 \
+  -p LimitNOFILE=20000 /mnt/dev/benchmark/release010/downloads/lavik-v0.1.0-linux-x86_64/lavik \
+  --bind 10.84.1.4 \
+  --port 16379 \
+  --metrics-port 19100 \
+  --threads 12 \
+  --pin-workers \
+  --shutdown-checkpoint \
+  --network kernel \
+  --storage uring \
+  --data-file /mnt/dev/benchmark/release010/ycsb/lavik-device \
+  --flush-max-ms 100 \
+  --defrag-max-active-per-device 8 \
+  --defrag-sleep-ms 0 \
+  --defrag-record-sleep-us 0 \
+  --log-dir /mnt/dev/benchmark/release010/ycsb/lavik-server-logs
+```
+
+### Lavik CPU/IRQ isolation
+
+irqbalance was inactive on this host. These commands combine with the service settings above to implement 12+4 isolation.
+
+```bash
+# Server, only after Aerospike has stopped; dedicated 16-logical-CPU test host.
+sudo systemctl set-property --runtime system.slice AllowedCPUs=12-15
+sudo systemctl set-property --runtime user.slice AllowedCPUs=12-15
+sudo systemctl set-property --runtime init.scope AllowedCPUs=12-15
+printf 'f000\n' | sudo tee /sys/devices/virtual/workqueue/cpumask
+
+# This PCI identity must match the benchmark NIC on the current boot.
+sudo python3 - <<'PYCODE'
+from pathlib import Path
+import os
+pci = '67bf:00:02.0'
+irqs = [line.split(':', 1)[0].strip()
+        for line in Path('/proc/interrupts').read_text().splitlines() if pci in line]
+assert len(irqs) == 17, irqs
+for i, irq in enumerate(irqs):
+    Path('/proc/irq', irq, 'smp_affinity_list').write_text(str(12 + i % 4) + '\n')
+# Migrate existing userspace threads; leave kernel threads to their own policy.
+for stat in Path('/proc').glob('[0-9]*/task/[0-9]*/stat'):
+    try:
+        raw = stat.read_text()
+        comm = raw[raw.index('(')+1:raw.rindex(')')]
+        flags = int(raw[raw.rindex(')')+2:].split()[6])
+        if flags & 0x04000000 or comm.startswith('kworker/'):
+            continue
+        os.sched_setaffinity(int(stat.parent.name), {12, 13, 14, 15})
+    except (OSError, ProcessLookupError):
+        pass
+PYCODE
+```
+
+### YCSB load, warmup and measurement
+
+```bash
+# On the client: Java 17 and the custom YCSB distribution are installed.
+# Run the complete load/recovery/matrix for Aerospike first, then for Lavik.
+DB=aerospike                       # use DB=lavik for the second database
+if [ "$DB" = aerospike ]; then
+  YCSB_ROOT=/opt/benchmark/release010/ycsb-aerospike-dist
+  BINDING=aerospike
+  DB_ARGS=(-p as.host=10.84.1.4 -p as.port=3000 -p as.namespace=ycsb -p as.timeout=10000)
+else
+  YCSB_ROOT=/opt/benchmark/ycsb-pr318-dist
+  BINDING=redis
+  DB_ARGS=(-p redis.host=10.84.1.4 -p redis.port=16379 -p redis.scanindex=none
+           -p redis.timeout=10000 -p redis.cluster=false)
+fi
+mkdir -p results
+COMMON=(-s -threads 256 -P "$YCSB_ROOT/workloads/workloada"
+  -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant
+  -p readallfields=true -p writeallfields=true -p insertorder=hashed
+  -p measurementtype=hdrhistogram -p measurement.interval=both
+  -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10)
+
+# Fresh load: run once on an empty database.
+taskset -c 0-15 "$YCSB_ROOT/bin/ycsb" load "$BINDING" "${COMMON[@]}" "${DB_ARGS[@]}" \
+  -p recordcount=100000000 -p insertstart=0 -p insertcount=100000000 \
+  > "results/$DB-load.log" 2>&1
+```
+
+After loading, verify exactly 100,000,000 successful INSERTs, server record counts and field lengths. Stop cleanly, restart with the same launch command, and confirm recovered samples before running the matrix below. Stop with `sudo systemctl stop aerospike-ycsb-default-20261013.service` or `sudo systemctl stop lavik-ycsb-tuned-20261013.service`; do not recreate or zero the partitions. Wait until all 4096 Aerospike master partitions are ready, or Lavik recovery is complete with the expected DBSIZE.
+
+```bash
+# Run after load/recovery verification; retain this client shell's variables.
+if [ "$DB" = lavik ]; then
+  DB_ARGS+=(-p redis.updatecommand=lavik.hreplace)
+fi
+for workload in C A B D; do
+  case "$workload" in
+    A) READ=0.5;  UPDATE=0.5;  INSERT=0 ;;
+    B) READ=0.95; UPDATE=0.05; INSERT=0 ;;
+    C) READ=1;    UPDATE=0;    INSERT=0 ;;
+    D) READ=0.95; UPDATE=0;    INSERT=0.05 ;;
+  esac
+  for target in 100000 0; do
+    RATE=()
+    if [ "$target" -gt 0 ]; then RATE=(-target "$target"); fi
+    for phase in warmup measured; do
+      LIMIT=(-p operationcount=1000000)
+      if [ "$phase" = measured ]; then
+        LIMIT=(-p operationcount=2000000000 -p maxexecutiontime=300)
+      fi
+      RECORDS=(-p recordcount=100000000)
+      if [ "$workload" = D ]; then
+        if [ "$target" -gt 0 ]; then start=2000000000; else start=6000000000; fi
+        if [ "$phase" = measured ]; then start=$((start + 2000000000)); fi
+        RECORDS=(-p "recordcount=$start" -p insertstart=0 -p insertcount=100000000)
+      fi
+      taskset -c 0-15 "$YCSB_ROOT/bin/ycsb" run "$BINDING" \
+        "${COMMON[@]}" "${DB_ARGS[@]}" "${RATE[@]}" "${LIMIT[@]}" "${RECORDS[@]}" \
+        -p requestdistribution=uniform -p "readproportion=$READ" \
+        -p "updateproportion=$UPDATE" -p "insertproportion=$INSERT" \
+        -p scanproportion=0 -p readmodifywriteproportion=0 \
+        > "results/$DB-$workload-$target-$phase.log" 2>&1
+    done
+  done
+done
+```

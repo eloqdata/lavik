@@ -1,6 +1,0 @@
-{
-  "utc": "2026-10-13T09:42:18Z",
-  "traceback": "Traceback (most recent call last):\n  File \"/mnt/dev/benchmark/release010/ycsb/runner.py\", line 386, in main\n    load(mode)\n  File \"/mnt/dev/benchmark/release010/ycsb/runner.py\", line 296, in load\n    parsed = bench.parse(ROOT / f'{mode}-load.log', COUNT)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/dev/benchmark/release010/ycsb/ycsb_client.py\", line 149, in parse\n    raise RuntimeError(f\"Incomplete run {path}: runtime={runtime}, attempted={attempted}\")\nRuntimeError: Incomplete run /mnt/dev/benchmark/release010/ycsb/aerospike-load.log: runtime=0, attempted=0\n",
-  "mode": "aerospike",
-  "completed": 0
-}
