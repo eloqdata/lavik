@@ -423,6 +423,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
           store, partition, db_id, key, digest, object,
           directory.groups()[begin_page].id_, offset, remaining));
     } else {
+      const auto groups = directory.groups();
       for (std::size_t i = begin_page; i < end_page;) {
         ListReadBatch batch(store.worker_);
         for (std::size_t j = 0; j < ListReadBatch::kWidth && i + j < end_page;
@@ -435,7 +436,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
                 "OOM grouped List read batch admission");
             break;
           }
-          const auto& route = directory.groups()[i + j];
+          const auto& route = groups[i + j];
           const auto take =
               std::min<std::uint64_t>(remaining, route.item_count_ - offset);
           batch.Add(LoadOrderedListRange(store, partition, db_id, key, digest,

@@ -114,7 +114,7 @@ TEST(MetaAuditStore, SameIndexDifferentContentFailsStop) {
   ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
   // The same raft log index carrying different content means the apply layer
   // lost the index/record correspondence: an implementation bug, fail-stop.
-  EXPECT_DEATH(store.Append(MakeAuditRecord(1, "SetSlotMap(...)")), "");
+  EXPECT_DEATH((void)store.Append(MakeAuditRecord(1, "SetSlotMap(...)")), "");
 }
 
 TEST(MetaAuditStore, OutOfOrderNewIndexFailsStop) {
@@ -122,7 +122,7 @@ TEST(MetaAuditStore, OutOfOrderNewIndexFailsStop) {
   ASSERT_TRUE(store.Append(MakeAuditRecord(5)).ok());
   // A NEW record below the window's newest index: apply is ordered by log
   // index, so this is an implementation bug, fail-stop.
-  EXPECT_DEATH(store.Append(MakeAuditRecord(3)), "");
+  EXPECT_DEATH((void)store.Append(MakeAuditRecord(3)), "");
 }
 
 TEST(MetaAuditStore, RejectsOverCapFields) {
@@ -158,7 +158,7 @@ TEST(MetaAuditStore, StrictExportFullWindowFailsStopIfGateIsBypassed) {
   ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
   ASSERT_TRUE(store.Append(MakeAuditRecord(2)).ok());
   EXPECT_TRUE(store.NeedsExport());
-  EXPECT_DEATH(store.Append(MakeAuditRecord(3)), "");
+  EXPECT_DEATH((void)store.Append(MakeAuditRecord(3)), "");
 }
 
 TEST(MetaAuditStore, DisabledSuppressesOrdinaryRecordsButForcedRecordRemains) {
@@ -255,7 +255,7 @@ TEST(MetaAuditStore, AppendAtOrBelowPrunedFloorFailsStop) {
   // Re-applying a pruned index means replay below the snapshot boundary: an
   // implementation bug, fail-stop (the prune is committed state, so a correct
   // recovery never revisits these indexes).
-  EXPECT_DEATH(store.Append(MakeAuditRecord(1)), "");
+  EXPECT_DEATH((void)store.Append(MakeAuditRecord(1)), "");
 }
 
 TEST(MetaAuditStore, SerializationRoundTripPreservesWindow) {

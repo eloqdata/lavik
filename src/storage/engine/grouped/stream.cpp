@@ -913,7 +913,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
     if (!status.ok()) co_return status;
     std::string group_header(*value);
     StreamGroupSummary summary{.name_ = name,
-                               .consumers_ = Count(*value, value->size() - 4)};
+                               .consumers_ = Count(*value, value->size() - 4),
+                               .first_pending_ = {},
+                               .last_pending_ = {},
+                               .consumer_pending_ = {}};
     auto count = co_await cache.Required(prefix + '\2');
     if (!count.ok()) co_return count.status();
     auto count_value = StreamRecordPayload(*count);

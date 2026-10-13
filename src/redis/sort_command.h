@@ -25,10 +25,10 @@ namespace lavik {
 class ReplyBuilder;
 
 struct SortExecKey {
-  storage::Digest digest_;
-  std::uint16_t owner_ = 0;
+  // EXEC supplies a command argument; scripts supply a declared key name.
+  // The SORT adapter derives the digest and owner from that selected name.
   std::uint16_t arg_ = 0;
-  std::string_view name_;
+  std::string_view name_{};
 };
 
 void InitSortCommandStorage(storage::StorageEngine* engine);

@@ -6580,8 +6580,7 @@ Task<std::string> ExecuteExecSequentialSort(
   std::vector<SortExecKey> sort_keys;
   sort_keys.reserve(keys.size());
   for (const ExecKey& key : keys) {
-    sort_keys.push_back(SortExecKey{
-        .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+    sort_keys.push_back(SortExecKey{.arg_ = key.arg_});
   }
   co_return co_await ExecuteSortCommandLocked(command, sort_keys, tx_writes,
                                               deterministic_set_order);
