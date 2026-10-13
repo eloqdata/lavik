@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/warmup",
+  "kind": "GET",
+  "keys": 10000000,
+  "connections": 640,
+  "qps": 1130019.69,
+  "avg_ms": 0.56615,
+  "p50_ms": 0.519,
+  "p99_ms": 2.447,
+  "p999_ms": 4.479,
+  "p9999_ms": 9.599
+}

@@ -1,0 +1,12 @@
+{
+  "name": "storage/lavik-spdk/set-c640",
+  "kind": "SET",
+  "keys": 1000000000,
+  "connections": 640,
+  "qps": 757742.41,
+  "avg_ms": 0.84429,
+  "p50_ms": 0.599,
+  "p99_ms": 4.927,
+  "p999_ms": 7.711,
+  "p9999_ms": 17.663
+}

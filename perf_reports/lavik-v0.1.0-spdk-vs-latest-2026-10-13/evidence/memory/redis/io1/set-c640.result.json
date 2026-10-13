@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io1/set-c640",
+  "kind": "SET",
+  "keys": 10000000,
+  "connections": 640,
+  "qps": 142870.49,
+  "avg_ms": 4.47852,
+  "p50_ms": 4.351,
+  "p99_ms": 8.703,
+  "p999_ms": 9.343,
+  "p9999_ms": 11.775
+}

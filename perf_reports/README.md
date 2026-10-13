@@ -25,6 +25,7 @@ Each report provides an English `README.md` and a Simplified Chinese
 | Report | Test date | English | 简体中文 |
 |---|---|---|---|
 | v0.1.0 on 2 vCPUs: latest Redis / Valkey + Lavik 100M-key capacity | 2026-10-13 | [English](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md) |
+| v0.1.0 release: Redis 8.10.2 / Valkey 9.1.2 and Lavik 1TB, defrag enabled | 2026-10-13 | [English](lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.zh-CN.md) |
 | SPDK 48-hour online stability | 2026-08-15 | [English](lavik-spdk-48h-stability-2026-08-15/README.md) | [简体中文](lavik-spdk-48h-stability-2026-08-15/README.zh-CN.md) |
 | One billion keys: SPDK value-size scaling on 16 workers | 2026-08-31 | [English](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.md) | [简体中文](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.zh-CN.md) |
 | SPDK vs. raw io_uring: 500M keys, 2 KiB values | 2026-08-26 | [English](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.md) | [简体中文](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.zh-CN.md) |

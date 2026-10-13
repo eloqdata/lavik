@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io8/set-c80",
+  "kind": "SET",
+  "keys": 10000000,
+  "connections": 80,
+  "qps": 518502.88,
+  "avg_ms": 0.15415,
+  "p50_ms": 0.143,
+  "p99_ms": 0.319,
+  "p999_ms": 0.415,
+  "p9999_ms": 0.527
+}

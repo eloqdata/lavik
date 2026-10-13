@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io2/get-c1280",
+  "kind": "GET",
+  "keys": 10000000,
+  "connections": 1280,
+  "qps": 134211.4,
+  "avg_ms": 9.53639,
+  "p50_ms": 8.895,
+  "p99_ms": 17.663,
+  "p999_ms": 22.399,
+  "p9999_ms": 26.111
+}

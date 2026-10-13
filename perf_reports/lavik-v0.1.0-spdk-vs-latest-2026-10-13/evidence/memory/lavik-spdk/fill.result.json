@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/fill",
+  "kind": "fill",
+  "keys": 10000000,
+  "connections": 640,
+  "qps": 920593.47,
+  "avg_ms": 0.69332,
+  "p50_ms": 0.559,
+  "p99_ms": 3.455,
+  "p999_ms": 4.767,
+  "p9999_ms": 7.167
+}

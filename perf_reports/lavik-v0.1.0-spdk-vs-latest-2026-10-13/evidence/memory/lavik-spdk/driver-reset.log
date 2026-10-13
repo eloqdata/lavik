@@ -1,0 +1,8 @@
+c05b:00:00.0 (1414 00a9): Skipping denied controller at c05b:00:00.0
+c05b:00:00.0 (1414 00a9): Active devices: mount@nvme0n1:nvme0n1p1,mount@nvme0n1:nvme0n1p15,mount@nvme0n1:nvme0n1p16,mount@nvme0n2:nvme0n2, so not binding PCI dev
+2401:00:00.0 (1414 b111): vfio-pci -> nvme
+6319:00:00.0 (1414 b111): vfio-pci -> nvme
+221c:00:00.0 (1414 b111): vfio-pci -> nvme
+399c:00:00.0 (1414 b111): vfio-pci -> nvme
+7f10:00:00.0 (1414 b111): vfio-pci -> nvme
+c0ef:00:00.0 (1414 b111): vfio-pci -> nvme

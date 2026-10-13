@@ -1,0 +1,17 @@
+{
+  "checked_on": "2026-10-13",
+  "selection": "Latest non-prerelease releases from the official GitHub repositories; pinned exact release commits",
+  "redis": {
+    "version": "8.10.2",
+    "commit": "498ecd0d6d007db11ddb3aea9428552598a78622",
+    "published_at": "2026-09-17T15:06:56Z",
+    "url": "https://github.com/redis/redis/releases/tag/8.10.2"
+  },
+  "valkey": {
+    "version": "9.1.2",
+    "commit": "7f1dffedff6de73058b2c2a389422b6ecd56c8fb",
+    "published_at": "2026-09-01T00:01:31Z",
+    "url": "https://github.com/valkey-io/valkey/releases/tag/9.1.2",
+    "download_page": "https://valkey.io/download/releases/v9-1-2/"
+  }
+}

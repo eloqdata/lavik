@@ -1,0 +1,45 @@
+[2026-10-13 11:38:24.701] [lavik] [info] I/O backends: network=kernel storage=spdk rings=one-per-worker
+[2026-10-13 11:38:24.702] [lavik] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-10-13 11:38:24.702] [lavik] [info] lavik version=0.1.0 listening on 10.84.1.4:6379 tls_port=0 metrics_port=0 shards=16 maxclients=10000 maxclients_fd_reserve=256 pin_workers=true idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=16 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=67108864 per worker storage_write_buffers=4 storage_read_buffer_bytes=32768 replication_publish_queue_bytes=16777216 per worker max_memory=0 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=100 flush_size_bytes=131072 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=true replication_backlog_backpressure=true
+[2026-10-13 11:38:24.702] [lavik] [info] memory limit=108053286093 (100.63G) initial_used=0 initial_rss=11620352
+[2026-10-13 11:38:29.959] [lavik] [info] storage device id=0 path=spdk://2401:00:00.0/1 capacity-bytes=1919850381312 data-blocks=228863 foreground-blocks=228855 defrag-reserve-blocks=8 data-bytes=1919841992704
+[2026-10-13 11:38:29.959] [lavik] [info] storage device id=1 path=spdk://221c:00:00.0/1 capacity-bytes=1919850381312 data-blocks=228863 foreground-blocks=228855 defrag-reserve-blocks=8 data-bytes=1919841992704
+[2026-10-13 11:38:29.959] [lavik] [info] storage device id=2 path=spdk://7f10:00:00.0/1 capacity-bytes=1919850381312 data-blocks=228863 foreground-blocks=228855 defrag-reserve-blocks=8 data-bytes=1919841992704
+[2026-10-13 11:38:29.959] [lavik] [info] storage device id=3 path=spdk://399c:00:00.0/1 capacity-bytes=1919850381312 data-blocks=228863 foreground-blocks=228855 defrag-reserve-blocks=8 data-bytes=1919841992704
+[2026-10-13 11:38:29.959] [lavik] [info] storage device id=4 path=spdk://c0ef:00:00.0/1 capacity-bytes=1919850381312 data-blocks=228863 foreground-blocks=228855 defrag-reserve-blocks=8 data-bytes=1919841992704
+[2026-10-13 11:38:29.959] [lavik] [info] storage device id=5 path=spdk://6319:00:00.0/1 capacity-bytes=1919850381312 data-blocks=228863 foreground-blocks=228855 defrag-reserve-blocks=8 data-bytes=1919841992704
+[2026-10-13 11:38:29.959] [lavik] [info] storage capacity: data-blocks=1373178 foreground-blocks=1373130 defrag-reserve-blocks=48
+[2026-10-13 11:38:29.959] [lavik] [info] storage direct-I/O alignment=512 bytes
+[2026-10-13 11:38:29.959] [lavik] [info] storage flush submission size=131072 bytes
+[2026-10-13 11:38:30.305] [lavik] [info] SPDK controller=221c:00:00.0 io-qpairs=31 foreground-weight=228855 home-workers=[0,6,12] qpair-workers=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+[2026-10-13 11:38:30.305] [lavik] [info] SPDK controller=2401:00:00.0 io-qpairs=31 foreground-weight=228855 home-workers=[1,7,13] qpair-workers=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+[2026-10-13 11:38:30.305] [lavik] [info] SPDK controller=399c:00:00.0 io-qpairs=31 foreground-weight=228855 home-workers=[2,8,14] qpair-workers=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+[2026-10-13 11:38:30.305] [lavik] [info] SPDK controller=6319:00:00.0 io-qpairs=31 foreground-weight=228855 home-workers=[3,9,15] qpair-workers=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+[2026-10-13 11:38:30.305] [lavik] [info] SPDK controller=7f10:00:00.0 io-qpairs=31 foreground-weight=228855 home-workers=[4,10] qpair-workers=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+[2026-10-13 11:38:30.305] [lavik] [info] SPDK controller=c0ef:00:00.0 io-qpairs=31 foreground-weight=228855 home-workers=[5,11] qpair-workers=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+[2026-10-13 11:38:30.496] [lavik] [info] runtime workers=16 data_shards=16 control_worker=none cpus=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+[2026-10-13 11:38:30.499] [lavik] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596134690 Hz (2596.135 MHz) ticks-per-us=2596.135
+[2026-10-13 11:38:31.200] [lavik] [info] storage recovery: blocks=0/0 (100.0%) swept=1373178/1373178 records=0 rate=0 blocks/s 0.00M records/s eta=0.0s
+[2026-10-13 11:38:31.221] [lavik] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-10-13 11:38:31.221] [lavik] [info] worker[12] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[4] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[0] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[13] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[6] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[11] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[3] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[2] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[5] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[9] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[1] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[14] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[7] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[10] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[15] direct-IO storage initialized
+[2026-10-13 11:38:31.221] [lavik] [info] worker[8] direct-IO storage initialized
+[2026-10-13 12:10:58.680] [lavik] [info] shutdown requested by signal 15
+[2026-10-13 12:10:58.702] [lavik] [info] replication targets quiesced before storage flush
+[2026-10-13 12:10:58.702] [lavik] [info] all active requests drained; flushing storage buffers
+[2026-10-13 12:11:35.376] [lavik] [info] published shutdown checkpoint generation=1 entries=1000000000 accounting-entries=151810 blocks=6832
+[2026-10-13 12:11:35.376] [lavik] [info] all storage buffers durably flushed
+[2026-10-13 12:11:35.376] [lavik] [info] durable shutdown checkpoint permits OS-reclaimed worker state

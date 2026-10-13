@@ -1,0 +1,95 @@
+============== Configuration values: ==============
+server = 10.84.1.4
+port = 6379
+uri = 
+unix socket = (null)
+address family = Unspecified
+protocol = redis
+tls = no
+cert = (null)
+key = (null)
+cacert = (null)
+tls_skip_verify = no
+sni = (null)
+out_file = (null)
+client_stats = (null)
+run_count = 1
+debug = 0
+requests = 15625
+rate_limit = 0
+clients = 40
+threads = 16
+test_time = 0
+ratio = 1:0
+pipeline = 1
+transaction = no
+data_size = 1024
+data_offset = 0
+random_data = no
+data_size_range = 0-0
+data_size_list = 
+data_size_pattern = R
+expiry_range = 0-0
+data_import = (null)
+data_verify = no
+verify_only = no
+generate_keys = no
+key_prefix = 
+key_minimum = 1
+key_maximum = 10000000
+key_pattern = P:P
+key_stddev = 0.000000
+key_median = 0.000000
+reconnect_interval = 0
+retry_on_error = no
+max_retries = -1
+retry_backoff_ms = 0
+retry_backoff_factor = 0.000000
+retry_on = 
+max_retry_queue = 0
+failed_keys_file = 
+connection_timeout = 0
+connection_stage_timeout = 30
+thread_conn_start_min_jitter_micros = 0
+thread_conn_start_max_jitter_micros = 0
+multi_key_get = 0
+authenticate = 
+select-db = 0
+no-expiry = no
+wait-ratio = 0:0
+num-slaves = 0-0
+wait-timeout = 0-0
+json-out-file = /opt/benchmark/release010-latest/suite/memory/lavik-spdk/fill.json
+print-all-runs = no
+prometheus-port = -1
+prometheus-bind-addr = 127.0.0.1
+prometheus-run-labels = 
+prometheus-latency-buckets = default
+===================================================
+Json file /opt/benchmark/release010-latest/suite/memory/lavik-spdk/fill.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 9%,   1 secs] 16 threads 40 conns:      940747 ops,  940029 (avg:  940029) ops/sec, 953.76MB/sec (avg: 953.76MB/sec),  0.68 (avg:  0.68) msec latency[RUN #1 19%,   2 secs] 16 threads 40 conns:     1878199 ops,  937306 (avg:  938668) ops/sec, 950.99MB/sec (avg: 952.38MB/sec),  0.68 (avg:  0.68) msec latency[RUN #1 28%,   3 secs] 16 threads 40 conns:     2790642 ops,  912305 (avg:  929882) ops/sec, 925.63MB/sec (avg: 943.46MB/sec),  0.70 (avg:  0.69) msec latency[RUN #1 37%,   4 secs] 16 threads 40 conns:     3710889 ops,  920106 (avg:  927438) ops/sec, 933.54MB/sec (avg: 940.98MB/sec),  0.69 (avg:  0.69) msec latency[RUN #1 46%,   5 secs] 16 threads 40 conns:     4624900 ops,  911602 (avg:  924265) ops/sec, 924.91MB/sec (avg: 937.76MB/sec),  0.70 (avg:  0.69) msec latency[RUN #1 55%,   6 secs] 16 threads 40 conns:     5492771 ops,  867717 (avg:  914845) ops/sec, 880.39MB/sec (avg: 928.21MB/sec),  0.74 (avg:  0.70) msec latency[RUN #1 64%,   7 secs] 16 threads 40 conns:     6419642 ops,  926627 (avg:  916528) ops/sec, 940.16MB/sec (avg: 929.91MB/sec),  0.69 (avg:  0.70) msec latency[RUN #1 73%,   8 secs] 16 threads 40 conns:     7347116 ops,  923331 (avg:  917381) ops/sec, 936.82MB/sec (avg: 930.78MB/sec),  0.69 (avg:  0.70) msec latency[RUN #1 83%,   9 secs] 16 threads 40 conns:     8269032 ops,  921731 (avg:  917864) ops/sec, 935.19MB/sec (avg: 931.27MB/sec),  0.69 (avg:  0.70) msec latency[RUN #1 92%,  10 secs] 16 threads 40 conns:     9167798 ops,  898496 (avg:  915928) ops/sec, 911.62MB/sec (avg: 929.30MB/sec),  0.71 (avg:  0.70) msec latency[RUN #1 99%,  10 secs] 16 threads 40 conns:     9932251 ops,  955280 (avg:  918842) ops/sec, 969.23MB/sec (avg: 932.26MB/sec),  0.67 (avg:  0.70) msec latency[RUN #1 100%,  10 secs]  0 threads 40 conns:    10000000 ops,  955280 (avg:  922844) ops/sec, 969.23MB/sec (avg: 936.32MB/sec),  0.67 (avg:  0.69) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   138.769s  (user 25.850s, sys 112.920s)
+  Wall time:        11.344s
+  Cores used:       12.233   (avg 76.4% across 16 worker threads)
+  Peak utilization: 1302.5%
+16        Threads
+40        Connections per thread
+15625     Requests per client
+
+
+ALL STATS
+============================================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
+--------------------------------------------------------------------------------------------------------------------------------------------
+Sets       920593.47          ---          ---         0.69332         0.55900         3.45500         4.76700         7.16700    956454.27 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---             ---          --- 
+Totals     920593.47         0.00         0.00         0.69332         0.55900         3.45500         4.76700         7.16700    956454.27 
+Saving JSON output file: /opt/benchmark/release010-latest/suite/memory/lavik-spdk/fill.json
+Json file closed.

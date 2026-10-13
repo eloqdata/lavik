@@ -1,0 +1,12 @@
+{
+  "name": "storage/lavik-spdk/set-c1280",
+  "kind": "SET",
+  "keys": 1000000000,
+  "connections": 1280,
+  "qps": 817112.53,
+  "avg_ms": 1.56595,
+  "p50_ms": 1.199,
+  "p99_ms": 6.815,
+  "p999_ms": 11.007,
+  "p9999_ms": 20.863
+}

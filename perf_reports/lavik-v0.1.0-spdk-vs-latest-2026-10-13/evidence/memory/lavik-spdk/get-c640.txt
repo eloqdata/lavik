@@ -1,0 +1,132 @@
+============== Configuration values: ==============
+server = 10.84.1.4
+port = 6379
+uri = 
+unix socket = (null)
+address family = Unspecified
+protocol = redis
+tls = no
+cert = (null)
+key = (null)
+cacert = (null)
+tls_skip_verify = no
+sni = (null)
+out_file = (null)
+client_stats = (null)
+run_count = 1
+debug = 0
+requests = 0
+rate_limit = 0
+clients = 40
+threads = 16
+test_time = 30
+ratio = 1:10
+pipeline = 1
+transaction = no
+data_size = 1024
+data_offset = 0
+random_data = no
+data_size_range = 0-0
+data_size_list = 
+data_size_pattern = R
+expiry_range = 0-0
+data_import = (null)
+data_verify = no
+verify_only = no
+generate_keys = no
+key_prefix = 
+key_minimum = 1
+key_maximum = 10000000
+key_pattern = R:R
+key_stddev = 0.000000
+key_median = 0.000000
+reconnect_interval = 0
+retry_on_error = no
+max_retries = -1
+retry_backoff_ms = 0
+retry_backoff_factor = 0.000000
+retry_on = 
+max_retry_queue = 0
+failed_keys_file = 
+connection_timeout = 0
+connection_stage_timeout = 30
+thread_conn_start_min_jitter_micros = 0
+thread_conn_start_max_jitter_micros = 0
+multi_key_get = 0
+authenticate = 
+select-db = 0
+no-expiry = no
+wait-ratio = 0:0
+num-slaves = 0-0
+wait-timeout = 0-0
+json-out-file = /opt/benchmark/release010-latest/suite/memory/lavik-spdk/get-c640.json
+print-all-runs = no
+prometheus-port = -1
+prometheus-bind-addr = 127.0.0.1
+prometheus-run-labels = 
+prometheus-latency-buckets = default
+===================================================
+Json file /opt/benchmark/release010-latest/suite/memory/lavik-spdk/get-c640.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 3%,   1 secs] 16 threads 40 conns:     1031393 ops, 1030412 (avg: 1030412) ops/sec, 1.02GB/sec (avg: 1.02GB/sec),  0.62 (avg:  0.62) msec latency[RUN #1 7%,   2 secs] 16 threads 40 conns:     2170856 ops, 1139249 (avg: 1084810) ops/sec, 1.12GB/sec (avg: 1.07GB/sec),  0.56 (avg:  0.59) msec latency
+warning: high CPU on thread 0: 96.4% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 3: 95.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 6: 98.6% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 7: 98.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 9: 99.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 11: 96.4% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 13: 96.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 14: 98.7% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 10%,   3 secs] 16 threads 40 conns:     3334524 ops, 1163422 (avg: 1111008) ops/sec, 1.15GB/sec (avg: 1.10GB/sec),  0.55 (avg:  0.58) msec latency
+warning: high CPU on thread 2: 96.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 4: 98.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 5: 97.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 97.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 10: 96.6% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 12: 95.7% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 13%,   4 secs] 16 threads 40 conns:     4476251 ops, 1141497 (avg: 1118629) ops/sec, 1.13GB/sec (avg: 1.10GB/sec),  0.56 (avg:  0.57) msec latency[RUN #1 17%,   5 secs] 16 threads 40 conns:     5609770 ops, 1133294 (avg: 1121561) ops/sec, 1.12GB/sec (avg: 1.11GB/sec),  0.56 (avg:  0.57) msec latency
+warning: high CPU on thread 15: 96.8% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 20%,   6 secs] 16 threads 40 conns:     6754050 ops, 1144031 (avg: 1125306) ops/sec, 1.13GB/sec (avg: 1.11GB/sec),  0.56 (avg:  0.57) msec latency[RUN #1 23%,   7 secs] 16 threads 40 conns:     7912849 ops, 1157652 (avg: 1129929) ops/sec, 1.14GB/sec (avg: 1.11GB/sec),  0.55 (avg:  0.57) msec latency
+warning: high CPU on thread 1: 97.4% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 27%,   8 secs] 16 threads 40 conns:     9053763 ops, 1140696 (avg: 1131275) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 30%,   9 secs] 16 threads 40 conns:    10193952 ops, 1139962 (avg: 1132240) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 33%,  10 secs] 16 threads 40 conns:    11348988 ops, 1154815 (avg: 1134497) ops/sec, 1.14GB/sec (avg: 1.12GB/sec),  0.55 (avg:  0.56) msec latency[RUN #1 37%,  11 secs] 16 threads 40 conns:    12482003 ops, 1132537 (avg: 1134319) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 40%,  12 secs] 16 threads 40 conns:    13624432 ops, 1142209 (avg: 1134976) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 43%,  13 secs] 16 threads 40 conns:    14775897 ops, 1150530 (avg: 1136173) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 47%,  14 secs] 16 threads 40 conns:    15930685 ops, 1154554 (avg: 1137486) ops/sec, 1.14GB/sec (avg: 1.12GB/sec),  0.55 (avg:  0.56) msec latency[RUN #1 50%,  15 secs] 16 threads 40 conns:    17068737 ops, 1132618 (avg: 1137160) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 53%,  16 secs] 16 threads 40 conns:    18210542 ops, 1141600 (avg: 1137437) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 57%,  17 secs] 16 threads 40 conns:    19364686 ops, 1153939 (avg: 1138408) ops/sec, 1.14GB/sec (avg: 1.12GB/sec),  0.55 (avg:  0.56) msec latency[RUN #1 60%,  18 secs] 16 threads 40 conns:    20495805 ops, 1130908 (avg: 1137991) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 63%,  19 secs] 16 threads 40 conns:    21641412 ops, 1145251 (avg: 1138373) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 67%,  20 secs] 16 threads 40 conns:    22777888 ops, 1136116 (avg: 1138260) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 70%,  21 secs] 16 threads 40 conns:    23907331 ops, 1129113 (avg: 1137825) ops/sec, 1.11GB/sec (avg: 1.12GB/sec),  0.57 (avg:  0.56) msec latency[RUN #1 73%,  22 secs] 16 threads 40 conns:    25051324 ops, 1143608 (avg: 1138088) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 77%,  23 secs] 16 threads 40 conns:    26177363 ops, 1125629 (avg: 1137546) ops/sec, 1.11GB/sec (avg: 1.12GB/sec),  0.57 (avg:  0.56) msec latency[RUN #1 80%,  24 secs] 16 threads 40 conns:    27315911 ops, 1138195 (avg: 1137573) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 83%,  25 secs] 16 threads 40 conns:    28443027 ops, 1126814 (avg: 1137143) ops/sec, 1.11GB/sec (avg: 1.12GB/sec),  0.57 (avg:  0.56) msec latency[RUN #1 87%,  26 secs] 16 threads 40 conns:    29579031 ops, 1134719 (avg: 1137050) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 90%,  27 secs] 16 threads 40 conns:    30718446 ops, 1139057 (avg: 1137124) ops/sec, 1.12GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 93%,  28 secs] 16 threads 40 conns:    31845250 ops, 1126470 (avg: 1136744) ops/sec, 1.11GB/sec (avg: 1.12GB/sec),  0.57 (avg:  0.56) msec latency[RUN #1 97%,  29 secs] 16 threads 40 conns:    32987126 ops, 1141266 (avg: 1136899) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency[RUN #1 100%,  30 secs]  0 threads 40 conns:    34115918 ops, 1141266 (avg: 1137045) ops/sec, 1.13GB/sec (avg: 1.12GB/sec),  0.56 (avg:  0.56) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   454.454s  (user 77.229s, sys 377.225s)
+  Wall time:        30.013s
+  Cores used:       15.142   (avg 94.6% across 16 worker threads)
+  Peak utilization: 1553.5%
+warning: thread 0 averaged 95.4% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 3 averaged 95.2% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 7 averaged 95.4% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 9 averaged 95.7% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 10 averaged 95.1% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 13 averaged 95.5% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 15 averaged 95.1% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+Saving JSON output file: /opt/benchmark/release010-latest/suite/memory/lavik-spdk/get-c640.json
+Json file closed.
+16        Threads
+40        Connections per thread
+30        Seconds
+
+
+ALL STATS
+============================================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
+--------------------------------------------------------------------------------------------------------------------------------------------
+Gets      1137059.72   1137059.72         0.00         0.56263         0.52700         1.67900         4.25500         6.14300   1175804.04 
+Totals    1137059.72   1137059.72         0.00         0.56263         0.52700         1.67900         4.25500         6.14300   2351608.09 

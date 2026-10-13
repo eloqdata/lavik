@@ -1,0 +1,38 @@
+[
+  {
+    "serial": "4d4fd73b0687ec770001",
+    "bdf": "2401:00:00.0",
+    "device": "/dev/nvme1n1",
+    "bytes": 1919850381312
+  },
+  {
+    "serial": "4d4fd73b0687ec770002",
+    "bdf": "221c:00:00.0",
+    "device": "/dev/nvme3n1",
+    "bytes": 1919850381312
+  },
+  {
+    "serial": "4d4fd73b0687ec770003",
+    "bdf": "7f10:00:00.0",
+    "device": "/dev/nvme5n1",
+    "bytes": 1919850381312
+  },
+  {
+    "serial": "4d4fd73b0687ec770004",
+    "bdf": "399c:00:00.0",
+    "device": "/dev/nvme4n1",
+    "bytes": 1919850381312
+  },
+  {
+    "serial": "4d4fd73b0687ec770005",
+    "bdf": "c0ef:00:00.0",
+    "device": "/dev/nvme6n1",
+    "bytes": 1919850381312
+  },
+  {
+    "serial": "4d4fd73b0687ec770006",
+    "bdf": "6319:00:00.0",
+    "device": "/dev/nvme2n1",
+    "bytes": 1919850381312
+  }
+]

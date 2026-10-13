@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io1/warmup",
+  "kind": "GET",
+  "keys": 10000000,
+  "connections": 640,
+  "qps": 154299.29,
+  "avg_ms": 4.1479,
+  "p50_ms": 4.015,
+  "p99_ms": 8.063,
+  "p999_ms": 8.575,
+  "p9999_ms": 10.943
+}

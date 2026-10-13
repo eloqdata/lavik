@@ -1,0 +1,12 @@
+{
+  "name": "storage/lavik-spdk/fill",
+  "kind": "fill",
+  "keys": 1000000000,
+  "connections": 640,
+  "qps": 866999.94,
+  "avg_ms": 0.73686,
+  "p50_ms": 0.551,
+  "p99_ms": 3.567,
+  "p999_ms": 5.343,
+  "p9999_ms": 9.983
+}

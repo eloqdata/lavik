@@ -1,0 +1,19 @@
+746991:M 13 Oct 2026 12:42:53.031 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+746991:M 13 Oct 2026 12:42:53.031 * oO0OoO0OoO0Oo Valkey is starting oO0OoO0OoO0Oo
+746991:M 13 Oct 2026 12:42:53.031 * Valkey version=9.1.2, bits=64, commit=00000000, modified=1, pid=746991, just started
+746991:M 13 Oct 2026 12:42:53.031 * Configuration loaded
+746991:M 13 Oct 2026 12:42:53.062 * monotonic clock: X86 TSC @ 2596.29 ticks/us
+746991:M 13 Oct 2026 12:42:53.062 * Running mode=standalone, port=6379.
+746991:M 13 Oct 2026 12:42:53.062 * Static Module 'lua' successfully loaded
+746991:M 13 Oct 2026 12:42:53.062 * Server initialized
+746991:M 13 Oct 2026 12:42:53.062 * Cleaning slot migration log in anticipation of a load operation.
+746991:M 13 Oct 2026 12:42:53.062 * Loading RDB produced by Valkey version 9.1.2
+746991:M 13 Oct 2026 12:42:53.062 * RDB age 28 seconds
+746991:M 13 Oct 2026 12:42:53.062 * RDB memory usage when created 12655.81 Mb
+746991:M 13 Oct 2026 12:43:20.643 * Done loading RDB, keys loaded: 10000000, keys expired: 0, all fields expired hashes: 0.
+746991:M 13 Oct 2026 12:43:20.643 * DB loaded from disk: 27.581 seconds
+746991:M 13 Oct 2026 12:43:20.643 * Ready to accept connections tcp
+746991:signal-handler (1791895726) Received SIGTERM scheduling shutdown...
+746991:M 13 Oct 2026 12:48:46.345 * User requested shutdown...
+746991:M 13 Oct 2026 12:48:46.345 * Module lua unloaded
+746991:M 13 Oct 2026 12:48:46.345 # Valkey is now ready to exit, bye bye...

@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io16/warmup",
+  "kind": "GET",
+  "keys": 10000000,
+  "connections": 640,
+  "qps": 951306.29,
+  "avg_ms": 0.67252,
+  "p50_ms": 0.567,
+  "p99_ms": 3.215,
+  "p999_ms": 4.479,
+  "p9999_ms": 7.039
+}

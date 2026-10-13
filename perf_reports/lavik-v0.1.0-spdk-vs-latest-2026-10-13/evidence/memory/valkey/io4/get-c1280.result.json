@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io4/get-c1280",
+  "kind": "GET",
+  "keys": 10000000,
+  "connections": 1280,
+  "qps": 440715.44,
+  "avg_ms": 2.90331,
+  "p50_ms": 2.863,
+  "p99_ms": 3.695,
+  "p999_ms": 10.111,
+  "p9999_ms": 16.639
+}

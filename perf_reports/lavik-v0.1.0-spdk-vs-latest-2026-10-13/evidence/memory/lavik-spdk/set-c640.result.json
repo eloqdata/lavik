@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/set-c640",
+  "kind": "SET",
+  "keys": 10000000,
+  "connections": 640,
+  "qps": 892044.53,
+  "avg_ms": 0.71723,
+  "p50_ms": 0.583,
+  "p99_ms": 3.199,
+  "p999_ms": 4.575,
+  "p9999_ms": 7.647
+}

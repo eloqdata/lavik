@@ -1,0 +1,12 @@
+{
+  "name": "storage/lavik-spdk/get-c160",
+  "kind": "GET",
+  "keys": 1000000000,
+  "connections": 160,
+  "qps": 579202.79,
+  "avg_ms": 0.27594,
+  "p50_ms": 0.263,
+  "p99_ms": 0.543,
+  "p999_ms": 0.735,
+  "p9999_ms": 1.351
+}

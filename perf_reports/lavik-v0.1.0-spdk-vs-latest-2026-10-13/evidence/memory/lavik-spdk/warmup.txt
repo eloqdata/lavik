@@ -1,0 +1,127 @@
+============== Configuration values: ==============
+server = 10.84.1.4
+port = 6379
+uri = 
+unix socket = (null)
+address family = Unspecified
+protocol = redis
+tls = no
+cert = (null)
+key = (null)
+cacert = (null)
+tls_skip_verify = no
+sni = (null)
+out_file = (null)
+client_stats = (null)
+run_count = 1
+debug = 0
+requests = 0
+rate_limit = 0
+clients = 40
+threads = 16
+test_time = 10
+ratio = 1:10
+pipeline = 1
+transaction = no
+data_size = 1024
+data_offset = 0
+random_data = no
+data_size_range = 0-0
+data_size_list = 
+data_size_pattern = R
+expiry_range = 0-0
+data_import = (null)
+data_verify = no
+verify_only = no
+generate_keys = no
+key_prefix = 
+key_minimum = 1
+key_maximum = 10000000
+key_pattern = R:R
+key_stddev = 0.000000
+key_median = 0.000000
+reconnect_interval = 0
+retry_on_error = no
+max_retries = -1
+retry_backoff_ms = 0
+retry_backoff_factor = 0.000000
+retry_on = 
+max_retry_queue = 0
+failed_keys_file = 
+connection_timeout = 0
+connection_stage_timeout = 30
+thread_conn_start_min_jitter_micros = 0
+thread_conn_start_max_jitter_micros = 0
+multi_key_get = 0
+authenticate = 
+select-db = 0
+no-expiry = no
+wait-ratio = 0:0
+num-slaves = 0-0
+wait-timeout = 0-0
+json-out-file = /opt/benchmark/release010-latest/suite/memory/lavik-spdk/warmup.json
+print-all-runs = no
+prometheus-port = -1
+prometheus-bind-addr = 127.0.0.1
+prometheus-run-labels = 
+prometheus-latency-buckets = default
+===================================================
+Json file /opt/benchmark/release010-latest/suite/memory/lavik-spdk/warmup.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 10%,   1 secs] 16 threads 40 conns:     1006865 ops, 1006257 (avg: 1006257) ops/sec, 1016.16MB/sec (avg: 1016.16MB/sec),  0.63 (avg:  0.63) msec latency[RUN #1 20%,   2 secs] 16 threads 40 conns:     2140155 ops, 1133089 (avg: 1069659) ops/sec, 1.12GB/sec (avg: 1.05GB/sec),  0.56 (avg:  0.60) msec latency
+warning: high CPU on thread 1: 96.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 3: 96.3% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 5: 95.8% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 6: 97.5% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 10: 96.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 11: 98.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 12: 97.2% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 30%,   3 secs] 16 threads 40 conns:     3283794 ops, 1143401 (avg: 1094237) ops/sec, 1.13GB/sec (avg: 1.08GB/sec),  0.56 (avg:  0.58) msec latency
+warning: high CPU on thread 4: 97.4% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 9: 96.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 15: 98.1% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 40%,   4 secs] 16 threads 40 conns:     4418187 ops, 1133682 (avg: 1104100) ops/sec, 1.12GB/sec (avg: 1.09GB/sec),  0.56 (avg:  0.58) msec latency
+warning: high CPU on thread 0: 96.1% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 2: 97.0% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 8: 95.4% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 50%,   5 secs] 16 threads 40 conns:     5550371 ops, 1131974 (avg: 1109674) ops/sec, 1.12GB/sec (avg: 1.09GB/sec),  0.56 (avg:  0.58) msec latency[RUN #1 60%,   6 secs] 16 threads 40 conns:     6703208 ops, 1152636 (avg: 1116833) ops/sec, 1.14GB/sec (avg: 1.10GB/sec),  0.55 (avg:  0.57) msec latency
+warning: high CPU on thread 7: 99.9% of a core (threshold 95.0%) - results may be unreliable
+
+warning: high CPU on thread 13: 99.2% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 70%,   7 secs] 16 threads 40 conns:     7861282 ops, 1155024 (avg: 1122300) ops/sec, 1.14GB/sec (avg: 1.11GB/sec),  0.55 (avg:  0.57) msec latency
+warning: high CPU on thread 14: 95.8% of a core (threshold 95.0%) - results may be unreliable
+[RUN #1 80%,   8 secs] 16 threads 40 conns:     9016162 ops, 1154621 (avg: 1126338) ops/sec, 1.14GB/sec (avg: 1.11GB/sec),  0.55 (avg:  0.57) msec latency[RUN #1 90%,   9 secs] 16 threads 40 conns:    10155462 ops, 1139073 (avg: 1127753) ops/sec, 1.12GB/sec (avg: 1.11GB/sec),  0.56 (avg:  0.57) msec latency[RUN #1 100%,  10 secs] 16 threads 40 conns:    11304100 ops, 1150415 (avg: 1130015) ops/sec, 1.13GB/sec (avg: 1.11GB/sec),  0.55 (avg:  0.57) msec latency[RUN #1 100%,  10 secs]  0 threads 40 conns:    11304309 ops, 1150415 (avg: 1129978) ops/sec, 1.13GB/sec (avg: 1.11GB/sec),  0.55 (avg:  0.57) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   150.035s  (user 25.311s, sys 124.724s)
+  Wall time:        10.011s
+  Cores used:       14.986   (avg 93.7% across 16 worker threads)
+  Peak utilization: 1533.1%
+warning: thread 6 averaged 95.3% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+warning: thread 11 averaged 95.1% of a core over the run (threshold 95.0%) - memtier may be the bottleneck; results may be unreliable
+Saving JSON output file: /opt/benchmark/release010-latest/suite/memory/lavik-spdk/warmup.json
+Json file closed.
+16        Threads
+40        Connections per thread
+10        Seconds
+
+
+ALL STATS
+============================================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
+--------------------------------------------------------------------------------------------------------------------------------------------
+Gets      1130019.69   1130019.69         0.00         0.56615         0.51900         2.44700         4.47900         9.59900   1168524.74 
+Totals    1130019.69   1130019.69         0.00         0.56615         0.51900         2.44700         4.47900         9.59900   2337049.48 

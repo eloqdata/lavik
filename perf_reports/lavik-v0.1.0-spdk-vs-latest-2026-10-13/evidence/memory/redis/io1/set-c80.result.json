@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io1/set-c80",
+  "kind": "SET",
+  "keys": 10000000,
+  "connections": 80,
+  "qps": 140991.64,
+  "avg_ms": 0.56728,
+  "p50_ms": 0.535,
+  "p99_ms": 0.879,
+  "p999_ms": 0.975,
+  "p9999_ms": 1.055
+}

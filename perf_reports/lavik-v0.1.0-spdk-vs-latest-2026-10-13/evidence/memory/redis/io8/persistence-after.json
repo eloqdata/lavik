@@ -1,0 +1,9 @@
+{
+  "effective_config": {
+    "save": "",
+    "appendonly": "no"
+  },
+  "info_persistence": "# Persistence\nloading:0\nasync_loading:0\ncurrent_cow_peak:0\ncurrent_cow_size:0\ncurrent_cow_size_age:0\ncurrent_fork_perc:0.00\ncurrent_save_keys_processed:0\ncurrent_save_keys_total:0\nrdb_changes_since_last_save:99071955\nrdb_bgsave_in_progress:0\nrdb_last_save_time:1791894620\nrdb_last_bgsave_status:ok\nrdb_last_bgsave_time_sec:-1\nrdb_current_bgsave_time_sec:-1\nrdb_saves:0\nrdb_saves_consecutive_failures:0\nrdb_last_cow_size:0\nrdb_last_load_keys_expired:0\nrdb_last_load_keys_loaded:10000000\naof_enabled:0\naof_rewrite_in_progress:0\naof_rewrite_scheduled:0\naof_last_rewrite_time_sec:-1\naof_current_rewrite_time_sec:-1\naof_last_bgrewrite_status:ok\naof_rewrites:0\naof_rewrites_consecutive_failures:0\naof_last_write_status:ok\naof_last_cow_size:0\nbackup_in_progress:0\nmodule_fork_in_progress:0\nmodule_fork_last_cow_size:0",
+  "automatic_rdb_disabled": true,
+  "aof_disabled": true
+}

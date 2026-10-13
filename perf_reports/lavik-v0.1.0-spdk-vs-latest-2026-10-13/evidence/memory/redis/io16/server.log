@@ -1,0 +1,17 @@
+746114:C 13 Oct 2026 12:36:11.891 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+746114:C 13 Oct 2026 12:36:11.891 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+746114:C 13 Oct 2026 12:36:11.891 * Redis version=8.10.2, bits=64, commit=00000000, modified=1, pid=746114, just started
+746114:C 13 Oct 2026 12:36:11.891 * Configuration loaded
+746114:M 13 Oct 2026 12:36:11.891 * monotonic clock: POSIX clock_gettime
+746114:M 13 Oct 2026 12:36:11.891 * Running mode=standalone, port=6379.
+746114:M 13 Oct 2026 12:36:11.892 * Server initialized
+746114:M 13 Oct 2026 12:36:11.897 * Loading RDB produced by version 8.10.2
+746114:M 13 Oct 2026 12:36:11.898 * RDB age 1448 seconds
+746114:M 13 Oct 2026 12:36:11.898 * RDB memory usage when created 12758.22 Mb
+746114:M 13 Oct 2026 12:36:40.104 * Done loading RDB, keys loaded: 10000000, keys expired: 0.
+746114:M 13 Oct 2026 12:36:40.105 * DB loaded from disk: 28.212 seconds
+746114:M 13 Oct 2026 12:36:40.105 * Ready to accept connections tcp
+746114:M 13 Oct 2026 12:36:40.105 # WARNING: Redis does not require authentication. Redis will accept connections from any IP address on the configured network interface.
+746114:signal-handler (1791895325) Received SIGTERM scheduling shutdown...
+746114:M 13 Oct 2026 12:42:05.074 * User requested shutdown...
+746114:M 13 Oct 2026 12:42:05.074 # Redis is now ready to exit, bye bye...
