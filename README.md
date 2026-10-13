@@ -27,17 +27,13 @@ in-memory services.
 
 **Keep the Redis interface. Break the memory-capacity ceiling.**
 
-[![Redis Compatible](https://img.shields.io/badge/Redis-Compatible-DC382D?style=for-the-badge&logo=redis&logoColor=white)](tests/valkey/README.md)
-[![Linux](https://img.shields.io/badge/Linux-x86__64%20%7C%20aarch64-FCC624?style=for-the-badge&logo=linux&logoColor=black)](docs/operations/building-and-packaging.md)
-[![NVMe](https://img.shields.io/badge/Storage-io__uring%20%7C%20SPDK-5C2D91?style=for-the-badge)](docs/architecture/04-storage-and-recovery.md)
-
-[![Star Lavik](https://img.shields.io/github/stars/eloqdata/lavik?style=for-the-badge&logo=github&label=Star%20Lavik&color=gold)](https://github.com/eloqdata/lavik/stargazers)
-
 </div>
 
 Lavik is a Linux C++23 key-value server that speaks RESP2 and RESP3. It keeps
 a compact key index in DRAM and stores data on files, raw block devices, or
-SPDK NVMe namespaces, so capacity scales with storage.
+SPDK NVMe namespaces, so capacity scales with storage. Networking uses kernel
+TCP with io_uring by default, with an optional
+[experimental DPDK backend](docs/operations/building-and-packaging.md#experimental-dpdk-networking).
 
 ## Highlights
 
