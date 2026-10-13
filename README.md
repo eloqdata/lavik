@@ -57,7 +57,7 @@ SPDK NVMe namespaces, so capacity scales with storage.
 ## Benchmark
 
 Browse the [performance reports](perf_reports/README.md) for full results,
-test configurations, and methodology in English and Simplified Chinese.
+test configurations, and methodology.
 
 <a id="in-memory-redis-and-valkey"></a>
 
