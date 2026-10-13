@@ -27,9 +27,9 @@ At 1M keys, Lavik's peak GET throughput is **8.1%** higher than Redis, and its p
 
 At the same 160 connections, Lavik at 1M keys records SET throughput of 191,909 ops/s with 3.727 ms p99.9, versus Valkey at 193,305 ops/s with 1.279 ms p99.9. Lavik reaches its higher SET peak at 640 connections. Throughput and tail latency at every connection count appear below.
 
-![Four-curve throughput](throughput.png)
+![Four-curve throughput](throughput.svg)
 
-![Four-curve p99.9 latency](latency.png)
+![Four-curve p99.9 latency](latency.svg)
 
 ## Matched-concurrency comparison
 
@@ -63,7 +63,7 @@ Cells show peak ops/s (connections at that point). All 84 raw points are retaine
 | Valkey 9.1.2 / 1M | 1 | 173,638 (1280) | 169,158 (1280) |
 | Valkey 9.1.2 / 1M | 2 | 226,514 (160) | 193,305 (160) |
 
-![All six configurations](all-configurations.png)
+![All six configurations](all-configurations.svg)
 
 ## Memory and client diagnostics
 

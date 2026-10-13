@@ -27,9 +27,9 @@ Redis / Valkey 各测 IO=1 和 IO=2；每个操作选峰值较高的一组 IO �
 
 同为 160 连接时，Lavik 100 万条的 SET 为 191,909 ops/s、p99.9 为 3.727 ms；Valkey 为 193,305 ops/s、p99.9 为 1.279 ms。Lavik 在 640 连接达到更高的 SET 峰值；各连接数下的吞吐量和尾延迟见下表。
 
-![Four-curve throughput](throughput.png)
+![Four-curve throughput](throughput.svg)
 
-![Four-curve p99.9 latency](latency.png)
+![Four-curve p99.9 latency](latency.svg)
 
 ## 同并发比较
 
@@ -63,7 +63,7 @@ Redis / Valkey 各测 IO=1 和 IO=2；每个操作选峰值较高的一组 IO �
 | Valkey 9.1.2 / 1M | 1 | 173,638 (1280) | 169,158 (1280) |
 | Valkey 9.1.2 / 1M | 2 | 226,514 (160) | 193,305 (160) |
 
-![All six configurations](all-configurations.png)
+![All six configurations](all-configurations.svg)
 
 ## 内存与客户端诊断
 
