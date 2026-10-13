@@ -54,15 +54,6 @@ SPDK NVMe namespaces, so capacity scales with storage.
   main lever for dataset growth. Deploy on preallocated files, raw block
   devices, or directly on NVMe through SPDK.
 
-- **2 vCPUs, 100 million keys.** On an Azure VM with **2 vCPUs and 16 GiB
-  RAM**, Lavik v0.1.0 served **95.37 GiB of value data** through SPDK/NVMe
-  at peak rates of **215K GET ops/s and 196K SET ops/s**. Increasing the dataset from
-  1 million to 100 million keys kept peak GET throughput essentially unchanged
-  and retained **95.2%** of peak SET throughput. See the
-  [2-vCPU comparison with Redis 8.10.2 and Valkey 9.1.2](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
-  ([简体中文](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md))
-  for the four curves, configurations, and benchmark commands.
-
 - **Multiples of the throughput of disk-backed alternatives.** In the
   **one-billion-key, 1 TB** test, [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) reached **952,560 GET QPS**:
   **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
@@ -322,6 +313,22 @@ See also the [100-million-record YCSB comparison with Aerospike](perf_reports/yc
 covering workloads A/B/C/D and their tail latencies.
 
 ### In-memory Redis and Valkey
+
+#### 2 vCPUs: 1 million and 100 million keys
+
+The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
+([简体中文](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md))
+compares Lavik v0.1.0 with Redis 8.10.2 and Valkey 9.1.2 on the same Azure
+L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**. All three systems use
+1 million keys with 1 KiB values; a fourth curve expands Lavik to
+**100 million keys and 95.37 GiB of value data** through SPDK/NVMe.
+
+At 100 million keys, Lavik reached peak rates of **215K GET ops/s and
+196K SET ops/s**. Increasing the dataset 100-fold kept peak GET throughput
+essentially unchanged and retained **95.2%** of peak SET throughput.
+The report includes all four curves, configurations, and benchmark commands.
+
+#### 16 vCPUs: 10 million keys
 
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#10m-keys--1-kib-in-memory-controls)
 used an AMD EPYC 9V74 server with approximately 126 GiB RAM and
