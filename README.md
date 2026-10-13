@@ -229,8 +229,8 @@ for dependency setup, standard-package builds, and compatibility details.
 ### Build from source
 
 Building locally with `-march=native` can improve peak QPS by enabling hardware
-acceleration for CRC32C storage-integrity checks on supported x86 CPUs; portable
-x86 release packages use software CRC32C for compatibility.
+acceleration for CRC32C storage-integrity checks on supported CPUs, beyond the
+conservative CPU targets used by portable release packages.
 
 #### Build prerequisites
 
