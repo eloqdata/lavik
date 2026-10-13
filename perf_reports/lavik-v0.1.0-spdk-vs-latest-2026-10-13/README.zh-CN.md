@@ -41,7 +41,7 @@
 - 方法沿用 [beta.1 对比报告](../lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.zh-CN.md)中的 Redis/Valkey 10M 组，以及 Lavik 的 1B 存储组；本批不包含 Dragonfly 或 Garnet。按 2026-10-13 官方稳定版选择 [Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2)、[Valkey 9.1.2](https://valkey.io/download/releases/v9-1-2/)。
 - 顺序为 Lavik SPDK 10M → Lavik SPDK 1B → Redis → Valkey。任一时刻只运行一个被测数据库和一个压测客户端；本组不改变服务端 CPU/IRQ 策略。编译在正式测量前完成。
 - 使用 `lavik-v0.1.0-linux-x86_64.tar.gz`；源码 `feb61224e414c5653fd09560e20c9d214db1e3ac`；可执行文件 SHA-256 `7bf8d204a137678cee0e1a621b02661181373fbbfe1366bc1c201942b9dcf420`；GCC 13 Release / x86-64-v2。未重新编译 Lavik，也未添加源码补丁。压缩包校验与发布的 SHA-256 一致。
-- Lavik 使用 16 个固定 worker；busy-poll 20 µs；前台/后台预算 1000/10 µs；后台保底 1%；SPDK completion cap=16、foreground pre-poll=5 µs；关闭 metrics listener。`defrag-paused=no`、每设备最多 8 个 relocation、block/record sleep 均为 0。Tomb Raider interval 按本组原报告保留为 0：它控制 tombstone 扫描，不是 defrag 开关。每个正式点前及前后快照均核验 defrag。
+- Lavik 调整了 `spdk-max-completions-per-poll=16`（v0.1.0 默认 8）和 `tomb-raider-interval-ms=0`（默认 86,400,000 ms，即 24 小时）；后者关闭 tombstone 扫描。Defrag 保持开启，每个正式点前后均核验。
 - 清盘前按序列号、PCI、namespace、容量核验六张临时盘，排除系统盘和开发盘。分别独立灌入 10M 与 1B Lavik 数据集，两次灌入之间重新清理六张临时盘；Lavik 干净停止后，盘交还内核并释放 hugepage 预留。
 - Redis/Valkey 使用发布的 8.10.2 / 9.1.2 固定 commit 编译，分配器为 jemalloc 5.3.0。各自新灌数据并生成 SHA 校验的 RDB；每档 I/O 线程从该基线启动。AOF、自动快照关闭，其他配置保留产品默认值。
 - 10M 组：memtier 2.5.1，16 线程、pipeline=1、不限速；十进制 key 1..10,000,000、无前缀；均匀随机 GET 或覆盖 SET；value=1,024 B。连接数 80/160/320/640/1280，每点 30 秒，每档服务端配置先 GET 预热 10 秒。按原 10M 方法保留默认相关客户端随机种子。
