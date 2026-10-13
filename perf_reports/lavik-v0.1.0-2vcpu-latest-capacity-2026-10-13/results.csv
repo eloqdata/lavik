@@ -1,85 +1,85 @@
-group,product,system,server_threads,thread_role,workload,connections,keys,value_bytes,test_seconds,client_seed_mode,qps,avg_ms,p50_ms,p99_ms,p999_ms,p9999_ms,requests,client_cores,server_cores_enclosing_window,host_steal_percent_enclosing_window,server_rss_mib_after,connection_errors,source
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,16,1000000,1024,30,distinct,27000.01,0.59268,0.591,0.663,1.023,2.975,810004,0.364,1.3989,0.0,747.53,0,evidence/results/memory/lavik-1m/get-c16.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,32,1000000,1024,30,distinct,54044.64,0.59219,0.591,0.671,1.143,2.735,1621357,0.728,1.7485,0.0,740.41,0,evidence/results/memory/lavik-1m/get-c32.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,80,1000000,1024,30,distinct,133263.31,0.60018,0.599,0.703,0.935,1.855,3997971,1.858,1.9426,0.0,740.84,0,evidence/results/memory/lavik-1m/get-c80.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,160,1000000,1024,30,distinct,215521.02,0.74178,0.751,0.943,1.239,2.303,6465805,3.233,1.9339,0.0,740.79,0,evidence/results/memory/lavik-1m/get-c160.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,320,1000000,1024,30,distinct,215505.98,1.48408,1.471,1.847,2.527,4.383,6465798,3.28,1.8848,0.0,743.83,0,evidence/results/memory/lavik-1m/get-c320.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,640,1000000,1024,30,distinct,215515.39,2.96842,2.975,3.583,6.207,9.087,6467102,3.325,1.8717,0.0,748.91,0,evidence/results/memory/lavik-1m/get-c640.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,1280,1000000,1024,30,distinct,212841.04,6.01213,5.983,7.199,14.207,18.303,6387487,3.172,1.8746,0.0,761.61,0,evidence/results/memory/lavik-1m/get-c1280.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,16,1000000,1024,30,distinct,30588.19,0.5232,0.519,0.607,1.191,3.231,917650,0.426,0.9952,0.0,751.75,0,evidence/results/memory/lavik-1m/set-c16.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,32,1000000,1024,30,distinct,60088.7,0.5327,0.527,0.983,1.511,2.463,1802695,0.811,1.4963,0.0,757.18,0,evidence/results/memory/lavik-1m/set-c32.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,80,1000000,1024,30,distinct,134453.75,0.5949,0.559,1.879,2.575,3.167,4033680,1.908,1.9349,0.0,760.84,0,evidence/results/memory/lavik-1m/set-c80.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,160,1000000,1024,30,distinct,191909.45,0.83331,0.775,2.735,3.727,4.159,5757429,2.872,1.9728,0.0,763.14,0,evidence/results/memory/lavik-1m/set-c160.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,320,1000000,1024,30,distinct,204387.87,1.56503,1.527,4.383,5.407,6.815,6131915,3.21,1.987,0.0,763.27,0,evidence/results/memory/lavik-1m/set-c320.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,640,1000000,1024,30,distinct,205820.41,3.10865,3.007,7.071,9.279,11.711,6175602,3.222,1.9861,0.0,771.82,0,evidence/results/memory/lavik-1m/set-c640.json
-memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,1280,1000000,1024,30,distinct,201237.76,6.35982,6.111,12.799,18.175,22.655,6038458,3.245,1.986,0.0,787.24,0,evidence/results/memory/lavik-1m/set-c1280.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,16,100000000,1024,30,distinct,27349.55,0.58509,0.591,0.655,0.887,2.351,820504,0.366,1.4175,0.0,5698.56,0,evidence/results/memory/lavik-100m/get-c16.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,32,100000000,1024,30,distinct,54039.64,0.59222,0.591,0.663,1.183,2.991,1621216,0.746,1.7458,0.0,5697.39,0,evidence/results/memory/lavik-100m/get-c32.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,80,100000000,1024,30,distinct,132749.46,0.60253,0.607,0.687,1.039,2.111,3982577,1.852,1.9428,0.0,5697.39,0,evidence/results/memory/lavik-100m/get-c80.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,160,100000000,1024,30,distinct,215434.3,0.74209,0.751,0.927,1.215,1.951,6463212,3.239,1.9326,0.0,5697.28,0,evidence/results/memory/lavik-100m/get-c160.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,320,100000000,1024,30,distinct,215463.02,1.48428,1.479,1.799,2.495,4.415,6464867,3.284,1.8844,0.0,5699.81,0,evidence/results/memory/lavik-100m/get-c320.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,640,100000000,1024,30,distinct,215341.29,2.97096,2.975,3.471,6.175,9.215,6461528,3.339,1.8709,0.0,5704.86,0,evidence/results/memory/lavik-100m/get-c640.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,1280,100000000,1024,30,distinct,206966.48,6.18289,6.175,6.943,15.167,19.199,6211258,3.019,1.8716,0.0,5715.54,0,evidence/results/memory/lavik-100m/get-c1280.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,16,100000000,1024,30,distinct,30045.5,0.53268,0.527,0.599,0.911,2.511,901379,0.402,0.9141,0.0,5710.3,0,evidence/results/memory/lavik-100m/set-c16.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,32,100000000,1024,30,distinct,59590.17,0.53719,0.535,0.911,1.631,2.287,1787738,0.791,1.415,0.0,5708.5,0,evidence/results/memory/lavik-100m/set-c32.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,80,100000000,1024,30,distinct,133976.56,0.59707,0.567,2.063,3.423,3.967,4019370,1.876,1.8605,0.0,5711.84,0,evidence/results/memory/lavik-100m/set-c80.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,160,100000000,1024,30,distinct,182929.41,0.87417,0.799,3.407,4.639,5.887,5488350,2.761,1.9599,0.0,5713.39,0,evidence/results/memory/lavik-100m/set-c160.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,320,100000000,1024,30,distinct,194730.72,1.64272,1.591,5.215,6.655,8.383,5842228,3.006,1.961,0.0,5712.82,0,evidence/results/memory/lavik-100m/set-c320.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,640,100000000,1024,30,distinct,195878.77,3.26646,3.119,8.191,10.495,13.311,5877103,3.1,1.9606,0.0,5727.75,0,evidence/results/memory/lavik-100m/set-c640.json
-memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,1280,100000000,1024,30,distinct,184737.61,6.92672,6.431,17.919,27.007,34.815,5544262,2.988,1.9266,0.0,5733.55,0,evidence/results/memory/lavik-100m/set-c1280.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,16,1000000,1024,30,distinct,29797.94,0.53705,0.535,0.607,0.719,1.999,893943,0.392,0.1827,0.0,1288.03,0,evidence/results/memory/redis/io1/get-c16.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,32,1000000,1024,30,distinct,60430.21,0.52965,0.527,0.599,0.647,1.767,1812926,0.8,0.3149,0.0,1288.03,0,evidence/results/memory/redis/io1/get-c32.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,80,1000000,1024,30,distinct,143953.37,0.55557,0.559,0.663,0.767,1.463,4318664,2.005,0.8234,0.0,1288.1,0,evidence/results/memory/redis/io1/get-c80.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,160,1000000,1024,30,distinct,173322.06,0.92261,0.927,1.159,1.359,2.223,5199786,2.447,0.9391,0.0,1288.31,0,evidence/results/memory/redis/io1/get-c160.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,320,1000000,1024,30,distinct,169904.26,1.88261,1.887,2.367,3.055,4.959,5097946,2.354,0.9421,0.0,1288.78,0,evidence/results/memory/redis/io1/get-c320.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,640,1000000,1024,30,distinct,172536.69,3.70811,3.471,6.495,7.327,10.559,5177424,2.57,0.9372,0.0,1289.77,0,evidence/results/memory/redis/io1/get-c640.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,1280,1000000,1024,30,distinct,176390.08,7.25574,6.911,13.503,14.847,19.839,5293164,2.546,0.9383,0.0,1291.76,0,evidence/results/memory/redis/io1/get-c1280.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,16,1000000,1024,30,distinct,30167.01,0.53059,0.535,0.599,0.631,1.343,905025,0.398,0.1808,0.0,1288.48,0,evidence/results/memory/redis/io1/set-c16.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,32,1000000,1024,30,distinct,58505.39,0.54713,0.551,0.615,0.839,2.591,1755173,0.786,0.3176,0.0,1288.49,0,evidence/results/memory/redis/io1/set-c32.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,80,1000000,1024,30,distinct,142593.41,0.56109,0.559,0.663,0.783,2.127,4277964,1.937,0.8781,0.0,1288.54,0,evidence/results/memory/redis/io1/set-c80.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,160,1000000,1024,30,distinct,161347.64,0.99122,0.991,1.191,1.799,2.959,4840637,2.288,0.9745,0.0,1288.63,0,evidence/results/memory/redis/io1/set-c160.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,320,1000000,1024,30,distinct,163702.11,1.95432,1.951,2.447,3.279,5.023,4911239,2.3,0.9378,0.0,1288.97,0,evidence/results/memory/redis/io1/set-c320.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,640,1000000,1024,30,distinct,166740.83,3.83774,3.551,6.623,7.071,9.727,5002609,2.528,0.9426,0.0,1289.79,0,evidence/results/memory/redis/io1/set-c640.json
-memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,1280,1000000,1024,30,distinct,167912.74,7.62112,7.263,14.207,15.807,20.479,5039117,2.457,0.9342,0.0,1291.49,0,evidence/results/memory/redis/io1/set-c1280.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,16,1000000,1024,30,distinct,28782.33,0.55598,0.551,0.623,0.831,2.335,863485,0.384,0.4177,0.0,1288.7,0,evidence/results/memory/redis/io2/get-c16.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,32,1000000,1024,30,distinct,58729.15,0.54494,0.543,0.615,1.151,2.863,1761891,0.797,0.6359,0.0,1288.68,0,evidence/results/memory/redis/io2/get-c32.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,80,1000000,1024,30,distinct,138447.71,0.57774,0.583,0.687,0.967,2.671,4153538,1.885,1.0504,0.0,1288.71,0,evidence/results/memory/redis/io2/get-c80.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,160,1000000,1024,30,distinct,192380.52,0.83118,0.831,0.975,1.239,2.095,5771599,2.778,1.2136,0.0,1288.74,0,evidence/results/memory/redis/io2/get-c160.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,320,1000000,1024,30,distinct,196845.29,1.62487,1.607,1.911,2.415,4.287,5905912,2.95,1.2037,0.0,1289.31,0,evidence/results/memory/redis/io2/get-c320.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,640,1000000,1024,30,distinct,199443.67,3.20785,2.479,5.279,6.815,9.983,5984434,3.028,1.186,0.0,1290.55,0,evidence/results/memory/redis/io2/get-c640.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,1280,1000000,1024,30,distinct,197000.24,6.49711,5.599,12.031,15.871,20.351,5910972,2.731,1.0956,0.0,1293.09,0,evidence/results/memory/redis/io2/get-c1280.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,16,1000000,1024,30,distinct,28967.91,0.5525,0.551,0.623,0.903,4.511,869048,0.375,0.45,0.0,1290.05,0,evidence/results/memory/redis/io2/set-c16.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,32,1000000,1024,30,distinct,59435.94,0.53859,0.543,0.607,0.655,1.295,1783094,0.781,0.6652,0.0,1291.54,0,evidence/results/memory/redis/io2/set-c32.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,80,1000000,1024,30,distinct,138635.58,0.57707,0.575,0.679,0.895,1.535,4159186,1.892,1.0882,0.0,1298.45,0,evidence/results/memory/redis/io2/set-c80.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,160,1000000,1024,30,distinct,175287.93,0.91238,0.911,1.071,1.263,2.015,5258939,2.573,1.1586,0.0,1310.17,0,evidence/results/memory/redis/io2/set-c160.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,320,1000000,1024,30,distinct,176490.81,1.81245,1.775,2.255,2.863,4.543,5295440,2.696,1.1423,0.0,2267.79,0,evidence/results/memory/redis/io2/set-c320.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,640,1000000,1024,30,distinct,168554.54,3.79591,3.119,6.687,8.383,11.391,5057906,2.537,1.1098,0.0,1361.57,0,evidence/results/memory/redis/io2/set-c640.json
-memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,1280,1000000,1024,30,distinct,166281.49,7.69806,7.071,14.335,18.175,24.447,4989265,2.239,1.0835,0.0,1308.04,0,evidence/results/memory/redis/io2/set-c1280.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,16,1000000,1024,30,distinct,29991.86,0.53358,0.535,0.607,0.639,2.143,899758,0.404,0.1654,0.0,1290.61,0,evidence/results/memory/valkey/io1/get-c16.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,32,1000000,1024,30,distinct,59679.64,0.53629,0.535,0.599,0.663,1.615,1790405,0.797,0.2909,0.0,1290.58,0,evidence/results/memory/valkey/io1/get-c32.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,80,1000000,1024,30,distinct,144411.08,0.55384,0.559,0.647,0.735,1.175,4332387,1.996,0.8068,0.0,1290.64,0,evidence/results/memory/valkey/io1/get-c80.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,160,1000000,1024,30,distinct,169667.33,0.94244,0.943,1.159,1.495,2.543,5090223,2.402,0.9691,0.0,1290.79,0,evidence/results/memory/valkey/io1/get-c160.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,320,1000000,1024,30,distinct,168365.71,1.89978,1.903,2.367,2.991,4.831,5051709,2.318,0.9436,0.0,1291.13,0,evidence/results/memory/valkey/io1/get-c320.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,640,1000000,1024,30,distinct,171308.8,3.73466,3.487,6.527,7.103,10.111,5140528,2.553,0.9371,0.0,1291.82,0,evidence/results/memory/valkey/io1/get-c640.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,1280,1000000,1024,30,distinct,173637.68,7.3716,7.103,13.887,15.743,20.991,5209767,2.491,0.94,0.0,1293.22,0,evidence/results/memory/valkey/io1/get-c1280.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,16,1000000,1024,30,distinct,29573.72,0.54122,0.543,0.607,0.671,2.023,887218,0.384,0.1718,0.0,1290.89,0,evidence/results/memory/valkey/io1/set-c16.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,32,1000000,1024,30,distinct,59995.12,0.53353,0.535,0.607,0.735,1.639,1799888,0.804,0.3136,0.0,1290.91,0,evidence/results/memory/valkey/io1/set-c32.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,80,1000000,1024,30,distinct,143404.09,0.55784,0.559,0.663,0.783,1.423,4302241,1.977,0.8665,0.0,1290.96,0,evidence/results/memory/valkey/io1/set-c80.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,160,1000000,1024,30,distinct,163917.53,0.97571,0.975,1.183,1.431,2.159,4917745,2.308,0.944,0.0,1291.03,0,evidence/results/memory/valkey/io1/set-c160.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,320,1000000,1024,30,distinct,164152.21,1.94865,1.951,2.431,3.343,5.119,4925438,2.288,0.967,0.0,1291.29,0,evidence/results/memory/valkey/io1/set-c320.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,640,1000000,1024,30,distinct,167689.52,3.81564,3.519,6.591,6.911,9.663,5031618,2.512,0.9425,0.0,1291.84,0,evidence/results/memory/valkey/io1/set-c640.json
-memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,1280,1000000,1024,30,distinct,169157.81,7.56681,7.263,14.143,15.487,20.607,5075437,2.377,0.9119,0.0,1292.98,0,evidence/results/memory/valkey/io1/set-c1280.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,16,1000000,1024,30,distinct,30119.19,0.53132,0.527,0.591,0.879,3.455,903593,0.399,0.5685,0.0,1291.06,0,evidence/results/memory/valkey/io2/get-c16.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,32,1000000,1024,30,distinct,61175.01,0.52317,0.527,0.591,0.719,1.991,1835274,0.816,0.2945,0.0,1291.04,0,evidence/results/memory/valkey/io2/get-c32.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,80,1000000,1024,30,distinct,148441.74,0.53877,0.543,0.623,0.927,2.023,4453319,2.058,1.7517,0.0,1291.15,0,evidence/results/memory/valkey/io2/get-c80.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,160,1000000,1024,30,distinct,226514.37,0.70583,0.711,0.807,1.231,2.255,6795773,3.337,1.9638,0.0,1291.3,0,evidence/results/memory/valkey/io2/get-c160.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,320,1000000,1024,30,distinct,217955.41,1.46746,1.479,1.583,2.255,4.287,6539534,3.098,1.9688,0.0,1291.62,0,evidence/results/memory/valkey/io2/get-c320.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,640,1000000,1024,30,distinct,220109.87,2.90675,2.847,3.375,6.079,9.343,6604106,3.345,1.9313,0.0,1292.37,0,evidence/results/memory/valkey/io2/get-c640.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,1280,1000000,1024,30,distinct,214337.59,5.97131,5.951,6.623,14.591,18.431,6431315,3.013,1.9322,0.0,1293.88,0,evidence/results/memory/valkey/io2/get-c1280.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,16,1000000,1024,30,distinct,29854.6,0.5361,0.535,0.599,1.119,3.423,895643,0.402,0.377,0.0,1291.45,0,evidence/results/memory/valkey/io2/set-c16.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,32,1000000,1024,30,distinct,60230.4,0.53144,0.535,0.607,1.055,2.959,1806920,0.814,0.3255,0.0,1291.47,0,evidence/results/memory/valkey/io2/set-c32.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,80,1000000,1024,30,distinct,146876.51,0.54465,0.543,0.631,0.951,2.751,4406462,2.04,1.7663,0.0,1301.05,0,evidence/results/memory/valkey/io2/set-c80.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,160,1000000,1024,30,distinct,193304.69,0.82735,0.831,0.935,1.279,2.111,5799279,2.825,1.9711,0.0,2245.62,0,evidence/results/memory/valkey/io2/set-c160.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,320,1000000,1024,30,distinct,188952.86,1.69291,1.695,2.479,3.631,4.767,5669406,2.839,1.9297,0.0,1361.18,0,evidence/results/memory/valkey/io2/set-c320.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,640,1000000,1024,30,distinct,188035.44,3.40293,3.407,3.791,6.847,9.535,5641709,2.662,1.9665,0.0,1305.88,0,evidence/results/memory/valkey/io2/set-c640.json
-memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,1280,1000000,1024,30,distinct,180499.72,7.09066,7.103,7.871,14.399,18.687,5416469,2.53,1.9278,0.0,1304.86,0,evidence/results/memory/valkey/io2/set-c1280.json
+group,product,system,server_threads,thread_role,workload,connections,keys,value_bytes,test_seconds,client_seed_mode,qps,avg_ms,p50_ms,p99_ms,p999_ms,p9999_ms,requests,client_cores,server_cores_enclosing_window,host_steal_percent_enclosing_window,server_rss_mib_after,connection_errors
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,16,1000000,1024,30,distinct,27000.01,0.59268,0.591,0.663,1.023,2.975,810004,0.364,1.3989,0.0,747.53,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,32,1000000,1024,30,distinct,54044.64,0.59219,0.591,0.671,1.143,2.735,1621357,0.728,1.7485,0.0,740.41,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,80,1000000,1024,30,distinct,133263.31,0.60018,0.599,0.703,0.935,1.855,3997971,1.858,1.9426,0.0,740.84,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,160,1000000,1024,30,distinct,215521.02,0.74178,0.751,0.943,1.239,2.303,6465805,3.233,1.9339,0.0,740.79,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,320,1000000,1024,30,distinct,215505.98,1.48408,1.471,1.847,2.527,4.383,6465798,3.28,1.8848,0.0,743.83,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,640,1000000,1024,30,distinct,215515.39,2.96842,2.975,3.583,6.207,9.087,6467102,3.325,1.8717,0.0,748.91,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,GET,1280,1000000,1024,30,distinct,212841.04,6.01213,5.983,7.199,14.207,18.303,6387487,3.172,1.8746,0.0,761.61,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,16,1000000,1024,30,distinct,30588.19,0.5232,0.519,0.607,1.191,3.231,917650,0.426,0.9952,0.0,751.75,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,32,1000000,1024,30,distinct,60088.7,0.5327,0.527,0.983,1.511,2.463,1802695,0.811,1.4963,0.0,757.18,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,80,1000000,1024,30,distinct,134453.75,0.5949,0.559,1.879,2.575,3.167,4033680,1.908,1.9349,0.0,760.84,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,160,1000000,1024,30,distinct,191909.45,0.83331,0.775,2.735,3.727,4.159,5757429,2.872,1.9728,0.0,763.14,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,320,1000000,1024,30,distinct,204387.87,1.56503,1.527,4.383,5.407,6.815,6131915,3.21,1.987,0.0,763.27,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,640,1000000,1024,30,distinct,205820.41,3.10865,3.007,7.071,9.279,11.711,6175602,3.222,1.9861,0.0,771.82,0
+memory,Lavik 0.1.0 SPDK / 1M keys,lavik-1m,2,workers,SET,1280,1000000,1024,30,distinct,201237.76,6.35982,6.111,12.799,18.175,22.655,6038458,3.245,1.986,0.0,787.24,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,16,100000000,1024,30,distinct,27349.55,0.58509,0.591,0.655,0.887,2.351,820504,0.366,1.4175,0.0,5698.56,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,32,100000000,1024,30,distinct,54039.64,0.59222,0.591,0.663,1.183,2.991,1621216,0.746,1.7458,0.0,5697.39,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,80,100000000,1024,30,distinct,132749.46,0.60253,0.607,0.687,1.039,2.111,3982577,1.852,1.9428,0.0,5697.39,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,160,100000000,1024,30,distinct,215434.3,0.74209,0.751,0.927,1.215,1.951,6463212,3.239,1.9326,0.0,5697.28,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,320,100000000,1024,30,distinct,215463.02,1.48428,1.479,1.799,2.495,4.415,6464867,3.284,1.8844,0.0,5699.81,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,640,100000000,1024,30,distinct,215341.29,2.97096,2.975,3.471,6.175,9.215,6461528,3.339,1.8709,0.0,5704.86,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,GET,1280,100000000,1024,30,distinct,206966.48,6.18289,6.175,6.943,15.167,19.199,6211258,3.019,1.8716,0.0,5715.54,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,16,100000000,1024,30,distinct,30045.5,0.53268,0.527,0.599,0.911,2.511,901379,0.402,0.9141,0.0,5710.3,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,32,100000000,1024,30,distinct,59590.17,0.53719,0.535,0.911,1.631,2.287,1787738,0.791,1.415,0.0,5708.5,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,80,100000000,1024,30,distinct,133976.56,0.59707,0.567,2.063,3.423,3.967,4019370,1.876,1.8605,0.0,5711.84,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,160,100000000,1024,30,distinct,182929.41,0.87417,0.799,3.407,4.639,5.887,5488350,2.761,1.9599,0.0,5713.39,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,320,100000000,1024,30,distinct,194730.72,1.64272,1.591,5.215,6.655,8.383,5842228,3.006,1.961,0.0,5712.82,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,640,100000000,1024,30,distinct,195878.77,3.26646,3.119,8.191,10.495,13.311,5877103,3.1,1.9606,0.0,5727.75,0
+memory,Lavik 0.1.0 SPDK / 100M keys,lavik-100m,2,workers,SET,1280,100000000,1024,30,distinct,184737.61,6.92672,6.431,17.919,27.007,34.815,5544262,2.988,1.9266,0.0,5733.55,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,16,1000000,1024,30,distinct,29797.94,0.53705,0.535,0.607,0.719,1.999,893943,0.392,0.1827,0.0,1288.03,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,32,1000000,1024,30,distinct,60430.21,0.52965,0.527,0.599,0.647,1.767,1812926,0.8,0.3149,0.0,1288.03,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,80,1000000,1024,30,distinct,143953.37,0.55557,0.559,0.663,0.767,1.463,4318664,2.005,0.8234,0.0,1288.1,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,160,1000000,1024,30,distinct,173322.06,0.92261,0.927,1.159,1.359,2.223,5199786,2.447,0.9391,0.0,1288.31,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,320,1000000,1024,30,distinct,169904.26,1.88261,1.887,2.367,3.055,4.959,5097946,2.354,0.9421,0.0,1288.78,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,640,1000000,1024,30,distinct,172536.69,3.70811,3.471,6.495,7.327,10.559,5177424,2.57,0.9372,0.0,1289.77,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,GET,1280,1000000,1024,30,distinct,176390.08,7.25574,6.911,13.503,14.847,19.839,5293164,2.546,0.9383,0.0,1291.76,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,16,1000000,1024,30,distinct,30167.01,0.53059,0.535,0.599,0.631,1.343,905025,0.398,0.1808,0.0,1288.48,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,32,1000000,1024,30,distinct,58505.39,0.54713,0.551,0.615,0.839,2.591,1755173,0.786,0.3176,0.0,1288.49,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,80,1000000,1024,30,distinct,142593.41,0.56109,0.559,0.663,0.783,2.127,4277964,1.937,0.8781,0.0,1288.54,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,160,1000000,1024,30,distinct,161347.64,0.99122,0.991,1.191,1.799,2.959,4840637,2.288,0.9745,0.0,1288.63,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,320,1000000,1024,30,distinct,163702.11,1.95432,1.951,2.447,3.279,5.023,4911239,2.3,0.9378,0.0,1288.97,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,640,1000000,1024,30,distinct,166740.83,3.83774,3.551,6.623,7.071,9.727,5002609,2.528,0.9426,0.0,1289.79,0
+memory,Redis 8.10.2 / 1M keys,redis,1,io-threads,SET,1280,1000000,1024,30,distinct,167912.74,7.62112,7.263,14.207,15.807,20.479,5039117,2.457,0.9342,0.0,1291.49,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,16,1000000,1024,30,distinct,28782.33,0.55598,0.551,0.623,0.831,2.335,863485,0.384,0.4177,0.0,1288.7,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,32,1000000,1024,30,distinct,58729.15,0.54494,0.543,0.615,1.151,2.863,1761891,0.797,0.6359,0.0,1288.68,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,80,1000000,1024,30,distinct,138447.71,0.57774,0.583,0.687,0.967,2.671,4153538,1.885,1.0504,0.0,1288.71,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,160,1000000,1024,30,distinct,192380.52,0.83118,0.831,0.975,1.239,2.095,5771599,2.778,1.2136,0.0,1288.74,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,320,1000000,1024,30,distinct,196845.29,1.62487,1.607,1.911,2.415,4.287,5905912,2.95,1.2037,0.0,1289.31,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,640,1000000,1024,30,distinct,199443.67,3.20785,2.479,5.279,6.815,9.983,5984434,3.028,1.186,0.0,1290.55,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,GET,1280,1000000,1024,30,distinct,197000.24,6.49711,5.599,12.031,15.871,20.351,5910972,2.731,1.0956,0.0,1293.09,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,16,1000000,1024,30,distinct,28967.91,0.5525,0.551,0.623,0.903,4.511,869048,0.375,0.45,0.0,1290.05,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,32,1000000,1024,30,distinct,59435.94,0.53859,0.543,0.607,0.655,1.295,1783094,0.781,0.6652,0.0,1291.54,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,80,1000000,1024,30,distinct,138635.58,0.57707,0.575,0.679,0.895,1.535,4159186,1.892,1.0882,0.0,1298.45,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,160,1000000,1024,30,distinct,175287.93,0.91238,0.911,1.071,1.263,2.015,5258939,2.573,1.1586,0.0,1310.17,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,320,1000000,1024,30,distinct,176490.81,1.81245,1.775,2.255,2.863,4.543,5295440,2.696,1.1423,0.0,2267.79,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,640,1000000,1024,30,distinct,168554.54,3.79591,3.119,6.687,8.383,11.391,5057906,2.537,1.1098,0.0,1361.57,0
+memory,Redis 8.10.2 / 1M keys,redis,2,io-threads,SET,1280,1000000,1024,30,distinct,166281.49,7.69806,7.071,14.335,18.175,24.447,4989265,2.239,1.0835,0.0,1308.04,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,16,1000000,1024,30,distinct,29991.86,0.53358,0.535,0.607,0.639,2.143,899758,0.404,0.1654,0.0,1290.61,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,32,1000000,1024,30,distinct,59679.64,0.53629,0.535,0.599,0.663,1.615,1790405,0.797,0.2909,0.0,1290.58,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,80,1000000,1024,30,distinct,144411.08,0.55384,0.559,0.647,0.735,1.175,4332387,1.996,0.8068,0.0,1290.64,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,160,1000000,1024,30,distinct,169667.33,0.94244,0.943,1.159,1.495,2.543,5090223,2.402,0.9691,0.0,1290.79,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,320,1000000,1024,30,distinct,168365.71,1.89978,1.903,2.367,2.991,4.831,5051709,2.318,0.9436,0.0,1291.13,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,640,1000000,1024,30,distinct,171308.8,3.73466,3.487,6.527,7.103,10.111,5140528,2.553,0.9371,0.0,1291.82,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,GET,1280,1000000,1024,30,distinct,173637.68,7.3716,7.103,13.887,15.743,20.991,5209767,2.491,0.94,0.0,1293.22,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,16,1000000,1024,30,distinct,29573.72,0.54122,0.543,0.607,0.671,2.023,887218,0.384,0.1718,0.0,1290.89,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,32,1000000,1024,30,distinct,59995.12,0.53353,0.535,0.607,0.735,1.639,1799888,0.804,0.3136,0.0,1290.91,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,80,1000000,1024,30,distinct,143404.09,0.55784,0.559,0.663,0.783,1.423,4302241,1.977,0.8665,0.0,1290.96,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,160,1000000,1024,30,distinct,163917.53,0.97571,0.975,1.183,1.431,2.159,4917745,2.308,0.944,0.0,1291.03,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,320,1000000,1024,30,distinct,164152.21,1.94865,1.951,2.431,3.343,5.119,4925438,2.288,0.967,0.0,1291.29,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,640,1000000,1024,30,distinct,167689.52,3.81564,3.519,6.591,6.911,9.663,5031618,2.512,0.9425,0.0,1291.84,0
+memory,Valkey 9.1.2 / 1M keys,valkey,1,io-threads,SET,1280,1000000,1024,30,distinct,169157.81,7.56681,7.263,14.143,15.487,20.607,5075437,2.377,0.9119,0.0,1292.98,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,16,1000000,1024,30,distinct,30119.19,0.53132,0.527,0.591,0.879,3.455,903593,0.399,0.5685,0.0,1291.06,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,32,1000000,1024,30,distinct,61175.01,0.52317,0.527,0.591,0.719,1.991,1835274,0.816,0.2945,0.0,1291.04,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,80,1000000,1024,30,distinct,148441.74,0.53877,0.543,0.623,0.927,2.023,4453319,2.058,1.7517,0.0,1291.15,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,160,1000000,1024,30,distinct,226514.37,0.70583,0.711,0.807,1.231,2.255,6795773,3.337,1.9638,0.0,1291.3,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,320,1000000,1024,30,distinct,217955.41,1.46746,1.479,1.583,2.255,4.287,6539534,3.098,1.9688,0.0,1291.62,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,640,1000000,1024,30,distinct,220109.87,2.90675,2.847,3.375,6.079,9.343,6604106,3.345,1.9313,0.0,1292.37,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,GET,1280,1000000,1024,30,distinct,214337.59,5.97131,5.951,6.623,14.591,18.431,6431315,3.013,1.9322,0.0,1293.88,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,16,1000000,1024,30,distinct,29854.6,0.5361,0.535,0.599,1.119,3.423,895643,0.402,0.377,0.0,1291.45,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,32,1000000,1024,30,distinct,60230.4,0.53144,0.535,0.607,1.055,2.959,1806920,0.814,0.3255,0.0,1291.47,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,80,1000000,1024,30,distinct,146876.51,0.54465,0.543,0.631,0.951,2.751,4406462,2.04,1.7663,0.0,1301.05,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,160,1000000,1024,30,distinct,193304.69,0.82735,0.831,0.935,1.279,2.111,5799279,2.825,1.9711,0.0,2245.62,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,320,1000000,1024,30,distinct,188952.86,1.69291,1.695,2.479,3.631,4.767,5669406,2.839,1.9297,0.0,1361.18,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,640,1000000,1024,30,distinct,188035.44,3.40293,3.407,3.791,6.847,9.535,5641709,2.662,1.9665,0.0,1305.88,0
+memory,Valkey 9.1.2 / 1M keys,valkey,2,io-threads,SET,1280,1000000,1024,30,distinct,180499.72,7.09066,7.103,7.871,14.399,18.687,5416469,2.53,1.9278,0.0,1304.86,0

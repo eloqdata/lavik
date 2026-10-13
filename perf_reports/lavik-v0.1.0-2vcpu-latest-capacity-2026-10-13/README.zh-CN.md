@@ -104,7 +104,7 @@ Redis / Valkey 各测 IO=1 和 IO=2；每个操作选峰值较高的一组 IO �
 - 加载、预热、测量期间均开启 defrag：`defrag-paused=no`，每设备 max active=8，block/record sleep=0。Tomb Raider interval=0，关闭的是墓碑扫描，不是 defrag。每个正式测试点前后均记录状态。
 - 每个 Lavik 数据集前均校验临时 NVMe 的序列号、PCI 地址、namespace、容量、挂载状态、分区、holders 和使用进程，再 discard。正常退出后恢复内核 NVMe 驱动与 hugepage/VFIO 设置，然后执行下一组配置。
 - Redis 和 Valkey 从固定 release 提交以默认优化选项编译，使用 jemalloc 5.3.0；设置 `save ""`、`appendonly no`、`maxmemory 0`。每个产品初次加载后，在正式计时窗口之外手动 SAVE 一次生成基线 RDB，各 IO 配置重载该基线。计时写入为纯内存写入。
-- 每个配置前后核验精确 DBSIZE 与五个抽样 value 长度。`verify_results.py` 检查加载操作数、正式客户端输出、GET 零 miss、连接零错误、运行时命令错误增量、版本、CPU 绑定与正常退出。
+- 每个配置前后核验精确 DBSIZE 与五个抽样 value 长度。检查加载操作数、GET 命中数、连接错误、运行时版本与 CPU 绑定。
 
 ## 同一台小机器，承载 100 倍数据
 
@@ -113,3 +113,119 @@ Lavik 在内存中保存索引，将 value 存放于 NVMe。本次使用相同�
 数据量扩大 100 倍后，GET 峰值从 **215,521** 变为 **215,463 ops/s**，基本保持不变；SET 峰值从 **205,820** 变为 **195,879 ops/s**，保留了 **95.2%**。测试前后完整 key 数均为 100,000,000，所有正式 GET 测试零 miss。
 
 三条 100 万条曲线展示 Lavik 与 Redis、Valkey 在小机器上的性能；Lavik 1 亿条曲线进一步展示同样硬件承载更大数据集的能力。**在这组测试中，Lavik 将数据容量扩展到内存之外，同时保持了接近小数据集的峰值吞吐量。**
+
+## 复现命令
+
+服务端使用上述 L2aos_v5，客户端使用同可用区的 F16as_v7；两端通过私网连接。准备 Lavik v0.1.0 标准 x86_64 二进制、Redis 8.10.2、Valkey 9.1.2 和 memtier 2.5.1。Redis / Valkey 使用默认优化构建、jemalloc 5.3.0，编译参数为 `make -j12 BUILD_TLS=yes`。以下命令使用 Bash。
+
+### 启动服务端
+
+```bash
+# Run on the server; replace the address and binary paths for your hosts.
+SERVER_IP=10.93.0.7
+LAVIK_BIN=/opt/lavik-v0.1.0-linux-x86_64/lavik
+REDIS_BIN=/opt/redis-8.10.2/src/redis-server
+VALKEY_BIN=/opt/valkey-9.1.2/src/valkey-server
+ulimit -n 65535
+sudo sysctl -w vm.overcommit_memory=1
+printf 'never\n' | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+Lavik 使用空的专用 NVMe namespace。启动前按 [SPDK 存储指南](../../docs/operations/spdk-storage.md) 识别测试盘并绑定 VFIO，本测试设置 `HUGEMEM=2048`、`BYCORF_DPDK_MEMORY_MB=2048`。该 VM 未暴露 IOMMU，按指南使用了专用测试机的 no-IOMMU 配置。分别加载 100 万条和 1 亿条；两次之间正常退出 Lavik、恢复 NVMe 驱动，再清空已确认的测试 namespace 并重新绑定，独立加载数据。
+
+```bash
+# Use the verified PCI address and namespace ID of your empty test NVMe.
+NVME_BDF=YOUR_NVME_PCI_ADDRESS
+NVME_NSID=1
+sudo prlimit --memlock=unlimited:unlimited --nofile=65535:65535 \
+  env BYCORF_EAL_ARGS="-a ${NVME_BDF}" BYCORF_DPDK_MEMORY_MB=2048 \
+  taskset -c 0-1 "$LAVIK_BIN" \
+  --network=kernel --storage=spdk --bind="$SERVER_IP" --port=6379 \
+  --metrics-port=0 --threads=2 --pin-workers --maxclients=10000 \
+  --busy-poll-us=20 --foreground-budget-us=1000 --background-budget-us=10 \
+  --background-warrant-percent=1 --tomb-raider-interval-ms=0 \
+  --spdk-max-completions-per-poll=16 --spdk-foreground-pre-poll-us=5 \
+  --defrag-max-active-per-device=8 --defrag-sleep-ms=0 \
+  --defrag-record-sleep-us=0 --log-dir="$PWD/lavik-logs" \
+  --data-file="spdk://${NVME_BDF}/${NVME_NSID}"
+```
+
+Redis 和 Valkey 分别测试 1、2 个 I/O 线程，每次只运行一个服务端：
+
+```bash
+# Run one product/configuration at a time. Repeat with IO_THREADS=2.
+IO_THREADS=1
+mkdir -p "$PWD/bench-data/redis" "$PWD/bench-data/valkey"
+
+# Redis 8.10.2
+taskset -c 0-1 "$REDIS_BIN" \
+  --bind "$SERVER_IP" --port 6379 --protected-mode no --daemonize no \
+  --dir "$PWD/bench-data/redis" --dbfilename dump.rdb \
+  --save "" --appendonly no --maxmemory 0 --maxclients 10000 \
+  --io-threads "$IO_THREADS"
+
+# Valkey 9.1.2 (after stopping Redis)
+taskset -c 0-1 "$VALKEY_BIN" \
+  --bind "$SERVER_IP" --port 6379 --protected-mode no --daemonize no \
+  --dir "$PWD/bench-data/valkey" --dbfilename dump.rdb \
+  --save "" --appendonly no --maxmemory 0 --maxclients 10000 \
+  --io-threads "$IO_THREADS"
+```
+
+### 客户端灌数与测试
+
+按 Lavik 100 万、Lavik 1 亿、Redis IO=1/2、Valkey IO=1/2 的顺序运行。切换配置时修改 `N` 和 `RUN`。每个产品首次灌数前确认 `DBSIZE=0`。Redis / Valkey 首次灌数后执行一次 `SAVE`，再用 `SHUTDOWN NOSAVE` 退出；每组 I/O 线程配置都从同一基线 RDB 重启，跳过再次灌数，重新检查数据后执行预热与扫描。Lavik 两组均从空的测试 namespace 独立灌数。
+
+```bash
+# Bash, on the separate 16-core client; memtier_benchmark 2.5.1.
+set -euo pipefail
+SERVER_IP=10.93.0.7
+N=1000000                 # Use 100000000 for the large Lavik dataset.
+RUN=lavik-1m              # lavik-100m, redis-io1, redis-io2, valkey-io1, valkey-io2
+mkdir -p "$RUN"
+ulimit -n 65535
+COMMON=(--server="$SERVER_IP" --port=6379 --protocol=redis \
+  --threads=16 --pipeline=1 --key-minimum=1 --key-maximum="$N" \
+  --key-prefix= --data-size=1024 --hide-histogram \
+  --print-percentiles=50,99,99.9,99.99 --show-config)
+
+# Fill an empty dataset using disjoint sequential key streams: exactly N writes.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=10 \
+  --requests="$((N / 160))" --ratio=1:0 --key-pattern=P:P \
+  --json-out-file="$RUN/fill.json" > "$RUN/fill.txt" 2>&1
+
+check_data() {
+  test "$(redis-cli -h "$SERVER_IP" --raw DBSIZE)" = "$N"
+  for key in 1 2 "$((N / 2))" "$((N - 1))" "$N"; do
+    test "$(redis-cli -h "$SERVER_IP" --raw STRLEN "$key")" = 1024
+  done
+}
+check_data
+
+# For each memory peer only: create its baseline RDB once after the first fill.
+# redis-cli -h "$SERVER_IP" SAVE
+
+# Warmup, then GET and SET sweeps. Reuse this part after loading a baseline RDB.
+taskset -c 0-15 memtier_benchmark "${COMMON[@]}" --clients=10 \
+  --distinct-client-seed --test-time=10 \
+  --command='GET __key__' --command-key-pattern=R --command-is-read \
+  --json-out-file="$RUN/warmup.json" > "$RUN/warmup.txt" 2>&1
+
+for kind in GET SET; do
+  if [ "$kind" = GET ]; then
+    COMMAND='GET __key__'; READ_FLAG=(--command-is-read)
+  else
+    COMMAND='SET __key__ __data__'; READ_FLAG=()
+  fi
+  for connections in 16 32 80 160 320 640 1280; do
+    taskset -c 0-15 memtier_benchmark "${COMMON[@]}" \
+      --clients="$((connections / 16))" --distinct-client-seed --test-time=30 \
+      --command="$COMMAND" --command-key-pattern=R "${READ_FLAG[@]}" \
+      --json-out-file="$RUN/${kind}-c${connections}.json" \
+      > "$RUN/${kind}-c${connections}.txt" 2>&1
+  done
+done
+check_data
+```
+
+每组结束后检查 GET 全部命中、连接错误为零，且 DBSIZE 保持不变。汇总结果见 [results.csv](results.csv)。

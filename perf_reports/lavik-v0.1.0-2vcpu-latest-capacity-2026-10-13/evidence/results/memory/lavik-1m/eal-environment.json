@@ -1,4 +1,0 @@
-{
-  "BYCORF_EAL_ARGS": "-a f79f:00:00.0",
-  "BYCORF_DPDK_MEMORY_MB": "2048"
-}

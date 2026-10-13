@@ -1,4 +1,0 @@
-{
-  "transparent_hugepages": "[always] madvise never",
-  "vm.overcommit_memory": "0"
-}
