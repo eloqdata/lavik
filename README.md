@@ -314,7 +314,7 @@ covering workloads A/B/C/D and their tail latencies.
 
 <a id="in-memory-redis-and-valkey"></a>
 
-### In-memory Redis and Valkey: 100× more data, comparable throughput
+### In-memory Redis and Valkey: more data, higher throughput
 
 #### 2 vCPUs
 
@@ -337,7 +337,11 @@ on an Azure Standard_L16aos_v4 VM.
 
 ![16 vCPUs: Lavik with 10M and 1B keys versus Redis and Valkey with 10M keys](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-qps.svg)
 
-For the 10M dataset, Lavik peaked at **1,145,772 GET QPS** and **971,950 SET QPS**.
+At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
+peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
+GET was **12.5% faster than Redis and 18.1% faster than Valkey**;
+SET was **2.2% and 20.3% faster**, respectively.
+
 With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
 **817,113 SET QPS**—throughput comparable to Redis and Valkey holding
 10 million keys in memory, with **100 times as much data**.
