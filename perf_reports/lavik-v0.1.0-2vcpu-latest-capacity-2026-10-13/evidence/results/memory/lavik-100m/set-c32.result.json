@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-100m/set-c32",
+  "kind": "SET",
+  "keys": 100000000,
+  "connections": 32,
+  "qps": 59590.17,
+  "avg_ms": 0.53719,
+  "p50_ms": 0.535,
+  "p99_ms": 0.911,
+  "p999_ms": 1.631,
+  "p9999_ms": 2.287
+}

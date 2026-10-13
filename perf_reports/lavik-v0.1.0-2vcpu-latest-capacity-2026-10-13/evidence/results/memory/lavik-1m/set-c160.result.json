@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-1m/set-c160",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 160,
+  "qps": 191909.45,
+  "avg_ms": 0.83331,
+  "p50_ms": 0.775,
+  "p99_ms": 2.735,
+  "p999_ms": 3.727,
+  "p9999_ms": 4.159
+}

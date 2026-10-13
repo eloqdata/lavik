@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-100m/get-c16",
+  "kind": "GET",
+  "keys": 100000000,
+  "connections": 16,
+  "qps": 27349.55,
+  "avg_ms": 0.58509,
+  "p50_ms": 0.591,
+  "p99_ms": 0.655,
+  "p999_ms": 0.887,
+  "p9999_ms": 2.351
+}

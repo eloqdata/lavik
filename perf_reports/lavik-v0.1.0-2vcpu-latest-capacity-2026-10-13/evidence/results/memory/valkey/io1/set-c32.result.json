@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io1/set-c32",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 32,
+  "qps": 59995.12,
+  "avg_ms": 0.53353,
+  "p50_ms": 0.535,
+  "p99_ms": 0.607,
+  "p999_ms": 0.735,
+  "p9999_ms": 1.639
+}

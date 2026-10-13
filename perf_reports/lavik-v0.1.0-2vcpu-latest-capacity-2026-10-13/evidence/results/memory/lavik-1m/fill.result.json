@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-1m/fill",
+  "kind": "fill",
+  "keys": 1000000,
+  "connections": 160,
+  "qps": 212249.06,
+  "avg_ms": 0.75514,
+  "p50_ms": 0.719,
+  "p99_ms": 1.999,
+  "p999_ms": 2.703,
+  "p9999_ms": 3.583
+}

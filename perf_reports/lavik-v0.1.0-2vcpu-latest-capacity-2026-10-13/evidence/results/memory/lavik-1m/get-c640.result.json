@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-1m/get-c640",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 640,
+  "qps": 215515.39,
+  "avg_ms": 2.96842,
+  "p50_ms": 2.975,
+  "p99_ms": 3.583,
+  "p999_ms": 6.207,
+  "p9999_ms": 9.087
+}

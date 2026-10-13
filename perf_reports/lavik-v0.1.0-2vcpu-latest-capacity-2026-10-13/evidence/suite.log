@@ -1,0 +1,229 @@
+2026-10-13 13:40:36 UTC clearing the verified disposable local NVMe namespace
+2026-10-13 13:40:37 UTC starting /opt/bench2c/downloads/lavik-v0.1.0-linux-x86_64/lavik
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 13:40:38 UTC memory/lavik-1m/fill
+2026-10-13 13:40:45 UTC memory/lavik-1m/fill done: 212249 QPS, p999=2.703 ms
+2026-10-13 13:40:45 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 13:40:45 UTC memory/lavik-1m/warmup
+2026-10-13 13:40:56 UTC memory/lavik-1m/warmup done: 215483 QPS, p999=1.455 ms
+2026-10-13 13:40:56 UTC memory/lavik-1m/get-c16
+2026-10-13 13:41:28 UTC memory/lavik-1m/get-c16 done: 27000 QPS, p999=1.023 ms
+2026-10-13 13:41:28 UTC memory/lavik-1m/get-c32
+2026-10-13 13:42:00 UTC memory/lavik-1m/get-c32 done: 54045 QPS, p999=1.143 ms
+2026-10-13 13:42:00 UTC memory/lavik-1m/get-c80
+2026-10-13 13:42:31 UTC memory/lavik-1m/get-c80 done: 133263 QPS, p999=0.935 ms
+2026-10-13 13:42:31 UTC memory/lavik-1m/get-c160
+2026-10-13 13:43:02 UTC memory/lavik-1m/get-c160 done: 215521 QPS, p999=1.239 ms
+2026-10-13 13:43:02 UTC memory/lavik-1m/get-c320
+2026-10-13 13:43:33 UTC memory/lavik-1m/get-c320 done: 215506 QPS, p999=2.527 ms
+2026-10-13 13:43:33 UTC memory/lavik-1m/get-c640
+2026-10-13 13:44:05 UTC memory/lavik-1m/get-c640 done: 215515 QPS, p999=6.207 ms
+2026-10-13 13:44:05 UTC memory/lavik-1m/get-c1280
+2026-10-13 13:44:37 UTC memory/lavik-1m/get-c1280 done: 212841 QPS, p999=14.207 ms
+2026-10-13 13:44:37 UTC memory/lavik-1m/set-c16
+2026-10-13 13:45:09 UTC memory/lavik-1m/set-c16 done: 30588 QPS, p999=1.191 ms
+2026-10-13 13:45:09 UTC memory/lavik-1m/set-c32
+2026-10-13 13:45:41 UTC memory/lavik-1m/set-c32 done: 60089 QPS, p999=1.511 ms
+2026-10-13 13:45:41 UTC memory/lavik-1m/set-c80
+2026-10-13 13:46:12 UTC memory/lavik-1m/set-c80 done: 134454 QPS, p999=2.575 ms
+2026-10-13 13:46:12 UTC memory/lavik-1m/set-c160
+2026-10-13 13:46:44 UTC memory/lavik-1m/set-c160 done: 191909 QPS, p999=3.727 ms
+2026-10-13 13:46:44 UTC memory/lavik-1m/set-c320
+2026-10-13 13:47:15 UTC memory/lavik-1m/set-c320 done: 204388 QPS, p999=5.407 ms
+2026-10-13 13:47:15 UTC memory/lavik-1m/set-c640
+2026-10-13 13:47:47 UTC memory/lavik-1m/set-c640 done: 205820 QPS, p999=9.279 ms
+2026-10-13 13:47:47 UTC memory/lavik-1m/set-c1280
+2026-10-13 13:48:20 UTC memory/lavik-1m/set-c1280 done: 201238 QPS, p999=18.175 ms
+2026-10-13 13:48:20 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 13:48:21 UTC COMPLETE fresh SPDK 1000000 keys
+2026-10-13 13:48:21 UTC clearing the verified disposable local NVMe namespace
+2026-10-13 13:48:21 UTC starting /opt/bench2c/downloads/lavik-v0.1.0-linux-x86_64/lavik
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 13:48:23 UTC memory/lavik-100m/fill
+2026-10-13 13:57:21 UTC memory/lavik-100m/fill done: 197547 QPS, p999=3.231 ms
+2026-10-13 13:57:21 UTC validating dataset: 100000000 keys, 1024-byte values
+2026-10-13 13:57:21 UTC memory/lavik-100m/warmup
+2026-10-13 13:57:33 UTC memory/lavik-100m/warmup done: 215311 QPS, p999=1.247 ms
+2026-10-13 13:57:33 UTC memory/lavik-100m/get-c16
+2026-10-13 13:58:05 UTC memory/lavik-100m/get-c16 done: 27350 QPS, p999=0.887 ms
+2026-10-13 13:58:05 UTC memory/lavik-100m/get-c32
+2026-10-13 13:58:37 UTC memory/lavik-100m/get-c32 done: 54040 QPS, p999=1.183 ms
+2026-10-13 13:58:37 UTC memory/lavik-100m/get-c80
+2026-10-13 13:59:07 UTC memory/lavik-100m/get-c80 done: 132749 QPS, p999=1.039 ms
+2026-10-13 13:59:07 UTC memory/lavik-100m/get-c160
+2026-10-13 13:59:38 UTC memory/lavik-100m/get-c160 done: 215434 QPS, p999=1.215 ms
+2026-10-13 13:59:38 UTC memory/lavik-100m/get-c320
+2026-10-13 14:00:10 UTC memory/lavik-100m/get-c320 done: 215463 QPS, p999=2.495 ms
+2026-10-13 14:00:10 UTC memory/lavik-100m/get-c640
+2026-10-13 14:00:42 UTC memory/lavik-100m/get-c640 done: 215341 QPS, p999=6.175 ms
+2026-10-13 14:00:42 UTC memory/lavik-100m/get-c1280
+2026-10-13 14:01:14 UTC memory/lavik-100m/get-c1280 done: 206966 QPS, p999=15.167 ms
+2026-10-13 14:01:14 UTC memory/lavik-100m/set-c16
+2026-10-13 14:01:46 UTC memory/lavik-100m/set-c16 done: 30046 QPS, p999=0.911 ms
+2026-10-13 14:01:46 UTC memory/lavik-100m/set-c32
+2026-10-13 14:02:18 UTC memory/lavik-100m/set-c32 done: 59590 QPS, p999=1.631 ms
+2026-10-13 14:02:18 UTC memory/lavik-100m/set-c80
+2026-10-13 14:02:49 UTC memory/lavik-100m/set-c80 done: 133977 QPS, p999=3.423 ms
+2026-10-13 14:02:49 UTC memory/lavik-100m/set-c160
+2026-10-13 14:03:20 UTC memory/lavik-100m/set-c160 done: 182929 QPS, p999=4.639 ms
+2026-10-13 14:03:20 UTC memory/lavik-100m/set-c320
+2026-10-13 14:03:51 UTC memory/lavik-100m/set-c320 done: 194731 QPS, p999=6.655 ms
+2026-10-13 14:03:51 UTC memory/lavik-100m/set-c640
+2026-10-13 14:04:22 UTC memory/lavik-100m/set-c640 done: 195879 QPS, p999=10.495 ms
+2026-10-13 14:04:22 UTC memory/lavik-100m/set-c1280
+2026-10-13 14:04:54 UTC memory/lavik-100m/set-c1280 done: 184738 QPS, p999=27.007 ms
+2026-10-13 14:04:54 UTC validating dataset: 100000000 keys, 1024-byte values
+2026-10-13 14:04:58 UTC COMPLETE fresh SPDK 100000000 keys
+2026-10-13 14:04:58 UTC starting /opt/bench2c/bin/redis-server
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 14:04:59 UTC memory/redis/fill
+2026-10-13 14:05:05 UTC memory/redis/fill done: 174271 QPS, p999=1.823 ms
+2026-10-13 14:05:05 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:05:08 UTC starting /opt/bench2c/bin/redis-server
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 14:05:11 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:05:11 UTC memory/redis/io1/warmup
+2026-10-13 14:05:22 UTC memory/redis/io1/warmup done: 169971 QPS, p999=1.415 ms
+2026-10-13 14:05:22 UTC memory/redis/io1/get-c16
+2026-10-13 14:05:53 UTC memory/redis/io1/get-c16 done: 29798 QPS, p999=0.719 ms
+2026-10-13 14:05:53 UTC memory/redis/io1/get-c32
+2026-10-13 14:06:24 UTC memory/redis/io1/get-c32 done: 60430 QPS, p999=0.647 ms
+2026-10-13 14:06:24 UTC memory/redis/io1/get-c80
+2026-10-13 14:06:56 UTC memory/redis/io1/get-c80 done: 143953 QPS, p999=0.767 ms
+2026-10-13 14:06:56 UTC memory/redis/io1/get-c160
+2026-10-13 14:07:28 UTC memory/redis/io1/get-c160 done: 173322 QPS, p999=1.359 ms
+2026-10-13 14:07:28 UTC memory/redis/io1/get-c320
+2026-10-13 14:08:00 UTC memory/redis/io1/get-c320 done: 169904 QPS, p999=3.055 ms
+2026-10-13 14:08:00 UTC memory/redis/io1/get-c640
+2026-10-13 14:08:32 UTC memory/redis/io1/get-c640 done: 172537 QPS, p999=7.327 ms
+2026-10-13 14:08:32 UTC memory/redis/io1/get-c1280
+2026-10-13 14:09:03 UTC memory/redis/io1/get-c1280 done: 176390 QPS, p999=14.847 ms
+2026-10-13 14:09:04 UTC memory/redis/io1/set-c16
+2026-10-13 14:09:35 UTC memory/redis/io1/set-c16 done: 30167 QPS, p999=0.631 ms
+2026-10-13 14:09:35 UTC memory/redis/io1/set-c32
+2026-10-13 14:10:07 UTC memory/redis/io1/set-c32 done: 58505 QPS, p999=0.839 ms
+2026-10-13 14:10:07 UTC memory/redis/io1/set-c80
+2026-10-13 14:10:38 UTC memory/redis/io1/set-c80 done: 142593 QPS, p999=0.783 ms
+2026-10-13 14:10:38 UTC memory/redis/io1/set-c160
+2026-10-13 14:11:09 UTC memory/redis/io1/set-c160 done: 161348 QPS, p999=1.799 ms
+2026-10-13 14:11:09 UTC memory/redis/io1/set-c320
+2026-10-13 14:11:41 UTC memory/redis/io1/set-c320 done: 163702 QPS, p999=3.279 ms
+2026-10-13 14:11:41 UTC memory/redis/io1/set-c640
+2026-10-13 14:12:13 UTC memory/redis/io1/set-c640 done: 166741 QPS, p999=7.071 ms
+2026-10-13 14:12:13 UTC memory/redis/io1/set-c1280
+2026-10-13 14:12:45 UTC memory/redis/io1/set-c1280 done: 167913 QPS, p999=15.807 ms
+2026-10-13 14:12:45 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:12:45 UTC starting /opt/bench2c/bin/redis-server
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 14:12:48 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:12:48 UTC memory/redis/io2/warmup
+2026-10-13 14:13:00 UTC memory/redis/io2/warmup done: 189470 QPS, p999=1.271 ms
+2026-10-13 14:13:00 UTC memory/redis/io2/get-c16
+2026-10-13 14:13:31 UTC memory/redis/io2/get-c16 done: 28782 QPS, p999=0.831 ms
+2026-10-13 14:13:31 UTC memory/redis/io2/get-c32
+2026-10-13 14:14:03 UTC memory/redis/io2/get-c32 done: 58729 QPS, p999=1.151 ms
+2026-10-13 14:14:03 UTC memory/redis/io2/get-c80
+2026-10-13 14:14:34 UTC memory/redis/io2/get-c80 done: 138448 QPS, p999=0.967 ms
+2026-10-13 14:14:34 UTC memory/redis/io2/get-c160
+2026-10-13 14:15:05 UTC memory/redis/io2/get-c160 done: 192381 QPS, p999=1.239 ms
+2026-10-13 14:15:05 UTC memory/redis/io2/get-c320
+2026-10-13 14:15:36 UTC memory/redis/io2/get-c320 done: 196845 QPS, p999=2.415 ms
+2026-10-13 14:15:36 UTC memory/redis/io2/get-c640
+2026-10-13 14:16:07 UTC memory/redis/io2/get-c640 done: 199444 QPS, p999=6.815 ms
+2026-10-13 14:16:07 UTC memory/redis/io2/get-c1280
+2026-10-13 14:16:40 UTC memory/redis/io2/get-c1280 done: 197000 QPS, p999=15.871 ms
+2026-10-13 14:16:40 UTC memory/redis/io2/set-c16
+2026-10-13 14:17:12 UTC memory/redis/io2/set-c16 done: 28968 QPS, p999=0.903 ms
+2026-10-13 14:17:12 UTC memory/redis/io2/set-c32
+2026-10-13 14:17:43 UTC memory/redis/io2/set-c32 done: 59436 QPS, p999=0.655 ms
+2026-10-13 14:17:44 UTC memory/redis/io2/set-c80
+2026-10-13 14:18:14 UTC memory/redis/io2/set-c80 done: 138636 QPS, p999=0.895 ms
+2026-10-13 14:18:14 UTC memory/redis/io2/set-c160
+2026-10-13 14:18:45 UTC memory/redis/io2/set-c160 done: 175288 QPS, p999=1.263 ms
+2026-10-13 14:18:45 UTC memory/redis/io2/set-c320
+2026-10-13 14:19:17 UTC memory/redis/io2/set-c320 done: 176491 QPS, p999=2.863 ms
+2026-10-13 14:19:17 UTC memory/redis/io2/set-c640
+2026-10-13 14:19:49 UTC memory/redis/io2/set-c640 done: 168555 QPS, p999=8.383 ms
+2026-10-13 14:19:49 UTC memory/redis/io2/set-c1280
+2026-10-13 14:20:21 UTC memory/redis/io2/set-c1280 done: 166281 QPS, p999=18.175 ms
+2026-10-13 14:20:21 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:20:21 UTC COMPLETE redis
+2026-10-13 14:20:21 UTC starting /opt/bench2c/bin/valkey-server
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 14:20:22 UTC memory/valkey/fill
+2026-10-13 14:20:29 UTC memory/valkey/fill done: 193607 QPS, p999=1.687 ms
+2026-10-13 14:20:29 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:20:31 UTC starting /opt/bench2c/bin/valkey-server
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 14:20:34 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:20:34 UTC memory/valkey/io1/warmup
+2026-10-13 14:20:46 UTC memory/valkey/io1/warmup done: 174080 QPS, p999=1.471 ms
+2026-10-13 14:20:46 UTC memory/valkey/io1/get-c16
+2026-10-13 14:21:17 UTC memory/valkey/io1/get-c16 done: 29992 QPS, p999=0.639 ms
+2026-10-13 14:21:17 UTC memory/valkey/io1/get-c32
+2026-10-13 14:21:49 UTC memory/valkey/io1/get-c32 done: 59680 QPS, p999=0.663 ms
+2026-10-13 14:21:49 UTC memory/valkey/io1/get-c80
+2026-10-13 14:22:21 UTC memory/valkey/io1/get-c80 done: 144411 QPS, p999=0.735 ms
+2026-10-13 14:22:21 UTC memory/valkey/io1/get-c160
+2026-10-13 14:22:52 UTC memory/valkey/io1/get-c160 done: 169667 QPS, p999=1.495 ms
+2026-10-13 14:22:52 UTC memory/valkey/io1/get-c320
+2026-10-13 14:23:24 UTC memory/valkey/io1/get-c320 done: 168366 QPS, p999=2.991 ms
+2026-10-13 14:23:24 UTC memory/valkey/io1/get-c640
+2026-10-13 14:23:56 UTC memory/valkey/io1/get-c640 done: 171309 QPS, p999=7.103 ms
+2026-10-13 14:23:56 UTC memory/valkey/io1/get-c1280
+2026-10-13 14:24:28 UTC memory/valkey/io1/get-c1280 done: 173638 QPS, p999=15.743 ms
+2026-10-13 14:24:28 UTC memory/valkey/io1/set-c16
+2026-10-13 14:25:00 UTC memory/valkey/io1/set-c16 done: 29574 QPS, p999=0.671 ms
+2026-10-13 14:25:00 UTC memory/valkey/io1/set-c32
+2026-10-13 14:25:32 UTC memory/valkey/io1/set-c32 done: 59995 QPS, p999=0.735 ms
+2026-10-13 14:25:32 UTC memory/valkey/io1/set-c80
+2026-10-13 14:26:03 UTC memory/valkey/io1/set-c80 done: 143404 QPS, p999=0.783 ms
+2026-10-13 14:26:03 UTC memory/valkey/io1/set-c160
+2026-10-13 14:26:34 UTC memory/valkey/io1/set-c160 done: 163918 QPS, p999=1.431 ms
+2026-10-13 14:26:34 UTC memory/valkey/io1/set-c320
+2026-10-13 14:27:05 UTC memory/valkey/io1/set-c320 done: 164152 QPS, p999=3.343 ms
+2026-10-13 14:27:05 UTC memory/valkey/io1/set-c640
+2026-10-13 14:27:37 UTC memory/valkey/io1/set-c640 done: 167690 QPS, p999=6.911 ms
+2026-10-13 14:27:37 UTC memory/valkey/io1/set-c1280
+2026-10-13 14:28:10 UTC memory/valkey/io1/set-c1280 done: 169158 QPS, p999=15.487 ms
+2026-10-13 14:28:10 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:28:10 UTC starting /opt/bench2c/bin/valkey-server
+Could not connect to Redis at 10.93.0.7:6379: Connection refused
+2026-10-13 14:28:13 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:28:13 UTC memory/valkey/io2/warmup
+2026-10-13 14:28:25 UTC memory/valkey/io2/warmup done: 217327 QPS, p999=1.263 ms
+2026-10-13 14:28:25 UTC memory/valkey/io2/get-c16
+2026-10-13 14:28:57 UTC memory/valkey/io2/get-c16 done: 30119 QPS, p999=0.879 ms
+2026-10-13 14:28:57 UTC memory/valkey/io2/get-c32
+2026-10-13 14:29:28 UTC memory/valkey/io2/get-c32 done: 61175 QPS, p999=0.719 ms
+2026-10-13 14:29:28 UTC memory/valkey/io2/get-c80
+2026-10-13 14:29:59 UTC memory/valkey/io2/get-c80 done: 148442 QPS, p999=0.927 ms
+2026-10-13 14:29:59 UTC memory/valkey/io2/get-c160
+2026-10-13 14:30:30 UTC memory/valkey/io2/get-c160 done: 226514 QPS, p999=1.231 ms
+2026-10-13 14:30:30 UTC memory/valkey/io2/get-c320
+2026-10-13 14:31:01 UTC memory/valkey/io2/get-c320 done: 217955 QPS, p999=2.255 ms
+2026-10-13 14:31:01 UTC memory/valkey/io2/get-c640
+2026-10-13 14:31:33 UTC memory/valkey/io2/get-c640 done: 220110 QPS, p999=6.079 ms
+2026-10-13 14:31:33 UTC memory/valkey/io2/get-c1280
+2026-10-13 14:32:05 UTC memory/valkey/io2/get-c1280 done: 214338 QPS, p999=14.591 ms
+2026-10-13 14:32:05 UTC memory/valkey/io2/set-c16
+2026-10-13 14:32:37 UTC memory/valkey/io2/set-c16 done: 29855 QPS, p999=1.119 ms
+2026-10-13 14:32:37 UTC memory/valkey/io2/set-c32
+2026-10-13 14:33:08 UTC memory/valkey/io2/set-c32 done: 60230 QPS, p999=1.055 ms
+2026-10-13 14:33:08 UTC memory/valkey/io2/set-c80
+2026-10-13 14:33:40 UTC memory/valkey/io2/set-c80 done: 146877 QPS, p999=0.951 ms
+2026-10-13 14:33:40 UTC memory/valkey/io2/set-c160
+2026-10-13 14:34:11 UTC memory/valkey/io2/set-c160 done: 193305 QPS, p999=1.279 ms
+2026-10-13 14:34:11 UTC memory/valkey/io2/set-c320
+2026-10-13 14:34:43 UTC memory/valkey/io2/set-c320 done: 188953 QPS, p999=3.631 ms
+2026-10-13 14:34:43 UTC memory/valkey/io2/set-c640
+2026-10-13 14:35:14 UTC memory/valkey/io2/set-c640 done: 188035 QPS, p999=6.847 ms
+2026-10-13 14:35:14 UTC memory/valkey/io2/set-c1280
+2026-10-13 14:35:46 UTC memory/valkey/io2/set-c1280 done: 180500 QPS, p999=14.399 ms
+2026-10-13 14:35:46 UTC validating dataset: 1000000 keys, 1024-byte values
+2026-10-13 14:35:46 UTC COMPLETE valkey
+2026-10-13 14:35:46 UTC COMPLETE: 84 fresh GET/SET points; two Lavik datasets and latest stable peers on 2 vCPUs

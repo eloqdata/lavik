@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io1/set-c640",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 640,
+  "qps": 167689.52,
+  "avg_ms": 3.81564,
+  "p50_ms": 3.519,
+  "p99_ms": 6.591,
+  "p999_ms": 6.911,
+  "p9999_ms": 9.663
+}

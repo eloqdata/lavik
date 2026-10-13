@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io1/get-c32",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 32,
+  "qps": 60430.21,
+  "avg_ms": 0.52965,
+  "p50_ms": 0.527,
+  "p99_ms": 0.599,
+  "p999_ms": 0.647,
+  "p9999_ms": 1.767
+}

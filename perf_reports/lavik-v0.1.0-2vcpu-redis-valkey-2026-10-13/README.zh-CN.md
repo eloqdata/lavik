@@ -1,5 +1,7 @@
 # Lavik v0.1.0：2 vCPU 上的 Redis / Valkey GET/SET 对比
 
+> 后续测试：[最新版 Redis / Valkey 与新增 Lavik 1 亿条曲线](../lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md)。四条曲线均以独立客户端随机种子重新测量，本历史报告保留。
+
 [English](README.md) | **简体中文**
 
 测试日期：2026-10-13。在同一台 Azure **L2aos_v5（2 vCPU / 16 GiB）** 上重新测量

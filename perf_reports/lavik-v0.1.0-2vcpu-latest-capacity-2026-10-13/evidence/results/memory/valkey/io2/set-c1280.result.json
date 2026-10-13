@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io2/set-c1280",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 1280,
+  "qps": 180499.72,
+  "avg_ms": 7.09066,
+  "p50_ms": 7.103,
+  "p99_ms": 7.871,
+  "p999_ms": 14.399,
+  "p9999_ms": 18.687
+}

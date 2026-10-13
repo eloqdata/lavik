@@ -1,0 +1,19 @@
+[2026-10-13 13:40:37.305] [lavik] [info] I/O backends: network=kernel storage=spdk rings=one-per-worker
+[2026-10-13 13:40:37.305] [lavik] [info] mimalloc recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1 allow_thp=0
+[2026-10-13 13:40:37.305] [lavik] [info] lavik version=0.1.0 listening on 10.93.0.7:6379 tls_port=0 metrics_port=0 shards=2 maxclients=10000 maxclients_fd_reserve=256 pin_workers=true idle_timeout_ms=-1 busy_poll_us=20 foreground_budget_us=1000 background_budget_us=10 background_warrant_percent=1 spdk_max_completions_per_poll=16 spdk_foreground_pre_poll_us=5 registered_buffer_bytes=67108864 per worker storage_write_buffers=4 storage_read_buffer_bytes=32768 replication_publish_queue_bytes=16777216 per worker max_memory=0 maxmemory_clients=5% client_query_buffer_limit=1073741824 flush_max_ms=100 flush_size_bytes=131072 defrag_max_active_per_device=8 defrag_sleep_ms=0 defrag_record_sleep_us=0 defrag_paused=false shutdown_checkpoint=false replication_backlog_backpressure=true
+[2026-10-13 13:40:37.305] [lavik] [info] memory limit=13413682381 (12.49G) initial_used=0 initial_rss=9945088
+[2026-10-13 13:40:38.242] [lavik] [info] storage device id=0 path=spdk://f79f:00:00.0/1 capacity-bytes=1439887785984 data-blocks=171647 foreground-blocks=171639 defrag-reserve-blocks=8 data-bytes=1439879397376
+[2026-10-13 13:40:38.242] [lavik] [info] storage capacity: data-blocks=171647 foreground-blocks=171639 defrag-reserve-blocks=8
+[2026-10-13 13:40:38.242] [lavik] [info] storage direct-I/O alignment=512 bytes
+[2026-10-13 13:40:38.242] [lavik] [info] storage flush submission size=131072 bytes
+[2026-10-13 13:40:38.353] [lavik] [info] SPDK controller=f79f:00:00.0 io-qpairs=15 foreground-weight=171639 home-workers=[0,1] qpair-workers=[0,1]
+[2026-10-13 13:40:38.382] [lavik] [info] runtime workers=2 data_shards=2 control_worker=none cpus=0,1
+[2026-10-13 13:40:38.383] [lavik] [info] runtime cycle-counter=rdtsc frequency-source=absl::NominalCPUFrequency frequency=2596121947 Hz (2596.122 MHz) ticks-per-us=2596.122
+[2026-10-13 13:40:38.455] [lavik] [info] storage recovery: blocks=0/0 (100.0%) swept=171647/171647 records=0 rate=0 blocks/s 0.00M records/s eta=0.0s
+[2026-10-13 13:40:38.508] [lavik] [info] mimalloc recovery collection complete; online purge_delay=60000
+[2026-10-13 13:40:38.508] [lavik] [info] worker[0] direct-IO storage initialized
+[2026-10-13 13:40:38.508] [lavik] [info] worker[1] direct-IO storage initialized
+[2026-10-13 13:48:20.413] [lavik] [info] shutdown requested by signal 15
+[2026-10-13 13:48:20.480] [lavik] [info] replication targets quiesced before storage flush
+[2026-10-13 13:48:20.480] [lavik] [info] all active requests drained; flushing storage buffers
+[2026-10-13 13:48:20.547] [lavik] [info] all storage buffers durably flushed

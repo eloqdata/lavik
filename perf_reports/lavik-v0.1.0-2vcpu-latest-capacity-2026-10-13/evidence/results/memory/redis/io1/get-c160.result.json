@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io1/get-c160",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 160,
+  "qps": 173322.06,
+  "avg_ms": 0.92261,
+  "p50_ms": 0.927,
+  "p99_ms": 1.159,
+  "p999_ms": 1.359,
+  "p9999_ms": 2.223
+}

@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/fill",
+  "kind": "fill",
+  "keys": 1000000,
+  "connections": 160,
+  "qps": 174270.83,
+  "avg_ms": 0.92687,
+  "p50_ms": 0.935,
+  "p99_ms": 1.151,
+  "p999_ms": 1.823,
+  "p9999_ms": 3.903
+}

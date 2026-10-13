@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-1m/set-c80",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 80,
+  "qps": 134453.75,
+  "avg_ms": 0.5949,
+  "p50_ms": 0.559,
+  "p99_ms": 1.879,
+  "p999_ms": 2.575,
+  "p9999_ms": 3.167
+}

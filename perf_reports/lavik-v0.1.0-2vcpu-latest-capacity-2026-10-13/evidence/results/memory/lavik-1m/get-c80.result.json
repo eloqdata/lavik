@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-1m/get-c80",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 80,
+  "qps": 133263.31,
+  "avg_ms": 0.60018,
+  "p50_ms": 0.599,
+  "p99_ms": 0.703,
+  "p999_ms": 0.935,
+  "p9999_ms": 1.855
+}

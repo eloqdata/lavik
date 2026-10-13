@@ -1,0 +1,85 @@
+{
+  "reference_report": "lavik-v0.1.0-2vcpu-redis-valkey-2026-10-13",
+  "lavik_version": "v0.1.0",
+  "lavik_revision": "feb61224e414c5653fd09560e20c9d214db1e3ac",
+  "redis_version": "8.10.2",
+  "valkey_version": "9.1.2",
+  "memtier_version": "2.5.1",
+  "keys": 1000000,
+  "value_bytes": 1024,
+  "commands": [
+    "GET",
+    "SET"
+  ],
+  "key_pattern": "uniform random; decimal keys 1..1000000; no prefix",
+  "pipeline": 1,
+  "duration_seconds": 30,
+  "warmup_seconds": 10,
+  "connections": [
+    16,
+    32,
+    80,
+    160,
+    320,
+    640,
+    1280
+  ],
+  "lavik_workers": 2,
+  "redis_valkey_io_threads": [
+    1,
+    2
+  ],
+  "lavik_backend": "SPDK + kernel TCP",
+  "server_size_requested": "Standard_L2aos_v5",
+  "server_cpus": "all 2 vCPUs; no memory cgroup cap",
+  "client": "separate VM in same region and zone",
+  "persistence_peers": {
+    "save": "",
+    "appendonly": "no"
+  },
+  "validation": [
+    "exact DBSIZE before and after each configuration",
+    "sample value lengths",
+    "zero GET misses",
+    "zero connection/protocol errors",
+    "record binary checksums, CPU topology and NIC path",
+    "Lavik defrag enabled throughout"
+  ],
+  "status": "planned",
+  "server_private": "10.93.0.7",
+  "client_private": "10.93.0.8",
+  "region": "eastus",
+  "zone": "3",
+  "server_size": "Standard_L2aos_v5",
+  "client_size": "Standard_F16as_v7",
+  "host_policy": {
+    "transparent_hugepages": "never",
+    "vm.overcommit_memory": 1,
+    "cpu_affinity": "0-1 for every product; IRQs share these CPUs",
+    "hugepages_lavik_mib": 2048
+  },
+  "versions": {
+    "redis": {
+      "version": "8.10.2",
+      "revision": "498ecd0d6d007db11ddb3aea9428552598a78622",
+      "release_url": "https://github.com/redis/redis/releases/tag/8.10.2",
+      "published_at": "2026-09-17T15:06:56Z",
+      "release_id": 390823002
+    },
+    "valkey": {
+      "version": "9.1.2",
+      "revision": "7f1dffedff6de73058b2c2a389422b6ecd56c8fb",
+      "release_url": "https://github.com/valkey-io/valkey/releases/tag/9.1.2",
+      "published_at": "2026-09-01T00:01:31Z",
+      "release_id": 380129319
+    }
+  },
+  "key_datasets": {
+    "lavik-1m": 1000000,
+    "lavik-100m": 100000000,
+    "redis": 1000000,
+    "valkey": 1000000
+  },
+  "client_seed_mode": "distinct for every timed run",
+  "formal_points": 84
+}

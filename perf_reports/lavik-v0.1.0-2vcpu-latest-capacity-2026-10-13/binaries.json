@@ -1,0 +1,46 @@
+{
+  "lavik": {
+    "version": "v0.1.0",
+    "source": "feb61224e414c5653fd09560e20c9d214db1e3ac",
+    "bycorf": "8caaf75cb131b591922af51a19861f92e2ffc893",
+    "archive": "https://github.com/eloqdata/lavik/releases/download/v0.1.0/lavik-v0.1.0-linux-x86_64.tar.gz",
+    "archive_sha256": "06d95f2d969cffa39fbfca85f25246c4d9166ebc9577b164f2b022306c9f6fab",
+    "binary_sha256": "7bf8d204a137678cee0e1a621b02661181373fbbfe1366bc1c201942b9dcf420",
+    "build": "official standard x86_64 release; not locally rebuilt"
+  },
+  "redis": {
+    "version": "8.10.2",
+    "source": "498ecd0d6d007db11ddb3aea9428552598a78622",
+    "binary_sha256": "741353bae5c1fe0640fc38988f318beab5bfd01c6b9ca341a85274c2c3057ab3",
+    "build": "make -j12 BUILD_TLS=yes; default release; jemalloc 5.3.0",
+    "release_url": "https://github.com/redis/redis/releases/tag/8.10.2"
+  },
+  "valkey": {
+    "version": "9.1.2",
+    "source": "7f1dffedff6de73058b2c2a389422b6ecd56c8fb",
+    "binary_sha256": "b2471c0ac907a3a872ead5d8839e84fd19994262d6e8e09fd957fce236003422",
+    "build": "make -j12 BUILD_TLS=yes; default release; jemalloc 5.3.0",
+    "release_url": "https://github.com/valkey-io/valkey/releases/tag/9.1.2"
+  },
+  "memtier": {
+    "version": "2.5.1",
+    "source_tag": "2.5.1",
+    "binary_sha256": "696d63292ce78aed751b4088317d1d342280dd43b4b06c254c81ae278aad4535",
+    "build": "autoreconf -ivf; ./configure; make -j12; make install"
+  },
+  "spdk_setup_helper": {
+    "source": "d519b163cbc0e2f28c35d9bc86d610da368b032c",
+    "usage": "scripts/setup.sh only; storage library comes from official Lavik package"
+  },
+  "reference_report": {
+    "repository": "thweetkomputer/lavik",
+    "commit": "102319a50d330f473240d08fba701f47ea72f4cd",
+    "path": "perf_reports/lavik-v0.1.0-2vcpu-redis-valkey-2026-10-13",
+    "differences": [
+      "latest stable Redis/Valkey",
+      "additional independent Lavik 100M dataset",
+      "distinct client seeds for all curves",
+      "all results freshly acquired on a new allocation of the same VM SKU"
+    ]
+  }
+}

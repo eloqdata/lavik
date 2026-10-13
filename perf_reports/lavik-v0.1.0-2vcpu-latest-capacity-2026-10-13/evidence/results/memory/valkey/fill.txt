@@ -1,0 +1,95 @@
+============== Configuration values: ==============
+server = 10.93.0.7
+port = 6379
+uri = 
+unix socket = (null)
+address family = Unspecified
+protocol = redis
+tls = no
+cert = (null)
+key = (null)
+cacert = (null)
+tls_skip_verify = no
+sni = (null)
+out_file = (null)
+client_stats = (null)
+run_count = 1
+debug = 0
+requests = 6250
+rate_limit = 0
+clients = 10
+threads = 16
+test_time = 0
+ratio = 1:0
+pipeline = 1
+transaction = no
+data_size = 1024
+data_offset = 0
+random_data = no
+data_size_range = 0-0
+data_size_list = 
+data_size_pattern = R
+expiry_range = 0-0
+data_import = (null)
+data_verify = no
+verify_only = no
+generate_keys = no
+key_prefix = 
+key_minimum = 1
+key_maximum = 1000000
+key_pattern = P:P
+key_stddev = 0.000000
+key_median = 0.000000
+reconnect_interval = 0
+retry_on_error = no
+max_retries = -1
+retry_backoff_ms = 0
+retry_backoff_factor = 0.000000
+retry_on = 
+max_retry_queue = 0
+failed_keys_file = 
+connection_timeout = 0
+connection_stage_timeout = 30
+thread_conn_start_min_jitter_micros = 0
+thread_conn_start_max_jitter_micros = 0
+multi_key_get = 0
+authenticate = 
+select-db = 0
+no-expiry = no
+wait-ratio = 0:0
+num-slaves = 0-0
+wait-timeout = 0-0
+json-out-file = /opt/bench2c/client-results/memory/valkey/fill.json
+print-all-runs = no
+prometheus-port = -1
+prometheus-bind-addr = 127.0.0.1
+prometheus-run-labels = 
+prometheus-latency-buckets = default
+===================================================
+Json file /opt/bench2c/client-results/memory/valkey/fill.json created...
+Writing results to stdout
+[RUN #1] Preparing benchmark client...
+[RUN #1] Launching threads now...
+[RUN #1 19%,   1 secs] 16 threads 10 conns:      185763 ops,  185554 (avg:  185554) ops/sec, 188.09MB/sec (avg: 188.09MB/sec),  0.86 (avg:  0.86) msec latency[RUN #1 37%,   2 secs] 16 threads 10 conns:      372447 ops,  186663 (avg:  186108) ops/sec, 189.21MB/sec (avg: 188.65MB/sec),  0.86 (avg:  0.86) msec latency[RUN #1 57%,   3 secs] 16 threads 10 conns:      565201 ops,  192731 (avg:  188315) ops/sec, 195.36MB/sec (avg: 190.89MB/sec),  0.83 (avg:  0.85) msec latency[RUN #1 76%,   4 secs] 16 threads 10 conns:      758602 ops,  193375 (avg:  189580) ops/sec, 196.02MB/sec (avg: 192.17MB/sec),  0.83 (avg:  0.84) msec latency[RUN #1 95%,   4 secs] 16 threads 10 conns:      949837 ops,  191762 (avg:  190015) ops/sec, 194.38MB/sec (avg: 192.61MB/sec),  0.83 (avg:  0.84) msec latency[RUN #1 100%,   5 secs]  0 threads 10 conns:     1000000 ops,  191762 (avg:  192109) ops/sec, 194.38MB/sec (avg: 194.73MB/sec),  0.83 (avg:  0.83) msec latency
+
+
+CPU Utilization Summary
+  Total CPU time:   14.399s  (user 3.324s, sys 11.075s)
+  Wall time:        5.340s
+  Cores used:       2.696   (avg 16.8% across 16 worker threads)
+  Peak utilization: 280.1%
+Saving JSON output file: /opt/bench2c/client-results/memory/valkey/fill.json
+Json file closed.
+16        Threads
+10        Connections per thread
+6250      Requests per client
+
+
+ALL STATS
+============================================================================================================================================
+Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
+--------------------------------------------------------------------------------------------------------------------------------------------
+Sets       193606.87          ---          ---         0.83260         0.83100         1.10300         1.68700         1.93500    200959.56 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---             ---         0.00 
+Waits           0.00          ---          ---             ---             ---             ---             ---             ---          --- 
+Totals     193606.87         0.00         0.00         0.83260         0.83100         1.10300         1.68700         1.93500    200959.56 

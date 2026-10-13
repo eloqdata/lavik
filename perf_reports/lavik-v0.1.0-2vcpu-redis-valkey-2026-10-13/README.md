@@ -1,5 +1,7 @@
 # Lavik v0.1.0 on 2 vCPUs: GET/SET versus Redis and Valkey
 
+> Follow-up: [latest Redis / Valkey and a fourth Lavik 100M-key curve](../lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md). All curves are freshly measured with independent client seeds; this historical report is preserved.
+
 **English** | [简体中文](README.zh-CN.md)
 
 Test date: 2026-10-13. All **70 formal points** were freshly measured on one
