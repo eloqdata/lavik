@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/get-c640",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 640,
+  "qps": 215478.98,
+  "avg_ms": 2.96923,
+  "p50_ms": 2.975,
+  "p99_ms": 3.759,
+  "p999_ms": 7.167,
+  "p9999_ms": 10.047
+}

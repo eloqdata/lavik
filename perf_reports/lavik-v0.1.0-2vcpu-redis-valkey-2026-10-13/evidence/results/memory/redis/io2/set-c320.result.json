@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io2/set-c320",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 320,
+  "qps": 184093.05,
+  "avg_ms": 1.73761,
+  "p50_ms": 1.711,
+  "p99_ms": 2.127,
+  "p999_ms": 3.055,
+  "p9999_ms": 5.279
+}

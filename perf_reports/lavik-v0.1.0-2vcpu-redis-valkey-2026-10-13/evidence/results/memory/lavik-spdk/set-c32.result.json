@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/set-c32",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 32,
+  "qps": 60377.36,
+  "avg_ms": 0.53017,
+  "p50_ms": 0.527,
+  "p99_ms": 0.679,
+  "p999_ms": 1.151,
+  "p9999_ms": 2.607
+}

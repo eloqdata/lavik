@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/set-c80",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 80,
+  "qps": 142385.09,
+  "avg_ms": 0.56183,
+  "p50_ms": 0.543,
+  "p99_ms": 1.207,
+  "p999_ms": 1.879,
+  "p9999_ms": 2.815
+}

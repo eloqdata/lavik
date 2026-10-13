@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io2/get-c320",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 320,
+  "qps": 192602.79,
+  "avg_ms": 1.66076,
+  "p50_ms": 1.647,
+  "p99_ms": 1.999,
+  "p999_ms": 3.183,
+  "p9999_ms": 6.431
+}

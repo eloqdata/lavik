@@ -1,0 +1,12 @@
+{
+  "name": "memory/lavik-spdk/get-c80",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 80,
+  "qps": 136305.33,
+  "avg_ms": 0.58676,
+  "p50_ms": 0.583,
+  "p99_ms": 0.735,
+  "p999_ms": 2.007,
+  "p9999_ms": 3.215
+}

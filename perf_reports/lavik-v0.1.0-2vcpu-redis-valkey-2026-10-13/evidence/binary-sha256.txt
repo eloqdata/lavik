@@ -1,0 +1,3 @@
+7bf8d204a137678cee0e1a621b02661181373fbbfe1366bc1c201942b9dcf420  /opt/bench2c/downloads/lavik-v0.1.0-linux-x86_64/lavik
+ef5da1e02b1c20214716d1781be96b8c5cffc010d2aada040ce3a322a83eb9cb  /opt/bench2c/bin/redis-server
+a3028e308490b0d5177bc4c29e1fa4069be54bfed581d71d48e4a1ec01cdb724  /opt/bench2c/bin/valkey-server

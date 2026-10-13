@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io2/set-c320",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 320,
+  "qps": 199335.94,
+  "avg_ms": 1.60485,
+  "p50_ms": 1.615,
+  "p99_ms": 1.711,
+  "p999_ms": 2.543,
+  "p9999_ms": 5.407
+}

@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io2/get-c320",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 320,
+  "qps": 211274.82,
+  "avg_ms": 1.51408,
+  "p50_ms": 1.495,
+  "p99_ms": 1.807,
+  "p999_ms": 6.335,
+  "p9999_ms": 12.927
+}

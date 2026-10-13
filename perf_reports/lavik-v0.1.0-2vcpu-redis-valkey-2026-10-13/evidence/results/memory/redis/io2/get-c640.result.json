@@ -1,0 +1,12 @@
+{
+  "name": "memory/redis/io2/get-c640",
+  "kind": "GET",
+  "keys": 1000000,
+  "connections": 640,
+  "qps": 192908.61,
+  "avg_ms": 3.31638,
+  "p50_ms": 2.719,
+  "p99_ms": 5.631,
+  "p999_ms": 7.839,
+  "p9999_ms": 10.751
+}

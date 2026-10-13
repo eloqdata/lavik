@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/io2/set-c16",
+  "kind": "SET",
+  "keys": 1000000,
+  "connections": 16,
+  "qps": 30146.86,
+  "avg_ms": 0.53092,
+  "p50_ms": 0.527,
+  "p99_ms": 0.607,
+  "p999_ms": 1.535,
+  "p9999_ms": 8.031
+}

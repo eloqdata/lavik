@@ -1,0 +1,49 @@
+{
+  "reference_report": "lavik-v0.1.0-redis-valkey-2026-10-13",
+  "lavik_version": "v0.1.0",
+  "lavik_revision": "feb61224e414c5653fd09560e20c9d214db1e3ac",
+  "redis_version": "8.8.0",
+  "valkey_version": "9.1.0",
+  "memtier_version": "2.5.1",
+  "keys": 1000000,
+  "value_bytes": 1024,
+  "commands": [
+    "GET",
+    "SET"
+  ],
+  "key_pattern": "uniform random; decimal keys 1..1000000; no prefix",
+  "pipeline": 1,
+  "duration_seconds": 30,
+  "warmup_seconds": 10,
+  "connections": [
+    16,
+    32,
+    80,
+    160,
+    320,
+    640,
+    1280
+  ],
+  "lavik_workers": 2,
+  "redis_valkey_io_threads": [
+    1,
+    2
+  ],
+  "lavik_backend": "SPDK with kernel TCP, subject to verified dedicated NVMe accessibility",
+  "server_size_requested": "Standard_L2aos_v5",
+  "server_cpus": "all 2 vCPUs; no memory cgroup cap",
+  "client": "separate VM in same region and zone",
+  "persistence_peers": {
+    "save": "",
+    "appendonly": "no"
+  },
+  "validation": [
+    "exact DBSIZE before and after each configuration",
+    "sample value lengths",
+    "zero GET misses",
+    "zero connection/protocol errors",
+    "record binary checksums, CPU topology and NIC path",
+    "Lavik defrag enabled throughout"
+  ],
+  "status": "preparing; no benchmark measurements yet"
+}

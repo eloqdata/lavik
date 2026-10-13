@@ -1,0 +1,12 @@
+{
+  "name": "memory/valkey/fill",
+  "kind": "fill",
+  "keys": 1000000,
+  "connections": 160,
+  "qps": 195569.87,
+  "avg_ms": 0.81844,
+  "p50_ms": 0.823,
+  "p99_ms": 1.079,
+  "p999_ms": 1.823,
+  "p9999_ms": 4.927
+}

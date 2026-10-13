@@ -1,0 +1,9 @@
+[
+  {
+    "serial": "39005cb11af5287c0001",
+    "bdf": "bc7f:00:00.0",
+    "device": "/dev/nvme1n1",
+    "bytes": 1439887785984,
+    "nsid": 1
+  }
+]
