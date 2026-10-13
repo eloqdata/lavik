@@ -319,14 +319,11 @@ covering workloads A/B/C/D and their tail latencies.
 The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 ([简体中文](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md))
 compares Lavik v0.1.0 with Redis 8.10.2 and Valkey 9.1.2 on the same Azure
-L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**. All three systems use
-1 million keys with 1 KiB values; a fourth curve expands Lavik to
-**100 million keys and 95.37 GiB of value data** through SPDK/NVMe.
+L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**, using 1 KiB values.
 
-At 100 million keys, Lavik reached peak rates of **215K GET ops/s and
-196K SET ops/s**. Increasing the dataset 100-fold kept peak GET throughput
-essentially unchanged and retained **95.2%** of peak SET throughput.
-The report includes all four curves, configurations, and benchmark commands.
+Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
+**215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
+Valkey holding 1 million keys entirely in memory, with **100 times as much data**.
 
 #### 16 vCPUs: 10 million keys
 
