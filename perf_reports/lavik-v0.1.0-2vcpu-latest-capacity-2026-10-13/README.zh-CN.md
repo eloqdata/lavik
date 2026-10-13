@@ -21,11 +21,13 @@ Lavik 1 亿条的峰值 GET / SET 分别为 215,463 / 195,879 ops/s，分别是�
 | SET | Redis 8.10.2 / 1M | 2 | 320 | 176,491 |
 | SET | Valkey 9.1.2 / 1M | 2 | 160 | 193,305 |
 
-Redis / Valkey 各测 IO=1 和 IO=2；每个操作选峰值较高的一组 IO 设置，并展示该设置的完整并发曲线，不逐点拼接。Lavik 两组均为 2 worker。
+Redis / Valkey 各测 IO=1 和 IO=2；每个操作选峰值较高的一组 IO 设置，并展示该设置在 16–640 连接范围内的并发曲线，不逐点拼接。Lavik 两组均为 2 worker。
 
 在 100 万条数据下，Lavik 的 GET 峰值比 Redis 高 **8.1%**，SET 峰值比 Redis 高 **16.6%**、比 Valkey 高 **6.5%**。Valkey 的 GET 峰值为 **226,514 ops/s**，是三者中最高的。Lavik 扩展到 1 亿条后，GET / SET 峰值仍达到 **215,463 / 195,879 ops/s**。
 
 同为 160 连接时，Lavik 100 万条的 SET 为 191,909 ops/s、p99.9 为 3.727 ms；Valkey 为 193,305 ops/s、p99.9 为 1.279 ms。Lavik 在 640 连接达到更高的 SET 峰值；各连接数下的吞吐量和尾延迟见下表。
+
+主图展示 16–640 连接；包含 1280 连接的完整测量结果保留在下方表格和全部配置图中。使用 `python3 build_assets.py`（Matplotlib 3.10.8）重新生成主图。
 
 ![Four-curve throughput](throughput.svg)
 

@@ -21,11 +21,13 @@ At 100M keys, Lavik reached peak GET / SET rates of 215,463 / 195,879 ops/s, ret
 | SET | Redis 8.10.2 / 1M | 2 | 320 | 176,491 |
 | SET | Valkey 9.1.2 / 1M | 2 | 160 | 193,305 |
 
-Redis and Valkey each test IO=1 and IO=2. For each command, the main plot uses the setting with the higher peak and shows its entire sweep; it does not splice settings point by point. Both Lavik datasets use two workers.
+Redis and Valkey each test IO=1 and IO=2. For each command, the main plot uses the setting with the higher peak and shows its 16–640 connection sweep; it does not splice settings point by point. Both Lavik datasets use two workers.
 
 At 1M keys, Lavik's peak GET throughput is **8.1%** higher than Redis, and its peak SET throughput is **16.6%** higher than Redis and **6.5%** higher than Valkey. Valkey records the highest GET peak among the three at **226,514 ops/s**. At 100M keys, Lavik still reaches **215,463 / 195,879 ops/s** for GET / SET.
 
 At the same 160 connections, Lavik at 1M keys records SET throughput of 191,909 ops/s with 3.727 ms p99.9, versus Valkey at 193,305 ops/s with 1.279 ms p99.9. Lavik reaches its higher SET peak at 640 connections. Throughput and tail latency at every connection count appear below.
+
+The main charts show 16–640 connections. The complete measured sweep, including 1280 connections, is retained in the tables and all-configuration chart below. Regenerate the main charts with `python3 build_assets.py` (Matplotlib 3.10.8).
 
 ![Four-curve throughput](throughput.svg)
 
