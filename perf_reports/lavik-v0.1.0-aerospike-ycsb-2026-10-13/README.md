@@ -12,7 +12,7 @@ Each figure shows total QPS above and per-operation p99.9 latency (ms) below, bo
 
 ## 100K target
 
-![100K target: throughput and p99.9 latency](ycsb-100k.png)
+![100K target: throughput and p99.9 latency](ycsb-100k.svg)
 
 | Workload | Operation | Aerospike | Lavik |
 |---|---|---:|---:|
@@ -30,7 +30,7 @@ Each figure shows total QPS above and per-operation p99.9 latency (ms) below, bo
 
 ## Unlimited
 
-![Unlimited: throughput and p99.9 latency](ycsb-unlimited.png)
+![Unlimited: throughput and p99.9 latency](ycsb-unlimited.svg)
 
 | Workload | Operation | Aerospike | Lavik |
 |---|---|---:|---:|
