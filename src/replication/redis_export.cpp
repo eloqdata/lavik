@@ -131,7 +131,7 @@ class RedisRdbStreamQueue
         available, owner, std::memory_order_acquire, std::memory_order_relaxed);
   }
 
-  bool TryPush(std::string* fragment, unsigned owner) {
+  bool TryPush(std::string* fragment, [[maybe_unused]] unsigned owner) {
     assert(entry_owner_.load(std::memory_order_relaxed) == owner);
     if (aborted_.load(std::memory_order_relaxed)) return false;
     const std::size_t bytes = fragment->size();

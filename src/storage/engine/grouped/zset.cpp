@@ -556,7 +556,7 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     auto status =
         selection.Prepare(entries.size(), operation.count_, true, &result);
     if (!status.ok()) return status;
-    for (const auto [rank, slot] : selection.draws_) {
+    for (const auto& [rank, slot] : selection.draws_) {
       auto copied = CopyOutput(entries[rank]);
       if (!copied.ok()) return copied.status();
       result.members_[slot] = std::move(*copied);
@@ -583,10 +583,15 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     auto encoded =
         EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
     if (!encoded.ok()) return encoded.status();
-    return CompactValueUpdate{.changed_ = true,
-                              .encoded_ = std::move(*encoded),
-                              .logical_size_ = entries.size(),
-                              .expire_at_ms_ = std::nullopt};
+    return CompactValueUpdate{
+        .changed_ = true,
+        .encoded_ = std::move(*encoded),
+        .logical_size_ = entries.size(),
+        .expire_at_ms_ = std::nullopt,
+        .stream_trim_ = {},
+        .stream_trim_complete_ = {},
+        .stream_pending_removed_ = {},
+    };
   }
   if (operation.kind_ == SortedSetOperationKind::kPop) {
     const auto count =
@@ -613,10 +618,15 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     auto encoded =
         EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
     if (!encoded.ok()) return encoded.status();
-    return CompactValueUpdate{.changed_ = true,
-                              .encoded_ = std::move(*encoded),
-                              .logical_size_ = entries.size(),
-                              .expire_at_ms_ = std::nullopt};
+    return CompactValueUpdate{
+        .changed_ = true,
+        .encoded_ = std::move(*encoded),
+        .logical_size_ = entries.size(),
+        .expire_at_ms_ = std::nullopt,
+        .stream_trim_ = {},
+        .stream_trim_complete_ = {},
+        .stream_pending_removed_ = {},
+    };
   }
   if (ScanRead(operation)) {
     auto read = ReadCompact(entries, operation, &result);
@@ -651,10 +661,15 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
   auto encoded =
       EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
   if (!encoded.ok()) return encoded.status();
-  return CompactValueUpdate{.changed_ = true,
-                            .encoded_ = std::move(*encoded),
-                            .logical_size_ = entries.size(),
-                            .expire_at_ms_ = std::nullopt};
+  return CompactValueUpdate{
+      .changed_ = true,
+      .encoded_ = std::move(*encoded),
+      .logical_size_ = entries.size(),
+      .expire_at_ms_ = std::nullopt,
+      .stream_trim_ = {},
+      .stream_trim_complete_ = {},
+      .stream_pending_removed_ = {},
+  };
 }
 
 }  // namespace
@@ -1416,7 +1431,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto admission = budget.Reserve(4);
   if (!admission.ok()) co_return admission.status();
   working_admission.emplace(std::move(*admission));
-  auto check_plan_read = [&](std::size_t i) -> absl::Status {
+  auto check_plan_read = [&]([[maybe_unused]] std::size_t i) -> absl::Status {
     LAVIK_FAULT_INJECT(
         if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key) &&
             LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key,

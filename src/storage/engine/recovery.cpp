@@ -794,22 +794,31 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 co_return absl::DataLossError(
                     "ordered page disagrees with its record identity");
               }
-              ordered_group = RecoveryOrderedMetadata{
-                  .previous_ = decoded->previous_,
-                  .next_ = decoded->next_,
-              };
+              // Initialize only the active metadata alternative; Stream pages
+              // never read score bounds, and live score bounds are known now.
               if (ordered_kind == OrderedCollectionKind::kStream) {
-                std::construct_at(&ordered_group->stream_max_key_);
+                ordered_group = RecoveryOrderedMetadata{
+                    .previous_ = decoded->previous_,
+                    .next_ = decoded->next_,
+                    .stream_max_key_ = {},
+                };
                 if (!decoded->retired_) {
                   auto max_key =
                       StreamRecordKey(decoded->entries_.back().value_);
                   if (!max_key.ok()) co_return max_key.status();
                   ordered_group->stream_max_key_.Set(*max_key);
                 }
-              } else if (!decoded->entries_.empty()) {
-                ordered_group->scores_ = {
-                    .min_ = decoded->entries_.front().score_,
-                    .max_ = decoded->entries_.back().score_};
+              } else {
+                ordered_group = RecoveryOrderedMetadata{
+                    .previous_ = decoded->previous_,
+                    .next_ = decoded->next_,
+                    .scores_ = {.min_ = decoded->entries_.empty()
+                                            ? 0
+                                            : decoded->entries_.front().score_,
+                                .max_ = decoded->entries_.empty()
+                                            ? 0
+                                            : decoded->entries_.back().score_},
+                };
               }
             } else {
               auto decoded = DecodeHashGroup(encoded);

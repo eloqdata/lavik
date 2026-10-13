@@ -84,7 +84,7 @@ class RdbOutputQueue {
     return true;
   }
 
-  void EndEntry(unsigned owner) {
+  void EndEntry([[maybe_unused]] unsigned owner) {
     std::lock_guard lock(mutex_);
     assert(entry_owner_ == owner);
     entry_owner_ = UINT_MAX;

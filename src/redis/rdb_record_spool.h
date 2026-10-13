@@ -41,7 +41,7 @@ class RecordSpool {
  public:
   struct Record {
     std::optional<MemoryReservation> reservation_;
-    std::string key_, value_;
+    std::string key_{}, value_{};
   };
   absl::Status Add(std::string_view key, std::string_view value) {
     if (finished_)

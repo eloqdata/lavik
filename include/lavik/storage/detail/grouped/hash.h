@@ -125,7 +125,7 @@ struct HashGroupSnapshot {
   bool retired_ = false;
   HashValue value_;
   // Mutually exclusive with value_; the encoder checks this invariant.
-  std::optional<PreparedHashGroupPayload> prepared_;
+  std::optional<PreparedHashGroupPayload> prepared_ = std::nullopt;
   std::size_t field_count() const noexcept {
     return prepared_ ? prepared_->count() : value_.entries_.size();
   }

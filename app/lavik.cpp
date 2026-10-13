@@ -391,11 +391,14 @@ int main(int argc, char** argv) {
 
   constexpr std::size_t kMiB = 1024 * 1024;
   constexpr std::size_t kKiB = 1024;
-  if (registered_buffer_mb > std::numeric_limits<std::size_t>::max() / kMiB ||
-      replication_publish_queue_mb >
+  if (static_cast<std::size_t>(registered_buffer_mb) >
           std::numeric_limits<std::size_t>::max() / kMiB ||
-      storage_read_buffer_kb > std::numeric_limits<std::size_t>::max() / kKiB ||
-      flush_size_kb > std::numeric_limits<std::size_t>::max() / kKiB) {
+      static_cast<std::size_t>(replication_publish_queue_mb) >
+          std::numeric_limits<std::size_t>::max() / kMiB ||
+      static_cast<std::size_t>(storage_read_buffer_kb) >
+          std::numeric_limits<std::size_t>::max() / kKiB ||
+      static_cast<std::size_t>(flush_size_kb) >
+          std::numeric_limits<std::size_t>::max() / kKiB) {
     return 2;
   }
   options.registered_buffer_bytes_ =

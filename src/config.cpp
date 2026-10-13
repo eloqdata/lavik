@@ -806,8 +806,9 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
         "storage-read-buffer-kb must be a 4 KiB multiple greater than 8 KiB "
         "and fit the 32-bit slot size");
   }
-  if (options.shard_count_ > std::numeric_limits<std::size_t>::max() /
-                                 storage::kStorageBlockBytes ||
+  if (static_cast<std::size_t>(options.shard_count_) >
+          std::numeric_limits<std::size_t>::max() /
+              storage::kStorageBlockBytes ||
       options.replication_options_.backlog_size_bytes_ <
           static_cast<std::size_t>(options.shard_count_) *
               storage::kStorageBlockBytes) {

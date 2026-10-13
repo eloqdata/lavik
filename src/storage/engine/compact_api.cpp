@@ -491,7 +491,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         // Preserve explicit identical-value/metadata mutation semantics from
         // the callback. A single page suffices; EXPIRE/PERSIST themselves use
         // the separate root-only metadata path.
-        const auto& first = directory.groups().front();
+        const auto groups = directory.groups();
+        const auto& first = groups.front();
         OrderedGroupSnapshot page{.kind_ = directory.root().kind_,
                                   .incarnation_ = directory.root().incarnation_,
                                   .id_ = first.id_,

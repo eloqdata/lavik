@@ -637,6 +637,9 @@ bycorf::Task<std::string> RunBitmapLocked(
         .encoded_ = std::move(next),
         .logical_size_ = logical_size,
         .expire_at_ms_ = std::nullopt,
+        .stream_trim_ = {},
+        .stream_trim_complete_ = {},
+        .stream_pending_removed_ = {},
     };
   };
 
@@ -805,19 +808,27 @@ bycorf::Task<std::string> RunStringLocked(
           .encoded_ = std::move(encoded),
           .logical_size_ = size,
           .expire_at_ms_ = expire_at,
+          .stream_trim_ = {},
+          .stream_trim_complete_ = {},
+          .stream_pending_removed_ = {},
       };
     };
 
     if (request.kind_ == CommandKind::kGetDel) {
       reply = exists ? EncodeBulkString(old)
                      : EncodeSemanticNull(request.resp_version_);
-      if (exists) captured_args = {"DEL", args[1]};
-      return exists ? storage::CompactValueUpdate{.changed_ = true,
-                                                  .erase_ = true,
-                                                  .encoded_ = {},
-                                                  .logical_size_ = 0,
-                                                  .expire_at_ms_ = std::nullopt}
-                    : storage::CompactValueUpdate{};
+      if (!exists) return storage::CompactValueUpdate{};
+      captured_args = {"DEL", args[1]};
+      return storage::CompactValueUpdate{
+          .changed_ = true,
+          .erase_ = true,
+          .encoded_ = {},
+          .logical_size_ = 0,
+          .expire_at_ms_ = std::nullopt,
+          .stream_trim_ = {},
+          .stream_trim_complete_ = {},
+          .stream_pending_removed_ = {},
+      };
     }
 
     if (request.kind_ == CommandKind::kGetEx) {
@@ -836,6 +847,9 @@ bycorf::Task<std::string> RunStringLocked(
             .encoded_ = {},
             .logical_size_ = old.size(),
             .expire_at_ms_ = 0,
+            .stream_trim_ = {},
+            .stream_trim_complete_ = {},
+            .stream_pending_removed_ = {},
         };
       }
       const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
@@ -849,11 +863,16 @@ bycorf::Task<std::string> RunStringLocked(
       captured_args = {"PEXPIREAT", args[1], std::to_string(*getex_deadline)};
       if (replication.has_value()) replication->args_ = captured_args;
       if (*getex_deadline <= RedisUnixTimeMillis()) {
-        return storage::CompactValueUpdate{.changed_ = true,
-                                           .erase_ = true,
-                                           .encoded_ = {},
-                                           .logical_size_ = 0,
-                                           .expire_at_ms_ = std::nullopt};
+        return storage::CompactValueUpdate{
+            .changed_ = true,
+            .erase_ = true,
+            .encoded_ = {},
+            .logical_size_ = 0,
+            .expire_at_ms_ = std::nullopt,
+            .stream_trim_ = {},
+            .stream_trim_complete_ = {},
+            .stream_pending_removed_ = {},
+        };
       }
       return storage::CompactValueUpdate{
           .changed_ = true,
@@ -861,6 +880,9 @@ bycorf::Task<std::string> RunStringLocked(
           .encoded_ = {},
           .logical_size_ = old.size(),
           .expire_at_ms_ = *getex_deadline,
+          .stream_trim_ = {},
+          .stream_trim_complete_ = {},
+          .stream_pending_removed_ = {},
       };
     }
 

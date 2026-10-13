@@ -771,7 +771,7 @@ std::uint64_t Interleave26(std::uint32_t lon, std::uint32_t lat) {
 
 std::uint64_t GeoScore(double lon, double lat) {
   constexpr double scale = static_cast<double>(std::uint64_t{1} << 26);
-  auto normalized = [scale](double value, double minimum, double maximum) {
+  auto normalized = [](double value, double minimum, double maximum) {
     double n = (value - minimum) / (maximum - minimum);
     n = std::clamp(n, 0.0, std::nextafter(1.0, 0.0));
     return static_cast<std::uint32_t>(n * scale);
@@ -796,7 +796,7 @@ std::pair<double, double> GeoDecode(std::uint64_t hash) {
 std::string GeoHashString(double lon, double lat) {
   static constexpr char alphabet[] = "0123456789bcdefghjkmnpqrstuvwxyz";
   constexpr double scale = static_cast<double>(std::uint64_t{1} << 26);
-  auto normalized = [scale](double value, double minimum, double maximum) {
+  auto normalized = [](double value, double minimum, double maximum) {
     double n = (value - minimum) / (maximum - minimum);
     n = std::clamp(n, 0.0, std::nextafter(1.0, 0.0));
     return static_cast<std::uint32_t>(n * scale);
@@ -2299,10 +2299,15 @@ Task<absl::Status> ReplaceMultiDestination(
       return absl::InternalError(
           "sorted-set STORE destination was not replaced");
     }
-    return storage::CompactValueUpdate{.changed_ = true,
-                                       .encoded_ = std::move(*encoded),
-                                       .logical_size_ = context->output_.size(),
-                                       .expire_at_ms_ = std::nullopt};
+    return storage::CompactValueUpdate{
+        .changed_ = true,
+        .encoded_ = std::move(*encoded),
+        .logical_size_ = context->output_.size(),
+        .expire_at_ms_ = std::nullopt,
+        .stream_trim_ = {},
+        .stream_trim_complete_ = {},
+        .stream_pending_removed_ = {},
+    };
   };
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, destination, digest, storage::ValueType::kSortedSet,

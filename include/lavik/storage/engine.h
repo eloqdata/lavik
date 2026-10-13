@@ -890,7 +890,7 @@ struct StreamTrimRequest {
 struct StreamTrimResult {
   std::uint64_t removed_ = 0;
   std::uint64_t length_ = 0;
-  std::optional<std::array<std::uint64_t, 2>> first_id_;
+  std::optional<std::array<std::uint64_t, 2>> first_id_ = std::nullopt;
 };
 
 struct CompactValueUpdate {
@@ -903,6 +903,8 @@ struct CompactValueUpdate {
   std::uint64_t logical_size_ = 0;
   // nullopt preserves the current deadline (or persistence for a new key).
   std::optional<std::uint64_t> expire_at_ms_;
+  // Non-Stream aggregate callers explicitly use {} for the Stream-only state.
+  // GCC 13 emits redundant stores with default member initializers here.
   std::optional<StreamTrimRequest> stream_trim_;
   // Called once after planning, before publication, to canonicalize replication
   // and the reply from the exact boundary. It must not access storage;
@@ -924,7 +926,7 @@ struct StreamRangeAccess {
   bool reverse_ = false;
   // Pinned reply sources may select sorted, unique IDs known to exist under
   // the caller's intent. Empty means an ordinary contiguous ID range.
-  std::vector<std::array<std::uint64_t, 2>> selected_ids_;
+  std::vector<std::array<std::uint64_t, 2>> selected_ids_{};
 };
 
 // A writable callback sees only the named messages and may remove them. Storage
@@ -943,7 +945,7 @@ struct StreamAckAccess {
 // additionally load the corresponding messages; deleted messages stay absent.
 struct StreamPendingAccess {
   StreamRangeAccess range_;
-  std::optional<std::string> consumer_;
+  std::optional<std::string> consumer_ = std::nullopt;
   std::uint64_t min_idle_ms_ = 0;
   std::uint64_t now_ms_ = 0;
   bool load_entries_ = false;
@@ -958,13 +960,13 @@ struct StreamGroupAccess {
   std::vector<std::array<std::uint64_t, 2>> pending_ids_{};
   std::vector<std::array<std::uint64_t, 2>> entry_ids_{};
   std::optional<std::uint64_t> read_new_count_ = std::nullopt;
-  std::optional<StreamPendingAccess> pending_scan_;
+  std::optional<StreamPendingAccess> pending_scan_ = std::nullopt;
   // Delivery callbacks need IDs/counters, while replies read immutable fields
   // through a pinned range source after publication under the same key intent.
   bool entry_ids_only_ = false;
   bool create_ = false;
   bool destroy_ = false;
-  std::optional<std::string> remove_consumer_;
+  std::optional<std::string> remove_consumer_ = std::nullopt;
 };
 
 struct StreamInspectAccess {

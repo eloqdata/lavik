@@ -83,7 +83,7 @@ struct Group {
   std::int64_t entries_read_ = -1;
   std::vector<Consumer> consumers_;
   std::vector<Pending> pending_;
-  std::optional<storage::StreamGroupSummary> summary_;
+  std::optional<storage::StreamGroupSummary> summary_ = std::nullopt;
 };
 
 struct Stream {
@@ -781,10 +781,15 @@ storage::CompactValueUpdate NoChange() { return {}; }
 absl::StatusOr<storage::CompactValueUpdate> Changed(Stream stream) {
   auto encoded = Encode(stream);
   if (!encoded.ok()) return encoded.status();
-  return storage::CompactValueUpdate{.changed_ = true,
-                                     .encoded_ = std::move(*encoded),
-                                     .logical_size_ = stream.entries_.size(),
-                                     .expire_at_ms_ = std::nullopt};
+  return storage::CompactValueUpdate{
+      .changed_ = true,
+      .encoded_ = std::move(*encoded),
+      .logical_size_ = stream.entries_.size(),
+      .expire_at_ms_ = std::nullopt,
+      .stream_trim_ = {},
+      .stream_trim_complete_ = {},
+      .stream_pending_removed_ = {},
+  };
 }
 
 Group* FindGroup(Stream* stream, std::string_view name) {
@@ -1378,9 +1383,9 @@ struct ReadOneResult {
     Id id_;
     std::optional<Entry> entry_;
   };
-  std::vector<Item> entries_;
+  std::vector<Item> entries_{};
   Id cursor_;
-  std::shared_ptr<StreamRangeReplyState> stream_;
+  std::shared_ptr<StreamRangeReplyState> stream_{};
 };
 
 Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(

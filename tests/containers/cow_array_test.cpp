@@ -108,7 +108,7 @@ TEST(CowArrayTest,
     EXPECT_EQ(appended->size(), 3);
     const auto before = WorkerMemoryAccountingBytes(0);
     CountedArrayValue::throw_after = 1;
-    EXPECT_THROW(current->Appended(values), std::runtime_error);
+    EXPECT_THROW((void)current->Appended(values), std::runtime_error);
     CountedArrayValue::throw_after = -1;
     EXPECT_EQ(WorkerMemoryAccountingBytes(0), before);
     EXPECT_EQ(current->front().value_, 11);
