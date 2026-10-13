@@ -12,7 +12,7 @@ Aerospike 使用默认性能配置及原始宿主策略；Lavik 使用 12 worker
 
 ## 100K 限速
 
-![100K 限速: throughput and p99.9 latency](ycsb-100k.png)
+![100K 限速: throughput and p99.9 latency](ycsb-100k.svg)
 
 | Workload | 操作 | Aerospike | Lavik |
 |---|---|---:|---:|
@@ -30,7 +30,7 @@ Aerospike 使用默认性能配置及原始宿主策略；Lavik 使用 12 worker
 
 ## 不限速
 
-![不限速: throughput and p99.9 latency](ycsb-unlimited.png)
+![不限速: throughput and p99.9 latency](ycsb-unlimited.svg)
 
 | Workload | 操作 | Aerospike | Lavik |
 |---|---|---:|---:|

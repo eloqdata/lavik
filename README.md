@@ -64,9 +64,9 @@ SPDK NVMe namespaces, so capacity scales with storage.
 
 - **NVMe storage, beyond in-memory throughput.**
   In the 10-million-key
-  benchmark, Lavik's peak GET throughput was **3.6% higher than Redis and
-  4.8% higher than Valkey**. Its peak SET throughput was **2.2% higher than
-  Redis and 15.9% higher than Valkey**.
+  benchmark, Lavik v0.1.0's peak GET throughput was **12.5% higher than Redis and
+  18.1% higher than Valkey**. Its peak SET throughput was **2.2% higher than
+  Redis and 20.3% higher than Valkey**.
   See [in-memory comparisons](#in-memory-redis-and-valkey) for full results.
 
 - **Put multiple CPU cores to work in one server.** Worker threads own their
@@ -312,42 +312,39 @@ different dataset and duration and is excluded from this chart and table.
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
 
-### In-memory Redis and Valkey
+<a id="in-memory-redis-and-valkey"></a>
 
-#### 2 vCPUs: 100× more data, comparable throughput
+### In-memory Redis and Valkey: more data, higher throughput
+
+#### 2 vCPUs
 
 The [2-vCPU comparison](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 compares Lavik v0.1.0 with Redis 8.10.2 and Valkey 9.1.2 on the same Azure
 L2aos_v5 instance with **2 vCPUs and 16 GiB RAM**, using 1 KiB values.
 
+![2 vCPUs: Lavik with 1M and 100M keys versus Redis and Valkey with 1M keys](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/throughput.svg)
+
 Lavik served **100 million keys (95.37 GiB of value data)** at peak rates of
 **215K GET ops/s and 196K SET ops/s**—throughput comparable to Redis and
 Valkey holding 1 million keys entirely in memory, with **100 times as much data**.
 
-#### 16 vCPUs: 10 million keys
+#### 16 vCPUs
 
-The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#10m-keys--1-kib-in-memory-controls)
-used an AMD EPYC 9V74 server with approximately 126 GiB RAM and
-**10 million keys with 1 KiB values** (about 10 GB). The
-[Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release used SPDK with six raw NVMe
-devices and separately loaded datasets. Redis 8.8.0 and Valkey 9.1.0 held
-the complete dataset in memory. Tests swept 80–1,280 connections with
-pipeline=1 and 30-second measurement windows, selecting each in-memory
-system's best measured I/O-thread setting per command.
+The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
+tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
+Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
+on an Azure Standard_L16aos_v4 VM.
 
-![Lavik SPDK versus tuned in-memory Redis and Valkey](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/memory-qps.svg)
+![16 vCPUs: Lavik with 10M and 1B keys versus Redis and Valkey with 10M keys](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-qps.svg)
 
-| System | Peak GET QPS | GET p99 | Peak SET QPS | SET p99 |
-|---|---:|---:|---:|---:|
-| Lavik SPDK | 1,012,180 | 3.599 ms | 930,465 | 4.799 ms |
-| Redis 8.8.0 | 976,801 | 4.671 ms | 910,426 | 4.831 ms |
-| Valkey 9.1.0 | 965,697 | 4.543 ms | 802,519 | 4.383 ms |
+At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
+peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
+GET was **12.5% faster than Redis and 18.1% faster than Valkey**;
+SET was **2.2% and 20.3% faster**, respectively.
 
-Lavik SPDK's GET peak occurred at 640 connections and its SET
-peak at 1,280. Redis and Valkey had AOF and
-automatic RDB saves disabled. Their controls reuse an earlier sweep on the same
-hosts; all Lavik points were measured with the release package. This 10 GB
-test is independent of the larger storage-tier benchmark above.
+With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
+**817,113 SET QPS**—throughput comparable to Redis and Valkey holding
+10 million keys in memory, with **100 times as much data**.
 
 ## Important notes
 
