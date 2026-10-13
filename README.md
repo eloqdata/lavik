@@ -40,12 +40,6 @@ Lavik is a Linux C++23 key-value server that speaks RESP2 and RESP3. It keeps
 a compact key index in DRAM and stores data on files, raw block devices, or
 SPDK NVMe namespaces, so capacity scales with storage.
 
-> [!IMPORTANT]
-> Lavik implements a broad Redis-compatible surface, but it is not a claim of
-> complete Redis command or operational compatibility. Review the
-> [current architecture](docs/architecture/README.md) and test your workload
-> before adopting it.
-
 ## Highlights
 
 - **Grow beyond RAM.** Keep a compact key index in memory and values on NVMe;
@@ -326,7 +320,11 @@ With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
 **817,113 SET QPS**—throughput comparable to Redis and Valkey holding
 10 million keys in memory, with **100 times as much data**.
 
-## Important notes
+## Compatibility and operational notes
+
+Lavik supports RESP2/RESP3 clients and the Redis commands described in
+[Highlights](#highlights). See the [Valkey compatibility test coverage](tests/valkey/README.md)
+for the command suites exercised by the project. Operational differences include:
 
 - A successful write is not a synchronous `fsync` fence; see the
   [storage architecture](docs/architecture/04-storage-and-recovery.md) before
@@ -334,6 +332,9 @@ With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
 - Redis-style configuration files may enable automatic RDB snapshots with
   `save <seconds> <changes>` pairs; `save ""` disables them. Lavik keeps
   automatic snapshots disabled when no `save` directive is present.
+- Native high availability uses Lavik Meta; external Redis Sentinel control
+  of Lavik HA is outside the supported deployment model. See
+  [replication](docs/architecture/05-replication.md).
 - A replication restart can require a full synchronization.
 - Raw block and SPDK paths require exclusive device ownership.
 
