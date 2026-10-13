@@ -55,9 +55,11 @@ SPDK NVMe namespaces, so capacity scales with storage.
   throughput in that test. See [full results](#in-memory-redis-and-valkey).
 - **Keep your Redis tools.** RESP2/RESP3, familiar data structures, Lua,
   transactions, Pub/Sub, authentication, TLS, and RDB import/export.
-- **Use multiple cores and scale to a cluster.** Parallel workers, atomic
-  cross-worker operations, replication, Redis Cluster routing, and
-  [Prometheus metrics](docs/operations/metrics.md).
+- **Atomic transactions on primaries and replicas.** Multi-key commands and
+  `MULTI`/`EXEC` coordinate across workers; native replication preserves
+  transaction atomicity on replicas. See [replication](docs/architecture/05-replication.md).
+- **Use multiple cores and scale to a cluster.** Parallel workers, replication,
+  Redis Cluster routing, and [Prometheus metrics](docs/operations/metrics.md).
 
 ## Performance at a glance
 
