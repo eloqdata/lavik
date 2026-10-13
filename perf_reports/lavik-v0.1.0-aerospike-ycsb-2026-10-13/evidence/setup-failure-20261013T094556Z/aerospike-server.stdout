@@ -1,0 +1,394 @@
+Oct 13 2026 09:45:54 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Oct 13 2026 09:45:54 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Oct 13 2026 09:45:54 GMT: INFO (as): (as.c:336) <><><><><><><><><><>  Aerospike Community Edition build 8.1.2.4-4  <><><><><><><><><><>
+Oct 13 2026 09:45:54 GMT: INFO (as): (as.c:338) starting Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) # Single-node YCSB device namespace. Performance settings use server defaults.
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) service {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     cluster-name ycsb-default-20261013
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) logging {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     console {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         context any info
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) network {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     service {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         address 10.84.1.4
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         port 3000
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     heartbeat {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         mode mesh
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         port 3002
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     fabric {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         port 3001
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     admin {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         port 3003
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) namespace ycsb {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     replication-factor 1
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     storage-engine device {
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)         device /mnt/dev/benchmark/release010/ycsb/aerospike-device
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:45:54 GMT: WARNING (config): (cfg.c:4788) mod-lua: allow-unsafe-lua is true - Lua UDFs have access to os/io/debug and can load native .so modules; set allow-unsafe-lua false in the mod-lua stanza to harden the UDF sandbox
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4805) system file descriptor limit: 100000, proto-fd-max: 15000
+Oct 13 2026 09:45:54 GMT: INFO (hardware): (hardware.c:2054) detected 16 CPU(s), 8 core(s), 1 NUMA node(s)
+Oct 13 2026 09:45:54 GMT: INFO (socket): (socket.c:2729) Node port 3001, node ID bb917c551bd4560
+Oct 13 2026 09:45:54 GMT: INFO (config): (cfg.c:4846) node-id bb917c551bd4560
+Oct 13 2026 09:45:54 GMT: WARNING (os): (os.c:951) failed min-free-kbytes check - min-free-kbytes should be at least 1150976
+Oct 13 2026 09:45:54 GMT: WARNING (os): (os.c:1006) failed thp-enabled check - THP enabled not set to either 'never' or 'madvise'
+Oct 13 2026 09:45:54 GMT: WARNING (os): (os.c:948) failed swappiness check - swappiness not set to 0
+Oct 13 2026 09:45:54 GMT: WARNING (config): (cfg.c:5240) failed best-practices checks - see 'https://docs.aerospike.com/docs/operations/install/linux/bestpractices/index.html'
+Oct 13 2026 09:45:54 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/evict.smd' - starting empty
+Oct 13 2026 09:45:54 GMT: INFO (namespace): (namespace_ce.c:85) {ycsb} beginning cold start
+Oct 13 2026 09:45:54 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/sindex.smd' - starting empty
+Oct 13 2026 09:45:54 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/truncate.smd' - starting empty
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:3609) opened device /mnt/dev/benchmark/release010/ycsb/aerospike-device: usable size 1099494850560, io-min-size 512
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:1058) /mnt/dev/benchmark/release010/ycsb/aerospike-device has 131070 wblocks of size 8388608
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:2900) device /mnt/dev/benchmark/release010/ycsb/aerospike-device: reading device to load index
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:3003) device /mnt/dev/benchmark/release010/ycsb/aerospike-device: read complete: UNIQUE 0 (REPLACED 0) (OLDER 0) (EXPIRED 0) (EVICTED 0) (UNOWNED 0) (DROPPED 0) (UNPARSABLE 0) records
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:1026) {ycsb} loading free & defrag queues
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:958) /mnt/dev/benchmark/release010/ycsb/aerospike-device init defrag profile: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:1045) /mnt/dev/benchmark/release010/ycsb/aerospike-device init wblocks: pristine-id 1 pristine 131069 free-q 0, defrag-q 0
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:2421) {ycsb} starting device maintenance threads
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:1707) {ycsb} starting write threads
+Oct 13 2026 09:45:54 GMT: INFO (drv_ssd): (drv_ssd.c:879) {ycsb} starting defrag threads
+Oct 13 2026 09:45:54 GMT: INFO (as): (as.c:422) initializing services...
+Oct 13 2026 09:45:54 GMT: INFO (service): (service.c:213) starting 80 service threads
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:809) updated fabric published address list to {127.0.0.1:3001}
+Oct 13 2026 09:45:54 GMT: INFO (partition): (partition_balance.c:210) {ycsb} 4096 partitions: found 4096 absent, 0 stored
+Oct 13 2026 09:45:54 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/UDF.smd' - starting empty
+Oct 13 2026 09:45:54 GMT: INFO (batch): (batch.c:847) starting 16 batch-index-threads
+Oct 13 2026 09:45:54 GMT: INFO (health): (health.c:325) starting health monitor thread
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:423) starting 8 fabric send threads
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:438) starting 16 fabric rw channel recv threads
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric ctrl channel recv threads
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric bulk channel recv threads
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric meta channel recv threads
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (fabric.c:451) starting fabric accept thread
+Oct 13 2026 09:45:54 GMT: INFO (hb): (hb.c:6920) initializing mesh heartbeat socket: 127.0.0.1:3002
+Oct 13 2026 09:45:54 GMT: INFO (fabric): (socket.c:823) Started fabric endpoint 127.0.0.1:3001
+Oct 13 2026 09:45:54 GMT: INFO (hb): (hb.c:6950) mtu of the network is 65536
+Oct 13 2026 09:45:54 GMT: INFO (hb): (socket.c:823) Started mesh heartbeat endpoint 127.0.0.1:3002
+Oct 13 2026 09:45:54 GMT: INFO (nsup): (nsup.c:201) starting namespace supervisor threads
+Oct 13 2026 09:45:54 GMT: INFO (hb): (hb.c:5476) updated heartbeat published address list to {127.0.0.1:3002}
+Oct 13 2026 09:45:54 GMT: INFO (service): (socket.c:823) Started admin endpoint 127.0.0.1:3003
+Oct 13 2026 09:45:54 GMT: INFO (service): (service.c:1140) starting reaper thread
+Oct 13 2026 09:45:54 GMT: INFO (service): (socket.c:823) Started client endpoint 10.84.1.4:3000
+Oct 13 2026 09:45:54 GMT: INFO (service): (socket.c:823) Started client endpoint 127.0.0.1:3000
+Oct 13 2026 09:45:54 GMT: INFO (service): (service.c:245) starting accept thread
+Oct 13 2026 09:45:54 GMT: INFO (as): (as.c:464) service ready: soon there will be cake!
+Oct 13 2026 09:45:55 GMT: INFO (deprecation): (thr_info.c:888) 'features' info command is deprecated - see https://aerospike.com/docs/database/release/8-1/
+Oct 13 2026 09:45:55 GMT: INFO (deprecation): (thr_info.c:888) 'services' info command is deprecated - use 'peers-clear-std' instead
+Oct 13 2026 09:45:55 GMT: INFO (as): (signal.c:221) SIGTERM received from uid 0 pid 1, shutting down Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Oct 13 2026 09:45:55 GMT: INFO (as): (as.c:489) initiating clean shutdown ...
+Oct 13 2026 09:45:55 GMT: INFO (hb): (hb.c:5776) closing mesh heartbeat sockets
+Oct 13 2026 09:45:55 GMT: INFO (smd): (smd.c:645) SMD module shut down
+Oct 13 2026 09:45:55 GMT: INFO (storage): (storage.c:250) {ycsb} partitions shut down
+Oct 13 2026 09:45:55 GMT: INFO (storage): (storage.c:257) {ycsb} storage flushed
+Oct 13 2026 09:45:55 GMT: INFO (as): (as.c:507) finished clean shutdown - exiting
+Oct 13 2026 09:47:01 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Oct 13 2026 09:47:01 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Oct 13 2026 09:47:01 GMT: INFO (as): (as.c:336) <><><><><><><><><><>  Aerospike Community Edition build 8.1.2.4-4  <><><><><><><><><><>
+Oct 13 2026 09:47:01 GMT: INFO (as): (as.c:338) starting Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) # Single-node YCSB device namespace. Performance settings use server defaults.
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) service {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     cluster-name ycsb-default-20261013
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) logging {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     console {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         context any info
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) network {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     service {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         address 10.84.1.4
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         port 3000
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     heartbeat {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         mode mesh
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         port 3002
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     fabric {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         port 3001
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     admin {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         port 3003
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) namespace ycsb {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     replication-factor 1
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     storage-engine device {
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)         device /mnt/dev/benchmark/release010/ycsb/aerospike-device
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:47:01 GMT: WARNING (config): (cfg.c:4788) mod-lua: allow-unsafe-lua is true - Lua UDFs have access to os/io/debug and can load native .so modules; set allow-unsafe-lua false in the mod-lua stanza to harden the UDF sandbox
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4805) system file descriptor limit: 100000, proto-fd-max: 15000
+Oct 13 2026 09:47:01 GMT: INFO (hardware): (hardware.c:2054) detected 16 CPU(s), 8 core(s), 1 NUMA node(s)
+Oct 13 2026 09:47:01 GMT: INFO (socket): (socket.c:2729) Node port 3001, node ID bb917c551bd4560
+Oct 13 2026 09:47:01 GMT: INFO (config): (cfg.c:4846) node-id bb917c551bd4560
+Oct 13 2026 09:47:01 GMT: WARNING (os): (os.c:951) failed min-free-kbytes check - min-free-kbytes should be at least 1150976
+Oct 13 2026 09:47:01 GMT: WARNING (os): (os.c:1006) failed thp-enabled check - THP enabled not set to either 'never' or 'madvise'
+Oct 13 2026 09:47:01 GMT: WARNING (os): (os.c:948) failed swappiness check - swappiness not set to 0
+Oct 13 2026 09:47:01 GMT: WARNING (config): (cfg.c:5240) failed best-practices checks - see 'https://docs.aerospike.com/docs/operations/install/linux/bestpractices/index.html'
+Oct 13 2026 09:47:01 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/evict.smd' - starting empty
+Oct 13 2026 09:47:01 GMT: INFO (namespace): (namespace_ce.c:85) {ycsb} beginning cold start
+Oct 13 2026 09:47:01 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/sindex.smd' - starting empty
+Oct 13 2026 09:47:01 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/truncate.smd' - starting empty
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:3609) opened device /mnt/dev/benchmark/release010/ycsb/aerospike-device: usable size 1099494850560, io-min-size 512
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:1058) /mnt/dev/benchmark/release010/ycsb/aerospike-device has 131070 wblocks of size 8388608
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:2900) device /mnt/dev/benchmark/release010/ycsb/aerospike-device: reading device to load index
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:3003) device /mnt/dev/benchmark/release010/ycsb/aerospike-device: read complete: UNIQUE 0 (REPLACED 0) (OLDER 0) (EXPIRED 0) (EVICTED 0) (UNOWNED 0) (DROPPED 0) (UNPARSABLE 0) records
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:1026) {ycsb} loading free & defrag queues
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:958) /mnt/dev/benchmark/release010/ycsb/aerospike-device init defrag profile: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:1045) /mnt/dev/benchmark/release010/ycsb/aerospike-device init wblocks: pristine-id 1 pristine 131069 free-q 0, defrag-q 0
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:2421) {ycsb} starting device maintenance threads
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:1707) {ycsb} starting write threads
+Oct 13 2026 09:47:01 GMT: INFO (drv_ssd): (drv_ssd.c:879) {ycsb} starting defrag threads
+Oct 13 2026 09:47:01 GMT: INFO (as): (as.c:422) initializing services...
+Oct 13 2026 09:47:01 GMT: INFO (service): (service.c:213) starting 80 service threads
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:809) updated fabric published address list to {127.0.0.1:3001}
+Oct 13 2026 09:47:01 GMT: INFO (partition): (partition_balance.c:210) {ycsb} 4096 partitions: found 4096 absent, 0 stored
+Oct 13 2026 09:47:01 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/UDF.smd' - starting empty
+Oct 13 2026 09:47:01 GMT: INFO (batch): (batch.c:847) starting 16 batch-index-threads
+Oct 13 2026 09:47:01 GMT: INFO (health): (health.c:325) starting health monitor thread
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:423) starting 8 fabric send threads
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:438) starting 16 fabric rw channel recv threads
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric ctrl channel recv threads
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric bulk channel recv threads
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric meta channel recv threads
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (fabric.c:451) starting fabric accept thread
+Oct 13 2026 09:47:01 GMT: INFO (hb): (hb.c:6920) initializing mesh heartbeat socket: 127.0.0.1:3002
+Oct 13 2026 09:47:01 GMT: INFO (fabric): (socket.c:823) Started fabric endpoint 127.0.0.1:3001
+Oct 13 2026 09:47:01 GMT: INFO (hb): (hb.c:6950) mtu of the network is 65536
+Oct 13 2026 09:47:01 GMT: INFO (hb): (socket.c:823) Started mesh heartbeat endpoint 127.0.0.1:3002
+Oct 13 2026 09:47:01 GMT: INFO (nsup): (nsup.c:201) starting namespace supervisor threads
+Oct 13 2026 09:47:01 GMT: INFO (hb): (hb.c:5476) updated heartbeat published address list to {127.0.0.1:3002}
+Oct 13 2026 09:47:01 GMT: INFO (service): (socket.c:823) Started admin endpoint 127.0.0.1:3003
+Oct 13 2026 09:47:01 GMT: INFO (service): (service.c:1140) starting reaper thread
+Oct 13 2026 09:47:01 GMT: INFO (service): (socket.c:823) Started client endpoint 10.84.1.4:3000
+Oct 13 2026 09:47:01 GMT: INFO (service): (socket.c:823) Started client endpoint 127.0.0.1:3000
+Oct 13 2026 09:47:01 GMT: INFO (service): (service.c:245) starting accept thread
+Oct 13 2026 09:47:01 GMT: INFO (as): (as.c:464) service ready: soon there will be cake!
+Oct 13 2026 09:47:03 GMT: INFO (clustering): (clustering.c:6362) principal node - proposing new cluster with succession list: bb917c551bd4560
+Oct 13 2026 09:47:03 GMT: INFO (clustering): (clustering.c:5799) applied new cluster key 3584bd2c691e
+Oct 13 2026 09:47:03 GMT: INFO (clustering): (clustering.c:5806) principal node - applied new succession list: bb917c551bd4560
+Oct 13 2026 09:47:03 GMT: INFO (clustering): (clustering.c:5814) applied cluster size 1
+Oct 13 2026 09:47:03 GMT: INFO (exchange): (exchange.c:2339) data exchange started with cluster key 3584bd2c691e
+Oct 13 2026 09:47:03 GMT: INFO (exchange): (exchange.c:2733) exchange-compatibility-id: self 15 cluster-min 0 -> 15 cluster-max 0 -> 15
+Oct 13 2026 09:47:03 GMT: INFO (exchange): (exchange.c:3326) received commit command from principal node bb917c551bd4560
+Oct 13 2026 09:47:03 GMT: INFO (exchange): (exchange.c:3289) data exchange completed with cluster key 3584bd2c691e
+Oct 13 2026 09:47:03 GMT: INFO (partition): (partition_balance.c:1087) {ycsb} replication factor is 1
+Oct 13 2026 09:47:03 GMT: INFO (partition): (partition_balance.c:1045) {ycsb} rebalanced: expected-migrations (0,0,0) fresh-partitions 4096
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129496448 free-mem-pct 98 thp-mem-kbytes 290816 host-free-mem-kbytes 129496448 host-free-mem-pct 98
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234044,1251068,1283584) heap-efficiency-pct 98.6
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:340)    fds: proto (0,0,0) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:47:11 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:47:21 GMT: INFO (drv_ssd): (drv_ssd.c:2133) {ycsb} /mnt/dev/benchmark/release010/ycsb/aerospike-device: used-bytes 0 free-wblocks 131069 write-q 0 write (0,0.0) defrag-q 0 defrag-read (0,0.0) defrag-write (0,0.0)
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129496452 free-mem-pct 98 thp-mem-kbytes 290816 host-free-mem-kbytes 129496452 host-free-mem-pct 98
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234044,1251068,1283584) heap-efficiency-pct 98.6
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:340)    fds: proto (0,0,0) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:47:21 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:47:23 GMT: INFO (deprecation): (thr_info.c:888) 'replicas-master' info command is deprecated - use 'replicas' instead or upgrade your client
+Oct 13 2026 09:47:23 GMT: INFO (deprecation): (thr_info.c:888) 'services' info command is deprecated - use 'peers-clear-std' instead
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 2 user-cpu-pct 1 kernel-cpu-pct 1 free-mem-kbytes 129486360 free-mem-pct 98 thp-mem-kbytes 296960 host-free-mem-kbytes 129486360 host-free-mem-pct 98
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234156,1251188,1289728) heap-efficiency-pct 98.6
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:340)    fds: proto (0,2,2) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:47:31 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:47:31 GMT: INFO (deprecation): (thr_info.c:888) (repeated:1) 'replicas-master' info command is deprecated - use 'replicas' instead or upgrade your client
+Oct 13 2026 09:47:31 GMT: INFO (deprecation): (thr_info.c:888) (repeated:1) 'services' info command is deprecated - use 'peers-clear-std' instead
+Oct 13 2026 09:47:41 GMT: INFO (drv_ssd): (drv_ssd.c:2133) {ycsb} /mnt/dev/benchmark/release010/ycsb/aerospike-device: used-bytes 0 free-wblocks 131069 write-q 0 write (0,0.0) defrag-q 0 defrag-read (0,0.0) defrag-write (0,0.0)
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129486372 free-mem-pct 98 thp-mem-kbytes 296960 host-free-mem-kbytes 129486372 host-free-mem-pct 98
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234156,1251188,1289728) heap-efficiency-pct 98.6
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:340)    fds: proto (0,2,2) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:47:41 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129486384 free-mem-pct 98 thp-mem-kbytes 296960 host-free-mem-kbytes 129486384 host-free-mem-pct 98
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234156,1251188,1289728) heap-efficiency-pct 98.6
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:340)    fds: proto (0,2,2) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:47:51 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:47:56 GMT: INFO (deprecation): (thr_info.c:888) 'features' info command is deprecated - see https://aerospike.com/docs/database/release/8-1/
+Oct 13 2026 09:47:56 GMT: INFO (deprecation): (thr_info.c:888) 'services' info command is deprecated - use 'peers-clear-std' instead
+Oct 13 2026 09:47:56 GMT: INFO (deprecation): (thr_info.c:888) 'replicas-master' info command is deprecated - use 'replicas' instead or upgrade your client
+Oct 13 2026 09:48:01 GMT: INFO (drv_ssd): (drv_ssd.c:2133) {ycsb} /mnt/dev/benchmark/release010/ycsb/aerospike-device: used-bytes 0 free-wblocks 131069 write-q 0 write (0,0.0) defrag-q 0 defrag-read (0,0.0) defrag-write (0,0.0)
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129474112 free-mem-pct 98 thp-mem-kbytes 305152 host-free-mem-kbytes 129474112 host-free-mem-pct 98
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234316,1251396,1297920) heap-efficiency-pct 98.6
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:340)    fds: proto (0,4,4) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:48:01 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:48:01 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:48:01 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:48:01 GMT: INFO (deprecation): (thr_info.c:888) (repeated:1) 'features' info command is deprecated - see https://aerospike.com/docs/database/release/8-1/
+Oct 13 2026 09:48:01 GMT: INFO (deprecation): (thr_info.c:888) (repeated:1) 'replicas-master' info command is deprecated - use 'replicas' instead or upgrade your client
+Oct 13 2026 09:48:01 GMT: INFO (deprecation): (thr_info.c:888) (repeated:3) 'services' info command is deprecated - use 'peers-clear-std' instead
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129474124 free-mem-pct 98 thp-mem-kbytes 305152 host-free-mem-kbytes 129474124 host-free-mem-pct 98
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234336,1251416,1297920) heap-efficiency-pct 98.6
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:340)    fds: proto (0,4,4) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:48:11 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:48:11 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:48:11 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:48:21 GMT: INFO (drv_ssd): (drv_ssd.c:2133) {ycsb} /mnt/dev/benchmark/release010/ycsb/aerospike-device: used-bytes 0 free-wblocks 131069 write-q 0 write (0,0.0) defrag-q 0 defrag-read (0,0.0) defrag-write (0,0.0)
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 4 user-cpu-pct 3 kernel-cpu-pct 1 free-mem-kbytes 129451004 free-mem-pct 98 thp-mem-kbytes 309248 host-free-mem-kbytes 129451004 host-free-mem-pct 98
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234398,1251484,1302016) heap-efficiency-pct 98.6
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:340)    fds: proto (0,5,5) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:48:21 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:48:21 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:48:21 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129465260 free-mem-pct 98 thp-mem-kbytes 309248 host-free-mem-kbytes 129465260 host-free-mem-pct 98
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234398,1251484,1302016) heap-efficiency-pct 98.6
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:340)    fds: proto (0,5,5) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:48:31 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:48:31 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:48:31 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:48:41 GMT: INFO (drv_ssd): (drv_ssd.c:2133) {ycsb} /mnt/dev/benchmark/release010/ycsb/aerospike-device: used-bytes 0 free-wblocks 131069 write-q 0 write (0,0.0) defrag-q 0 defrag-read (0,0.0) defrag-write (0,0.0)
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129465260 free-mem-pct 98 thp-mem-kbytes 309248 host-free-mem-kbytes 129465260 host-free-mem-pct 98
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234398,1251484,1302016) heap-efficiency-pct 98.6
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:340)    fds: proto (0,5,5) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:48:41 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:48:41 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:48:41 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 2 user-cpu-pct 1 kernel-cpu-pct 1 free-mem-kbytes 129462044 free-mem-pct 98 thp-mem-kbytes 309248 host-free-mem-kbytes 129462044 host-free-mem-pct 98
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234398,1251484,1302016) heap-efficiency-pct 98.6
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:340)    fds: proto (0,5,5) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:48:51 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:48:51 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:48:51 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:49:01 GMT: INFO (drv_ssd): (drv_ssd.c:2133) {ycsb} /mnt/dev/benchmark/release010/ycsb/aerospike-device: used-bytes 0 free-wblocks 131069 write-q 0 write (0,0.0) defrag-q 0 defrag-read (0,0.0) defrag-write (0,0.0)
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129462800 free-mem-pct 98 thp-mem-kbytes 309248 host-free-mem-kbytes 129462800 host-free-mem-pct 98
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234398,1251484,1302016) heap-efficiency-pct 98.6
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:340)    fds: proto (0,5,5) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:49:01 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:49:01 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:49:01 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:169) NODE-ID bb917c551bd4560 CLUSTER-SIZE 1 CLUSTER-NAME ycsb-default-20261013
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:241)    cluster-clock: skew-ms 0
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:265)    system: total-cpu-pct 0 user-cpu-pct 0 kernel-cpu-pct 0 free-mem-kbytes 129468056 free-mem-pct 98 thp-mem-kbytes 309248 host-free-mem-kbytes 129468056 host-free-mem-pct 98
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:287)    process: cpu-pct 0 threads (9,61,113,113) heap-kbytes (1234398,1251484,1302016) heap-efficiency-pct 98.6
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:297)    in-progress: info-q 0 rw-hash 0 proxy-hash 0 tree-gc-q 0 long-queries 0
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:340)    fds: proto (0,5,5) heartbeat (0,0,0) fabric (0,0,0) admin (0,0,0)
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:352)    heartbeat-received: self 0 foreign 0
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:378)    fabric-bytes-per-second: bulk (0,0) ctrl (0,0) meta (0,0) rw (0,0)
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:426) {ycsb} objects: all 0 master 0 prole 0 non-replica 0
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:481) {ycsb} migrations: complete
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:506) {ycsb} index-usage: used-bytes 0
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:559) {ycsb} data-usage: used-bytes 0 avail-pct 99 cache-read-pct 0.00
+Oct 13 2026 09:49:11 GMT: INFO (info): (ticker.c:618) {ycsb} client: tsvc (0,0) proxy (0,0,0) read (0,0,0,1,0) write (0,0,0,0) delete (0,0,0,0,0) udf (0,0,0,0) lang (0,0,0,0)
+Oct 13 2026 09:49:11 GMT: INFO (info): (hist.c:319) histogram dump: {ycsb}-read (1 total) msec
+Oct 13 2026 09:49:11 GMT: INFO (info): (hist.c:339)  (00: 0000000001)
+Oct 13 2026 09:49:19 GMT: INFO (as): (signal.c:221) SIGTERM received from uid 0 pid 1, shutting down Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Oct 13 2026 09:49:19 GMT: INFO (as): (as.c:489) initiating clean shutdown ...
+Oct 13 2026 09:49:19 GMT: INFO (hb): (hb.c:5776) closing mesh heartbeat sockets
+Oct 13 2026 09:49:19 GMT: INFO (smd): (smd.c:645) SMD module shut down
+Oct 13 2026 09:49:19 GMT: INFO (storage): (storage.c:250) {ycsb} partitions shut down
+Oct 13 2026 09:49:19 GMT: INFO (storage): (storage.c:257) {ycsb} storage flushed
+Oct 13 2026 09:49:19 GMT: INFO (as): (as.c:507) finished clean shutdown - exiting

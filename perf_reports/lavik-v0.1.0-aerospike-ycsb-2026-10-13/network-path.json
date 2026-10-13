@@ -1,0 +1,49 @@
+{
+  "utc": "2026-10-13T10:21:25Z",
+  "rules": {
+    "argv": [
+      "ip",
+      "-j",
+      "rule",
+      "show"
+    ],
+    "stdout": "[{\"priority\":0,\"src\":\"all\",\"table\":\"local\"},{\"priority\":101,\"src\":\"10.84.1.4\",\"table\":\"101\",\"protocol\":\"static\"},{\"priority\":32766,\"src\":\"all\",\"table\":\"main\"},{\"priority\":32767,\"src\":\"all\",\"table\":\"default\"}]\n"
+  },
+  "route_from_data_ip": {
+    "argv": [
+      "ip",
+      "-j",
+      "route",
+      "get",
+      "10.84.0.5",
+      "from",
+      "10.84.1.4"
+    ],
+    "stdout": "[{\"dst\":\"10.84.0.5\",\"from\":\"10.84.1.4\",\"gateway\":\"10.84.1.1\",\"dev\":\"eth1\",\"table\":\"101\",\"flags\":[],\"uid\":1000,\"cache\":[]}]\n"
+  },
+  "routes_all": {
+    "argv": [
+      "ip",
+      "-j",
+      "route",
+      "show",
+      "table",
+      "all"
+    ],
+    "stdout": "[{\"dst\":\"default\",\"gateway\":\"10.84.1.1\",\"dev\":\"eth1\",\"table\":\"101\",\"protocol\":\"static\",\"flags\":[\"onlink\"]},{\"dst\":\"10.84.1.0/24\",\"dev\":\"eth1\",\"table\":\"101\",\"protocol\":\"static\",\"scope\":\"link\",\"flags\":[]},{\"dst\":\"default\",\"gateway\":\"10.84.0.1\",\"dev\":\"eth0\",\"protocol\":\"dhcp\",\"prefsrc\":\"10.84.0.4\",\"metric\":100,\"flags\":[]},{\"dst\":\"10.84.0.0/24\",\"dev\":\"eth0\",\"protocol\":\"kernel\",\"scope\":\"link\",\"prefsrc\":\"10.84.0.4\",\"metric\":100,\"flags\":[]},{\"dst\":\"10.84.0.1\",\"dev\":\"eth0\",\"protocol\":\"dhcp\",\"scope\":\"link\",\"prefsrc\":\"10.84.0.4\",\"metric\":100,\"flags\":[]},{\"dst\":\"10.84.1.0/24\",\"dev\":\"eth1\",\"protocol\":\"kernel\",\"scope\":\"link\",\"prefsrc\":\"10.84.1.4\",\"metric\":200,\"flags\":[]},{\"dst\":\"168.63.129.16\",\"gateway\":\"10.84.0.1\",\"dev\":\"eth0\",\"protocol\":\"dhcp\",\"prefsrc\":\"10.84.0.4\",\"metric\":100,\"flags\":[]},{\"dst\":\"169.254.169.254\",\"gateway\":\"10.84.0.1\",\"dev\":\"eth0\",\"protocol\":\"dhcp\",\"prefsrc\":\"10.84.0.4\",\"metric\":100,\"flags\":[]},{\"type\":\"local\",\"dst\":\"10.84.0.4\",\"dev\":\"eth0\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"host\",\"prefsrc\":\"10.84.0.4\",\"flags\":[]},{\"type\":\"broadcast\",\"dst\":\"10.84.0.255\",\"dev\":\"eth0\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"link\",\"prefsrc\":\"10.84.0.4\",\"flags\":[]},{\"type\":\"local\",\"dst\":\"10.84.1.4\",\"dev\":\"eth1\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"host\",\"prefsrc\":\"10.84.1.4\",\"flags\":[]},{\"type\":\"broadcast\",\"dst\":\"10.84.1.255\",\"dev\":\"eth1\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"link\",\"prefsrc\":\"10.84.1.4\",\"flags\":[]},{\"type\":\"local\",\"dst\":\"127.0.0.0/8\",\"dev\":\"lo\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"host\",\"prefsrc\":\"127.0.0.1\",\"flags\":[]},{\"type\":\"local\",\"dst\":\"127.0.0.1\",\"dev\":\"lo\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"host\",\"prefsrc\":\"127.0.0.1\",\"flags\":[]},{\"type\":\"broadcast\",\"dst\":\"127.255.255.255\",\"dev\":\"lo\",\"table\":\"local\",\"protocol\":\"kernel\",\"scope\":\"link\",\"prefsrc\":\"127.0.0.1\",\"flags\":[]},{\"dst\":\"fe80::/64\",\"dev\":\"eth0\",\"protocol\":\"kernel\",\"metric\":256,\"flags\":[],\"pref\":\"medium\"},{\"dst\":\"fe80::/64\",\"dev\":\"eth1\",\"protocol\":\"kernel\",\"metric\":256,\"flags\":[],\"pref\":\"medium\"},{\"type\":\"local\",\"dst\":\"::1\",\"dev\":\"lo\",\"table\":\"local\",\"protocol\":\"kernel\",\"metric\":0,\"flags\":[],\"pref\":\"medium\"},{\"type\":\"local\",\"dst\":\"fe80::6245:bdff:fe51:c517\",\"dev\":\"eth0\",\"table\":\"local\",\"protocol\":\"kernel\",\"metric\":0,\"flags\":[],\"pref\":\"medium\"},{\"type\":\"local\",\"dst\":\"fe80::6245:bdff:fe51:c751\",\"dev\":\"eth1\",\"table\":\"local\",\"protocol\":\"kernel\",\"metric\":0,\"flags\":[],\"pref\":\"medium\"},{\"type\":\"multicast\",\"dst\":\"ff00::/8\",\"dev\":\"eth0\",\"table\":\"local\",\"protocol\":\"kernel\",\"metric\":256,\"flags\":[],\"pref\":\"medium\"},{\"type\":\"multicast\",\"dst\":\"ff00::/8\",\"dev\":\"eth1\",\"table\":\"local\",\"protocol\":\"kernel\",\"metric\":256,\"flags\":[],\"pref\":\"medium\"}]\n"
+  },
+  "topology": {
+    "argv": [
+      "lscpu",
+      "-e=CPU,CORE,SOCKET,NODE"
+    ],
+    "stdout": "CPU CORE SOCKET NODE\n  0    0      0    0\n  1    0      0    0\n  2    1      0    0\n  3    1      0    0\n  4    2      0    0\n  5    2      0    0\n  6    3      0    0\n  7    3      0    0\n  8    4      0    0\n  9    4      0    0\n 10    5      0    0\n 11    5      0    0\n 12    6      0    0\n 13    6      0    0\n 14    7      0    0\n 15    7      0    0\n"
+  },
+  "kernel": {
+    "argv": [
+      "uname",
+      "-r"
+    ],
+    "stdout": "6.17.0-1022-azure\n"
+  }
+}

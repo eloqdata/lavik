@@ -1,0 +1,12 @@
+{
+  "commit": "a47bf01c4f197d2ff2eecbbebd9743da5a1cae47",
+  "source_repository": "https://github.com/eloqdata/YCSB",
+  "java_client_aerospike": "3.1.2",
+  "jedis": "3.9.0",
+  "note": "Same existing patched YCSB source as the prior PR318 batch; Redis command name LAVIK.HREPLACE; Aerospike REPLACE_ONLY/CREATE_ONLY; no Lavik source patch. Aerospike binding rebuilt on the client before any formal point.",
+  "files": {
+    "ycsb-command-rename.patch": "dd1d41a125c0d94b1e87162813da7f566d7c18cf6c8ccf6f429dd83a58c56cff",
+    "RedisClient.java": "385808ad68d150ce67329d2c5cf9b0198aeaace3f1806035bd2f9df8cb9b5355",
+    "AerospikeClient.java": "81071e5e96569c8557999b947a7a7151623c00da74e4030dcf36476e303125d2"
+  }
+}

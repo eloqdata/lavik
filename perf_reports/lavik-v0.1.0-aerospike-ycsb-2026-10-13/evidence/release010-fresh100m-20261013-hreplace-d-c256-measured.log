@@ -1,0 +1,112 @@
+java -cp /opt/benchmark/ycsb-pr318-dist/redis-binding/conf:/opt/benchmark/ycsb-pr318-dist/conf:/opt/benchmark/ycsb-pr318-dist/lib/commons-pool2-2.11.1.jar:/opt/benchmark/ycsb-pr318-dist/lib/jackson-mapper-asl-1.9.4.jar:/opt/benchmark/ycsb-pr318-dist/lib/slf4j-api-1.7.25.jar:/opt/benchmark/ycsb-pr318-dist/lib/core-0.18.0-SNAPSHOT.jar:/opt/benchmark/ycsb-pr318-dist/lib/HdrHistogram-2.1.12.jar:/opt/benchmark/ycsb-pr318-dist/lib/htrace-core4-4.1.0-incubating.jar:/opt/benchmark/ycsb-pr318-dist/lib/jedis-3.9.0.jar:/opt/benchmark/ycsb-pr318-dist/lib/jackson-core-asl-1.9.4.jar:/opt/benchmark/ycsb-pr318-dist/lib/redis-binding-0.18.0-SNAPSHOT.jar site.ycsb.Client -db site.ycsb.db.RedisClient -s -threads 256 -P /opt/benchmark/ycsb-pr318-dist/workloads/workloada -p recordcount=8000000000 -p operationcount=2000000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p maxexecutiontime=300 -p insertstart=0 -p insertcount=100000000 -p redis.host=10.84.1.4 -p redis.port=16379 -p redis.scanindex=none -p redis.timeout=10000 -p redis.cluster=false -p redis.updatecommand=lavik.hreplace -t
+Command line: -db site.ycsb.db.RedisClient -s -threads 256 -P /opt/benchmark/ycsb-pr318-dist/workloads/workloada -p recordcount=8000000000 -p operationcount=2000000000 -p fieldcount=10 -p fieldlength=128 -p fieldlengthdistribution=constant -p readallfields=true -p writeallfields=true -p insertorder=hashed -p requestdistribution=uniform -p readproportion=0.95 -p updateproportion=0 -p insertproportion=0.05 -p scanproportion=0 -p readmodifywriteproportion=0 -p measurementtype=hdrhistogram -p measurement.interval=both -p hdrhistogram.percentiles=50,95,99,99.9,99.99 -p status.interval=10 -p maxexecutiontime=300 -p insertstart=0 -p insertcount=100000000 -p redis.host=10.84.1.4 -p redis.port=16379 -p redis.scanindex=none -p redis.timeout=10000 -p redis.cluster=false -p redis.updatecommand=lavik.hreplace -t
+YCSB Client 0.18.0-SNAPSHOT
+
+Loading workload...
+Starting test.
+SLF4J: Failed to load class "org.slf4j.impl.StaticLoggerBinder".
+SLF4J: Defaulting to no-operation (NOP) logger implementation
+SLF4J: See http://www.slf4j.org/codes.html#StaticLoggerBinder for further details.
+Maximum execution time specified as: 300 secs
+2026-10-13 11:15:04:733 0 sec: 0 operations; est completion in 0 second 
+DBWrapper: report latency for each error is false and specific error codes to track for latency are: []
+2026-10-13 11:15:14:596 10 sec: 5462482 operations; 546248.2 current ops/sec; est completion in 1 hour [READ: Count=5189917, Max=73855, Min=143, Avg=457.98, 50=424, 90=594, 99=1039, 99.9=3359, 99.99=13279] [INSERT: Count=273279, Max=72703, Min=104, Avg=399.09, 50=361, 90=534, 99=1160, 99.9=3511, 99.99=19167] [Intended-READ: Count=5197924, Max=73855, Min=143, Avg=458.03, 50=424, 90=594, 99=1039, 99.9=3361, 99.99=13271] [Intended-INSERT: Count=273607, Max=72703, Min=104, Avg=399.11, 50=361, 90=534, 99=1157, 99.9=3511, 99.99=19167] 
+2026-10-13 11:15:24:596 20 sec: 11246088 operations; 578360.6 current ops/sec; est completion in 58 minutes [READ: Count=5494273, Max=8983, Min=142, Avg=444.1, 50=422, 90=577, 99=790, 99.9=1957, 99.99=5055] [INSERT: Count=289090, Max=6011, Min=108, Avg=376.96, 50=358, 90=516, 99=724, 99.9=1575, 99.99=5195] [Intended-READ: Count=5492890, Max=8983, Min=142, Avg=444.1, 50=422, 90=577, 99=790, 99.9=1935, 99.99=5055] [Intended-INSERT: Count=288938, Max=6011, Min=108, Avg=377, 50=359, 90=516, 99=724, 99.9=1580, 99.99=5195] 
+2026-10-13 11:15:34:596 30 sec: 17041332 operations; 579524.4 current ops/sec; est completion in 58 minutes [READ: Count=5506500, Max=6847, Min=150, Avg=443.27, 50=422, 90=575, 99=784, 99.9=1766, 99.99=4611] [INSERT: Count=288673, Max=5763, Min=103, Avg=375.87, 50=358, 90=512, 99=719, 99.9=1556, 99.99=4287] [Intended-READ: Count=5502870, Max=6847, Min=150, Avg=443.31, 50=423, 90=575, 99=784, 99.9=1766, 99.99=4611] [Intended-INSERT: Count=288615, Max=5763, Min=103, Avg=375.9, 50=358, 90=512, 99=719, 99.9=1556, 99.99=4287] 
+2026-10-13 11:15:44:596 40 sec: 22840483 operations; 579915.1 current ops/sec; est completion in 57 minutes [READ: Count=5509013, Max=6151, Min=152, Avg=442.99, 50=422, 90=575, 99=783, 99.9=1763, 99.99=4643] [INSERT: Count=290137, Max=5231, Min=102, Avg=375.33, 50=358, 90=512, 99=713, 99.9=1521, 99.99=4123] [Intended-READ: Count=5509261, Max=6151, Min=152, Avg=443.03, 50=422, 90=575, 99=783, 99.9=1763, 99.99=4643] [Intended-INSERT: Count=290138, Max=5231, Min=102, Avg=375.37, 50=358, 90=512, 99=713, 99.9=1521, 99.99=4123] 
+2026-10-13 11:15:54:596 50 sec: 28647347 operations; 580686.4 current ops/sec; est completion in 57 minutes [READ: Count=5516688, Max=5755, Min=148, Avg=442.4, 50=422, 90=573, 99=780, 99.9=1784, 99.99=4619] [INSERT: Count=290702, Max=5827, Min=104, Avg=375.16, 50=358, 90=511, 99=716, 99.9=1530, 99.99=4403] [Intended-READ: Count=5516273, Max=5755, Min=148, Avg=442.44, 50=422, 90=573, 99=780, 99.9=1786, 99.99=4619] [Intended-INSERT: Count=290690, Max=5827, Min=104, Avg=375.2, 50=358, 90=511, 99=716, 99.9=1530, 99.99=4403] 
+2026-10-13 11:16:04:596 60 sec: 34439541 operations; 579219.4 current ops/sec; est completion in 57 minutes [READ: Count=5502017, Max=6123, Min=149, Avg=443.49, 50=423, 90=575, 99=785, 99.9=1774, 99.99=4611] [INSERT: Count=289525, Max=5983, Min=107, Avg=376.55, 50=359, 90=513, 99=718, 99.9=1545, 99.99=4331] [Intended-READ: Count=5500158, Max=6123, Min=149, Avg=443.54, 50=423, 90=575, 99=785, 99.9=1773, 99.99=4611] [Intended-INSERT: Count=289498, Max=5983, Min=107, Avg=376.58, 50=359, 90=513, 99=718, 99.9=1545, 99.99=4331] 
+2026-10-13 11:16:14:596 70 sec: 40234325 operations; 579478.4 current ops/sec; est completion in 56 minutes [READ: Count=5504686, Max=5987, Min=151, Avg=443.34, 50=423, 90=575, 99=785, 99.9=1737, 99.99=4587] [INSERT: Count=290497, Max=5487, Min=102, Avg=376.11, 50=359, 90=513, 99=720, 99.9=1540, 99.99=4371] [Intended-READ: Count=5506132, Max=5987, Min=151, Avg=443.37, 50=423, 90=575, 99=785, 99.9=1737, 99.99=4587] [Intended-INSERT: Count=290469, Max=5487, Min=102, Avg=376.15, 50=359, 90=513, 99=720, 99.9=1540, 99.99=4371] 
+2026-10-13 11:16:24:596 80 sec: 46027221 operations; 579289.6 current ops/sec; est completion in 56 minutes [READ: Count=5502853, Max=6075, Min=151, Avg=443.49, 50=422, 90=577, 99=789, 99.9=1805, 99.99=4627] [INSERT: Count=289652, Max=5459, Min=104, Avg=375.6, 50=358, 90=513, 99=720, 99.9=1559, 99.99=4043] [Intended-READ: Count=5501015, Max=6075, Min=151, Avg=443.53, 50=422, 90=577, 99=789, 99.9=1805, 99.99=4627] [Intended-INSERT: Count=289637, Max=5459, Min=104, Avg=375.64, 50=358, 90=513, 99=720, 99.9=1559, 99.99=4043] 
+2026-10-13 11:16:34:596 90 sec: 51807785 operations; 578056.4 current ops/sec; est completion in 56 minutes [READ: Count=5493668, Max=5687, Min=149, Avg=444.39, 50=423, 90=579, 99=792, 99.9=1745, 99.99=4567] [INSERT: Count=287713, Max=5251, Min=103, Avg=377.21, 50=359, 90=517, 99=725, 99.9=1538, 99.99=4151] [Intended-READ: Count=5494339, Max=5687, Min=149, Avg=444.43, 50=423, 90=579, 99=792, 99.9=1745, 99.99=4567] [Intended-INSERT: Count=287696, Max=5251, Min=103, Avg=377.25, 50=359, 90=517, 99=725, 99.9=1538, 99.99=4151] 
+2026-10-13 11:16:44:597 100 sec: 57601788 operations; 579400.3 current ops/sec; est completion in 56 minutes [READ: Count=5503272, Max=6111, Min=147, Avg=443.46, 50=423, 90=576, 99=787, 99.9=1751, 99.99=4519] [INSERT: Count=290093, Max=5295, Min=103, Avg=376.24, 50=359, 90=514, 99=721, 99.9=1513, 99.99=4115] [Intended-READ: Count=5504726, Max=6111, Min=147, Avg=443.5, 50=423, 90=576, 99=787, 99.9=1751, 99.99=4519] [Intended-INSERT: Count=290226, Max=5295, Min=103, Avg=376.27, 50=359, 90=514, 99=721, 99.9=1513, 99.99=4115] 
+2026-10-13 11:16:54:596 110 sec: 63388447 operations; 578665.9 current ops/sec; est completion in 56 minutes [READ: Count=5497246, Max=6079, Min=145, Avg=443.84, 50=423, 90=577, 99=788, 99.9=1701, 99.99=4671] [INSERT: Count=289151, Max=5507, Min=96, Avg=376.43, 50=359, 90=515, 99=725, 99.9=1472, 99.99=4267] [Intended-READ: Count=5494983, Max=6079, Min=145, Avg=443.89, 50=423, 90=577, 99=788, 99.9=1704, 99.99=4671] [Intended-INSERT: Count=289028, Max=5507, Min=96, Avg=376.48, 50=359, 90=515, 99=725, 99.9=1473, 99.99=4267] 
+2026-10-13 11:17:04:596 120 sec: 69156757 operations; 576831 current ops/sec; est completion in 55 minutes [READ: Count=5479586, Max=6223, Min=147, Avg=445.36, 50=424, 90=579, 99=788, 99.9=1753, 99.99=4619] [INSERT: Count=288850, Max=5867, Min=105, Avg=378.56, 50=361, 90=518, 99=723, 99.9=1528, 99.99=4327] [Intended-READ: Count=5480359, Max=6223, Min=147, Avg=445.39, 50=424, 90=579, 99=788, 99.9=1750, 99.99=4615] [Intended-INSERT: Count=288840, Max=5867, Min=105, Avg=378.59, 50=361, 90=518, 99=723, 99.9=1528, 99.99=4327] 
+2026-10-13 11:17:14:596 130 sec: 74939786 operations; 578302.9 current ops/sec; est completion in 55 minutes [READ: Count=5494599, Max=6567, Min=146, Avg=444.21, 50=423, 90=577, 99=788, 99.9=1750, 99.99=4627] [INSERT: Count=288274, Max=6011, Min=110, Avg=376.85, 50=359, 90=516, 99=722, 99.9=1501, 99.99=4279] [Intended-READ: Count=5493830, Max=6567, Min=146, Avg=444.24, 50=423, 90=577, 99=788, 99.9=1750, 99.99=4627] [Intended-INSERT: Count=288282, Max=6011, Min=110, Avg=376.89, 50=359, 90=516, 99=722, 99.9=1501, 99.99=4279] 
+2026-10-13 11:17:24:596 140 sec: 80722421 operations; 578263.5 current ops/sec; est completion in 55 minutes [READ: Count=5494072, Max=6163, Min=148, Avg=444.25, 50=423, 90=578, 99=789, 99.9=1787, 99.99=4855] [INSERT: Count=288630, Max=5999, Min=106, Avg=376.7, 50=359, 90=517, 99=722, 99.9=1481, 99.99=4183] [Intended-READ: Count=5494055, Max=6163, Min=148, Avg=444.29, 50=423, 90=578, 99=789, 99.9=1787, 99.99=4855] [Intended-INSERT: Count=288711, Max=5999, Min=106, Avg=376.73, 50=359, 90=517, 99=722, 99.9=1481, 99.99=4183] 
+2026-10-13 11:17:34:596 150 sec: 86514978 operations; 579255.7 current ops/sec; est completion in 55 minutes [READ: Count=5503062, Max=6307, Min=153, Avg=443.49, 50=423, 90=574, 99=779, 99.9=1716, 99.99=4631] [INSERT: Count=289436, Max=5583, Min=103, Avg=376.28, 50=359, 90=513, 99=714, 99.9=1489, 99.99=4275] [Intended-READ: Count=5502982, Max=6307, Min=153, Avg=443.52, 50=423, 90=574, 99=779, 99.9=1716, 99.99=4631] [Intended-INSERT: Count=289340, Max=5583, Min=103, Avg=376.32, 50=359, 90=513, 99=714, 99.9=1489, 99.99=4275] 
+2026-10-13 11:17:44:596 160 sec: 92295175 operations; 578019.7 current ops/sec; est completion in 55 minutes [READ: Count=5491407, Max=5899, Min=149, Avg=444.47, 50=423, 90=579, 99=792, 99.9=1782, 99.99=4439] [INSERT: Count=288786, Max=5607, Min=104, Avg=376.83, 50=359, 90=518, 99=725, 99.9=1552, 99.99=4099] [Intended-READ: Count=5491838, Max=5899, Min=149, Avg=444.51, 50=423, 90=580, 99=792, 99.9=1782, 99.99=4439] [Intended-INSERT: Count=288825, Max=5607, Min=104, Avg=376.87, 50=359, 90=518, 99=725, 99.9=1552, 99.99=4099] 
+2026-10-13 11:17:54:596 170 sec: 98092314 operations; 579713.9 current ops/sec; est completion in 54 minutes [READ: Count=5507541, Max=5707, Min=145, Avg=443.14, 50=422, 90=575, 99=788, 99.9=1716, 99.99=4659] [INSERT: Count=289626, Max=5235, Min=101, Avg=375.74, 50=358, 90=514, 99=720, 99.9=1465, 99.99=4243] [Intended-READ: Count=5508216, Max=5707, Min=145, Avg=443.18, 50=422, 90=575, 99=788, 99.9=1716, 99.99=4659] [Intended-INSERT: Count=289636, Max=5235, Min=101, Avg=375.78, 50=359, 90=514, 99=720, 99.9=1465, 99.99=4243] 
+2026-10-13 11:18:04:597 180 sec: 103875981 operations; 578366.7 current ops/sec; est completion in 54 minutes [READ: Count=5494052, Max=6051, Min=152, Avg=444.22, 50=423, 90=577, 99=789, 99.9=1725, 99.99=4739] [INSERT: Count=289634, Max=6071, Min=110, Avg=376.81, 50=359, 90=515, 99=722, 99.9=1504, 99.99=4085] [Intended-READ: Count=5493669, Max=6051, Min=152, Avg=444.26, 50=423, 90=577, 99=789, 99.9=1725, 99.99=4739] [Intended-INSERT: Count=289637, Max=6071, Min=110, Avg=376.85, 50=359, 90=515, 99=722, 99.9=1504, 99.99=4085] 
+2026-10-13 11:18:14:596 190 sec: 109661425 operations; 578544.4 current ops/sec; est completion in 54 minutes [READ: Count=5496517, Max=5639, Min=142, Avg=443.97, 50=423, 90=579, 99=792, 99.9=1705, 99.99=4423] [INSERT: Count=288846, Max=5251, Min=100, Avg=377.14, 50=359, 90=518, 99=725, 99.9=1510, 99.99=4259] [Intended-READ: Count=5495873, Max=5639, Min=142, Avg=444.01, 50=423, 90=579, 99=792, 99.9=1705, 99.99=4423] [Intended-INSERT: Count=288796, Max=5251, Min=100, Avg=377.17, 50=359, 90=518, 99=725, 99.9=1510, 99.99=4259] 
+2026-10-13 11:18:24:596 200 sec: 115455905 operations; 579448 current ops/sec; est completion in 54 minutes [READ: Count=5504376, Max=6535, Min=151, Avg=443.36, 50=422, 90=576, 99=786, 99.9=1750, 99.99=4579] [INSERT: Count=290447, Max=5351, Min=108, Avg=376.2, 50=359, 90=514, 99=717, 99.9=1524, 99.99=4411] [Intended-READ: Count=5504474, Max=6535, Min=151, Avg=443.4, 50=422, 90=576, 99=786, 99.9=1750, 99.99=4579] [Intended-INSERT: Count=290461, Max=5351, Min=108, Avg=376.24, 50=359, 90=514, 99=717, 99.9=1524, 99.99=4411] 
+2026-10-13 11:18:34:596 210 sec: 121238375 operations; 578247 current ops/sec; est completion in 54 minutes [READ: Count=5492278, Max=5819, Min=150, Avg=444.27, 50=423, 90=577, 99=787, 99.9=1746, 99.99=4575] [INSERT: Count=289969, Max=5247, Min=101, Avg=376.81, 50=360, 90=515, 99=719, 99.9=1522, 99.99=4051] [Intended-READ: Count=5493707, Max=5819, Min=150, Avg=444.31, 50=423, 90=577, 99=787, 99.9=1747, 99.99=4575] [Intended-INSERT: Count=289975, Max=5247, Min=101, Avg=376.85, 50=360, 90=515, 99=719, 99.9=1522, 99.99=4051] 
+2026-10-13 11:18:44:596 220 sec: 127034736 operations; 579636.1 current ops/sec; est completion in 54 minutes [READ: Count=5506627, Max=5771, Min=144, Avg=443.21, 50=422, 90=575, 99=786, 99.9=1731, 99.99=4575] [INSERT: Count=289681, Max=5463, Min=110, Avg=375.43, 50=358, 90=512, 99=718, 99.9=1511, 99.99=3991] [Intended-READ: Count=5506026, Max=5771, Min=144, Avg=443.25, 50=422, 90=576, 99=786, 99.9=1730, 99.99=4575] [Intended-INSERT: Count=289705, Max=5463, Min=110, Avg=375.47, 50=358, 90=512, 99=718, 99.9=1511, 99.99=3991] 
+2026-10-13 11:18:54:596 230 sec: 132836386 operations; 580165 current ops/sec; est completion in 53 minutes [READ: Count=5510966, Max=6227, Min=159, Avg=442.77, 50=422, 90=574, 99=779, 99.9=1816, 99.99=4687] [INSERT: Count=290632, Max=5487, Min=112, Avg=375.9, 50=359, 90=512, 99=715, 99.9=1571, 99.99=4303] [Intended-READ: Count=5510608, Max=6227, Min=159, Avg=442.81, 50=422, 90=574, 99=779, 99.9=1816, 99.99=4687] [Intended-INSERT: Count=290609, Max=5487, Min=112, Avg=375.93, 50=359, 90=512, 99=715, 99.9=1571, 99.99=4303] 
+2026-10-13 11:19:04:596 240 sec: 138627970 operations; 579158.4 current ops/sec; est completion in 53 minutes [READ: Count=5502024, Max=6067, Min=152, Avg=443.58, 50=423, 90=575, 99=781, 99.9=1815, 99.99=4651] [INSERT: Count=289630, Max=5379, Min=104, Avg=376.47, 50=359, 90=513, 99=714, 99.9=1585, 99.99=4259] [Intended-READ: Count=5502054, Max=6067, Min=152, Avg=443.61, 50=423, 90=575, 99=781, 99.9=1815, 99.99=4651] [Intended-INSERT: Count=289665, Max=5379, Min=104, Avg=376.51, 50=359, 90=513, 99=714, 99.9=1585, 99.99=4259] 
+2026-10-13 11:19:14:596 250 sec: 144418361 operations; 579039.1 current ops/sec; est completion in 53 minutes [READ: Count=5501418, Max=5787, Min=148, Avg=443.64, 50=423, 90=577, 99=788, 99.9=1749, 99.99=4431] [INSERT: Count=288925, Max=5439, Min=106, Avg=376.52, 50=359, 90=515, 99=718, 99.9=1495, 99.99=3881] [Intended-READ: Count=5500755, Max=5787, Min=148, Avg=443.68, 50=423, 90=577, 99=788, 99.9=1749, 99.99=4431] [Intended-INSERT: Count=288873, Max=5439, Min=106, Avg=376.56, 50=359, 90=515, 99=718, 99.9=1495, 99.99=3881] 
+2026-10-13 11:19:24:596 260 sec: 150198175 operations; 577981.4 current ops/sec; est completion in 53 minutes [READ: Count=5490747, Max=5995, Min=153, Avg=444.46, 50=424, 90=575, 99=786, 99.9=1800, 99.99=4523] [INSERT: Count=289214, Max=5659, Min=111, Avg=377.25, 50=360, 90=514, 99=716, 99.9=1547, 99.99=4199] [Intended-READ: Count=5493307, Max=5995, Min=153, Avg=444.49, 50=424, 90=575, 99=786, 99.9=1800, 99.99=4523] [Intended-INSERT: Count=289305, Max=5659, Min=111, Avg=377.29, 50=360, 90=514, 99=715, 99.9=1548, 99.99=4199] 
+2026-10-13 11:19:34:596 270 sec: 155972449 operations; 577427.4 current ops/sec; est completion in 53 minutes [READ: Count=5484812, Max=6027, Min=150, Avg=444.9, 50=424, 90=578, 99=792, 99.9=1868, 99.99=4507] [INSERT: Count=289360, Max=5307, Min=106, Avg=377.78, 50=360, 90=516, 99=724, 99.9=1546, 99.99=4175] [Intended-READ: Count=5482908, Max=6027, Min=150, Avg=444.93, 50=424, 90=578, 99=792, 99.9=1867, 99.99=4507] [Intended-INSERT: Count=289327, Max=5307, Min=106, Avg=377.81, 50=360, 90=516, 99=724, 99.9=1546, 99.99=4175] 
+2026-10-13 11:19:44:596 280 sec: 161766185 operations; 579315.67 current ops/sec; est completion in 53 minutes [READ: Count=5504283, Max=5743, Min=157, Avg=443.42, 50=422, 90=575, 99=789, 99.9=1785, 99.99=4567] [INSERT: Count=289490, Max=5519, Min=104, Avg=376.14, 50=359, 90=513, 99=717, 99.9=1550, 99.99=4391] [Intended-READ: Count=5504375, Max=5743, Min=157, Avg=443.45, 50=422, 90=575, 99=789, 99.9=1785, 99.99=4567] [Intended-INSERT: Count=289430, Max=5519, Min=104, Avg=376.17, 50=359, 90=513, 99=717, 99.9=1550, 99.99=4391] 
+2026-10-13 11:19:54:596 290 sec: 167546372 operations; 578076.51 current ops/sec; est completion in 52 minutes [READ: Count=5490372, Max=5639, Min=149, Avg=444.42, 50=423, 90=578, 99=789, 99.9=1755, 99.99=4583] [INSERT: Count=289753, Max=5655, Min=95, Avg=377.53, 50=360, 90=515, 99=725, 99.9=1568, 99.99=4299] [Intended-READ: Count=5490615, Max=5639, Min=149, Avg=444.46, 50=423, 90=578, 99=789, 99.9=1755, 99.99=4583] [Intended-INSERT: Count=289763, Max=5655, Min=95, Avg=377.56, 50=360, 90=515, 99=725, 99.9=1568, 99.99=4299] 
+2026-10-13 11:20:04:596 300 sec: 173345163 operations; 579879.1 current ops/sec; est completion in 52 minutes [READ: Count=5508443, Max=6035, Min=147, Avg=442.98, 50=423, 90=573, 99=781, 99.9=1737, 99.99=4695] [INSERT: Count=290357, Max=5535, Min=106, Avg=376.52, 50=359, 90=512, 99=716, 99.9=1520, 99.99=4491] [Intended-READ: Count=5508597, Max=6035, Min=147, Avg=443.02, 50=423, 90=573, 99=781, 99.9=1738, 99.99=4695] [Intended-INSERT: Count=290456, Max=5535, Min=106, Avg=376.55, 50=359, 90=512, 99=716, 99.9=1520, 99.99=4491] 
+Maximum time elapsed. Requesting stop for the workload.
+Stop requested for workload. Now Joining!
+2026-10-13 11:20:04:715 300 sec: 173410482 operations; 548899.16 current ops/sec; est completion in 52 minutes [READ: Count=61877, Max=5759, Min=172, Avg=448.79, 50=423, 90=573, 99=798, 99.9=4355, 99.99=5367] [CLEANUP: Count=256, Max=5587, Min=15, Avg=1668.57, 50=1234, 90=4715, 99=5375, 99.9=5587, 99.99=5587] [INSERT: Count=3238, Max=5107, Min=125, Avg=381.41, 50=356, 90=513, 99=711, 99.9=4171, 99.99=5107] [Intended-READ: Count=60373, Max=5759, Min=172, Avg=448.9, 50=423, 90=573, 99=796, 99.9=4367, 99.99=5367] [Intended-CLEANUP: Count=256, Max=5587, Min=15, Avg=1668.72, 50=1234, 90=4715, 99=5379, 99.9=5587, 99.99=5587] [Intended-INSERT: Count=3112, Max=5107, Min=125, Avg=382.26, 50=356, 90=515, 99=711, 99.9=4171, 99.99=5107] 
+[OVERALL], RunTime(ms), 300118
+[OVERALL], Throughput(ops/sec), 577807.6689835332
+[TOTAL_GCS_G1_Young_Generation], Count, 1202
+[TOTAL_GC_TIME_G1_Young_Generation], Time(ms), 1152
+[TOTAL_GC_TIME_%_G1_Young_Generation], Time(%), 0.38384901938570826
+[TOTAL_GCS_G1_Old_Generation], Count, 0
+[TOTAL_GC_TIME_G1_Old_Generation], Time(ms), 0
+[TOTAL_GC_TIME_%_G1_Old_Generation], Time(%), 0.0
+[TOTAL_GCs], Count, 1202
+[TOTAL_GC_TIME], Time(ms), 1152
+[TOTAL_GC_TIME_%], Time(%), 0.38384901938570826
+[READ], Operations, 164739192
+[READ], AverageLatency(us), 444.20400736213395
+[READ], MinLatency(us), 142
+[READ], MaxLatency(us), 73855
+[READ], 50thPercentileLatency(us), 423
+[READ], 95thPercentileLatency(us), 641
+[READ], 99thPercentileLatency(us), 790
+[READ], 99.9PercentileLatency(us), 1824
+[READ], 99.99PercentileLatency(us), 4683
+[READ], Return=OK, 164739192
+[CLEANUP], Operations, 256
+[CLEANUP], AverageLatency(us), 1668.5703125
+[CLEANUP], MinLatency(us), 15
+[CLEANUP], MaxLatency(us), 5587
+[CLEANUP], 50thPercentileLatency(us), 1234
+[CLEANUP], 95thPercentileLatency(us), 5031
+[CLEANUP], 99thPercentileLatency(us), 5375
+[CLEANUP], 99.9PercentileLatency(us), 5587
+[CLEANUP], 99.99PercentileLatency(us), 5587
+[INSERT], Operations, 8671290
+[INSERT], AverageLatency(us), 377.2266700802303
+[INSERT], MinLatency(us), 95
+[INSERT], MaxLatency(us), 72703
+[INSERT], 50thPercentileLatency(us), 359
+[INSERT], 95thPercentileLatency(us), 578
+[INSERT], 99thPercentileLatency(us), 724
+[INSERT], 99.9PercentileLatency(us), 1589
+[INSERT], 99.99PercentileLatency(us), 4443
+[INSERT], Return=OK, 8671290
+[Intended-READ], Operations, 164739192
+[Intended-READ], AverageLatency(us), 444.2426539460021
+[Intended-READ], MinLatency(us), 142
+[Intended-READ], MaxLatency(us), 73855
+[Intended-READ], 50thPercentileLatency(us), 423
+[Intended-READ], 95thPercentileLatency(us), 641
+[Intended-READ], 99thPercentileLatency(us), 790
+[Intended-READ], 99.9PercentileLatency(us), 1824
+[Intended-READ], 99.99PercentileLatency(us), 4683
+[Intended-CLEANUP], Operations, 256
+[Intended-CLEANUP], AverageLatency(us), 1668.71875
+[Intended-CLEANUP], MinLatency(us), 15
+[Intended-CLEANUP], MaxLatency(us), 5587
+[Intended-CLEANUP], 50thPercentileLatency(us), 1234
+[Intended-CLEANUP], 95thPercentileLatency(us), 5031
+[Intended-CLEANUP], 99thPercentileLatency(us), 5379
+[Intended-CLEANUP], 99.9PercentileLatency(us), 5587
+[Intended-CLEANUP], 99.99PercentileLatency(us), 5587
+[Intended-INSERT], Operations, 8671290
+[Intended-INSERT], AverageLatency(us), 377.2635102735579
+[Intended-INSERT], MinLatency(us), 95
+[Intended-INSERT], MaxLatency(us), 72703
+[Intended-INSERT], 50thPercentileLatency(us), 359
+[Intended-INSERT], 95thPercentileLatency(us), 578
+[Intended-INSERT], 99thPercentileLatency(us), 724
+[Intended-INSERT], 99.9PercentileLatency(us), 1589
+[Intended-INSERT], 99.99PercentileLatency(us), 4443

@@ -1,0 +1,33 @@
+{
+  "lavik": {
+    "version": "0.1.0",
+    "revision": "feb61224e414c5653fd09560e20c9d214db1e3ac",
+    "sha256": "7bf8d204a137678cee0e1a621b02661181373fbbfe1366bc1c201942b9dcf420",
+    "package": "lavik-v0.1.0-linux-x86_64.tar.gz",
+    "package_sha256": "06d95f2d969cffa39fbfca85f25246c4d9166ebc9577b164f2b022306c9f6fab",
+    "bycorf_revision": "8caaf75cb131b591922af51a19861f92e2ffc893",
+    "spdk_revision": "d519b163cbc0e2f28c35d9bc86d610da368b032c",
+    "build": "Official Ubuntu24.04/GCC13 x86-64-v2 standard package; unmodified"
+  },
+  "redis": {
+    "version": "8.8.0",
+    "source": "5a693aaed0842c4eef21c706b79fa49938ca9f6c",
+    "sha256": "6436cb80693c1af502213dee764990d9ee64323cb0986e5c95eec423f17a7d71",
+    "allocator": "jemalloc-5.3.0"
+  },
+  "valkey": {
+    "version": "9.1.0",
+    "source": "c9e8005e9d0ec817e26c7db318861cb821409249",
+    "sha256": "0f04f8836e52bb45cf8938738973f21ab7472dfe0d79a114bf58640eb02878da",
+    "allocator": "jemalloc-5.3.0"
+  },
+  "aerospike": {
+    "version": "Community Edition 8.1.2.4-4",
+    "sha256": "6e1b2bd6deebd5816f4f369ac1db4151217ed0be3b66578bdd6f15c24e6af8d0",
+    "package_url": "https://download.aerospike.com/artifacts/aerospike-server-community/8.1.2.4/aerospike-server-community_8.1.2.4_tools-13.0.2_ubuntu24.04_x86_64.tgz"
+  },
+  "memtier": {
+    "version": "2.5.1",
+    "revision": "5f634d17"
+  }
+}

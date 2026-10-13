@@ -1,0 +1,92 @@
+Oct 13 2026 09:42:18 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Oct 13 2026 09:42:18 GMT: WARNING (hardware): (hardware.c:552) bad or missing /proc/self/cpuset file
+Oct 13 2026 09:42:18 GMT: INFO (as): (as.c:336) <><><><><><><><><><>  Aerospike Community Edition build 8.1.2.4-4  <><><><><><><><><><>
+Oct 13 2026 09:42:18 GMT: INFO (as): (as.c:338) starting Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) # Single-node YCSB device namespace. Performance settings use server defaults.
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) service {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     cluster-name ycsb-default-20261013
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) logging {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     console {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         context any info
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) network {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     service {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         address 10.84.1.4
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         port 3000
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     heartbeat {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         mode mesh
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         port 3002
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     fabric {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         port 3001
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     admin {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         address 127.0.0.1
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         port 3003
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) namespace ycsb {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     replication-factor 1
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     storage-engine device {
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)         device /mnt/dev/benchmark/release010/ycsb/aerospike-device
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764)     }
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4764) }
+Oct 13 2026 09:42:18 GMT: WARNING (config): (cfg.c:4788) mod-lua: allow-unsafe-lua is true - Lua UDFs have access to os/io/debug and can load native .so modules; set allow-unsafe-lua false in the mod-lua stanza to harden the UDF sandbox
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4805) system file descriptor limit: 100000, proto-fd-max: 15000
+Oct 13 2026 09:42:18 GMT: INFO (hardware): (hardware.c:2054) detected 16 CPU(s), 8 core(s), 1 NUMA node(s)
+Oct 13 2026 09:42:18 GMT: INFO (socket): (socket.c:2729) Node port 3001, node ID bb917c551bd4560
+Oct 13 2026 09:42:18 GMT: INFO (config): (cfg.c:4846) node-id bb917c551bd4560
+Oct 13 2026 09:42:18 GMT: WARNING (os): (os.c:951) failed min-free-kbytes check - min-free-kbytes should be at least 1150976
+Oct 13 2026 09:42:18 GMT: WARNING (os): (os.c:1006) failed thp-enabled check - THP enabled not set to either 'never' or 'madvise'
+Oct 13 2026 09:42:18 GMT: WARNING (os): (os.c:948) failed swappiness check - swappiness not set to 0
+Oct 13 2026 09:42:18 GMT: WARNING (config): (cfg.c:5240) failed best-practices checks - see 'https://docs.aerospike.com/docs/operations/install/linux/bestpractices/index.html'
+Oct 13 2026 09:42:18 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/evict.smd' - starting empty
+Oct 13 2026 09:42:18 GMT: INFO (namespace): (namespace_ce.c:85) {ycsb} beginning cold start
+Oct 13 2026 09:42:18 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/sindex.smd' - starting empty
+Oct 13 2026 09:42:18 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/truncate.smd' - starting empty
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:3609) opened device /mnt/dev/benchmark/release010/ycsb/aerospike-device: usable size 1099494850560, io-min-size 512
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:1058) /mnt/dev/benchmark/release010/ycsb/aerospike-device has 131070 wblocks of size 8388608
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:3372) {ycsb} found all 1 devices fresh, initializing to random 842268614182998192
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:1026) {ycsb} loading free & defrag queues
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:958) /mnt/dev/benchmark/release010/ycsb/aerospike-device init defrag profile: 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:1045) /mnt/dev/benchmark/release010/ycsb/aerospike-device init wblocks: pristine-id 1 pristine 131069 free-q 0, defrag-q 0
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:2421) {ycsb} starting device maintenance threads
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:1707) {ycsb} starting write threads
+Oct 13 2026 09:42:18 GMT: INFO (drv_ssd): (drv_ssd.c:879) {ycsb} starting defrag threads
+Oct 13 2026 09:42:18 GMT: INFO (as): (as.c:422) initializing services...
+Oct 13 2026 09:42:18 GMT: INFO (service): (service.c:213) starting 80 service threads
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:809) updated fabric published address list to {127.0.0.1:3001}
+Oct 13 2026 09:42:18 GMT: INFO (partition): (partition_balance.c:210) {ycsb} 4096 partitions: found 4096 absent, 0 stored
+Oct 13 2026 09:42:18 GMT: INFO (smd): (smd.c:2342) no file '/opt/aerospike/smd/UDF.smd' - starting empty
+Oct 13 2026 09:42:18 GMT: INFO (batch): (batch.c:847) starting 16 batch-index-threads
+Oct 13 2026 09:42:18 GMT: INFO (health): (health.c:325) starting health monitor thread
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:423) starting 8 fabric send threads
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:438) starting 16 fabric rw channel recv threads
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric ctrl channel recv threads
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric bulk channel recv threads
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:438) starting 4 fabric meta channel recv threads
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (fabric.c:451) starting fabric accept thread
+Oct 13 2026 09:42:18 GMT: INFO (hb): (hb.c:6920) initializing mesh heartbeat socket: 127.0.0.1:3002
+Oct 13 2026 09:42:18 GMT: INFO (fabric): (socket.c:823) Started fabric endpoint 127.0.0.1:3001
+Oct 13 2026 09:42:18 GMT: INFO (hb): (hb.c:6950) mtu of the network is 65536
+Oct 13 2026 09:42:18 GMT: INFO (hb): (socket.c:823) Started mesh heartbeat endpoint 127.0.0.1:3002
+Oct 13 2026 09:42:18 GMT: INFO (nsup): (nsup.c:201) starting namespace supervisor threads
+Oct 13 2026 09:42:18 GMT: INFO (hb): (hb.c:5476) updated heartbeat published address list to {127.0.0.1:3002}
+Oct 13 2026 09:42:18 GMT: INFO (service): (socket.c:823) Started admin endpoint 127.0.0.1:3003
+Oct 13 2026 09:42:18 GMT: INFO (service): (service.c:1140) starting reaper thread
+Oct 13 2026 09:42:18 GMT: INFO (service): (socket.c:823) Started client endpoint 10.84.1.4:3000
+Oct 13 2026 09:42:18 GMT: INFO (service): (socket.c:823) Started client endpoint 127.0.0.1:3000
+Oct 13 2026 09:42:18 GMT: INFO (service): (service.c:245) starting accept thread
+Oct 13 2026 09:42:18 GMT: INFO (as): (as.c:464) service ready: soon there will be cake!
+Oct 13 2026 09:42:19 GMT: INFO (as): (signal.c:221) SIGTERM received from uid 0 pid 1, shutting down Aerospike Community Edition build 8.1.2.4-4 os ubuntu24.04 arch x86_64 sha 634ac90
+Oct 13 2026 09:42:19 GMT: INFO (as): (as.c:489) initiating clean shutdown ...
+Oct 13 2026 09:42:19 GMT: INFO (hb): (hb.c:5776) closing mesh heartbeat sockets
+Oct 13 2026 09:42:19 GMT: INFO (smd): (smd.c:645) SMD module shut down
+Oct 13 2026 09:42:19 GMT: INFO (storage): (storage.c:250) {ycsb} partitions shut down
+Oct 13 2026 09:42:19 GMT: INFO (storage): (storage.c:257) {ycsb} storage flushed
+Oct 13 2026 09:42:19 GMT: INFO (as): (as.c:507) finished clean shutdown - exiting

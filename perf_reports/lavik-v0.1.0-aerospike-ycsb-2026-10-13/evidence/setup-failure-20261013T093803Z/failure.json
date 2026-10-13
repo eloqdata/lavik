@@ -1,0 +1,6 @@
+{
+  "utc": "2026-10-13T09:38:03Z",
+  "traceback": "Traceback (most recent call last):\n  File \"/mnt/dev/benchmark/release010/ycsb/runner.py\", line 384, in main\n    start(mode, 'load')\n  File \"/mnt/dev/benchmark/release010/ycsb/runner.py\", line 208, in start\n    assert unit_state in ('active', 'activating'), (mode, unit_state)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: ('aerospike', 'inactive')\n",
+  "mode": "aerospike",
+  "completed": 0
+}

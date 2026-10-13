@@ -1,0 +1,4 @@
+{
+  "reason": "Aerospike listener ready preceded single-node cluster formation. No objects inserted. Require all 4096 master partitions in replicas-master before YCSB launch. Read-only Java probe later succeeded with unchanged binding.",
+  "objects_before_retry": 0
+}

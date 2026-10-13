@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Minimal read-only Aerospike info-protocol client; emits the requested value."""
+import argparse,socket,struct
+p=argparse.ArgumentParser(add_help=False);p.add_argument('-h',dest='host');p.add_argument('-p',dest='port',type=int,default=3000);p.add_argument('-v',dest='command');a=p.parse_args()
+with socket.create_connection((a.host,a.port),timeout=20) as s:
+ payload=(a.command+'\n').encode();s.sendall(struct.pack('>Q',(2<<56)|(1<<48)|len(payload))+payload)
+ def exact(n):
+  b=bytearray()
+  while len(b)<n:
+   x=s.recv(n-len(b))
+   if not x:raise EOFError('Truncated Aerospike info response')
+   b+=x
+  return bytes(b)
+ size=struct.unpack('>Q',exact(8))[0]&((1<<48)-1)
+ print(exact(size).decode().rstrip('\n').split('\t',1)[1])

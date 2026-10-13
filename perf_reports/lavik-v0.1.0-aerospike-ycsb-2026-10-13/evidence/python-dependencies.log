@@ -1,0 +1,6 @@
+Collecting aerospike
+  Downloading aerospike-19.3.0-cp312-cp312-manylinux_2_28_x86_64.whl.metadata (5.5 kB)
+Downloading aerospike-19.3.0-cp312-cp312-manylinux_2_28_x86_64.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 2.2 MB/s eta 0:00:00
+Installing collected packages: aerospike
+Successfully installed aerospike-19.3.0

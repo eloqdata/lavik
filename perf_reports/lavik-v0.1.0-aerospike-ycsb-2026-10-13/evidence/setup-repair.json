@@ -1,0 +1,10 @@
+{
+  "reason": "Extracted Aerospike package requires default runtime directories; startup failed before loading any records.",
+  "created_directories": [
+    "/opt/aerospike/usr/udf/lua",
+    "/opt/aerospike/smd",
+    "/opt/aerospike/data",
+    "/opt/aerospike/output"
+  ],
+  "data_reinitialized": false
+}

@@ -1,0 +1,163 @@
+{
+  "mode": "hreplace",
+  "workload": "C",
+  "workers": 256,
+  "phase": "warmup",
+  "label": "release010-fresh100m-20261013",
+  "requested_duration_seconds": 0,
+  "d_insert_start": null,
+  "target_ops_sec": 0,
+  "measurement_interval": "both",
+  "command": [
+    "taskset",
+    "-c",
+    "0-15",
+    "/opt/benchmark/ycsb-pr318-dist/bin/ycsb",
+    "run",
+    "redis",
+    "-s",
+    "-threads",
+    "256",
+    "-P",
+    "/opt/benchmark/ycsb-pr318-dist/workloads/workloada",
+    "-p",
+    "recordcount=100000000",
+    "-p",
+    "operationcount=1000000",
+    "-p",
+    "fieldcount=10",
+    "-p",
+    "fieldlength=128",
+    "-p",
+    "fieldlengthdistribution=constant",
+    "-p",
+    "readallfields=true",
+    "-p",
+    "writeallfields=true",
+    "-p",
+    "insertorder=hashed",
+    "-p",
+    "requestdistribution=uniform",
+    "-p",
+    "readproportion=1",
+    "-p",
+    "updateproportion=0",
+    "-p",
+    "insertproportion=0",
+    "-p",
+    "scanproportion=0",
+    "-p",
+    "readmodifywriteproportion=0",
+    "-p",
+    "measurementtype=hdrhistogram",
+    "-p",
+    "measurement.interval=both",
+    "-p",
+    "hdrhistogram.percentiles=50,95,99,99.9,99.99",
+    "-p",
+    "status.interval=10",
+    "-p",
+    "redis.host=10.84.1.4",
+    "-p",
+    "redis.port=16379",
+    "-p",
+    "redis.scanindex=none",
+    "-p",
+    "redis.timeout=10000",
+    "-p",
+    "redis.cluster=false",
+    "-p",
+    "redis.updatecommand=lavik.hreplace"
+  ],
+  "start_utc": "2026-10-13T10:44:10Z",
+  "runtime_ms": 3619,
+  "attempted": 1000000,
+  "succeeded": 1000000,
+  "failed": 0,
+  "success_qps": 276319.4252555955,
+  "metrics": {
+    "OVERALL": {
+      "RunTime(ms)": 3619,
+      "Throughput(ops/sec)": 276319.4252555955
+    },
+    "TOTAL_GCS_G1_Young_Generation": {
+      "Count": 11
+    },
+    "TOTAL_GC_TIME_G1_Young_Generation": {
+      "Time(ms)": 27
+    },
+    "TOTAL_GC_TIME_%_G1_Young_Generation": {
+      "Time(%)": 0.7460624481901078
+    },
+    "TOTAL_GCS_G1_Old_Generation": {
+      "Count": 0
+    },
+    "TOTAL_GC_TIME_G1_Old_Generation": {
+      "Time(ms)": 0
+    },
+    "TOTAL_GC_TIME_%_G1_Old_Generation": {
+      "Time(%)": 0.0
+    },
+    "TOTAL_GCs": {
+      "Count": 11
+    },
+    "TOTAL_GC_TIME": {
+      "Time(ms)": 27
+    },
+    "TOTAL_GC_TIME_%": {
+      "Time(%)": 0.7460624481901078
+    },
+    "READ": {
+      "Operations": 1000000,
+      "AverageLatency(us)": 827.119963,
+      "MinLatency(us)": 140,
+      "MaxLatency(us)": 205055,
+      "50thPercentileLatency(us)": 438,
+      "95thPercentileLatency(us)": 2511,
+      "99thPercentileLatency(us)": 4033,
+      "99.9PercentileLatency(us)": 7855,
+      "99.99PercentileLatency(us)": 138111,
+      "Return=OK": 1000000
+    },
+    "CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 37.30078125,
+      "MinLatency(us)": 18,
+      "MaxLatency(us)": 587,
+      "50thPercentileLatency(us)": 27,
+      "95thPercentileLatency(us)": 89,
+      "99thPercentileLatency(us)": 188,
+      "99.9PercentileLatency(us)": 587,
+      "99.99PercentileLatency(us)": 587
+    },
+    "Intended-READ": {
+      "Operations": 1000000,
+      "AverageLatency(us)": 827.166418,
+      "MinLatency(us)": 140,
+      "MaxLatency(us)": 205055,
+      "50thPercentileLatency(us)": 438,
+      "95thPercentileLatency(us)": 2511,
+      "99thPercentileLatency(us)": 4033,
+      "99.9PercentileLatency(us)": 7855,
+      "99.99PercentileLatency(us)": 138111
+    },
+    "Intended-CLEANUP": {
+      "Operations": 256,
+      "AverageLatency(us)": 37.6328125,
+      "MinLatency(us)": 19,
+      "MaxLatency(us)": 589,
+      "50thPercentileLatency(us)": 27,
+      "95thPercentileLatency(us)": 89,
+      "99thPercentileLatency(us)": 188,
+      "99.9PercentileLatency(us)": 589,
+      "99.99PercentileLatency(us)": 589
+    }
+  },
+  "sha256": "c92e973915be4bb3d1ced931f324d4a95152c14cd48ad030dace0dcffc2bf60f",
+  "exit_code": 0,
+  "end_utc": "2026-10-13T10:44:14Z",
+  "before_records": 100000000,
+  "after_records": 100000000,
+  "host_before": "release010-fresh100m-20261013-hreplace-c-c256-warmup.host-before.json",
+  "host_after": "release010-fresh100m-20261013-hreplace-c-c256-warmup.host-after.json"
+}

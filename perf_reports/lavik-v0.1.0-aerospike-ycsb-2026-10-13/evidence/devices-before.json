@@ -1,0 +1,98 @@
+[
+  {
+    "serial": "4d4fd73b0687ec770001",
+    "pci": "2401:00:00.0",
+    "device": "/dev/nvme1n1",
+    "nsid": 1,
+    "info": {
+      "name": "nvme1n1",
+      "path": "/dev/nvme1n1",
+      "size": 1919850381312,
+      "type": "disk",
+      "fstype": null,
+      "mountpoints": [
+        null
+      ]
+    }
+  },
+  {
+    "serial": "4d4fd73b0687ec770002",
+    "pci": "221c:00:00.0",
+    "device": "/dev/nvme3n1",
+    "nsid": 1,
+    "info": {
+      "name": "nvme3n1",
+      "path": "/dev/nvme3n1",
+      "size": 1919850381312,
+      "type": "disk",
+      "fstype": null,
+      "mountpoints": [
+        null
+      ]
+    }
+  },
+  {
+    "serial": "4d4fd73b0687ec770003",
+    "pci": "7f10:00:00.0",
+    "device": "/dev/nvme5n1",
+    "nsid": 1,
+    "info": {
+      "name": "nvme2n1",
+      "path": "/dev/nvme2n1",
+      "size": 1919850381312,
+      "type": "disk",
+      "fstype": null,
+      "mountpoints": [
+        null
+      ]
+    }
+  },
+  {
+    "serial": "4d4fd73b0687ec770004",
+    "pci": "399c:00:00.0",
+    "device": "/dev/nvme4n1",
+    "nsid": 1,
+    "info": {
+      "name": "nvme5n1",
+      "path": "/dev/nvme5n1",
+      "size": 1919850381312,
+      "type": "disk",
+      "fstype": null,
+      "mountpoints": [
+        null
+      ]
+    }
+  },
+  {
+    "serial": "4d4fd73b0687ec770005",
+    "pci": "c0ef:00:00.0",
+    "device": "/dev/nvme6n1",
+    "nsid": 1,
+    "info": {
+      "name": "nvme4n1",
+      "path": "/dev/nvme4n1",
+      "size": 1919850381312,
+      "type": "disk",
+      "fstype": null,
+      "mountpoints": [
+        null
+      ]
+    }
+  },
+  {
+    "serial": "4d4fd73b0687ec770006",
+    "pci": "6319:00:00.0",
+    "device": "/dev/nvme2n1",
+    "nsid": 1,
+    "info": {
+      "name": "nvme6n1",
+      "path": "/dev/nvme6n1",
+      "size": 1919850381312,
+      "type": "disk",
+      "fstype": null,
+      "mountpoints": [
+        null
+      ]
+    }
+  }
+]

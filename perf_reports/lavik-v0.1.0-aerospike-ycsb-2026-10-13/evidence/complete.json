@@ -1,0 +1,10 @@
+{
+  "utc": "2026-10-13T11:24:11Z",
+  "complete": 16,
+  "phases": 32,
+  "host_restored": true,
+  "aerospike_final_records": 108497069,
+  "lavik_final_records": 110271711,
+  "aerospike_default_service_running": true,
+  "lavik_stopped": true
+}

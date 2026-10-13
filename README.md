@@ -309,7 +309,7 @@ to KeyDB On Flash's hot-tier design. The report documents those differences
 and reproduction commands. Its separate Azure Managed Redis test used a
 different dataset and duration and is excluded from this chart and table.
 
-See also the [100-million-record YCSB comparison with Aerospike](perf_reports/ycsb-rerun-2026-09-13/README.md),
+See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
 
 ### In-memory Redis and Valkey
