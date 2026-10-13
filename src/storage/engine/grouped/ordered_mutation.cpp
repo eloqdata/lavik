@@ -466,9 +466,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
          .item_count_ = group.location_.logical_size_,
          .encoded_bytes_ = ordered_sizes[i],
          .record_token_ = page.id_,
-         .retired_ = group.retired_,
          .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
-         .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_},
+         .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_,
+         .retired_ = group.retired_},
         tx->txid_,
         command_batch};
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {

@@ -3609,13 +3609,13 @@ acquire_active_stream:
           "transaction undo handle capacity exhausted");
     }
     undo.entries_.push_back(TxUndoEntry{
-        .entry_handle_ = *entry_handle,
         .previous_ = previous,
         .previous_extents_ = previous_extents,
         .previous_grouped_ = previous_grouped,
-        .previous_dependency_pinned_ = dependency_pinned,
         .previous_grouped_retirements_ = grouped_retirements,
         .applied_grouped_retirements_ = grouped_abort_retirements,
+        .entry_handle_ = *entry_handle,
+        .previous_dependency_pinned_ = dependency_pinned,
         .db_id_ = request.db_id_,
     });
   }

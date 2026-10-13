@@ -465,9 +465,9 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
                                  .item_count_ = physical->logical_size_,
                                  .encoded_bytes_ = g.encoded_bytes,
                                  .record_token_ = i + 1,
-                                 .retired_ = g.retired != 0,
                                  .min_score_ = g.min_score,
-                                 .max_score_ = g.max_score}});
+                                 .max_score_ = g.max_score,
+                                 .retired_ = g.retired != 0}});
     } else {
       if (g.previous != 0 || g.next != 0 || g.min_score != 0 ||
           g.max_score != 0)

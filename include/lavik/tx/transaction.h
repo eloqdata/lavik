@@ -187,8 +187,6 @@ class Transaction {
   ShardSlice Slice(const ShardData& sd) const;
   bycorf::Task<absl::Status> ExecuteSingleShard(bool release);
 
-  bool releasing_ = false;
-  bool scheduled_ = false;
   std::uint64_t txid_ = 0;
   ShardCallback cb_ = nullptr;
   void* cb_ctx_ = nullptr;
@@ -204,9 +202,13 @@ class Transaction {
   std::optional<TxShard::Guard> single_shard_guard_;
 
   // The only cross-thread words on the hop path.
-  std::atomic<std::uint32_t> barrier_{0};
   std::coroutine_handle<> coord_handle_;
+  std::atomic<std::uint32_t> barrier_{0};
   bycorf::WorkerId coord_worker_ = 0;
+  // Use the remaining tail bytes for coordinator state instead of adding
+  // padding before the aligned members of this frame-embedded transaction.
+  bool releasing_ = false;
+  bool scheduled_ = false;
 };
 
 // Called by TxShard::Poll when an armed transaction entry reaches the head

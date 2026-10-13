@@ -300,9 +300,9 @@ struct ActiveBlock {
 // allocated block carries a BlockState, so this lives in a side table instead
 // of charging staging-only state to every block.
 struct StagingSlot {
-  std::uint16_t write_buffer_id_ = 0;
   std::byte* heap_data_ = nullptr;
   std::size_t heap_data_size_ = 0;
+  std::uint64_t max_lsn_ = 0;
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
   std::uint32_t durable_bytes_ = kBlockHeaderBytes;
@@ -311,10 +311,11 @@ struct StagingSlot {
   // dirty staging bytes without walking every allocated block.
   std::uint32_t committed_bytes_ = kBlockHeaderBytes;
   std::uint32_t record_count_ = 0;
-  std::uint64_t max_lsn_ = 0;
   // Sequence stamped into the last header write. Its parity picks the slot,
   // so the header slot needs no field of its own.
   std::uint32_t header_sequence_ = 0;
+  // Keep the small slot identifiers together after the aligned flush state.
+  std::uint16_t write_buffer_id_ = 0;
   std::uint16_t next_free_ = 0;
 };
 
@@ -872,17 +873,19 @@ static_assert(sizeof(RecordIdentity) == 96);
 // handle so replacing its concrete Entry object never requires editing every
 // earlier undo item.
 struct TxUndoEntry {
-  std::uint32_t entry_handle_ = 0;
   std::optional<RecordLocation> previous_;
   ExtentManifest previous_extents_;
   GroupedObject::Handle previous_grouped_ = nullptr;
-  bool previous_dependency_pinned_ = false;
   std::shared_ptr<const std::vector<RetiredRecord>>
       previous_grouped_retirements_ = nullptr;
   // Prepared before root publication so an OOM-triggered abort never needs
   // fresh graph-retirement allocation merely to restore the previous view.
   std::shared_ptr<const std::vector<RetiredRecord>>
       applied_grouped_retirements_ = nullptr;
+  // Pack the small fields together without changing the owners' destruction
+  // order; a transaction retains one entry for every journaled write.
+  std::uint32_t entry_handle_ = 0;
+  bool previous_dependency_pinned_ = false;
   std::uint8_t db_id_ = 0;
 };
 

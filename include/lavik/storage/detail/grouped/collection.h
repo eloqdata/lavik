@@ -285,13 +285,15 @@ struct OrderedGroupEntry {
   // Complete encoded page payload, including the ordered-page envelope.
   std::uint64_t encoded_bytes_ = 0;
   std::uint64_t record_token_ = 0;
-  bool retired_ = false;
   // These two doubles are the resident score routing index. They are rebuilt
   // from checked pages during recovery and published with every new directory
   // view; physical relocation shares them unchanged. No member strings are
   // retained, so equal-score runs still require pagewise member comparisons.
   double min_score_ = 0;
   double max_score_ = 0;
+  // Keep byte-aligned routing state together: directories retain one entry
+  // per page, so padding here multiplies across the collection.
+  bool retired_ = false;
   // Populated from checked Stream pages, never from the durable page header.
   // A fixed allocation makes retained-directory admission cover the cache.
   mutable StreamPageMaxKey stream_max_key_{};
