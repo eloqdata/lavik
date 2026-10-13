@@ -469,9 +469,7 @@ L 1111.68 745.524
   <g id="text_32">
    <text style="font-size: 14px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="75.816" transform="rotate(-0 51.84 75.816)">1 KiB values · 16 memtier threads · pipeline 1 · Lavik SPDK / peers in DRAM</text>
   </g>
-  <g id="text_33">
-   <text style="font-size: 11.5px; font-family: 'DejaVu Sans'; text-anchor: start; fill: #566573" x="51.84" y="815.4432" transform="rotate(-0 51.84 815.4432)">10M: 30 s, default client seeds · 1B: 60 s, distinct client seeds · Lavik defrag enabled · single run per point</text>
-  </g>
+
   <g id="legend_1">
    <g id="line2d_47">
     <path d="M 290.07543 111.939203
