@@ -329,7 +329,7 @@ Valkey holding 1 million keys entirely in memory, with **100 times as much data*
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
 Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
-on an AMD EPYC 9V74 server with approximately 126 GiB RAM.
+on an Azure Standard_L16aos_v4 VM.
 
 ![Lavik v0.1.0 SPDK with 10M and 1B keys versus Redis 8.10.2 and Valkey 9.1.2](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined-qps.svg)
 
