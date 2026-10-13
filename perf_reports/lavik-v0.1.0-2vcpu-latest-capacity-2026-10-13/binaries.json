@@ -31,16 +31,5 @@
   "spdk_setup_helper": {
     "source": "d519b163cbc0e2f28c35d9bc86d610da368b032c",
     "usage": "scripts/setup.sh only; storage library comes from official Lavik package"
-  },
-  "reference_report": {
-    "repository": "thweetkomputer/lavik",
-    "commit": "102319a50d330f473240d08fba701f47ea72f4cd",
-    "path": "perf_reports/lavik-v0.1.0-2vcpu-redis-valkey-2026-10-13",
-    "differences": [
-      "latest stable Redis/Valkey",
-      "additional independent Lavik 100M dataset",
-      "distinct client seeds for all curves",
-      "all results freshly acquired on a new allocation of the same VM SKU"
-    ]
   }
 }

@@ -44,8 +44,7 @@ on 2026-10-13 is in `versions.json`.
 
 **These are host-specific, destructive scratch-device scripts.** The recorded
 server's local data disk is `/dev/nvme0n1`, while its OS is on `/dev/nvme1n1`.
-This is the reverse of the previous allocation. Do not select by Linux device
-number. Before adapting the scripts, inventory the new disposable namespace
+Do not select by Linux device number. Before adapting the scripts, inventory the new disposable namespace
 and explicitly replace the recorded serial, PCI address, namespace ID and
 capacity. Keep all guards for partitions, mounted filesystems, swap, holders,
 open users and exact device identity. `spdk_run.py` discards this allowlisted
@@ -74,9 +73,7 @@ Keys are decimal `1..N` without a prefix, values are 1,024 B, and there is no TT
 The fill uses partitioned key streams and checks exactly N successful requests
 and N stored keys. GET and overwriting SET use uniformly random keys across
 the complete declared range, with **`--distinct-client-seed` for every timed
-run, for all four curves**. This differs from the old correlated-seed batch;
-do not combine their results into one curve or attribute changes solely to
-software versions.
+run, for all four curves**.
 
 Each configuration has a 10-second GET warmup, then seven GET and seven SET
 points at total connections 16, 32, 80, 160, 320, 640 and 1280. Each point lasts

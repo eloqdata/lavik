@@ -1,93 +1,0 @@
-============== Configuration values: ==============
-server = 10.93.0.7
-port = 6379
-uri = 
-unix socket = (null)
-address family = Unspecified
-protocol = redis
-tls = no
-cert = (null)
-key = (null)
-cacert = (null)
-tls_skip_verify = no
-sni = (null)
-out_file = (null)
-client_stats = (null)
-run_count = 1
-debug = 0
-requests = 0
-rate_limit = 0
-clients = 10
-threads = 16
-test_time = 10
-ratio = 1:10
-pipeline = 1
-transaction = no
-data_size = 1024
-data_offset = 0
-random_data = no
-data_size_range = 0-0
-data_size_list = 
-data_size_pattern = R
-expiry_range = 0-0
-data_import = (null)
-data_verify = no
-verify_only = no
-generate_keys = no
-key_prefix = 
-key_minimum = 1
-key_maximum = 1000000
-key_pattern = R:R
-key_stddev = 0.000000
-key_median = 0.000000
-reconnect_interval = 0
-retry_on_error = no
-max_retries = -1
-retry_backoff_ms = 0
-retry_backoff_factor = 0.000000
-retry_on = 
-max_retry_queue = 0
-failed_keys_file = 
-connection_timeout = 0
-connection_stage_timeout = 30
-thread_conn_start_min_jitter_micros = 0
-thread_conn_start_max_jitter_micros = 0
-multi_key_get = 0
-authenticate = 
-select-db = 0
-no-expiry = no
-wait-ratio = 0:0
-num-slaves = 0-0
-wait-timeout = 0-0
-json-out-file = /opt/bench2c/client-results/memory/redis/io2/warmup.json
-print-all-runs = no
-prometheus-port = -1
-prometheus-bind-addr = 127.0.0.1
-prometheus-run-labels = 
-prometheus-latency-buckets = default
-===================================================
-Json file /opt/bench2c/client-results/memory/redis/io2/warmup.json created...
-Writing results to stdout
-[RUN #1] Preparing benchmark client...
-[RUN #1] Launching threads now...
-[RUN #1 10%,   1 secs] 16 threads 10 conns:      189494 ops,  189435 (avg:  189435) ops/sec, 191.12MB/sec (avg: 191.12MB/sec),  0.84 (avg:  0.84) msec latency[RUN #1 20%,   2 secs] 16 threads 10 conns:      380392 ops,  190878 (avg:  190156) ops/sec, 192.58MB/sec (avg: 191.85MB/sec),  0.84 (avg:  0.84) msec latency[RUN #1 30%,   3 secs] 16 threads 10 conns:      570228 ops,  189816 (avg:  190043) ops/sec, 191.50MB/sec (avg: 191.73MB/sec),  0.84 (avg:  0.84) msec latency[RUN #1 40%,   4 secs] 16 threads 10 conns:      758048 ops,  187615 (avg:  189436) ops/sec, 189.28MB/sec (avg: 191.12MB/sec),  0.85 (avg:  0.84) msec latency[RUN #1 50%,   5 secs] 16 threads 10 conns:      944823 ops,  186753 (avg:  188899) ops/sec, 188.41MB/sec (avg: 190.58MB/sec),  0.86 (avg:  0.85) msec latency[RUN #1 60%,   6 secs] 16 threads 10 conns:     1131922 ops,  187076 (avg:  188595) ops/sec, 188.74MB/sec (avg: 190.27MB/sec),  0.85 (avg:  0.85) msec latency[RUN #1 70%,   7 secs] 16 threads 10 conns:     1319562 ops,  187612 (avg:  188455) ops/sec, 189.28MB/sec (avg: 190.13MB/sec),  0.85 (avg:  0.85) msec latency[RUN #1 80%,   8 secs] 16 threads 10 conns:     1507324 ops,  187739 (avg:  188366) ops/sec, 189.41MB/sec (avg: 190.04MB/sec),  0.85 (avg:  0.85) msec latency[RUN #1 90%,   9 secs] 16 threads 10 conns:     1694672 ops,  187319 (avg:  188249) ops/sec, 188.98MB/sec (avg: 189.92MB/sec),  0.85 (avg:  0.85) msec latency[RUN #1 100%,  10 secs]  5 threads 10 conns:     1879953 ops,  187319 (avg:  187973) ops/sec, 188.98MB/sec (avg: 189.64MB/sec),  0.85 (avg:  0.85) msec latency[RUN #1 100%,  10 secs]  0 threads 10 conns:     1879969 ops,  187319 (avg:  187973) ops/sec, 188.98MB/sec (avg: 189.64MB/sec),  0.85 (avg:  0.85) msec latency
-
-
-CPU Utilization Summary
-  Total CPU time:   26.369s  (user 5.946s, sys 20.423s)
-  Wall time:        10.004s
-  Cores used:       2.636   (avg 16.5% across 16 worker threads)
-  Peak utilization: 270.5%
-Saving JSON output file: /opt/bench2c/client-results/memory/redis/io2/warmup.json
-Json file closed.
-16        Threads
-10        Connections per thread
-10        Seconds
-
-
-ALL STATS
-============================================================================================================================================
-Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
---------------------------------------------------------------------------------------------------------------------------------------------
-Gets       187965.53    187965.53         0.00         0.85075         0.85500         1.00700         1.67900         3.23100    194185.72 
-Totals     187965.53    187965.53         0.00         0.85075         0.85500         1.00700         1.67900         3.23100    388371.45 

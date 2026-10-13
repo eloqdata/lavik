@@ -1,93 +1,0 @@
-============== Configuration values: ==============
-server = 10.93.0.7
-port = 6379
-uri = 
-unix socket = (null)
-address family = Unspecified
-protocol = redis
-tls = no
-cert = (null)
-key = (null)
-cacert = (null)
-tls_skip_verify = no
-sni = (null)
-out_file = (null)
-client_stats = (null)
-run_count = 1
-debug = 0
-requests = 0
-rate_limit = 0
-clients = 10
-threads = 16
-test_time = 10
-ratio = 1:10
-pipeline = 1
-transaction = no
-data_size = 1024
-data_offset = 0
-random_data = no
-data_size_range = 0-0
-data_size_list = 
-data_size_pattern = R
-expiry_range = 0-0
-data_import = (null)
-data_verify = no
-verify_only = no
-generate_keys = no
-key_prefix = 
-key_minimum = 1
-key_maximum = 1000000
-key_pattern = R:R
-key_stddev = 0.000000
-key_median = 0.000000
-reconnect_interval = 0
-retry_on_error = no
-max_retries = -1
-retry_backoff_ms = 0
-retry_backoff_factor = 0.000000
-retry_on = 
-max_retry_queue = 0
-failed_keys_file = 
-connection_timeout = 0
-connection_stage_timeout = 30
-thread_conn_start_min_jitter_micros = 0
-thread_conn_start_max_jitter_micros = 0
-multi_key_get = 0
-authenticate = 
-select-db = 0
-no-expiry = no
-wait-ratio = 0:0
-num-slaves = 0-0
-wait-timeout = 0-0
-json-out-file = /opt/bench2c/client-results/memory/valkey/io2/warmup.json
-print-all-runs = no
-prometheus-port = -1
-prometheus-bind-addr = 127.0.0.1
-prometheus-run-labels = 
-prometheus-latency-buckets = default
-===================================================
-Json file /opt/bench2c/client-results/memory/valkey/io2/warmup.json created...
-Writing results to stdout
-[RUN #1] Preparing benchmark client...
-[RUN #1] Launching threads now...
-[RUN #1 10%,   1 secs] 16 threads 10 conns:      209602 ops,  209462 (avg:  209462) ops/sec, 211.32MB/sec (avg: 211.32MB/sec),  0.76 (avg:  0.76) msec latency[RUN #1 20%,   2 secs] 16 threads 10 conns:      428119 ops,  218486 (avg:  213973) ops/sec, 220.43MB/sec (avg: 215.87MB/sec),  0.73 (avg:  0.75) msec latency[RUN #1 30%,   3 secs] 16 threads 10 conns:      647292 ops,  219146 (avg:  215697) ops/sec, 221.09MB/sec (avg: 217.61MB/sec),  0.73 (avg:  0.74) msec latency[RUN #1 40%,   4 secs] 16 threads 10 conns:      866290 ops,  218972 (avg:  216516) ops/sec, 220.92MB/sec (avg: 218.44MB/sec),  0.73 (avg:  0.74) msec latency[RUN #1 50%,   5 secs] 16 threads 10 conns:     1083699 ops,  217383 (avg:  216689) ops/sec, 219.31MB/sec (avg: 218.61MB/sec),  0.74 (avg:  0.74) msec latency[RUN #1 60%,   6 secs] 16 threads 10 conns:     1302889 ops,  219166 (avg:  217102) ops/sec, 221.11MB/sec (avg: 219.03MB/sec),  0.73 (avg:  0.74) msec latency[RUN #1 70%,   7 secs] 16 threads 10 conns:     1521980 ops,  219062 (avg:  217382) ops/sec, 221.01MB/sec (avg: 219.31MB/sec),  0.73 (avg:  0.74) msec latency[RUN #1 80%,   8 secs] 16 threads 10 conns:     1741898 ops,  219890 (avg:  217695) ops/sec, 221.84MB/sec (avg: 219.63MB/sec),  0.73 (avg:  0.73) msec latency[RUN #1 90%,   9 secs] 16 threads 10 conns:     1960893 ops,  218970 (avg:  217837) ops/sec, 220.91MB/sec (avg: 219.77MB/sec),  0.73 (avg:  0.73) msec latency[RUN #1 100%,  10 secs] 13 threads 10 conns:     2178198 ops,  218970 (avg:  217799) ops/sec, 220.91MB/sec (avg: 219.73MB/sec),  0.73 (avg:  0.73) msec latency[RUN #1 100%,  10 secs]  0 threads 10 conns:     2178312 ops,  218970 (avg:  217800) ops/sec, 220.91MB/sec (avg: 219.73MB/sec),  0.73 (avg:  0.73) msec latency
-
-
-CPU Utilization Summary
-  Total CPU time:   31.244s  (user 7.433s, sys 23.811s)
-  Wall time:        10.015s
-  Cores used:       3.120   (avg 19.5% across 16 worker threads)
-  Peak utilization: 316.2%
-Saving JSON output file: /opt/bench2c/client-results/memory/valkey/io2/warmup.json
-Json file closed.
-16        Threads
-10        Connections per thread
-10        Seconds
-
-
-ALL STATS
-============================================================================================================================================
-Type         Ops/sec     Hits/sec   Misses/sec    Avg. Latency     p50 Latency     p99 Latency   p99.9 Latency  p99.99 Latency       KB/sec 
---------------------------------------------------------------------------------------------------------------------------------------------
-Gets       217794.41    217794.41         0.00         0.73415         0.73500         0.92700         1.35900         5.88700    225001.60 
-Totals     217794.41    217794.41         0.00         0.73415         0.73500         0.92700         1.35900         5.88700    450003.20 
