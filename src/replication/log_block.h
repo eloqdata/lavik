@@ -45,10 +45,11 @@ class ReplicationLogBlock {
   ReplicationLogBlock(ReplicationLogBlock&&) noexcept = default;
   ReplicationLogBlock& operator=(ReplicationLogBlock&&) noexcept = default;
 
-  // One admission covers both bytes and the maximum sparse-index allocation.
-  // Capacity is charged separately by the caller's history quota. Metadata
-  // and bytes both participate in owner-local process memory accounting.
-  static absl::StatusOr<ReplicationLogBlock> Allocate(std::size_t capacity);
+  // One admission covers bytes and the maximum sparse-index allocation.
+  // An already accepted source publication may bypass the soft budget; both
+  // allocations still charge their actual allocator sizes immediately.
+  static absl::StatusOr<ReplicationLogBlock> Allocate(
+      std::size_t capacity, bool externally_admitted = false);
   static std::size_t AllocationBytes(std::size_t capacity);
 
   std::span<std::byte> AppendBuffer(std::size_t bytes);

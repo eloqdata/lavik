@@ -10216,7 +10216,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
 
       struct StreamedFullSyncCommand {
         storage::FullSyncPublishItem item_;
-        ReplicationCommandPayloadSource source_;
+        std::optional<ReplicationCommandPayloadSource> source_;
         std::size_t payload_bytes_ = 0;
       };
       std::vector<StreamedFullSyncCommand> commands;
@@ -10263,6 +10263,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       constexpr std::size_t kFragmentBytes = kBacklogBatchBytes - kWireOverhead;
 
       std::size_t command_index = 0;
+      std::size_t acknowledged_command_index = 0;
       std::size_t command_offset = 0;
       std::uint32_t command_fragment = 0;
       while (command_index < commands.size()) {
@@ -10305,7 +10306,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           PutU8(payload, flags);
           const std::size_t payload_offset = payload.size();
           payload.resize(payload_offset + count);
-          absl::Status read = co_await encoded.source_.Read(
+          absl::Status read = co_await encoded.source_->Read(
               command_offset, std::span(reinterpret_cast<std::byte*>(
                                             payload.data() + payload_offset),
                                         count));
@@ -10354,6 +10355,13 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           absl::Status acknowledged =
               co_await WaitFullSyncRequest(ack_state, expected.sequence_);
           if (!acknowledged.ok()) co_return acknowledged;
+          // The queue ACK is also the borrowed-payload reclamation boundary.
+          // Drop transport views and ownership before waking command waiters;
+          // later items in this batch may still be waiting for their ACKs.
+          auto& completed = commands[acknowledged_command_index++];
+          assert(completed.item_.id_ == expected.item_id_);
+          completed.source_.reset();
+          completed.item_.command_.reset();
           storage_->AcknowledgeFullSyncPublishItem(session->id_,
                                                    expected.item_id_);
           ++drained_items;

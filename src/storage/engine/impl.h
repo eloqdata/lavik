@@ -1664,6 +1664,7 @@ class StorageEngine::Impl {
 
       struct PendingCommand {
         std::uint64_t log_epoch_ = 0;
+        std::uint64_t publish_sequence_ = 0;
         std::size_t staging_bytes_ = 0;
         ReplicationCommandAppend append_;
         std::shared_ptr<PublishFence> fence_;
@@ -1675,17 +1676,25 @@ class StorageEngine::Impl {
       std::uint64_t log_epoch_ = 0;
       std::uint64_t next_lsn_ = 1;
       std::size_t max_blocks_ = 0;
+      // One publisher owns the current complete event. Runtime shrinkage may
+      // lower max_blocks_, but cannot revoke the space needed to finish that
+      // event or trim its fragments while a payload read is suspended.
+      std::size_t append_min_blocks_ = 0;
       std::deque<ReplicationLogBlock> blocks_;
-      // The history quota counts published blocks only. This fully prepared
-      // successor is admitted and accounted normally, but stays outside
-      // blocks_ until rollover consumes it. Reserving both the 8 MiB payload
-      // and maximum sparse index here preserves the all-or-nothing retained-
-      // memory boundary while keeping both allocations off the append path.
+      // Only the raw append API prepares a complete event ahead of time.
+      // Accepted dataset writes allocate on demand and repay temporary soft
+      // budget borrowing by physically releasing ACK-safe history blocks.
+      std::deque<ReplicationLogBlock> spare_blocks_;
+      std::size_t borrowed_blocks_ = 0;
+      bool append_admitted_ = false;
+      std::uint64_t published_sequence_ = 0;
+      std::uint64_t enqueued_sequence_ = 0;
+      // The initial block is admitted when the history is enabled; later
+      // growth happens only when an append consumes another block.
       std::optional<ReplicationLogBlock> standby_block_;
-      bool standby_refill_pending_ = false;
       std::uint64_t coverage_revocations_ = 0;
-      // Only one publisher owns the log mutex, so this state is worker-local.
-      // ACK cursor updates wake the notification without acquiring that mutex.
+      // ACK updates and publication are worker-local. Pressure stops new
+      // admission, while accepted commands finish every flow before waiting.
       bool capacity_backpressured_ = false;
       std::uint64_t capacity_waits_ = 0;
       AsyncNotification retention_advanced_;
@@ -1988,10 +1997,12 @@ class StorageEngine::Impl {
     // suspend on a notification owned by one session.
     AsyncNotification fullsync_publisher_capacity_ready_;
     std::uint64_t fullsync_publisher_capacity_waits_ = 0;
-    // FIFO admission prevents an oversized command from starving while later
-    // small commands continuously refill the publisher queues.
+    // Stable global priorities order only pending admission. Intrusive nodes
+    // belong to coordinators and survive rollback, so younger small commands
+    // cannot repeatedly bypass an older oversized request.
     std::uint64_t replication_publisher_next_ticket_ = 1;
-    std::uint64_t replication_publisher_serving_ticket_ = 1;
+    ReplicationPublisherWaiter* replication_publisher_waiters_head_ = nullptr;
+    ReplicationPublisherWaiter* replication_publisher_waiters_tail_ = nullptr;
     AsyncNotification replication_publisher_admission_ready_;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records_;
@@ -3139,7 +3150,7 @@ class StorageEngine::Impl {
   Task<absl::Status> SetReplicationPublishQueueCapacity(
       std::size_t capacity_bytes);
   Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
-      ReplicationLogAppend event);
+      ReplicationLogAppend event, bool already_admitted = false);
   Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog(
       std::function<bool()> cancelled);
   Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
@@ -3169,7 +3180,22 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target,
+      std::size_t event_bytes = 0);
+  absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
+  TryGrantReplicationPublisherAdmission(
+      std::size_t logical_bytes,
       std::optional<ReplicationPublisherTarget> target);
+  absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
+  TryAcquireReplicationPublisherAdmission(
+      ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target);
+  Task<absl::Status> WaitReplicationPublisherAdmission(
+      ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target);
+  void FinishReplicationPublisherAdmission(ReplicationPublisherWaiter& waiter);
+  Task<absl::Status> WaitForReplicationMemory(std::uint64_t log_epoch,
+                                              bool payload_pressure = false);
   std::optional<ReplicationPublisherAdmission>
   TryAcquireFullSyncReplacementAdmission(std::size_t logical_bytes,
                                          ReplicationPublisherTarget target);
@@ -3184,14 +3210,16 @@ class StorageEngine::Impl {
   PrepareAdmittedReplicationCommand(
       const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
       std::uint16_t partition_id, std::vector<std::string> args,
-      std::optional<std::vector<std::string>> fullsync_projection);
+      std::optional<std::vector<std::string>> fullsync_projection,
+      std::shared_ptr<const void> retained_owner = {});
   absl::Status PublishPreparedReplicationCommand(
       const ReplicationPublisherAdmission& admission,
       PreparedReplicationCommandPublication publication);
   absl::Status PublishLateAdmittedReplicationCommand(
       const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
       std::uint16_t partition_id, std::vector<std::string> args,
-      std::optional<std::vector<std::string>> fullsync_projection);
+      std::optional<std::vector<std::string>> fullsync_projection,
+      std::shared_ptr<const void> retained_owner = {});
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 
@@ -3396,11 +3424,14 @@ class StorageEngine::Impl {
 
   Task<absl::Status> EnsureReplicationLogActiveBlock(
       WorkerStore& store, std::uint64_t protected_lsn);
-  absl::StatusOr<WorkerStore::ReplicationLogBlock>
-  AllocateReplicationLogBlock();
-  void EnsureReplicationLogStandby(WorkerStore& store);
-  Task<absl::Status> RefillReplicationLogStandby(WorkerStore* store,
-                                                 std::uint64_t log_epoch);
+  absl::StatusOr<WorkerStore::ReplicationLogBlock> AllocateReplicationLogBlock(
+      bool already_admitted = false);
+  absl::Status EnsureReplicationLogPool(WorkerStore& store,
+                                        std::size_t required_blocks);
+  void TrimReplicationLogPool(WorkerStore& store);
+  void ReclaimReplicationLogDebt(WorkerStore& store);
+  void CompleteReplicationPublication(WorkerStore& store, std::uint64_t epoch,
+                                      std::uint64_t sequence);
   Task<absl::Status> SealReplicationLogActiveBlock(WorkerStore& store);
   Task<absl::Status> ReclaimReplicationLogPrefix(WorkerStore& store,
                                                  std::uint64_t keep_from_lsn,

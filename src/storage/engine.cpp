@@ -477,9 +477,35 @@ bool StorageEngine::ReplicationLogActive() const noexcept {
 
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 StorageEngine::AcquireReplicationPublisherAdmission(
-    std::size_t logical_bytes,
+    std::size_t logical_bytes, std::optional<ReplicationPublisherTarget> target,
+    std::size_t event_bytes) {
+  return impl_->AcquireReplicationPublisherAdmission(logical_bytes, target,
+                                                     event_bytes);
+}
+
+absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
+StorageEngine::TryAcquireReplicationPublisherAdmission(
+    ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
     std::optional<ReplicationPublisherTarget> target) {
-  return impl_->AcquireReplicationPublisherAdmission(logical_bytes, target);
+  return impl_->TryAcquireReplicationPublisherAdmission(waiter, logical_bytes,
+                                                        target);
+}
+
+Task<absl::Status> StorageEngine::WaitReplicationPublisherAdmission(
+    ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  return impl_->WaitReplicationPublisherAdmission(waiter, logical_bytes,
+                                                  target);
+}
+
+void StorageEngine::FinishReplicationPublisherAdmission(
+    ReplicationPublisherWaiter& waiter) {
+  impl_->FinishReplicationPublisherAdmission(waiter);
+}
+
+Task<absl::Status> StorageEngine::WaitForReplicationMemory(
+    std::uint64_t log_epoch, bool payload_pressure) {
+  return impl_->WaitForReplicationMemory(log_epoch, payload_pressure);
 }
 
 void StorageEngine::ReleaseReplicationPublisherAdmission(
@@ -503,10 +529,11 @@ absl::StatusOr<PreparedReplicationCommandPublication>
 StorageEngine::PrepareAdmittedReplicationCommand(
     const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
     std::uint16_t partition_id, std::vector<std::string> args,
-    std::optional<std::vector<std::string>> fullsync_projection) {
+    std::optional<std::vector<std::string>> fullsync_projection,
+    std::shared_ptr<const void> retained_owner) {
   return impl_->PrepareAdmittedReplicationCommand(
       admission, kind, partition_id, std::move(args),
-      std::move(fullsync_projection));
+      std::move(fullsync_projection), std::move(retained_owner));
 }
 
 absl::Status StorageEngine::PublishPreparedReplicationCommand(
@@ -519,10 +546,11 @@ absl::Status StorageEngine::PublishPreparedReplicationCommand(
 absl::Status StorageEngine::PublishLateAdmittedReplicationCommand(
     const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
     std::uint16_t partition_id, std::vector<std::string> args,
-    std::optional<std::vector<std::string>> fullsync_projection) {
+    std::optional<std::vector<std::string>> fullsync_projection,
+    std::shared_ptr<const void> retained_owner) {
   return impl_->PublishLateAdmittedReplicationCommand(
       admission, kind, partition_id, std::move(args),
-      std::move(fullsync_projection));
+      std::move(fullsync_projection), std::move(retained_owner));
 }
 
 bool StorageEngine::TryEnqueueReplicationTransaction(

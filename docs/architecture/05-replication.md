@@ -58,8 +58,10 @@ consumes those values after durable detach; the receiver applies the clear
 only when all flows rendezvous at the same history-local barrier. Epoch changes
 also invalidate any active FULL capture, which restarts from the new epochs.
 
-As with ordinary asynchronous writes, local FLUSH success does not wait for
-replica ACKs. A failed enqueue invalidates the existing history; normal session
+As with ordinary writes, local FLUSH success waits for replica ACKs only when
+accepted publication must repay temporary memory or backlog excess. Every flow
+is published and command locks and admission are released before that wait.
+A failed enqueue invalidates the existing history; normal session
 cancellation aborts incomplete barriers and the replacement history requires
 FULL. No FLUSH-specific process fence is added, and a prepared old-history
 event cannot enter a new history. A control-plane rebuild explicitly bound to
@@ -780,25 +782,42 @@ standalone `PUBLISH`; Function mutations carry the original Redis command in
 the catalog-mutation kind.
 
 Publisher queues, full-sync subscriber queues, backlog blocks, full-sync
-coverage, and multi-frame target staging are retained replication state. They
-are admitted against the owning worker before they can accumulate. Each active
-worker log and full-sync session owns a bounded publisher budget; sessions and
-transaction participants share immutable command envelopes rather than
-duplicating payloads. Admission reserves every destination before mutation, so
-a successful primary write is not silently omitted from a valid history.
+coverage, and multi-frame target staging are retained replication state. New
+writes check worker memory and reserve publisher capacity before mutation.
+Each active worker log and full-sync session owns a bounded publisher budget.
+Transaction participants share immutable command envelopes; independently
+copied full-sync payloads retain their own allocation charges. Once a write is
+admitted, allocations needed to complete its replication may exceed the
+worker's soft memory budget. Payload, encoding metadata, and backlog owners
+charge their allocations immediately and
+release the charge with the allocation, so subsequent admissions observe the
+excess. Fixed queue staging allowances remain reserved independently of the
+separately charged payload and codec owners. Hard protocol and complete-event
+size limits remain in force.
 
 One command larger than its publisher-staging waterline may proceed only as the
 sole queued item so the queue cannot deadlock on an item that no consumer can
-make smaller. The complete canonical event is still bounded by the 1 GiB
-native-event limit and the receiving flow's block share of
-`repl-backlog-size`; transport fragmentation never weakens that event-level
-admission rule. The command layer checks a conservative complete-event bound,
-including possible expiration after-images, before mutation. A foreground publication-admission
-failure before mutation is returned as Redis OOM. A
-recoverable encoding or backlog failure discovered after a mutation invalidates
-the affected history or full-sync attempt and requires a new full sync. Once
-explicit retained-memory admission succeeds, unexpected physical allocation
-failure is process-fatal rather than converted to a second admission result.
+make smaller. The complete canonical event is bounded by the 1 GiB native-event
+limit. `repl-backlog-size` is a history-retention target, not a command-size
+limit. Publisher admission does not preallocate complete-event backlog blocks;
+the publisher allocates them as each complete accepted event needs space.
+Budget pressure cannot discard an accepted mutation or suspend a transaction
+between participant markers and its payload. New admission stops while backlog
+excess is retained. The accepted command releases its key, database, and order
+locks and publisher admission after preparing every participant, then observes
+publication completion and waits for temporary excess to become reclaimable.
+The wait concerns finite replication ownership, not unrelated process memory.
+History retirement ends this wait without rewriting a successful mutation's
+reply; cancellation and log teardown retain ownership and accounting until the
+old allocations are released. It does not establish replication durability.
+
+Result-dependent commands retain their deterministic canonical effects and
+final expiration after-images through nested execution and asynchronous
+publication. EXEC and Lua preserve the effects of successful children when a
+later child fails. Capture and encoding allocation retain normal accounting
+while accepted replication ownership permits soft-budget growth. Unexpected
+physical allocation failure remains process-fatal; exceeding a soft budget is
+not an encoding failure or a reason to invalidate history.
 
 The source sends bounded batches while a separate receiver validates ACK order
 and advances the retained cursor. An ONLINE range ACK carries two
@@ -819,8 +838,9 @@ eventually cancelled. A progressing full sync has no overall wall-clock limit.
 Each source worker has one heap-backed backlog shared by all downstream native
 sessions. Downstreams own only their cursors and
 retention pins. `repl-backlog-size` is a global quota divided across workers in
-8 MiB blocks, and block ownership is covered by worker-local retained-memory
-admission. Per-worker LSNs start at one for a new history and increase
+8 MiB blocks, and block ownership is charged to worker-local retained memory.
+Accepted publication may temporarily borrow above the soft budget. Per-worker
+LSNs start at one for a new history and increase
 monotonically. The log remains active across a downstream disconnect while that
 replica can still resume from the circular reconnect window. Each online native
 session records the next LSN after its highest completely written socket batch
@@ -848,19 +868,28 @@ export while foreground writes and native history continue. An interrupted
 process discards these blocks during recovery.
 
 A connected native downstream advertises its first unacknowledged LSN as a
-coverage claim. By default, the publisher waits at the hard backlog limit until
-ACK progress makes a complete event reclaimable; publisher staging then fills
-and propagates bounded backpressure to foreground write admission. Runtime
-`CONFIG SET replication-backlog-backpressure no` wakes any blocked publisher
-and changes capacity conflicts to revoke lagging claims, evict complete old
-events, and let affected consumers discover a floor gap and reconnect with
-whole-group full sync. Re-enabling it affects the next capacity conflict. A
-full-sync session pinned after its cut follows the same selected policy.
-Disconnect leaves the remaining capacity as a circular reconnect window.
-Shrinking below claimed history establishes a target quota; later publication
-waits or revokes according to the current policy. Eviction, trim, and reconnect
-coverage operate on complete events and never retain or advertise only a
-suffix of one fragmented event.
+coverage claim. Accepted publication always completes its logical event, even
+when pinned history makes the backlog exceed its retention target. Pressure
+then stops new foreground admission. Commands wait for reclamation only after
+all participating flows can publish and transaction locks and admission have
+been released, allowing replicas to finish the transaction and ACK it.
+Runtime `CONFIG SET replication-backlog-backpressure no` changes capacity
+conflicts to revoke lagging claims, evict complete old events, and let affected
+consumers discover a floor gap and reconnect with whole-group full sync.
+Re-enabling it affects the next capacity conflict. A full-sync session pinned
+after its cut follows the same selected policy.
+
+ACK advancement, session cancellation, publication completion, and quota changes
+actively reclaim whole safe events and release their physical blocks. No later
+write is required to return excess memory. Borrowed allocations can require
+shrinking the reconnect window below its configured target; releasing any safe
+block repays that temporary memory debt. A partially occupied active block is
+also reclaimable once every contained event is acknowledged. Shrinking below
+claimed history establishes a target quota, while incomplete events remain
+protected until publication finishes. Eviction, trim, and reconnect coverage
+operate on complete events and never retain or advertise only a suffix of one
+fragmented event. Disconnect leaves the remaining capacity as a bounded
+reconnect window.
 
 Client `WAIT` uses the same ACK cursors without changing the native wire
 protocol. Because worker LSN domains are independent, the source captures a
@@ -882,10 +911,19 @@ guard covers only waiter-list handoff; no replication registry work or
 
 Writes reserve the worker publisher queue and all relevant active full-sync
 queues before entering database or key gates. Multi-participant requests
-reserve every destination while the cross-flow ordering boundary keeps worker
-FIFOs consistent. Queue exhaustion therefore backpressures the client before
-commit instead of silently dropping publication. A post-mutation encoding or
-backlog failure leaves the primary dataset usable but invalidates the history:
+attempt queue credit in parallel with one stable process-wide admission
+priority. Worker-local pending intents retain that order across retries. A
+coordinator joins every attempt and returns all partial grants before waiting,
+so competing requests cannot hold each other's missing capacity. Admission
+waiters own no database, key, or publication-order gates; an older pending
+request cannot be repeatedly bypassed by younger small requests. Uncontended
+single-worker requests enter directly without a shared priority allocation.
+After complete admission, the cross-flow publication-order slot keeps
+participant marker order consistent across worker FIFOs. Queue exhaustion
+therefore backpressures the client before commit instead of silently dropping
+publication. Memory-budget rejection belongs to new-write admission;
+accepted replication may exceed that soft budget. An internal encoding/backlog
+invariant failure or an explicit publication fault invalidates the history:
 the manager assigns a new history ID, cancels downstream sessions, clears all
 worker logs, and requires full sync. An already-admitted head item may drain
 above the current waterline to preserve forward progress; new admissions remain
@@ -1241,10 +1279,10 @@ already durable at this point, the source waits for every participant marker
 to cross a publisher fence before replying; failure globally fences request
 serving until restart.
 
-A replicated standalone `MSET` acquires the slot before publisher admission or
-database gating, admits its participant workers in parallel, and releases it
-as soon as every participant marker is queued rather than holding it across
-storage I/O. Database-control publication uses the same ordering boundary:
+A replicated standalone `MSET` completes parallel ordered publisher admission
+before the publication-order slot, like other multi-participant writes. It releases
+the slot as soon as every participant marker is queued rather than holding it
+across storage I/O. Database-control publication uses the same ordering boundary:
 `FLUSH` acquires it before closing database gates, while a full-sync cut closes
 and drains snapshot-transaction admission before database gates. These gates
 do not have one global acquisition order, so the remaining hold-and-wait risk
@@ -1490,8 +1528,10 @@ connection metrics.
   publication; session closure and output backpressure retain their ordinary
   delivery behavior, while a rejected final check exposes neither a local
   message nor a replica-backlog event.
-- Publication admission must reject before mutation when the complete event
-  cannot fit. Retention pressure either waits for ACK progress or, when
+- Publication admission rejects hard protocol-size violations before mutation.
+  Accepted replication can exceed the soft memory budget while preparing all
+  participant effects. After locks and admission are released, retention
+  pressure either waits for ACK progress or, when
   configured not to backpressure, revokes a lagging consumer's coverage and
   forces its full sync; neither policy can leave a successful primary write
   out of the source history.

@@ -380,6 +380,117 @@ def full_and_copy(root):
             reader.close()
 
 
+def publisher_admission_precedes_order(root):
+    def key_on_worker(label, worker):
+        for index in range(1000):
+            key = f"publisher-{label}-{index}"
+            if C.redis_slot(key) % 3 == worker:
+                return key
+        raise AssertionError(f"no key found for worker {worker}")
+
+    keys = [key_on_worker("mset", owner) for owner in (0, 1)]
+    overlap_keys = [
+        [
+            key_on_worker(f"overlap-{index}-{side}", owner)
+            for side, owner in enumerate(owners)
+        ]
+        for index, owners in enumerate(((0, 1), (1, 2), (2, 0)))
+    ]
+    zsource = key_on_worker("source", 2)
+    zdestination = key_on_worker("destination", 2)
+    with pair(
+        root,
+        "publisher-order",
+        client_mode="single",
+        source_workers=3,
+        source_extra_args=("--replication-publish-queue-mb-per-worker", "1"),
+        source_faults={
+            "LAVIK_REPLICATION_ORDER_HOLD_MS": "6000",
+            "LAVIK_TRACE_REPLICATION_ADMISSION": "1",
+        },
+    ) as (meta, source, target, writer):
+        ready(meta)
+        assert writer.call("ZADD", zsource, 1, "member") == 1
+        assert writer.call("WAIT", 1, 5000) == 1
+        # An oversized admission needs an otherwise empty worker queue. MSET
+        # uses owners 0/1, while ZUNIONSTORE's incomplete key view reserves all
+        # workers despite both of its actual keys belonging to owner 2.
+        payload = "m" * (1024 * 1024)
+        contender = Client(source)
+        overlap_clients = [Client(source) for _ in overlap_keys]
+        reader = Client(target)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                mset = pool.submit(
+                    writer.call, "MSET", keys[0], payload, keys[1], payload
+                )
+                held = "holding the replication order gate"
+                H.wait_until(
+                    "MSET holds the cross-flow order gate",
+                    10,
+                    lambda: held in Path(source.log_path).read_text(),
+                )
+                admitted = (
+                    "replication publisher admission completed for MSET on 2 workers"
+                )
+                log = Path(source.log_path).read_text()
+                # Check the blocked stage itself: the former gate-before-credit
+                # path fails here, without leaving two clients in a deadlock.
+                assert admitted in log, log[-6000:]
+                assert log.index(admitted) < log.index(held)
+                zstore = pool.submit(
+                    contender.call, "ZUNIONSTORE", zdestination, 1, zsource
+                )
+                # Every pair overlaps another on one worker. The held MSET
+                # fills owners 0/1, guaranteeing admission contention while
+                # owner 2 can return tentative grants that must be rolled
+                # back. Disjoint keys isolate publisher arbitration from key
+                # locking, and each request exceeds the one-MiB waterline.
+                overlapping = [
+                    pool.submit(
+                        client.call,
+                        "MSET",
+                        pair_keys[0],
+                        payload,
+                        pair_keys[1],
+                        payload,
+                    )
+                    for client, pair_keys in zip(overlap_clients, overlap_keys)
+                ]
+                assert mset.result(timeout=15) == "OK"
+                assert zstore.result(timeout=15) == 1
+                for pending in overlapping:
+                    assert pending.result(timeout=15) == "OK"
+            assert (
+                "replication publisher admission completed for ZUNIONSTORE on 3 workers"
+                in Path(source.log_path).read_text()
+            )
+            assert writer.call("PING") == "PONG"
+            H.wait_until(
+                "overlapping publisher admissions replicated",
+                20,
+                lambda: reader.call("MGET", *keys) == [payload, payload]
+                and reader.call("ZSCORE", zdestination, "member") == "1"
+                and all(
+                    reader.call("MGET", *pair_keys) == [payload, payload]
+                    for pair_keys in overlap_keys
+                ),
+            )
+            # Successful and retried requests must remove every ordered intent
+            # and return all grants; otherwise a later small owner-local write
+            # can remain blocked even after the large requests completed.
+            tail_keys = [key_on_worker("after-overlap", owner) for owner in range(3)]
+            for key in tail_keys:
+                assert writer.call("SET", key, "ready") == "OK"
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("MGET", *tail_keys) == ["ready"] * 3
+        finally:
+            reader.close()
+            contender.close()
+            for client in overlap_clients:
+                client.close()
+
+
 def copy_fenced_after_wait(root):
     with pair(
         root,
@@ -656,6 +767,8 @@ def main():
     ) as directory:
         basic_and_stale(Path(directory))
         full_and_copy(Path(directory))
+        if C.has_fault(C.DATA, b"LAVIK_TRACE_REPLICATION_ADMISSION"):
+            publisher_admission_precedes_order(Path(directory))
         if C.has_fault(C.DATA, b"LAVIK_COPY_HOLD_FILE"):
             copy_fenced_after_wait(Path(directory))
             copy_hop_fencing(Path(directory), "read")

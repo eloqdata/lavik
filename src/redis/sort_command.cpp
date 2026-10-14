@@ -17,6 +17,7 @@
 #include "sort_command.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cstring>
 #include <limits>
@@ -477,7 +478,7 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
 std::vector<std::string> SortReplicationEffects(
     const CommandRequest& request, std::string_view destination,
     std::span<const std::string> values) {
-  std::vector<CapturedReplicationCommand> effects;
+  CapturedReplicationCommands effects;
   effects.push_back(CapturedReplicationCommand{
       request.db_id_, {"DEL", std::string(destination)}});
   if (!values.empty()) {
@@ -596,6 +597,17 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     g_storage->InitializeTxWrites(txid, writes,
                                   ClusterMutationPrecondition(request));
     writes[destination->owner_].collect_undo_ = true;
+    const std::array expiration_keys{ReplicationExpirationKey{
+        destination_name, destination->owner_, request.db_id_}};
+    status = replication->PrepareFinalExpirations(writes, expiration_keys);
+    if (status.ok()) {
+      status = co_await replication->PrepareCommandArgs(SortReplicationEffects(
+          request, destination_name, product->stored_values_));
+    }
+    if (!status.ok()) {
+      (void)co_await ReleaseSortTransaction(&transaction);
+      co_return Built(AppendSortError(reply_builder, status));
+    }
     auto replaced = co_await ReplaceDestinationLocked(
         request, *destination, product->stored_values_,
         &writes[destination->owner_]);
@@ -638,8 +650,6 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
         (void)co_await ReleaseSortTransaction(&transaction);
         co_return Built(AppendSortError(reply_builder, status));
       }
-      replication->SetCommandArgs(SortReplicationEffects(
-          request, destination_name, product->stored_values_));
       replication->SetFinalExpirations(writes);
       replication->Commit();
     }
@@ -716,6 +726,19 @@ Task<std::string> ExecuteSortCommandLocked(
   if (destination == nullptr) {
     co_return EncodeError("ERR SORT destination is missing");
   }
+  // STORE can copy an arbitrarily large source into its canonical effects.
+  // Admit both effects while the destination is still untouched.
+  std::vector<std::string> remove_effect{"DEL", destination_name};
+  auto prepared = PrepareCapturedReplicationCommand(request, remove_effect);
+  if (!prepared.ok()) co_return EncodeSortError(prepared);
+  std::vector<std::string> push_effect;
+  if (!product->stored_values_.empty()) {
+    push_effect = {"RPUSH", destination_name};
+    push_effect.insert(push_effect.end(), product->stored_values_.begin(),
+                       product->stored_values_.end());
+    prepared = PrepareCapturedReplicationCommand(request, push_effect);
+    if (!prepared.ok()) co_return EncodeSortError(prepared);
+  }
   auto prior = co_await SubmitTaskTo(
       destination->owner_, [db = request.db_id_, name = destination->name_,
                             digest = destination->digest_]() {
@@ -755,12 +778,9 @@ Task<std::string> ExecuteSortCommandLocked(
     co_return EncodeSortError(restored.ok() ? replaced.status() : restored);
   }
   if (*replaced) {
-    CaptureReplicationCommand(request, {"DEL", destination_name});
-    if (!product->stored_values_.empty()) {
-      std::vector<std::string> push{"RPUSH", destination_name};
-      push.insert(push.end(), product->stored_values_.begin(),
-                  product->stored_values_.end());
-      CaptureReplicationCommand(request, std::move(push));
+    CaptureReplicationCommand(request, std::move(remove_effect));
+    if (!push_effect.empty()) {
+      CaptureReplicationCommand(request, std::move(push_effect));
       NotifyListBlockingKey(request, destination_name);
     }
   }

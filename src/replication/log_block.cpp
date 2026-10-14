@@ -56,12 +56,13 @@ std::size_t ReplicationLogBlock::AllocationBytes(std::size_t capacity) {
 }
 
 absl::StatusOr<ReplicationLogBlock> ReplicationLogBlock::Allocate(
-    std::size_t capacity) {
+    std::size_t capacity, bool externally_admitted) {
   const auto bytes = AllocationBytes(capacity);
   if (bytes == std::numeric_limits<std::size_t>::max())
     return absl::ResourceExhaustedError("invalid replication block capacity");
-  auto reservation = TryReserveMemory(bytes);
-  if (!reservation)
+  auto reservation = externally_admitted ? std::optional<MemoryReservation>{}
+                                         : TryReserveMemory(bytes);
+  if (!externally_admitted && !reservation)
     return absl::ResourceExhaustedError(
         "maxmemory cannot allocate a replication block");
   ReplicationLogBlock block;
@@ -70,7 +71,7 @@ absl::StatusOr<ReplicationLogBlock> ReplicationLogBlock::Allocate(
       TryAllocateRetainedBytes(block.bytes_.get_deleter().domain_, capacity,
                                alignof(std::max_align_t))));
   block.capacity_ = capacity;
-  reservation->Release();
+  if (reservation) reservation->Release();
   return block;
 }
 

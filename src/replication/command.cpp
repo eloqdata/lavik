@@ -225,65 +225,156 @@ bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept {
          encoded.substr(0, kTransactionMagic.size()) == kTransactionMagic;
 }
 
-// This is the ownership boundary for the source's header and view table. A
-// single catch keeps allocation failure out of callers without wrapping each
-// vector or string operation separately.
+std::optional<std::size_t> ReplicationCommandPayloadSource::ReservationBytes(
+    std::size_t maximum_argument_count) noexcept {
+  if (maximum_argument_count == 0 || maximum_argument_count > kMaxArgumentCount)
+    return std::nullopt;
+  const auto fixed = ReplicationCommandFixedHeaderBytes(maximum_argument_count);
+  if (maximum_argument_count >
+      (kMaxNativeReplicationEventBytes - fixed) / sizeof(std::uint32_t)) {
+    return std::nullopt;
+  }
+  std::size_t bytes = 0;
+  // libstdc++ may grow a short string from its inline capacity to twice that
+  // capacity even for a smaller reserve request. Cover that first heap block
+  // as well as the requested table so small codecs do not undercharge it.
+  const auto header_capacity =
+      std::max(2 * std::string{}.capacity(),
+               fixed + maximum_argument_count * sizeof(std::uint32_t));
+  const auto add = [&bytes](std::size_t requested) {
+    const auto usable = AllocatorUsableSizeForRequest(requested);
+    if (usable == std::numeric_limits<std::size_t>::max() ||
+        usable > std::numeric_limits<std::size_t>::max() - bytes)
+      return false;
+    bytes += usable;
+    return true;
+  };
+  if (maximum_argument_count >
+          std::numeric_limits<std::size_t>::max() / sizeof(std::string_view) ||
+      !add(sizeof(ReplicationCommandPayloadSource) + 64) ||
+      !add(header_capacity + 1) ||
+      !add(maximum_argument_count * sizeof(std::string_view))) {
+    return std::nullopt;
+  }
+  return bytes;
+}
+
+// Protocol bounds return explicit errors; container exceptions propagate to
+// the caller instead of being reclassified as recoverable encoding failures.
 absl::StatusOr<ReplicationCommandPayloadSource>
-ReplicationCommandPayloadSource::Create(
-    std::uint8_t db_id, std::span<const std::string_view> args) try {
+ReplicationCommandPayloadSource::Prepare(std::size_t maximum_argument_count) {
+  const auto header_bytes = CommandHeaderBytes(maximum_argument_count);
+  if (!header_bytes.ok()) return header_bytes.status();
+  ReplicationCommandPayloadSource source;
+  source.header_.reserve(*header_bytes);
+  source.args_.reserve(maximum_argument_count);
+  source.argument_capacity_ = maximum_argument_count;
+  source.AccountMetadata();
+  return source;
+}
+
+absl::Status ReplicationCommandPayloadSource::Begin(
+    std::uint8_t db_id, std::size_t argument_count) {
   if (db_id >= storage::kLogicalDatabaseCount) {
     return Malformed("replication command database is out of range");
   }
-  const auto header_bytes = CommandHeaderBytes(args.size());
+  const auto header_bytes = CommandHeaderBytes(argument_count);
   if (!header_bytes.ok()) return header_bytes.status();
-
-  ReplicationCommandPayloadSource source;
-  source.header_.reserve(*header_bytes);
-  source.header_.append(kMagic);
-  const bool legacy = args.size() <= kLegacyMaxArgumentCount;
-  source.header_.push_back(
-      static_cast<char>(legacy ? kLegacyVersion : kWideArgumentCountVersion));
-  source.header_.push_back(static_cast<char>(db_id));
-  if (legacy)
-    PutU16(&source.header_, static_cast<std::uint16_t>(args.size()));
-  else
-    PutU32(&source.header_, static_cast<std::uint32_t>(args.size()));
-  source.size_ = *header_bytes;
-  source.args_.reserve(args.size());
-  for (std::string_view arg : args) {
-    if (arg.size() > kMaxArgumentBytes ||
-        arg.size() > std::numeric_limits<std::uint32_t>::max() ||
-        source.size_ > std::numeric_limits<std::uint64_t>::max() - arg.size()) {
-      return Malformed("replication command argument is too large");
-    }
-    if (source.size_ > kMaxNativeReplicationEventBytes - arg.size()) {
-      return absl::ResourceExhaustedError(
-          "replication command exceeds the native event limit");
-    }
-    PutU32(&source.header_, static_cast<std::uint32_t>(arg.size()));
-    source.args_.push_back(arg);
-    source.size_ += arg.size();
+  if (argument_count > argument_capacity_ ||
+      *header_bytes > header_.capacity()) {
+    return absl::FailedPreconditionError(
+        "replication command exceeds its prepared argument capacity");
   }
+  header_.clear();
+  args_.clear();
+  argument_count_ = argument_count;
+  header_.append(kMagic);
+  const bool legacy = argument_count <= kLegacyMaxArgumentCount;
+  header_.push_back(
+      static_cast<char>(legacy ? kLegacyVersion : kWideArgumentCountVersion));
+  header_.push_back(static_cast<char>(db_id));
+  if (legacy)
+    PutU16(&header_, static_cast<std::uint16_t>(argument_count));
+  else
+    PutU32(&header_, static_cast<std::uint32_t>(argument_count));
+  size_ = *header_bytes;
+  return absl::OkStatus();
+}
+
+absl::Status ReplicationCommandPayloadSource::AppendArgument(
+    std::string_view argument) {
+  if (args_.size() >= argument_count_) {
+    return absl::FailedPreconditionError(
+        "replication command argument count exceeds the prepared encoding");
+  }
+  if (argument.size() > kMaxArgumentBytes ||
+      argument.size() > std::numeric_limits<std::uint32_t>::max()) {
+    return Malformed("replication command argument is too large");
+  }
+  if (size_ > kMaxNativeReplicationEventBytes - argument.size()) {
+    return absl::ResourceExhaustedError(
+        "replication command exceeds the native event limit");
+  }
+  PutU32(&header_, static_cast<std::uint32_t>(argument.size()));
+  args_.push_back(argument);
+  size_ += argument.size();
+  return absl::OkStatus();
+}
+
+absl::Status ReplicationCommandPayloadSource::AppendArguments(
+    std::span<const std::string> arguments) {
+  for (const auto& argument : arguments) {
+    auto status = AppendArgument(argument);
+    if (!status.ok()) return status;
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ReplicationCommandPayloadSource::AppendArguments(
+    std::span<const std::string_view> arguments) {
+  for (const auto argument : arguments) {
+    auto status = AppendArgument(argument);
+    if (!status.ok()) return status;
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<ReplicationCommandPayloadSource>
+ReplicationCommandPayloadSource::Create(
+    std::uint8_t db_id, std::span<const std::string_view> args) {
+  auto source = Prepare(args.size());
+  if (!source.ok()) return source.status();
+  if (auto status = source->Begin(db_id, args.size()); !status.ok())
+    return status;
+  if (auto status = source->AppendArguments(args); !status.ok()) return status;
   return source;
-} catch (const std::length_error&) {
-  return absl::ResourceExhaustedError("replication command is too large");
 }
 
 absl::StatusOr<ReplicationCommandPayloadSource>
 ReplicationCommandPayloadSource::Create(std::uint8_t db_id,
-                                        std::span<const std::string> args) try {
-  const auto header_bytes = CommandHeaderBytes(args.size());
-  if (!header_bytes.ok()) return header_bytes.status();
-  std::vector<std::string_view> views;
-  views.reserve(args.size());
-  for (const std::string& arg : args) views.push_back(arg);
-  return Create(db_id, views);
-} catch (const std::length_error&) {
-  return absl::ResourceExhaustedError("replication command is too large");
+                                        std::span<const std::string> args) {
+  auto source = Prepare(args.size());
+  if (!source.ok()) return source.status();
+  if (auto status = source->Begin(db_id, args.size()); !status.ok())
+    return status;
+  if (auto status = source->AppendArguments(args); !status.ok()) return status;
+  return source;
+}
+
+void ReplicationCommandPayloadSource::AccountMetadata() {
+  std::size_t bytes = AllocatorUsableSizeForRequest(args_.capacity() *
+                                                    sizeof(std::string_view));
+  if (header_.capacity() > std::string{}.capacity())
+    bytes += AllocatorUsableSizeForRequest(header_.capacity() + 1);
+  metadata_charge_.Account(CurrentMemoryAccountingShard(), bytes);
 }
 
 bycorf::Task<absl::Status> ReplicationCommandPayloadSource::Read(
     std::uint64_t offset, std::span<std::byte> output) {
+  if (!complete()) {
+    co_return absl::FailedPreconditionError(
+        "replication command source is incomplete");
+  }
   if (offset > size_ || output.size() > size_ - offset) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "replication command source read is out of range");
@@ -302,11 +393,10 @@ bycorf::Task<absl::Status> ReplicationCommandPayloadSource::Read(
   co_return absl::OkStatus();
 }
 
-// Argument views point into the disposable frame, so decoding must create all
-// owned strings here. Treat the complete decode as one fallible allocation
-// boundary instead of checking each argument copy independently.
+// Argument views point into the disposable frame, so decoding validates the
+// complete length table before creating the owned argument strings.
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
-    std::string_view encoded) try {
+    std::string_view encoded) {
   if (encoded.size() > kMaxNativeReplicationEventBytes) {
     return absl::ResourceExhaustedError(
         "replication command exceeds the native event limit");
@@ -365,8 +455,6 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     offset += length;
   }
   return command;
-} catch (const std::length_error&) {
-  return absl::ResourceExhaustedError("replication command is too large");
 }
 
 bool IsPublishOnlyReplicationCommand(

@@ -2456,18 +2456,8 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     }
   }
 
-  // Replication's in-memory backlog owns a separately replenished standby.
-  // Shutdown prevents new refills, then joins an in-flight allocation before
-  // releasing the unused 8 MiB owner.
-  for (;;) {
-    co_await store->replication_log_.mutex_.Lock();
-    const bool pending = store->replication_log_.standby_refill_pending_;
-    store->replication_log_.mutex_.Unlock(*store->worker_);
-    if (!pending) break;
-    absl::Status status = co_await bycorf::SleepFor(
-        *store->worker_, std::chrono::milliseconds(1));
-    if (!status.ok()) co_return status;
-  }
+  // No detached replication allocator remains: subsequent backlog blocks are
+  // allocated by the publisher on demand. Release an unused initial block.
   co_await store->replication_log_.mutex_.Lock();
   store->replication_log_.standby_block_.reset();
   store->replication_log_.mutex_.Unlock(*store->worker_);
