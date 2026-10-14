@@ -492,16 +492,24 @@ It excludes unrelated operation/archive payloads, Policy history, and audit.
 Selected whole operations preserve cross-recipient source authorization and
 its exact receipt identity.
 
-Admin queries, preflight and effect checks capture their required committed
-records without retaining the aggregate. Group checks join topology, authority,
+Admin handlers acknowledging one typed mutation use the exact committed apply
+verdict carried by its proposal completion. Later changes, archival, or pruning
+cannot turn that accepted mutation into a rejection. Workflow entry points have
+additional contracts: Cluster Create verifies its immutable Genesis binding,
+controlled failover verifies its operation identity, and membership
+administration waits for its durable workflow to complete.
+
+Admin queries and preflight capture their required committed records without
+retaining the aggregate. Group checks join topology, authority,
 lifecycle and epoch in one cut; operation status joins the selected journal
 record with its controlled transition. Creation reads lifecycle, the Meta
 directory and admission predicates. Membership retains the selected in-flight
 operation, or the identity domain needed to preserve principal reservations
 and endpoint uniqueness when admitting a new workflow. Manual promotion uses
 its Group and the complete compact observation-facts domain, sharing typed
-failover validation with proposal admission. Every post-proposal check obtains
-a new cut; these reads retain their existing non-linearizable Admin semantics.
+failover validation with proposal admission. Workflow status reads obtain a new
+cut to observe progress. The `getop` and `getnode` diagnostic reads remain
+non-linearizable.
 
 Audit export retains the immutable paged audit cut; operation export retains
 only archive summaries and receipts in operation-id order. Encoding happens
@@ -1553,7 +1561,7 @@ audit history rather than replacing it.
 | Registered typed durable Policy families, strict raw JSON admission/history, and current-value accessors | `include/lavik/meta/policy_store.h`, `src/meta/policy_store.cpp`, `tests/meta_stores_test.cpp` |
 | Pure Owner Serviceability cut, causal lease confirmation, leader-local detector state, automatic Begin adapter, and generation-bracketed diagnostics | `include/lavik/meta/owner_serviceability.h`, `src/meta/owner_serviceability.cpp`, `include/lavik/meta/automatic_failover_detector.h`, `src/meta/automatic_failover_detector.cpp`, `include/lavik/meta/automatic_failover_reconciler.h`, `src/meta/automatic_failover_reconciler.cpp` |
 | Volatile candidate/failover observations and deterministic compatibility-domain plan selection | `include/lavik/meta/observation_store.h`, `src/meta/observation_store.cpp`, `include/lavik/meta/candidate_plan.h`, `src/meta/candidate_plan.cpp` |
-| Owned Admin preflight/effect checks and archive-only export captures | `include/lavik/meta/admin_views.h`, `src/meta/admin_views.cpp`, `src/meta/ctl_server.cpp`, `src/meta/operation_store.cpp` |
+| Admin apply-result replies, owned preflight/status reads, and archive-only export captures | `include/lavik/meta/admin_views.h`, `src/meta/admin_views.cpp`, `src/meta/ctl_server.cpp`, `src/meta/coordinator.cpp`, `src/meta/operation_store.cpp` |
 | Owned observation-facts cuts, index-only captures, and atomic subscription registration | `include/lavik/meta/observation_facts_view.h`, `src/meta/observation_facts_view.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |
 | Owned failover discovery and per-target planning, compact automatic detection and conditional trigger cuts | `include/lavik/meta/failover_views.h`, `src/meta/failover_views.cpp`, `src/meta/topology_store.cpp`, `src/meta/failover_reconciler.cpp`, `src/meta/automatic_failover_reconciler.cpp` |
 | Command-specific proposal cuts, live-operation headers, and the same-cut full recovery exception | `include/lavik/meta/proposal_view.h`, `src/meta/proposal_view.cpp`, `src/meta/operation_store.cpp`, `src/meta/state_machine.cpp`, `src/meta/coordinator.cpp` |

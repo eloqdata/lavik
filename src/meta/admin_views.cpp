@@ -3,8 +3,6 @@
 
 #include "lavik/meta/admin_views.h"
 
-#include <algorithm>
-
 #include "lavik/meta/failover.h"
 #include "lavik/meta/state_machine.h"
 
@@ -15,12 +13,6 @@ bool IsTerminal(MetaOperationLifecycle lifecycle) {
          lifecycle == MetaOperationLifecycle::kAborted;
 }
 }  // namespace
-
-std::optional<std::string_view> MetaSlotMapCheckView::SlotOwner(
-    std::uint32_t slot) const {
-  if (slot >= slots_.size() || slots_[slot].empty()) return std::nullopt;
-  return slots_[slot];
-}
 
 MetaAdminGroupView MetaStateMachine::CaptureAdminGroup(
     const std::string& group_id) const {
@@ -98,15 +90,6 @@ MetaPromoteView MetaStateMachine::CapturePromote(
   return result;
 }
 
-MetaSlotMapCheckView MetaStateMachine::CaptureSlotMapCheck(
-    const std::string& group_id) const {
-  std::lock_guard lock(mutex_);
-  return {{last_committed_idx_.load(), last_state_change_idx_.load()},
-          stores_.topology_.TopologyEpoch(),
-          stores_.topology_.GroupExists(group_id),
-          stores_.topology_.SlotOwners()};
-}
-
 MetaCurrentPolicyView MetaStateMachine::CaptureCurrentPolicy(
     const std::string& policy_id) const {
   std::lock_guard lock(mutex_);
@@ -120,25 +103,6 @@ MetaCurrentPolicyView MetaStateMachine::CaptureCurrentPolicy(
 std::uint64_t MetaStateMachine::TopologyEpoch() const {
   std::lock_guard lock(mutex_);
   return stores_.topology_.TopologyEpoch();
-}
-
-bool MetaStateMachine::GroupExists(const std::string& group_id) const {
-  std::lock_guard lock(mutex_);
-  return stores_.topology_.GroupExists(group_id);
-}
-
-std::optional<std::uint64_t> MetaStateMachine::CurrentGroupTerm(
-    const std::string& group_id) const {
-  std::lock_guard lock(mutex_);
-  return stores_.topology_.CurrentGroupTerm(group_id);
-}
-
-bool MetaStateMachine::ArchivedOperationsExist(
-    std::span<const std::uint64_t> seqs) const {
-  std::lock_guard lock(mutex_);
-  return std::all_of(seqs.begin(), seqs.end(), [&](auto seq) {
-    return stores_.operation_.ArchivedSequenceExists(seq);
-  });
 }
 
 MetaAuditStatus MetaStateMachine::AuditStatus() const {

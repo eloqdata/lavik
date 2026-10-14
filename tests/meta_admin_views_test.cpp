@@ -1,7 +1,6 @@
 /* Copyright (C) 2026 EloqData Inc.
  * SPDX-License-Identifier: Apache-2.0 */
 
-#include <array>
 #include <atomic>
 #include <thread>
 
@@ -42,29 +41,17 @@ class MetaAdminViewsTest : public testing::Test {
   std::unique_ptr<MetaStateMachine> machine_;
 };
 
-TEST_F(MetaAdminViewsTest, GroupAndAbsoluteSlotsOwnTheirCutAcrossInstall) {
+TEST_F(MetaAdminViewsTest, GroupOwnsItsCutAcrossInstall) {
   Group("selected");
   Group("other");
-  SetSlotMap slots;
-  slots.new_topology_epoch_ = 3;
-  slots.ranges_ = {{3, 7, "selected"}, {10, 12, "other"}};
-  ASSERT_TRUE(stores_.topology_.Apply(slots).ok());
   Install();
   const auto group = machine_->CaptureAdminGroup("selected");
-  const auto map = machine_->CaptureSlotMapCheck("selected");
   EXPECT_EQ(group.group_, stores_.topology_.FindGroup("selected"));
   EXPECT_EQ(group.authority_, stores_.topology_.AuthorityFor("selected"));
   EXPECT_EQ(group.lifecycle_, stores_.topology_.ClusterLifecycle());
-  EXPECT_EQ(group.topology_epoch_, 3);
+  EXPECT_EQ(group.topology_epoch_, 2);
   EXPECT_EQ(group.cursor_.applied_index(), 10);
   EXPECT_EQ(group.cursor_.state_change_index(), 10);
-  EXPECT_TRUE(map.group_exists_);
-  for (std::uint32_t i = 0; i <= kMetaSlotCount; ++i) {
-    const auto expected = stores_.topology_.SlotOwner(i);
-    const auto actual = map.SlotOwner(i);
-    EXPECT_EQ(actual.has_value(), expected.has_value());
-    if (actual && expected) EXPECT_EQ(*actual, *expected);
-  }
   machine_->Advance(11);
   const auto advanced = machine_->CaptureAdminGroup("selected");
   EXPECT_EQ(advanced.cursor_.applied_index(), 11);
@@ -72,11 +59,9 @@ TEST_F(MetaAdminViewsTest, GroupAndAbsoluteSlotsOwnTheirCutAcrossInstall) {
   stores_ = MetaStores();
   Install(12);
   EXPECT_FALSE(machine_->CaptureAdminGroup("selected").group_);
-  EXPECT_FALSE(machine_->CaptureSlotMapCheck("selected").group_exists_);
   machine_.reset();
   ASSERT_TRUE(group.group_);
   EXPECT_EQ(group.group_->group_id_, "selected");
-  EXPECT_EQ(map.SlotOwner(11), std::optional<std::string_view>("other"));
 }
 
 TEST_F(MetaAdminViewsTest, GroupAuthorityAndIndexStayPairedDuringCommits) {
@@ -109,8 +94,10 @@ TEST_F(MetaAdminViewsTest, GroupAuthorityAndIndexStayPairedDuringCommits) {
     }
   } while (!done.load());
   writer.join();
-  EXPECT_EQ(machine_->CurrentGroupTerm("g"), 100);
-  EXPECT_FALSE(machine_->CurrentGroupTerm("missing"));
+  const auto final = machine_->CaptureAdminGroup("g");
+  ASSERT_TRUE(final.group_);
+  EXPECT_EQ(final.group_->record_.group_term_, 100);
+  EXPECT_FALSE(machine_->CaptureAdminGroup("missing").group_);
 }
 
 TEST_F(MetaAdminViewsTest, OperationAndArchiveCutsRetainExactIdOrderAndBytes) {
@@ -140,14 +127,13 @@ TEST_F(MetaAdminViewsTest, OperationAndArchiveCutsRetainExactIdOrderAndBytes) {
   EXPECT_EQ(exported.summaries_[1].operation_seq_, 1);
   EXPECT_EQ(exported.Encode(), stores_.operation_.ExportArchive());
   EXPECT_FALSE(machine_->CaptureOperationStatus(selected).operation_);
-  EXPECT_TRUE(machine_->ArchivedOperationsExist(archive.operation_seqs_));
-  const std::array<std::uint64_t, 2> partly_live{1, 3};
-  EXPECT_FALSE(machine_->ArchivedOperationsExist(partly_live));
   PruneOperationArchive prune;
   prune.operation_seqs_ = {1};
   ASSERT_TRUE(stores_.operation_.PruneArchive(prune).ok());
   Install(12);
-  EXPECT_FALSE(machine_->ArchivedOperationsExist(archive.operation_seqs_));
+  const auto pruned = machine_->CaptureOperationArchiveExport();
+  ASSERT_EQ(pruned.summaries_.size(), 1);
+  EXPECT_EQ(pruned.summaries_[0].operation_seq_, 2);
   machine_.reset();
   ASSERT_TRUE(exported.Encode().ok());
   EXPECT_EQ(DecodeMetaOperationArchiveExport(*exported.Encode())->summaries_,

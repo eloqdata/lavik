@@ -35,10 +35,11 @@
 //   submitop <id32hex> <kind> <payload> [<history40hex>]
 //                          -> propose SubmitOperation (intent = payload,
 //                             intent_hash = SHA-256(payload)): "OK <log_idx>"
-//                             once committed AND the effect verified in the
-//                             local committed state; "ERR rejected" when
-//                             apply consumed the index but refused the
-//                             command; "ERR not-leader" on a follower;
+//                             once that entry's committed apply verdict is
+//                             accepted. Later changes or pruning cannot change
+//                             this result. "ERR rejected" means apply consumed
+//                             the index but refused the command;
+//                             "ERR not-leader" on a follower;
 //                             otherwise "ERR <code>" (replication timeout is
 //                             Raft's client_req_timeout_).
 //   completeop <id32hex> [<result>]
@@ -52,7 +53,7 @@
 //                             tiny and below max_active_operations.
 //   abortop <id32hex> [<reason>]
 //                          -> propose AbortOperation with the same committed
-//                             revision/CAS and effect-verification rules.
+//                             revision/CAS and committed-verdict rules.
 //                             Empty result/reason forms are the zero-growth
 //                             terminalization step admitted by the durability
 //                             fail-safe before archival.

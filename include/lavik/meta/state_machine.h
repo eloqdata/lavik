@@ -127,16 +127,9 @@ class MetaStateMachine {
   MetaCreatePreflightView CaptureCreatePreflight() const;
   MetaMembershipAdminView CaptureMembershipAdmin() const;
   MetaPromoteView CapturePromote(const std::string& group_id) const;
-  MetaSlotMapCheckView CaptureSlotMapCheck(const std::string& group_id) const;
   MetaCurrentPolicyView CaptureCurrentPolicy(
       const std::string& policy_id) const;
   std::uint64_t TopologyEpoch() const;
-  bool GroupExists(const std::string& group_id) const;
-  std::optional<std::uint64_t> CurrentGroupTerm(
-      const std::string& group_id) const;
-  // Checks the complete requested sequence set in one cut without copying
-  // archived receipts. Concurrent pruning is reflected by a fresh check.
-  bool ArchivedOperationsExist(std::span<const std::uint64_t> seqs) const;
   MetaAuditStatus AuditStatus() const;
   // Capture only the export domain. All encoding runs outside the state lock.
   MetaAuditStore CaptureAuditExport() const;
