@@ -2892,6 +2892,63 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
+  bycorf::Task<absl::Status> ExercisePublishedWideArgumentCommand() {
+    constexpr std::uint8_t kDb = 4;
+    constexpr std::size_t kArgumentCount = 65'536;
+    const std::string key = "journal-wide-set";
+    absl::Status status = co_await storage_->EnableReplicationLog(28, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    const auto initial = storage_->LocalReplicationLogInfo();
+
+    // Cross the legacy u16 argc boundary through a real committed mutation.
+    // Repeated members keep the dataset small; the distinct final member also
+    // exposes truncation of the command tail during publication or replay.
+    std::vector<std::string> args(kArgumentCount, "x");
+    args[0] = "SADD";
+    args[1] = key;
+    args.back() = "y";
+    status = co_await ExecuteClientCommand(kDb, args, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(kDb, {"SCARD", key}, ":2\r\n");
+    if (!status.ok()) co_return status;
+
+    auto fence = co_await storage_->FenceReplicationLog();
+    if (!fence.ok()) co_return fence.status();
+    const auto published = storage_->LocalReplicationLogInfo();
+    Check(*fence == 2 && published.state_ == ReplicationLogState::kActive &&
+              published.log_epoch_ == initial.log_epoch_ &&
+              published.tail_lsn_ == 1,
+          "wide-argument SADD invalidated history after committing its data");
+
+    ReplicationLogCursor cursor;
+    std::string encoded;
+    do {
+      auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+      if (!batch.ok()) co_return batch.status();
+      Check(batch->frames_.size() == 1 &&
+                batch->frames_.front().header_.lsn_ == 1,
+            "wide-argument SADD did not retain one complete logical event");
+      encoded.append(batch->frames_.front().payload_);
+      cursor = batch->next_;
+    } while (cursor.lsn_ == 1);
+    auto command = lavik::DecodeReplicationCommand(encoded);
+    if (!command.ok()) co_return command.status();
+    Check(command->db_id_ == kDb && ReplicatedEffectAt(*command, 0) == args,
+          "wide-argument SADD lost arguments in the replication log");
+
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    auto removed = co_await storage_->Delete(kDb, key);
+    if (!removed.ok()) co_return removed.status();
+    Check(*removed, "wide-argument SADD did not create its source key");
+    status = co_await lavik::ApplyReplicatedCommand(*command);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(kDb, {"SCARD", key}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    co_return co_await ExecuteClientCommand(kDb, {"SMISMEMBER", key, "x", "y"},
+                                            "*2\r\n:1\r\n:1\r\n");
+  }
+
   bycorf::Task<absl::Status> ExerciseFullSyncDuringTombstoneReaping() {
     constexpr std::uint8_t kDb = 9;
     constexpr std::uint64_t kSession = 0x534852494e4b;
@@ -3539,6 +3596,9 @@ class ReplicationLogService final : public bycorf::Service {
     if (!status.ok()) co_return status;
 
     status = co_await ExercisePublishedCollectionCommands();
+    if (!status.ok()) co_return status;
+
+    status = co_await ExercisePublishedWideArgumentCommand();
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseFlushControlBarriers();

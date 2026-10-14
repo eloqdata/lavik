@@ -18,8 +18,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +46,19 @@ class CaptureMemoryScope {
  private:
   unsigned previous_;
 };
+
+std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
+  std::string encoded(source.size(), '\0');
+  auto task = source.Read(0, std::as_writable_bytes(std::span(encoded)));
+  // This in-memory source never suspends. Detect any future asynchronous
+  // dependency instead of resuming a coroutine owned by another operation.
+  auto handle = std::move(task).ReleaseHandle();
+  handle.resume();
+  EXPECT_TRUE(handle.done());
+  if (handle.done()) EXPECT_TRUE(handle.promise().value_.ok());
+  handle.destroy();
+  return encoded;
+}
 
 TEST(ReplicationCommandTest, PreparedCaptureChargeFollowsMovedEffects) {
   CaptureMemoryScope memory;
@@ -264,26 +279,105 @@ TEST(ReplicationCommandTest, TransactionEnvelopeRoundTripsCanonicalBitmap) {
   EXPECT_FALSE(lavik::DecodeReplicationTransactionEnvelope(noncanonical).ok());
 }
 
-TEST(ReplicationCommandTest, AcceptsFullWireArgumentCount) {
+TEST(ReplicationCommandTest, SmallCommandsKeepLegacyWireEncoding) {
+  std::vector<std::string_view> args{"SET", "key", "value"};
+  auto source = lavik::ReplicationCommandPayloadSource::Create(15, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+
+  std::string encoded("LRC1\x01\x0f\x03\0", 8);
+  encoded.append("\x03\0\0\0\x03\0\0\0\x05\0\0\0", 12);
+  encoded.append("SETkeyvalue");
+  EXPECT_EQ(ReadCommandSource(*source), encoded);
+  auto decoded = lavik::DecodeReplicationCommand(encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->db_id_, 15);
+  EXPECT_EQ(decoded->args_, (std::vector<std::string>{"SET", "key", "value"}));
+}
+
+TEST(ReplicationCommandTest, LegacyArgumentBoundaryKeepsLegacyWireEncoding) {
   constexpr auto count = std::numeric_limits<std::uint16_t>::max();
   std::vector<std::string_view> args(count, "x");
   auto source = lavik::ReplicationCommandPayloadSource::Create(15, args);
   ASSERT_TRUE(source.ok()) << source.status();
   EXPECT_EQ(source->size(), 8U + 5U * count);
 
-  // Independent wire construction also covers the receiver limit: every
+  // Independent wire construction also covers the legacy count boundary: every
   // argument has one payload byte and a little-endian uint32 length.
   std::string encoded("LRC1\x01\x0f\xff\xff", 8);
   for (std::size_t i = 0; i < count; ++i) encoded.append("\x01\0\0\0", 4);
   encoded.append(count, 'x');
+  EXPECT_EQ(ReadCommandSource(*source), encoded);
   auto decoded = lavik::DecodeReplicationCommand(encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(decoded->db_id_, 15);
   EXPECT_EQ(decoded->args_, std::vector<std::string>(count, "x"));
-  args.push_back("overflow");
-  EXPECT_FALSE(lavik::ReplicationCommandPayloadSource::Create(0, args).ok());
   encoded.resize(8);
   EXPECT_FALSE(lavik::DecodeReplicationCommand(encoded).ok());
+}
+
+TEST(ReplicationCommandTest, WideArgumentCountRoundTrips) {
+  constexpr std::size_t count = 65536;
+  std::vector<std::string> args(count, "x");
+  auto source = lavik::ReplicationCommandPayloadSource::Create(15, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+  EXPECT_EQ(source->size(), 10U + 5U * count);
+
+  // The independently constructed count crosses both legacy count bytes.
+  std::string expected("LRC1\x02\x0f\0\0\x01\0", 10);
+  for (std::size_t i = 0; i < count; ++i) expected.append("\x01\0\0\0", 4);
+  expected.append(count, 'x');
+  const auto encoded = ReadCommandSource(*source);
+  EXPECT_EQ(encoded, expected);
+  auto decoded = lavik::DecodeReplicationCommand(encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->db_id_, 15);
+  EXPECT_EQ(decoded->args_, args);
+}
+
+TEST(ReplicationCommandTest, DecodesIndependentWideFormatWithSmallCount) {
+  // Readers accept V2 independently of the writer's small-command V1 choice.
+  std::string encoded("LRC1\x02\x0f\x02\0\0\0", 10);
+  encoded.append("\x03\0\0\0\x03\0\0\0", 8);
+  encoded.append("DELkey");
+  auto decoded = lavik::DecodeReplicationCommand(encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->db_id_, 15);
+  EXPECT_EQ(decoded->args_, (std::vector<std::string>{"DEL", "key"}));
+}
+
+TEST(ReplicationCommandTest, RejectsMalformedWideFormat) {
+  std::string valid("LRC1\x02\x0f\x02\0\0\0", 10);
+  valid.append("\x03\0\0\0\x03\0\0\0", 8);
+  valid.append("DELkey");
+  // Exercise every truncation boundary, including the four-byte count,
+  // length table and argument payload, before testing complete corruptions.
+  for (std::size_t size = 0; size < valid.size(); ++size) {
+    SCOPED_TRACE(size);
+    EXPECT_EQ(
+        lavik::DecodeReplicationCommand(valid.substr(0, size)).status().code(),
+        absl::StatusCode::kInvalidArgument);
+  }
+
+  const std::vector<std::string> invalid_counts{
+      std::string("LRC1\x02\0\0\0\0\0", 10),
+      std::string("LRC1\x02\0\0\0\0\x80", 10),
+      std::string("LRC1\x02\0\xff\xff\xff\xff", 10)};
+  for (const auto& encoded : invalid_counts) {
+    const auto decoded = lavik::DecodeReplicationCommand(encoded);
+    EXPECT_EQ(decoded.status().code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_EQ(decoded.status().message(),
+              "replication command argument count is out of range");
+  }
+  auto unsupported_version = valid;
+  unsupported_version[4] = 3;
+  EXPECT_FALSE(lavik::DecodeReplicationCommand(unsupported_version).ok());
+  auto invalid_db = valid;
+  invalid_db[5] = 16;
+  EXPECT_FALSE(lavik::DecodeReplicationCommand(invalid_db).ok());
+  auto oversized_argument = valid;
+  oversized_argument.replace(10, 4, "\x01\0\0\x40", 4);
+  EXPECT_FALSE(lavik::DecodeReplicationCommand(oversized_argument).ok());
+  EXPECT_FALSE(lavik::DecodeReplicationCommand(valid + "extra").ok());
 }
 
 TEST(ReplicationCommandTest, EnforcesCompleteEncodingLimit) {
@@ -300,6 +394,27 @@ TEST(ReplicationCommandTest, EnforcesCompleteEncodingLimit) {
   auto oversized = lavik::ReplicationCommandPayloadSource::Create(0, args);
 
   EXPECT_FALSE(oversized.ok());
+  EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
+}
+
+TEST(ReplicationCommandTest, EnforcesCompleteWideEncodingLimit) {
+  constexpr std::size_t count = 65536;
+  constexpr std::size_t payload_bytes = 16 * 1024;
+  constexpr std::size_t header_bytes = 10 + count * sizeof(std::uint32_t);
+  const std::string payload(payload_bytes, 'x');
+  std::vector<std::string_view> args(count, payload);
+  // Reuse one payload to test the 1 GiB accounting boundary without owning
+  // that much memory. Leave exactly the widened header's worth of headroom.
+  for (std::size_t i = 0; i < header_bytes / payload_bytes; ++i) args[i] = {};
+  args[header_bytes / payload_bytes] =
+      std::string_view(payload).substr(header_bytes % payload_bytes);
+  auto exact = lavik::ReplicationCommandPayloadSource::Create(0, args);
+  ASSERT_TRUE(exact.ok()) << exact.status();
+  EXPECT_EQ(exact->size(), lavik::kMaxNativeReplicationEventBytes);
+
+  args[header_bytes / payload_bytes] =
+      std::string_view(payload).substr(header_bytes % payload_bytes - 1);
+  auto oversized = lavik::ReplicationCommandPayloadSource::Create(0, args);
   EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
 }
 
