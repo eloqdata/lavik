@@ -33,10 +33,15 @@ namespace lavik::meta {
 class MetaCommittedFacts;
 class MetaProposalView;
 class MetaObservationStore;
+struct MetaOperationRecord;
 
 inline constexpr std::string_view kFailoverOperationKind = "failover";
 inline constexpr std::string_view kFailoverCompletedResult =
     "failover-completed";
+
+// Checks the untouched submitted failover journal shape. Admission and apply
+// still validate the decoded intent and the Group/transition anchors.
+bool IsPristineSubmittedFailoverOperation(const MetaOperationRecord& operation);
 
 // Durable operator request stored in MetaOperationRecord. The Group's
 // failover transition owns the durable election and Candidate Action state;

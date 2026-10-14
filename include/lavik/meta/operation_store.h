@@ -106,6 +106,13 @@ enum class MetaOperationLifecycle : std::uint8_t {
   kAborted = 4,    // terminal
 };
 
+// Terminal operations retain their record until archival but cannot become
+// active again.
+constexpr bool IsTerminal(MetaOperationLifecycle lifecycle) noexcept {
+  return lifecycle == MetaOperationLifecycle::kCompleted ||
+         lifecycle == MetaOperationLifecycle::kAborted;
+}
+
 struct MetaCurrentDirective {
   MetaDirectiveSpec spec_;
   std::uint64_t directive_revision_ = 0;  // transition Raft apply index

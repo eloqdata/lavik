@@ -145,11 +145,6 @@ absl::StatusOr<control::WireMetaEndpoint> ParseMetaEndpoint(
   };
 }
 
-bool IsTerminal(MetaOperationLifecycle lifecycle) {
-  return lifecycle == MetaOperationLifecycle::kCompleted ||
-         lifecycle == MetaOperationLifecycle::kAborted;
-}
-
 std::int64_t NowUnixMillis() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::system_clock::now().time_since_epoch())
@@ -1734,8 +1729,7 @@ bool ActiveClusterCreateDeclaresNode(const MetaDataPublicationView& view,
   const auto operation = view.FindOperation(lifecycle.root_operation_id_);
   if (operation == nullptr ||
       operation->kind_ != kMetaClusterCreateOperationKind ||
-      operation->lifecycle_ == MetaOperationLifecycle::kCompleted ||
-      operation->lifecycle_ == MetaOperationLifecycle::kAborted) {
+      IsTerminal(operation->lifecycle_)) {
     return false;
   }
   MetaOperationId intent_root{};

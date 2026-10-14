@@ -32,6 +32,7 @@
 #include "lavik/meta/coordinator.h"
 #include "lavik/meta/encoding.h"
 #include "lavik/meta/hash.h"
+#include "lavik/meta/operation_store.h"
 
 namespace lavik::meta {
 namespace {
@@ -270,6 +271,17 @@ absl::Status ValidateCommitProposal(
 }
 
 }  // namespace
+
+bool IsPristineSubmittedFailoverOperation(
+    const MetaOperationRecord& operation) {
+  return operation.kind_ == kFailoverOperationKind &&
+         operation.lifecycle_ == MetaOperationLifecycle::kSubmitted &&
+         operation.revision_ == 0 && operation.kind_phase_blob_.empty() &&
+         operation.current_directives_.empty() &&
+         operation.terminal_receipts_.empty() &&
+         IsZero(operation.replication_history_id_) &&
+         operation.intent_hash_ == MetaSha256(operation.intent_);
+}
 
 absl::Status ValidateFailoverOperationIntent(
     const FailoverOperationIntent& intent) {

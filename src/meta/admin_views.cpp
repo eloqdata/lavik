@@ -7,13 +7,6 @@
 #include "lavik/meta/state_machine.h"
 
 namespace lavik::meta {
-namespace {
-bool IsTerminal(MetaOperationLifecycle lifecycle) {
-  return lifecycle == MetaOperationLifecycle::kCompleted ||
-         lifecycle == MetaOperationLifecycle::kAborted;
-}
-}  // namespace
-
 MetaAdminGroupView MetaStateMachine::CaptureAdminGroup(
     const std::string& group_id) const {
   std::lock_guard lock(mutex_);

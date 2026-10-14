@@ -56,11 +56,6 @@ bool IsZero(const std::array<std::uint8_t, N>& value) {
                              [](std::uint8_t byte) { return byte == 0; });
 }
 
-bool Terminal(MetaOperationLifecycle lifecycle) {
-  return lifecycle == MetaOperationLifecycle::kCompleted ||
-         lifecycle == MetaOperationLifecycle::kAborted;
-}
-
 bool WarmupComplete(const MetaFailoverPlannerContext& context) {
   if (context.observation_grace_ms_ == 0) return true;
   if (context.leadership_started_unix_ms_ >
@@ -468,7 +463,7 @@ absl::StatusOr<std::optional<MetaCommand>> PlanControlledTransition(
         "controlled failover transition is incomplete");
   }
   const auto& operation = view.operation_;
-  if (!operation.has_value() || Terminal(operation->lifecycle_)) {
+  if (!operation.has_value() || IsTerminal(operation->lifecycle_)) {
     return absl::FailedPreconditionError(
         "controlled failover operation is unavailable");
   }

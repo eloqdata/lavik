@@ -1063,11 +1063,6 @@ const char* LifecycleName(MetaOperationLifecycle lifecycle) {
   return "unknown";
 }
 
-bool IsTerminal(MetaOperationLifecycle lifecycle) {
-  return lifecycle == MetaOperationLifecycle::kCompleted ||
-         lifecycle == MetaOperationLifecycle::kAborted;
-}
-
 const char* RoleName(MetaNodeRole role) {
   return role == MetaNodeRole::kPrimary ? "primary" : "replica";
 }

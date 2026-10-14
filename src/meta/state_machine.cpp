@@ -436,8 +436,7 @@ MetaMembershipDiscovery MetaStateMachine::CaptureMembershipDiscovery() const {
     // LiveOperations.
     for (const auto& operation : stores_.operation_.LiveOperationsView()) {
       if (operation.kind_ == kMetaMembershipOperationKind &&
-          operation.lifecycle_ != MetaOperationLifecycle::kCompleted &&
-          operation.lifecycle_ != MetaOperationLifecycle::kAborted) {
+          !IsTerminal(operation.lifecycle_)) {
         view.operation_ = operation;
         break;
       }
