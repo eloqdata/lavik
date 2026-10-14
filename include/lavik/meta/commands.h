@@ -367,8 +367,7 @@ struct SetGroupReplicationState {
 // ---------------------------------------------------------------------------
 // GroupRecord: per-group committed record. replication_history_id is
 // deliberately absent because it is scoped to a data-plane boot and does not
-// enter the committed group record. The versioned record codec is defined here
-// (u16 schema_version envelope, same convention as commands).
+// enter the committed group record. MetaTopologyStore owns its snapshot layout.
 // ---------------------------------------------------------------------------
 
 struct MetaGroupRecord {
@@ -382,10 +381,6 @@ struct MetaGroupRecord {
   std::uint64_t partition_replication_epoch_ = 0;
   bool operator==(const MetaGroupRecord&) const = default;
 };
-
-absl::StatusOr<std::string> EncodeMetaGroupRecord(
-    const MetaGroupRecord& record);
-absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes);
 
 // ---------------------------------------------------------------------------
 // term/grant: BeginGroupTerm(T) raises group_term exactly once and enters the
