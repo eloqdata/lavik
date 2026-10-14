@@ -67,10 +67,20 @@ test configurations, and methodology.
 Lavik v0.1.0 served **100M keys (95.37 GiB of values)** from NVMe on a
 **2-vCPU / 16-GiB** Azure VM, reaching **215K GET ops/s and 196K SET ops/s**.
 Redis 8.10.2 and Valkey 9.1.2 held **1M keys** in memory on the same VM;
-all values were **1 KiB**. The chart shows throughput and p99.9 latency
+all values were **1 KiB**. The tables show throughput and p99.9 latency
 at **80 connections**; the report includes the full connection sweeps.
 
-<img src="perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/80-connections.svg" alt="2 vCPUs, 80 connections: GET and SET throughput and p99.9 latency" width="800">
+**SET**
+
+| Lavik 0.1.0 · 1M | Lavik 0.1.0 · 100M | Redis 8.10.2 · 1M | Valkey 9.1.2 · 1M |
+|---|---|---|---|
+| QPS: **134,454**<br>p99.9: 2.575 ms | QPS: **133,977**<br>p99.9: 3.423 ms | QPS: **138,636**<br>p99.9: 0.895 ms | QPS: **146,877**<br>p99.9: 0.951 ms |
+
+**GET**
+
+| Lavik 0.1.0 · 1M | Lavik 0.1.0 · 100M | Redis 8.10.2 · 1M | Valkey 9.1.2 · 1M |
+|---|---|---|---|
+| QPS: **133,263**<br>p99.9: 0.935 ms | QPS: **132,749**<br>p99.9: 1.039 ms | QPS: **138,448**<br>p99.9: 0.967 ms | QPS: **148,442**<br>p99.9: 0.927 ms |
 
 [2-vCPU test details and methodology](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 · [16-vCPU results](#16-vcpus)
@@ -81,10 +91,20 @@ at **80 connections**; the report includes the full connection sweeps.
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
 Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
-on an Azure Standard_L16aos_v4 VM. The chart shows **80 connections**;
+on an Azure Standard_L16aos_v4 VM. The tables show **80 connections**;
 the report includes the full connection sweeps.
 
-<img src="perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/80-connections.svg" alt="16 vCPUs, 80 connections: GET and SET throughput and p99.9 latency" width="800">
+**SET**
+
+| Lavik 0.1.0 · 10M | Lavik 0.1.0 · 1B | Redis 8.10.2 · 10M | Valkey 9.1.2 · 10M |
+|---|---|---|---|
+| QPS: **479,032**<br>p99.9: 1.375 ms | QPS: **425,907**<br>p99.9: 2.655 ms | QPS: **389,525**<br>p99.9: 0.471 ms | QPS: **518,503**<br>p99.9: 0.415 ms |
+
+**GET**
+
+| Lavik 0.1.0 · 10M | Lavik 0.1.0 · 1B | Redis 8.10.2 · 10M | Valkey 9.1.2 · 10M |
+|---|---|---|---|
+| QPS: **390,074**<br>p99.9: 0.439 ms | QPS: **385,514**<br>p99.9: 0.439 ms | QPS: **401,379**<br>p99.9: 0.471 ms | QPS: **536,405**<br>p99.9: 0.495 ms |
 
 At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
 peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
@@ -97,50 +117,19 @@ With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
 
 ### Disk-backed KV systems
 
-Our [Redis-compatible storage-tier benchmark](perf_reports/lavik-vs-dragonfly-tiering-2026-08-11/README.md)
-compares Lavik with Garnet, Dragonfly, Pika, Apache Kvrocks,
-Tendis, and KeyDB On Flash. Server and client ran on separate Azure
-`Standard_L16s_v3` VMs. Each backend used two NVMe drives and **200 million
-keys with uniformly random 1–4 KB values**, measured with 80 connections over
-300 seconds per workload, without a QPS limit. Results below are from the
-report's August 12, 2026 rerun.
+The [1TB storage comparison](perf_reports/lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.md) tests
+Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
+Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
+Results below use **80 connections**; each cell shows QPS and p99.9 latency.
 
-![Read, mixed, and write throughput across Redis-compatible storage tiers](perf_reports/charts/tiering-throughput.svg)
-
-| System / storage backend | Read-only QPS | Write-only QPS | 1:1 read/write QPS |
-|---|---:|---:|---:|
-| **Lavik SPDK** | **310,387** | **392,284** | **352,442** |
-| **Lavik io_uring — raw devices** | **278,925** | **393,733** | **328,831** |
-| **Lavik io_uring — XFS files** | **272,727** | **385,324** | **326,110** |
-| Garnet Storage Tier | 205,297 | 361,960 | 209,366 |
-| Dragonfly Tiered Storage | 187,653 | 199,234 | 207,248 |
-| Pika | 86,669 | 79,537 | 75,324 |
-| Apache Kvrocks | 70,672 | 110,167 | 88,084 |
-| Tendis | 68,860 | 160,642 | 102,213 |
-| KeyDB On Flash | 6,146 | 5,395 | 5,197 |
-
-Across these read, write, and mixed workloads, **Lavik SPDK delivered
-2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis**. Its read
-throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
-**1.97× and 1.08×**, respectively.
-
-The [1 TB storage-tier test](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#1b-keys--1-kib-storage-tier-controls)
-used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
-drives. The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release with SPDK peaked
-at **952,560 GET QPS**, or **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
-Its **764,939 SET QPS** was **1.42× Dragonfly's and 1.02× Garnet's**.
-These compare each system's highest measured point within its concurrency
-sweep and are separate from the dual-NVMe table above. Lavik SPDK
-used freshly loaded datasets; the controls reuse measurements from an earlier
-sweep on the same hosts. Garnet's post-measurement full key-count scan
-was omitted after its formal tests completed, as documented in the report.
-
-In the August 12 dual-NVMe test, Lavik SPDK's read p99 was **0.455 ms**,
-versus 2.303 ms for Garnet and 2.911 ms for Dragonfly. These results use each system's recorded
-cache, warmup, and persistence settings; uniform random access is unfavorable
-to KeyDB On Flash's hot-tier design. The report documents those differences
-and reproduction commands. Its separate Azure Managed Redis test used a
-different dataset and duration and is excluded from this chart and table.
+| Database | SET | GET |
+|---|---:|---:|
+| Lavik 0.1.0 SPDK | **425,907 QPS**<br>p99.9: 2.655 ms | **385,514 QPS**<br>p99.9: 0.439 ms |
+| Dragonfly 2.0.2 | **355,092 QPS**<br>p99.9: 5.535 ms | **205,326 QPS**<br>p99.9: 11.071 ms |
+| Garnet 2.2.1 | **421,152 QPS**<br>p99.9: 3.007 ms | **217,523 QPS**<br>p99.9: 4.703 ms |
+| Apache Kvrocks 2.17.0 | **134,307 QPS**<br>p99.9: 1.631 ms | **44,737 QPS**<br>p99.9: 5.599 ms |
+| Pika 3.5.7 | **92,505 QPS**<br>p99.9: 4.063 ms | **106,451 QPS**<br>p99.9: 2.479 ms |
+| Tendis 2.8.4 | **266,802 QPS**<br>p99.9: 1.511 ms | **44,614 QPS**<br>p99.9: 58.879 ms |
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
