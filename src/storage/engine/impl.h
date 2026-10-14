@@ -1664,7 +1664,6 @@ class StorageEngine::Impl {
 
       struct PendingCommand {
         std::uint64_t log_epoch_ = 0;
-        std::uint64_t publish_sequence_ = 0;
         std::size_t staging_bytes_ = 0;
         ReplicationCommandAppend append_;
         std::shared_ptr<PublishFence> fence_;
@@ -1687,14 +1686,12 @@ class StorageEngine::Impl {
       std::deque<ReplicationLogBlock> spare_blocks_;
       std::size_t borrowed_blocks_ = 0;
       bool append_admitted_ = false;
-      std::uint64_t published_sequence_ = 0;
-      std::uint64_t enqueued_sequence_ = 0;
       // The initial block is admitted when the history is enabled; later
       // growth happens only when an append consumes another block.
       std::optional<ReplicationLogBlock> standby_block_;
       std::uint64_t coverage_revocations_ = 0;
       // ACK updates and publication are worker-local. Pressure stops new
-      // admission, while accepted commands finish every flow before waiting.
+      // admission while accepted commands continue publishing every flow.
       bool capacity_backpressured_ = false;
       std::uint64_t capacity_waits_ = 0;
       AsyncNotification retention_advanced_;
@@ -3192,8 +3189,6 @@ class StorageEngine::Impl {
       ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
       std::optional<ReplicationPublisherTarget> target);
   void FinishReplicationPublisherAdmission(ReplicationPublisherWaiter& waiter);
-  Task<absl::Status> WaitForReplicationMemory(std::uint64_t log_epoch,
-                                              bool payload_pressure = false);
   std::optional<ReplicationPublisherAdmission>
   TryAcquireFullSyncReplacementAdmission(std::size_t logical_bytes,
                                          ReplicationPublisherTarget target);
@@ -3428,8 +3423,6 @@ class StorageEngine::Impl {
                                         std::size_t required_blocks);
   void TrimReplicationLogPool(WorkerStore& store);
   void ReclaimReplicationLogDebt(WorkerStore& store);
-  void CompleteReplicationPublication(WorkerStore& store, std::uint64_t epoch,
-                                      std::uint64_t sequence);
   Task<absl::Status> SealReplicationLogActiveBlock(WorkerStore& store);
   Task<absl::Status> ReclaimReplicationLogPrefix(WorkerStore& store,
                                                  std::uint64_t keep_from_lsn,

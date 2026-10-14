@@ -1530,19 +1530,20 @@ class StorageEngine {
   // growth allocates nothing until a later append needs another block.
   bycorf::Task<absl::Status> SetReplicationLogCapacity(
       std::size_t capacity_bytes);
-  // Selects whether excess retention waits for ACKs after accepted events
-  // finish publication. Disabling revokes lagging coverage and reclaims safe
-  // complete events; enabling it affects the next capacity conflict.
+  // Selects whether excess retention blocks new publisher admission and raw
+  // appends until ACK progress or cancellation. Disabling revokes lagging
+  // coverage and reclaims safe complete events; enabling it affects the next
+  // capacity conflict.
   bycorf::Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
   // Changes the worker-local in-memory publisher admission waterline. A
   // shrink never drops queued commands; new admissions wait for occupancy to
   // fall below the new limit. A growth wakes waiters immediately.
   bycorf::Task<absl::Status> SetReplicationPublishQueueCapacity(
       std::size_t capacity_bytes);
-  // Appends a complete owner-worker event. Dataset writers already hold
-  // publisher admission and may allocate beyond the soft memory budget;
-  // they wait for reclamation only after all participant effects are ready
-  // and their mutation locks and publisher admission have been released.
+  // Appends a complete owner-worker event without prior publisher admission.
+  // This raw path reserves capacity before the first fragment and may wait for
+  // retained backlog space. Admitted dataset publication uses an internal path
+  // that may exceed the soft memory budget without delaying command replies.
   bycorf::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
   // Inserts an ordered publisher fence and returns the first LSN assigned
@@ -1590,7 +1591,9 @@ class StorageEngine {
   // command/transaction gates. The log and each full-sync session already
   // hold fixed retained-memory budgets; this token reserves byte waterline and
   // ring-slot credit in their FIFOs. A request larger than the normal limit is
-  // admitted only when it can be the sole staged item.
+  // admitted only when it can be the sole staged item. Unreclaimed backlog
+  // borrowing blocks new grants; already admitted writes keep publishing
+  // asynchronously without delaying their replies for replica ACKs.
   bycorf::Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
@@ -1611,15 +1614,6 @@ class StorageEngine {
   // Removes an intent after global success or cancellation. This does not
   // return any granted capacity; release its token separately when necessary.
   void FinishReplicationPublisherAdmission(ReplicationPublisherWaiter& waiter);
-  // After releasing mutation locks and publisher admission, waits for this
-  // history's accepted publications and temporary replication memory to drain.
-  // Pressure also snapshots existing FULL queue tails so shared payloads wait
-  // for ACK or session cancellation. Returns Cancelled when this history is
-  // retired; its lifecycle then owns reclamation. Callers preserve an already
-  // successful mutation's result in that case, rather than report a failure
-  // after applying it. This is a memory backpressure boundary, not durability.
-  bycorf::Task<absl::Status> WaitForReplicationMemory(
-      std::uint64_t log_epoch, bool payload_pressure = false);
   void ReleaseReplicationPublisherAdmission(
       const ReplicationPublisherAdmission& admission,
       std::size_t logical_bytes);

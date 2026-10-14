@@ -10356,7 +10356,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
               co_await WaitFullSyncRequest(ack_state, expected.sequence_);
           if (!acknowledged.ok()) co_return acknowledged;
           // The queue ACK is also the borrowed-payload reclamation boundary.
-          // Drop transport views and ownership before waking command waiters;
+          // Drop transport views and ownership before waking admission waiters;
           // later items in this batch may still be waiting for their ACKs.
           auto& completed = commands[acknowledged_command_index++];
           assert(completed.item_.id_ == expected.item_id_);

@@ -262,7 +262,6 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   log.append_admitted_ = false;
   log.borrowed_blocks_ = 0;
   log.spare_blocks_.clear();
-  log.published_sequence_ = log.enqueued_sequence_ = 0;
   log.publish_queue_.clear();
   log.standby_block_.emplace(std::move(*standby));
   log.publish_queue_bytes_ = 0;
@@ -797,7 +796,6 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
     }
     return false;
   }
-  pending.publish_sequence_ = ++log.enqueued_sequence_;
   log.publish_queue_.push_back_prepared(std::move(pending));
   if (!log.publisher_running_) {
     log.publisher_running_ = true;
@@ -861,15 +859,6 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
   absl::Status published =
       PublishPreparedReplicationCommand(*admission, std::move(*publication));
   ReleaseReplicationPublisherAdmission(*admission, *staging_bytes);
-  if (published.ok()) {
-    // This entry point is standalone PUBLISH. EXEC captures its child instead
-    // and waits only after the enclosing transaction has released its gates.
-    auto drained = co_await WaitForReplicationMemory(admission->log_epoch_);
-    // Retiring history owns its remaining charged buffers. Publication was
-    // already accepted, so retirement must not suppress local delivery or
-    // turn this completed operation into a client-visible failure.
-    if (!absl::IsCancelled(drained)) published = std::move(drained);
-  }
   co_return published;
 }
 
@@ -1022,7 +1011,6 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
     RecordMemoryRejection();
     return false;
   }
-  pending.publish_sequence_ = ++log.enqueued_sequence_;
   log.publish_queue_.push_back_prepared(std::move(pending));
   if (!log.publisher_running_) {
     log.publisher_running_ = true;
@@ -1111,7 +1099,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog(
     log.publish_queue_.push_back_prepared(
         WorkerStore::ReplicationLogRuntime::PendingCommand{
             .log_epoch_ = log.log_epoch_,
-            .publish_sequence_ = ++log.enqueued_sequence_,
             .staging_bytes_ = kFenceStagingBytes,
             .append_ = {},
             .fence_ = fence,
@@ -1146,19 +1133,17 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     WorkerStore* store) {
   auto& log = store->replication_log_;
   while (!log.publish_queue_.empty()) {
-    struct PublicationComplete {
+    struct ReclaimPublicationDebt {
       Impl* impl;
       WorkerStore* store;
       std::uint64_t epoch;
-      std::uint64_t sequence;
-      ~PublicationComplete() {
-        impl->CompleteReplicationPublication(*store, epoch, sequence);
+      ~ReclaimPublicationDebt() {
+        if (store->replication_log_.log_epoch_ == epoch)
+          impl->ReclaimReplicationLogDebt(*store);
       }
-    } complete{this, store, log.publish_queue_.front().log_epoch_,
-               log.publish_queue_.front().publish_sequence_};
-    // Declare payload owners after the completion guard: reverse destruction
-    // releases codec buffers and canonical payload references before exposing
-    // the completed sequence to memory-repayment waiters.
+    } reclaim{this, store, log.publish_queue_.front().log_epoch_};
+    // Release codec buffers and canonical payload references before reclaiming
+    // debt and waking admissions. An old publisher cannot reclaim a new epoch.
     auto pending = std::move(log.publish_queue_.front());
     log.publish_queue_.pop_front();
     if (pending.fence_ != nullptr) {
@@ -1547,65 +1532,6 @@ void StorageEngine::Impl::ReclaimReplicationLogDebt(WorkerStore& store) {
     log.publisher_capacity_ready_.NotifyAll(*store.worker_);
 }
 
-void StorageEngine::Impl::CompleteReplicationPublication(
-    WorkerStore& store, std::uint64_t epoch, std::uint64_t sequence) {
-  auto& log = store.replication_log_;
-  if (log.log_epoch_ != epoch) return;
-  log.published_sequence_ = std::max(log.published_sequence_, sequence);
-  ReclaimReplicationLogDebt(store);
-  log.retention_advanced_.NotifyAll(*store.worker_);
-}
-
-Task<absl::Status> StorageEngine::Impl::WaitForReplicationMemory(
-    std::uint64_t log_epoch, bool payload_pressure) {
-  WorkerStore& store = CurrentStore();
-  auto& log = store.replication_log_;
-  const auto sequence = log.enqueued_sequence_;
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> fullsync_cuts;
-  if (payload_pressure || WouldExceedMemoryLimit(0)) {
-    // FULL can share an accepted command's payload after the source publisher
-    // has released its reference. Snapshot finite existing queue tails rather
-    // than waiting for global memory, which unrelated owners can keep high.
-    for (const auto& [session_id, session] : store.fullsync_sessions_) {
-      if (!session.db_epoch_invalidated_ && !session.publish_queue_.empty()) {
-        fullsync_cuts.emplace_back(
-            session_id,
-            session.publish_queue_[session.publish_queue_.size() - 1].id_);
-      }
-    }
-  }
-  for (;;) {
-    if (log_epoch != 0) {
-      if (log.state_ != ReplicationLogState::kActive ||
-          log.log_epoch_ != log_epoch) {
-        co_return absl::CancelledError(
-            "replication history changed while waiting for memory repayment");
-      }
-      // Publication may allocate after the command released its admission.
-      // Observing this sequence first closes that race without a queued fence.
-      if (log.published_sequence_ < sequence) {
-        co_await log.retention_advanced_.Wait();
-        continue;
-      }
-      ReclaimReplicationLogDebt(store);
-      if (log.borrowed_blocks_ != 0 || log.blocks_.size() > log.max_blocks_) {
-        co_await log.retention_advanced_.Wait();
-        continue;
-      }
-    }
-    const bool fullsync_pending = std::any_of(
-        fullsync_cuts.begin(), fullsync_cuts.end(), [&](const auto& cut) {
-          const auto session = store.fullsync_sessions_.find(cut.first);
-          return session != store.fullsync_sessions_.end() &&
-                 !session->second.db_epoch_invalidated_ &&
-                 !session->second.publish_queue_.empty() &&
-                 session->second.publish_queue_.front().id_ <= cut.second;
-        });
-    if (!fullsync_pending) co_return absl::OkStatus();
-    co_await store.fullsync_publisher_capacity_ready_.Wait();
-  }
-}
-
 auto StorageEngine::Impl::AllocateReplicationLogBlock(bool already_admitted)
     -> absl::StatusOr<WorkerStore::ReplicationLogBlock> {
   using Block = ::lavik::detail::ReplicationLogBlock;
@@ -1676,8 +1602,8 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
       log.retained_lsn_by_session_.clear();
       continue;
     }
-    // Only raw callers wait here. An admitted command must publish every
-    // participant and the complete payload before waiting for any replica.
+    // Only raw callers wait here. Accepted publication continues so replicas
+    // can receive every participant marker and the complete payload.
     log.capacity_backpressured_ = true;
     ++log.capacity_waits_;
     co_await log.retention_advanced_.Wait();
@@ -2100,7 +2026,6 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     log.append_admitted_ = false;
     log.borrowed_blocks_ = 0;
     log.spare_blocks_.clear();
-    log.published_sequence_ = log.enqueued_sequence_ = 0;
     log.capacity_backpressured_ = false;
     for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
       auto& pending = log.publish_queue_[index];

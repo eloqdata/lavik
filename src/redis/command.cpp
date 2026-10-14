@@ -2603,31 +2603,6 @@ Task<absl::Status> ReleaseReplicationPublisherAdmission(
       });
 }
 
-Task<absl::Status> WaitForReplicationMemory(
-    const ReplicationPublisherAdmission& admission) {
-  // Payload ownership may live on the coordinator even when it owns none of
-  // the transaction's flows. Pass that pressure to all participating owners;
-  // they wait on finite publication/ACK cutoffs, never on unrelated allocations
-  // bringing total process memory back below the soft limit.
-  const bool payload_pressure = WouldExceedMemoryLimit(0);
-  return ForEachParticipantParallel(
-      admission.worker_tokens_.size(),
-      [&admission, payload_pressure](std::size_t index) {
-        const auto& token = admission.worker_tokens_[index];
-        return std::pair{
-            token.worker_,
-            [epoch = token.token_.log_epoch_,
-             payload_pressure]() -> Task<absl::Status> {
-              auto status = co_await g_storage->WaitForReplicationMemory(
-                  epoch, payload_pressure);
-              // Retirement cancels retention and owns the old
-              // buffers' cleanup. It must not turn an applied
-              // write into a retryable command error.
-              co_return absl::IsCancelled(status) ? absl::OkStatus() : status;
-            }};
-      });
-}
-
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                                      const CommandRequest* request = nullptr) {
@@ -10840,11 +10815,9 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   struct PatternCut {
     bool active = false;
     bool expiration = false;
-    ~PatternCut() { Release(); }
-    void Release() {
+    ~PatternCut() {
       if (expiration) g_storage->ResumeExpiration();
       if (active) OpenAllCommandDbGates();
-      expiration = active = false;
     }
   } pattern_cut;
   ReplicationTransactionOrderGuard pattern_order;
@@ -10996,15 +10969,6 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       failed.close_connection_ = reply.close_connection_;
       co_return failed;
     }
-  }
-  pattern_order.Release();
-  pattern_cut.Release();
-  const auto drained = co_await WaitForReplicationMemory(*admission);
-  if (!drained.ok()) {
-    CommandReply failed =
-        BuiltReply(AppendStorageError(reply_builder, drained));
-    failed.close_connection_ = reply.close_connection_;
-    co_return failed;
   }
   co_return reply;
 }
@@ -13347,7 +13311,6 @@ Task<CommandReply> ExecuteAdmittedWriteCommand(CommandRequest& request,
   replication_order.Release();
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
-  if (released.ok()) released = co_await WaitForReplicationMemory(*admission);
   if (!released.ok()) {
     reply = BuiltReply(reply_builder.AppendError(
         absl::StrCat("ERR replication publisher admission release failed: ",
@@ -13439,7 +13402,6 @@ Task<absl::Status> RunReplicationAdmittedAttempt(
   absl::Status result = co_await attempt();
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
-  if (released.ok()) released = co_await WaitForReplicationMemory(*admission);
   co_return released.ok() ? result : released;
 }
 

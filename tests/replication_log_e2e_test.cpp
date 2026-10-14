@@ -656,13 +656,13 @@ class ReplicationLogService final : public bycorf::Service {
       co_return absl::OkStatus();
     };
     worker_->Spawn(run());
-    // The reply may wait for the consumer to release borrowed memory. Inspect
-    // the complete canonical event before ACK allows its blocks to disappear.
+    // Retain the complete event while checking the reply. An admitted write
+    // must finish even while the consumer still pins its excess blocks.
     auto body = co_await ReadSinglePublishedCommand(expected_fragments);
     const auto history = storage_->LocalReplicationLogInfo();
-    storage_->ReleaseReplicationLogRetention(kConsumer);
     Check(co_await WaitForCondition([&] { return finished; }),
-          "command did not finish after its consumer released retention");
+          "completed write waited for its consumer to release retention");
+    storage_->ReleaseReplicationLogRetention(kConsumer);
     if (!command_status.ok()) co_return command_status;
     if (!body.ok()) co_return body.status();
     co_return PinnedPublication{std::move(*body), history};
@@ -1817,50 +1817,25 @@ class ReplicationLogService final : public bycorf::Service {
     const auto second_id = (*batched)[1].id_;
     queued->clear();
     batched->clear();
-    bool fullsync_wait_started = false;
-    bool fullsync_wait_done = false;
-    absl::Status fullsync_wait_status =
-        absl::UnknownError("FULL memory waiter did not run");
-    auto wait_fullsync_memory = [&]() -> bycorf::Task<absl::Status> {
-      fullsync_wait_started = true;
-      fullsync_wait_status = co_await storage_->WaitForReplicationMemory(
-          storage_->LocalReplicationLogInfo().log_epoch_, true);
-      fullsync_wait_done = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(wait_fullsync_memory());
-    Check(co_await WaitForCondition([&] { return fullsync_wait_started; }) &&
-              !fullsync_wait_done,
-          "memory waiter ignored payload ownership retained by FULL");
-
-    // A later write must not move this waiter's finite ACK cutoff. Otherwise
-    // a continuously busy FULL queue can keep an already-completed writer
-    // asleep indefinitely despite releasing all of its own retained payload.
-    written = co_await ExecuteClientCommand(
-        kDb, {"SET", key, "after-memory-cut"}, "+OK\r\n");
-    if (!written.ok()) co_return written;
+    // Drain publisher ownership before measuring the memory held by FULL.
+    // Client replies themselves need neither this fence nor a replica ACK.
+    auto published = co_await storage_->FenceReplicationLog();
+    if (!published.ok()) co_return published.status();
     storage_->AcknowledgeFullSyncPublishItem(kSession, first_id);
     auto batch_tail = storage_->PeekFullSyncPublishItems(kSession, 2);
     if (!batch_tail.ok()) co_return batch_tail.status();
-    Check(batch_tail->size() == 2 && batch_tail->front().id_ == second_id,
+    Check(batch_tail->size() == 1 && batch_tail->front().id_ == second_id,
           "full-sync publish ACK did not release exactly one FIFO item");
-    const auto later_id = batch_tail->back().id_;
     batch_tail->clear();
-    co_await bycorf::Yield(*worker_);
-    Check(!fullsync_wait_done, "FULL waiter skipped part of its original cut");
     lavik::RefreshMemoryStats();
     const auto before_fullsync_ack = lavik::GetMemoryStats().used_bytes_;
     storage_->AcknowledgeFullSyncPublishItem(kSession, second_id);
-    Check(co_await WaitForCondition([&] { return fullsync_wait_done; }),
-          "FULL ACK did not wake memory waiter without another publication");
-    if (!fullsync_wait_status.ok()) co_return fullsync_wait_status;
     lavik::RefreshMemoryStats();
     Check(
         lavik::GetMemoryStats().used_bytes_ < before_fullsync_ack &&
-            storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_ >
+            storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_ ==
                 0,
-        "FULL cutoff failed to release payload memory or consumed later work");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, later_id);
+        "FULL ACK did not immediately release its payload memory");
 
     absl::Status queue_capacity =
         co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
@@ -2428,35 +2403,18 @@ class ReplicationLogService final : public bycorf::Service {
     if (!status.ok()) co_return status;
     status = storage_->RetainReplicationLog(kPin, 1);
     if (!status.ok()) co_return status;
-    bool old_command_done = false;
-    absl::Status old_command_status = absl::UnknownError("old SET did not run");
-    auto old_command = [&]() -> bycorf::Task<absl::Status> {
-      old_command_status = co_await ExecuteClientCommand(
-          0, {"SET", "replacement-old", std::string(9 * kMiB, 'O')}, "+OK\r\n");
-      old_command_done = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(old_command());
+    status = co_await ExecuteClientCommand(
+        0, {"SET", "replacement-old", std::string(9 * kMiB, 'O')}, "+OK\r\n");
+    if (!status.ok()) co_return status;
     status = co_await WaitForReplicationTail(1);
     if (!status.ok()) co_return status;
-
-    bool old_wait_done = false;
-    absl::Status old_wait_status;
-    auto old_wait = [&]() -> bycorf::Task<absl::Status> {
-      old_wait_status = co_await storage_->WaitForReplicationMemory(kOldEpoch);
-      old_wait_done = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(old_wait());
-    co_await bycorf::Yield(*worker_);
-    Check(!old_wait_done && !old_command_done,
-          "old memory waiter bypassed retained excess blocks");
+    Check(storage_->LocalReplicationLogInfo().capacity_backpressured_,
+          "replacement fixture did not retain the oversized old event");
     status = co_await storage_->DisableReplicationLog();
     Check(status.ok(), "could not disable the backpressured publisher");
 
-    // Replace the history while its old command is waiting for safe memory
-    // reclamation. Cancellation must release that waiter without interpreting
-    // the new history's publication sequence as completion of the old one.
+    // Replacing a history with pinned excess blocks must release its state
+    // without invalidating or consuming the new history's publications.
     status = co_await storage_->EnableReplicationLog(kNewEpoch, 8 * kMiB);
     Check(status.ok(), "could not enable replacement replication history");
     auto admission =
@@ -2474,19 +2432,11 @@ class ReplicationLogService final : public bycorf::Service {
     Check(queued.log_epoch_ == kNewEpoch && queued.tail_lsn_ == 0 &&
               queued.publish_queue_bytes_ != 0,
           "replacement fixture resumed the publisher before enqueue");
-    Check(co_await WaitForCondition([&] {
-            const auto info = storage_->LocalReplicationLogInfo();
-            return old_wait_done && old_command_done &&
-                   (info.tail_lsn_ == 1 ||
-                    info.state_ != ReplicationLogState::kActive);
-          }),
-          "old publisher abandoned the replacement history's queue");
+    auto decoded = co_await ReadSinglePublishedCommand(1);
     const auto published = storage_->LocalReplicationLogInfo();
-    Check(absl::IsCancelled(old_wait_status) && old_command_status.ok() &&
-              published.state_ == ReplicationLogState::kActive &&
+    Check(published.state_ == ReplicationLogState::kActive &&
               published.log_epoch_ == kNewEpoch && published.tail_lsn_ == 1,
           "old publisher resumed into or invalidated replacement history");
-    auto decoded = co_await ReadSinglePublishedCommand(1);
     Check(decoded.ok() &&
               decoded->args_ ==
                   std::vector<std::string>({"SET", "replacement-new", "value"}),
@@ -2947,13 +2897,6 @@ class ReplicationLogService final : public bycorf::Service {
                     {"SET", "continued-event", std::string(17 * kMiB, 'G')}),
             "borrowed blocks lost part of the complete canonical event");
 
-      bool repaid = false;
-      absl::Status repayment = absl::UnknownError("repayment did not run");
-      auto wait_repayment = [&]() -> bycorf::Task<absl::Status> {
-        repayment = co_await storage_->WaitForReplicationMemory(epoch);
-        repaid = true;
-        co_return absl::OkStatus();
-      };
       bool next_admitted = false;
       absl::Status next_status = absl::UnknownError("next writer did not run");
       auto next_writer = [&]() -> bycorf::Task<absl::Status> {
@@ -2963,21 +2906,16 @@ class ReplicationLogService final : public bycorf::Service {
         next_admitted = true;
         co_return absl::OkStatus();
       };
-      worker_->Spawn(wait_repayment());
       worker_->Spawn(next_writer());
       co_await bycorf::Yield(*worker_);
-      Check(!repaid && !next_admitted,
-            "borrowed memory allowed a reply or another publisher admission");
+      Check(!next_admitted,
+            "borrowed memory allowed another publisher admission");
       if (cancel_consumer) {
         storage_->ReleaseReplicationLogRetention(epoch);
       } else {
         status = storage_->RetainReplicationLog(epoch, 2);
         if (!status.ok()) co_return status;
       }
-      Check(co_await WaitForCondition([&] { return repaid && next_admitted; }),
-            "ACK/cancellation failed to repay debt without a subsequent write");
-      if (!repayment.ok()) co_return repayment;
-      if (!next_status.ok()) co_return next_status;
       lavik::RefreshMemoryStats();
       const auto reclaimed = storage_->LocalReplicationLogInfo();
       Check(
@@ -2986,6 +2924,10 @@ class ReplicationLogService final : public bycorf::Service {
               reclaimed.block_count_ <= quota_blocks &&
               lavik::GetMemoryStats().used_bytes_ + 16 * kMiB <= pinned_bytes,
           "safe continuation blocks retained physical memory or reset history");
+      Check(
+          co_await WaitForCondition([&] { return next_admitted; }),
+          "ACK/cancellation failed to reopen admission without another write");
+      if (!next_status.ok()) co_return next_status;
       storage_->ReleaseReplicationLogRetention(epoch);
       status = co_await storage_->DisableReplicationLog();
       if (!status.ok()) co_return status;

@@ -502,11 +502,6 @@ void StorageEngine::FinishReplicationPublisherAdmission(
   impl_->FinishReplicationPublisherAdmission(waiter);
 }
 
-Task<absl::Status> StorageEngine::WaitForReplicationMemory(
-    std::uint64_t log_epoch, bool payload_pressure) {
-  return impl_->WaitForReplicationMemory(log_epoch, payload_pressure);
-}
-
 void StorageEngine::ReleaseReplicationPublisherAdmission(
     const ReplicationPublisherAdmission& admission, std::size_t logical_bytes) {
   impl_->ReleaseReplicationPublisherAdmission(admission, logical_bytes);
