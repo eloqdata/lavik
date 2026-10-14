@@ -59,11 +59,6 @@ constexpr std::string_view kGroupPhaseReplicate =
 constexpr std::string_view kGroupPhaseReady = "population-ready";
 constexpr std::string_view kGroupFailurePrefix = "deterministic-failure:";
 
-bool IsTerminal(MetaOperationLifecycle state) {
-  return state == MetaOperationLifecycle::kCompleted ||
-         state == MetaOperationLifecycle::kAborted;
-}
-
 template <std::size_t N>
 std::string Hex(const std::array<std::uint8_t, N>& value) {
   return absl::BytesToHexString(std::string_view(

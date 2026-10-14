@@ -8,15 +8,13 @@
 #include <utility>
 
 #include "lavik/meta/failover.h"
-#include "lavik/meta/hash.h"
 #include "lavik/meta/state_machine.h"
 
 namespace lavik::meta {
 namespace {
 bool ActiveFailover(const MetaOperationRecord& operation) {
   return operation.kind_ == kFailoverOperationKind &&
-         operation.lifecycle_ != MetaOperationLifecycle::kCompleted &&
-         operation.lifecycle_ != MetaOperationLifecycle::kAborted;
+         !IsTerminal(operation.lifecycle_);
 }
 
 template <typename Policy, typename Decode>
@@ -42,14 +40,7 @@ const MetaOperationRecord*
 MetaAutomaticTriggerView::PreemptableControlledRequest(
     std::string_view group_id) const {
   for (const MetaOperationRecord& operation : operations_) {
-    if (operation.kind_ != kFailoverOperationKind ||
-        operation.lifecycle_ != MetaOperationLifecycle::kSubmitted ||
-        operation.revision_ != 0 || !operation.kind_phase_blob_.empty() ||
-        !operation.current_directives_.empty() ||
-        !operation.terminal_receipts_.empty() ||
-        !std::ranges::all_of(operation.replication_history_id_,
-                             [](std::uint8_t byte) { return byte == 0; }) ||
-        operation.intent_hash_ != MetaSha256(operation.intent_)) {
+    if (!IsPristineSubmittedFailoverOperation(operation)) {
       continue;
     }
     const auto intent = DecodeFailoverOperationIntent(operation.intent_);

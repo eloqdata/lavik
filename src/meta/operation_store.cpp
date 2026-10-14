@@ -43,11 +43,6 @@ namespace {
   std::abort();
 }
 
-bool IsTerminal(MetaOperationLifecycle lifecycle) {
-  return lifecycle == MetaOperationLifecycle::kCompleted ||
-         lifecycle == MetaOperationLifecycle::kAborted;
-}
-
 template <std::size_t N>
 bool IsZero(const std::array<std::uint8_t, N>& value) {
   return std::all_of(value.begin(), value.end(),

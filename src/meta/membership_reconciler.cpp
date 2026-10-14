@@ -39,10 +39,6 @@
 
 namespace lavik::meta {
 namespace {
-bool Terminal(const MetaOperationRecord& op) {
-  return op.lifecycle_ == MetaOperationLifecycle::kCompleted ||
-         op.lifecycle_ == MetaOperationLifecycle::kAborted;
-}
 std::string Id(const MetaOperationId& id) {
   return absl::BytesToHexString(
       std::string_view(reinterpret_cast<const char*>(id.data()), id.size()));
@@ -294,7 +290,7 @@ Plan PlanMembershipStep(const MetaMembershipView& view,
                         const std::vector<MetaMembershipPeer>& config,
                         std::uint32_t local_id) {
   const auto& op = view.operation_;
-  if (op.kind_ != kMetaMembershipOperationKind || Terminal(op))
+  if (op.kind_ != kMetaMembershipOperationKind || IsTerminal(op.lifecycle_))
     return std::nullopt;
   auto intent = DecodeMembershipIntent(op.intent_);
   if (!intent.ok()) return intent.status();
@@ -641,7 +637,7 @@ bycorf::Task<absl::Status> MetaMembershipReconciler::Run(
                 auto current = machine->FindOperation(id);
                 auto config_now = CaptureMembershipConfig(server->get_config());
                 if (server->leader_term() != static_cast<std::int64_t>(term) ||
-                    !current || Terminal(*current) ||
+                    !current || IsTerminal(current->lifecycle_) ||
                     current->revision_ != revision || !config_now.ok() ||
                     *config_now != expected) {
                   attempt->replied_ = true;

@@ -244,11 +244,6 @@ constexpr std::uint64_t kMaximumAuditSnapshotGrowth =
     (4u + kMaxMetaAuditDetailBytes) + (4u + kMaxMetaAuditReadableTimeBytes) +
     32u;
 
-bool IsTerminal(MetaOperationLifecycle lifecycle) {
-  return lifecycle == MetaOperationLifecycle::kCompleted ||
-         lifecycle == MetaOperationLifecycle::kAborted;
-}
-
 // A terminal command may be replayed only when the retained operation is the
 // same canonical Genesis root named by topology. Merely observing compatible
 // terminal states on both stores is insufficient: a wrong kind, submit index,
@@ -534,8 +529,7 @@ absl::Status ValidateDecodedAggregate(const MetaStores& stores) {
             "failover operation violates the request-only typed lifecycle");
       }
     }
-    if (operation.lifecycle_ == MetaOperationLifecycle::kCompleted ||
-        operation.lifecycle_ == MetaOperationLifecycle::kAborted) {
+    if (IsTerminal(operation.lifecycle_)) {
       continue;
     }
     for (const MetaCurrentDirective& directive :
@@ -660,20 +654,6 @@ bool TransitionMatches(const MetaFailoverTransition& transition,
 
 std::string_view FailoverLossName(MetaFailoverLoss loss) {
   return loss == MetaFailoverLoss::kNone ? "none" : "unknown";
-}
-
-bool IsPristineSubmittedFailoverOperation(
-    const MetaOperationRecord& operation) {
-  return operation.kind_ == kFailoverOperationKind &&
-         operation.lifecycle_ == MetaOperationLifecycle::kSubmitted &&
-         operation.revision_ == 0 &&
-         operation.intent_hash_ == MetaSha256(operation.intent_) &&
-         operation.kind_phase_blob_.empty() &&
-         operation.current_directives_.empty() &&
-         operation.terminal_receipts_.empty() &&
-         std::all_of(operation.replication_history_id_.begin(),
-                     operation.replication_history_id_.end(),
-                     [](std::uint8_t byte) { return byte == 0; });
 }
 
 // This terminal result is part of the replicated Begin post-effect. It is
