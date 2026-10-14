@@ -122,14 +122,14 @@ Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
 Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
 Results below use **80 connections**; each cell shows QPS and p99.9 latency.
 
-| Database | SET | GET |
+| Database | GET | SET |
 |---|---:|---:|
-| Lavik 0.1.0 | **425,907 QPS**, p99.9: 2.655 ms | **385,514 QPS**, p99.9: 0.439 ms |
-| Dragonfly 2.0.2 | **355,092 QPS**, p99.9: 5.535 ms | **205,326 QPS**, p99.9: 11.071 ms |
-| Garnet 2.2.1 | **421,152 QPS**, p99.9: 3.007 ms | **217,523 QPS**, p99.9: 4.703 ms |
-| Apache Kvrocks 2.17.0 | **134,307 QPS**, p99.9: 1.631 ms | **44,737 QPS**, p99.9: 5.599 ms |
-| Pika 3.5.7 | **92,505 QPS**, p99.9: 4.063 ms | **106,451 QPS**, p99.9: 2.479 ms |
-| Tendis 2.8.4 | **266,802 QPS**, p99.9: 1.511 ms | **44,614 QPS**, p99.9: 58.879 ms |
+| Lavik 0.1.0 | **385,514 QPS**, p99.9: 0.439 ms | **425,907 QPS**, p99.9: 2.655 ms |
+| Garnet 2.2.1 | **217,523 QPS**, p99.9: 4.703 ms | **421,152 QPS**, p99.9: 3.007 ms |
+| Dragonfly 2.0.2 | **205,326 QPS**, p99.9: 11.071 ms | **355,092 QPS**, p99.9: 5.535 ms |
+| Pika 3.5.7 | **106,451 QPS**, p99.9: 2.479 ms | **92,505 QPS**, p99.9: 4.063 ms |
+| Apache Kvrocks 2.17.0 | **44,737 QPS**, p99.9: 5.599 ms | **134,307 QPS**, p99.9: 1.631 ms |
+| Tendis 2.8.4 | **44,614 QPS**, p99.9: 58.879 ms | **266,802 QPS**, p99.9: 1.511 ms |
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
