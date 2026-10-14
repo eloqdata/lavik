@@ -793,9 +793,11 @@ queue staging allowances remain separate from these actual allocation charges.
 
 One command larger than its publisher-staging waterline may proceed only as the
 sole queued item so the queue cannot deadlock on an item that no consumer can
-make smaller. The complete canonical event is bounded by the 1 GiB native-event
-limit. `repl-backlog-size` is a history-retention target, not a command-size
-limit. The publisher allocates blocks on demand and completes accepted events
+make smaller. Command and EXEC admission reject an estimated event larger than
+the effective per-flow `repl-backlog-size` capacity or the 1 GiB native-event
+limit. Once admitted, dynamic effects such as Lua writes may exceed the backlog
+budget; the complete canonical event still has the 1 GiB encoding limit.
+The publisher allocates blocks on demand and completes accepted events
 without waiting for ACKs between participant markers and payload. Commands
 release their locks and publisher admission without waiting for background
 publication or memory reclamation. Excess backlog blocks stop new publisher

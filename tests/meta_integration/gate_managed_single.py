@@ -420,6 +420,48 @@ def publisher_admission_precedes_order(root):
         overlap_clients = [Client(source) for _ in overlap_keys]
         reader = Client(target)
         try:
+            # The fixture has 24 MiB total backlog: one 8 MiB block per flow.
+            # Reject estimated 10 MiB events before any key or history changes.
+            history = [
+                line
+                for line in source.metrics().splitlines()
+                if line.startswith(
+                    (
+                        "lavik_replication_backlog_active{",
+                        "lavik_replication_backlog_tail_lsn{",
+                    )
+                )
+            ]
+            assert len(history) == 6, history
+            history_id = next(
+                line
+                for line in writer.call("INFO", "replication").splitlines()
+                if line.startswith("master_replid:")
+            )
+            large = "x" * (5 * 1024 * 1024)
+            rejects(
+                writer, ("MSET", keys[0], large, keys[1], large), "repl-backlog-size"
+            )
+            assert writer.call("MULTI") == "OK"
+            for key in keys:
+                assert writer.call("SET", key, large) == "QUEUED"
+            rejects(writer, ("EXEC",), "repl-backlog-size")
+            assert writer.call("MGET", *keys) == [None, None]
+            after_rejection = source.metrics().splitlines()
+            assert all(line in after_rejection for line in history)
+            assert history_id in writer.call("INFO", "replication").splitlines()
+            # A small admitted script may discover a larger canonical effect.
+            # Its child SET must complete even though 9 MiB exceeds one flow.
+            lua_key = key_on_worker("lua-growth", 2)
+            script = (
+                "redis.call('SET', KEYS[1], string.rep('x', 9*1024*1024)); "
+                "return redis.call('STRLEN', KEYS[1])"
+            )
+            assert writer.call("EVAL", script, 1, lua_key) == 9 * 1024 * 1024
+            assert writer.call("WAIT", 1, 5000) == 1
+            assert reader.call("STRLEN", lua_key) == 9 * 1024 * 1024
+            assert writer.call("DEL", lua_key) == 1
+            assert writer.call("WAIT", 1, 5000) == 1
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
                 mset = pool.submit(
                     writer.call, "MSET", keys[0], payload, keys[1], payload
