@@ -124,12 +124,12 @@ Results below use **80 connections**; each cell shows QPS and p99.9 latency.
 
 | Database | SET | GET |
 |---|---:|---:|
-| Lavik 0.1.0 | **425,907 QPS**<br>p99.9: 2.655 ms | **385,514 QPS**<br>p99.9: 0.439 ms |
-| Dragonfly 2.0.2 | **355,092 QPS**<br>p99.9: 5.535 ms | **205,326 QPS**<br>p99.9: 11.071 ms |
-| Garnet 2.2.1 | **421,152 QPS**<br>p99.9: 3.007 ms | **217,523 QPS**<br>p99.9: 4.703 ms |
-| Apache Kvrocks 2.17.0 | **134,307 QPS**<br>p99.9: 1.631 ms | **44,737 QPS**<br>p99.9: 5.599 ms |
-| Pika 3.5.7 | **92,505 QPS**<br>p99.9: 4.063 ms | **106,451 QPS**<br>p99.9: 2.479 ms |
-| Tendis 2.8.4 | **266,802 QPS**<br>p99.9: 1.511 ms | **44,614 QPS**<br>p99.9: 58.879 ms |
+| Lavik 0.1.0 | **425,907 QPS**, p99.9: 2.655 ms | **385,514 QPS**, p99.9: 0.439 ms |
+| Dragonfly 2.0.2 | **355,092 QPS**, p99.9: 5.535 ms | **205,326 QPS**, p99.9: 11.071 ms |
+| Garnet 2.2.1 | **421,152 QPS**, p99.9: 3.007 ms | **217,523 QPS**, p99.9: 4.703 ms |
+| Apache Kvrocks 2.17.0 | **134,307 QPS**, p99.9: 1.631 ms | **44,737 QPS**, p99.9: 5.599 ms |
+| Pika 3.5.7 | **92,505 QPS**, p99.9: 4.063 ms | **106,451 QPS**, p99.9: 2.479 ms |
+| Tendis 2.8.4 | **266,802 QPS**, p99.9: 1.511 ms | **44,614 QPS**, p99.9: 58.879 ms |
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
