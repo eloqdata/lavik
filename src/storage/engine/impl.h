@@ -60,6 +60,7 @@
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/fault_injection.h"
+#include "lavik/fault_pause.h"
 #include "lavik/memory.h"
 #include "lavik/replication_history.h"
 #include "lavik/storage/detail/compact_write.h"
@@ -1503,6 +1504,19 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
 }
 
 #if LAVIK_FAULTS_ENABLED
+// Only the first matching write may wait: gating a second write as well would
+// hide a broken key lock from concurrency tests. The fixture removes the hold
+// file after checking progress and may re-arm only once those writes finish.
+// A configured but unarmed gate returns immediately; it must not fall back to
+// the timed pause on subsequent writes or external records.
+inline Task<absl::Status> PauseWriteOnceForTest(const char* variable) {
+  const char* path = std::getenv(variable);
+  if (path == nullptr) co_return absl::OkStatus();
+  const std::string arm = std::string(path) + ".arm";
+  if (::unlink(arm.c_str()) != 0) co_return absl::OkStatus();
+  co_return co_await fault_injection::PauseWhileFileExists(variable);
+}
+
 // Runs in the original write's key-lock lifetime, after store state is
 // released. The whole call site is erased in Release, including the extra
 // coroutine.
@@ -1510,6 +1524,9 @@ inline Task<absl::Status> PauseCompactWriteForTest(Worker& worker,
                                                    std::string_view key) {
   if (!LAVIK_FAULT_MATCHES("LAVIK_COMPACT_WRITE_PAUSE_KEY", key))
     co_return absl::OkStatus();
+  if (std::getenv("LAVIK_COMPACT_WRITE_HOLD_FILE") != nullptr) {
+    co_return co_await PauseWriteOnceForTest("LAVIK_COMPACT_WRITE_HOLD_FILE");
+  }
   const char* configured = std::getenv("LAVIK_COMPACT_WRITE_PAUSE_MS");
   if (configured == nullptr) co_return absl::OkStatus();
   std::uint64_t milliseconds = 0;
@@ -1537,6 +1554,9 @@ inline Task<absl::Status> PauseGroupedWriteForTest(Worker& worker,
     co_return absl::OkStatus();
   const char* selected = std::getenv("LAVIK_GROUPED_WRITE_PAUSE_PHASE");
   if (selected == nullptr || phase != selected) co_return absl::OkStatus();
+  if (std::getenv("LAVIK_GROUPED_WRITE_HOLD_FILE") != nullptr) {
+    co_return co_await PauseWriteOnceForTest("LAVIK_GROUPED_WRITE_HOLD_FILE");
+  }
   spdlog::info("grouped write pause armed key={} phase={}", key, phase);
   const auto status =
       co_await bycorf::SleepFor(worker, std::chrono::seconds(3));

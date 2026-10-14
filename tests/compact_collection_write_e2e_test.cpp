@@ -43,6 +43,42 @@ class ScopedFault {
   std::optional<std::string> previous_;
 };
 
+// Only the writer that consumes .arm may pause. Otherwise a second writer
+// bypassing the key lock could also wait here and hide the concurrency bug.
+// Keep the environment and files scoped across child cleanup on test failure.
+class WritePauseGate {
+ public:
+  WritePauseGate(const PrivateDisk& disk, const char* variable)
+      : path_(disk.path() + ".write-pause"),
+        marker_(std::string("fault pause reached: ") + variable),
+        fault_(variable, path_.c_str()) {}
+  WritePauseGate(const WritePauseGate&) = delete;
+  WritePauseGate& operator=(const WritePauseGate&) = delete;
+  ~WritePauseGate() {
+    ::unlink(path_.c_str());
+    ::unlink((path_ + ".arm").c_str());
+  }
+  void Arm() const {
+    // Publish the hold before allowing the child to claim this pause.
+    std::ofstream hold(path_);
+    Check(hold.good(), "create write pause hold file");
+    std::ofstream arm(path_ + ".arm");
+    Check(arm.good(), "create write pause arm file");
+  }
+  void Release() const {
+    Check(::unlink(path_.c_str()) == 0, "release write pause gate");
+    ::unlink((path_ + ".arm").c_str());
+  }
+  bool IsArmed() const { return ::access((path_ + ".arm").c_str(), F_OK) == 0; }
+  bool IsHeld() const { return ::access(path_.c_str(), F_OK) == 0; }
+  const std::string& marker() const { return marker_; }
+
+ private:
+  std::string path_;
+  std::string marker_;
+  ScopedFault fault_;
+};
+
 // Keep send and read separate: the marker identifies the unlocked interval,
 // and another connection can prove progress without a guessed start delay.
 class PendingWrite {
@@ -222,17 +258,16 @@ TEST_P(CompactCollectionWriteE2e, ColdPauseReleasesStateButSerializesSameKey) {
   ASSERT_TRUE(disk.Auxiliaries(key).empty());
   {
     ScopedFault paused_key("LAVIK_COMPACT_WRITE_PAUSE_KEY", key.c_str());
-    ScopedFault pause_ms("LAVIK_COMPACT_WRITE_PAUSE_MS", "3000");
+    WritePauseGate gate(disk, "LAVIK_COMPACT_WRITE_HOLD_FILE");
     Server server(disk, 1);
     server.PreserveOnFailure();
     Client client(server.port());
     PendingWrite first(server.port()), second(server.port());
     // Do not read the target before this command: its old bytes must be on
     // disk after restart, not warmed by a fixture read or a previous write.
+    gate.Arm();
     first.Send(FirstWrite(type, key));
-    const std::string armed = "compact collection write pause armed key=" + key;
-    const std::string complete =
-        "compact collection write pause complete key=" + key;
+    const auto& armed = gate.marker();
     ASSERT_TRUE(AwaitMarker(server, armed)) << server.Log();
     second.Send(SecondWrite(type, key));
     EXPECT_EQ(client.Command({"SET", "other-string", "after"}).text_, "OK");
@@ -243,9 +278,11 @@ TEST_P(CompactCollectionWriteE2e, ColdPauseReleasesStateButSerializesSameKey) {
     EXPECT_EQ(client.Command({"HGET", "other-hash", "new"}).text_,
               "independent");
     EXPECT_NE(client.Command(FirstWrite(type, "other-collection")).kind_, '-');
-    EXPECT_EQ(server.Log().find(complete), std::string::npos) << server.Log();
+    EXPECT_TRUE(gate.IsHeld());
+    EXPECT_FALSE(gate.IsArmed());
     EXPECT_FALSE(first.HasReply());
     EXPECT_FALSE(second.HasReply());
+    gate.Release();
     const auto a = first.Read();
     EXPECT_EQ(a.kind_, type == Collection::kSortedSet ? '$' : ':');
     EXPECT_EQ(a.text_, type == Collection::kSet    ? "1"
@@ -256,9 +293,10 @@ TEST_P(CompactCollectionWriteE2e, ColdPauseReleasesStateButSerializesSameKey) {
     EXPECT_EQ(b.text_, type == Collection::kList ? "4" : "1");
     CheckPausedResult(client, type, key);
 
-    // Borrowed EXEC writes retain their old path, even with the pause selector
-    // armed for this same compact key. Repeating existing bytes preserves the
-    // final contents while detecting accidental expansion of the new scope.
+    // Re-arm the consumed gate so borrowed EXEC must bypass a live pause,
+    // rather than merely passing because the earlier hold was released.
+    // Repeating existing bytes preserves the final contents.
+    gate.Arm();
     const auto pauses_before = MarkerCount(server.Log(), armed);
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
     const auto unchanged =
@@ -268,7 +306,9 @@ TEST_P(CompactCollectionWriteE2e, ColdPauseReleasesStateButSerializesSameKey) {
             : std::vector<std::string>{"ZADD", key, "XX", "5", "a"};
     ASSERT_EQ(client.Command(unchanged).text_, "QUEUED");
     ASSERT_EQ(client.Command({"EXEC"}).items_.size(), 1);
+    EXPECT_TRUE(gate.IsArmed());
     EXPECT_EQ(MarkerCount(server.Log(), armed), pauses_before) << server.Log();
+    gate.Release();
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -545,15 +585,14 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
   {
     ScopedFault pause_key("LAVIK_GROUPED_WRITE_PAUSE_KEY", key.c_str());
     ScopedFault pause_phase("LAVIK_GROUPED_WRITE_PAUSE_PHASE", phase);
+    WritePauseGate gate(disk, "LAVIK_GROUPED_WRITE_HOLD_FILE");
     Server server(disk, 1);
     server.PreserveOnFailure();
     Client client(server.port());
     PendingWrite first(server.port()), second(server.port());
+    gate.Arm();
     first.Send(commands.First(key));
-    const std::string armed =
-        "grouped write pause armed key=" + key + " phase=" + phase;
-    const std::string complete =
-        "grouped write pause complete key=" + key + " phase=" + phase;
+    const auto& armed = gate.marker();
     ASSERT_TRUE(AwaitMarker(server, armed)) << server.Log();
     second.Send(commands.Second(key));
     // SET/HSET need store state; PING or GET alone would not prove the writer
@@ -563,9 +602,11 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
         client.Command({"HSET", "other-hash", "f", std::string(20000, 'p')})
             .text_,
         "1");
-    EXPECT_EQ(server.Log().find(complete), std::string::npos) << server.Log();
+    EXPECT_TRUE(gate.IsHeld());
+    EXPECT_FALSE(gate.IsArmed());
     EXPECT_FALSE(first.HasReply());
     EXPECT_FALSE(second.HasReply());
+    gate.Release();
     const auto a = first.Read();
     ASSERT_NE(a.kind_, '-') << a.text_ << server.Log();
     const auto b = second.Read();
@@ -836,16 +877,15 @@ TEST_P(CollectionCreationE2e,
   {
     ScopedFault pause_key("LAVIK_GROUPED_WRITE_PAUSE_KEY", key.c_str());
     ScopedFault pause_phase("LAVIK_GROUPED_WRITE_PAUSE_PHASE", phase);
+    WritePauseGate gate(disk, "LAVIK_GROUPED_WRITE_HOLD_FILE");
     Server server(disk, 1);
     server.PreserveOnFailure();
     Client client(server.port()), watcher(server.port());
     ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
     PendingWrite first(server.port()), second(server.port());
+    gate.Arm();
     first.Send(commands.Seed(key));
-    const std::string armed =
-        "grouped write pause armed key=" + key + " phase=" + phase;
-    const std::string complete =
-        "grouped write pause complete key=" + key + " phase=" + phase;
+    const auto& armed = gate.marker();
     ASSERT_TRUE(AwaitMarker(server, armed)) << server.Log();
     second.Send(commands.First(key));
     EXPECT_EQ(client.Command({"SET", "independent", "progress"}).text_, "OK");
@@ -854,9 +894,11 @@ TEST_P(CollectionCreationE2e,
             .Command({"HSET", "independent-hash", "f", std::string(20000, 'p')})
             .text_,
         "1");
-    EXPECT_EQ(server.Log().find(complete), std::string::npos) << server.Log();
+    EXPECT_TRUE(gate.IsHeld());
+    EXPECT_FALSE(gate.IsArmed());
     EXPECT_FALSE(first.HasReply());
     EXPECT_FALSE(second.HasReply());
+    gate.Release();
     EXPECT_EQ(first.Read().text_, "2");
     const auto changed = second.Read();
     ASSERT_NE(changed.kind_, '-') << changed.text_ << server.Log();
