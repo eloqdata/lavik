@@ -788,36 +788,27 @@ Each active worker log and full-sync session owns a bounded publisher budget.
 Transaction participants share immutable command envelopes; independently
 copied full-sync payloads retain their own allocation charges. Once a write is
 admitted, allocations needed to complete its replication may exceed the
-worker's soft memory budget. Payload, encoding metadata, and backlog owners
-charge their allocations immediately and
-release the charge with the allocation, so subsequent admissions observe the
-excess. Fixed queue staging allowances remain reserved independently of the
-separately charged payload and codec owners. Hard protocol and complete-event
-size limits remain in force.
+worker's soft memory budget. Payload, encoding metadata, and backlog allocations
+are charged until freed, so subsequent admissions observe the excess. Fixed
+queue staging allowances remain separate from these actual allocation charges.
 
 One command larger than its publisher-staging waterline may proceed only as the
 sole queued item so the queue cannot deadlock on an item that no consumer can
 make smaller. The complete canonical event is bounded by the 1 GiB native-event
 limit. `repl-backlog-size` is a history-retention target, not a command-size
-limit. Publisher admission does not preallocate complete-event backlog blocks;
-the publisher allocates them as each complete accepted event needs space.
-Budget pressure cannot discard an accepted mutation or suspend a transaction
-between participant markers and its payload. New admission stops while backlog
-excess is retained. The accepted command releases its key, database, and order
-locks and publisher admission after preparing every participant, then observes
-publication completion and waits for temporary excess to become reclaimable.
-The wait concerns finite replication ownership, not unrelated process memory.
-History retirement ends this wait without rewriting a successful mutation's
-reply; cancellation and log teardown retain ownership and accounting until the
-old allocations are released. It does not establish replication durability.
+limit. The publisher allocates blocks on demand and completes an accepted event
+without waiting between participant markers and payload. After all participants
+can publish, the command releases its key, database, and order locks and
+publisher admission, observes local publication completion, and waits for
+temporary excess to become reclaimable. New admission stops while backlog
+excess is retained. The wait covers finite replication ownership, not unrelated
+process memory or replication durability. History retirement ends it without
+changing an applied mutation's reply; teardown owns the remaining allocations.
 
-Result-dependent commands retain their deterministic canonical effects and
-final expiration after-images through nested execution and asynchronous
-publication. EXEC and Lua preserve the effects of successful children when a
-later child fails. Capture and encoding allocation retain normal accounting
-while accepted replication ownership permits soft-budget growth. Unexpected
-physical allocation failure remains process-fatal; exceeding a soft budget is
-not an encoding failure or a reason to invalidate history.
+EXEC and Lua retain successful children's deterministic effects and final
+expiration after-images even when a later child fails. Capture and encoding use
+the same accounting and soft-budget policy. Hard encoding limits remain in
+force; physical allocation failure remains process-fatal.
 
 The source sends bounded batches while a separate receiver validates ACK order
 and advances the retained cursor. An ONLINE range ACK carries two
@@ -840,8 +831,8 @@ sessions. Downstreams own only their cursors and
 retention pins. `repl-backlog-size` is a global quota divided across workers in
 8 MiB blocks, and block ownership is charged to worker-local retained memory.
 Accepted publication may temporarily borrow above the soft budget. Per-worker
-LSNs start at one for a new history and increase
-monotonically. The log remains active across a downstream disconnect while that
+LSNs start at one for a new history and increase monotonically. The log remains
+active across a downstream disconnect while that
 replica can still resume from the circular reconnect window. Each online native
 session records the next LSN after its highest completely written socket batch
 on every flow; this is a conservative upper bound even when the final ACK is
@@ -868,11 +859,8 @@ export while foreground writes and native history continue. An interrupted
 process discards these blocks during recovery.
 
 A connected native downstream advertises its first unacknowledged LSN as a
-coverage claim. Accepted publication always completes its logical event, even
-when pinned history makes the backlog exceed its retention target. Pressure
-then stops new foreground admission. Commands wait for reclamation only after
-all participating flows can publish and transaction locks and admission have
-been released, allowing replicas to finish the transaction and ACK it.
+coverage claim. Pinned history may temporarily exceed the retention target;
+reclamation waits leave every participant able to finish and ACK a transaction.
 Runtime `CONFIG SET replication-backlog-backpressure no` changes capacity
 conflicts to revoke lagging claims, evict complete old events, and let affected
 consumers discover a floor gap and reconnect with whole-group full sync.
@@ -881,14 +869,11 @@ after its cut follows the same selected policy.
 
 ACK advancement, session cancellation, publication completion, and quota changes
 actively reclaim whole safe events and release their physical blocks. No later
-write is required to return excess memory. Borrowed allocations can require
-shrinking the reconnect window below its configured target; releasing any safe
-block repays that temporary memory debt. A partially occupied active block is
-also reclaimable once every contained event is acknowledged. Shrinking below
-claimed history establishes a target quota, while incomplete events remain
-protected until publication finishes. Eviction, trim, and reconnect coverage
-operate on complete events and never retain or advertise only a suffix of one
-fragmented event. Disconnect leaves the remaining capacity as a bounded
+write is required to return excess memory. Repaying borrowed blocks can shrink
+the reconnect window below its target, including releasing a partially occupied
+active block once all its events are safe. Incomplete events remain protected
+until publication finishes. Eviction, trim, and reconnect coverage never retain
+or advertise only a suffix of a fragmented event. Disconnect leaves a bounded
 reconnect window.
 
 Client `WAIT` uses the same ACK cursors without changing the native wire

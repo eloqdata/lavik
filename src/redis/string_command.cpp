@@ -705,16 +705,12 @@ bycorf::Task<std::string> RunStringLocked(
     }
     storage::SetOptions options;
     options.expire_at_ms_ = *expire_at;
-    std::vector<std::string> captured_args{"SET", args[1], args[3], "PXAT",
-                                           std::to_string(*expire_at)};
-    const auto prepared =
-        PrepareCapturedReplicationCommand(request, captured_args);
-    if (!prepared.ok()) co_return StorageError(prepared);
     auto result = co_await g_storage->SetLocked(
         db, key, digest, args[3], options, tx,
         replication ? &*replication : nullptr, nullptr, mutation_precondition);
     if (result.ok() && result->applied_) {
-      CaptureReplicationCommand(request, std::move(captured_args));
+      CaptureReplicationCommand(request, {"SET", args[1], args[3], "PXAT",
+                                          std::to_string(*expire_at)});
     }
     co_return result.ok() ? EncodeSimpleString("OK")
                           : StorageError(result.status());
@@ -823,9 +819,6 @@ bycorf::Task<std::string> RunStringLocked(
                      : EncodeSemanticNull(request.resp_version_);
       if (!exists) return storage::CompactValueUpdate{};
       captured_args = {"DEL", args[1]};
-      const auto prepared =
-          PrepareCapturedReplicationCommand(request, captured_args);
-      if (!prepared.ok()) return prepared;
       return storage::CompactValueUpdate{
           .changed_ = true,
           .erase_ = true,
@@ -848,9 +841,6 @@ bycorf::Task<std::string> RunStringLocked(
       if (args.size() == 3) {
         if (ttl == 0) return storage::CompactValueUpdate{};
         captured_args = {"PERSIST", args[1]};
-        const auto prepared =
-            PrepareCapturedReplicationCommand(request, captured_args);
-        if (!prepared.ok()) return prepared;
         return storage::CompactValueUpdate{
             .changed_ = true,
             .reuse_encoded_ = true,
@@ -871,9 +861,6 @@ bycorf::Task<std::string> RunStringLocked(
       }
       getex_deadline = *parsed;
       captured_args = {"PEXPIREAT", args[1], std::to_string(*getex_deadline)};
-      const auto prepared =
-          PrepareCapturedReplicationCommand(request, captured_args);
-      if (!prepared.ok()) return prepared;
       if (replication.has_value()) replication->args_ = captured_args;
       if (*getex_deadline <= RedisUnixTimeMillis()) {
         return storage::CompactValueUpdate{
@@ -927,9 +914,6 @@ bycorf::Task<std::string> RunStringLocked(
         replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
       }
       captured_args = {"SET", std::string(key), formatted, "KEEPTTL"};
-      const auto prepared =
-          PrepareCapturedReplicationCommand(request, captured_args);
-      if (!prepared.ok()) return prepared;
       return changed(std::move(formatted));
     }
 
@@ -969,9 +953,6 @@ bycorf::Task<std::string> RunStringLocked(
       replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
     }
     captured_args = {"SET", std::string(key), formatted, "KEEPTTL"};
-    const auto prepared =
-        PrepareCapturedReplicationCommand(request, captured_args);
-    if (!prepared.ok()) return prepared;
     return changed(std::move(formatted));
   };
 
@@ -1276,12 +1257,11 @@ struct BitOpContext {
   std::string output_;
   storage::MutationPrecondition mutation_precondition_;
   ReplicationTransactionGuard* replication_ = nullptr;
-  unsigned coordinator_ = 0;
 };
 
-bycorf::Task<absl::Status> PrepareBitOpReplication(BitOpContext* context) {
+absl::Status PrepareBitOpReplication(BitOpContext* context) noexcept {
   if (context->replication_ == nullptr || !context->replication_->active()) {
-    co_return absl::OkStatus();
+    return absl::OkStatus();
   }
   try {
     std::vector<std::string> canonical_args;
@@ -1292,22 +1272,14 @@ bycorf::Task<absl::Status> PrepareBitOpReplication(BitOpContext* context) {
       canonical_args.emplace_back(context->output_);
     }
 
-    // BITOP's selected value may dwarf its request. Admit its owned copy and
-    // backlog capacity on the coordinator before replacing the destination;
-    // a rejection must leave the primary index untouched.
-    if (bycorf::ThisWorker().id_ == context->coordinator_)
-      co_return co_await context->replication_->PrepareCommandArgs(
-          std::move(canonical_args));
-    co_return co_await bycorf::SubmitTaskTo(
-        context->coordinator_,
-        [replication = context->replication_,
-         canonical_args = std::move(
-             canonical_args)]() mutable -> bycorf::Task<absl::Status> {
-          co_return co_await replication->PrepareCommandArgs(
-              std::move(canonical_args));
-        });
+    // The transaction envelope was allocated for the original BITOP, which
+    // has at least four arguments, so replacing its body with this two- or
+    // three-argument after-image only moves already-owned strings. Preparing
+    // the value copy here is the last potentially failing allocation and must
+    // happen before WriteBitOpDestination mutates the primary index.
+    return context->replication_->TrySetCommandArgs(std::move(canonical_args));
   } catch (const std::length_error&) {
-    co_return absl::ResourceExhaustedError(
+    return absl::ResourceExhaustedError(
         "BITOP replication command is too large");
   }
 }
@@ -1366,7 +1338,7 @@ bycorf::Task<absl::Status> BitOpSingleShardCallback(
   absl::Status read = co_await ReadBitOpSources(context, slice);
   if (!read.ok()) co_return read;
   context->output_ = ComputeBitOp(context->operation_, context->inputs_);
-  absl::Status prepared = co_await PrepareBitOpReplication(context);
+  absl::Status prepared = PrepareBitOpReplication(context);
   if (!prepared.ok()) co_return prepared;
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ == 2) {
@@ -1493,7 +1465,6 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
       .output_ = {},
       .mutation_precondition_ = ClusterMutationPrecondition(request),
       .replication_ = &replication,
-      .coordinator_ = bycorf::ThisWorker().id_,
   };
   if (transaction.single_shard()) {
     status =
@@ -1502,7 +1473,7 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
     status = co_await transaction.Execute(&BitOpReadCallback, &context, false);
     if (status.ok()) {
       context.output_ = ComputeBitOp(context.operation_, context.inputs_);
-      status = co_await PrepareBitOpReplication(&context);
+      status = PrepareBitOpReplication(&context);
       if (status.ok()) {
         status =
             co_await transaction.Execute(&BitOpWriteCallback, &context, true);
@@ -1578,12 +1549,6 @@ bycorf::Task<std::string> ExecuteBitOpLocked(
   const StringExecKey* destination = find_key(2);
   if (destination == nullptr)
     co_return EncodeError("ERR BITOP destination key is missing");
-  std::vector<std::string> canonical =
-      context.output_.empty()
-          ? std::vector<std::string>{"DEL", request.args_[2]}
-          : std::vector<std::string>{"SET", request.args_[2], context.output_};
-  const auto prepared = PrepareCapturedReplicationCommand(request, canonical);
-  if (!prepared.ok()) co_return StorageError(prepared);
   auto write = [&context, destination, &tx_writes]() {
     return WriteBitOpDestination(&context, destination->digest_,
                                  &tx_writes[destination->owner_]);
@@ -1595,7 +1560,11 @@ bycorf::Task<std::string> ExecuteBitOpLocked(
     status = co_await bycorf::SubmitTaskTo(destination->owner_, write);
   }
   if (!status.ok()) co_return StorageError(status);
-  CaptureReplicationCommand(request, std::move(canonical));
+  CaptureReplicationCommand(
+      request,
+      context.output_.empty()
+          ? std::vector<std::string>{"DEL", request.args_[2]}
+          : std::vector<std::string>{"SET", request.args_[2], context.output_});
   co_return EncodeInteger(context.output_.size());
 }
 

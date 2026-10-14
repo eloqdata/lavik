@@ -19,7 +19,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -85,36 +84,9 @@ class ReplicationCommandPayloadSource final
   static absl::StatusOr<ReplicationCommandPayloadSource> Create(
       std::uint8_t db_id, std::span<const std::string_view> args);
   // Convenience ownership boundary for queued vector<string> payloads. The
-  // returned source keeps only views, so args must outlive the source. Create
-  // accounts its codec buffers; accepted publication may exceed a soft budget.
+  // returned source keeps only views, so args must outlive the source.
   static absl::StatusOr<ReplicationCommandPayloadSource> Create(
       std::uint8_t db_id, std::span<const std::string> args);
-
-  // Estimates codec storage including one shared source owner and allocator
-  // rounding. This is a sizing helper, not a separate admission requirement.
-  static std::optional<std::size_t> ReservationBytes(
-      std::size_t maximum_argument_count) noexcept;
-  // Allocates and accounts the length table and argument views. Accepted
-  // replication may exceed the soft memory budget; hard protocol limits still
-  // apply. The caller keeps every referenced argument owner alive until
-  // publication completes. No argument is copied.
-  static absl::StatusOr<ReplicationCommandPayloadSource> Prepare(
-      std::size_t maximum_argument_count);
-
-  // Reuses prepared storage to concatenate independently owned argument
-  // segments into the unchanged LRC1 encoding. Successful calls allocate
-  // nothing, so after-images can be sealed after mutation without another
-  // memory admission. Begin may reset a source until it is published; readers
-  // must observe only a complete source that is no longer being changed.
-  absl::Status Begin(std::uint8_t db_id, std::size_t argument_count);
-  absl::Status AppendArgument(std::string_view argument);
-  absl::Status AppendArguments(std::span<const std::string> arguments);
-  absl::Status AppendArguments(std::span<const std::string_view> arguments);
-  bool complete() const noexcept {
-    return argument_count_ != 0 && args_.size() == argument_count_;
-  }
-  std::size_t argument_capacity() const noexcept { return argument_capacity_; }
-  std::size_t argument_count() const noexcept { return args_.size(); }
 
   ReplicationCommandPayloadSource(ReplicationCommandPayloadSource&&) noexcept =
       default;
@@ -127,15 +99,12 @@ class ReplicationCommandPayloadSource final
 
  private:
   ReplicationCommandPayloadSource() = default;
-  void AccountMetadata();
 
-  // Every source owns its codec-buffer accounting, including prepared sources
-  // that move into a transaction. Buffers are destroyed before their charge.
+  // Codec buffers remain charged until the source is destroyed. Accepted
+  // replication may allocate them beyond the soft memory budget.
   RetainedMemoryCharge metadata_charge_;
   std::string header_;
   std::vector<std::string_view> args_;
-  std::size_t argument_capacity_ = 0;
-  std::size_t argument_count_ = 0;
   std::uint64_t size_ = 0;
 };
 

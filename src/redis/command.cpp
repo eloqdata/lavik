@@ -2518,80 +2518,6 @@ struct ReplicationPublisherAdmission {
   std::vector<WorkerToken> worker_tokens_;
 };
 
-class CommandReplicationEventLimit final
-    : public storage::ReplicationWriteAdmission {
- public:
-  explicit CommandReplicationEventLimit(std::size_t initial_bytes)
-      : initial_bytes_(initial_bytes) {}
-
-  void RequireEventBytes(std::size_t bytes) noexcept override {
-    auto previous = prepared_bytes_.load(std::memory_order_relaxed);
-    while (previous < bytes && !prepared_bytes_.compare_exchange_weak(
-                                   previous, bytes, std::memory_order_release,
-                                   std::memory_order_relaxed)) {
-    }
-  }
-
-  void ReserveEffectBytes(std::size_t bytes) noexcept override {
-    auto previous = effect_bytes_.load(std::memory_order_relaxed);
-    while (!effect_bytes_.compare_exchange_weak(
-        previous, SaturatingAdd(previous, bytes), std::memory_order_release,
-        std::memory_order_relaxed)) {
-    }
-  }
-
-  void ReleaseEffectBytes(std::size_t bytes) noexcept override {
-    auto previous = effect_bytes_.load(std::memory_order_relaxed);
-    while (!effect_bytes_.compare_exchange_weak(
-        previous, previous - std::min(previous, bytes),
-        std::memory_order_release, std::memory_order_relaxed)) {
-    }
-  }
-
-  bool CoversWrite(std::size_t event_bytes = 0) const noexcept override {
-    return !ReplicationEventExceedsLimit(RequiredBytes(event_bytes));
-  }
-
-  Task<absl::Status> PrepareWrite(std::size_t event_bytes = 0) override {
-    const std::size_t bytes = RequiredBytes(event_bytes);
-    if (ReplicationEventExceedsLimit(bytes)) {
-      co_return absl::ResourceExhaustedError(
-          "replication event exceeds the 1 GiB event limit");
-    }
-    // This bridge enforces only the wire limit. An admitted command allocates
-    // its replication state on demand, without another soft-budget decision
-    // or a cross-worker reservation while it holds transaction locks.
-    co_return absl::OkStatus();
-  }
-
- private:
-  std::size_t RequiredBytes(std::size_t event_bytes) const noexcept {
-    return std::max(
-        {initial_bytes_, event_bytes,
-         prepared_bytes_.load(std::memory_order_acquire),
-         SaturatingAdd(effect_bytes_.load(std::memory_order_acquire), 256)});
-  }
-  const std::size_t initial_bytes_;
-  std::atomic<std::size_t> prepared_bytes_{0};
-  std::atomic<std::size_t> effect_bytes_{0};
-};
-
-class RequestReplicationAdmissionGuard {
- public:
-  RequestReplicationAdmissionGuard(const CommandRequest& request,
-                                   storage::ReplicationWriteAdmission* current)
-      : request_(request), previous_(request.replication_admission_) {
-    request_.replication_admission_ = current;
-  }
-  ~RequestReplicationAdmissionGuard() {
-    request_.replication_admission_ = previous_;
-  }
-
- private:
-  const CommandRequest& request_;
-  storage::ReplicationWriteAdmission* previous_;
-};
-
 thread_local const ReplicationPublisherAdmission*
     g_active_replication_publisher_admission = nullptr;
 
@@ -5369,8 +5295,6 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
         co_return EncodeError(RestoreDecodeError(value.status()));
       }
       value->expire_at_ms_ = options->expire_at_ms_;
-      auto canonical =
-          CanonicalRestoreCommand(args[1], args[3], options->expire_at_ms_);
       auto restored = co_await ApplyPreparedRestore(
           *value, db_id, args[1], options->replace_, &digest, tx);
       if (!restored.ok()) co_return EncodeStorageError(restored.status());
@@ -5378,7 +5302,9 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
         co_return EncodeError("BUSYKEY Target key name already exists.");
       }
       if (restored->changed_) {
-        CaptureReplicationCommand(request, std::move(canonical));
+        CaptureReplicationCommand(
+            request,
+            CanonicalRestoreCommand(args[1], args[3], options->expire_at_ms_));
         if (!restored->deleted_) {
           NotifyRenamedValue(request, db_id, args[1], value->value_type_);
         }
@@ -5392,19 +5318,19 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       if (!options.ok()) {
         co_return EncodeError(absl::StrCat("ERR ", options.status().message()));
       }
-      std::vector<std::string> canonical{"SET", args[1], args[2]};
-      if (options->expire_at_ms_ != 0) {
-        canonical.emplace_back("PXAT");
-        canonical.push_back(std::to_string(options->expire_at_ms_));
-      } else if (options->keep_ttl_) {
-        canonical.emplace_back("KEEPTTL");
-      }
       auto result = co_await g_storage->SetLocked(db_id, args[1], digest,
                                                   args[2], *options, tx);
       if (!result.ok()) {
         co_return EncodeStorageError(result.status());
       }
       if (result->applied_) {
+        std::vector<std::string> canonical{"SET", args[1], args[2]};
+        if (options->expire_at_ms_ != 0) {
+          canonical.emplace_back("PXAT");
+          canonical.push_back(std::to_string(options->expire_at_ms_));
+        } else if (options->keep_ttl_) {
+          canonical.emplace_back("KEEPTTL");
+        }
         CaptureReplicationCommand(request, std::move(canonical));
       }
       if (options->return_old_value_) {
@@ -5729,18 +5655,16 @@ Task<absl::Status> PauseCopyHopForTest(const CommandRequest& request,
 template <typename Context, typename ShouldSkip>
 Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
     tx::Transaction& transaction, const CommandRequest& request,
-    ReplicationTransactionGuard& replication, Context* context,
-    TwoPhaseCallback read_callback, TwoPhaseCallback write_callback,
-    TwoPhaseCallback single_shard_callback, ShouldSkip should_skip) {
+    Context* context, TwoPhaseCallback read_callback,
+    TwoPhaseCallback write_callback, TwoPhaseCallback single_shard_callback,
+    ShouldSkip should_skip) {
+  absl::Status status = co_await transaction.Schedule();
+  if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
+
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   context->writes_.resize(g_storage->worker_count());
   g_storage->InitializeTxWrites(txid, context->writes_,
                                 ClusterMutationPrecondition(request));
-  absl::Status status =
-      replication.PrepareFinalExpirations(context->writes_, request);
-  if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
-  status = co_await transaction.Schedule();
-  if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
   for (storage::TxShardWrites& writes : context->writes_) {
     writes.collect_undo_ = true;
   }
@@ -5954,9 +5878,8 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
   RenameContext context;
   context.request_ = &request;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
-      transaction, request, replication, &context, &RenameReadCallback,
-      &RenameWriteCallback, &RenameSingleShardCallback,
-      [nx](const RenameContext& value) {
+      transaction, request, &context, &RenameReadCallback, &RenameWriteCallback,
+      &RenameSingleShardCallback, [nx](const RenameContext& value) {
         return nx && value.destination_exists_;
       });
   absl::Status status = std::move(execution.status_);
@@ -6152,9 +6075,8 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
   context.request_ = &request;
   context.options_ = *options;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
-      transaction, request, replication, &context, &CopyReadCallback,
-      &CopyWriteCallback, &CopySingleShardCallback,
-      [](const CopyContext& value) {
+      transaction, request, &context, &CopyReadCallback, &CopyWriteCallback,
+      &CopySingleShardCallback, [](const CopyContext& value) {
         return !value.source_.has_value() ||
                (value.destination_exists_ && !value.options_.replace_);
       });
@@ -6265,7 +6187,7 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
   MSetNxContext context;
   context.request_ = &request;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
-      transaction, request, replication, &context, &MSetNxCheckCallback,
+      transaction, request, &context, &MSetNxCheckCallback,
       &MSetNxWriteCallback, &MSetNxSingleShardCallback,
       [](const MSetNxContext& value) {
         return value.exists_.load(std::memory_order_relaxed);
@@ -6453,12 +6375,6 @@ Task<CommandReply> ExecuteMultiKey(
     ctx.tx_writes_.resize(g_storage->worker_count());
     g_storage->InitializeTxWrites(write_txid, ctx.tx_writes_,
                                   ClusterMutationPrecondition(request));
-    if (replication != nullptr) {
-      const auto prepared =
-          replication->PrepareFinalExpirations(ctx.tx_writes_, request);
-      if (!prepared.ok())
-        co_return BuiltReply(AppendStorageError(reply_builder, prepared));
-    }
     for (auto& shard : ctx.tx_writes_) {
       shard.collect_undo_ = true;
     }
@@ -7059,23 +6975,10 @@ Task<std::string> ExecuteExecSequentialSetMulti(
     *bytes += count * width;
     return true;
   };
-  const auto prepare_capture = [&](const std::vector<std::string>& first,
-                                   const std::vector<std::string>& second,
-                                   bool include_second) -> absl::Status {
+  const auto prepare_capture = [&](bool include_second) -> absl::Status {
     if (command.replication_capture_ == nullptr) return absl::OkStatus();
-    std::size_t bytes = 0;
-    std::size_t argument_count = 0;
-    for (const auto* effect : {&first, include_second ? &second : &first}) {
-      argument_count += effect->size();
-      if (!add_bytes(&bytes, effect->capacity(), sizeof(std::string)))
-        return oom();
-      for (const auto& argument : *effect) {
-        if (!add_bytes(&bytes, argument.capacity() + 1)) return oom();
-      }
-      if (!include_second) break;
-    }
     return command.replication_capture_->ReserveAdditionalCommands(
-        include_second ? 2 : 1, bytes, argument_count);
+        include_second ? 2 : 1);
   };
   try {
     // These outlive the materialized input/output strings, including owner
@@ -7189,7 +7092,7 @@ Task<std::string> ExecuteExecSequentialSetMulti(
       effect_charge.Adopt(&*effect_admission, effect_bytes);
       std::vector<std::string> remove_effect{"SREM", args[1], args[3]};
       std::vector<std::string> add_effect{"SADD", args[2], args[3]};
-      auto capture_ready = prepare_capture(remove_effect, add_effect, true);
+      auto capture_ready = prepare_capture(true);
       if (!capture_ready.ok()) co_return EncodeStorageError(capture_ready);
       absl::Status undo =
           co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
@@ -7341,8 +7244,7 @@ Task<std::string> ExecuteExecSequentialSetMulti(
                          std::make_move_iterator(ordered.begin()),
                          std::make_move_iterator(ordered.end()));
       }
-      auto capture_ready =
-          prepare_capture(remove_effect, canonical, !output.empty());
+      auto capture_ready = prepare_capture(!output.empty());
       if (!capture_ready.ok()) co_return EncodeStorageError(capture_ready);
       absl::Status undo =
           co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
@@ -7453,27 +7355,6 @@ Task<std::string> ExecuteExecSequentialListPop(
   }
 
   for (const ExecKey& key : keys) {
-    std::vector<std::string> canonical;
-    if (command.replication_capture_ != nullptr) {
-      auto read_length = [&]() -> Task<absl::StatusOr<storage::ListResult>> {
-        storage::ListOperation operation;
-        operation.kind_ = storage::ListOperationKind::kLength;
-        co_return co_await g_storage->ExecuteListLocked(
-            command.db_id_, args[key.arg_], key.digest_, operation);
-      };
-      absl::StatusOr<storage::ListResult> length;
-      if (key.owner_ == ThisWorker().id_)
-        length = co_await read_length();
-      else
-        length = co_await SubmitTaskTo(key.owner_, read_length);
-      if (!length.ok()) co_return EncodeStorageError(length.status());
-      if (length->length_ == 0) continue;
-      canonical = {left ? "LPOP" : "RPOP", args[key.arg_],
-                   std::to_string(std::min(count, length->length_))};
-      const auto prepared =
-          PrepareCapturedReplicationCommand(command, canonical);
-      if (!prepared.ok()) co_return EncodeStorageError(prepared);
-    }
     auto pop = [&]() -> Task<absl::StatusOr<storage::ListResult>> {
       storage::ListOperation operation;
       operation.kind_ = left ? storage::ListOperationKind::kPopLeft
@@ -7503,7 +7384,9 @@ Task<std::string> ExecuteExecSequentialListPop(
     } else {
       builder.AppendBulkString(result->values_.front());
     }
-    CaptureReplicationCommand(command, std::move(canonical));
+    CaptureReplicationCommand(command,
+                              {left ? "LPOP" : "RPOP", args[key.arg_],
+                               std::to_string(result->values_.size())});
     co_return std::string(builder.View());
   }
   ReplyBuilder builder(command.resp_version_);
@@ -7573,33 +7456,7 @@ Task<std::string> ExecuteExecSequentialListMove(
     co_return co_await SubmitTaskTo(key.owner_, execute);
   };
 
-  std::vector<std::string> pop_effect;
-  std::vector<std::string> push_effect;
-  auto prepare_effects = [&]() -> Task<absl::StatusOr<bool>> {
-    if (command.replication_capture_ == nullptr) co_return true;
-    // EXEC keeps both key holds throughout the child. Read the chosen value
-    // before mutating so capture failure leaves this child and every earlier
-    // successful child's effects intact, including same-key moves without undo.
-    storage::ListOperation peek;
-    peek.kind_ = storage::ListOperationKind::kIndex;
-    peek.first_ = source_left ? 0 : -1;
-    auto selected = co_await run_list(*source, std::move(peek), false);
-    if (!selected.ok()) co_return selected.status();
-    if (selected->values_.empty()) co_return false;
-    pop_effect = {source_left ? "LPOP" : "RPOP", args[1]};
-    push_effect = {destination_left ? "LPUSH" : "RPUSH", args[2],
-                   selected->values_.front()};
-    auto prepared = PrepareCapturedReplicationCommand(command, pop_effect);
-    if (!prepared.ok()) co_return prepared;
-    prepared = PrepareCapturedReplicationCommand(command, push_effect);
-    if (!prepared.ok()) co_return prepared;
-    co_return true;
-  };
-
   if (args[1] == args[2]) {
-    auto prepared = co_await prepare_effects();
-    if (!prepared.ok()) co_return EncodeStorageError(prepared.status());
-    if (!*prepared) co_return EncodeSemanticNull(command.resp_version_);
     storage::ListOperation move;
     move.kind_ = storage::ListOperationKind::kMoveWithin;
     move.first_ = source_left ? 1 : 0;
@@ -7609,8 +7466,10 @@ Task<std::string> ExecuteExecSequentialListMove(
     if (moved->values_.empty())
       co_return EncodeSemanticNull(command.resp_version_);
     const std::string& value = moved->values_.front();
-    CaptureReplicationCommand(command, std::move(pop_effect));
-    CaptureReplicationCommand(command, std::move(push_effect));
+    CaptureReplicationCommand(command,
+                              {source_left ? "LPOP" : "RPOP", args[1]});
+    CaptureReplicationCommand(
+        command, {destination_left ? "LPUSH" : "RPUSH", args[2], value});
     NotifyListBlockingKey(command, args[1]);
     co_return EncodeBulkString(value);
   }
@@ -7621,9 +7480,6 @@ Task<std::string> ExecuteExecSequentialListMove(
   validate.kind_ = storage::ListOperationKind::kLength;
   auto checked = co_await run_list(*destination, std::move(validate), false);
   if (!checked.ok()) co_return EncodeStorageError(checked.status());
-  auto prepared = co_await prepare_effects();
-  if (!prepared.ok()) co_return EncodeStorageError(prepared.status());
-  if (!*prepared) co_return EncodeSemanticNull(command.resp_version_);
 
   // EXEC normally has no runtime undo because command errors do not roll back
   // earlier commands. LMOVE is one command spanning two writes, however: keep
@@ -7669,8 +7525,9 @@ Task<std::string> ExecuteExecSequentialListMove(
       co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
   if (!completed.ok()) co_return EncodeStorageError(completed);
   const std::string& value = popped->values_.front();
-  CaptureReplicationCommand(command, std::move(pop_effect));
-  CaptureReplicationCommand(command, std::move(push_effect));
+  CaptureReplicationCommand(command, {source_left ? "LPOP" : "RPOP", args[1]});
+  CaptureReplicationCommand(
+      command, {destination_left ? "LPUSH" : "RPUSH", args[2], value});
   NotifyListBlockingKey(command, args[1]);
   NotifyListBlockingKey(command, args[2]);
   co_return EncodeBulkString(value);
@@ -7681,47 +7538,45 @@ Task<std::string> ExecuteExecSequentialCommand(
     const std::vector<ExecKey>& keys,
     std::vector<storage::TxShardWrites>& tx_writes, bool script_context = false,
     ReplyChunkSource* chunks = nullptr) {
-  std::string reply;
+  struct PreparedCaptureCleanup {
+    ReplicationCommandCapture* capture;
+    ~PreparedCaptureCleanup() {
+      if (capture != nullptr) capture->ReleaseUnusedPreparation();
+    }
+  } capture_cleanup{family == ExecSequentialFamily::kSetMulti ||
+                            family == ExecSequentialFamily::kZSetMulti
+                        ? command.replication_capture_.get()
+                        : nullptr};
   switch (family) {
     case ExecSequentialFamily::kListPop:
-      reply = co_await ExecuteExecSequentialListPop(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialListPop(command, keys, tx_writes);
     case ExecSequentialFamily::kListMove:
-      reply = co_await ExecuteExecSequentialListMove(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialListMove(command, keys,
+                                                       tx_writes);
     case ExecSequentialFamily::kRename:
-      reply = co_await ExecuteExecSequentialRename(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialRename(command, keys, tx_writes);
     case ExecSequentialFamily::kCopy:
-      reply = co_await ExecuteExecSequentialCopy(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialCopy(command, keys, tx_writes);
     case ExecSequentialFamily::kStringMulti:
-      reply =
-          co_await ExecuteExecSequentialStringMulti(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialStringMulti(command, keys,
+                                                          tx_writes);
     case ExecSequentialFamily::kSetMulti:
-      reply = co_await ExecuteExecSequentialSetMulti(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialSetMulti(command, keys,
+                                                       tx_writes);
     case ExecSequentialFamily::kZSetMulti:
-      reply = co_await ExecuteExecSequentialZSetMulti(command, keys, tx_writes);
-      break;
+      co_return co_await ExecuteExecSequentialZSetMulti(command, keys,
+                                                        tx_writes);
     case ExecSequentialFamily::kStreamRead:
-      reply = co_await ExecuteExecSequentialStreamRead(command, keys, tx_writes,
-                                                       chunks);
-      break;
+      co_return co_await ExecuteExecSequentialStreamRead(command, keys,
+                                                         tx_writes, chunks);
     case ExecSequentialFamily::kSort:
-      reply = co_await ExecuteExecSequentialSort(
+      co_return co_await ExecuteExecSequentialSort(
           command, keys, tx_writes,
           /*deterministic_set_order=*/script_context);
-      break;
     case ExecSequentialFamily::kNone:
-      reply = EncodeError("ERR internal EXEC sequential routing error");
-      break;
+      co_return EncodeError("ERR internal EXEC sequential routing error");
   }
-  if (command.replication_capture_ != nullptr)
-    command.replication_capture_->ReleaseUnusedPreparation(
-        !reply.empty() && reply.front() == '-');
-  co_return reply;
+  co_return EncodeError("ERR internal EXEC sequential routing error");
 }
 
 // One squashed run of consecutive keyed commands [begin, end): every shard
@@ -7754,10 +7609,10 @@ struct ExecRunContext {
 void AssembleRunReplies(ExecRunContext& run) {
   for (std::size_t i = run.begin_; i < run.end_; ++i) {
     const auto& capture = (*run.queued_)[i].replication_capture_;
+    if (capture != nullptr) capture->ReleaseUnusedPreparation();
     const std::size_t local = i - run.begin_;
     if (!run.errors_[local].ok()) {
       (*run.replies_)[i] = EncodeStorageError(run.errors_[local]);
-      if (capture != nullptr) capture->ReleaseUnusedPreparation(true);
       continue;
     }
     switch ((*run.queued_)[i].kind_) {
@@ -7786,9 +7641,6 @@ void AssembleRunReplies(ExecRunContext& run) {
       default:
         break;
     }
-    const auto& reply = (*run.replies_)[i];
-    if (capture != nullptr)
-      capture->ReleaseUnusedPreparation(!reply.empty() && reply.front() == '-');
   }
 }
 
@@ -7823,17 +7675,11 @@ void InitExecRun(ExecRunContext& run, const std::vector<CommandRequest>& queued,
       absl::Status prepared;
       try {
         effects.resize(cmd_keys[i].size());
-        std::size_t bytes = 0;
         for (const ExecKey& key : cmd_keys[i]) {
-          auto& args = effects[key.slot_];
-          args = {"DEL", command.args_[key.arg_]};
-          bytes = SaturatingAdd(bytes, args.capacity() * sizeof(std::string));
-          for (const auto& arg : args) {
-            bytes = SaturatingAdd(bytes, arg.capacity() + 1);
-          }
+          effects[key.slot_] = {"DEL", command.args_[key.arg_]};
         }
         prepared = command.replication_capture_->ReserveAdditionalCommands(
-            effects.size(), bytes);
+            effects.size());
       } catch (const std::length_error&) {
         prepared = absl::ResourceExhaustedError("OOM preparing DEL effects");
       }
@@ -7901,29 +7747,6 @@ std::shared_ptr<RetainedMemoryCharge> ChargeReplicationArguments(
   return charge;
 }
 
-CapturedReplicationCommand CapturedCommandFallback(
-    const CommandRequest& command) {
-  if (command.replication_capture_ != nullptr)
-    return command.replication_capture_->Fallback(command.db_id_,
-                                                  command.args_);
-  return CapturedReplicationCommand{command.db_id_, command.args_};
-}
-
-struct PreparedCapturedBody {
-  std::vector<std::shared_ptr<RetainedMemoryCharge>> charges_;
-  std::vector<std::string> args_;
-};
-
-PreparedCapturedBody EncodePreparedCapturedBody(
-    CapturedReplicationCommands commands) {
-  PreparedCapturedBody result;
-  result.args_ = EncodeReplicationCommandEffects(std::move(commands));
-  // The old per-command vectors have been destroyed. Replace their charges
-  // with the actual merged representation, including its new argument table.
-  result.charges_.push_back(ChargeReplicationArguments(result.args_));
-  return result;
-}
-
 void CollectLuaReplicationEffects(const CommandRequest& command,
                                   std::string_view reply,
                                   CapturedReplicationCommands* effects) {
@@ -7938,16 +7761,11 @@ void CollectLuaReplicationEffects(const CommandRequest& command,
   // A child can fail after an earlier Stream/key has committed. Handled
   // captures describe actual effects, regardless of redis.call/pcall's reply.
   if (!captured.handled_) {
-    if (reply.empty() || reply.front() == '-') {
-      if (command.replication_capture_ != nullptr)
-        command.replication_capture_->ReleaseUnusedPreparation(true);
-      return;
-    }
-    effects->push_back(CapturedCommandFallback(command));
+    if (reply.empty() || reply.front() == '-') return;
+    effects->push_back(
+        CapturedReplicationCommand{command.db_id_, command.args_});
     return;
   }
-  if (captured.commands_.empty() && command.replication_capture_ != nullptr)
-    command.replication_capture_->ReleaseUnusedPreparation();
   effects->insert(effects->end(),
                   std::make_move_iterator(captured.commands_.begin()),
                   std::make_move_iterator(captured.commands_.end()));
@@ -7978,7 +7796,6 @@ Task<std::string> ExecuteLuaRedisCall(
   CommandRequest command = std::move(*built);
   command.resp_version_ = lua_execution->resp_version();
   command.replication_origin_ = eval_request.replication_origin_;
-  command.replication_admission_ = eval_request.replication_admission_;
   command.cluster_authority_admission_ =
       eval_request.cluster_authority_admission_;
   command.blocking_notification_capture_ = notifications;
@@ -8131,11 +7948,6 @@ Task<std::string> ExecuteLuaRedisCall(
   }
   if (write && !lua_execution->MarkWriteCommand()) {
     co_return EncodeError("ERR Script killed by user with SCRIPT KILL...");
-  }
-  if ((flags & (kCmdWrite | kCmdMayReplicate)) != 0) {
-    const auto prepared = command.replication_capture_->PrepareDefault(
-        command.args_, command.replication_admission_);
-    if (!prepared.ok()) co_return EncodeStorageError(prepared);
   }
 
   // Choke point 2 for redis.call: re-check the script's captured authority
@@ -8577,14 +8389,6 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
         co_return BuiltReply(
             AppendStorageError(reply_builder, replication->status()));
       }
-      const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
-      tx_writes.resize(g_storage->worker_count());
-      g_storage->InitializeTxWrites(txid, tx_writes,
-                                    ClusterMutationPrecondition(request));
-      const auto prepared =
-          replication->PrepareFinalExpirations(tx_writes, request);
-      if (!prepared.ok())
-        co_return BuiltReply(AppendStorageError(reply_builder, prepared));
     }
     absl::Status scheduled = co_await transaction->Schedule();
     if (!scheduled.ok()) {
@@ -8603,6 +8407,12 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
       }
       co_return BuiltReply(
           reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
+    }
+    if (!read_only) {
+      const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+      tx_writes.resize(g_storage->worker_count());
+      g_storage->InitializeTxWrites(txid, tx_writes,
+                                    ClusterMutationPrecondition(request));
     }
   }
 
@@ -8638,9 +8448,8 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
           reply_builder.AppendError(absl::StrCat("ERR ", released.message())));
     }
     if (!read_only && !effects.empty() && replication != nullptr) {
-      auto prepared = EncodePreparedCapturedBody(std::move(effects));
-      replication->AdoptCommandArgs(std::move(prepared.args_),
-                                    std::move(prepared.charges_));
+      replication->SetCommandArgs(
+          EncodeReplicationCommandEffects(std::move(effects)));
       replication->SetFinalExpirations(tx_writes);
       replication->Commit();
     }
@@ -9299,15 +9108,6 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
           // the reply slot directly (errors self-encode).
           (*ctx->replies_)[i] = co_await RunSingleKeyLocked(
               cmd.db_id_, cmd, key.digest_, tx, &(*ctx->reply_chunks_)[i]);
-          // A squashed run executes its next child before the coordinator
-          // assembles replies. Retire an unused failed child's allowance now;
-          // otherwise its larger bound can reject an unrelated later write.
-          // This branch has one owner, unlike the aggregate MSET/DEL cases.
-          if (cmd.replication_capture_ != nullptr) {
-            const auto& reply = (*ctx->replies_)[i];
-            cmd.replication_capture_->ReleaseUnusedPreparation(
-                !reply.empty() && reply.front() == '-');
-          }
           break;
       }
       if (command_failed) {
@@ -9824,12 +9624,6 @@ Task<CommandReply> ExecuteExecBody(
       if (ExecCommandMayReplicate(command)) {
         command.replication_capture_ =
             std::make_shared<ReplicationCommandCapture>();
-        const auto prepared = command.replication_capture_->PrepareDefault(
-            command.args_, command.replication_admission_);
-        if (!prepared.ok()) {
-          co_await DropWatches(ctx);
-          co_return BuiltReply(AppendStorageError(reply_builder, prepared));
-        }
         command.defer_pubsub_delivery_ = command.kind_ == CommandKind::kPublish;
       }
     }
@@ -10251,16 +10045,6 @@ Task<CommandReply> ExecuteExecBody(
         write_request == queued.end()
             ? storage::MutationPrecondition{}
             : ClusterMutationPrecondition(*write_request));
-    auto prepare_final_expirations = [&](ReplicationTransactionGuard& guard) {
-      std::vector<ReplicationExpirationKey> keys;
-      for (std::size_t index = 0; index < cmd_keys.size(); ++index) {
-        for (const ExecKey& key : cmd_keys[index]) {
-          if (key.mode_ != tx::LockMode::kExclusive) continue;
-          keys.push_back({queued[index].args_[key.arg_], key.owner_, key.db_});
-        }
-      }
-      return guard.PrepareFinalExpirations(tx_writes, keys);
-    };
 
     // Every read and write owner participates in the replication barrier.
     // Any command that has not yet been reduced to an independent after-image
@@ -10332,11 +10116,12 @@ Task<CommandReply> ExecuteExecBody(
         } else if (replies[index].empty() || replies[index].front() != '-') {
           if (command.spec_ != nullptr &&
               (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0) {
-            commands.push_back(CapturedCommandFallback(command));
+            commands.push_back(
+                CapturedReplicationCommand{command.db_id_, command.args_});
           }
         }
       }
-      return EncodePreparedCapturedBody(std::move(commands));
+      return EncodeReplicationCommandEffects(std::move(commands));
     };
     auto catalog_mutation_succeeded = [&]() {
       if (!contains_catalog_replication_mutation) return false;
@@ -10352,16 +10137,15 @@ Task<CommandReply> ExecuteExecBody(
         [&](ReplicationTransactionGuard* replication) -> absl::StatusOr<bool> {
       if (replication == nullptr) return false;
       const bool catalog_mutation_committed = catalog_mutation_succeeded();
-      auto resolved = resolved_replication_args();
-      if (resolved.args_.size() < 2 || resolved.args_[1] == "0") {
+      std::vector<std::string> resolved = resolved_replication_args();
+      if (resolved.size() < 2 || resolved[1] == "0") {
         if (catalog_mutation_committed) {
           return absl::DataLossError(
               "durable Function catalog has no replication body");
         }
         return false;
       }
-      replication->AdoptCommandArgs(std::move(resolved.args_),
-                                    std::move(resolved.charges_));
+      replication->SetCommandArgs(std::move(resolved));
       replication->SetFinalExpirations(tx_writes);
       if (!replication->Commit()) {
         if (catalog_mutation_committed) {
@@ -10463,12 +10247,6 @@ Task<CommandReply> ExecuteExecBody(
           co_await DropWatches(ctx);
           co_return finalize_exec_reply(BuiltReply(
               AppendStorageError(reply_builder, replication->status())));
-        }
-        const auto expirations_ready = prepare_final_expirations(*replication);
-        if (!expirations_ready.ok()) {
-          co_await DropWatches(ctx);
-          co_return finalize_exec_reply(
-              BuiltReply(AppendStorageError(reply_builder, expirations_ready)));
         }
         if (needs_catalog_replication_participant) {
           absl::Status entered =
@@ -10640,12 +10418,6 @@ Task<CommandReply> ExecuteExecBody(
           co_await DropWatches(ctx);
           co_return finalize_exec_reply(BuiltReply(
               AppendStorageError(reply_builder, replication->status())));
-        }
-        const auto expirations_ready = prepare_final_expirations(*replication);
-        if (!expirations_ready.ok()) {
-          co_await DropWatches(ctx);
-          co_return finalize_exec_reply(
-              BuiltReply(AppendStorageError(reply_builder, expirations_ready)));
         }
         if (needs_catalog_replication_participant) {
           absl::Status entered =
@@ -10854,7 +10626,8 @@ Task<CommandReply> ExecuteExecBody(
                         std::make_move_iterator(captured.commands_.end()));
       } else if (command.spec_ != nullptr &&
                  (command.spec_->flags_ & kCmdMayReplicate) != 0) {
-        commands.push_back(CapturedCommandFallback(command));
+        commands.push_back(
+            CapturedReplicationCommand{command.db_id_, command.args_});
       }
     }
     if (!commands.empty()) {
@@ -10898,10 +10671,9 @@ Task<CommandReply> ExecuteExecBody(
                                   : EncodeReplicationCommandEffects(
                                         std::move(non_catalog_commands));
       }
-      auto prepared_effects = EncodePreparedCapturedBody(std::move(commands));
-      auto retained_owner =
-          std::make_shared<std::vector<std::shared_ptr<RetainedMemoryCharge>>>(
-              std::move(prepared_effects.charges_));
+      std::vector<std::string> effects =
+          EncodeReplicationCommandEffects(std::move(commands));
+      auto effects_charge = ChargeReplicationArguments(effects);
       const auto token = std::find_if(active_admission->worker_tokens_.begin(),
                                       active_admission->worker_tokens_.end(),
                                       [source_worker](const auto& item) {
@@ -10921,9 +10693,9 @@ Task<CommandReply> ExecuteExecBody(
       absl::Status published = co_await bycorf::SubmitTo(
           source_worker,
           [storage_admission = std::move(storage_admission), event_kind,
-           partition_id, effects = std::move(prepared_effects.args_),
+           partition_id, effects_charge = std::move(effects_charge),
+           effects = std::move(effects),
            fullsync_projection = std::move(fullsync_projection),
-           retained_owner = std::move(retained_owner),
            exec_admission]() mutable {
             LAVIK_FAULT_INJECT(
                 static std::atomic<bool> reject_ephemeral_once = false;
@@ -10949,7 +10721,7 @@ Task<CommandReply> ExecuteExecBody(
             }
             return g_storage->PublishLateAdmittedReplicationCommand(
                 storage_admission, event_kind, partition_id, std::move(effects),
-                std::move(fullsync_projection), std::move(retained_owner));
+                std::move(fullsync_projection), std::move(effects_charge));
           });
       if (!published.ok()) {
         if (catalog_mutation) {
@@ -11210,10 +10982,6 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   CommandReply reply;
   {
     ActivePublisherAdmissionGuard active_admission(&*admission);
-    CommandReplicationEventLimit replication_limit(event_bytes);
-    for (auto& command : ctx.queued_) {
-      command.replication_admission_ = &replication_limit;
-    }
     reply = co_await ExecuteExecBody(
         ctx, reply_builder, write_admission_role_epoch, &*admission,
         &admission_released, needs_pattern_cut ? &pattern_order : nullptr);
@@ -11404,63 +11172,20 @@ CapturedReplicationCommand::CapturedReplicationCommand(
       db_id_(db_id),
       args_(std::move(args)) {}
 
-absl::Status ReplicationCommandCapture::PrepareDefault(
-    std::span<const std::string> args,
-    storage::ReplicationWriteAdmission* admission) {
-  admission_ = admission;
-  std::size_t bytes = 64;
-  for (const auto& arg : args)
-    bytes =
-        SaturatingAdd(bytes, SaturatingAdd(arg.size(), sizeof(std::uint32_t)));
-  if (admission_ != nullptr) {
-    admission_->ReserveEffectBytes(bytes);
-    reserved_effect_bytes_ = bytes;
-  }
-  return absl::OkStatus();
-}
-
-CapturedReplicationCommand ReplicationCommandCapture::Fallback(
-    std::uint8_t db_id, std::vector<std::string> args) const {
-  return CapturedReplicationCommand{db_id, std::move(args)};
-}
-
 absl::Status ReplicationCommandCapture::ReserveAdditionalCommands(
-    std::size_t count, std::size_t payload_bytes, std::size_t argument_count) {
+    std::size_t count) {
   std::lock_guard lock(mutex_);
-  if (count > commands_.max_size() - prepared_items_) {
+  if (count > commands_.max_size() - commands_.size()) {
     return absl::ResourceExhaustedError("replication capture size overflow");
   }
-  const auto event_bytes = SaturatingAdd(
-      payload_bytes,
-      SaturatingAdd(
-          count > SIZE_MAX / 64 ? SIZE_MAX : count * 64,
-          argument_count > SIZE_MAX / 4 ? SIZE_MAX : argument_count * 4));
-  if (event_bytes > kMaxNativeReplicationEventBytes ||
-      reserved_effect_bytes_ > kMaxNativeReplicationEventBytes - event_bytes) {
-    return absl::ResourceExhaustedError(
-        "replication capture exceeds the 1 GiB event limit");
-  }
-  commands_.reserve(prepared_items_ + count);
-  prepared_items_ += count;
-  if (admission_ != nullptr) {
-    admission_->ReserveEffectBytes(event_bytes);
-  }
-  reserved_effect_bytes_ += event_bytes;
+  commands_.reserve(commands_.size() + count);
   return absl::OkStatus();
 }
 
-void ReplicationCommandCapture::ReleaseUnusedPreparation(bool failed) {
+void ReplicationCommandCapture::ReleaseUnusedPreparation() {
   std::lock_guard lock(mutex_);
-  if (!commands_.empty() || (!failed && !handled_)) return;
-  // The queued request can outlive this failed command for the rest of EXEC.
-  // Drop allocated capacity before the charge; preserve handled_ so an empty
-  // canonical result cannot fall back to replaying the original command.
+  if (!commands_.empty()) return;
   CapturedReplicationCommands().swap(commands_);
-  prepared_items_ = 0;
-  if (admission_ != nullptr && reserved_effect_bytes_ != 0) {
-    admission_->ReleaseEffectBytes(reserved_effect_bytes_);
-  }
-  reserved_effect_bytes_ = 0;
 }
 
 void ReplicationCommandCapture::MarkHandled() {
@@ -11487,7 +11212,6 @@ void ReplicationCommandCapture::Record(CapturedReplicationCommand command) {
 
 CapturedReplicationEffects ReplicationCommandCapture::Take() {
   std::lock_guard lock(mutex_);
-  prepared_items_ = 0;
   return CapturedReplicationEffects{handled_, std::move(commands_)};
 }
 
@@ -11507,17 +11231,6 @@ ReplicationCommandCapture::TakeCapturedPubSubPublication() {
 void CaptureReplicationCommand(const CommandRequest& request,
                                std::vector<std::string> canonical_args) {
   CaptureReplicationCommand(request, request.db_id_, std::move(canonical_args));
-}
-
-absl::Status PrepareCapturedReplicationCommand(
-    const CommandRequest& request,
-    std::span<const std::string> canonical_args) {
-  if (request.replication_capture_ == nullptr) return absl::OkStatus();
-  std::size_t bytes = canonical_args.size() * sizeof(std::string);
-  for (const auto& argument : canonical_args)
-    bytes = SaturatingAdd(bytes, argument.capacity() + 1);
-  return request.replication_capture_->ReserveAdditionalCommands(
-      1, bytes, canonical_args.size());
 }
 
 void CaptureReplicationCommand(const CommandRequest& request,
@@ -11561,7 +11274,6 @@ std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
   }
   storage::ReplicationCommandAppend append;
   append.db_id_ = request.db_id_;
-  append.admission_ = request.replication_admission_;
   append.args_ =
       canonical_args.empty() ? request.args_ : std::move(canonical_args);
   return append;
@@ -11602,7 +11314,6 @@ ReplicationTransactionGuard::ReplicationTransactionGuard(
 void ReplicationTransactionGuard::Initialize(
     const CommandRequest& request, std::vector<unsigned> participants,
     std::vector<std::string> canonical_args) {
-  replication_admission_ = request.replication_admission_;
   if (request.replication_origin_ || g_storage == nullptr ||
       !g_storage->ReplicationLogActive() || request.spec_ == nullptr ||
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) == 0 ||
@@ -11613,8 +11324,6 @@ void ReplicationTransactionGuard::Initialize(
       g_next_replication_transaction_id.fetch_add(1, std::memory_order_relaxed);
   if (id == 0) return;
 
-  const auto& command_args =
-      canonical_args.empty() ? request.args_ : canonical_args;
   // Publisher admission precedes this owner. Finishing its replication must
   // not be rejected by a second soft-budget check after another participant
   // has started; charge the allocated representation before yielding.
@@ -11638,25 +11347,8 @@ void ReplicationTransactionGuard::Initialize(
     return;
   }
   transaction->envelope_metadata_ = std::move(*metadata);
-  transaction->command_args_.assign(command_args.begin(), command_args.end());
-  auto payload_source = ReplicationCommandPayloadSource::Prepare(
-      1 + transaction->command_args_.size());
-  auto marker_source = ReplicationCommandPayloadSource::Prepare(1);
-  if (!payload_source.ok() || !marker_source.ok()) {
-    status_ =
-        payload_source.ok() ? marker_source.status() : payload_source.status();
-    return;
-  }
-  transaction->payload_source_ =
-      std::allocate_shared<ReplicationCommandPayloadSource>(
-          RetainedAllocator<ReplicationCommandPayloadSource>(
-              RetainedAllocationDomain{.externally_admitted_ = true}),
-          std::move(*payload_source));
-  transaction->marker_source_ =
-      std::allocate_shared<ReplicationCommandPayloadSource>(
-          RetainedAllocator<ReplicationCommandPayloadSource>(
-              RetainedAllocationDomain{.externally_admitted_ = true}),
-          std::move(*marker_source));
+  transaction->command_args_ =
+      canonical_args.empty() ? request.args_ : std::move(canonical_args);
   const auto allocation_bytes = storage::ReplicationTransactionAllocationBytes(
       transaction->participants_.capacity(),
       std::span<const std::string>(&transaction->envelope_metadata_, 1),
@@ -11692,10 +11384,6 @@ ReplicationTransactionGuard::~ReplicationTransactionGuard() {
 
 bool ReplicationTransactionGuard::Commit() noexcept {
   if (transaction_ != nullptr) {
-    if (!SealPayload()) {
-      InvalidatePayload();
-      return false;
-    }
     storage::ReplicationTransactionResolution expected =
         storage::ReplicationTransactionResolution::kPending;
     return transaction_->resolution_.compare_exchange_strong(
@@ -11725,329 +11413,60 @@ absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
     return absl::ResourceExhaustedError(
         "replication transaction allocation size overflow");
   }
-  const std::size_t ttl_arguments =
-      transaction_->expiration_effects_ == nullptr
-          ? 0
-          : 4 + 5 * transaction_->expiration_effects_->slots_.size();
-  if (canonical_args.size() >
-      std::numeric_limits<std::size_t>::max() - 1 - ttl_arguments) {
-    return absl::ResourceExhaustedError(
-        "replication transaction argument count overflow");
-  }
-  const std::size_t maximum_arguments =
-      1 + canonical_args.size() + ttl_arguments;
-  std::shared_ptr<ReplicationCommandPayloadSource> replacement_source;
-  if (maximum_arguments > transaction_->payload_source_->argument_capacity()) {
-    auto source = ReplicationCommandPayloadSource::Prepare(maximum_arguments);
-    if (!source.ok()) return source.status();
-    replacement_source = std::allocate_shared<ReplicationCommandPayloadSource>(
-        RetainedAllocator<ReplicationCommandPayloadSource>(
-            RetainedAllocationDomain{.externally_admitted_ = true}),
-        std::move(*source));
-  }
-  // Build a complete replacement before touching the shared payload. This
-  // gives pre-mutation callers a strong failure boundary; publisher workers
-  // continue seeing the old immutable body until the noexcept swap.
-  std::vector<std::string> replacement;
-  replacement.reserve(canonical_args.size());
-  replacement.insert(replacement.end(),
-                     std::make_move_iterator(canonical_args.begin()),
-                     std::make_move_iterator(canonical_args.end()));
-  transaction_->command_args_.swap(replacement);
-  if (replacement_source != nullptr)
-    transaction_->payload_source_ = std::move(replacement_source);
+  // This is completion of an admitted write. Move ownership without another
+  // copy or soft-budget gate, and charge the representation before yielding.
+  transaction_->command_args_.swap(canonical_args);
+  std::vector<std::string>().swap(canonical_args);
   transaction_->retained_charge_.Resize(*target_bytes);
   return absl::OkStatus();
 }
 
-Task<absl::Status> ReplicationTransactionGuard::PrepareCommandArgs(
-    std::vector<std::string> canonical_args) {
-  const auto prepared = TrySetCommandArgs(std::move(canonical_args));
-  if (!prepared.ok()) co_return prepared;
-  const auto bytes = PreparedPayloadBytes();
-  if (!bytes || ReplicationEventExceedsLimit(*bytes)) {
-    co_return absl::ResourceExhaustedError(
-        "replication event exceeds the 1 GiB event limit");
-  }
-  if (replication_admission_ != nullptr &&
-      !replication_admission_->CoversWrite(*bytes))
-    co_return co_await replication_admission_->PrepareWrite(*bytes);
-  co_return absl::OkStatus();
-}
-
-void ReplicationTransactionGuard::AdoptCommandArgs(
-    std::vector<std::string> canonical_args,
-    std::vector<std::shared_ptr<RetainedMemoryCharge>> charges) noexcept {
-  if (transaction_ == nullptr || canonical_args.empty()) return;
-  // Replace the body's own charge when ownership moves, instead of keeping
-  // charges for the destroyed child vectors or the old transaction body.
-  // TrySet checks representation limits but never rejects a soft overrun.
+void ReplicationTransactionGuard::SetCommandArgs(
+    std::vector<std::string> canonical_args) noexcept {
   if (!TrySetCommandArgs(std::move(canonical_args)).ok()) InvalidatePayload();
-  charges.clear();
-}
-
-absl::Status ReplicationTransactionGuard::PrepareFinalExpirations(
-    std::span<storage::TxShardWrites> shard_writes,
-    const CommandRequest& request) {
-  if (transaction_ == nullptr) return absl::OkStatus();
-  auto view = DetermineKeys(*request.spec_, request.args_);
-  if (!view.ok()) return view.status();
-  std::vector<ReplicationExpirationKey> keys;
-  auto add = [&](std::size_t index, std::uint8_t db_id) {
-    const auto& key = request.args_[index];
-    keys.push_back({key, ShardForKey(key), db_id});
-  };
-  if (request.kind_ == CommandKind::kCopy) {
-    auto options = ParseCopyOptions(request);
-    if (!options.ok()) return options.status();
-    add(1, request.db_id_);
-    add(2, options->destination_db_);
-  } else {
-    for (std::size_t index = view->first_;
-         !view->empty() && index <= view->last_; index += view->step_) {
-      add(index, request.db_id_);
-    }
-    if (request.kind_ == CommandKind::kZDiffStore ||
-        request.kind_ == CommandKind::kZInterStore ||
-        request.kind_ == CommandKind::kZUnionStore) {
-      add(1, request.db_id_);
-    }
-    if (const auto destination = GeoStoreDestinationArg(request))
-      add(*destination, request.db_id_);
-  }
-  return PrepareFinalExpirations(shard_writes, keys);
-}
-
-absl::Status ReplicationTransactionGuard::PrepareFinalExpirations(
-    std::span<storage::TxShardWrites> shard_writes,
-    std::span<const ReplicationExpirationKey> keys) {
-  for (auto& shard : shard_writes)
-    shard.replication_admission_ = replication_admission_;
-  if (transaction_ == nullptr || keys.empty()) return absl::OkStatus();
-  if (transaction_->expiration_effects_ != nullptr) {
-    return absl::FailedPreconditionError(
-        "transaction expiration preparation was repeated");
-  }
-  std::vector<ReplicationExpirationKey> unique(keys.begin(), keys.end());
-  std::sort(unique.begin(), unique.end(), [](const auto& a, const auto& b) {
-    if (a.owner_ != b.owner_) return a.owner_ < b.owner_;
-    return a.db_id_ != b.db_id_ ? a.db_id_ < b.db_id_ : a.key_ < b.key_;
-  });
-  unique.erase(std::unique(unique.begin(), unique.end(),
-                           [](const auto& a, const auto& b) {
-                             return a.owner_ == b.owner_ &&
-                                    a.db_id_ == b.db_id_ && a.key_ == b.key_;
-                           }),
-               unique.end());
-  if (shard_writes.empty() ||
-      (shard_writes.size() == 1 &&
-       unique.front().owner_ != unique.back().owner_) ||
-      (shard_writes.size() > 1 &&
-       unique.back().owner_ >= shard_writes.size())) {
-    return absl::InvalidArgumentError(
-        "transaction expiration keys have no participant receipt");
-  }
-  constexpr auto limit = std::numeric_limits<std::size_t>::max();
-  const auto body_arguments = transaction_->command_args_.size();
-  if (body_arguments > limit - 5 ||
-      unique.size() > (limit - body_arguments - 5) / 5 ||
-      unique.size() > limit / sizeof(storage::ReplicationExpirationSlot)) {
-    return absl::ResourceExhaustedError("transaction expiration size overflow");
-  }
-  const std::size_t maximum_arguments =
-      1 + body_arguments + 4 + unique.size() * 5;
-  std::size_t bytes = 0;
-  const auto add = [&](std::size_t allocation) {
-    const auto charge = AllocatorUsableSizeForRequest(allocation);
-    if (charge == limit || charge > limit - bytes) return false;
-    bytes += charge;
-    return true;
-  };
-  if (!add(sizeof(storage::PreparedReplicationExpirations) + 64) ||
-      !add(unique.size() * sizeof(storage::ReplicationExpirationSlot)) ||
-      !add(21) || !add(21)) {
-    return absl::ResourceExhaustedError("transaction expiration size overflow");
-  }
-  const auto sso_capacity = std::string{}.capacity();
-  for (const auto& key : unique) {
-    if (key.key_.size() == limit ||
-        (key.key_.size() > sso_capacity && !add(key.key_.size() + 1)) ||
-        !add(21)) {
-      return absl::ResourceExhaustedError(
-          "transaction expiration size overflow");
-    }
-  }
-  auto prepared = std::make_shared<storage::PreparedReplicationExpirations>();
-  prepared->slots_.reserve(unique.size());
-  prepared->prefix_ = {
-      std::string(kReplicatedExecCommand), std::string(20, '0'),
-      std::to_string(transaction_->db_id_), std::string(20, '0')};
-  for (const auto& key : unique) {
-    prepared->slots_.push_back(storage::ReplicationExpirationSlot{
-        .args_ = {std::to_string(key.db_id_), "3", "PEXPIREAT",
-                  std::string(key.key_), std::string(20, '0')},
-        .owner_ = key.owner_,
-        .db_id_ = key.db_id_,
-    });
-  }
-  if (maximum_arguments > transaction_->payload_source_->argument_capacity()) {
-    auto source = ReplicationCommandPayloadSource::Prepare(maximum_arguments);
-    if (!source.ok()) return source.status();
-    transaction_->payload_source_ =
-        std::allocate_shared<ReplicationCommandPayloadSource>(
-            RetainedAllocator<ReplicationCommandPayloadSource>(
-                RetainedAllocationDomain{.externally_admitted_ = true}),
-            std::move(*source));
-  }
-  prepared->retained_charge_.Account(CurrentMemoryAccountingShard(), bytes);
-  auto slots = std::span(prepared->slots_);
-  for (std::size_t index = 0; index < shard_writes.size(); ++index) {
-    const unsigned owner =
-        shard_writes.size() == 1 ? unique.front().owner_ : index;
-    const auto first = std::lower_bound(
-        slots.begin(), slots.end(), owner,
-        [](const auto& slot, unsigned value) { return slot.owner_ < value; });
-    const auto last = std::upper_bound(
-        first, slots.end(), owner,
-        [](unsigned value, const auto& slot) { return value < slot.owner_; });
-    shard_writes[index].prepared_expirations_ = prepared;
-    shard_writes[index].expiration_slots_ = std::span(first, last);
-  }
-  transaction_->expiration_effects_ = std::move(prepared);
-  if (replication_admission_ != nullptr) {
-    // A request estimate cannot cover the exact envelope and TTL suffix at
-    // a block boundary. Fixed-body transactions need their combined bound;
-    // captured children additionally contribute to the running effect bound.
-    const auto event_bytes = PreparedPayloadBytes();
-    if (!event_bytes || ReplicationEventExceedsLimit(*event_bytes)) {
-      return absl::ResourceExhaustedError(
-          "replication event exceeds the 1 GiB event limit");
-    }
-    replication_admission_->RequireEventBytes(*event_bytes);
-    std::size_t suffix_bytes =
-        4 * sizeof(std::uint32_t) + kReplicatedExecCommand.size() + 20 + 3 + 20;
-    for (const auto& key : unique)
-      suffix_bytes = SaturatingAdd(
-          suffix_bytes,
-          SaturatingAdd(key.key_.size(),
-                        5 * sizeof(std::uint32_t) + 3 + 1 + 9 + 20));
-    replication_admission_->ReserveEffectBytes(suffix_bytes);
-  }
-  return absl::OkStatus();
 }
 
 void ReplicationTransactionGuard::SetFinalExpirations(
     std::span<const storage::TxShardWrites> shard_writes) noexcept {
-  if (transaction_ == nullptr) return;
-  // Collection already updated the fixed slots on each participant. Detect a
-  // forgotten preparation boundary rather than publishing incomplete TTLs.
-  for (const auto& shard : shard_writes) {
-    if (!shard.expiration_effects_.empty()) {
-      InvalidatePayload();
-      return;
-    }
+  if (transaction_ == nullptr ||
+      transaction_->resolution_.load(std::memory_order_acquire) !=
+          storage::ReplicationTransactionResolution::kPending) {
+    return;
   }
-}
+  try {
+    using Effect = storage::TxShardWrites::ExpirationEffect;
+    std::vector<const Effect*, RetainedAllocator<const Effect*>> final_effects{
+        RetainedAllocator<const Effect*>(
+            RetainedAllocationDomain{.externally_admitted_ = true})};
+    for (const auto& shard : shard_writes) {
+      for (const auto& effect : shard.expiration_effects_) {
+        auto found = std::find_if(final_effects.begin(), final_effects.end(),
+                                  [&](const auto* prior) {
+                                    return prior->db_id_ == effect.db_id_ &&
+                                           prior->key_ == effect.key_;
+                                  });
+        if (found == final_effects.end()) {
+          final_effects.push_back(&effect);
+        } else {
+          *found = &effect;
+        }
+      }
+    }
+    if (final_effects.empty()) return;
 
-std::optional<std::size_t> ReplicationTransactionGuard::PreparedPayloadBytes()
-    const noexcept {
-  if (transaction_ == nullptr) return 0;
-  constexpr auto limit = std::numeric_limits<std::size_t>::max();
-  std::size_t argc = 1 + transaction_->command_args_.size();
-  std::size_t bytes = transaction_->envelope_metadata_.size();
-  const auto add = [&](std::size_t size) {
-    if (size > limit - bytes) return false;
-    bytes += size;
-    return true;
-  };
-  for (const auto& argument : transaction_->command_args_)
-    if (!add(argument.size())) return std::nullopt;
-  if (const auto& prepared = transaction_->expiration_effects_) {
-    if (argc > limit - 4 || prepared->slots_.size() > (limit - argc - 4) / 5)
-      return std::nullopt;
-    argc += 4 + 5 * prepared->slots_.size();
-    // Count fields are uint64 decimal. Every key may survive with a deadline;
-    // use the prepared maximum even before any slot has been touched.
-    if (!add(kReplicatedExecCommand.size() + 20 + 3 + 20)) return std::nullopt;
-    for (const auto& slot : prepared->slots_)
-      if (!add(slot.args_[3].size()) || !add(3 + 1 + 9 + 20))
-        return std::nullopt;
-  }
-  if (argc > (limit - bytes) / sizeof(std::uint32_t)) return std::nullopt;
-  bytes += argc * sizeof(std::uint32_t);
-  if (!add(ReplicationCommandFixedHeaderBytes(argc))) return std::nullopt;
-  return bytes;
-}
-
-bool ReplicationTransactionGuard::SealPayload() noexcept {
-  auto& transaction = *transaction_;
-  if (transaction.resolution_.load(std::memory_order_acquire) !=
-      storage::ReplicationTransactionResolution::kPending)
-    return false;
-  auto body = std::span<const std::string>(transaction.command_args_);
-  if (body.empty()) return false;
-  auto* expirations = const_cast<storage::PreparedReplicationExpirations*>(
-      transaction.expiration_effects_.get());
-  std::size_t ttl_count = 0, ttl_arguments = 0;
-  if (expirations != nullptr && body.front() != "SET") {
-    for (const auto& slot : expirations->slots_) {
-      if (!slot.touched_ || !slot.exists_) continue;
-      ++ttl_count;
-      ttl_arguments += slot.expire_at_ms_ == 0 ? 4 : 5;
+    if (transaction_->command_args_.empty()) return;
+    std::vector<std::string> command_args =
+        std::move(transaction_->command_args_);
+    command_args.reserve(command_args.size() + final_effects.size() * 4);
+    for (const auto* effect : final_effects) {
+      AppendReplicationExpirationEffect(&command_args, transaction_->db_id_,
+                                        effect->db_id_, effect->key_,
+                                        effect->exists_, effect->expire_at_ms_);
     }
+    SetCommandArgs(std::move(command_args));
+  } catch (const std::length_error&) {
+    InvalidatePayload();
   }
-  auto& source = *transaction.payload_source_;
-  auto& marker = *transaction.marker_source_;
-  if (!marker.Begin(transaction.db_id_, 1).ok() ||
-      !marker.AppendArgument(transaction.envelope_metadata_).ok())
-    return false;
-  if (ttl_count == 0) {
-    return source.Begin(transaction.db_id_, 1 + body.size()).ok() &&
-           source.AppendArgument(transaction.envelope_metadata_).ok() &&
-           source.AppendArguments(body).ok();
-  }
-  const bool exec = body.front() == kReplicatedExecCommand;
-  std::uint64_t commands = 1;
-  if (exec) {
-    if (body.size() < 2) return false;
-    const auto& count = body[1];
-    const auto parsed =
-        std::from_chars(count.data(), count.data() + count.size(), commands);
-    if (parsed.ec != std::errc{} || parsed.ptr != count.data() + count.size())
-      return false;
-  }
-  const auto set_number = [](std::string& target, std::uint64_t value) {
-    target.resize(20);
-    const auto result =
-        std::to_chars(target.data(), target.data() + target.size(), value);
-    assert(result.ec == std::errc{});
-    target.resize(result.ptr - target.data());
-  };
-  set_number(expirations->prefix_[1], commands + ttl_count);
-  set_number(expirations->prefix_[3], body.size());
-  const auto total_arguments = 1 + body.size() + (exec ? 0 : 4) + ttl_arguments;
-  if (!source.Begin(transaction.db_id_, total_arguments).ok() ||
-      !source.AppendArgument(transaction.envelope_metadata_).ok() ||
-      !source
-           .AppendArguments(std::span(expirations->prefix_).first(exec ? 2 : 4))
-           .ok() ||
-      !source.AppendArguments(exec ? body.subspan(2) : body).ok())
-    return false;
-  for (auto& slot : expirations->slots_) {
-    if (!slot.touched_ || !slot.exists_) continue;
-    if (slot.expire_at_ms_ == 0) {
-      slot.args_[1] = "2";
-      slot.args_[2] = "PERSIST";
-    } else {
-      set_number(slot.args_[4], slot.expire_at_ms_);
-    }
-    if (!source
-             .AppendArguments(
-                 std::span(slot.args_).first(slot.expire_at_ms_ == 0 ? 4 : 5))
-             .ok())
-      return false;
-  }
-  return source.complete();
 }
 
 void ReplicationTransactionGuard::InvalidatePayload() noexcept {
@@ -13920,8 +13339,6 @@ Task<CommandReply> ExecuteAdmittedWriteCommand(CommandRequest& request,
   CommandReply reply;
   {
     ActivePublisherAdmissionGuard active_admission(&*admission);
-    CommandReplicationEventLimit replication_limit(event_bytes);
-    RequestReplicationAdmissionGuard request_limit(request, &replication_limit);
     reply = co_await ExecuteCommandBody(
         request, reply_builder, client_id, connection,
         ordered_mset ? &replication_order : nullptr,
@@ -14019,12 +13436,7 @@ Task<absl::Status> RunReplicationAdmittedAttempt(
   auto admission = co_await AcquireReplicationPublisherAdmission(
       RequestArgumentBytes(request), &request);
   if (!admission.ok()) co_return admission.status();
-  absl::Status result;
-  {
-    CommandReplicationEventLimit replication_limit(event_bytes);
-    RequestReplicationAdmissionGuard request_limit(request, &replication_limit);
-    result = co_await attempt();
-  }
+  absl::Status result = co_await attempt();
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
   if (released.ok()) released = co_await WaitForReplicationMemory(*admission);

@@ -121,21 +121,6 @@ absl::Status InvalidState(std::string_view message) {
 std::optional<std::size_t> TransactionStagingBytes(
     const ReplicationTransaction& transaction, unsigned worker) noexcept {
   const bool carries_payload = worker == transaction.payload_flow_;
-  if (transaction.resolution_.load(std::memory_order_acquire) ==
-      ReplicationTransactionResolution::kPublish) {
-    const auto& source = carries_payload ? transaction.payload_source_
-                                         : transaction.marker_source_;
-    if (source == nullptr || !source->complete()) return std::nullopt;
-    const auto encoded_bytes = source->size();
-    std::size_t total = kReplicationPublisherItemMetadataBytes;
-    if (encoded_bytes > std::numeric_limits<std::size_t>::max() - total)
-      return std::nullopt;
-    total += encoded_bytes;
-    if (source->argument_count() >
-        (std::numeric_limits<std::size_t>::max() - total) / sizeof(std::string))
-      return std::nullopt;
-    return total + source->argument_count() * sizeof(std::string);
-  }
   const std::size_t argument_count =
       1 + (carries_payload ? transaction.command_args_.size() : 0);
   std::size_t total = kReplicationPublisherItemMetadataBytes;
@@ -204,23 +189,15 @@ std::optional<std::size_t> ReplicationCommandStagingBytes(
   return CommandStagingBytes(args);
 }
 
-namespace {
-
-std::optional<std::size_t> TransactionOwnerAllocationBytes(
-    std::size_t participant_capacity, std::size_t prefix_count,
-    std::span<const std::string> prefix,
-    std::span<const std::string> command_args,
-    bool reserve_maximum_metadata) noexcept {
-  if (prefix_count >
-      std::numeric_limits<std::size_t>::max() - command_args.size()) {
-    return std::nullopt;
-  }
-  const std::size_t argument_count = prefix_count + command_args.size();
+std::optional<std::size_t> ReplicationTransactionAllocationBytes(
+    std::size_t participant_capacity, std::span<const std::string> prefix,
+    const std::vector<std::string>& command_args) noexcept {
   std::size_t total = 0;
-  if (argument_count != 0 &&
-      (argument_count >
+  if (command_args.capacity() != 0 &&
+      (command_args.capacity() >
            std::numeric_limits<std::size_t>::max() / sizeof(std::string) ||
-       !AddAllocationCharge(argument_count * sizeof(std::string), &total))) {
+       !AddAllocationCharge(command_args.capacity() * sizeof(std::string),
+                            &total))) {
     return std::nullopt;
   }
   if (participant_capacity != 0 &&
@@ -229,46 +206,14 @@ std::optional<std::size_t> TransactionOwnerAllocationBytes(
        !AddAllocationCharge(participant_capacity * sizeof(unsigned), &total))) {
     return std::nullopt;
   }
-  // LTX1 uses one generated metadata string. Reserve its largest valid bitmap
-  // before allocation exists so source admission still covers the eventual
-  // retained owner on every supported worker count.
-  constexpr std::size_t kMaximumMetadataBytes = 4 + sizeof(std::uint64_t) +
-                                                2 * sizeof(std::uint16_t) +
-                                                (kLogicalStorageShards + 7) / 8;
-  if ((reserve_maximum_metadata &&
-       !AddAllocationCharge(kMaximumMetadataBytes + 1, &total)) ||
-      !AddCommandArgumentAllocationBytes(prefix, &total) ||
-      !AddCommandArgumentAllocationBytes(command_args, &total) ||
+  if (!AddCommandArgumentAllocationBytes(prefix, &total) ||
+      !AddCommandArgumentAllocationBytes(
+          std::span<const std::string>(command_args), &total) ||
       !AddAllocationCharge(sizeof(ReplicationTransaction) + 64, &total)) {
     return std::nullopt;
   }
   // Codec sources own their buffers and allocation charges independently.
   return total;
-}
-
-}  // namespace
-
-std::optional<std::size_t> ReplicationTransactionReservationBytes(
-    std::size_t participant_capacity, std::size_t participant_count,
-    std::span<const std::string> command_args) noexcept {
-  if (participant_count == 0 || participant_count > kLogicalStorageShards) {
-    return std::nullopt;
-  }
-  return TransactionOwnerAllocationBytes(
-      participant_capacity, 1, std::span<const std::string>{}, command_args,
-      /*reserve_maximum_metadata=*/true);
-}
-
-std::optional<std::size_t> ReplicationTransactionAllocationBytes(
-    std::size_t participant_capacity, std::span<const std::string> prefix,
-    std::span<const std::string> command_args) noexcept {
-  if (prefix.size() >
-      std::numeric_limits<std::size_t>::max() - command_args.size()) {
-    return std::nullopt;
-  }
-  return TransactionOwnerAllocationBytes(participant_capacity, prefix.size(),
-                                         prefix, command_args,
-                                         /*reserve_maximum_metadata=*/false);
 }
 
 Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
@@ -441,12 +386,8 @@ absl::StatusOr<std::uint64_t> NextReplicationPublisherPriority() {
 
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 StorageEngine::Impl::AcquireReplicationPublisherAdmission(
-    std::size_t logical_bytes, std::optional<ReplicationPublisherTarget> target,
-    std::size_t event_bytes) {
-  if (event_bytes > kMaxNativeReplicationEventBytes) {
-    co_return absl::ResourceExhaustedError(
-        "replication event exceeds the protocol size limit");
-  }
+    std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
   WorkerStore& store = CurrentStore();
   if (store.replication_publisher_waiters_head_ == nullptr) {
     // The ordinary owner-local write neither allocates a queue node nor
@@ -518,13 +459,7 @@ StorageEngine::Impl::TryGrantReplicationPublisherAdmission(
       return std::nullopt;
     }
   }
-  if (store.replication_publisher_next_ticket_ ==
-      std::numeric_limits<std::uint64_t>::max()) {
-    return absl::ResourceExhaustedError(
-        "replication publisher admission ticket space exhausted");
-  }
   ReplicationPublisherAdmission admission;
-  admission.ticket_id_ = store.replication_publisher_next_ticket_++;
   if (log.state_ == ReplicationLogState::kActive) {
     admission.log_epoch_ = log.log_epoch_;
   }
@@ -1098,26 +1033,23 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
 
 namespace {
 
-ReplicationLogPayloadSource* BuildReplicationTransactionEnvelope(
-    const ReplicationTransaction& transaction, unsigned worker) {
-  assert(!transaction.participants_.empty());
-  const unsigned payload_flow = transaction.payload_flow_;
-  assert(std::find(transaction.participants_.begin(),
-                   transaction.participants_.end(),
-                   payload_flow) != transaction.participants_.end());
-  assert(IsReplicationTransactionEnvelope(transaction.envelope_metadata_));
-  assert(!transaction.command_args_.empty());
-
-  // Every participant must retain an ordered log record so reconnect cursors
-  // can advance atomically. Only the deterministic payload flow needs the
-  // canonical command, however; the other records are rendezvous markers.
-  // The canonical envelope fixes that choice before workers publish, so the
-  // durable representation is independent of which worker finishes first.
-  const bool carries_payload = worker == payload_flow;
-  const auto& source = carries_payload ? transaction.payload_source_
-                                       : transaction.marker_source_;
-  assert(source != nullptr && source->complete());
-  return source.get();
+absl::StatusOr<ReplicationCommandPayloadSource>
+BuildReplicationTransactionEnvelope(const ReplicationTransaction& transaction,
+                                    unsigned worker) {
+  assert(!transaction.envelope_metadata_.empty());
+  const bool carries_payload = worker == transaction.payload_flow_;
+  // Borrow the immutable transaction strings until append completes. Only the
+  // small view table is copied; even a large canonical body has one owner.
+  std::vector<std::string_view, RetainedAllocator<std::string_view>> args{
+      RetainedAllocator<std::string_view>(
+          RetainedAllocationDomain{.externally_admitted_ = true})};
+  args.reserve(carries_payload ? 1 + transaction.command_args_.size() : 1);
+  args.push_back(transaction.envelope_metadata_);
+  if (carries_payload) {
+    for (const auto& argument : transaction.command_args_)
+      args.push_back(argument);
+  }
+  return ReplicationCommandPayloadSource::Create(transaction.db_id_, args);
 }
 
 }  // namespace
@@ -1296,7 +1228,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
               "canonical replication transaction queue accounting overflow");
           break;
         }
-        // The shared canonical payload already owns retained-memory admission.
+        // The shared canonical payload already accounts its retained memory.
         // This FIFO has one consumer, so waiting for queued_without_pending to
         // shrink would wait on items that only this coroutine can drain. Let
         // the oldest admitted item temporarily exceed the byte waterline;
@@ -1347,25 +1279,17 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       continue;
     }
 
-    std::optional<ReplicationCommandPayloadSource> command_source;
-    ReplicationLogPayloadSource* payload_source = nullptr;
-    if (pending.transaction_ != nullptr) {
-      // The transaction owns the immutable body, TTL suffix, and prepared
-      // codec until the awaited append finishes. Never duplicate its strings
-      // or re-admit memory after the mutation has committed.
-      payload_source = BuildReplicationTransactionEnvelope(
-          *pending.transaction_, bycorf::ThisWorker().id_);
-    } else {
-      auto source = ReplicationCommandPayloadSource::Create(
-          pending.append_.db_id_, pending.append_.args_);
-      if (!source.ok()) {
-        log.state_ = ReplicationLogState::kInvalid;
-        spdlog::warn("replication command encoding failed: {}",
-                     source.status().message());
-        break;
-      }
-      command_source.emplace(std::move(*source));
-      payload_source = &*command_source;
+    auto command_source =
+        pending.transaction_ != nullptr
+            ? BuildReplicationTransactionEnvelope(*pending.transaction_,
+                                                  bycorf::ThisWorker().id_)
+            : ReplicationCommandPayloadSource::Create(pending.append_.db_id_,
+                                                      pending.append_.args_);
+    if (!command_source.ok()) {
+      log.state_ = ReplicationLogState::kInvalid;
+      spdlog::warn("replication command encoding failed: {}",
+                   command_source.status().message());
+      break;
     }
     auto appended = co_await AppendReplicationLog(
         ReplicationLogAppend{
@@ -1373,7 +1297,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
             .partition_id_ = pending.append_.partition_id_,
             .partition_sequence_ = pending.append_.partition_sequence_,
             .payload_ = {},
-            .payload_source_ = payload_source,
+            .payload_source_ = &*command_source,
         },
         /*already_admitted=*/true);
     if (!appended.ok()) {

@@ -17,7 +17,6 @@
 #include "list_command.h"
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -192,56 +191,6 @@ std::vector<std::string> EncodeListPopEffect(std::string_view key, bool left,
   return {left ? "LPOP" : "RPOP", std::string(key), std::to_string(count)};
 }
 
-Task<absl::Status> PrepareListReplication(
-    ReplicationTransactionGuard* replication, unsigned coordinator,
-    std::vector<std::string> args) {
-  if (replication == nullptr) co_return absl::OkStatus();
-  if (bycorf::ThisWorker().id_ == coordinator)
-    co_return co_await replication->PrepareCommandArgs(std::move(args));
-  co_return co_await bycorf::SubmitTaskTo(
-      coordinator,
-      [replication, args = std::move(args)]() mutable -> Task<absl::Status> {
-        co_return co_await replication->PrepareCommandArgs(std::move(args));
-      });
-}
-
-Task<absl::Status> PrepareListExpirations(
-    ReplicationTransactionGuard* replication, unsigned coordinator,
-    storage::TxShardWrites* writes, std::uint8_t db_id, std::string_view source,
-    std::string_view destination) {
-  if (replication == nullptr) co_return absl::OkStatus();
-  const std::array keys{
-      ReplicationExpirationKey{source, ShardForKey(source), db_id},
-      ReplicationExpirationKey{destination, ShardForKey(destination), db_id}};
-  if (bycorf::ThisWorker().id_ == coordinator)
-    co_return replication->PrepareFinalExpirations(std::span(writes, 1), keys);
-  co_return co_await bycorf::SubmitTaskTo(
-      coordinator, [replication, writes, keys]() -> Task<absl::Status> {
-        co_return replication->PrepareFinalExpirations(std::span(writes, 1),
-                                                       keys);
-      });
-}
-
-Task<absl::Status> PrepareSelectedListPop(
-    ReplicationTransactionGuard* replication, unsigned coordinator,
-    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    bool left, std::uint64_t count) {
-  if (replication == nullptr || !replication->active())
-    co_return absl::OkStatus();
-  storage::ListOperation length_operation;
-  length_operation.kind_ = storage::ListOperationKind::kLength;
-  auto length = co_await g_storage->ExecuteListLocked(db_id, key, digest,
-                                                      length_operation);
-  if (!length.ok()) co_return length.status();
-  if (length->length_ == 0) co_return absl::OkStatus();
-  // Key holds keep selection stable while publisher capacity is prepared.
-  // Expiry can still make the following pop empty, in which case no marker
-  // is committed and the next candidate prepares its own canonical command.
-  co_return co_await PrepareListReplication(
-      replication, coordinator,
-      EncodeListPopEffect(key, left, std::min(count, length->length_)));
-}
-
 struct SingleShardListOutcome {
   explicit SingleShardListOutcome(absl::Status status, std::string key = {},
                                   std::vector<std::string> values = {})
@@ -258,7 +207,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     std::uint8_t db_id, std::vector<std::string> keys, bool move,
     bool source_left, bool destination_left, bool pop_left,
     std::uint64_t pop_count, ReplicationTransactionGuard* replication,
-    unsigned coordinator, storage::MutationPrecondition mutation_precondition) {
+    storage::MutationPrecondition mutation_precondition) {
   std::vector<tx::KeyRef> locks;
   locks.reserve(keys.size());
   for (const std::string& key : keys) {
@@ -280,10 +229,6 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
 
   if (!move) {
     for (const std::string& key : keys) {
-      auto prepared = co_await PrepareSelectedListPop(
-          replication, coordinator, db_id, key, storage::ComputeDigest(key),
-          pop_left, pop_count);
-      if (!prepared.ok()) co_return SingleShardListOutcome(prepared);
       storage::ListOperation pop;
       pop.kind_ = pop_left ? storage::ListOperationKind::kPopLeft
                            : storage::ListOperationKind::kPopRight;
@@ -311,9 +256,6 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     g_storage->InitializeTxWrites(txid, std::span(&writes, 1),
                                   mutation_precondition);
     writes.collect_undo_ = true;
-    auto prepared = co_await PrepareListExpirations(
-        replication, coordinator, &writes, db_id, source, destination);
-    if (!prepared.ok()) co_return SingleShardListOutcome(prepared);
     storage::ListOperation operation;
     operation.kind_ = storage::ListOperationKind::kMoveWithin;
     operation.first_ = source_left ? 1 : 0;
@@ -326,14 +268,6 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     if (result->values_.empty()) {
       co_return SingleShardListOutcome(absl::OkStatus());
     }
-    prepared = co_await PrepareListReplication(
-        replication, coordinator,
-        EncodeListMoveEffects(db_id, source, destination, source_left,
-                              destination_left, result->values_.front()));
-    if (!prepared.ok()) {
-      (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
-      co_return SingleShardListOutcome(prepared);
-    }
     std::vector<storage::TxShardWrites*> write_refs{&writes};
     absl::Status committed =
         co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
@@ -343,6 +277,9 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     }
     (void)co_await g_storage->FinishTxLocal(writes);
     if (replication != nullptr) {
+      replication->SetCommandArgs(
+          EncodeListMoveEffects(db_id, source, destination, source_left,
+                                destination_left, result->values_.front()));
       replication->SetFinalExpirations(
           std::span<const storage::TxShardWrites>(&writes, 1));
     }
@@ -355,9 +292,6 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   g_storage->InitializeTxWrites(txid, std::span(&writes, 1),
                                 mutation_precondition);
   writes.collect_undo_ = true;
-  auto prepared = co_await PrepareListExpirations(
-      replication, coordinator, &writes, db_id, source, destination);
-  if (!prepared.ok()) co_return SingleShardListOutcome(prepared);
   storage::ListOperation pop;
   pop.kind_ = source_left ? storage::ListOperationKind::kPopLeft
                           : storage::ListOperationKind::kPopRight;
@@ -369,17 +303,6 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   }
   if (popped->values_.empty()) {
     co_return SingleShardListOutcome(absl::OkStatus());
-  }
-
-  // Pop is still undoable. Admit the value-bearing after-image before push
-  // or commit, and restore the source if the canonical payload cannot fit.
-  prepared = co_await PrepareListReplication(
-      replication, coordinator,
-      EncodeListMoveEffects(db_id, source, destination, source_left,
-                            destination_left, popped->values_.front()));
-  if (!prepared.ok()) {
-    (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
-    co_return SingleShardListOutcome(prepared);
   }
 
   storage::ListOperation push;
@@ -403,6 +326,9 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   }
   (void)co_await g_storage->FinishTxLocal(writes);
   if (replication != nullptr) {
+    replication->SetCommandArgs(
+        EncodeListMoveEffects(db_id, source, destination, source_left,
+                              destination_left, popped->values_.front()));
     replication->SetFinalExpirations(
         std::span<const storage::TxShardWrites>(&writes, 1));
   }
@@ -762,9 +688,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
         first_owner,
         [&request, db_id = request.db_id_, keys = std::move(keys), move,
          source_left, destination_left, pop_left, pop_count,
-         mutation_precondition, replication = &replication,
-         coordinator = bycorf::ThisWorker().id_]() mutable
-            -> Task<SingleShardListOutcome> {
+         mutation_precondition,
+         replication = &replication]() mutable -> Task<SingleShardListOutcome> {
           // Choke point 2 for the transaction-free single-shard path: re-check
           // the cluster admission on the owner right before mutating. Cluster
           // admission guarantees one slot, hence this path.
@@ -775,8 +700,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           }
           co_return co_await ExecuteSingleShardListMulti(
               db_id, std::move(keys), move, source_left, destination_left,
-              pop_left, pop_count, replication, coordinator,
-              mutation_precondition);
+              pop_left, pop_count, replication, mutation_precondition);
         });
     if (!outcome.status_.ok()) {
       if (IsClusterAuthorityChanged(outcome.status_)) {
@@ -790,6 +714,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       if (unavailable != nullptr) *unavailable = true;
       co_return BuiltReply(move ? reply_builder.AppendNull()
                                 : reply_builder.AppendNullArray());
+    }
+    if (!move) {
+      replication.SetCommandArgs(
+          EncodeListPopEffect(outcome.key_, pop_left, outcome.values_.size()));
     }
     replication.Commit();
     for (std::size_t arg : key_args) {
@@ -854,12 +782,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       auto popped = co_await bycorf::SubmitTaskTo(
           ShardForKey(args[arg]),
           [db = request.db_id_, key = std::string(args[arg]), digest, op,
-           mutation_precondition, replication = &replication,
-           coordinator = bycorf::ThisWorker().id_, pop_left,
-           pop_count]() mutable -> Task<absl::StatusOr<storage::ListResult>> {
-            auto prepared = co_await PrepareSelectedListPop(
-                replication, coordinator, db, key, digest, pop_left, pop_count);
-            if (!prepared.ok()) co_return prepared;
+           mutation_precondition]() mutable
+              -> Task<absl::StatusOr<storage::ListResult>> {
             co_return co_await g_storage->ExecuteListLocked(
                 db, key, digest, op, nullptr, nullptr, &mutation_precondition);
           });
@@ -874,6 +798,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           co_return BuiltReply(
               reply_builder.AppendError("ERR ", status.message()));
         }
+        replication.SetCommandArgs(
+            EncodeListPopEffect(args[arg], pop_left, popped->values_.size()));
         replication.Commit();
         reply_builder.AppendArrayHeader(2);
         reply_builder.AppendBulkString(args[arg]);
@@ -923,11 +849,6 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   for (auto& write : writes) {
     write.collect_undo_ = true;
   }
-  status = replication.PrepareFinalExpirations(writes, request);
-  if (!status.ok()) {
-    (void)co_await release();
-    co_return BuiltReply(AppendStorageError(reply_builder, status));
-  }
   storage::ListOperation pop;
   pop.kind_ = source_left ? storage::ListOperationKind::kPopLeft
                           : storage::ListOperationKind::kPopRight;
@@ -946,18 +867,6 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     }
     if (unavailable != nullptr) *unavailable = true;
     co_return BuiltReply(reply_builder.AppendNull());
-  }
-
-  status = co_await replication.PrepareCommandArgs(EncodeListMoveEffects(
-      request.db_id_, source_key, destination_key, source_left,
-      destination_left, popped->values_.front()));
-  if (!status.ok()) {
-    (void)co_await bycorf::SubmitTaskTo(
-        source_owner, [write = &writes[source_owner]] {
-          return g_storage->FinishTxLocal(*write, /*rollback=*/true);
-        });
-    (void)co_await release();
-    co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
 
   storage::ListOperation push;
@@ -1004,6 +913,9 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   if (!released.ok()) {
     co_return BuiltReply(reply_builder.AppendError("ERR ", released.message()));
   }
+  replication.SetCommandArgs(EncodeListMoveEffects(
+      request.db_id_, source_key, destination_key, source_left,
+      destination_left, popped->values_.front()));
   replication.SetFinalExpirations(writes);
   replication.Commit();
   NotifyListBlockingKey(request, source_key);

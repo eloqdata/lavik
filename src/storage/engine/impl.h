@@ -2000,7 +2000,6 @@ class StorageEngine::Impl {
     // Stable global priorities order only pending admission. Intrusive nodes
     // belong to coordinators and survive rollback, so younger small commands
     // cannot repeatedly bypass an older oversized request.
-    std::uint64_t replication_publisher_next_ticket_ = 1;
     ReplicationPublisherWaiter* replication_publisher_waiters_head_ = nullptr;
     ReplicationPublisherWaiter* replication_publisher_waiters_tail_ = nullptr;
     AsyncNotification replication_publisher_admission_ready_;
@@ -3180,8 +3179,7 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
-      std::optional<ReplicationPublisherTarget> target,
-      std::size_t event_bytes = 0);
+      std::optional<ReplicationPublisherTarget> target);
   absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
   TryGrantReplicationPublisherAdmission(
       std::size_t logical_bytes,

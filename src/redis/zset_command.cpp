@@ -576,36 +576,9 @@ Task<absl::Status> ZSetHoldCallback(void*, const tx::ShardSlice&) {
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> PrepareSelectedZSetPop(
-    ReplicationTransactionGuard* replication, unsigned coordinator,
-    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    bool maximum, std::uint64_t count) {
-  if (replication == nullptr || !replication->active())
-    co_return absl::OkStatus();
-  // The caller retains the key lock. Determine the selected command's exact
-  // count while the key is unchanged, so all allocation/admission precedes pop.
-  auto length = co_await g_storage->ExecuteSortedSetLocked(
-      db_id, key, digest,
-      storage::SortedSetOperation{
-          .kind_ = storage::SortedSetOperationKind::kLength});
-  if (!length.ok()) co_return length.status();
-  if (length->length_ == 0) co_return absl::OkStatus();
-  auto args =
-      CanonicalSelectedZSetPop(key, maximum, std::min(count, length->length_));
-  if (bycorf::ThisWorker().id_ == coordinator)
-    co_return co_await replication->PrepareCommandArgs(std::move(args));
-  co_return co_await bycorf::SubmitTaskTo(
-      coordinator,
-      [replication, args = std::move(args)]() mutable -> Task<absl::Status> {
-        co_return co_await replication->PrepareCommandArgs(std::move(args));
-      });
-}
-
 struct SingleShardPopContext {
   const CommandRequest* request_ = nullptr;
   const MultiPopShape* shape_ = nullptr;
-  ReplicationTransactionGuard* replication_ = nullptr;
-  unsigned coordinator_ = 0;
   std::size_t selected_arg_ = 0;
   storage::SortedSetResult popped_;
 };
@@ -624,11 +597,6 @@ Task<absl::Status> SingleShardPopCallback(void* opaque,
     if (locked == nullptr) {
       co_return absl::InternalError("Sorted Set pop key routing is incomplete");
     }
-    auto prepared = co_await PrepareSelectedZSetPop(
-        context->replication_, context->coordinator_, context->request_->db_id_,
-        context->request_->args_[argument], locked->digest_,
-        context->shape_->maximum_, context->shape_->count_);
-    if (!prepared.ok()) co_return prepared;
     auto popped = co_await PopZSetLocked(
         context->request_->db_id_, context->request_->args_[argument],
         locked->digest_, context->shape_->maximum_, context->shape_->count_,
@@ -721,8 +689,6 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     SingleShardPopContext context{
         .request_ = &request,
         .shape_ = &shape,
-        .replication_ = &replication,
-        .coordinator_ = bycorf::ThisWorker().id_,
         .selected_arg_ = 0,
         .popped_ = {},
     };
@@ -739,6 +705,9 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       if (empty != nullptr) *empty = true;
       co_return Built(builder.AppendNullArray());
     }
+    replication.SetCommandArgs(CanonicalSelectedZSetPop(
+        request.args_[context.selected_arg_], shape.maximum_,
+        context.popped_.members_.size()));
     replication.Commit();
     AppendMultiPopReply(builder, request.args_[context.selected_arg_],
                         context.popped_, shape.flat_reply_);
@@ -767,14 +736,10 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     auto popped = co_await bycorf::SubmitTaskTo(
         g_storage->OwnerForKey(key),
         [db = request.db_id_, key = std::string(key), digest,
-         maximum = shape.maximum_, count = shape.count_, request_ptr = &request,
-         replication = &replication, coordinator = bycorf::ThisWorker().id_]()
-            -> Task<absl::StatusOr<storage::SortedSetResult>> {
-          auto prepared = co_await PrepareSelectedZSetPop(
-              replication, coordinator, db, key, digest, maximum, count);
-          if (!prepared.ok()) co_return prepared;
-          co_return co_await PopZSetLocked(db, key, digest, maximum, count,
-                                           nullptr, request_ptr);
+         maximum = shape.maximum_, count = shape.count_,
+         request_ptr = &request]() {
+          return PopZSetLocked(db, key, digest, maximum, count, nullptr,
+                               request_ptr);
         });
     if (!popped.ok()) {
       (void)co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
@@ -783,6 +748,8 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     if (!popped->members_.empty()) {
       status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
       if (!status.ok()) co_return Built(StorageError(builder, status));
+      replication.SetCommandArgs(CanonicalSelectedZSetPop(
+          key, shape.maximum_, popped->members_.size()));
       replication.Commit();
       AppendMultiPopReply(builder, key, *popped, shape.flat_reply_);
       co_return Built(builder.View());
@@ -2042,8 +2009,6 @@ struct MultiContext {
   RetainedMemoryCharge output_charge_;
   std::vector<ZSetInputCharge> input_charges_;
   const CommandRequest* request_ = nullptr;
-  ReplicationTransactionGuard* replication_ = nullptr;
-  unsigned coordinator_ = 0;
   std::vector<ZSet> inputs_;
   ZSet output_;
   CapturedReplicationCommands replacement_effects_;
@@ -2104,27 +2069,8 @@ void ClearMultiPayloads(MultiContext* context) noexcept {
 absl::Status PrepareMultiCapture(const MultiContext& context) {
   const auto& capture = context.request_->replication_capture_;
   if (!capture) return absl::OkStatus();
-  std::size_t bytes = 0;
-  std::size_t argument_count = 0;
-  constexpr auto limit = std::numeric_limits<std::size_t>::max();
-  for (const auto& effect : context.replacement_effects_) {
-    if (effect.args_.size() > limit - argument_count)
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set capture argument count overflow");
-    argument_count += effect.args_.size();
-    if (effect.args_.capacity() > (limit - bytes) / sizeof(std::string))
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set capture size overflow");
-    bytes += effect.args_.capacity() * sizeof(std::string);
-    for (const auto& argument : effect.args_) {
-      if (argument.capacity() >= limit - bytes)
-        return absl::ResourceExhaustedError(
-            "OOM Sorted Set capture size overflow");
-      bytes += argument.capacity() + 1;
-    }
-  }
-  return capture->ReserveAdditionalCommands(context.replacement_effects_.size(),
-                                            bytes, argument_count);
+  return capture->ReserveAdditionalCommands(
+      context.replacement_effects_.size());
 }
 
 CapturedReplicationCommands BuildZSetReplacement(const CommandRequest& request,
@@ -2294,8 +2240,7 @@ absl::Status ComputeMulti(MultiContext* context) {
   if (!add_strings(context->replacement_args_))
     return absl::ResourceExhaustedError(
         "OOM Sorted Set replication size overflow");
-  // Captured effects account their own argument and vector allocations; only
-  // the plain canonical replacement above belongs to the output owner.
+  // Captured effects account their own argument and vector allocations.
   if (admission->bytes() && *retained > admission->bytes())
     return absl::ResourceExhaustedError(
         "OOM Sorted Set output exceeds admission");
@@ -2454,22 +2399,6 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
   if (context->single_shard_ && context->store_) {
     absl::Status computed = ComputeMulti(context);
     if (!computed.ok()) co_return computed;
-    if (context->replication_ != nullptr) {
-      if (bycorf::ThisWorker().id_ == context->coordinator_) {
-        computed = co_await context->replication_->PrepareCommandArgs(
-            std::move(context->replacement_args_));
-      } else {
-        computed = co_await bycorf::SubmitTaskTo(
-            context->coordinator_,
-            [replication = context->replication_,
-             args = std::move(
-                 context->replacement_args_)]() mutable -> Task<absl::Status> {
-              co_return co_await replication->PrepareCommandArgs(
-                  std::move(args));
-            });
-      }
-      if (!computed.ok()) co_return computed;
-    }
     const storage::Digest destination = storage::ComputeDigest(
         request.args_[context->store_shape_->destination_arg_]);
     absl::Status replaced =
@@ -2750,8 +2679,6 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   if (!replication.status().ok()) {
     co_return Built(StorageError(builder, replication.status()));
   }
-  context.replication_ = &replication;
-  context.coordinator_ = bycorf::ThisWorker().id_;
   context.single_shard_ = transaction.single_shard();
   std::uint64_t txid = 0;
   if (context.store_) {
@@ -2762,9 +2689,6 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     for (auto& write : context.writes_) {
       write.collect_undo_ = true;
     }
-    const auto prepared =
-        replication.PrepareFinalExpirations(context.writes_, request);
-    if (!prepared.ok()) co_return Built(StorageError(builder, prepared));
   }
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) co_return Built(StorageError(builder, status));
@@ -2773,9 +2697,6 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   if (status.ok() && !context.store_) status = ComputeMulti(&context);
   if (status.ok() && context.store_ && !context.single_shard_) {
     status = ComputeMulti(&context);
-    if (status.ok())
-      status = co_await replication.PrepareCommandArgs(
-          std::move(context.replacement_args_));
     if (status.ok())
       status = co_await transaction.Execute(&MultiWriteShard, &context, false);
     context.rollback_ = !status.ok();
@@ -2806,6 +2727,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(StorageError(builder, status));
   }
   if (context.store_) {
+    replication.SetCommandArgs(std::move(context.replacement_args_));
     replication.SetFinalExpirations(context.writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
@@ -3115,31 +3037,6 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       co_return std::string(
           builder.AppendError("ERR Sorted Set key is missing"));
     }
-    std::vector<std::string> canonical;
-    if (request.replication_capture_ != nullptr) {
-      auto read_length = [&]() {
-        return g_storage->ExecuteSortedSetLocked(
-            request.db_id_, request.args_[argument], key->digest_,
-            storage::SortedSetOperation{
-                .kind_ = storage::SortedSetOperationKind::kLength});
-      };
-      absl::StatusOr<storage::SortedSetResult> length;
-      if (key->owner_ == bycorf::ThisWorker().id_) {
-        length = co_await read_length();
-      } else {
-        length = co_await bycorf::SubmitTaskTo(key->owner_, read_length);
-      }
-      if (!length.ok())
-        co_return std::string(StorageError(builder, length.status()));
-      if (length->length_ == 0) continue;
-      canonical =
-          CanonicalSelectedZSetPop(request.args_[argument], shape.maximum_,
-                                   std::min(shape.count_, length->length_));
-      const auto prepared =
-          PrepareCapturedReplicationCommand(request, canonical);
-      if (!prepared.ok())
-        co_return std::string(StorageError(builder, prepared));
-    }
     auto pop = [&]() {
       return PopZSetLocked(request.db_id_, request.args_[argument],
                            key->digest_, shape.maximum_, shape.count_,
@@ -3159,7 +3056,10 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       co_return std::string(StorageError(builder, popped.status()));
     }
     if (!popped->members_.empty()) {
-      CaptureReplicationCommand(request, std::move(canonical));
+      CaptureReplicationCommand(
+          request,
+          CanonicalSelectedZSetPop(request.args_[argument], shape.maximum_,
+                                   popped->members_.size()));
       AppendMultiPopReply(builder, request.args_[argument], *popped,
                           shape.flat_reply_);
       co_return std::string(builder.View());

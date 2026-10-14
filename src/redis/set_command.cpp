@@ -36,7 +36,6 @@
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "lavik/command_table.h"
-#include "lavik/expiration.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
@@ -185,53 +184,7 @@ Task<CommandReply> ExecuteSetCommandImpl(
   absl::StatusOr<storage::HashResult> result;
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
-  std::vector<std::string> selected_effect;
-  const bool prepare_selected_pop = request.kind_ == CommandKind::kSPop &&
-                                    request.replication_capture_ != nullptr &&
-                                    digest != nullptr && compact == nullptr;
-  if (prepare_selected_pop) {
-    // The EXEC/Lua key lock spans selection, effect admission, and deletion.
-    // Pin expiry too, so the two storage calls observe the same incarnation
-    // even when the deadline passes while they suspend.
-    operation.now_ms_ = RedisUnixTimeMillis();
-    storage::HashOperation select = operation;
-    select.kind_ = storage::HashOperationKind::kRandomFields;
-    result = co_await g_storage->ExecuteSetLocked(request.db_id_, args[1],
-                                                  *digest, select);
-    if (!result.ok()) {
-      co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
-    }
-    if (!result->values_.empty()) {
-      selected_effect = {"SREM", args[1]};
-      selected_effect.reserve(result->values_.size() + 2);
-      storage::HashOperation remove;
-      remove.kind_ = storage::HashOperationKind::kDelete;
-      remove.now_ms_ = operation.now_ms_;
-      remove.fields_.reserve(result->values_.size());
-      for (const auto& member : result->values_) {
-        if (member.has_value()) {
-          selected_effect.push_back(*member);
-          remove.fields_.push_back(*member);
-        }
-      }
-      const auto prepared =
-          PrepareCapturedReplicationCommand(request, selected_effect);
-      if (!prepared.ok()) {
-        co_return BuiltReply(AppendStorageError(reply_builder, prepared));
-      }
-      auto removed = co_await g_storage->ExecuteSetLocked(
-          request.db_id_, args[1], *digest, remove, tx,
-          replication ? &*replication : nullptr);
-      if (!removed.ok()) {
-        co_return BuiltReply(
-            AppendStorageError(reply_builder, removed.status()));
-      }
-      result->changed_ = removed->changed_;
-      result->integer_ = removed->integer_;
-      result->length_ = removed->length_;
-      result->key_exists_ = removed->key_exists_;
-    }
-  } else if (compact != nullptr) {
+  if (compact != nullptr) {
     result =
         storage::ReadCompactHash(*compact, operation, storage::ValueType::kSet);
   } else if (digest == nullptr) {
@@ -249,14 +202,12 @@ Task<CommandReply> ExecuteSetCommandImpl(
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
   }
   if (request.kind_ == CommandKind::kSPop && !result->values_.empty()) {
-    if (!prepare_selected_pop) {
-      selected_effect = {"SREM", args[1]};
-      selected_effect.reserve(result->values_.size() + 2);
-      for (const auto& member : result->values_) {
-        if (member.has_value()) selected_effect.push_back(*member);
-      }
+    std::vector<std::string> canonical{"SREM", args[1]};
+    canonical.reserve(result->values_.size() + 2);
+    for (const auto& member : result->values_) {
+      if (member.has_value()) canonical.push_back(*member);
     }
-    CaptureReplicationCommand(request, std::move(selected_effect));
+    CaptureReplicationCommand(request, std::move(canonical));
   }
 
   switch (request.kind_) {
@@ -507,14 +458,12 @@ Task<absl::Status> PrepareSetEffects(SetMultiContext* context) {
     // elsewhere; an allocation failure must still be an untouched transaction.
     absl::Status status;
     if (ThisWorker().id_ == context->coordinator_) {
-      status = co_await context->replication_->PrepareCommandArgs(
-          std::move(effects));
+      status = context->replication_->TrySetCommandArgs(std::move(effects));
     } else {
-      status = co_await SubmitTaskTo(
-          context->coordinator_,
-          [guard = context->replication_,
-           effects = std::move(effects)]() mutable -> Task<absl::Status> {
-            co_return co_await guard->PrepareCommandArgs(std::move(effects));
+      status = co_await SubmitTo(
+          context->coordinator_, [guard = context->replication_,
+                                  effects = std::move(effects)]() mutable {
+            return guard->TrySetCommandArgs(std::move(effects));
           });
     }
     if (!status.ok()) co_return status;
@@ -802,10 +751,6 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
     for (auto& shard : context.tx_writes_) {
       shard.collect_undo_ = true;
     }
-    const auto prepared =
-        replication.PrepareFinalExpirations(context.tx_writes_, request);
-    if (!prepared.ok())
-      co_return BuiltReply(AppendStorageError(reply_builder, prepared));
   }
 
   absl::Status status = co_await transaction.Schedule();

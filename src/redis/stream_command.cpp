@@ -1516,11 +1516,6 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     if (!changed) return NoChange();
     auto canonical = RestoreGroupArgs(key, group_name, group, &before_group);
     if (!canonical.ok()) return canonical.status();
-    if (request != nullptr) {
-      const auto prepared =
-          PrepareCapturedReplicationCommand(*request, *canonical);
-      if (!prepared.ok()) return prepared;
-    }
     if (replication.has_value()) replication->args_ = *canonical;
     captured_group_args = std::move(*canonical);
     return Changed(std::move(stream));
@@ -2244,15 +2239,6 @@ Task<CommandReply> ExecuteImpl(
         if (replication) replication->args_ = *canonical;
         captured_group_args = std::move(*canonical);
       }
-      // The callback has changed only its private decoded image. Admission
-      // here can still reject the command without publishing Stream/PEL state.
-      for (const auto* effect :
-           {&captured_group_args, &captured_xadd, &captured_xtrim}) {
-        if (effect->empty()) continue;
-        const auto prepared =
-            PrepareCapturedReplicationCommand(request, *effect);
-        if (!prepared.ok()) return prepared;
-      }
       return Changed(std::move(after));
     };
     const std::uint64_t now = NowMs();
@@ -2394,14 +2380,6 @@ Task<CommandReply> ExecuteImpl(
                 ? trim_limit.value_or(DefaultApproximateTrimLimit())
                 : 0;
         if (value && value->stream_incremental_trim_) {
-          // The grouped trim callback will learn the final boundary later,
-          // before publication. Reserve two uint64 ID components and their
-          // formatter's growth capacity now; that callback cannot return OOM.
-          if (trim_approximate)
-            captured_xadd[*trim_threshold_arg].reserve(2 * 41);
-          const auto prepared =
-              PrepareCapturedReplicationCommand(request, captured_xadd);
-          if (!prepared.ok()) return prepared;
           auto update = Changed(std::move(stream));
           if (!update.ok()) return update.status();
           if (trim != Trim::kNone) {
@@ -2587,14 +2565,6 @@ Task<CommandReply> ExecuteImpl(
                 ? requested_limit.value_or(DefaultApproximateTrimLimit())
                 : 0;
         if (value && value->stream_incremental_trim_) {
-          if (approximate) {
-            captured_xtrim = request.args_;
-            captured_xtrim[trim_threshold_arg].reserve(2 * 41);
-            const auto prepared =
-                PrepareCapturedReplicationCommand(request, captured_xtrim);
-            if (!prepared.ok()) return prepared;
-            MarkReplicationCommandHandled(request);
-          }
           auto update = Changed(std::move(stream));
           if (!update.ok()) return update.status();
           update->stream_trim_ = storage::StreamTrimRequest{
@@ -2607,6 +2577,7 @@ Task<CommandReply> ExecuteImpl(
                trim_threshold_arg](const storage::StreamTrimResult& result) {
                 integer = result.removed_;
                 if (approximate && result.removed_ != 0) {
+                  captured_xtrim = request.args_;
                   captured_xtrim[*trim_specifier_arg] = "=";
                   captured_xtrim[trim_threshold_arg] =
                       maxlen_mode ? std::to_string(result.length_)
@@ -2617,8 +2588,6 @@ Task<CommandReply> ExecuteImpl(
                   captured_xtrim.resize(trim_threshold_arg + 1);
                   if (replication) replication->args_ = captured_xtrim;
                   MarkReplicationCommandHandled(request);
-                } else if (approximate) {
-                  captured_xtrim.clear();
                 }
               };
           return update;

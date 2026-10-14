@@ -50,7 +50,6 @@ class Worker;
 
 namespace lavik {
 class ReplicationHistory;
-class ReplicationCommandPayloadSource;
 }  // namespace lavik
 
 namespace lavik::storage {
@@ -570,26 +569,6 @@ struct SetResult {
   std::optional<DiskValue> old_value_;
 };
 
-// Foreground-only hard protocol bound for prepared command effects. Receipts
-// borrow it only while applying a command; asynchronous publication never
-// dereferences it. This does not reserve memory: replication allocations for
-// an admitted write may exceed the soft budget and are accounted on allocation.
-class ReplicationWriteAdmission {
- public:
-  virtual ~ReplicationWriteAdmission() = default;
-  // The common case checks the complete-event limit without a coroutine.
-  virtual bool CoversWrite(std::size_t event_bytes = 0) const noexcept = 0;
-  virtual bycorf::Task<absl::Status> PrepareWrite(
-      std::size_t event_bytes = 0) = 0;
-  // Sets an absolute bound for a prepared body plus envelope/TTL metadata.
-  // The next write validates it before any mutation becomes visible.
-  virtual void RequireEventBytes(std::size_t bytes) noexcept = 0;
-  // Called before an effect can mutate data. Concurrent participant captures
-  // contribute to one complete transaction bound without a shared mutex.
-  virtual void ReserveEffectBytes(std::size_t bytes) noexcept = 0;
-  virtual void ReleaseEffectBytes(std::size_t bytes) noexcept = 0;
-};
-
 // An owned command handed from command dispatch to the per-worker asynchronous
 // replication publisher. A large canonical argument may require one owned
 // staging string; that string is subsequently moved into the queue.
@@ -603,8 +582,6 @@ struct ReplicationCommandAppend {
   // declare it before the arguments so their buffers die before the charge.
   std::shared_ptr<const void> retained_owner_{};
   std::vector<std::string> args_;
-  // Borrowed only by the storage mutation before the command enters the FIFO.
-  ReplicationWriteAdmission* admission_ = nullptr;
 };
 
 // Accounts an accepted command's vector/string capacities without another
@@ -646,8 +623,6 @@ struct ReplicationPublisherAdmission {
   };
 
   std::uint64_t log_epoch_ = 0;
-  // Owner-local identity for this grant. A retry receives a fresh identity.
-  std::uint64_t ticket_id_ = 0;
   std::vector<std::uint64_t> fullsync_session_ids_;
   std::vector<UnstartedGuard> fullsync_unstarted_guards_;
 };
@@ -722,8 +697,6 @@ enum class ReplicationTransactionResolution : std::uint8_t {
   kInvalidate,
 };
 
-struct PreparedReplicationExpirations;
-
 // Shared by the source workers participating in one cross-key command. Each
 // worker queues a reference to the same canonical command while the command
 // holds its shard locks; resolution publishes its final contents. A publisher
@@ -739,25 +712,15 @@ struct ReplicationTransaction {
   unsigned payload_flow_ = 0;
   std::string envelope_metadata_;
   std::vector<std::string> command_args_;
-  std::shared_ptr<const PreparedReplicationExpirations> expiration_effects_;
-  // Sources account their own codec buffers and are sealed before resolution.
-  // Views refer to the body and expiration owner above; marker participants
-  // share one immutable codec instead of copying canonical arguments.
-  std::shared_ptr<ReplicationCommandPayloadSource> payload_source_;
-  std::shared_ptr<ReplicationCommandPayloadSource> marker_source_;
   std::atomic<ReplicationTransactionResolution> resolution_{
       ReplicationTransactionResolution::kPending};
 };
 
-// Returns a conservative pre-allocation reservation for a transaction and the
-// retained footprint after its prefix has been materialized. The participant
-// capacity is included because that vector moves into the shared owner.
-std::optional<std::size_t> ReplicationTransactionReservationBytes(
-    std::size_t participant_capacity, std::size_t participant_count,
-    std::span<const std::string> command_args) noexcept;
+// Returns the retained footprint of a materialized transaction, including
+// both vectors' allocated capacities and heap storage owned by its strings.
 std::optional<std::size_t> ReplicationTransactionAllocationBytes(
     std::size_t participant_capacity, std::span<const std::string> prefix,
-    std::span<const std::string> command_args) noexcept;
+    const std::vector<std::string>& command_args) noexcept;
 
 enum class ListOperationKind : std::uint8_t {
   kPushLeft,
@@ -1191,29 +1154,6 @@ class MutationPrecondition {
 struct GroupedCommitDecision;
 struct GroupedCommitDependency;
 
-// A source transaction prepares one slot per possible (database, key) before
-// mutation. Participants only update their own slots; repeated writes and
-// command-local compensation overwrite the final metadata without allocating.
-struct ReplicationExpirationSlot {
-  // DB, argc, command, key, deadline. All storage is prepared before writing;
-  // the last argument is omitted for PERSIST and the entire slot for absence.
-  std::array<std::string, 5> args_;
-  std::uint64_t expire_at_ms_ = 0;
-  unsigned owner_ = 0;
-  std::uint8_t db_id_ = 0;
-  bool exists_ = false;
-  bool touched_ = false;
-};
-
-struct PreparedReplicationExpirations {
-  // Argument buffers and slots must be destroyed before returning allowance.
-  RetainedMemoryCharge retained_charge_;
-  std::vector<ReplicationExpirationSlot> slots_;
-  // EXEC name/count and the original command's DB/argc, prepared even when the
-  // original body is already an EXEC (only name/count are then needed).
-  std::array<std::string, 4> prefix_;
-};
-
 struct TxShardWrites {
   // Command-lifetime cache only. It avoids rereading a large immutable key
   // for every auxiliary segment; no original long key stays in the registry.
@@ -1274,18 +1214,10 @@ struct TxShardWrites {
   };
   std::vector<Fence> fences_;
   std::vector<Retired> retirements_;
-  // Final metadata is collected while the key lock is held. Replication
-  // collapses repeated writes to the same key before publishing the command.
+  // Final metadata is collected while the key lock is held and collapsed
+  // before publication. Its charge outlives the actual vector/key buffers.
+  RetainedMemoryCharge expiration_charge_;
   std::vector<ExpirationEffect> expiration_effects_;
-  // The shared owner also belongs to the replication envelope. Each receipt
-  // sees only its worker's fixed slots; the coordinator freezes them after the
-  // last storage hop and publication keeps the allowance alive independently
-  // of the asynchronous durability receipt.
-  std::shared_ptr<PreparedReplicationExpirations> prepared_expirations_;
-  std::span<ReplicationExpirationSlot> expiration_slots_;
-  // Borrowed during foreground writes only. Commit-queue processing must not
-  // dereference this command-scoped admission after the coordinator returns.
-  ReplicationWriteAdmission* replication_admission_ = nullptr;
   // Collected under participant key locks, but invisible to full-sync
   // sessions until the coordinator has made the global commit decision.
   std::vector<FullSyncEffect> fullsync_effects_;
@@ -1658,13 +1590,11 @@ class StorageEngine {
   // command/transaction gates. The log and each full-sync session already
   // hold fixed retained-memory budgets; this token reserves byte waterline and
   // ring-slot credit in their FIFOs. A request larger than the normal limit is
-  // admitted only when it can be the sole staged item. event_bytes validates
-  // the protocol limit without reserving future backlog allocation.
+  // admitted only when it can be the sole staged item.
   bycorf::Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
-      std::optional<ReplicationPublisherTarget> target = std::nullopt,
-      std::size_t event_bytes = 0);
+      std::optional<ReplicationPublisherTarget> target = std::nullopt);
   // Registers a stable ordered intent and attempts a grant without waiting.
   // An empty result retains the intent but owns no capacity. Even a successful
   // result retains the intent: the coordinator must collect every participant
@@ -1718,9 +1648,9 @@ class StorageEngine {
   absl::Status PublishPreparedReplicationCommand(
       const ReplicationPublisherAdmission& admission,
       PreparedReplicationCommandPublication publication);
-  // Publishes outcome-dependent effects whose memory and complete-event block
-  // requirements were admitted before mutation. retained_owner keeps their
-  // canonical charge alive through both backlog and full-sync publication.
+  // Publishes outcome-dependent effects of an admitted command. Their
+  // allocations may exceed the soft budget; retained_owner keeps canonical
+  // accounting alive through both backlog and full-sync publication.
   // An unexpected publication failure invalidates history rather than leaving
   // a committed mutation outside an otherwise resumable history.
   absl::Status PublishLateAdmittedReplicationCommand(

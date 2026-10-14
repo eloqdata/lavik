@@ -477,10 +477,9 @@ bool StorageEngine::ReplicationLogActive() const noexcept {
 
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 StorageEngine::AcquireReplicationPublisherAdmission(
-    std::size_t logical_bytes, std::optional<ReplicationPublisherTarget> target,
-    std::size_t event_bytes) {
-  return impl_->AcquireReplicationPublisherAdmission(logical_bytes, target,
-                                                     event_bytes);
+    std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  return impl_->AcquireReplicationPublisherAdmission(logical_bytes, target);
 }
 
 absl::StatusOr<std::optional<ReplicationPublisherAdmission>>

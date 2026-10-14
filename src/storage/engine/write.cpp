@@ -72,23 +72,6 @@ absl::StatusOr<RecordIndex::Entry*> StorageEngine::Impl::ReplaceIndexLocation(
 
 namespace {
 
-ReplicationExpirationSlot* FindPreparedExpiration(TxShardWrites& writes,
-                                                  std::uint8_t db_id,
-                                                  std::string_view key) {
-  auto slots = writes.expiration_slots_;
-  const auto found = std::lower_bound(
-      slots.begin(), slots.end(), std::pair{db_id, key},
-      [](const ReplicationExpirationSlot& slot, const auto& identity) {
-        return slot.db_id_ < identity.first ||
-               (slot.db_id_ == identity.first &&
-                slot.args_[3] < identity.second);
-      });
-  return found != slots.end() && found->db_id_ == db_id &&
-                 found->args_[3] == key
-             ? &*found
-             : nullptr;
-}
-
 template <typename Queue>
 bool TryPreparePostMutationQueueSlot(Queue* queue,
                                      std::size_t admitted_items) noexcept {
@@ -798,10 +781,6 @@ void MergeTxCommitFence(std::vector<RelocationDurabilityFence>* merged,
 bool StorageEngine::Impl::EnqueueTxCommit(std::uint64_t txid,
                                           std::vector<TxShardWrites> writes) {
   assert(txid != 0);
-  // Admission belongs to the foreground command's stack. The background
-  // coordinator only settles completed mutations and must never retain this
-  // borrowed hook after ownership of the receipts transfers to its queue.
-  for (TxShardWrites& shard : writes) shard.replication_admission_ = nullptr;
 #ifndef NDEBUG
   for (const TxShardWrites& shard : writes) {
     // Command-local undo must be settled before ownership transfers to the
@@ -1113,16 +1092,6 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         if (!restored.ok()) {
           store.write_failed_ = true;
           co_return restored;
-        }
-        if (compensation->prepared_expirations_ != nullptr) {
-          auto* slot =
-              FindPreparedExpiration(*compensation, entry.db_id_, undo_key);
-          assert(slot != nullptr);
-          slot->touched_ = true;
-          slot->exists_ = entry.previous_.has_value() &&
-                          entry.previous_->kind() == RecordKind::kValue;
-          slot->expire_at_ms_ =
-              slot->exists_ ? entry.previous_->expire_at_ms_ : 0;
         }
         continue;
       }
@@ -2008,31 +1977,23 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     AppendReplicationExpirationEffect(
         &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
         kind == RecordKind::kValue ? expire_at_ms : 0);
-    if (replication->admission_ != nullptr) {
-      const auto argc = replication->args_.size();
-      if (argc == 0 || argc > static_cast<std::size_t>(
-                                  std::numeric_limits<std::int32_t>::max())) {
+    // Soft-budget growth is allowed after publisher admission, but the final
+    // canonical encoding (including TTL) must still fit before data changes.
+    const auto argc = replication->args_.size();
+    if (argc == 0 || argc > static_cast<std::size_t>(
+                                std::numeric_limits<std::int32_t>::max())) {
+      co_return absl::ResourceExhaustedError(
+          "replication command argument count exceeds encoding limit");
+    }
+    std::size_t bytes =
+        ReplicationCommandFixedHeaderBytes(argc) + argc * sizeof(std::uint32_t);
+    for (const auto& argument : replication->args_) {
+      if (argument.size() > kMaxNativeReplicationEventBytes ||
+          bytes > kMaxNativeReplicationEventBytes - argument.size()) {
         co_return absl::ResourceExhaustedError(
-            "replication command argument count exceeds encoding limit");
+            "replication event exceeds the 1 GiB event limit");
       }
-      std::size_t bytes = ReplicationCommandFixedHeaderBytes(argc) +
-                          argc * sizeof(std::uint32_t);
-      for (const auto& argument : replication->args_) {
-        if (argument.size() > kMaxNativeReplicationEventBytes ||
-            bytes > kMaxNativeReplicationEventBytes - argument.size()) {
-          co_return absl::ResourceExhaustedError(
-              "replication event exceeds the 1 GiB event limit");
-        }
-        bytes += argument.size();
-      }
-      if (!replication->admission_->CoversWrite(bytes)) {
-        const auto admitted =
-            co_await replication->admission_->PrepareWrite(bytes);
-        if (!admitted.ok()) co_return admitted;
-      }
-      // The hard-size validator belongs to the foreground stack; queued
-      // publications retain their allocated payload independently.
-      replication->admission_ = nullptr;
+      bytes += argument.size();
     }
     replication->db_id_ = db_id;
     replication->partition_id_ = partition.id_;
@@ -2044,7 +2005,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
       // than converted into a recoverable command error.
       auto owned_copy =
           std::make_shared<ReplicationCommandAppend>(*replication);
-      // This is a physical copy, so it needs its own allocation charge.
+      // This copy owns distinct string buffers, so it needs its own charge.
       owned_copy->retained_owner_.reset();
       AccountReplicationCommand(owned_copy.get());
       fullsync_command = std::move(owned_copy);
@@ -2137,14 +2098,33 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   }
   if (status.ok() && tx != nullptr) {
     ++tx->dataset_changes_;
-    if (tx->prepared_expirations_ == nullptr) {
-      tx->expiration_effects_.push_back(TxShardWrites::ExpirationEffect{
-          .key_ = std::string(key),
-          .expire_at_ms_ = kind == RecordKind::kValue ? expire_at_ms : 0,
-          .db_id_ = db_id,
-          .exists_ = kind == RecordKind::kValue,
-      });
+    const auto previous_capacity = tx->expiration_effects_.capacity();
+    tx->expiration_effects_.push_back(TxShardWrites::ExpirationEffect{
+        .key_ = std::string(key),
+        .expire_at_ms_ = kind == RecordKind::kValue ? expire_at_ms : 0,
+        .db_id_ = db_id,
+        .exists_ = kind == RecordKind::kValue,
+    });
+    // Account capacity growth and this key incrementally: a large MSET must
+    // not rescan every earlier expiration entry after each individual write.
+    const auto capacity = tx->expiration_effects_.capacity();
+    std::size_t bytes = tx->expiration_charge_.bytes();
+    if (capacity != previous_capacity) {
+      bytes += AllocatorUsableSizeForRequest(
+                   capacity * sizeof(TxShardWrites::ExpirationEffect)) -
+               (previous_capacity == 0
+                    ? 0
+                    : AllocatorUsableSizeForRequest(
+                          previous_capacity *
+                          sizeof(TxShardWrites::ExpirationEffect)));
     }
+    const auto& key_copy = tx->expiration_effects_.back().key_;
+    if (key_copy.capacity() > std::string{}.capacity())
+      bytes += AllocatorUsableSizeForRequest(key_copy.capacity() + 1);
+    if (tx->expiration_charge_.bytes() == 0)
+      tx->expiration_charge_.Account(CurrentMemoryAccountingShard(), bytes);
+    else
+      tx->expiration_charge_.Resize(bytes);
   }
   if (status.ok() && tx == nullptr) {
     RecordDatasetChanges();
@@ -2625,31 +2605,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       request.group_ != nullptr && request.group_->auxiliary_;
   const bool grouped_root =
       request.group_ != nullptr && !request.group_->auxiliary_;
-  ReplicationExpirationSlot* expiration_slot = nullptr;
-  if (!auxiliary && !request.indirect_key_record_ &&
-      request.kind_ != RecordKind::kTxCommit && request.tx_ != nullptr &&
-      request.tx_->prepared_expirations_ != nullptr) {
-    expiration_slot =
-        FindPreparedExpiration(*request.tx_, request.db_id_, request.key_);
-    if (expiration_slot == nullptr) {
-      // A missing slot is a command preparation bug. Reject before staging or
-      // publishing a record, never allocate a replacement after mutation.
-      co_return absl::FailedPreconditionError(
-          "transaction expiration key was not prepared");
-    }
-  }
-  if (!auxiliary && !request.indirect_key_record_ &&
-      request.kind_ != RecordKind::kTxCommit && request.tx_ != nullptr &&
-      request.tx_->replication_admission_ != nullptr &&
-      request.replacement_undo_ == nullptr &&
-      !request.tx_->replication_admission_->CoversWrite()) {
-    // Validate only the protocol bound here. Waiting for memory or ACKs while
-    // a transaction owns key intents could prevent its peers from finishing.
-    // Compensation restores its existing effects without extending the bound.
-    const auto admitted =
-        co_await request.tx_->replication_admission_->PrepareWrite();
-    if (!admitted.ok()) co_return admitted;
-  }
   struct FailIncompleteGroupedRoot {
     WorkerStore& store_;
     TxShardWrites* tx_;
@@ -3832,12 +3787,6 @@ acquire_active_stream:
 #if LAVIK_ENABLE_TRACE
   if (trace != nullptr) trace->index_done_ns_ = SetTraceNowNanos();
 #endif
-  if (expiration_slot != nullptr) {
-    expiration_slot->touched_ = true;
-    expiration_slot->exists_ = request.kind_ == RecordKind::kValue;
-    expiration_slot->expire_at_ms_ =
-        expiration_slot->exists_ ? request.expire_at_ms_ : 0;
-  }
   grouped_root_guard.completed_ = true;
   co_return absl::OkStatus();
 }

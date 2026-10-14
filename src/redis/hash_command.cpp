@@ -16,7 +16,6 @@
 
 #include "hash_command.h"
 
-#include <cassert>
 #include <charconv>
 #include <limits>
 
@@ -206,24 +205,6 @@ Task<CommandReply> ExecuteHashCommandImpl(
   // Both locked and ordinary dispatch assign this placeholder. A non-empty
   // diagnostic here only allocates a StatusRep that is discarded immediately.
   absl::StatusOr<storage::HashResult> result;
-  std::vector<std::string> captured_increment;
-  if (request.replication_capture_ != nullptr &&
-      (request.kind_ == CommandKind::kHIncrBy ||
-       request.kind_ == CommandKind::kHIncrByFloat)) {
-    // A short increment can produce a much longer existing numeric value.
-    // Reserve the formatter's complete range before storage mutates it; the
-    // result below only fills this already-owned canonical HSET.
-    const std::size_t maximum_number =
-        request.kind_ == CommandKind::kHIncrBy
-            ? 20
-            : std::numeric_limits<long double>::max_exponent10 + 128;
-    captured_increment = {"HSET", args[1], args[2],
-                          std::string(maximum_number, '0')};
-    const auto prepared =
-        PrepareCapturedReplicationCommand(request, captured_increment);
-    if (!prepared.ok())
-      co_return BuiltReply(AppendStorageError(reply_builder, prepared));
-  }
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (compact != nullptr) {
@@ -250,21 +231,12 @@ Task<CommandReply> ExecuteHashCommandImpl(
     co_return BuiltReply(reply_builder.AppendNull());
   }
   if (request.kind_ == CommandKind::kHIncrBy) {
-    if (!captured_increment.empty()) {
-      const auto formatted = std::to_chars(
-          captured_increment[3].data(),
-          captured_increment[3].data() + captured_increment[3].size(),
-          result->signed_integer_);
-      assert(formatted.ec == std::errc{});
-      captured_increment[3].resize(formatted.ptr -
-                                   captured_increment[3].data());
-      CaptureReplicationCommand(request, std::move(captured_increment));
-    }
+    CaptureReplicationCommand(
+        request,
+        {"HSET", args[1], args[2], std::to_string(result->signed_integer_)});
   } else if (request.kind_ == CommandKind::kHIncrByFloat) {
-    if (!captured_increment.empty()) {
-      captured_increment[3].assign(result->scalar_);
-      CaptureReplicationCommand(request, std::move(captured_increment));
-    }
+    CaptureReplicationCommand(request,
+                              {"HSET", args[1], args[2], result->scalar_});
   }
   switch (request.kind_) {
     case CommandKind::kHSet:
