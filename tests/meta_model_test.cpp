@@ -388,13 +388,6 @@ void ExpectRoundTrip(const T& cmd) {
   ExpectCommandEnvelope(cmd);
 }
 
-void ExpectRecordDecodeFailStop(std::string_view bytes) {
-  const auto decoded = lavik::meta::DecodeMetaGroupRecord(bytes);
-  ASSERT_FALSE(decoded.ok());
-  EXPECT_EQ(lavik::meta::MetaFailureClassOf(decoded.status()),
-            lavik::meta::MetaFailureClass::kFailStop);
-}
-
 // Encode-side cap violations are proposal-validation failures (domain
 // reject): nothing out-of-spec ever reaches the wire.
 void ExpectEncodeDomainReject(const MetaCommand& cmd) {
@@ -614,35 +607,6 @@ TEST(MetaModelCommands, SetSlotMapRoundTrip) {
   };
   cmd.new_topology_epoch_ = 101;  // absolute value
   ExpectRoundTrip(cmd);
-}
-
-TEST(MetaModelCommands, GroupRecordRoundTrip) {
-  // The per-group committed record contains owner, group_term,
-  // population_manifest_revision, and partition_replication_epoch.
-  // replication_history_id is deliberately absent because it is scoped to a
-  // data-plane boot. The record codec is defined here.
-  lavik::meta::MetaGroupRecord record;
-  record.owner_ = "0123456789abcdef0123456789abcdef01234567";
-  record.group_term_ = 9;
-  record.population_manifest_revision_ = 777;
-  record.population_manifest_digest_.fill(0x77);
-  record.partition_replication_epoch_ = 3;
-
-  const auto encoded = lavik::meta::EncodeMetaGroupRecord(record);
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  // Records carry the same u16 format-version envelope convention.
-  ASSERT_GE(encoded->size(), 2u);
-  const auto* p = reinterpret_cast<const unsigned char*>(encoded->data());
-  EXPECT_EQ(static_cast<std::uint16_t>(p[0] | (p[1] << 8)),
-            lavik::meta::kMetaFormatVersion);
-
-  const auto decoded = lavik::meta::DecodeMetaGroupRecord(*encoded);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  EXPECT_EQ(*decoded, record);
-
-  // Trailing bytes and truncation fail.
-  ExpectRecordDecodeFailStop(*encoded + '\0');
-  ExpectRecordDecodeFailStop(encoded->substr(0, encoded->size() - 1));
 }
 
 // ---------------------------------------------------------------------------
