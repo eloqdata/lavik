@@ -26,6 +26,7 @@
 // class; domain validation rejections are the other class — the two must stay
 // distinguishable.
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -293,7 +294,7 @@ TEST(MetaModelEncoding, FailureClassesAreDistinguishable) {
 }
 
 // ---------------------------------------------------------------------------
-// Command envelope: u16 schema_version | u16 command tag | request_id | body.
+// Command envelope: u16 version | u16 tag | request_id | actor | body.
 // ---------------------------------------------------------------------------
 
 using lavik::meta::DecodeMetaCommand;
@@ -326,6 +327,57 @@ void ExpectDecodeFailStop(std::string_view bytes) {
             lavik::meta::MetaFailureClass::kFailStop);
 }
 
+void ExpectCommandEnvelope(MetaCommand command) {
+  // This independent wire fixture covers every alternative through the valid
+  // body examples below. Removed tags 9, 11 and 14 must remain holes even when
+  // the encoder and decoder are refactored together.
+  constexpr std::array<std::uint16_t, 35> kWireTags = {
+      1,  2,  3,  4,  5,  6,  7,  8,  10, 12, 13, 15, 16, 17, 18, 19, 20, 21,
+      22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38};
+  static_assert(kWireTags.size() == std::variant_size_v<MetaCommand>);
+  const auto tag = kWireTags[command.index()];
+  SCOPED_TRACE(::testing::Message() << "command tag=" << tag);
+  std::visit(
+      [](auto& value) {
+        value.request_id_ = MakeRequestId(0xa0);
+        value.actor_ = {"lavik://operator/alice", "2026-09-04T01:02:03Z"};
+      },
+      command);
+
+  // Golden bytes pin field order and little-endian length prefixes without
+  // relying on the command encoder or MetaWriter to construct the expectation.
+  std::string header("\x01\x00", 2);
+  header.push_back(static_cast<char>(tag));
+  header.push_back('\0');
+  header.append(
+      "\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7"
+      "\xa8\xa9\xaa\xab\xac\xad\xae\xaf",
+      16);
+  header.append("\x16\x00\x00\x00", 4);
+  header.append("lavik://operator/alice");
+  header.append("\x14\x00\x00\x00", 4);
+  header.append("2026-09-04T01:02:03Z");
+  const std::string bytes = MustEncode(command);
+  ASSERT_GT(bytes.size(), header.size());
+  EXPECT_EQ(bytes.substr(0, header.size()), header);
+  const auto decoded = DecodeMetaCommand(bytes);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, command);
+  ExpectDecodeFailStop(bytes + '\0');
+
+  for (std::size_t length = 0; length < header.size(); ++length) {
+    SCOPED_TRACE(::testing::Message() << "header prefix length=" << length);
+    ExpectDecodeFailStop(std::string_view(bytes).substr(0, length));
+  }
+  // Keep the valid body intact while corrupting each actor length prefix.
+  // Both principal (offset 20) and readable time (offset 46) are bounded.
+  for (const std::size_t offset : {20u, 46u}) {
+    std::string corrupt = bytes;
+    corrupt.replace(offset, 4, 4, '\xff');
+    ExpectDecodeFailStop(corrupt);
+  }
+}
+
 template <typename T>
 void ExpectRoundTrip(const T& cmd) {
   const std::string bytes = MustEncode(cmd);
@@ -333,6 +385,7 @@ void ExpectRoundTrip(const T& cmd) {
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   ASSERT_TRUE(std::holds_alternative<T>(*decoded));
   EXPECT_EQ(std::get<T>(*decoded), cmd);
+  ExpectCommandEnvelope(cmd);
 }
 
 void ExpectRecordDecodeFailStop(std::string_view bytes) {
@@ -363,13 +416,7 @@ lavik::meta::RegisterNode MakeRegisterNode() {
 }
 
 TEST(MetaModelCommands, RegisterNodeRoundTrip) {
-  const lavik::meta::RegisterNode cmd = MakeRegisterNode();
-  const std::string bytes = MustEncode(cmd);
-
-  const auto decoded = DecodeMetaCommand(bytes);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  ASSERT_TRUE(std::holds_alternative<lavik::meta::RegisterNode>(*decoded));
-  EXPECT_EQ(std::get<lavik::meta::RegisterNode>(*decoded), cmd);
+  ExpectRoundTrip(MakeRegisterNode());
 }
 
 TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
@@ -400,11 +447,16 @@ TEST(MetaModelCommands, UnknownCommandTagFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
   // Removed tags remain holes instead of being reused for a different durable
   // command type.
-  for (const std::uint16_t bad_tag : {9, 14, 0xFFFF}) {
+  for (const std::uint16_t bad_tag : {9, 11, 14, 0xFFFF}) {
     std::string corrupt = bytes;
     corrupt[2] = static_cast<char>(bad_tag & 0xFF);
     corrupt[3] = static_cast<char>((bad_tag >> 8) & 0xFF);
     ExpectDecodeFailStop(corrupt);
+    // Tag dispatch precedes header decoding, including when no header follows.
+    corrupt.resize(4);
+    const auto decoded = DecodeMetaCommand(corrupt);
+    ASSERT_FALSE(decoded.ok());
+    EXPECT_EQ(decoded.status().message(), "unknown command tag");
   }
 }
 
@@ -848,6 +900,17 @@ TEST(MetaModelCommands, TypedFailoverCommandsRoundTrip) {
       lavik::meta::MetaCommandTag::kCommitUncontrolledFailover);
 }
 
+TEST(MetaModelCommands, StartCandidateRecoveryRoundTrip) {
+  lavik::meta::StartCandidateRecovery command;
+  command.request_id_ = MakeRequestId(0x9a);
+  command.group_id_ = "group-a";
+  command.expected_transition_.transition_id_.fill(0x52);
+  command.expected_transition_.revision_ = 88;
+  command.action_id_.fill(0x32);
+  command.recovery_deadline_unix_ms_ = 1'800'000'000'000;
+  ExpectRoundTrip(command);
+}
+
 TEST(MetaModelCommands, FailoverCodecRejectsInvalidValues) {
   lavik::meta::BeginUncontrolledFailover automatic;
   automatic.group_id_ = "group-a";
@@ -1076,6 +1139,19 @@ TEST(MetaModelCommands, SetGroupReplicationStateRoundTrip) {
   command.new_partition_replication_epoch_ = 11;
   command.new_topology_epoch_ = 12;
   ExpectRoundTrip(command);
+}
+
+TEST(MetaModelCommands, PopulationManifestCommandsRoundTrip) {
+  lavik::meta::PutPopulationManifest put;
+  put.request_id_ = MakeRequestId(0x76);
+  put.manifest_digest_.fill(0x51);
+  put.entries_ = {{1, 7}, {4096, 11}};
+  ExpectRoundTrip(put);
+
+  lavik::meta::PrunePopulationManifest prune;
+  prune.request_id_ = MakeRequestId(0x77);
+  prune.manifest_digest_ = put.manifest_digest_;
+  ExpectRoundTrip(prune);
 }
 
 // ---------------------------------------------------------------------------
