@@ -34,7 +34,7 @@
 
 ## 方法与边界
 
-- 方法沿用 [beta.1 对比报告](../lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.zh-CN.md)中的 Redis/Valkey 10M 组，以及 Lavik 的 1B 存储组；本批不包含 Dragonfly 或 Garnet。按 2026-10-13 官方稳定版选择 [Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2)、[Valkey 9.1.2](https://valkey.io/download/releases/v9-1-2/)。
+- 本报告覆盖 Redis/Valkey 10M 组与 Lavik 1B 存储组。对照版本为 2026-10-13 选择的最新稳定版：[Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2)、[Valkey 9.1.2](https://valkey.io/download/releases/v9-1-2/)。
 - 顺序为 Lavik SPDK 10M → Lavik SPDK 1B → Redis → Valkey。任一时刻只运行一个被测数据库和一个压测客户端；本组不改变服务端 CPU/IRQ 策略。编译在正式测量前完成。
 - 使用 `lavik-v0.1.0-linux-x86_64.tar.gz`；源码 `feb61224e414c5653fd09560e20c9d214db1e3ac`；可执行文件 SHA-256 `7bf8d204a137678cee0e1a621b02661181373fbbfe1366bc1c201942b9dcf420`；GCC 13 Release / x86-64-v2。未重新编译 Lavik，也未添加源码补丁。压缩包校验与发布的 SHA-256 一致。
 - Lavik 使用 `spdk-max-completions-per-poll=16`（v0.1.0 默认 8）。Defrag 保持开启，每个正式点前后均核验。

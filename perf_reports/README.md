@@ -24,13 +24,10 @@ Each report provides an English `README.md` and a Simplified Chinese
 
 | Report | Test date | English | 简体中文 |
 |---|---|---|---|
+| v0.1.0: 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | 2026-10-13–14 | [English](lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.md) | [简体中文](lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.zh-CN.md) |
 | v0.1.0 on 2 vCPUs: latest Redis / Valkey + Lavik 100M-key capacity | 2026-10-13 | [English](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md) |
 | v0.1.0 release: Redis 8.10.2 / Valkey 9.1.2 and Lavik 1TB, defrag enabled | 2026-10-13 | [English](lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.zh-CN.md) |
 | SPDK 48-hour online stability | 2026-08-15 | [English](lavik-spdk-48h-stability-2026-08-15/README.md) | [简体中文](lavik-spdk-48h-stability-2026-08-15/README.zh-CN.md) |
-| One billion keys: SPDK value-size scaling on 16 workers | 2026-08-31 | [English](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.md) | [简体中文](lavik-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31/README.zh-CN.md) |
-| SPDK vs. raw io_uring: 500M keys, 2 KiB values | 2026-08-26 | [English](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.md) | [简体中文](lavik-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26/README.zh-CN.md) |
-| Persistence and storage tiers: Dragonfly, Garnet, Kvrocks, Pika, Tendis, KeyDB, and Azure Managed Redis | 2026-08-11 | [English](lavik-vs-dragonfly-tiering-2026-08-11/README.md) | [简体中文](lavik-vs-dragonfly-tiering-2026-08-11/README.zh-CN.md) |
-| v0.1.0-beta.1 release: SPDK versus peers | — | [English](lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md) | [简体中文](lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.zh-CN.md) |
 | v0.1.0 release: Aerospike YCSB A/B/C/D throughput and tail latency, defrag enabled | 2026-10-13 | [English](lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.zh-CN.md) |
 
 Evidence availability and measurement limits are described in each report. Historical reproduction commands can depend on the

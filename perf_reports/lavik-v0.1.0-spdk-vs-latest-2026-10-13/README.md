@@ -34,7 +34,7 @@ Full-batch acquisition span (including per-point setup/snapshots): 2026-10-13 11
 
 ## Method and limits
 
-- Method follows the [beta.1 peer report](../lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md), covering its Redis/Valkey 10M group and Lavik 1B storage group. Dragonfly and Garnet are outside this batch. Latest stable peer versions were selected on 2026-10-13: [Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2), [Valkey 9.1.2](https://valkey.io/download/releases/v9-1-2/).
+- This report covers the Redis/Valkey 10M group and Lavik 1B storage group. Latest stable peer versions were selected on 2026-10-13: [Redis 8.10.2](https://github.com/redis/redis/releases/tag/8.10.2), [Valkey 9.1.2](https://valkey.io/download/releases/v9-1-2/).
 - Order: Lavik SPDK 10M, Lavik SPDK 1B, Redis, Valkey. One database and one load generator run at a time. Server CPU/IRQ policy is not changed during this group. Builds finish before measurement.
 - Standard package `lavik-v0.1.0-linux-x86_64.tar.gz`; source `feb61224e414c5653fd09560e20c9d214db1e3ac`; executable SHA-256 `7bf8d204a137678cee0e1a621b02661181373fbbfe1366bc1c201942b9dcf420`; GCC 13 release / x86-64-v2. No Lavik rebuild or source patch. Archive checksum matches the published checksum.
 - Lavik uses `spdk-max-completions-per-poll=16` (v0.1.0 default: 8). Defrag remains enabled and is verified before and after each formal point.

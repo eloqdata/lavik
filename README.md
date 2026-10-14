@@ -96,50 +96,13 @@ With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
 
 ### Disk-backed KV systems
 
-Our [Redis-compatible storage-tier benchmark](perf_reports/lavik-vs-dragonfly-tiering-2026-08-11/README.md)
-compares Lavik with Garnet, Dragonfly, Pika, Apache Kvrocks,
-Tendis, and KeyDB On Flash. Server and client ran on separate Azure
-`Standard_L16s_v3` VMs. Each backend used two NVMe drives and **200 million
-keys with uniformly random 1–4 KB values**, measured with 80 connections over
-300 seconds per workload, without a QPS limit. Results below are from the
-report's August 12, 2026 rerun.
+The [1TB storage comparison](perf_reports/lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.md) tests
+Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
+Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
+Results below use **80 connections**, sorted by QPS for each command. QPS bars
+grow from left to right; p99.9 latency bars grow from right to left on the same row.
 
-![Read, mixed, and write throughput across Redis-compatible storage tiers](perf_reports/charts/tiering-throughput.svg)
-
-| System / storage backend | Read-only QPS | Write-only QPS | 1:1 read/write QPS |
-|---|---:|---:|---:|
-| **Lavik SPDK** | **310,387** | **392,284** | **352,442** |
-| **Lavik io_uring — raw devices** | **278,925** | **393,733** | **328,831** |
-| **Lavik io_uring — XFS files** | **272,727** | **385,324** | **326,110** |
-| Garnet Storage Tier | 205,297 | 361,960 | 209,366 |
-| Dragonfly Tiered Storage | 187,653 | 199,234 | 207,248 |
-| Pika | 86,669 | 79,537 | 75,324 |
-| Apache Kvrocks | 70,672 | 110,167 | 88,084 |
-| Tendis | 68,860 | 160,642 | 102,213 |
-| KeyDB On Flash | 6,146 | 5,395 | 5,197 |
-
-Across these read, write, and mixed workloads, **Lavik SPDK delivered
-2.44–4.93× the throughput of Pika, Apache Kvrocks, and Tendis**. Its read
-throughput was **1.65× Dragonfly's and 1.51× Garnet's**; write throughput was
-**1.97× and 1.08×**, respectively.
-
-The [1 TB storage-tier test](perf_reports/lavik-v0.1.0-beta.1-spdk-vs-peers-2026-09-18/README.md#1b-keys--1-kib-storage-tier-controls)
-used **one billion 1 KiB values** on an AMD EPYC 9V74 server with six NVMe
-drives. The [Lavik](https://github.com/eloqdata/lavik/releases/tag/v0.1.0-beta.1) release with SPDK peaked
-at **952,560 GET QPS**, or **2.04× Dragonfly's and 2.13× Garnet's peak read throughput**.
-Its **764,939 SET QPS** was **1.42× Dragonfly's and 1.02× Garnet's**.
-These compare each system's highest measured point within its concurrency
-sweep and are separate from the dual-NVMe table above. Lavik SPDK
-used freshly loaded datasets; the controls reuse measurements from an earlier
-sweep on the same hosts. Garnet's post-measurement full key-count scan
-was omitted after its formal tests completed, as documented in the report.
-
-In the August 12 dual-NVMe test, Lavik SPDK's read p99 was **0.455 ms**,
-versus 2.303 ms for Garnet and 2.911 ms for Dragonfly. These results use each system's recorded
-cache, warmup, and persistence settings; uniform random access is unfavorable
-to KeyDB On Flash's hot-tier design. The report documents those differences
-and reproduction commands. Its separate Azure Managed Redis test used a
-different dataset and duration and is excluded from this chart and table.
+<img src="perf_reports/lavik-v0.1.0-storage-peers-1tb-2026-10-14/ranked-80.svg" alt="80 connections: paired horizontal QPS and p99.9 latency bars for each database, sorted by QPS within GET and SET" width="900">
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
