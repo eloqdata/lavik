@@ -68,9 +68,9 @@ Lavik v0.1.0 served **100M keys (95.37 GiB of values)** from NVMe on a
 **2-vCPU / 16-GiB** Azure VM, reaching **215K GET ops/s and 196K SET ops/s**.
 Redis 8.10.2 and Valkey 9.1.2 held **1M keys** in memory on the same VM;
 all values were **1 KiB**. The chart shows throughput and p99.9 latency
-across connection counts.
+at **80 connections**; the report includes the full connection sweeps.
 
-<img src="perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
+<img src="perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/80-connections.svg" alt="2 vCPUs, 80 connections: GET and SET throughput and p99.9 latency" width="800">
 
 [2-vCPU test details and methodology](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 · [16-vCPU results](#16-vcpus)
@@ -81,9 +81,10 @@ across connection counts.
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
 Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
-on an Azure Standard_L16aos_v4 VM.
+on an Azure Standard_L16aos_v4 VM. The chart shows **80 connections**;
+the report includes the full connection sweeps.
 
-<img src="perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency" width="800">
+<img src="perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/80-connections.svg" alt="16 vCPUs, 80 connections: GET and SET throughput and p99.9 latency" width="800">
 
 At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
 peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
