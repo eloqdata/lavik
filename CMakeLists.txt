@@ -952,6 +952,19 @@ if (BUILD_TESTING)
       LABELS meta-integration TIMEOUT 15)
 
     add_test(
+      NAME meta_integration.gate_admin_apply_results
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_admin_apply_results.py
+              $<TARGET_FILE:lavik-meta>
+    )
+    set_tests_properties(meta_integration.gate_admin_apply_results PROPERTIES
+      LABELS meta-integration
+      TIMEOUT 90
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 77
+    )
+
+    add_test(
       NAME meta_integration.smoke_3node
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py

@@ -50,6 +50,7 @@
 #include "lavik/client_endpoint.h"
 #include "lavik/cluster/control_protocol.h"
 #include "lavik/cluster/control_transport.h"
+#include "lavik/fault_pause.h"
 #include "lavik/meta/automatic_failover_detector.h"
 #include "lavik/meta/cluster_create.h"
 #include "lavik/meta/cluster_create_reconciler.h"
@@ -1136,8 +1137,9 @@ using CmdResult = MetaRaftResult;
 
 // Proposes one encoded meta command and resolves to "OK <log_idx>" only when
 // the entry commits and this leader's state machine reports an accepted apply
-// verdict. Some callers additionally verify a stable post-state when their
-// effect cannot be removed by a later valid command.
+// verdict. This exact result is authoritative: later commits may advance or
+// remove the effect before the Admin coroutine resumes. Reading current state
+// cannot reclassify the accepted proposal as rejected.
 bycorf::Task<std::string> ProposeCommand(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, MetaCommand command) {
@@ -1163,12 +1165,26 @@ bycorf::Task<std::string> ProposeCommand(
   if (result->verdict_ != MetaAuditVerdict::kAccepted) {
     co_return "ERR rejected";
   }
+  LAVIK_FAULT_INJECT({
+    const auto tag = static_cast<uint16_t>(result->command_tag_);
+    const char* hold_file =
+        std::getenv("LAVIK_TEST_META_ADMIN_AFTER_APPLY_HOLD_FILE");
+    if (fault_injection::Matches("LAVIK_TEST_META_ADMIN_AFTER_APPLY_TAG",
+                                 std::to_string(tag)) &&
+        hold_file != nullptr && ::access(hold_file, F_OK) == 0) {
+      // Let another Admin request commit before this accepted reply resumes.
+      spdlog::warn("fault admin apply held: tag={} log_index={}", tag,
+                   result->log_index_);
+      auto status = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_TEST_META_ADMIN_AFTER_APPLY_HOLD_FILE");
+      if (!status.ok()) co_return "ERR timeout";
+    }
+  });
   co_return "OK " + std::to_string(result->log_index_);
 }
 
 bycorf::Task<std::string> HandleSubmitOp(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const MetaOperationId& id,
     const std::string& kind, const std::string& payload,
     const MetaReplicationHistoryId& replication_history_id) {
@@ -1185,20 +1201,8 @@ bycorf::Task<std::string> HandleSubmitOp(
   command.intent_ = payload;
   command.intent_hash_ = MetaSha256(payload);
   command.replication_history_id_ = replication_history_id;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  // OK never reports an apply-level rejection: verify the committed effect.
-  // An idempotent duplicate submit (same id, same intent) verifies
-  // identically; a payload-reuse rejection leaves a mismatched intent hash.
-  const std::optional<MetaOperationRecord> record =
-      state_machine->FindOperation(id);
-  if (!record.has_value() || record->intent_hash_ != command.intent_hash_) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 bycorf::Task<std::string> HandleCompleteOp(
@@ -1236,19 +1240,8 @@ bycorf::Task<std::string> HandleCompleteOp(
   command.operation_id_ = id;
   command.expected_revision_ = record->revision_;
   command.result_ = result;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  const std::optional<MetaOperationRecord> after =
-      state_machine->FindOperation(id);
-  if (!after.has_value() ||
-      after->lifecycle_ != MetaOperationLifecycle::kCompleted ||
-      after->terminal_result_ != result) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 bycorf::Task<std::string> HandleAbortOp(
@@ -1279,19 +1272,8 @@ bycorf::Task<std::string> HandleAbortOp(
   command.operation_id_ = id;
   command.expected_revision_ = record->revision_;
   command.reason_ = reason;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  const std::optional<MetaOperationRecord> after =
-      state_machine->FindOperation(id);
-  if (!after.has_value() ||
-      after->lifecycle_ != MetaOperationLifecycle::kAborted ||
-      after->terminal_result_ != reason) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // Non-linearizable read of committed operator state (see the header).
@@ -1470,7 +1452,6 @@ bycorf::Task<std::string> HandlePromote(
 
 bycorf::Task<std::string> HandleRegisterNode(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal authenticated, const std::string& node_id,
     const std::string& principal, MetaNodeRole role,
     std::vector<std::string> endpoints) {
@@ -1480,21 +1461,8 @@ bycorf::Task<std::string> HandleRegisterNode(
   command.principal_ = principal;
   command.endpoints_ = std::move(endpoints);
   command.role_ = role;
-  const std::vector<std::string> expected_endpoints = command.endpoints_;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(authenticated), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  // Same effect-verification as submitop: an idempotent re-register with
-  // identical content verifies; a principal conflict does not.
-  const std::optional<MetaNodeRecord> record = state_machine->FindNode(node_id);
-  if (!record.has_value() || record->principal_ != principal ||
-      record->endpoints_ != expected_endpoints || record->role_ != role ||
-      record->retired_) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(authenticated),
+                                    std::move(command));
 }
 
 std::string HandleGetNode(std::shared_ptr<MetaStateMachine> state_machine,
@@ -1518,7 +1486,7 @@ std::string HandleGetNode(std::shared_ptr<MetaStateMachine> state_machine,
 }
 
 // creategroup <group_id>: the topology epoch is absolute (current + 1), read
-// from a committed snapshot. Effect-verified like submitop.
+// from a committed snapshot and checked when the command applies.
 bycorf::Task<std::string> HandleCreateGroup(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     std::shared_ptr<MetaStateMachine> state_machine,
@@ -1527,15 +1495,8 @@ bycorf::Task<std::string> HandleCreateGroup(
   command.request_id_ = MakeRequestId();
   command.group_id_ = group_id;
   command.new_topology_epoch_ = state_machine->TopologyEpoch() + 1;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  if (!state_machine->GroupExists(group_id)) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // assignnode <group_id> <node_id> <primary|replica>. The operator names the
@@ -1566,21 +1527,8 @@ bycorf::Task<std::string> HandleAssignNode(
   command.role_ = role;
   command.expected_revision_ = group->revision_;
   command.new_topology_epoch_ = before.topology_epoch_ + 1;
-  const MetaAssignmentId expected_assignment = command.assignment_id_;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) co_return reply;
-
-  const auto after = state_machine->FindGroup(group_id);
-  if (!after.has_value()) co_return "ERR rejected";
-  const auto installed =
-      std::find_if(after->members_.begin(), after->members_.end(),
-                   [&](const MetaGroupMember& member) {
-                     return member.node_id_ == node_id &&
-                            member.assignment_id_ == expected_assignment &&
-                            member.role_ == role;
-                   });
-  co_return installed == after->members_.end() ? "ERR rejected" : reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // Replica removal uses the revision the operator reviewed. In particular,
@@ -1610,19 +1558,8 @@ bycorf::Task<std::string> HandleUnassignNode(
   command.node_id_ = node_id;
   command.expected_revision_ = expected_revision;
   command.new_topology_epoch_ = before.topology_epoch_ + 1;
-  const std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (!reply.starts_with("OK ")) co_return reply;
-  // Concurrent topology commits can reject an appended CAS command. As with
-  // assignment, report success only when the requested effect is visible.
-  const auto after = state_machine->FindGroup(group_id);
-  if (!after || std::any_of(after->members_.begin(), after->members_.end(),
-                            [&](const MetaGroupMember& member) {
-                              return member.node_id_ == node_id;
-                            })) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // begingroupterm <group_id> <expected> <new>: promotes the committed
@@ -1630,7 +1567,6 @@ bycorf::Task<std::string> HandleUnassignNode(
 // anchor to.
 bycorf::Task<std::string> HandleBeginGroupTerm(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected, std::uint64_t next) {
   BeginGroupTerm command;
@@ -1638,17 +1574,8 @@ bycorf::Task<std::string> HandleBeginGroupTerm(
   command.group_id_ = group_id;
   command.expected_term_ = expected;
   command.new_term_ = next;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  const std::optional<std::uint64_t> term =
-      state_machine->CurrentGroupTerm(group_id);
-  if (!term.has_value() || *term != next) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // These topology/authority verbs intentionally expose the typed domain
@@ -1693,24 +1620,8 @@ bycorf::Task<std::string> HandleSetSlotMap(
   command.request_id_ = MakeRequestId();
   command.ranges_.push_back({first_slot, last_slot, group_id});
   command.new_topology_epoch_ = state_machine->TopologyEpoch() + 1;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) co_return reply;
-
-  const auto after = state_machine->CaptureSlotMapCheck(group_id);
-  if (!after.group_exists_ ||
-      after.topology_epoch_ != command.new_topology_epoch_) {
-    co_return "ERR rejected";
-  }
-  for (std::uint32_t slot = 0; slot < kMetaSlotCount; ++slot) {
-    const auto owner = after.SlotOwner(slot);
-    const bool assigned = slot >= first_slot && slot <= last_slot;
-    if ((assigned && owner != std::optional<std::string_view>(group_id)) ||
-        (!assigned && owner.has_value())) {
-      co_return "ERR rejected";
-    }
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 bycorf::Task<std::string> HandleActivateAuthority(
@@ -1724,27 +1635,12 @@ bycorf::Task<std::string> HandleActivateAuthority(
   command.expected_term_ = expected_term;
   command.new_owner_ = owner_node_id;
   command.new_topology_epoch_ = state_machine->TopologyEpoch() + 1;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) co_return reply;
-
-  const auto after = state_machine->CaptureAdminGroup(group_id);
-  const auto& topology = after.group_;
-  const auto& grant = after.authority_;
-  if (!topology.has_value() || !grant.has_value() ||
-      !grant->grant_.has_value() || grant->grant_->owner_ != owner_node_id ||
-      grant->group_term_ != expected_term ||
-      topology->record_.owner_ != owner_node_id ||
-      topology->record_.group_term_ != expected_term ||
-      after.topology_epoch_ != command.new_topology_epoch_) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 bycorf::Task<std::string> HandleFenceGroup(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, const std::string& group_id,
     std::uint64_t expected_term) {
   FenceGroup command;
@@ -1752,19 +1648,8 @@ bycorf::Task<std::string> HandleFenceGroup(
   command.group_id_ = group_id;
   command.expected_term_ = expected_term;
   command.new_term_ = expected_term + 1;
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) co_return reply;
-
-  const auto after = state_machine->CaptureAdminGroup(group_id);
-  const auto& state = after.authority_;
-  const auto& topology = after.group_;
-  if (!state.has_value() || !topology.has_value() ||
-      state->group_term_ != command.new_term_ || state->grant_.has_value() ||
-      topology->record_.group_term_ != command.new_term_) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // transitionop <id32hex> <phase> <history>: moves the operation to Running.
@@ -1791,19 +1676,8 @@ bycorf::Task<std::string> HandleTransitionOp(
   if (record->replication_history_id_ != history) {
     co_return "ERR history-mismatch";
   }
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) {
-    co_return reply;
-  }
-  const std::optional<MetaOperationRecord> after =
-      state_machine->FindOperation(id);
-  if (!after.has_value() ||
-      after->lifecycle_ != MetaOperationLifecycle::kRunning ||
-      after->kind_phase_blob_ != phase) {
-    co_return "ERR rejected";
-  }
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 std::string ClusterCreateError(std::string_view stage, std::string_view code,
@@ -1965,18 +1839,12 @@ bycorf::Task<std::string> HandlePruneOperationArchive(
 
 bycorf::Task<std::string> HandleArchiveOperations(
     const std::shared_ptr<MetaCoordinator>& coordinator,
-    std::shared_ptr<MetaStateMachine> state_machine,
     AuthenticatedPrincipal principal, std::vector<std::uint64_t> seqs) {
   ArchiveOperations command;
   command.request_id_ = MakeRequestId();
   command.operation_seqs_ = std::move(seqs);
-  std::string reply =
-      co_await ProposeCommand(coordinator, std::move(principal), command);
-  if (reply.rfind("OK ", 0) != 0) co_return reply;
-
-  if (!state_machine->ArchivedOperationsExist(command.operation_seqs_))
-    co_return "ERR rejected";
-  co_return reply;
+  co_return co_await ProposeCommand(coordinator, std::move(principal),
+                                    std::move(command));
 }
 
 // adoptsession injects a session identity supplied by the authorized transport
@@ -2227,7 +2095,6 @@ bycorf::Task<std::string> HandleConfigChange(
               reinterpret_cast<const char*>(operation_id->data()),
               operation_id->size())));
     }
-    if (!state_machine->FindOperation(*operation_id)) co_return "ERR rejected";
     // The committed active-kind reservation bridges release to the reconciler.
   }
   const auto id = HexEncode(
@@ -2306,9 +2173,8 @@ bycorf::Task<std::string> DispatchMutationVerb(
     if (tokens.size() == 5u && !ParseReplicationHistoryId(tokens[4], history)) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandleSubmitOp(coordinator, std::move(state_machine),
-                                      std::move(principal), id, tokens[2],
-                                      tokens[3], history);
+    co_return co_await HandleSubmitOp(coordinator, std::move(principal), id,
+                                      tokens[2], tokens[3], history);
   }
   if (command == "completeop" || command == "abortop") {
     // The final token is optional so a durability-gated operator can express
@@ -2342,9 +2208,9 @@ bycorf::Task<std::string> DispatchMutationVerb(
       co_return "ERR bad-request";
     }
     std::vector<std::string> endpoints(tokens.begin() + 4, tokens.end());
-    co_return co_await HandleRegisterNode(
-        coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        tokens[2], role, std::move(endpoints));
+    co_return co_await HandleRegisterNode(coordinator, std::move(principal),
+                                          tokens[1], tokens[2], role,
+                                          std::move(endpoints));
   }
   if (command == "creategroup") {
     if (tokens.size() != 2 || tokens[1].empty() ||
@@ -2392,9 +2258,8 @@ bycorf::Task<std::string> DispatchMutationVerb(
     if (!ParseU64(tokens[2], expected) || !ParseU64(tokens[3], next)) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandleBeginGroupTerm(
-        coordinator, std::move(state_machine), std::move(principal), tokens[1],
-        expected, next);
+    co_return co_await HandleBeginGroupTerm(coordinator, std::move(principal),
+                                            tokens[1], expected, next);
   }
   if (command == "putpolicy") {
     std::uint64_t version = 0;
@@ -2439,9 +2304,8 @@ bycorf::Task<std::string> DispatchMutationVerb(
         expected_term == std::numeric_limits<std::uint64_t>::max()) {
       co_return "ERR bad-request";
     }
-    co_return co_await HandleFenceGroup(coordinator, std::move(state_machine),
-                                        std::move(principal), tokens[1],
-                                        expected_term);
+    co_return co_await HandleFenceGroup(coordinator, std::move(principal),
+                                        tokens[1], expected_term);
   }
   if (command == "transitionop") {
     if (tokens.size() != 4) {
@@ -2512,8 +2376,7 @@ bycorf::Task<std::string> DispatchMutationVerb(
       seqs.push_back(seq);
     }
     co_return co_await HandleArchiveOperations(
-        coordinator, std::move(state_machine), std::move(principal),
-        std::move(seqs));
+        coordinator, std::move(principal), std::move(seqs));
   }
   co_return "ERR unknown-command";
 }
