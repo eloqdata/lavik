@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -32,6 +34,14 @@ inline constexpr std::string_view kReplicatedExecCommand = "__LAVIK_EXEC_V1";
 // receiver applies this limit to the complete canonical event.
 inline constexpr std::uint64_t kMaxNativeReplicationEventBytes =
     1024ULL * 1024 * 1024;
+
+// Fixed command header size, excluding the per-argument length table. Keep
+// representable commands in V1 so old readers can still consume them; V2
+// widens the argument count to four bytes without changing argument lengths.
+inline constexpr std::size_t ReplicationCommandFixedHeaderBytes(
+    std::size_t argument_count) noexcept {
+  return argument_count <= std::numeric_limits<std::uint16_t>::max() ? 8 : 10;
+}
 
 // A committed, deterministic Redis command. The database is carried on every
 // record so replay does not depend on connection-local SELECT state.
@@ -66,6 +76,8 @@ bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept;
 // without flattening large arguments into another contiguous allocation.
 // Replication log frames may split this byte stream, but the receiver still
 // observes one logical command and one LSN.
+// V1 carries up to UINT16_MAX arguments; larger commands use V2 with a
+// four-byte count bounded by INT32_MAX and the complete-event byte limit.
 class ReplicationCommandPayloadSource final
     : public storage::ReplicationLogPayloadSource {
  public:
@@ -95,7 +107,8 @@ class ReplicationCommandPayloadSource final
 
 // Decodes one complete logical command after all transport frames for its LSN
 // have arrived. The format is native to Lavik and deliberately independent
-// of the source worker count and the target's physical value layout.
+// of the source worker count and the target's physical value layout. Accepts
+// both the V1 two-byte argument count and the V2 four-byte count.
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     std::string_view encoded);
 

@@ -169,7 +169,9 @@ std::size_t RequestArgumentBytes(const CommandRequest& request) noexcept {
 }
 
 std::size_t CanonicalCommandBytes(const CommandRequest& request) noexcept {
-  std::size_t bytes = SaturatingAdd(8, request.args_.size() * 4);
+  std::size_t bytes =
+      SaturatingAdd(ReplicationCommandFixedHeaderBytes(request.args_.size()),
+                    request.args_.size() * sizeof(std::uint32_t));
   for (const std::string& argument : request.args_) {
     bytes = SaturatingAdd(bytes, argument.size());
   }

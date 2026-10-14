@@ -30,13 +30,14 @@ namespace lavik {
 namespace {
 
 constexpr std::string_view kMagic = "LRC1";
-constexpr std::uint8_t kVersion = 1;
-constexpr std::size_t kFixedHeaderBytes = 8;
-// Redis variadic writes routinely exceed 1024 arguments. Use the complete
-// LRC1 count field; the length table and event byte budget still bound
-// decoding.
-constexpr std::size_t kMaxArgumentCount =
+constexpr std::uint8_t kLegacyVersion = 1;
+constexpr std::uint8_t kWideArgumentCountVersion = 2;
+constexpr std::size_t kLegacyMaxArgumentCount =
     std::numeric_limits<std::uint16_t>::max();
+// Match the RESP parser's count range. The complete-event budget also bounds
+// the length table, so a wide count never authorizes unbounded allocation.
+constexpr std::size_t kMaxArgumentCount =
+    std::numeric_limits<std::int32_t>::max();
 constexpr std::size_t kMaxArgumentBytes =
     static_cast<std::size_t>(kMaxNativeReplicationEventBytes);
 constexpr std::string_view kTransactionMagic = "LTX1";
@@ -117,6 +118,22 @@ void CopySegment(std::string_view segment, std::uint64_t* offset,
 
 absl::Status Malformed(std::string_view message) {
   return absl::Status(absl::StatusCode::kInvalidArgument, message);
+}
+
+absl::StatusOr<std::size_t> CommandHeaderBytes(std::size_t argument_count) {
+  if (argument_count == 0 || argument_count > kMaxArgumentCount) {
+    return Malformed("replication command argument count is out of range");
+  }
+  const std::size_t fixed_bytes =
+      ReplicationCommandFixedHeaderBytes(argument_count);
+  // Check before reserving either the encoded table or the argument views.
+  // In V2 the count alone can describe a table larger than the event budget.
+  if (argument_count >
+      (kMaxNativeReplicationEventBytes - fixed_bytes) / sizeof(std::uint32_t)) {
+    return absl::ResourceExhaustedError(
+        "replication command exceeds the native event limit");
+  }
+  return fixed_bytes + argument_count * sizeof(std::uint32_t);
 }
 
 }  // namespace
@@ -217,22 +234,21 @@ ReplicationCommandPayloadSource::Create(
   if (db_id >= storage::kLogicalDatabaseCount) {
     return Malformed("replication command database is out of range");
   }
-  if (args.empty() || args.size() > kMaxArgumentCount) {
-    return Malformed("replication command argument count is out of range");
-  }
+  const auto header_bytes = CommandHeaderBytes(args.size());
+  if (!header_bytes.ok()) return header_bytes.status();
 
   ReplicationCommandPayloadSource source;
-  source.header_.reserve(kFixedHeaderBytes +
-                         args.size() * sizeof(std::uint32_t));
+  source.header_.reserve(*header_bytes);
   source.header_.append(kMagic);
-  source.header_.push_back(static_cast<char>(kVersion));
+  const bool legacy = args.size() <= kLegacyMaxArgumentCount;
+  source.header_.push_back(
+      static_cast<char>(legacy ? kLegacyVersion : kWideArgumentCountVersion));
   source.header_.push_back(static_cast<char>(db_id));
-  PutU16(&source.header_, static_cast<std::uint16_t>(args.size()));
-  source.size_ = source.header_.size() + args.size() * sizeof(std::uint32_t);
-  if (source.size_ > kMaxNativeReplicationEventBytes) {
-    return absl::ResourceExhaustedError(
-        "replication command exceeds the native event limit");
-  }
+  if (legacy)
+    PutU16(&source.header_, static_cast<std::uint16_t>(args.size()));
+  else
+    PutU32(&source.header_, static_cast<std::uint32_t>(args.size()));
+  source.size_ = *header_bytes;
   source.args_.reserve(args.size());
   for (std::string_view arg : args) {
     if (arg.size() > kMaxArgumentBytes ||
@@ -256,6 +272,8 @@ ReplicationCommandPayloadSource::Create(
 absl::StatusOr<ReplicationCommandPayloadSource>
 ReplicationCommandPayloadSource::Create(std::uint8_t db_id,
                                         std::span<const std::string> args) try {
+  const auto header_bytes = CommandHeaderBytes(args.size());
+  if (!header_bytes.ok()) return header_bytes.status();
   std::vector<std::string_view> views;
   views.reserve(args.size());
   for (const std::string& arg : args) views.push_back(arg);
@@ -293,11 +311,11 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     return absl::ResourceExhaustedError(
         "replication command exceeds the native event limit");
   }
-  if (encoded.size() < kFixedHeaderBytes ||
-      encoded.substr(0, kMagic.size()) != kMagic) {
+  if (encoded.size() < 6 || encoded.substr(0, kMagic.size()) != kMagic) {
     return Malformed("invalid replication command magic");
   }
-  if (static_cast<std::uint8_t>(encoded[4]) != kVersion) {
+  const auto version = static_cast<std::uint8_t>(encoded[4]);
+  if (version != kLegacyVersion && version != kWideArgumentCountVersion) {
     return Malformed("unsupported replication command version");
   }
   ReplicatedCommand command;
@@ -306,9 +324,17 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     return Malformed("replication command database is out of range");
   }
   std::size_t offset = 6;
-  std::uint16_t argc = 0;
-  if (!ReadU16(encoded, &offset, &argc) || argc == 0 ||
-      argc > kMaxArgumentCount) {
+  std::uint32_t argc = 0;
+  if (version == kLegacyVersion) {
+    std::uint16_t legacy_argc = 0;
+    if (!ReadU16(encoded, &offset, &legacy_argc)) {
+      return Malformed("truncated replication command argument count");
+    }
+    argc = legacy_argc;
+  } else if (!ReadU32(encoded, &offset, &argc)) {
+    return Malformed("truncated replication command argument count");
+  }
+  if (argc == 0 || argc > kMaxArgumentCount) {
     return Malformed("replication command argument count is out of range");
   }
   if (offset > encoded.size() ||
@@ -319,7 +345,7 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
   std::vector<std::uint32_t> lengths;
   lengths.reserve(argc);
   std::uint64_t payload_bytes = 0;
-  for (std::uint16_t i = 0; i < argc; ++i) {
+  for (std::uint32_t i = 0; i < argc; ++i) {
     std::uint32_t length = 0;
     if (!ReadU32(encoded, &offset, &length) || length > kMaxArgumentBytes ||
         payload_bytes > std::numeric_limits<std::uint64_t>::max() - length) {

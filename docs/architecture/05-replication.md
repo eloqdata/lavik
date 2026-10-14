@@ -756,10 +756,18 @@ client write
   -> per-flow ordered ACK
 ```
 
-Canonical commands use the LRC1 command-body encoding: explicit logical database,
-a 16-bit argument count (up to 65,535), argument lengths, then argument bytes.
-The complete-event byte budget also bounds large batches. Large arguments stream into
-the backlog without another complete flattened allocation. The native v1
+Canonical commands use the LRC1 command-body encoding: a four-byte magic,
+one-byte version, one-byte logical database, argument count, per-argument
+32-bit lengths, then argument bytes. Counts and lengths are little-endian.
+V1 uses a 16-bit argument count and an eight-byte fixed header; V2 uses a
+32-bit count bounded by `INT32_MAX` and a ten-byte fixed header. Readers accept
+both versions. Writers retain V1 for up to 65,535 arguments and use V2 for
+larger commands, preserving old-reader compatibility for representable events.
+There is no command-codec capability negotiation; all nodes that may consume
+V2 events must be upgraded before those larger commands are issued.
+The complete-event byte budget bounds large batches and their length tables
+before allocation. Large arguments stream into the backlog without another
+complete flattened allocation. The native v1
 transport wraps each fragment in a versioned little-endian header containing
 magic, header and payload lengths, kind, and payload CRC32C. One logical event
 has one flow-local LSN and may span transport fragments and 8 MiB memory blocks,
@@ -1565,7 +1573,8 @@ names, overrides, reporting, and independent client semantics and authority.
 `tests/cluster/serving_generation_integration_test.cpp` uses a real Redis
 upstream to verify that blocked commands, WATCH and KEYS cannot cross dataset
 replacement. External Sentinel HA is outside the supported contract.
-There is no focused malformed-LRC1 decoder matrix.
+`tests/replication_command_test.cpp` covers legacy wire compatibility, wide
+argument counts, malformed command bodies, and the complete-event byte limit.
 
 ## Source map
 
