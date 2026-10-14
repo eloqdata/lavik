@@ -67,20 +67,10 @@ test configurations, and methodology.
 Lavik v0.1.0 served **100M keys (95.37 GiB of values)** from NVMe on a
 **2-vCPU / 16-GiB** Azure VM, reaching **215K GET ops/s and 196K SET ops/s**.
 Redis 8.10.2 and Valkey 9.1.2 held **1M keys** in memory on the same VM;
-all values were **1 KiB**. The tables show throughput and p99.9 latency
-at **80 connections**; the report includes the full connection sweeps.
+all values were **1 KiB**. The chart shows throughput and p99.9 latency
+across connection counts.
 
-**SET**
-
-| Lavik 0.1.0 · 1M | Lavik 0.1.0 · 100M | Redis 8.10.2 · 1M | Valkey 9.1.2 · 1M |
-|---|---|---|---|
-| QPS: **134,454**<br>p99.9: 2.575 ms | QPS: **133,977**<br>p99.9: 3.423 ms | QPS: **138,636**<br>p99.9: 0.895 ms | QPS: **146,877**<br>p99.9: 0.951 ms |
-
-**GET**
-
-| Lavik 0.1.0 · 1M | Lavik 0.1.0 · 100M | Redis 8.10.2 · 1M | Valkey 9.1.2 · 1M |
-|---|---|---|---|
-| QPS: **133,263**<br>p99.9: 0.935 ms | QPS: **132,749**<br>p99.9: 1.039 ms | QPS: **138,448**<br>p99.9: 0.967 ms | QPS: **148,442**<br>p99.9: 0.927 ms |
+<img src="perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/combined.svg" alt="2 vCPUs: GET and SET throughput and p99.9 latency for Lavik with 1M and 100M keys and Redis and Valkey with 1M keys" width="800">
 
 [2-vCPU test details and methodology](perf_reports/lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md)
 · [16-vCPU results](#16-vcpus)
@@ -91,20 +81,9 @@ at **80 connections**; the report includes the full connection sweeps.
 The [Redis/Valkey comparison](perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/README.md)
 tested [Lavik v0.1.0](https://github.com/eloqdata/lavik/releases/tag/v0.1.0),
 Redis 8.10.2 and Valkey 9.1.2 with **10 million keys and 1 KiB values**
-on an Azure Standard_L16aos_v4 VM. The tables show **80 connections**;
-the report includes the full connection sweeps.
+on an Azure Standard_L16aos_v4 VM.
 
-**SET**
-
-| Lavik 0.1.0 · 10M | Lavik 0.1.0 · 1B | Redis 8.10.2 · 10M | Valkey 9.1.2 · 10M |
-|---|---|---|---|
-| QPS: **479,032**<br>p99.9: 1.375 ms | QPS: **425,907**<br>p99.9: 2.655 ms | QPS: **389,525**<br>p99.9: 0.471 ms | QPS: **518,503**<br>p99.9: 0.415 ms |
-
-**GET**
-
-| Lavik 0.1.0 · 10M | Lavik 0.1.0 · 1B | Redis 8.10.2 · 10M | Valkey 9.1.2 · 10M |
-|---|---|---|---|
-| QPS: **390,074**<br>p99.9: 0.439 ms | QPS: **385,514**<br>p99.9: 0.439 ms | QPS: **401,379**<br>p99.9: 0.471 ms | QPS: **536,405**<br>p99.9: 0.495 ms |
+<img src="perf_reports/lavik-v0.1.0-spdk-vs-latest-2026-10-13/combined.svg" alt="16 vCPUs: GET and SET throughput and p99.9 latency" width="800">
 
 At the same **10 million keys**, Lavik surpassed both Redis and Valkey in
 peak GET and SET throughput, reaching **1,145,772 GET QPS** and **971,950 SET QPS**.
@@ -120,16 +99,10 @@ With **1 billion keys (1TB)**, Lavik reached **1,069,126 GET QPS** and
 The [1TB storage comparison](perf_reports/lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.md) tests
 Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
 Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
-Results below use **80 connections**; each cell shows QPS and p99.9 latency.
+Results below use **80 connections**. Bars show QPS in descending order for each
+command, with p99.9 latency beside each bar.
 
-| Database | GET | SET |
-|---|---:|---:|
-| Lavik 0.1.0 | **385,514 QPS**, p99.9: 0.439 ms | **425,907 QPS**, p99.9: 2.655 ms |
-| Garnet 2.2.1 | **217,523 QPS**, p99.9: 4.703 ms | **421,152 QPS**, p99.9: 3.007 ms |
-| Dragonfly 2.0.2 | **205,326 QPS**, p99.9: 11.071 ms | **355,092 QPS**, p99.9: 5.535 ms |
-| Pika 3.5.7 | **106,451 QPS**, p99.9: 2.479 ms | **92,505 QPS**, p99.9: 4.063 ms |
-| Apache Kvrocks 2.17.0 | **44,737 QPS**, p99.9: 5.599 ms | **134,307 QPS**, p99.9: 1.631 ms |
-| Tendis 2.8.4 | **44,614 QPS**, p99.9: 58.879 ms | **266,802 QPS**, p99.9: 1.511 ms |
+<img src="perf_reports/lavik-v0.1.0-storage-peers-1tb-2026-10-14/ranked-80.svg" alt="80 connections: GET and SET QPS ranked by throughput, with p99.9 latency for each database" width="900">
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.1.0-aerospike-ycsb-2026-10-13/README.md),
 covering workloads A/B/C/D and their tail latencies.
