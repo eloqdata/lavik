@@ -18,6 +18,9 @@
 
 #include <limits>
 
+#include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
+
 namespace lavik::storage {
 
 namespace {
@@ -153,6 +156,122 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
     value.entries_.push_back(std::move(entry));
   }
   return value;
+}
+
+absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
+    std::string_view payload, std::size_t expected_count,
+    std::span<const std::string_view> fields,
+    std::span<const std::string_view> values, std::size_t max_bytes) {
+  if (fields.size() != values.size())
+    return absl::InvalidArgumentError("Hash field/value mismatch");
+  auto reader = HashValueReader::Open(payload);
+  if (!reader.ok()) return reader.status();
+  if (reader->size() != expected_count)
+    return absl::InternalError(
+        "Hash element count does not match record metadata");
+
+  struct Edit {
+    std::string_view field;
+    std::string_view value;
+    bool varied = false;
+    bool found = false;
+  };
+  struct Splice {
+    std::size_t begin;
+    std::size_t end;
+    std::size_t edit;
+  };
+  // Single-field HSET keeps its entire plan inline. Batch plans index only
+  // operands, never every field in the old value. First-seen order determines
+  // the position of new fields; varied preserves A -> B -> A write semantics.
+  absl::InlinedVector<Edit, 1> edits;
+  absl::InlinedVector<Splice, 1> splices;
+  absl::flat_hash_map<std::string_view, std::size_t> positions;
+  edits.reserve(fields.size());
+  if (fields.size() > 1) positions.reserve(fields.size());
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    auto size = AppendHashEntrySize(kHashValueHeaderBytes, fields[i].size(),
+                                    values[i].size(), std::string{}.max_size());
+    if (!size.ok()) return size.status();
+    if (fields.size() > 1) {
+      const auto [it, inserted] = positions.emplace(fields[i], edits.size());
+      if (!inserted) {
+        auto& edit = edits[it->second];
+        edit.varied |= edit.value != values[i];
+        edit.value = values[i];
+        continue;
+      }
+    }
+    edits.push_back({fields[i], values[i]});
+  }
+  CompactHashEdit result{.count_ = expected_count, .payload_ = {}};
+  std::size_t bytes = payload.size();
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return entry.status();
+    std::size_t index = 0;
+    if (fields.size() <= 1) {
+      if (edits.empty() || entry->field_ != edits[0].field) continue;
+    } else {
+      const auto it = positions.find(entry->field_);
+      if (it == positions.end()) continue;
+      index = it->second;
+    }
+    auto& edit = edits[index];
+    if (edit.found)
+      return absl::DataLossError("duplicate requested Hash field");
+    edit.found = true;
+    result.changed_ |= edit.varied || edit.value != entry->value_;
+    if (edit.value == entry->value_) continue;
+    const auto begin =
+        static_cast<std::size_t>(entry->field_.data() - payload.data()) - 8;
+    const auto end = begin + 8 + entry->field_.size() + entry->value_.size();
+    auto size =
+        AppendHashEntrySize(bytes - (end - begin), edit.field.size(),
+                            edit.value.size(), std::string{}.max_size());
+    if (!size.ok()) return size.status();
+    bytes = *size;
+    splices.push_back({begin, end, index});
+  }
+  for (const auto& edit : edits) {
+    if (edit.found) continue;
+    auto size = AppendHashEntrySize(bytes, edit.field.size(), edit.value.size(),
+                                    std::string{}.max_size());
+    if (!size.ok()) return size.status();
+    bytes = *size;
+    ++result.added_;
+  }
+  if (result.added_ > UINT32_MAX - result.count_)
+    return absl::OutOfRangeError("Hash element count overflow");
+  result.count_ += result.added_;
+  result.changed_ |= result.added_ != 0;
+  if (bytes > max_bytes) return std::nullopt;
+  if (!result.changed_) return result;
+
+  auto& output = result.payload_;
+  output.reserve(bytes);
+  AppendU64(&output, kHashValueMagic);
+  AppendU32(&output, kStorageFormatVersion);
+  AppendU32(&output, kHashValueHeaderBytes);
+  AppendU32(&output, result.count_);
+  AppendU32(&output, 0);
+  AppendU64(&output, bytes);
+  auto append = [&](const Edit& edit) {
+    AppendU32(&output, edit.field.size());
+    AppendU32(&output, edit.value.size());
+    output.append(edit.field);
+    output.append(edit.value);
+  };
+  std::size_t offset = kHashValueHeaderBytes;
+  for (const auto& splice : splices) {
+    output.append(payload.substr(offset, splice.begin - offset));
+    append(edits[splice.edit]);
+    offset = splice.end;
+  }
+  output.append(payload.substr(offset));
+  for (const auto& edit : edits)
+    if (!edit.found) append(edit);
+  return result;
 }
 
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {

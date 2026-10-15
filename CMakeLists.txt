@@ -1822,6 +1822,10 @@ if (BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/redis
     ${CMAKE_CURRENT_SOURCE_DIR}/src/replication
   )
+  # Explicit opt-in microbenchmark; it is not a correctness test or CTest job.
+  add_executable(lavik_compact_hash_bench EXCLUDE_FROM_ALL
+    tests/compact_hash_bench.cpp)
+  target_link_libraries(lavik_compact_hash_bench PRIVATE lavik::module)
   gtest_discover_tests(lavik_unit_tests)
   # Apply resource-sensitive test properties after discovery. Large codec
   # cases retain roughly 2 GiB; memlock cases need isolation from other rings.

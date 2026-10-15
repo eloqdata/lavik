@@ -104,8 +104,8 @@ bool IsPointOperation(HashOperationKind kind) {
 
 bool NeedsGroupedHash(const HashValue& value) {
   // Small hashes keep the compact path. Crossing the threshold publishes a
-  // complete grouped graph atomically; incremental writes never demote it.
-  // An explicit whole-Hash replacement may choose a compact new value.
+  // complete grouped graph atomically; grouped publication separately decides
+  // whether a shrinking after-image can return to compact storage.
   std::uint64_t bytes = kHashValueHeaderBytes;
   for (const auto& entry : value.entries_) {
     bytes += 8 + entry.field_.size() + entry.value_.size();
@@ -175,6 +175,78 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
     return absl::ResourceExhaustedError("OOM Hash output retention");
   }
   result.retained_charge_.Adopt(&*reservation, retained);
+  return result;
+}
+
+bool IsCompactPointRead(HashOperationKind kind) {
+  return kind == HashOperationKind::kGet ||
+         kind == HashOperationKind::kGetMany ||
+         kind == HashOperationKind::kExists ||
+         kind == HashOperationKind::kStringLength;
+}
+
+absl::StatusOr<HashResult> ReadCompactHashFields(
+    std::string_view payload, std::size_t count,
+    const HashOperation& operation) {
+  HashResult result;
+  result.key_exists_ = true;
+  result.length_ = count;
+  if (operation.fields_.empty()) {
+    auto status = FindCompactHashFields(payload, count, {});
+    if (!status.ok()) return status;
+    return result;
+  }
+  if (operation.kind_ == HashOperationKind::kExists ||
+      operation.kind_ == HashOperationKind::kStringLength ||
+      operation.fields_.size() == 1) {
+    auto matched =
+        FindCompactHashField(payload, count, operation.fields_.front());
+    if (!matched.ok()) return matched.status();
+    if (operation.kind_ == HashOperationKind::kExists)
+      result.integer_ = matched->has_value();
+    else if (operation.kind_ == HashOperationKind::kStringLength)
+      result.integer_ = *matched ? (**matched).size() : 0;
+    else {
+      auto status = RetainHashLookupValue(result, *matched);
+      if (!status.ok()) return status;
+    }
+    return result;
+  }
+  const auto size = operation.fields_.size();
+  GroupedScratchBudget budget;
+  if (size > SIZE_MAX / sizeof(HashFieldLookup))
+    return absl::ResourceExhaustedError("OOM Hash lookup plan is too large");
+  auto added = budget.AddBytes(size * sizeof(HashFieldLookup));
+  if (!added.ok()) return added;
+  auto scratch = budget.Reserve(1);
+  if (!scratch.ok()) return scratch.status();
+  std::vector<HashFieldLookup> requests;
+  requests.reserve(size);
+  for (std::size_t i = 0; i < size; ++i)
+    requests.push_back({.group_ = {},
+                        .field_ = operation.fields_[i],
+                        .result_index_ = i,
+                        .value_ = std::nullopt});
+  std::sort(requests.begin(), requests.end(),
+            [](const auto& a, const auto& b) { return a.field_ < b.field_; });
+  auto status = FindCompactHashFields(payload, count, requests);
+  if (!status.ok()) return status;
+  if (size > (SIZE_MAX - sizeof(HashResult)) / sizeof(result.values_[0]))
+    return absl::ResourceExhaustedError("OOM Hash output is too large");
+  auto output =
+      TryReserveMemory(sizeof(HashResult) + size * sizeof(result.values_[0]));
+  if (!output) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM Hash output retention");
+  }
+  result.values_.resize(size);
+  const auto retained = sizeof(HashResult) +
+                        result.values_.capacity() * sizeof(result.values_[0]);
+  if (retained > output->bytes())
+    return absl::ResourceExhaustedError("OOM Hash output retention");
+  result.retained_charge_.Adopt(&*output, retained);
+  status = RetainHashGroupValues(result, requests);
+  if (!status.ok()) return status;
   return result;
 }
 
@@ -385,6 +457,9 @@ absl::StatusOr<HashResult> ReadCompactHash(const CompactReadResult& value,
         operation.kind_ == HashOperationKind::kValues)
       return ReadCompactHashResult(view.encoded_, operation.kind_,
                                    view.logical_size_);
+    if (type == ValueType::kHash && IsCompactPointRead(operation.kind_))
+      return ReadCompactHashFields(view.encoded_, view.logical_size_,
+                                   operation);
     auto decoded = DecodeHashValue(view.encoded_);
     if (!decoded.ok()) return decoded.status();
     compact = std::move(*decoded);
@@ -396,24 +471,20 @@ absl::StatusOr<HashResult> ReadCompactHash(const CompactReadResult& value,
                           type, nullptr);
 }
 
-absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
-    std::string_view payload, std::uint32_t field_count,
-    std::string_view field) {
-  // DecodeHashGroupMetadata already checked the empty-group representation
-  // and the minimum payload length. Only the inner encoding remains unchecked.
-  if (field_count == 0) return std::nullopt;
-  auto reader = HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
+absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
+    std::string_view payload, std::size_t field_count, std::string_view field) {
+  auto reader = HashValueReader::Open(payload);
   if (!reader.ok()) [[unlikely]]
     return absl::DataLossError(reader.status().message());
   if (reader->size() != field_count) [[unlikely]]
     return absl::DataLossError(
-        "Hash group inner count disagrees with envelope");
+        "Hash element count does not match record metadata");
 
   std::optional<std::string_view> matched;
   // Consume even the entries after a match: Next checks trailing bytes on the
   // last entry, and a later occurrence of the requested field is corruption.
-  // Find(field) already checked the requested field's route using the persisted
-  // seed. Unrelated fields need neither copying nor digest reconstruction.
+  // Grouped callers have already checked the requested route. Unrelated
+  // fields need neither copying nor digest reconstruction.
   for (std::size_t i = 0; i < reader->size(); ++i) {
     auto entry = reader->Next();
     if (!entry.ok()) [[unlikely]]
@@ -426,17 +497,16 @@ absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
   return matched;
 }
 
-absl::Status FindHashGroupFields(std::string_view payload,
-                                 std::uint32_t field_count,
-                                 std::span<HashFieldLookup> requests) {
+absl::Status FindCompactHashFields(std::string_view payload,
+                                   std::size_t field_count,
+                                   std::span<HashFieldLookup> requests) {
   for (auto& request : requests) request.value_.reset();
-  if (field_count == 0) return absl::OkStatus();
-  auto reader = HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
+  auto reader = HashValueReader::Open(payload);
   if (!reader.ok()) [[unlikely]]
     return absl::DataLossError(reader.status().message());
   if (reader->size() != field_count) [[unlikely]]
     return absl::DataLossError(
-        "Hash group inner count disagrees with envelope");
+        "Hash element count does not match record metadata");
   for (std::size_t i = 0; i < reader->size(); ++i) {
     auto entry = reader->Next();
     if (!entry.ok()) [[unlikely]]
@@ -455,6 +525,26 @@ absl::Status FindHashGroupFields(std::string_view payload,
       match->value_ = entry->value_;
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
+    std::string_view payload, std::uint32_t field_count,
+    std::string_view field) {
+  // The loader has validated the group envelope, including empty leaves.
+  if (field_count == 0) return std::nullopt;
+  return FindCompactHashField(payload.substr(kHashGroupHeaderBytes),
+                              field_count, field);
+}
+
+absl::Status FindHashGroupFields(std::string_view payload,
+                                 std::uint32_t field_count,
+                                 std::span<HashFieldLookup> requests) {
+  if (field_count == 0) {
+    for (auto& request : requests) request.value_.reset();
+    return absl::OkStatus();
+  }
+  return FindCompactHashFields(payload.substr(kHashGroupHeaderBytes),
+                               field_count, requests);
 }
 
 absl::Status RetainHashGroupValues(HashResult& result,
@@ -1056,6 +1146,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     grouped_scratch.emplace(std::move(*admitted));
   }
   HashValue compact;
+  std::optional<MemoryReservation> compact_edit_scratch;
+  std::optional<CompactHashEdit> compact_edit;
   std::optional<HashGroupMutationPlan> grouped_plan;
   std::uint64_t edited_length = location.logical_size_;
   if (edit_leaves) {
@@ -1152,12 +1244,47 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return ReadCompactHashResult(payload, operation.kind_,
                                       location.logical_size_);
     }
-    auto decoded = DecodeHashValue(payload);
-    if (!decoded.ok()) co_return decoded.status();
-    compact = std::move(*decoded);
-    if (compact.entries_.size() != location.logical_size_) {
-      co_return absl::InternalError(
-          "Hash element count does not match record metadata");
+    if (value_type == ValueType::kHash && IsCompactPointRead(operation.kind_))
+      co_return ReadCompactHashFields(payload, location.logical_size_,
+                                      operation);
+    if (value_type == ValueType::kHash &&
+        operation.kind_ == HashOperationKind::kSet) {
+      // Only operand views and a bounded after-image survive preparation; the
+      // old fields remain borrowed from this read lease. Publication still
+      // uses the existing key intent, snapshot validation and append boundary.
+      GroupedScratchBudget budget;
+      if (operation.fields_.size() > SIZE_MAX / 256)
+        co_return absl::ResourceExhaustedError(
+            "OOM Hash edit plan is too large");
+      auto added = budget.AddBytes(operation.fields_.size() * 256);
+      if (!added.ok()) co_return added;
+      added = budget.AddBytes(kCollectionPromotionBytes * 2);
+      if (!added.ok()) co_return added;
+      auto admitted = budget.Reserve(1);
+      if (!admitted.ok()) co_return admitted.status();
+      compact_edit_scratch.emplace(std::move(*admitted));
+      auto edited =
+          EditCompactHash(payload, location.logical_size_, operation.fields_,
+                          operation.values_, kCollectionPromotionBytes - 1);
+      if (!edited.ok()) co_return edited.status();
+      compact_edit = std::move(*edited);
+      if (compact_edit) {
+        result.changed_ = compact_edit->changed_;
+        result.integer_ = compact_edit->added_;
+      } else {
+        // Promotion keeps the existing owned builder and its admission. No
+        // oversized output was allocated by the bounded editor.
+        compact_edit_scratch.reset();
+      }
+    }
+    if (!compact_edit) {
+      auto decoded = DecodeHashValue(payload);
+      if (!decoded.ok()) co_return decoded.status();
+      compact = std::move(*decoded);
+      if (compact.entries_.size() != location.logical_size_) {
+        co_return absl::InternalError(
+            "Hash element count does not match record metadata");
+      }
     }
   }
 
@@ -1291,7 +1418,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
     case HashOperationKind::kSet:
     case HashOperationKind::kSetIfAbsent: {
-      if (edit_leaves) break;
+      if (edit_leaves || compact_edit) break;
       if (operation.fields_.size() != operation.values_.size())
         co_return absl::InvalidArgumentError("Hash field/value mismatch");
       const bool indexed = operation.fields_.size() > 1;
@@ -1420,7 +1547,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return absl::InternalError("read operation reached Hash mutation");
   }
 
-  result.length_ = edit_leaves ? edited_length
+  result.length_ = compact_edit  ? compact_edit->count_
+                   : edit_leaves ? edited_length
                    : grouped == nullptr
                        ? compact.entries_.size()
                        : location.logical_size_ - selected_field_count +
@@ -1446,6 +1574,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!valid.ok()) co_return valid;
   }
   std::optional<std::string> prepared_compact_payload;
+  if (compact_edit && compact_edit->changed_)
+    prepared_compact_payload.emplace(std::move(compact_edit->payload_));
   bool compact_write_promotes = false;
   if (unlocked_compact_write || unlocked_create) {
     if (result.changed_ && result.key_exists_) {
@@ -1455,7 +1585,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                                                    {}, result.length_, 1);
         if (!prepared.ok()) co_return prepared.status();
         grouped_plan.emplace(std::move(*prepared));
-      } else if (!compact_write_promotes) {
+      } else if (!compact_write_promotes && !prepared_compact_payload) {
         auto encoded = EncodeHashValue(compact);
         if (!encoded.ok()) co_return encoded.status();
         prepared_compact_payload.emplace(std::move(*encoded));
@@ -1552,8 +1682,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   absl::Status written = co_await AppendLocked(
       store, partition, db_id, key, digest, payload, kind, published_type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
-      kind == RecordKind::kValue ? compact.entries_.size() : 0, nullptr,
-      nullptr, replication, true, nullptr, mutation_precondition);
+      kind == RecordKind::kValue ? result.length_ : 0, nullptr, nullptr,
+      replication, true, nullptr, mutation_precondition);
   if (!written.ok()) co_return written;
   co_return result;
 }

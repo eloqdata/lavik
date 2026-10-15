@@ -55,6 +55,16 @@ absl::Status FindHashGroupFields(std::string_view payload,
                                  std::uint32_t field_count,
                                  std::span<HashFieldLookup> requests);
 
+// Compact equivalents: validate the complete payload and expected record
+// count. Returned views borrow payload. Batch requests must be sorted by field;
+// repeated requested fields retain distinct result positions. Reject duplicate
+// occurrences of requested fields on disk, as the grouped readers do.
+absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
+    std::string_view payload, std::size_t field_count, std::string_view field);
+absl::Status FindCompactHashFields(std::string_view payload,
+                                   std::size_t field_count,
+                                   std::span<HashFieldLookup> requests);
+
 // Copies this page's matches to their distinct, empty slots in a pre-sized,
 // charged result. Admits all copies (including repeated operands) before any
 // allocation, and grows the existing charge. Discard result on failure.
