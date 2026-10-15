@@ -468,6 +468,138 @@ TEST(GroupedCollectionTest, StringSegmentsValidateLengthsAndDirectPositions) {
   EXPECT_FALSE(DecodeOrderedGroup(*retired).ok());
 }
 
+TEST(GroupedCollectionTest,
+     BorrowedStringSegmentsPreserveWireAndDecodeOwnership) {
+  for (const auto size :
+       {std::size_t{1}, std::size_t{137}, kStringGroupBytes}) {
+    SCOPED_TRACE(size);
+    std::string source(size, '\0');
+    for (std::size_t i = 0; i < size; ++i)
+      source[i] = static_cast<char>(i % 256);
+    const auto expected = source;
+    OrderedGroupSnapshot borrowed{.kind_ = OrderedCollectionKind::kString,
+                                  .incarnation_ = 17,
+                                  .id_ = 2,
+                                  .previous_ = 1,
+                                  .borrowed_string_ = source};
+    // Plans may move before preflight, without relocating the caller's body.
+    auto moved = std::move(borrowed);
+    EXPECT_TRUE(moved.entries_.empty());
+    EXPECT_EQ(OrderedGroupSize(moved), size);
+    EXPECT_EQ(OrderedStringBytes(moved).data(), source.data());
+    {
+      auto encoder = OrderedGroupEncoder::Create(moved);
+      ASSERT_TRUE(encoder.ok()) << encoder.status();
+      auto header = encoder->Next();
+      ASSERT_TRUE(header.has_value());
+      EXPECT_EQ(header->size(), kOrderedGroupHeaderBytes);
+      auto body = encoder->Next();
+      ASSERT_TRUE(body.has_value());
+      EXPECT_EQ(body->data(), source.data());
+      EXPECT_EQ(*body, expected);
+      EXPECT_FALSE(encoder->Next().has_value());
+      EXPECT_FALSE(encoder->Next().has_value());
+    }
+    OrderedGroupSnapshot owned{.kind_ = OrderedCollectionKind::kString,
+                               .incarnation_ = 17,
+                               .id_ = 2,
+                               .previous_ = 1,
+                               .entries_ = {{.value_ = source}}};
+    auto encoded = EncodeOrderedGroup(moved);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    auto owned_encoded = EncodeOrderedGroup(owned);
+    ASSERT_TRUE(owned_encoded.ok()) << owned_encoded.status();
+    EXPECT_EQ(*encoded, *owned_encoded);
+    auto metadata = DecodeOrderedGroupMetadata(*encoded, encoded->size());
+    ASSERT_TRUE(metadata.ok()) << metadata.status();
+    EXPECT_EQ(metadata->item_count_, size);
+    EXPECT_EQ(metadata->previous_, 1);
+    auto decoded = DecodeOrderedGroup(*encoded);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    ASSERT_EQ(decoded->entries_.size(), 1);
+    EXPECT_FALSE(decoded->borrowed_string_.has_value());
+    EXPECT_NE(OrderedStringBytes(*decoded).data(), source.data());
+    EXPECT_NE(OrderedStringBytes(*decoded).data(), encoded->data());
+    // Decoded pages used by incremental writers own their bytes independently
+    // of both the full-write request and the encoded input buffer.
+    source.assign(size, 'x');
+    encoded->assign(encoded->size(), 'y');
+    EXPECT_EQ(OrderedStringBytes(*decoded), expected);
+    decoded->entries_.front().value_.front() = 'z';
+    EXPECT_EQ(source, std::string(size, 'x'));
+  }
+}
+
+TEST(GroupedCollectionTest,
+     BorrowedStringSegmentsRejectInvalidRepresentations) {
+  const std::string source(kStringGroupBytes + 1, 'x');
+  OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kString,
+                            .incarnation_ = 17,
+                            .id_ = 1,
+                            .borrowed_string_ = std::string_view(source).substr(
+                                0, kStringGroupBytes)};
+  ASSERT_TRUE(OrderedGroupEncoder::Create(page).ok());
+  auto broken = page;
+  broken.entries_.push_back({.value_ = "ambiguous"});
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet,
+        OrderedCollectionKind::kStream}) {
+    broken = page;
+    broken.kind_ = kind;
+    EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  }
+  broken = page;
+  broken.retired_ = true;
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  broken = page;
+  broken.borrowed_string_ = std::string_view{};
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  broken = page;
+  broken.borrowed_string_ = source;
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  broken = page;
+  broken.next_ = 2;
+  ASSERT_TRUE(OrderedGroupEncoder::Create(broken).ok());
+  broken.borrowed_string_ =
+      std::string_view(source).substr(0, kStringGroupBytes - 1);
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  broken = page;
+  broken.previous_ = 3;
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+  broken = page;
+  broken.next_ = 3;
+  EXPECT_FALSE(OrderedGroupEncoder::Create(broken).ok());
+}
+
+TEST(GroupedCollectionTest, BorrowedStringSegmentsPreserveBoundaryChecks) {
+  const std::string source(kStringGroupBytes, 'x');
+  OrderedGroupSnapshot first{.kind_ = OrderedCollectionKind::kString,
+                             .incarnation_ = 17,
+                             .id_ = 1,
+                             .next_ = 2,
+                             .borrowed_string_ = source};
+  OrderedGroupSnapshot tail{.kind_ = OrderedCollectionKind::kString,
+                            .incarnation_ = 17,
+                            .id_ = 2,
+                            .previous_ = 1,
+                            .entries_ = {{.value_ = "tail"}}};
+  EXPECT_TRUE(ValidateOrderedGroupBoundary(first, tail).ok());
+  first.borrowed_string_.reset();
+  first.entries_.push_back({.value_ = source});
+  tail.entries_.clear();
+  tail.borrowed_string_ = std::string_view(source).substr(0, 4);
+  EXPECT_TRUE(ValidateOrderedGroupBoundary(first, tail).ok());
+  tail.borrowed_string_ = std::string_view{};
+  EXPECT_FALSE(ValidateOrderedGroupBoundary(first, tail).ok());
+  tail.borrowed_string_ = std::string_view(source).substr(0, 4);
+  tail.previous_ = 3;
+  EXPECT_FALSE(ValidateOrderedGroupBoundary(first, tail).ok());
+  tail.previous_ = 1;
+  tail.incarnation_ = 18;
+  EXPECT_FALSE(ValidateOrderedGroupBoundary(first, tail).ok());
+}
+
 TEST(GroupedCollectionTest, StringPointUpdatesShareUntouchedDirectoryChunks) {
   auto root = StringRoot(128 * kStringGroupBytes);
   auto records = StringCandidates(root);

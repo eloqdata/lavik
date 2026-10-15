@@ -187,6 +187,7 @@ StorageEngine::Impl::WriteGroupRecordLocked(
   ExtentManifest extents;
   std::string payload;
   std::string_view record_payload;
+  std::optional<InlineRecordPayload> inline_payload;
   if (external) {
     RecordPayloadCursor cursor(encoder, std::string_view{});
     auto written = co_await WriteExtentValueLocked(store, {}, {}, &cursor, key);
@@ -201,10 +202,10 @@ StorageEngine::Impl::WriteGroupRecordLocked(
     // command-owned bytes can be copied directly into the storage buffer.
     record_payload = prepared_payload;
   } else {
-    auto encoded = EncodeInlineRecordPayload(encoder);
-    if (!encoded.ok()) co_return encoded.status();
-    payload = std::move(*encoded);
-    record_payload = payload;
+    // Preflight already validated this snapshot. Keep the encoder unconsumed
+    // across allocation waits and write its fragments straight into the final
+    // staging range, before the append publishes any byte or record identity.
+    inline_payload.emplace(encoder);
   }
   const GroupRecordWrite identity{
       .auxiliary_ = true,
@@ -222,6 +223,7 @@ StorageEngine::Impl::WriteGroupRecordLocked(
   const RecordWriteRequest record_write{
       .key_ = key,
       .value_ = record_payload,
+      .inline_payload_ = inline_payload ? &*inline_payload : nullptr,
       .digest_ = digest,
       .mutation_sequence_ = sequence,
       .logical_size_ = logical_size,

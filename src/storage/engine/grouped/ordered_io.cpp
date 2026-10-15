@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/storage/detail/grouped/scratch.h"
 
 namespace lavik::storage {
 
@@ -223,6 +224,104 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
     co_return absl::DataLossError("ordered collection aggregate mismatch");
   }
   co_return result;
+}
+
+Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
+StorageEngine::Impl::LoadGroupedStringValue(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, bool pinned) {
+  const auto& directory = object->ordered_directory();
+  const auto& root = directory.root();
+  if (root.item_count_ == 0 || root.item_count_ > kMaxStringBytes ||
+      root.item_count_ != object->version().root_.logical_size_ ||
+      root.group_count_ !=
+          (root.item_count_ + kStringGroupBytes - 1) / kStringGroupBytes ||
+      root.first_group_ != 1 || root.last_group_ != root.group_count_ ||
+      root.next_group_id_ != root.last_group_ + 1) {
+    co_return absl::DataLossError("grouped String aggregate mismatch");
+  }
+  const auto size = static_cast<std::size_t>(root.item_count_);
+  const auto& options = options_.buffers_;
+  // The output survives every page read. Even a small grouped String must use
+  // overflow storage: retaining a fixed slot while waiting for another can
+  // deadlock a bounded pool when concurrent readers each hold their output.
+  const auto minimum_output = std::max(size, options.read_payload_bytes() + 1);
+  constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+  if (options.alignment_ == 0 || options.alignment_ > limit ||
+      minimum_output > limit - (options.alignment_ - 1)) {
+    co_return absl::ResourceExhaustedError(
+        "grouped String output size overflow");
+  }
+  const auto aligned_output =
+      (minimum_output + options.alignment_ - 1) & ~(options.alignment_ - 1);
+  if (options.read_headroom_bytes_ > limit - aligned_output ||
+      options.read_tailroom_bytes_ >
+          limit - aligned_output - options.read_headroom_bytes_) {
+    co_return absl::ResourceExhaustedError(
+        "grouped String output size overflow");
+  }
+  const auto output_bytes = aligned_output + options.read_headroom_bytes_ +
+                            options.read_tailroom_bytes_;
+  std::size_t page_scratch = 0;
+  for (const auto& metadata : directory.groups()) {
+    const GroupedRecordId id{metadata.id_, 0};
+    const auto* entry = object->FindGroup(id);
+    if (entry == nullptr)
+      co_return absl::DataLossError("missing grouped materialization page");
+    GroupedScratchBudget page;
+    const auto status = page.AddGroup(*entry, object->ExtentsFor(id));
+    if (!status.ok()) co_return status;
+    page_scratch = std::max(page_scratch, page.bytes());
+  }
+  // Admit the final capacity and at most one page, including any external
+  // layout, before allocating. No decoded segment strings or full-image
+  // encoding coexist with the output. The reservation is local to assembly;
+  // the returned lease retains the pool's existing cross-worker lifecycle.
+  GroupedScratchBudget budget;
+  auto status = budget.AddBytes(AllocatorUsableSizeForRequest(output_bytes));
+  if (!status.ok()) co_return status;
+  status = budget.AddBytes(page_scratch);
+  if (!status.ok()) co_return status;
+  auto scratch = budget.Reserve(1);
+  if (!scratch.ok()) co_return scratch.status();
+  auto buffer = co_await store.buffers_.AcquireReadBuffer(minimum_output);
+  if (!buffer.ok()) co_return buffer.status();
+  const auto output = buffer->io_buffer();
+  if (output.size_ < size)
+    co_return absl::ResourceExhaustedError("grouped output buffer too small");
+  std::size_t written = 0;
+  for (const auto& metadata : directory.groups()) {
+    auto copied = co_await LoadOrderedGroup<std::size_t>(
+        store, partition, db_id, key, digest, object, metadata.id_, pinned,
+        [metadata,
+         destination = std::span(output.data_ + written, size - written)](
+            std::string_view payload, std::uint64_t,
+            const OrderedGroupEntry& route,
+            LoadedValue&&) -> absl::StatusOr<std::size_t> {
+          // LoadOrderedGroup already checked CRC, physical/logical identity,
+          // and the fixed String segment envelope without decoding its body.
+          // Reconcile against the retained directory before exposing bytes.
+          const auto bytes = payload.substr(kOrderedGroupHeaderBytes);
+          if (route.previous_ != metadata.previous_ ||
+              route.next_ != metadata.next_ ||
+              bytes.size() != metadata.item_count_) {
+            return absl::DataLossError(
+                "ordered page links disagree with directory");
+          }
+          if (bytes.size() > destination.size())
+            return absl::DataLossError("grouped String aggregate mismatch");
+          std::memcpy(destination.data(), bytes.data(), bytes.size());
+          return bytes.size();
+        });
+    if (!copied.ok()) co_return copied.status();
+    written += *copied;
+  }
+  if (written != size)
+    co_return absl::DataLossError("grouped String aggregate mismatch");
+  const auto offset =
+      static_cast<std::size_t>(output.data_ - buffer->bytes().data());
+  co_return LoadedValue{std::move(*buffer), offset, written};
 }
 
 }  // namespace lavik::storage

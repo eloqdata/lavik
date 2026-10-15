@@ -29,33 +29,69 @@
 
 namespace lavik::storage {
 
-// Consumes a preflighted encoder into one inline payload. Unlike extent reads,
-// this has no partial-span state or type-erased calls. Every byte is
-// overwritten before exposure, including when resize_and_overwrite supplies
-// extra capacity. Next() must not throw and its borrowed span is consumed
-// before advancing.
+// Consumes a preflighted encoder into an exact, caller-owned destination.
+// Next() must not throw; borrowed framing is copied before advancing. A
+// malformed producer can partially modify output, so the caller must withhold
+// publication of the entire destination until this succeeds.
+template <typename Encoder>
+absl::Status WriteInlineRecordPayload(Encoder& encoder,
+                                      std::span<std::byte> output) {
+  static_assert(noexcept(encoder.Next()));
+  if (output.size() != encoder.encoded_bytes())
+    return absl::DataLossError("inline payload destination length mismatch");
+  std::size_t offset = 0;
+  while (auto part = encoder.Next()) {
+    if (part->size() > output.size() - offset)
+      return absl::DataLossError("inline payload encoder length mismatch");
+    if (!part->empty())
+      std::memcpy(output.data() + offset, part->data(), part->size());
+    offset += part->size();
+  }
+  return offset == output.size()
+             ? absl::OkStatus()
+             : absl::DataLossError("inline payload encoder length mismatch");
+}
+
+// Borrows an unstarted, preflighted encoder and its immutable source through
+// the writer's allocation waits; both must stay alive and unmoved. WriteTo
+// consumes it exactly once, without suspension or allocation on success. Type
+// erasure happens once per payload, rather than once per framing/value
+// fragment. No byte is published here.
+class InlineRecordPayload {
+ public:
+  template <typename Encoder>
+  explicit InlineRecordPayload(Encoder& encoder) noexcept
+      : source_(&encoder),
+        write_([](void* source, std::span<std::byte> output) {
+          return WriteInlineRecordPayload(*static_cast<Encoder*>(source),
+                                          output);
+        }),
+        bytes_(encoder.encoded_bytes()) {}
+
+  std::size_t encoded_bytes() const noexcept { return bytes_; }
+  absl::Status WriteTo(std::span<std::byte> output) const {
+    return write_(source_, output);
+  }
+
+ private:
+  void* source_;
+  absl::Status (*write_)(void*, std::span<std::byte>);
+  std::size_t bytes_;
+};
+
+// Owning convenience form for callers that need contiguous encoded bytes.
+// Storage appends use InlineRecordPayload to avoid this temporary allocation.
 template <typename Encoder>
 absl::StatusOr<std::string> EncodeInlineRecordPayload(Encoder& encoder) {
-  static_assert(noexcept(encoder.Next()));
   const auto bytes = encoder.encoded_bytes();
   std::string payload;
-  bool valid = true;
+  absl::Status status;
   payload.resize_and_overwrite(bytes, [&](char* output, std::size_t) noexcept {
-    std::size_t offset = 0;
-    while (auto part = encoder.Next()) {
-      if (part->size() > bytes - offset) {
-        valid = false;
-        return std::size_t{0};
-      }
-      if (!part->empty())
-        std::memcpy(output + offset, part->data(), part->size());
-      offset += part->size();
-    }
-    valid = offset == bytes;
-    return valid ? offset : 0;
+    status = WriteInlineRecordPayload(
+        encoder, std::as_writable_bytes(std::span(output, bytes)));
+    return status.ok() ? bytes : 0;
   });
-  if (!valid)
-    return absl::DataLossError("inline payload encoder length mismatch");
+  if (!status.ok()) return status;
   return payload;
 }
 

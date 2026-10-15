@@ -295,8 +295,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             const auto& page = *changed->second;
             if (page.retired_)
               co_return absl::DataLossError("retired demotion page in chain");
-            compact.insert(compact.end(), page.entries_.begin(),
-                           page.entries_.end());
+            if (page.kind_ == OrderedCollectionKind::kString)
+              compact.push_back(
+                  {.value_ = std::string(OrderedStringBytes(page))});
+            else
+              compact.insert(compact.end(), page.entries_.begin(),
+                             page.entries_.end());
             id = page.next_;
           } else {
             const auto* route = previous->ordered_directory().Find(id);

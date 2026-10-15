@@ -126,15 +126,30 @@ struct OrderedGroupSnapshot {
   std::uint64_t next_ = 0;
   bool retired_ = false;
   std::vector<OrderedCollectionEntry> entries_;
+  // Command-local full String writes may borrow their caller's immutable
+  // value instead of allocating one string/vector per segment. This is valid
+  // only for live String pages with no entries_. The source must outlive all
+  // page writes, including suspension; decoding always produces owned entries.
+  // Routing directories and asynchronous commit receipts never retain it.
+  std::optional<std::string_view> borrowed_string_ = std::nullopt;
 };
 
-// A live String segment owns one raw byte string. Its logical size is the
-// byte count, which lets the shared directory validate aggregate lengths.
+// Returns a String segment's raw bytes from its owned or borrowed form. The
+// caller must keep that form's owner alive and unchanged while using the view.
+inline std::string_view OrderedStringBytes(
+    const OrderedGroupSnapshot& group) noexcept {
+  if (group.borrowed_string_) return *group.borrowed_string_;
+  return group.entries_.empty()
+             ? std::string_view{}
+             : std::string_view(group.entries_.front().value_);
+}
+
+// String logical sizes count bytes, letting the shared directory validate
+// aggregate lengths independently of the segment's ownership representation.
 inline std::size_t OrderedGroupSize(
     const OrderedGroupSnapshot& group) noexcept {
   return group.kind_ == OrderedCollectionKind::kString
-             ? (group.entries_.empty() ? 0
-                                       : group.entries_.front().value_.size())
+             ? OrderedStringBytes(group).size()
              : group.entries_.size();
 }
 
@@ -194,8 +209,9 @@ class OrderedGroupMetadataDecoder {
 };
 
 // The cursor validates before emitting any data and borrows immutable entry
-// strings. An extent writer can consume it without a second full-value copy.
-// The input snapshot must outlive the cursor and remain unchanged.
+// strings or a String segment's borrowed bytes. An extent writer can consume
+// it without a second full-value copy. The input snapshot and any borrowed
+// String source must outlive the cursor and remain unchanged.
 class OrderedGroupEncoder {
  public:
   static absl::StatusOr<OrderedGroupEncoder> Create(

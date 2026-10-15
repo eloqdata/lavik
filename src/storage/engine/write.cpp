@@ -2646,6 +2646,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     SetLatencyTrace* trace
 #endif
 ) {
+  const std::size_t payload_bytes =
+      request.inline_payload_ != nullptr
+          ? request.inline_payload_->encoded_bytes()
+          : request.value_.size();
   std::uint64_t logical_size = request.logical_size_;
   std::uint64_t txid = 0;
   if (store.write_failed_ || RuntimeFailureLatched() ||
@@ -2654,7 +2658,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                            "storage writer is stopped after an IO failure");
   }
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
-    logical_size = request.value_.size();
+    logical_size = payload_bytes;
   }
   if (request.tx_ != nullptr) {
     assert(request.tx_->txid_ != 0);
@@ -2672,6 +2676,9 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       request.group_ != nullptr && request.group_->auxiliary_;
   const bool grouped_root =
       request.group_ != nullptr && !request.group_->auxiliary_;
+  if (request.inline_payload_ != nullptr &&
+      (!auxiliary || request.external_ || !request.value_.empty()))
+    co_return absl::InvalidArgumentError("invalid inline group encoder write");
   struct FailIncompleteGroupedRoot {
     WorkerStore& store_;
     TxShardWrites* tx_;
@@ -2710,7 +2717,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
        logical_size > kMaxBitmapBytes) ||
       logical_size > std::numeric_limits<std::uint32_t>::max();
   if (!ValidRecordKeySize(request.key_.size()) || invalid_logical_size ||
-      request.value_.size() > kMaxRecordPayloadBytes) {
+      payload_bytes > kMaxRecordPayloadBytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record key and value exceed storage limits");
   }
@@ -2740,7 +2747,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   const std::size_t record_header_bytes =
       RecordHeaderBytes(request.key_.size(), request.key_indirect_, txid != 0,
                         request.expire_at_ms_ != 0, auxiliary);
-  const std::size_t payload_bytes = request.value_.size();
   const std::size_t total_disk_bytes =
       AlignRecord(record_header_bytes + payload_bytes);
   if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
@@ -3404,10 +3410,27 @@ acquire_active_stream:
     absl::Status admissible = effective_precondition->Validate();
     if (!admissible.ok()) co_return admissible;
   }
+  if (request.inline_payload_ != nullptr) {
+    // Allocation and retry paths above have not consumed the borrowed encoder.
+    // No await remains: its source and this staging allocation stay stable
+    // through encoding, CRC and publication. On length failure the active
+    // append boundary is unchanged; subsequent writes overwrite this private
+    // tail, and neither an index identity nor an indirect-key reference exists.
+    auto encoded = request.inline_payload_->WriteTo(std::span<std::byte>(
+        staging.data_ + record_offset + record_header_bytes, payload_bytes));
+    LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES(
+                               "LAVIK_FAIL_INLINE_GROUP_ENCODE_KEY",
+                               request.key_)) {
+      static std::atomic<bool> injected{false};
+      if (!injected.exchange(true, std::memory_order_relaxed))
+        encoded = absl::DataLossError("injected inline group encoding fault");
+    });
+    if (!encoded.ok()) co_return encoded;
+  }
   // Admit exceptional reference-directory allocations before publishing any
-  // staging bytes. Ordinary keys do not touch these maps. A later encoding
-  // failure stops the writer; conservative dependencies remain until the
-  // containing allocation is retired.
+  // staging bytes. Ordinary keys do not touch these maps. A later header
+  // encoding failure retains conservative dependencies until the containing
+  // allocation is retired; inline producer failures above own no such entry.
   if (indirect_key) {
     store
         .indirect_key_references_[{updated.block_id_,
@@ -3427,9 +3450,9 @@ acquire_active_stream:
     tx::CurrentTxShard().MarkWatched(request.db_id_,
                                      tx::FingerprintOf(request.digest_));
   }
-  // The encoder overwrites the complete header and the copies below overwrite
-  // the complete payload. Preserve deterministic on-disk padding without
-  // clearing those bytes twice on every append.
+  // The encoder overwrites the complete header; either the inline encoder
+  // above or the copy below overwrites the complete payload. Preserve padding
+  // without clearing those bytes twice on every append.
   const std::size_t encoded_record_bytes = record_header_bytes + payload_bytes;
   grouped_root_guard.armed_ = grouped_root || previous_grouped != nullptr;
   std::fill_n(staging.data_ + record_offset + encoded_record_bytes,

@@ -59,6 +59,12 @@ The resident String directory and physical index use direct positional indexing,
 without binary search or hash routing. Physical index pages share unchanged
 entries with snapshot/undo versions. Incremental writes preserve segment IDs;
 whole replacement or shrinking may create a fresh incarnation or a compact value.
+Whole String writes borrow immutable input segments until every changed page
+has been encoded into staging. Published directories and queued commit receipts
+retain no borrowed input. Whole String reads validate each segment against the
+retained graph and assemble it directly into the returned read lease. That lease
+uses overflow storage so its lifetime cannot exhaust the fixed slots needed for
+page reads; admission covers its capacity and one page of temporary scratch.
 For grouped Strings, GETRANGE/GETBIT retain an immutable routing view and read
 only intersecting segments outside worker store state. The page loader checks
 population and physical lifetime across I/O. SETRANGE/SETBIT/APPEND replace
