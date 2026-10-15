@@ -20,6 +20,7 @@
 
 #include "../impl.h"
 #include "lavik/storage/detail/grouped/scratch.h"
+#include "zset_work_budget.h"
 
 namespace lavik::storage {
 
@@ -32,6 +33,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     std::optional<std::span<const SortedSetMemberChange>> checked_changes,
     SortedSetMemberProbe* probe) {
   SortedSetMemberMutation result;
+  SortedSetPageWorkBudget page_work;
   if (ordered.root_.kind_ != OrderedCollectionKind::kSortedSet)
     co_return result;
   // Reject before staging either graph so private plans and admission are
@@ -168,22 +170,27 @@ StorageEngine::Impl::PrepareSortedSetMembers(
       co_return absl::DataLossError("checked member-index count mismatch");
   } else {
     for (const auto& page : ordered.writes_) {
-      if (unlocked) co_await bycorf::Yield(*store.worker_);
+      GroupedScratchBudget work;
       for (const auto& entry : page.entries_) {
+        status = work.AddBytes(entry.value_.size() + 256);
+        if (!status.ok()) co_return status;
         auto& change = changes[entry.value_];
         if (change.after_)
           co_return absl::DataLossError("duplicate ordered replacement member");
         change.after_ = entry.score_;
       }
+      if (unlocked && page_work.Add(work.bytes()))
+        co_await bycorf::Yield(*store.worker_);
     }
     for (const auto& page : ordered.writes_) {
       if (!previous || !previous->ordered_directory().Find(page.id_)) continue;
-      if (unlocked) co_await bycorf::Yield(*store.worker_);
       GroupedScratchBudget read_budget;
       status = add_group(read_budget, {page.id_, 0});
       if (!status.ok()) co_return status;
       auto read_admission = read_budget.Reserve(2);
       if (!read_admission.ok()) co_return read_admission.status();
+      if (unlocked && page_work.Add(read_budget.bytes()))
+        co_await bycorf::Yield(*store.worker_);
       LAVIK_FAULT_INJECT(
           if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DIFF_READ_KEY",
                                   key)) co_return absl::
@@ -240,9 +247,39 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   }
   if (probe != nullptr &&
       (!checked_changes || probe->source_.get() != previous.get() ||
-       leaves.size() != 1 || leaves.begin()->first != probe->snapshot_.id_ ||
+       leaves.size() != 1 ||
+       leaves.begin()->first !=
+           (probe->encoded_ ? probe->encoded_->id() : probe->snapshot_.id_) ||
        probe->snapshot_.retired_))
     co_return absl::DataLossError("invalid Sorted Set member probe");
+  if (probe != nullptr && probe->encoded_) {
+    // The point lookup validated every field and retained exactly this old
+    // value. Reconcile the semantic delta before consuming its private bytes;
+    // no new root may heal disagreement between the two indexes.
+    if (changes.size() != 1 ||
+        changes.begin()->first != probe->encoded_->field())
+      co_return absl::DataLossError("invalid encoded Sorted Set member change");
+    const auto& change = changes.begin()->second;
+    auto score = DecodeSortedSetMemberScore(probe->encoded_->value());
+    if (!score.ok()) co_return score.status();
+    if (!change.before_ || *score != *change.before_)
+      co_return absl::DataLossError("ordered/member-index score mismatch");
+    std::optional<std::string> encoded_score;
+    if (change.after_)
+      encoded_score = EncodeSortedSetMemberScore(*change.after_);
+    auto replacement =
+        std::move(*probe->encoded_)
+            .Apply(encoded_score
+                       ? std::optional<std::string_view>(*encoded_score)
+                       : std::nullopt);
+    if (!replacement.ok()) co_return replacement.status();
+    result.leaves_ = std::move(probe->admission_);
+    plan.root_.revision_ = ordered.root_.revision_;
+    plan.root_.field_count_ = ordered.root_.item_count_;
+    plan.changed_ = true;
+    plan.writes_.push_back(std::move(*replacement));
+    co_return result;
+  }
   if (probe != nullptr) {
     // The lookup already admitted and decoded this exact logical leaf.
     // Transfer its credit with the strings rather than charging it twice.
@@ -261,9 +298,11 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     result.leaves_ = std::move(*admission);
   }
   for (auto& [id, leaf] : leaves) {
-    // Reusing payload work must not remove the preparation phase's
-    // scheduling opportunity for other keys on this worker.
-    if (unlocked) co_await bycorf::Yield(*store.worker_);
+    // Point preparation reuses admitted bytes without an extra scheduler
+    // round trip. Conservatively charge all retained leaves for a batch so
+    // large preparations keep their frequent fairness opportunities.
+    if (unlocked && page_work.Add(result.leaves_.bytes()))
+      co_await bycorf::Yield(*store.worker_);
     if (probe == nullptr) {
       LAVIK_FAULT_INJECT(
           if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_LEAF_READ_KEY",

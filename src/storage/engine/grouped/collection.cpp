@@ -1721,6 +1721,14 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
         ++end;
       }
     }
+    if (begin == 0 && end == group.entries_.size()) {
+      // The checked page already fits (or is one indivisible oversized
+      // entry). Preserve its entry storage as well as its identity; ordinary
+      // point mutations should not allocate another vector just to move every
+      // entry back into an otherwise identical page.
+      result.groups_.push_back(std::move(group));
+      return result;
+    }
     std::uint64_t id = group.id_;
     if (!result.groups_.empty()) {
       if (result.next_group_id_ == std::numeric_limits<std::uint64_t>::max())

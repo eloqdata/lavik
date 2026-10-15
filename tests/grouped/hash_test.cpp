@@ -59,6 +59,123 @@ HashValue Value(std::size_t count, std::size_t length = 128) {
   return value;
 }
 
+TEST(HashGroupPointProbe, OwnsValidatedBytesAcrossMovesAndKeepsWireFormat) {
+  for (std::size_t count : {1U, 3U}) {
+    for (std::size_t target = 0; target < count; ++target) {
+      for (bool remove : {false, true}) {
+        HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(count, 8)};
+        auto& entry = group.value_.entries_[target];
+        entry.field_.append("\0\xff", 2);
+        const auto field = entry.field_;
+        const std::string replacement("\0\1\2\3\xff\xfe\xfd\xfc", 8);
+        auto payload = EncodeHashGroup(group);
+        ASSERT_TRUE(payload.ok()) << payload.status();
+        auto probe = HashGroupPointProbe::Create(*payload, Seed(), field);
+        ASSERT_TRUE(probe.ok()) << probe.status();
+        ASSERT_TRUE(*probe);
+        payload->assign(payload->size(), '!');
+        auto moved = std::move(**probe);
+        EXPECT_EQ(moved.field(), field);
+        EXPECT_EQ(moved.value(), entry.value_);
+        auto changed = std::move(moved).Apply(
+            remove ? std::nullopt
+                   : std::optional<std::string_view>(replacement));
+        ASSERT_TRUE(changed.ok()) << changed.status();
+        ASSERT_TRUE(changed->prepared_);
+        if (remove)
+          group.value_.entries_.erase(group.value_.entries_.begin() + target);
+        else
+          entry.value_ = replacement;
+        auto expected = EncodeHashGroup(group);
+        auto actual = EncodeHashGroup(*changed);
+        ASSERT_TRUE(expected.ok()) << expected.status();
+        ASSERT_TRUE(actual.ok()) << actual.status();
+        EXPECT_EQ(*actual, *expected);
+        auto decoded = DecodeHashGroup(*actual);
+        ASSERT_TRUE(decoded.ok()) << decoded.status();
+        EXPECT_EQ(decoded->field_count(), count - remove);
+      }
+    }
+  }
+}
+
+TEST(HashGroupPointProbe, RejectsUnrelatedCorruptionBeforeCertifyingMatch) {
+  HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(3, 8)};
+  auto payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  auto reject = [&](std::string bytes) {
+    auto result = HashGroupPointProbe::Create(bytes, Seed(), "field-0");
+    EXPECT_EQ(result.status().code(), absl::StatusCode::kDataLoss);
+  };
+  auto duplicate = *payload;
+  duplicate.replace(duplicate.find("field-2"), 7, "field-1");
+  reject(duplicate);
+  auto count = *payload;
+  count[kHashGroupHeaderBytes + 16] = 1;
+  reject(count);
+  auto route = *payload;
+  route[40] = 64;
+  reject(route);
+  auto truncated = *payload;
+  truncated.pop_back();
+  reject(truncated);
+}
+
+TEST(HashGroupPointProbe, MissingAndOversizedLeavesRequireCheckedFallback) {
+  for (const auto length :
+       std::array<std::size_t, 2>{8, kCollectionGroupTargetBytes}) {
+    HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(3, length)};
+    auto payload = EncodeHashGroup(group);
+    ASSERT_TRUE(payload.ok());
+    auto duplicate = *payload;
+    duplicate.replace(duplicate.find("field-2"), 7, "field-1");
+    auto probe = HashGroupPointProbe::Create(duplicate, Seed(), "missing");
+    ASSERT_TRUE(probe.ok()) << probe.status();
+    EXPECT_FALSE(*probe);
+    // The actual fallback decodes and checks routing before any page plan.
+    // A missing field must not let unrelated corruption become writable.
+    auto decoded = DecodeHashGroup(duplicate);
+    EXPECT_EQ(decoded.status().code(), absl::StatusCode::kDataLoss);
+    auto route = *payload;
+    route[40] = 64;
+    probe = HashGroupPointProbe::Create(route, Seed(), "missing");
+    ASSERT_TRUE(probe.ok()) << probe.status();
+    EXPECT_FALSE(*probe);
+    decoded = DecodeHashGroup(route);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    EXPECT_TRUE(std::any_of(decoded->value_.entries_.begin(),
+                            decoded->value_.entries_.end(),
+                            [&](const auto& entry) {
+                              return !decoded->id_.ContainsHash(
+                                  ComputeDigest(entry.field_, Seed()).value_);
+                            }));
+  }
+}
+
+TEST(HashGroupPointProbe, BoundsOwnedCopyAndRejectsGrowingReplacement) {
+  HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(2, 8)};
+  auto payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  auto absent = HashGroupPointProbe::Create(*payload, Seed(), "missing");
+  ASSERT_TRUE(absent.ok());
+  EXPECT_FALSE(*absent);
+  auto probe = HashGroupPointProbe::Create(*payload, Seed(), "field-0");
+  ASSERT_TRUE(probe.ok());
+  ASSERT_TRUE(*probe);
+  auto rejected = std::move(**probe).Apply("larger than eight bytes");
+  EXPECT_EQ(rejected.status().code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ((**probe).value(), group.value_.entries_[0].value_);
+  auto aliased = std::move(**probe).Apply((**probe).value());
+  ASSERT_TRUE(aliased.ok()) << aliased.status();
+  EXPECT_EQ(*EncodeHashGroup(*aliased), *payload);
+  group.value_.entries_[1].value_.resize(kCollectionGroupTargetBytes, 'x');
+  payload = EncodeHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  auto large = HashGroupPointProbe::Create(*payload, Seed(), "field-0");
+  ASSERT_TRUE(large.ok());
+  EXPECT_FALSE(*large);
+}
+
 TEST(HashGroupEdits, OrderedDuplicatesOwnTheirBytesAndKeepWireFormat) {
   HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(8, 64)};
   auto payload = EncodeHashGroup(group);
