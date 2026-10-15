@@ -63,6 +63,9 @@ struct StorageEngineOptions {
   // before assigning a fresh storage-set identity. Data blocks are left
   // physically intact but become unreachable.
   bool reset_data_files_ = false;
+  // Startup-only write policy for data records and value/key extents. Readers
+  // use each persisted object's CRC flag, including after a policy change.
+  bool record_crc_ = false;
   // Initial value for the runtime checkpoint setting. It controls checkpoint
   // consumption during startup and can be changed before the next clean
   // shutdown through CONFIG once request serving begins.

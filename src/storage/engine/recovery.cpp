@@ -105,7 +105,7 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
   }
   const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
                                                   ref.payload_bytes_);
-  if (Crc32c(payload) != ref.payload_checksum_) {
+  if (!header.extent_no_crc_ && Crc32c(payload) != ref.payload_checksum_) {
     co_return absl::InternalError("recovered extent checksum mismatch");
   }
   if (ordered != nullptr) {
@@ -136,7 +136,7 @@ StorageEngine::Impl::LoadRecoveryPayloadPrefix(
     const ExtentRef ref = extents->at(index);
     const std::size_t count =
         std::min<std::size_t>(bytes - copied, ref.payload_bytes_);
-    // The envelope is small, but every extent still crosses checksum and
+    // The envelope is small, but every extent still crosses its CRC policy and
     // identity validation before this graph can become recovery authority.
     // Empty destinations validate the remaining payload without retaining it.
     // Ordered recovery also observes its entry headers in this same pass to
@@ -589,7 +589,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             recovery.buffer_.data_ + record_offset + record.header_bytes_;
         const auto payload_span =
             std::span<const std::byte>(payload, record.payload_bytes_);
-        if (Crc32c(payload_span) != record.payload_checksum_) {
+        if (!ValidateRecordPayload(record, payload_span)) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "record payload checksum mismatch");
         }
@@ -1652,7 +1652,7 @@ StorageEngine::Impl::RecoverOrderedObject(
 Task<absl::Status> StorageEngine::Impl::ValidateRecoveredGroup(
     WorkerStore& store, const RecoveryAuxiliaryRecord& record) {
   if (!record.location_.external()) co_return absl::OkStatus();
-  // Ordered winners were fully checksummed while resolving their links;
+  // Ordered winners passed their CRC policy while resolving their links;
   // there is no reason to read their potentially huge bodies twice.
   if ((record.location_.value_type() == ValueType::kString ||
        record.location_.value_type() == ValueType::kList ||

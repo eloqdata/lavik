@@ -166,6 +166,7 @@ constexpr ConfigOption kScalarOptions[] = {
     ScalarOption<&ServerOptions::tls_replication_>("tls-replication"),
     ScalarOption<&ServerOptions::load_rdb_replace_>("load-rdb-replace"),
     ScalarOption<&ServerOptions::shutdown_checkpoint_>("shutdown-checkpoint"),
+    ScalarOption<&ServerOptions::record_crc_>("record-crc"),
     ScalarOption<&ServerOptions::shard_count_>("shards"),
     ScalarOption<&ServerOptions::shard_count_>("threads"),
     ScalarOption<&ServerOptions::shard_count_>("io-threads"),

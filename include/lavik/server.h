@@ -49,6 +49,8 @@ struct ServerOptions {
   // Startup-only choices; compiled-in capabilities remain optional.
   std::string network_backend_ = "kernel";
   std::string storage_backend_ = "uring";
+  // Enable CRC on newly written data records and their payload extents.
+  bool record_crc_ = false;
   std::string config_file_;
   LoggingOptions logging_;
   std::vector<std::string> bind_addresses_{"127.0.0.1"};

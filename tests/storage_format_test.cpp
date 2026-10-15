@@ -27,6 +27,97 @@
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
 
+TEST(StorageFormatTest, MixedRecordCrcPoliciesPreserveLegacyEncoding) {
+  using namespace lavik::storage;
+  const std::string key = "key";
+  const std::string value = "value";
+  const auto payload = std::as_bytes(std::span(value));
+  RecordHeader record{
+      .header_bytes_ =
+          static_cast<std::uint16_t>(RecordHeaderBytes(key.size())),
+      .value_type_ = ValueType::kString,
+      .key_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .logical_size_ = static_cast<std::uint32_t>(value.size()),
+      .payload_bytes_ = static_cast<std::uint32_t>(value.size()),
+      .total_disk_bytes_ = static_cast<std::uint32_t>(
+          AlignRecord(RecordHeaderBytes(key.size()) + value.size())),
+      .payload_checksum_ = Crc32c(payload),
+  };
+  std::vector<std::byte> encoded(record.header_bytes_);
+  for (bool no_crc : {false, true, false}) {
+    record.no_crc_ = no_crc;
+    ASSERT_TRUE(EncodeRecordHeader(record, key, encoded));
+    RecordHeader decoded;
+    std::string_view decoded_key;
+    ASSERT_TRUE(DecodeRecordHeader(encoded, &decoded, &decoded_key));
+    EXPECT_EQ(decoded.no_crc_, no_crc);
+    EXPECT_EQ(decoded_key, key);
+    EXPECT_EQ(decoded.payload_checksum_, no_crc ? 0 : record.payload_checksum_);
+    if (no_crc) EXPECT_EQ(decoded.header_checksum_, 0);
+    EXPECT_TRUE(ValidateRecordPayload(decoded, payload));
+    const std::string corrupt = "Value";
+    EXPECT_EQ(ValidateRecordPayload(decoded, std::as_bytes(std::span(corrupt))),
+              no_crc);
+    EXPECT_FALSE(ValidateRecordPayload(decoded, payload.first(1)));
+
+    // Header corruption is checked when CRC is present; framing checks are
+    // mandatory with either policy. Existing records leave metadata bit 15
+    // zero.
+    std::uint16_t metadata = 0;
+    std::memcpy(&metadata, encoded.data() + 20, sizeof(metadata));
+    EXPECT_EQ((metadata & 0x8000) != 0, no_crc);
+    auto changed = encoded;
+    changed[kRecordHeaderBaseBytes] ^= std::byte{1};
+    EXPECT_EQ(DecodeRecordHeader(changed, &decoded, &decoded_key), no_crc);
+    changed = encoded;
+    changed[0] ^= std::byte{1};
+    EXPECT_FALSE(DecodeRecordHeader(changed, &decoded, &decoded_key));
+    changed = encoded;
+    const std::uint32_t oversized = kStorageBlockBytes;
+    std::memcpy(changed.data() + 16, &oversized, sizeof(oversized));
+    EXPECT_FALSE(DecodeRecordHeader(changed, &decoded, &decoded_key));
+
+    if (!no_crc) {
+      metadata |= 0x8000;
+      std::memcpy(encoded.data() + 20, &metadata, sizeof(metadata));
+      EXPECT_FALSE(DecodeRecordHeader(encoded, &decoded, &decoded_key));
+    }
+  }
+}
+
+TEST(StorageFormatTest, ExtentCrcPolicyIsProtectedByBlockHeader) {
+  using namespace lavik::storage;
+  // Repurpose one reserved byte without changing persisted field offsets.
+  static_assert(offsetof(BlockHeader, extent_index_) == 72);
+  BlockHeader header;
+  header.block_id_ = 1;
+  header.layout_worker_count_ = 1;
+  header.kind_ = BlockKind::kPayloadExtent;
+  header.extent_no_crc_ = 1;
+  header.extent_payload_bytes_ = 5;
+  header.committed_bytes_ = kBlockHeaderBytes + 5;
+  std::array<std::byte, kBlockHeaderSlotBytes> encoded{};
+  EncodeBlockHeader(header, encoded);
+  BlockHeader decoded;
+  ASSERT_TRUE(DecodeBlockHeader(encoded, &decoded));
+  EXPECT_EQ(decoded.extent_no_crc_, 1);
+  encoded[offsetof(BlockHeader, extent_no_crc_)] = std::byte{0};
+  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  header.extent_payload_checksum_ = 1;
+  EncodeBlockHeader(header, encoded);
+  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  header.extent_payload_checksum_ = 0;
+  header.extent_no_crc_ = 2;
+  EncodeBlockHeader(header, encoded);
+  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+  header.extent_no_crc_ = 1;
+  header.kind_ = BlockKind::kRecords;
+  header.extent_payload_bytes_ = 0;
+  header.committed_bytes_ = kBlockHeaderBytes;
+  EncodeBlockHeader(header, encoded);
+  EXPECT_FALSE(DecodeBlockHeader(encoded, &decoded));
+}
+
 TEST(StorageStateTest, PromotionBaseEqualityIncludesDurabilityFrontier) {
   using namespace lavik::storage;
   const PromotionBase base{

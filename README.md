@@ -304,6 +304,14 @@ redis-cli HGETALL user:42
 Stop the server with `Ctrl-C`. See [Multi-Device Storage](docs/operations/multi-device-storage.md)
 for persistent files, raw devices, and storage expansion.
 
+CRC generation for new data records and value/key extents is disabled by
+default. Enable it with `--record-crc` or `record-crc yes` in a Redis-style
+configuration file; `--no-record-crc` or `record-crc no` disables it on the next
+startup. Reads always verify CRCs that are present, including records written
+under a previous startup setting. Device metadata, block headers, checkpoints,
+Function catalog and replication CRCs remain enabled. Without a data CRC,
+structural checks still run but arbitrary payload corruption is not detected.
+
 ## Compatibility and operational notes
 
 Lavik supports RESP2/RESP3 clients and the Redis commands described in

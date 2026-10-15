@@ -2159,6 +2159,7 @@ endforeach()
     add_executable(lavik_extent_recovery_e2e_test
       tests/extent_recovery_e2e_test.cpp
     )
+    target_link_libraries(lavik_extent_recovery_e2e_test PRIVATE lavik::module)
     add_test(
       NAME lavik_extent_recovery_e2e
       COMMAND lavik_extent_recovery_e2e_test $<TARGET_FILE:lavik>
