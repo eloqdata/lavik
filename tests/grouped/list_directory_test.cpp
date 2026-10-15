@@ -15,7 +15,10 @@
  */
 
 #include <algorithm>
+#include <deque>
+#include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -24,6 +27,118 @@
 
 namespace lavik::storage {
 namespace {
+
+// Exercise the real payload planner and incremental directory publication.
+// Recovery consumes all historical page versions, not just the final chain.
+struct ListSpliceState {
+  OrderedGroupDirectory directory_;
+  std::map<std::uint64_t, LoadedOrderedGroup> pages_;
+  std::vector<RecoveredOrderedGroup> records_;
+
+  static absl::StatusOr<std::vector<RecoveredOrderedGroup>> Records(
+      const std::vector<OrderedGroupSnapshot>& pages, std::uint64_t revision) {
+    std::vector<RecoveredOrderedGroup> records;
+    for (const auto& page : pages) {
+      auto encoded = EncodeOrderedGroup(page);
+      if (!encoded.ok()) return encoded.status();
+      records.push_back({{.incarnation_ = page.incarnation_,
+                          .id_ = page.id_,
+                          .previous_ = page.previous_,
+                          .next_ = page.next_,
+                          .sequence_ = revision,
+                          .lsn_ = revision,
+                          .item_count_ = page.entries_.size(),
+                          .encoded_bytes_ = encoded->size(),
+                          .record_token_ = page.id_,
+                          .retired_ = page.retired_}});
+    }
+    return records;
+  }
+
+  absl::Status Initialize(std::vector<OrderedCollectionEntry> entries,
+                          std::size_t target_bytes) {
+    auto split = SplitOrderedGroup({.kind_ = OrderedCollectionKind::kList,
+                                    .incarnation_ = 17,
+                                    .id_ = 1,
+                                    .entries_ = std::move(entries)},
+                                   2, target_bytes);
+    if (!split.ok()) return split.status();
+    OrderedCollectionRoot root{
+        .kind_ = OrderedCollectionKind::kList,
+        .incarnation_ = 17,
+        .first_group_ = split->groups_.front().id_,
+        .last_group_ = split->groups_.back().id_,
+        .next_group_id_ = split->next_group_id_,
+        .group_count_ = static_cast<std::uint32_t>(split->groups_.size()),
+        .revision_ = 1};
+    for (const auto& page : split->groups_)
+      root.item_count_ += page.entries_.size();
+    auto records = Records(split->groups_, 1);
+    if (!records.ok()) return records.status();
+    auto directory = OrderedGroupDirectory::Recover(root, 1, *records, {}, 1);
+    if (!directory.ok()) return directory.status();
+    directory_ = std::move(*directory);
+    records_ = std::move(*records);
+    for (auto& page : split->groups_)
+      pages_.emplace(page.id_, LoadedOrderedGroup{1, std::move(page)});
+    return absl::OkStatus();
+  }
+
+  absl::Status Splice(std::uint64_t rank, std::uint64_t erased,
+                      std::vector<OrderedCollectionEntry> inserted,
+                      std::size_t target_bytes) {
+    const auto first =
+        directory_.FindRank(std::min(rank, directory_.root().item_count_ - 1));
+    const auto last =
+        erased == 0 ? first : directory_.FindRank(rank + erased - 1);
+    const auto begin = first->group_index_ == 0 ? 0 : first->group_index_ - 1;
+    const auto end =
+        std::min(last->group_index_ + 2, directory_.groups().size());
+    std::vector<LoadedOrderedGroup> loaded;
+    for (auto i = begin; i < end; ++i)
+      loaded.push_back(pages_.at(directory_.groups()[i].id_));
+    auto plan =
+        PlanOrderedCollectionSplice(directory_, std::move(loaded), rank, erased,
+                                    std::move(inserted), target_bytes);
+    if (!plan.ok()) return plan.status();
+    const auto revision = directory_.sequence() + 1;
+    auto records = Records(plan->writes_, revision);
+    if (!records.ok()) return records.status();
+    auto directory =
+        directory_.Apply(plan->root_, revision, *records, revision);
+    if (!directory.ok()) return directory.status();
+    directory_ = std::move(*directory);
+    records_.insert(records_.end(), records->begin(), records->end());
+    for (auto& page : plan->writes_) {
+      const auto id = page.id_;
+      if (page.retired_)
+        pages_.erase(id);
+      else
+        pages_[id] = LoadedOrderedGroup{revision, std::move(page)};
+    }
+    return absl::OkStatus();
+  }
+
+  void CheckValues(const OrderedGroupDirectory& directory,
+                   const std::deque<std::string>& expected,
+                   std::size_t target_bytes) const {
+    ASSERT_EQ(directory.root().item_count_, expected.size());
+    std::size_t position = 0;
+    for (const auto& group : directory.groups()) {
+      const auto& page = pages_.at(group.id_).snapshot_;
+      EXPECT_EQ(group.previous_, page.previous_);
+      EXPECT_EQ(group.next_, page.next_);
+      ASSERT_EQ(group.item_count_, page.entries_.size());
+      EXPECT_TRUE(group.encoded_bytes_ <= target_bytes ||
+                  page.entries_.size() == 1);
+      for (const auto& entry : page.entries_) {
+        ASSERT_LT(position, expected.size());
+        EXPECT_EQ(entry.value_, expected[position++]);
+      }
+    }
+    EXPECT_EQ(position, expected.size());
+  }
+};
 
 class ListRingTest : public testing::Test {
  protected:
@@ -180,6 +295,95 @@ TEST_F(ListRingTest, SmallRecoveryStaysCompactThroughFirstGrowthAndWrap) {
       Check(original, expected);
       directory = std::move(updated);
     }
+  }
+}
+
+TEST_F(ListRingTest, PrependPopCyclesKeepPagesPacked) {
+  constexpr std::size_t kItems = 4096, kValueBytes = 256;
+  const auto target = kCollectionGroupTargetBytes;
+  std::vector<OrderedCollectionEntry> entries;
+  std::deque<std::string> expected;
+  for (std::size_t i = 0; i < kItems; ++i) {
+    auto value = std::to_string(i);
+    value.resize(kValueBytes, 'a');
+    expected.push_back(value);
+    entries.push_back({.value_ = std::move(value)});
+  }
+  ListSpliceState state;
+  ASSERT_TRUE(state.Initialize(std::move(entries), target).ok());
+  const auto original = state.directory_;
+  const std::vector<RecoveredOrderedGroup> original_groups(
+      original.groups().begin(), original.groups().end());
+  const auto first_id = original.root().first_group_;
+  const auto initial_pages = original.groups().size();
+  const auto capacity = (target - kOrderedGroupHeaderBytes) /
+                        (kOrderedEntryHeaderBytes + kValueBytes);
+  for (std::size_t step = 0; step < kItems; ++step) {
+    auto value = std::to_string(step);
+    value.resize(kValueBytes, 'b');
+    ASSERT_TRUE(state.Splice(0, 0, {{.value_ = value}}, target).ok());
+    expected.push_front(std::move(value));
+    ASSERT_TRUE(state.Splice(kItems, 1, {}, target).ok());
+    expected.pop_back();
+    // Keep at most two partially filled end pages. A head that remains full
+    // after splitting violates this bound on the very next prepend.
+    ASSERT_LE(state.directory_.groups().size(), initial_pages + 1);
+    ASSERT_EQ(state.directory_.root().first_group_, first_id);
+  }
+  EXPECT_LE(
+      state.directory_.root().next_group_id_ - original.root().next_group_id_,
+      (kItems + capacity - 1) / capacity);
+  state.CheckValues(state.directory_, expected, target);
+  Check(original, original_groups);
+  auto recovered = OrderedGroupDirectory::Recover(
+      state.directory_.root(), state.directory_.sequence(), state.records_, {},
+      state.directory_.sequence());
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  state.CheckValues(*recovered, expected, target);
+  const std::vector<RecoveredOrderedGroup> current(
+      state.directory_.groups().begin(), state.directory_.groups().end());
+  Check(*recovered, current);
+}
+
+TEST_F(ListRingTest,
+       BatchedPrependPreservesOrderAcrossVariableAndOversizedItems) {
+  for (const auto target : {std::size_t{128}, kCollectionGroupTargetBytes}) {
+    SCOPED_TRACE(target);
+    ListSpliceState state;
+    std::deque<std::string> expected;
+    std::vector<OrderedCollectionEntry> entries;
+    for (std::size_t i = 0; i < 8; ++i) {
+      std::string value(1 + i * target / 16, 'a' + i);
+      expected.push_back(value);
+      entries.push_back({.value_ = std::move(value)});
+    }
+    ASSERT_TRUE(state.Initialize(std::move(entries), target).ok());
+    const auto original = state.directory_;
+    const std::vector<RecoveredOrderedGroup> original_groups(
+        original.groups().begin(), original.groups().end());
+    for (const auto sizes :
+         {std::vector<std::size_t>{0, 1, target / 4, target / 2, target},
+          std::vector<std::size_t>{target * 2, 3, target + 1, 2, 0},
+          std::vector<std::size_t>{target / 3, 5, target / 2, 1}}) {
+      std::vector<OrderedCollectionEntry> inserted;
+      for (const auto size : sizes)
+        inserted.push_back(
+            {.value_ = std::string(size, 'k' + inserted.size())});
+      // The command adapter already reverses LPUSH arguments. The planner
+      // must retain this supplied logical order even while packing backwards.
+      for (auto it = inserted.rbegin(); it != inserted.rend(); ++it)
+        expected.push_front(it->value_);
+      const auto first_id = state.directory_.root().first_group_;
+      ASSERT_TRUE(state.Splice(0, 0, std::move(inserted), target).ok());
+      EXPECT_EQ(state.directory_.root().first_group_, first_id);
+      state.CheckValues(state.directory_, expected, target);
+      auto recovered = OrderedGroupDirectory::Recover(
+          state.directory_.root(), state.directory_.sequence(), state.records_,
+          {}, state.directory_.sequence());
+      ASSERT_TRUE(recovered.ok()) << recovered.status();
+      state.CheckValues(*recovered, expected, target);
+    }
+    Check(original, original_groups);
   }
 }
 

@@ -1141,33 +1141,62 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     result.root_.revision_ = revision;
     result.sequence_ = revision;
     result.command_sequence_ = command_sequence;
-    std::vector<OrderedGroupEntry> groups(groups_.begin(), groups_.end());
-    groups.resize(root.group_count_);
+    // The predecessor already validated every dense segment. Only changed
+    // slots and the old tail can gain different length/link requirements, so
+    // retain its immutable chunks instead of rebuilding the complete array.
+    result.groups_ = groups_;
+    const auto added_groups = root.group_count_ - groups_.size();
+    if (added_groups > changed.size())
+      return absl::DataLossError("incomplete String segment update");
+    std::vector<OrderedGroupEntry> appended(added_groups);
+    std::size_t appended_count = 0;
+    absl::int128 total_bytes = total_group_bytes_;
+    const auto valid_segment = [&](const OrderedGroupEntry& item) {
+      return item.previous_ == item.id_ - 1 &&
+             item.next_ == (item.id_ == root.group_count_ ? 0 : item.id_ + 1) &&
+             item.item_count_ ==
+                 std::min<std::uint64_t>(
+                     kStringGroupBytes,
+                     root.item_count_ - (item.id_ - 1) * kStringGroupBytes) &&
+             item.record_token_ != 0 && item.sequence_ != 0 && item.lsn_ != 0;
+    };
     for (const auto& item : changed) {
       if (item.id_ == 0 || item.id_ > root.group_count_ || item.retired_ ||
-          item.incarnation_ != root.incarnation_ ||
-          item.sequence_ != revision ||
-          groups[item.id_ - 1].sequence_ == revision)
+          item.incarnation_ != root.incarnation_ || item.sequence_ != revision)
         return absl::DataLossError("invalid changed String segment");
-      groups[item.id_ - 1] = item;
-    }
-    for (std::size_t i = 0; i < groups.size(); ++i) {
-      const auto& item = groups[i];
-      if (item.id_ != i + 1 || item.previous_ != i ||
-          item.next_ != (i + 1 == groups.size() ? 0 : i + 2) ||
-          item.item_count_ != std::min<std::uint64_t>(
-                                  kStringGroupBytes,
-                                  root.item_count_ - i * kStringGroupBytes) ||
-          item.record_token_ == 0 || item.sequence_ == 0 || item.lsn_ == 0)
+      if (!valid_segment(item))
         return absl::DataLossError("incomplete String segment update");
-      if (item.encoded_bytes_ >
-          std::numeric_limits<std::uint64_t>::max() - result.total_group_bytes_)
-        return absl::DataLossError("String segment byte total overflows");
-      result.total_group_bytes_ += item.encoded_bytes_;
+      const auto index = item.id_ - 1;
+      if (index < groups_.size()) {
+        if (result.groups_[index].sequence_ == revision)
+          return absl::DataLossError("invalid changed String segment");
+        total_bytes -= groups_[index].encoded_bytes_;
+        const auto status = result.groups_.Set(index, item);
+        if (!status.ok()) return status;
+      } else {
+        auto& slot = appended[index - groups_.size()];
+        if (slot.sequence_ == revision)
+          return absl::DataLossError("invalid changed String segment");
+        slot = item;
+        ++appended_count;
+      }
+      total_bytes += item.encoded_bytes_;
     }
-    auto array = decltype(result.groups_)::From(groups);
-    if (!array.ok()) return array.status();
-    result.groups_ = std::move(*array);
+    // Growth must replace the old tail even when it was exactly full: its
+    // next link then changes. Counting unique new slots rejects sparse appends
+    // without revisiting any of the unchanged prefix.
+    if (appended_count != added_groups ||
+        (root.item_count_ != root_.item_count_ &&
+         !valid_segment(result.groups_.back())))
+      return absl::DataLossError("incomplete String segment update");
+    if (total_bytes < 0 || total_bytes > UINT64_MAX)
+      return absl::DataLossError("String segment byte total overflows");
+    result.total_group_bytes_ = static_cast<std::uint64_t>(total_bytes);
+    if (!appended.empty()) {
+      auto array = result.groups_.Appended(appended);
+      if (!array.ok()) return array.status();
+      result.groups_ = std::move(*array);
+    }
     return result;
   }
   auto analysis = AnalyzeChanges(*this, root, revision, changed);
@@ -1630,9 +1659,11 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(OrderedGroupSnapshot& left,
   return true;
 }
 
-absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
-                                                    std::uint64_t next_group_id,
-                                                    std::size_t target_bytes) {
+namespace {
+
+absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
+    OrderedGroupSnapshot group, std::uint64_t next_group_id,
+    std::size_t target_bytes, bool pack_from_back) {
   if (target_bytes <= kOrderedGroupHeaderBytes ||
       target_bytes > kMaxRecordPayloadBytes ||
       next_group_id <= std::max({group.id_, group.previous_, group.next_}) ||
@@ -1648,19 +1679,47 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
   }
   auto valid = ValidateEntries(group.kind_, group.entries_);
   if (!valid.ok()) return valid;
+  absl::InlinedVector<std::size_t, 2> ends;
+  if (pack_from_back) {
+    // A prepend must leave spare capacity at the head. Filling the first
+    // page instead leaves it full after every split, so repeated LPUSH makes
+    // one tiny successor per command even when RPOP keeps the List bounded.
+    // Choose cuts backwards, but publish entries and identities forwards:
+    // the first page retains its id and only its successor link can change.
+    for (std::size_t end = group.entries_.size(); end != 0;) {
+      ends.push_back(end);
+      std::size_t begin = end;
+      std::size_t bytes = kOrderedGroupHeaderBytes;
+      while (begin != 0) {
+        const auto item_bytes =
+            kEntryHeaderBytes + group.entries_[begin - 1].value_.size();
+        if (begin != end &&
+            (bytes > target_bytes || item_bytes > target_bytes - bytes))
+          break;
+        bytes += item_bytes;
+        --begin;
+      }
+      end = begin;
+    }
+    std::reverse(ends.begin(), ends.end());
+  }
   OrderedGroupSplit result{.next_group_id_ = next_group_id, .groups_ = {}};
   std::size_t begin = 0;
   while (begin != group.entries_.size()) {
     std::size_t end = begin;
-    std::size_t bytes = kOrderedGroupHeaderBytes;
-    while (end != group.entries_.size()) {
-      const auto item_bytes =
-          kEntryHeaderBytes + group.entries_[end].value_.size();
-      if (end != begin &&
-          (bytes > target_bytes || item_bytes > target_bytes - bytes))
-        break;
-      bytes += item_bytes;
-      ++end;
+    if (pack_from_back) {
+      end = ends[result.groups_.size()];
+    } else {
+      std::size_t bytes = kOrderedGroupHeaderBytes;
+      while (end != group.entries_.size()) {
+        const auto item_bytes =
+            kEntryHeaderBytes + group.entries_[end].value_.size();
+        if (end != begin &&
+            (bytes > target_bytes || item_bytes > target_bytes - bytes))
+          break;
+        bytes += item_bytes;
+        ++end;
+      }
     }
     std::uint64_t id = group.id_;
     if (!result.groups_.empty()) {
@@ -1685,6 +1744,15 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
     begin = end;
   }
   return result;
+}
+
+}  // namespace
+
+absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
+                                                    std::uint64_t next_group_id,
+                                                    std::size_t target_bytes) {
+  return SplitOrderedGroupImpl(std::move(group), next_group_id, target_bytes,
+                               false);
 }
 
 absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
@@ -1834,8 +1902,10 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   std::uint64_t new_last = previous;
   std::size_t replacement_count = 0;
   if (!replacement.entries_.empty()) {
-    auto split = SplitOrderedGroup(std::move(replacement), root.next_group_id_,
-                                   target_bytes);
+    auto split = SplitOrderedGroupImpl(
+        std::move(replacement), root.next_group_id_, target_bytes,
+        root.kind_ == OrderedCollectionKind::kList && rank == 0 &&
+            erase_count == 0);
     if (!split.ok()) return split.status();
     plan.root_.next_group_id_ = split->next_group_id_;
     replacement_count = split->groups_.size();
