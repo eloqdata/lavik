@@ -778,6 +778,10 @@ TEST(IndirectKeyE2e, RemoteGroupedReadsRespectParentKeyOwnership) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
+    // Keep recovery's shared physical block until the cross-owner reads.
+    // The autonomous Tx cleaner can otherwise move each page to its logical
+    // owner before the first request, bypassing the key-copy admission path.
+    ScopedEnvironment pause_cleaner("LAVIK_TX_CLEANER_START_PAUSED", "1");
     // Each logical owner retains two 16 MiB side-index keys plus its fixed
     // 16 MiB arena directory. Its 57.6 MiB steady-state quota fits the pages,
     // but not another complete key copy.
@@ -788,6 +792,9 @@ TEST(IndirectKeyE2e, RemoteGroupedReadsRespectParentKeyOwnership) {
     Server limited(disk, 3, {}, {}, false, 2, "192M", {}, "128M");
     limited.PreserveOnFailure();
     Client client(limited.port());
+    const auto stats = client.Command({"INFO", "STATS"}).text_;
+    ASSERT_NE(stats.find("tx_cleaner_cooldown_ms:0\r\n"), std::string::npos)
+        << stats;
     unsigned rejected_hash = 0;
     for (unsigned i = 0; i < hash_keys.size(); ++i) {
       EXPECT_EQ(client.Command({"HLEN", hash_keys[i]}).text_, "1");

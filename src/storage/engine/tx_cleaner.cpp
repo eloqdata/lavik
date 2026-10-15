@@ -26,9 +26,6 @@ namespace lavik::storage {
 
 namespace {
 
-constexpr std::uint64_t kTxBacklogAdmissionBytes =
-    2 * (kStorageBlockBytes - kBlockHeaderBytes);
-
 std::int64_t MonotonicMillis() noexcept {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -101,6 +98,7 @@ void StorageEngine::Impl::InitializeTxWrites(
   auto lease = std::shared_ptr<void>(new std::uint8_t{0}, [this](void* token) {
     delete static_cast<std::uint8_t*>(token);
     tx_cleaner_dirty_.store(true, std::memory_order_release);
+    RequestTxCleaner(true);
   });
   for (TxShardWrites& shard : writes) {
     shard.txid_ = txid;
@@ -128,8 +126,7 @@ void StorageEngine::Impl::NoteTxRecordLocal(
   } else {
     block.commit_ends_.insert_or_assign(txid, record_end);
   }
-  if (block.counted_backlog_)
-    store.tx_backlog_may_have_writers_.store(true, std::memory_order_release);
+  block.NotePromotionProgress();
   block.txids_.Record(txid,
                       receipt != nullptr
                           ? std::weak_ptr<void>(receipt->transaction_lease_)
@@ -154,6 +151,7 @@ void StorageEngine::Impl::DropTaggedRecordLocal(WorkerStore& store,
   }
   assert(found->second.live_tagged_bytes_ >= bytes);
   found->second.live_tagged_bytes_ -= bytes;
+  found->second.NotePromotionProgress();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
@@ -165,6 +163,7 @@ bool StorageEngine::Impl::PinTxDependencyLocal(
     return false;
   }
   ++found->second.dependency_pins_;
+  found->second.NotePromotionProgress();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
   return true;
 }
@@ -179,6 +178,7 @@ void StorageEngine::Impl::UnpinTxDependencyLocal(
   }
   assert(found->second.dependency_pins_ != 0);
   --found->second.dependency_pins_;
+  found->second.NotePromotionProgress();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
@@ -191,6 +191,8 @@ absl::Status StorageEngine::Impl::ConfigureTxCleanerCooldown(
                                 std::memory_order_release);
   tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
+  RequestTxCleaner(false);
+  if (cooldown_ms == 0) NotifyTxCleanerCapacityWaiters();
   return absl::OkStatus();
 }
 
@@ -208,97 +210,208 @@ void StorageEngine::Impl::NoteTxBlockSealedLocal(WorkerStore& store,
   // space is accounted for separately by the block allocator.
   found->second.backlog_bytes_ = state->committed_bytes_ - kBlockHeaderBytes;
   found->second.counted_backlog_ = true;
-  store.tx_backlog_may_have_writers_.store(true, std::memory_order_release);
   store.tx_backlog_bytes_.fetch_add(found->second.backlog_bytes_,
                                     std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
+  RequestTxCleaner(true);
 }
 
-bool StorageEngine::Impl::TxBacklogAtLimit() const noexcept {
-  if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
-    return false;
-  // Two substantially filled sealed Tx blocks are the admission boundary.
-  // Charge only their occupied records, not free blocks elsewhere on a device.
+bool StorageEngine::Impl::HasSealedTxBacklog() const noexcept {
+  // This is work discovery, not write admission: even one sealed record can
+  // become reclaimable, and allocated capacity is enforced by the allocator.
   for (const auto& store : stores_)
-    if (store->tx_backlog_bytes_.load(std::memory_order_acquire) >=
-            kTxBacklogAdmissionBytes &&
-        store->tx_backlog_may_have_writers_.load(std::memory_order_acquire))
+    if (store->tx_backlog_bytes_.load(std::memory_order_acquire) != 0)
       return true;
   return false;
 }
 
-Task<bool> StorageEngine::Impl::HasLiveBacklogTxLeaseLocal(WorkerStore& store) {
-  co_await store.store_state_mutex_.Lock();
-  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  if (!store.tx_backlog_may_have_writers_.load(std::memory_order_acquire))
-    co_return false;
-  // Thousands of admission waiters must not each walk historical txids while
-  // the same writer is active. A weak witness and per-block settled proofs
-  // reduce repeated probes without timers, strong pins or an admission bypass.
-  if (store.tx_backlog_writer_block_) {
-    const auto [block_id, epoch] = *store.tx_backlog_writer_block_;
-    const auto found = store.tx_blocks_.find(block_id);
-    if (found != store.tx_blocks_.end() &&
-        found->second.allocation_epoch_ == epoch &&
-        found->second.counted_backlog_ && found->second.txids_.HasLiveWriter())
-      co_return true;
+void StorageEngine::Impl::RequestTxCleaner(bool force) {
+  // Lease completion and grouped writes share one runner. Avoid touching
+  // every owner's backlog on those hot paths while it already owns the work.
+  if (tx_cleaner_scheduled_.load(std::memory_order_acquire)) return;
+  const auto& current = bycorf::ThisWorker();
+  // Lease destruction and configuration can originate outside the runtime.
+  // PeriodicFlush starts any outstanding work for those callers. Recovery
+  // also rebuilds sealed-block metadata; do not clean it before this worker
+  // has finished initialization and enabled online access.
+  if (current.self_ == nullptr || current.cross_core_ == nullptr ||
+      current.self_->stop_requested() || current.id_ >= stores_.size() ||
+      !stores_[current.id_] ||
+      !stores_[current.id_]->remote_reads_ready_.load(
+          std::memory_order_acquire) ||
+      shutdown_flush_requested_.load(std::memory_order_acquire) ||
+      RuntimeFailureLatched() ||
+      tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+    return;
+  if (force) {
+    if (!HasSealedTxBacklog()) return;
+  } else if (tx_cleaner_running_.load(std::memory_order_acquire) ||
+             !tx_cleaner_dirty_.load(std::memory_order_acquire) ||
+             MonotonicMillis() <
+                 tx_cleaner_next_run_ms_.load(std::memory_order_acquire)) {
+    return;
   }
-  for (auto& [block_id, block] : store.tx_blocks_) {
-    if (!block.counted_backlog_) continue;
-    if (block.txids_.HasLiveWriter()) {
-      store.tx_backlog_writer_block_ = {block_id, block.allocation_epoch_};
-      co_return true;
-    }
-  }
-  store.tx_backlog_writer_block_.reset();
-  store.tx_backlog_may_have_writers_.store(false, std::memory_order_release);
-  co_return false;
+  bool expected = false;
+  if (!tx_cleaner_scheduled_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
+    return;
+  TxCleanerRequest request(this, [](Impl* engine) {
+    engine->tx_cleaner_scheduled_.store(false, std::memory_order_release);
+  });
+  // The frame owns request before publication, including allocation failure
+  // and Spawn's stop-time discard path. A queued task is visible to shutdown.
+  auto task = RunRequestedTxCleaner(std::move(request), force);
+  current.self_->SpawnBackground(std::move(task));
 }
 
-Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
-  // A new transaction waits while sealed pressure still belongs to a live
-  // transaction. Once all leases are released, an old snapshot or full-sync
-  // reader may keep those blocks allocated. Waiting for that reader can
-  // deadlock its own next command, so make one cleanup attempt and admit.
+Task<absl::Status> StorageEngine::Impl::RunRequestedTxCleaner(
+    TxCleanerRequest request, bool force) {
+  (void)request;
+  auto* worker = bycorf::ThisWorker().self_;
+  constexpr std::uint64_t kRetryMs = 50;
+  std::uint64_t failure_delay_ms = kRetryMs;
   for (;;) {
-    if (shutdown_flush_requested_.load(std::memory_order_acquire))
-      co_return absl::UnavailableError("storage is shutting down");
-    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
-    const std::int64_t now = MonotonicMillis();
-    std::int64_t next = tx_backlog_retry_ms_.load(std::memory_order_acquire);
-    if (now >= next && tx_backlog_retry_ms_.compare_exchange_strong(
-                           next, now + 50, std::memory_order_acq_rel,
-                           std::memory_order_acquire)) {
-      const absl::Status cleaned = co_await MaybeRunTxCleaner(true);
-      if (!cleaned.ok() && !absl::IsFailedPrecondition(cleaned) &&
-          !absl::IsAborted(cleaned) && !absl::IsResourceExhausted(cleaned))
-        co_return cleaned;
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        worker->stop_requested() || RuntimeFailureLatched() ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0 ||
+        (force && !HasSealedTxBacklog()))
+      co_return absl::OkStatus();
+    const auto retired_before =
+        tx_cleaner_retired_blocks_.load(std::memory_order_relaxed);
+    const auto status = co_await MaybeRunTxCleaner(force);
+    if (!status.ok() &&
+        !(absl::IsCancelled(status) &&
+          shutdown_flush_requested_.load(std::memory_order_acquire))) {
+      // The next grouped write observes the published error code. Keep full
+      // diagnostic detail here even when no client is currently writing.
+      spdlog::warn("transaction cleaner round failed; retrying: {}",
+                   status.message());
     }
-    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
-    bool live_transaction = false;
-    for (unsigned owner = 0; owner < worker_count_; ++owner) {
-      if (stores_[owner]->tx_backlog_bytes_.load(std::memory_order_acquire) <
-              kTxBacklogAdmissionBytes ||
-          !stores_[owner]->tx_backlog_may_have_writers_.load(
-              std::memory_order_acquire))
-        continue;
-      bool live;
-      if (owner == bycorf::ThisWorker().id_) {
-        live = co_await HasLiveBacklogTxLeaseLocal(*stores_[owner]);
-      } else {
-        live = co_await bycorf::SubmitTaskTo(owner, [this, owner]() {
-          return HasLiveBacklogTxLeaseLocal(*stores_[owner]);
-        });
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        worker->stop_requested() || RuntimeFailureLatched() ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0 ||
+        !HasSealedTxBacklog())
+      co_return status;
+    if (status.ok()) failure_delay_ms = kRetryMs;
+    if (status.ok() && tx_cleaner_retired_blocks_.load(
+                           std::memory_order_relaxed) != retired_before) {
+      // Retirement can remove decision dependencies for another pass. Keep
+      // draining without imposing an idle cooldown, but let ready work run.
+      co_await bycorf::Yield(*worker);
+    } else {
+      // Leases and read pins need frequent progress checks, but a persistent
+      // failed round must not repeatedly scan storage and log at that rate.
+      // The delay is at most a uint32 cooldown; widen before doubling so even
+      // the largest accepted configuration cannot wrap back to a short retry.
+      if (!status.ok()) {
+        const auto cooldown =
+            tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
+        if (cooldown == 0) co_return status;
+        failure_delay_ms = std::min<std::uint64_t>(
+            std::max(failure_delay_ms * 2, kRetryMs), cooldown);
       }
-      if (live) {
-        live_transaction = true;
-        break;
+      const auto wait_started = MonotonicMillis();
+#if LAVIK_FAULTS_ENABLED
+      std::optional<std::uint64_t> observed_delay;
+#endif
+      for (;;) {
+        const auto cooldown =
+            tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
+        if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+            worker->stop_requested() || RuntimeFailureLatched() ||
+            cooldown == 0 || !HasSealedTxBacklog())
+          co_return status;
+        const auto delay_ms =
+            status.ok() ? kRetryMs
+                        : std::min<std::uint64_t>(failure_delay_ms, cooldown);
+#if LAVIK_FAULTS_ENABLED
+        if (observed_delay != delay_ms) {
+          observed_delay = delay_ms;
+          if (tx_cleaner_retry_delay_for_test_)
+            tx_cleaner_retry_delay_for_test_(delay_ms);
+        }
+#endif
+        const auto elapsed_ms =
+            static_cast<std::uint64_t>(MonotonicMillis() - wait_started);
+        if (elapsed_ms >= delay_ms) break;
+        // Keep configuration and shutdown responsive even when persistent
+        // errors have reached a long cooldown. Lowered cooldowns also shorten
+        // an already pending retry; these timer wakes do not run a new round.
+        const auto waited = co_await bycorf::SleepFor(
+            *worker, std::chrono::milliseconds(
+                         std::min(kRetryMs, delay_ms - elapsed_ms)));
+        if (!waited.ok()) co_return waited;
       }
     }
-    if (!live_transaction) co_return absl::OkStatus();
-    const absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
-    if (!waited.ok()) co_return waited;
+    force = true;
+  }
+}
+
+void StorageEngine::Impl::NotifyTxCleanerCapacityWaiters() noexcept {
+  // Publish every reason to recheck before inspecting registrations. The
+  // seq_cst generation/count handshake covers registration racing a producer
+  // that sees zero waiters and therefore sends no message.
+  tx_cleaner_capacity_generation_.fetch_add(1, std::memory_order_seq_cst);
+  const auto& current = bycorf::ThisWorker();
+  if (current.self_ == nullptr || current.cross_core_ == nullptr) return;
+  for (const auto& owned : stores_) {
+    if (!owned) continue;
+    auto& store = *owned;
+    if (store.worker_ == nullptr ||
+        store.tx_cleaner_capacity_waiters_.load(std::memory_order_seq_cst) == 0)
+      continue;
+    if (store.worker_ == current.self_) {
+      store.tx_cleaner_capacity_progress_.NotifyAll(*store.worker_);
+    } else {
+      // Like block-pin handback, the notification borrows the stable store,
+      // not a coroutine-local waiter. Callbacks run only in owner event loops;
+      // all loops and detached frames stop before stores are finalized. No
+      // detached task retains an Impl pointer beyond that lifecycle boundary.
+      bycorf::PostNotification(
+          current.cross_core_, store.worker_->id(),
+          {&store, 0, [](void* context, std::uint64_t) noexcept {
+             auto& target = *static_cast<WorkerStore*>(context);
+             target.tx_cleaner_capacity_progress_.NotifyAll(*target.worker_);
+           }});
+    }
+  }
+}
+
+Task<bool> StorageEngine::Impl::AwaitRunningTxCleanerForCapacity(
+    WorkerStore& store, std::uint64_t completed_before,
+    std::uint64_t space_before) {
+  store.tx_cleaner_capacity_waiters_.fetch_add(1, std::memory_order_seq_cst);
+  struct Registration {
+    std::atomic<unsigned>& count_;
+    ~Registration() { count_.fetch_sub(1, std::memory_order_seq_cst); }
+  } registration{store.tx_cleaner_capacity_waiters_};
+  for (;;) {
+    const auto generation =
+        tx_cleaner_capacity_generation_.load(std::memory_order_seq_cst);
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        store.worker_->stop_requested() || store.write_failed_ ||
+        RuntimeFailureLatched() ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+      co_return false;
+    if (tx_cleaner_completed_rounds_.load(std::memory_order_acquire) !=
+        completed_before)
+      co_return true;
+    if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
+      // Observing the guard's release store also makes its completion visible.
+      // Recheck: the round may have ended between our two loads above.
+      co_return tx_cleaner_completed_rounds_.load(std::memory_order_acquire) !=
+          completed_before;
+    }
+    if (space_reclaim_generation_.load(std::memory_order_acquire) !=
+        space_before)
+      co_return true;
+    if (tx_cleaner_capacity_generation_.load(std::memory_order_seq_cst) !=
+        generation)
+      continue;
+    // All notifications execute on this worker. With no await between the
+    // recheck and registration in Wait(), remote delivery cannot get ahead of
+    // the park. A retrying runner alone never keeps this waiter suspended.
+    co_await store.tx_cleaner_capacity_progress_.Wait();
   }
 }
 
@@ -323,53 +436,23 @@ void StorageEngine::Impl::SealIdleTxBlocksLocal(WorkerStore& store) {
   tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
 }
 
-Task<absl::Status> StorageEngine::Impl::BeforeGroupedTransaction(
-    WorkerStore& store, std::uint64_t append_bytes) {
-  // Ordinary grouped snapshots can fill transaction blocks long before the
-  // periodic cooldown expires. Cleaning after this command has acquired its
-  // lease would leave that transaction preventing reclamation.
+absl::Status StorageEngine::Impl::BeforeGroupedTransaction(WorkerStore& store) {
+  if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+      store.worker_->stop_requested())
+    return absl::UnavailableError("storage is shutting down");
+  if (store.write_failed_ || RuntimeFailureLatched())
+    return absl::InternalError("storage writer has failed");
   if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
-    co_return absl::OkStatus();  // Preserve explicit maintenance disabling.
-  if (shutdown_flush_requested_.load(std::memory_order_acquire))
-    co_return absl::UnavailableError("storage is shutting down");
-  // Observe only on this stream's owner, without suspension. Small
-  // successors can reuse the current Tx stream's staging capacity even
-  // when every free foreground block is occupied. Forcing a rotation in
-  // that case would discard usable space and require a fresh tx block:
-  // a snapshot may retain the old extents until it obtains the key intent
-  // this very writer holds. This is not append admission; WriteRecord
-  // still validates the stream and remaining bytes after its own waits.
-  if (store.active_tx_block_) {
-    const auto& stream = *store.active_tx_block_;
-    const auto* state = FindBlockState(store, stream.block_id_);
-    if (state != nullptr && state->allocated_ && state->in_memory_ &&
-        !state->freeing_ && !state->release_pending_ &&
-        state->allocation_epoch_ == stream.allocation_epoch_ &&
-        state->kind_ == BlockKind::kTransaction) {
-      const auto used =
-          std::max(stream.committed_bytes_, state->committed_bytes_);
-      // An in-flight flush owns only its captured prefix, so still-open
-      // staging bytes remain reusable; the writer rechecks after waiting.
-      if (used <= kStorageBlockBytes &&
-          append_bytes <= kStorageBlockBytes - used)
-        co_return absl::OkStatus();
-    }
-  }
-  // Try to reclaim sealed predecessors before the append path needs a new
-  // block. This is a maintenance attempt, not admission: allocation itself
-  // decides whether a successor exists after other writers run.
-  if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
-    const auto cleaned = co_await MaybeRunTxCleaner(true);
-    if (!cleaned.ok()) {
-      if (!store.write_failed_ &&
-          !epoch_metadata_failed_.load(std::memory_order_acquire) &&
-          (absl::IsResourceExhausted(cleaned) || absl::IsAborted(cleaned) ||
-           absl::IsFailedPrecondition(cleaned)))
-        co_return absl::OkStatus();
-      co_return cleaned;
-    }
-  }
-  co_return absl::OkStatus();
+    return absl::OkStatus();
+  // Holding a key intent must not make unrelated cleanup part of this write.
+  // A free physical block and staging buffer suffice to append a successor;
+  // only their actual allocation paths may apply capacity backpressure.
+  RequestTxCleaner(true);
+  const auto error = tx_cleaner_error_.load(std::memory_order_acquire);
+  if (error != absl::StatusCode::kOk)
+    return absl::Status(error,
+                        "transaction cleaner failed before grouped write");
+  return absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
@@ -390,9 +473,14 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
     co_return absl::OkStatus();
   }
   struct RunningGuard {
-    std::atomic<bool>* running_;
-    ~RunningGuard() { running_->store(false, std::memory_order_release); }
-  } guard{&tx_cleaner_running_};
+    Impl* engine_;
+    ~RunningGuard() {
+      engine_->tx_cleaner_completed_rounds_.fetch_add(
+          1, std::memory_order_release);
+      engine_->tx_cleaner_running_.store(false, std::memory_order_release);
+      engine_->NotifyTxCleanerCapacityWaiters();
+    }
+  } guard{this};
 
   tx_cleaner_dirty_.store(false, std::memory_order_release);
   tx_cleaner_next_run_ms_.store(now + static_cast<std::int64_t>(cooldown),
@@ -408,13 +496,29 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
         status = absl::FailedPreconditionError(
             "injected retryable transaction cleaner failure");
       });
-  if (status.ok()) status = co_await RunTxCleaner();
+  if (status.ok()) {
+#if LAVIK_FAULTS_ENABLED
+    if (tx_cleaner_round_for_test_)
+      status = co_await tx_cleaner_round_for_test_();
+    else
+#endif
+      status = co_await RunTxCleaner();
+  }
   if (!status.ok()) {
     if (!(absl::IsCancelled(status) &&
           shutdown_flush_requested_.load(std::memory_order_acquire)))
       tx_cleaner_failures_.fetch_add(1, std::memory_order_relaxed);
     tx_cleaner_dirty_.store(true, std::memory_order_release);
   }
+  const bool retryable = absl::IsFailedPrecondition(status) ||
+                         absl::IsAborted(status) ||
+                         absl::IsResourceExhausted(status);
+  const auto cleaner_error =
+      status.ok() || retryable ? absl::StatusCode::kOk : status.code();
+  // Publish only after an actual round: a concurrent caller that lost the
+  // running CAS must not erase another round's error. A later successful or
+  // retryable round can clear this result without a permanent engine fence.
+  tx_cleaner_error_.store(cleaner_error, std::memory_order_release);
   co_return status;
 }
 
@@ -528,15 +632,31 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
     ~RemoteAdmission() { state_.OpenRemotePins(); }
   } remote_admission{*source};
   const bool has_live_records = tx_block->second.live_tagged_bytes_ != 0;
+  const auto promotion_generation = tx_block->second.promotion_generation_;
+  const auto rewind_generation =
+      tx_promotion_rewind_generation_.load(std::memory_order_acquire);
+  // Eligibility has already established settled leases and a complete commit
+  // decision snapshot. No later append/decision can make an omitted record
+  // movable; only accounting/dependency progress or inverse publication can.
+  const bool scan_needed =
+      has_live_records &&
+      (tx_block->second.scanned_promotion_generation_ != promotion_generation ||
+       tx_block->second.scanned_rewind_generation_ != rewind_generation);
   source->defragging_ = true;
   const auto [file_id, offset] = FileOffset(block.block_id_);
   store.store_state_mutex_.Unlock(*store.worker_);
 
   absl::Status promoted = absl::OkStatus();
-  if (has_live_records)
-    promoted =
-        co_await SalvageBlockRecords(store, block.block_id_, *source, file_id,
-                                     offset, committed, !shutdown_drain);
+  if (scan_needed) {
+#if LAVIK_FAULTS_ENABLED
+    if (tx_promotion_scan_for_test_)
+      promoted = co_await tx_promotion_scan_for_test_();
+    else
+#endif
+      promoted =
+          co_await SalvageBlockRecords(store, block.block_id_, *source, file_id,
+                                       offset, committed, !shutdown_drain);
+  }
   std::vector<RelocationDurabilityFence> fences;
   co_await store.store_state_mutex_.Lock();
   if (const auto owed = store.pending_relocation_fences_.find(block.block_id_);
@@ -556,6 +676,23 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
   // retire it just because relocation already removed its live tagged bytes.
   co_await store.store_state_mutex_.Lock();
   store.pending_relocation_fences_.erase(block.block_id_);
+  if (scan_needed) {
+    const auto current = store.tx_blocks_.find(block.block_id_);
+    if (current != store.tx_blocks_.end() &&
+        current->second.allocation_epoch_ == block.allocation_epoch_ &&
+        current->second.promotion_generation_ == promotion_generation &&
+        tx_promotion_rewind_generation_.load(std::memory_order_acquire) ==
+            rewind_generation) {
+      // A successful full scan has processed every currently movable record.
+      // Remaining charged bytes can belong to superseded versions awaiting
+      // their successors' durable retirement. Another block's progress must
+      // not reread these bytes. Changes during either the scan or fence waits
+      // invalidate this proof, including our own relocation accounting; never
+      // stamp the newer generation as though it had already been scanned.
+      current->second.scanned_promotion_generation_ = promotion_generation;
+      current->second.scanned_rewind_generation_ = rewind_generation;
+    }
+  }
   store.store_state_mutex_.Unlock(*store.worker_);
   co_return absl::OkStatus();
 }
@@ -621,6 +758,7 @@ Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
     }
     tx_cleaner_retired_blocks_.fetch_add(1, std::memory_order_relaxed);
     space_reclaim_generation_.fetch_add(1, std::memory_order_release);
+    NotifyTxCleanerCapacityWaiters();
   }
   co_return returned;
 }

@@ -86,19 +86,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     const auto predecessor =
         co_await PrepareGroupedDependencyLocked(store, source_side, nullptr);
     if (!predecessor.ok()) co_return predecessor;
-    std::uint64_t append_bytes = kBlockHeaderSlotBytes;
-    for (const auto& page : plan.writes_) {
-      append_bytes += kBlockHeaderSlotBytes;
-      for (const auto& entry : page.entries_)
-        append_bytes += (entry.value_.size() + 16) *
-                        (value_type == ValueType::kSortedSet ? 2 : 1);
-    }
-    // An outer transaction must be able to finish even under capacity
-    // pressure. Only a new standalone transaction can wait for reclamation
-    // before taking its lease.
-    store.store_state_mutex_.Unlock(*store.worker_);
-    const auto space = co_await BeforeGroupedTransaction(store, append_bytes);
-    co_await store.store_state_mutex_.Lock();
+    // Cleanup runs independently; opening a transaction does not require an
+    // older transaction block to become reclaimable first.
+    const auto space = BeforeGroupedTransaction(store);
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
@@ -118,7 +108,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       !SameLogicalView(source_side, side.CurrentForMutation(key))) {
     co_return absl::AbortedError("grouped population changed before mutation");
   }
-  // Admission and cross-coordinator dependency waits release the store lock.
+  // Cross-coordinator dependency waits release the store lock.
   // GC may publish another physical view of this same logical root meanwhile;
   // the publication reservation compares handle identity, not just C/R.
   // Refresh only after the population/logical checks, while the lock is held.

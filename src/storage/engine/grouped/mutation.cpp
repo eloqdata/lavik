@@ -158,21 +158,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     const auto predecessor =
         co_await PrepareGroupedDependencyLocked(store, source_side, nullptr);
     if (!predecessor.ok()) co_return predecessor;
-    std::uint64_t append_bytes = kBlockHeaderSlotBytes;
-    for (const auto& entry : after_image.entries_)
-      append_bytes += entry.field_.size() + entry.value_.size() + 64;
-    if (prepared != nullptr) {
-      for (const auto& page : prepared->writes_) {
-        if (page.prepared_) append_bytes += page.prepared_->bytes().size() + 64;
-        for (const auto& entry : page.value_.entries_)
-          append_bytes += entry.field_.size() + entry.value_.size() + 64;
-      }
-    }
-    // No transaction lease may be held while asking the cleaner to make room.
-    // The population checks below also cover GC during this unlocked wait.
-    store.store_state_mutex_.Unlock(*store.worker_);
-    const auto space = co_await BeforeGroupedTransaction(store, append_bytes);
-    co_await store.store_state_mutex_.Lock();
+    // Resource allocation enforces capacity while the cleaner runs separately.
+    const auto space = BeforeGroupedTransaction(store);
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),

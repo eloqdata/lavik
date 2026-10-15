@@ -1732,6 +1732,11 @@ if (BUILD_TESTING)
     endif()
   endif()
 
+  add_executable(lavik_tx_cleaner_pipeline_tests tests/tx_cleaner_pipeline_test.cpp)
+  target_link_libraries(lavik_tx_cleaner_pipeline_tests PRIVATE lavik::module GTest::gtest_main)
+  add_test(NAME lavik_tx_cleaner_pipeline COMMAND lavik_tx_cleaner_pipeline_tests)
+  set_tests_properties(lavik_tx_cleaner_pipeline PROPERTIES TIMEOUT 60)
+
   add_executable(lavik_stream_records_test tests/stream_records_test.cpp)
   target_link_libraries(lavik_stream_records_test PRIVATE lavik::module GTest::gtest_main)
   add_test(NAME lavik_stream_records COMMAND lavik_stream_records_test)
@@ -2248,6 +2253,23 @@ endforeach()
     )
     set_tests_properties(lavik_compact_collection_write_e2e PROPERTIES
       TIMEOUT 600 RUN_SERIAL TRUE
+    )
+
+    add_executable(lavik_adaptive_flush_e2e_test
+      tests/adaptive_flush_e2e_test.cpp
+    )
+    target_link_libraries(lavik_adaptive_flush_e2e_test
+      PRIVATE lavik::module GTest::gtest
+    )
+    target_compile_definitions(lavik_adaptive_flush_e2e_test PRIVATE
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
+    )
+    add_test(
+      NAME lavik_adaptive_flush_e2e
+      COMMAND lavik_adaptive_flush_e2e_test $<TARGET_FILE:lavik>
+    )
+    set_tests_properties(lavik_adaptive_flush_e2e PROPERTIES
+      TIMEOUT 180 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_grouped_ordered_write_e2e_test

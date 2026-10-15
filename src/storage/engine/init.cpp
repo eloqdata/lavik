@@ -18,6 +18,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "device_affinity.h"
+#include "flush_policy.h"
 #include "impl.h"
 
 namespace lavik::storage {
@@ -250,6 +251,12 @@ absl::Status InitializeAddedDeviceMetadata(
 }  // namespace
 
 absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
+  // Cross-owner recovery tests must retain their tagged source until the
+  // client explicitly enables cleaning. Pausing after the listener opens can
+  // race the autonomous cleaner's first pass over recovered sealed blocks.
+  LAVIK_FAULT_INJECT(
+      if (std::getenv("LAVIK_TX_CLEANER_START_PAUSED") != nullptr)
+          tx_cleaner_cooldown_ms_.store(0, std::memory_order_release););
   if (options_.database_count_ == 0 ||
       options_.database_count_ > kLogicalDatabaseCount) {
     return absl::InvalidArgumentError("invalid runtime database count");
@@ -691,14 +698,14 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       options_.flush_size_bytes_ > kStorageBlockBytes ||
       (options_.flush_size_bytes_ & (options_.flush_size_bytes_ - 1)) != 0 ||
       options_.flush_size_bytes_ % direct_io_alignment_ != 0) {
-    return absl::Status(
-        absl::StatusCode::kInvalidArgument,
-        "flush size must be a power of two between the direct-I/O alignment "
-        "and the 8 MiB storage block size");
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "flush trigger size must be a power of two between the "
+                        "direct-I/O alignment "
+                        "and the 8 MiB storage block size");
   }
   spdlog::info("storage direct-I/O alignment={} bytes", direct_io_alignment_);
-  spdlog::info("storage flush submission size={} bytes",
-               options_.flush_size_bytes_);
+  spdlog::info("storage flush trigger={} bytes maximum submission={} bytes",
+               options_.flush_size_bytes_, kMaxFlushWriteBytes);
 
   absl::Status system_state = LoadSystemState();
   if (!system_state.ok()) return system_state;
@@ -2439,10 +2446,13 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   // Join it locally before freezing append streams; doing this through the
   // global QuiesceExpiration helper would make workers submit to and wait on
   // themselves while every periodic flush owns the same shutdown barrier.
-  // Tomb Raider also touches indexes and record accounting across workers;
-  // join its cancellable round before any worker freezes append streams.
+  // Tomb Raider and the Tx cleaner also touch indexes and record accounting
+  // across workers. Join their rounds before any worker freezes append streams;
+  // a queued Tx cleaner is included even before its coroutine starts running.
   while (store->expiry_cycle_running_ || store->indirect_key_cleaner_running_ ||
-         tomb_raider_running_.load(std::memory_order_acquire)) {
+         tomb_raider_running_.load(std::memory_order_acquire) ||
+         tx_cleaner_scheduled_.load(std::memory_order_acquire) ||
+         tx_cleaner_running_.load(std::memory_order_acquire)) {
     absl::Status status = co_await bycorf::SleepFor(
         *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;

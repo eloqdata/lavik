@@ -17,6 +17,7 @@
 #include <exception>
 
 #include "absl/strings/str_cat.h"
+#include "flush_policy.h"
 #include "grouped/dependency_test_hook.h"
 #include "impl.h"
 #include "lavik/memory.h"
@@ -826,6 +827,14 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxCommitCapacity() {
 }
 
 Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
+  const auto release_writer_leases = [](WorkerStore::PendingTxCommit& pending) {
+    // Only queue-owned receipts reach this boundary, after their last append
+    // or terminal failure. Grouped decisions also finish their durability
+    // wait before release. Retaining the other receipt metadata must not let
+    // an unrelated later transaction keep these blocks' writer leases alive.
+    for (TxShardWrites& shard : pending.writes_)
+      shard.transaction_lease_.reset();
+  };
   while (!store->tx_commit_queue_.empty()) {
     std::vector<WorkerStore::PendingTxCommit> batch;
     const std::size_t count =
@@ -946,6 +955,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
               shard.grouped_decision_->FailPending();
             }
           }
+          release_writer_leases(*pending);
         }
         if (!decisions_durable.ok())
           spdlog::warn("transaction batch decision flush failed: {}",
@@ -984,6 +994,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
           if (!committed.ok()) {
             spdlog::warn("transaction {} commit append failed: {}",
                          pending.txid_, committed.message());
+            release_writer_leases(pending);
           } else if (defer_decisions) {
             decision_fences.push_back(decision);
             deferred_pending.push_back(&pending);
@@ -991,7 +1002,11 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
               for (const auto& shard : pending.writes_)
                 if (shard.grouped_decision_)
                   deferred_decisions.insert(shard.grouped_decision_.get());
+          } else {
+            release_writer_leases(pending);
           }
+        } else {
+          release_writer_leases(pending);
         }
       } else {
         spdlog::warn("transaction {} batch durability failed: {}",
@@ -1001,6 +1016,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
             shard.grouped_decision_->FailPending();
           }
         }
+        release_writer_leases(pending);
       }
     }
     if (!decision_fences.empty()) co_await flush_decisions();
@@ -1209,6 +1225,11 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       co_return restored.status();
     }
     current = *restored;
+    // An old physical winner may have been classified as obsolete by an
+    // earlier Tx promotion scan. Its pages can belong to different physical
+    // owners, so invalidate their runtime scan proofs before completing this
+    // inverse publication. Ordinary forward writes do not need this barrier.
+    InvalidateTxPromotionAfterRewind();
     if (restored_group_slot.has_value()) {
       auto published = restored_group_slot->Commit(entry.previous_grouped_);
       if (!published.ok()) {
@@ -1447,9 +1468,10 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
 
 // Allocates a block for this writer inline. `unlock_writer` releases the
 // store-state mutex across the allocation so appends behind this one keep
-// flowing; the caller must revalidate whatever it read before the call. Every
-// refusal surfaces as an error to exactly this caller — waiters queue on
-// mutexes end to end, so there is no notification to miss.
+// flowing; the caller must revalidate whatever it read before the call. The
+// caller retains its stream allocation gate while capacity waits release store
+// state. A final refusal belongs to this elected allocator; queued appends
+// recheck the stream after acquiring that gate.
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     WorkerStore& store, bool for_defrag, bool unlock_writer) {
   if (unlock_writer) {
@@ -1493,26 +1515,64 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   // recovery (never half-kept). Defrag keeps allocating from its reserve.
   if (for_defrag ||
       !shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    // Capture before allocation can suspend: a cleaner finishing between FULL
+    // and waiter registration still earns one final allocation attempt. These
+    // loads occur only when acquiring a physical block, not on every append.
+    const bool may_wait_for_cleaner = !for_defrag && unlock_writer;
+    const auto completed_before =
+        may_wait_for_cleaner
+            ? tx_cleaner_completed_rounds_.load(std::memory_order_acquire)
+            : 0;
+    auto space_before =
+        may_wait_for_cleaner
+            ? space_reclaim_generation_.load(std::memory_order_acquire)
+            : 0;
     allocated = co_await AllocateBlock(
         store, for_defrag ? AllocationPurpose::kDefrag
                           : AllocationPurpose::kForeground);
+    if (may_wait_for_cleaner) {
+      while (!allocated.ok() && allocated.status()
+                                    .GetPayload(kDiskSpaceExhaustionTypeUrl)
+                                    .has_value()) {
+        const bool retry = co_await AwaitRunningTxCleanerForCapacity(
+            store, completed_before, space_before);
+        if (!retry) break;
+        const bool finished =
+            tx_cleaner_completed_rounds_.load(std::memory_order_acquire) !=
+            completed_before;
+        space_before =
+            space_reclaim_generation_.load(std::memory_order_acquire);
+        allocated =
+            co_await AllocateBlock(store, AllocationPurpose::kForeground);
+        // Several owners can wake for one block. A loser can wait for further
+        // progress in this same round, but completion permits only this final
+        // retry: never follow the persistent driver's next no-progress round.
+        if (finished) break;
+      }
+    }
   }
   if (unlock_writer) {
     co_await store.store_state_mutex_.Lock();
   }
-  if (allocated.ok() && (store.write_failed_ || RuntimeFailureLatched())) {
+  if (store.write_failed_ || RuntimeFailureLatched()) {
     // The writer fail-stopped while the allocation waited; report that
     // instead of appending into a stream that will never flush.
-    if (unlock_writer) {
-      store.store_state_mutex_.Unlock(*store.worker_);
-    }
-    (void)co_await ReturnReservedBlock(*allocated);
-    if (unlock_writer) {
-      co_await store.store_state_mutex_.Lock();
+    if (allocated.ok()) {
+      if (unlock_writer) {
+        store.store_state_mutex_.Unlock(*store.worker_);
+      }
+      (void)co_await ReturnReservedBlock(*allocated);
+      if (unlock_writer) {
+        co_await store.store_state_mutex_.Lock();
+      }
     }
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "storage writer is stopped after an IO failure");
   }
+  if (!allocated.ok() && !for_defrag &&
+      (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+       store.worker_->stop_requested()))
+    co_return absl::UnavailableError("storage is shutting down");
   co_return allocated;
 }
 
@@ -1821,7 +1881,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
       absl::Status write_status = absl::OkStatus();
       for (std::size_t offset = write_begin; offset < write_bytes;) {
         const std::size_t chunk =
-            std::min(options_.flush_size_bytes_, write_bytes - offset);
+            std::min(kMaxFlushWriteBytes, write_bytes - offset);
         auto written = co_await WriteStorageBuffer(
             *store.worker_, store.files_[file_id],
             std::span<const std::byte>(staging.data_ + offset, chunk),
@@ -2728,8 +2788,15 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         // value while this foreground append has not acquired its final stream.
         spdlog::info("record write publication pause armed");
         store.store_state_mutex_.Unlock(*store.worker_);
-        auto paused = co_await bycorf::SleepFor(
-            *store.worker_, std::chrono::milliseconds(1000));
+        absl::Status paused;
+        const char* pause_file = std::getenv("LAVIK_RECORD_WRITE_PAUSE_FILE");
+        if (pause_file != nullptr && *pause_file != '\0') {
+          paused = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_RECORD_WRITE_PAUSE_FILE");
+        } else {
+          paused = co_await bycorf::SleepFor(*store.worker_,
+                                             std::chrono::milliseconds(1000));
+        }
         co_await store.store_state_mutex_.Lock();
         if (!paused.ok()) co_return paused;
       });
@@ -3756,9 +3823,14 @@ acquire_active_stream:
   staging_state->record_count_ = updated.record_count_;
   staging_state->max_lsn_ = updated.max_lsn_;
   state.live_bytes_ += location.total_disk_bytes();
-  state.flush_queued_ = updated.committed_bytes_ == kStorageBlockBytes;
-  if (transaction_append && state.flush_queued_)
+  // Queued partial flushes remain queued across later appends. Queue ownership
+  // belongs to RequestFlush/the flusher; it does not mean the stream is sealed.
+  if (transaction_append && updated.committed_bytes_ == kStorageBlockBytes)
     NoteTxBlockSealedLocal(store, updated.block_id_);
+  if (state.committed_bytes_ - staging_state->durable_bytes_ >=
+      options_.flush_size_bytes_) {
+    RequestFlush(store, updated.block_id_);
+  }
   // A superseded record stays in its block's live_bytes until this record's
   // flush completes (the RecordIdentity above carries it there): the old copy
   // is the key's only durable version until then, and retiring it now lets

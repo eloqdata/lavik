@@ -173,11 +173,17 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   // The caller filters its failed receipt set: a restored old auxiliary must
   // not be reclaimed when the outer transaction later commits. This helper
   // only publishes the compensation and updates stable undo entry handles.
-  co_return co_await AppendLocked(
+  const auto restored = co_await AppendLocked(
       store, partition, db_id, key, digest, *payload, RecordKind::kValue,
       old_version.root_.value_type(), old_version.root_.expire_at_ms_,
       compensation, old_version.root_.logical_size_, nullptr, nullptr, nullptr,
       true, replacement_undo, nullptr, &mutation);
+  // Compensation can republish old physical pages without appending them.
+  // Its retained journal pins keep them allocated across AppendLocked's
+  // waits; invalidate prior scans even if a late handoff error follows the
+  // publication, so their physical owners reconsider the restored winners.
+  InvalidateTxPromotionAfterRewind();
+  co_return restored;
 }
 
 }  // namespace lavik::storage

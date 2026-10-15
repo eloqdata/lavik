@@ -472,6 +472,10 @@ class ChildServer {
       if (!pause_root_pin.empty()) {
         ::setenv("LAVIK_GROUP_ROOT_PIN_PAUSE_KEY",
                  std::string(pause_root_pin).c_str(), 1);
+        // Preserve the recovered tagged source before the first client can
+        // configure maintenance. An online cleaner may otherwise promote it
+        // immediately after recovery, invalidating the intended pin scenario.
+        ::setenv("LAVIK_TX_CLEANER_START_PAUSED", "1", 1);
       }
       const int log = ::open(log_.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
       if (log < 0) ::_exit(127);
@@ -520,10 +524,16 @@ class ChildServer {
     std::ifstream stream(log_);
     return {std::istreambuf_iterator<char>(stream), {}};
   }
-  bool WaitForLog(std::string_view message) const {
+  bool WaitForLog(std::string_view message,
+                  const std::future<std::string>* command = nullptr) const {
     const auto until = std::chrono::steady_clock::now() + 20s;
     while (std::chrono::steady_clock::now() < until) {
       if (Log().find(message) != std::string::npos) return true;
+      // A completed command cannot subsequently reach its pause hook. Report
+      // its actual result instead of spending the timeout hiding an error.
+      if (command != nullptr &&
+          command->wait_for(0s) == std::future_status::ready)
+        return Log().find(message) != std::string::npos;
       std::this_thread::sleep_for(10ms);
     }
     return false;
@@ -1610,8 +1620,12 @@ TEST(GroupedRecoveryE2e, TaggedRootDependencyPinsCrossRecoveredPhysicalOwners) {
       // the exact root identity in the admitted pin guard, not merely whether
       // another changed group happened to pin the same source block.
       ASSERT_TRUE(server.WaitForLog(
-          "group root dependency pause owner=0 key-owner=1 pinned=1"))
-          << server.Log();
+          "group root dependency pause owner=0 key-owner=1 pinned=1",
+          &mutation))
+          << server.Log() << "\nmutation result: "
+          << (mutation.wait_for(0s) == std::future_status::ready
+                  ? mutation.get()
+                  : "still pending");
       ASSERT_EQ(
           server.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "1"}),
           "+OK");
@@ -1664,8 +1678,11 @@ TEST(GroupedRecoveryE2e, FailedOverwriteReleasesTaggedRootOnItsPhysicalOwner) {
           {"MSET", key, "replacement", "guard{bar}", "value"});
     });
     ASSERT_TRUE(server.WaitForLog(
-        "group root dependency pause owner=0 key-owner=1 pinned=1"))
-        << server.Log();
+        "group root dependency pause owner=0 key-owner=1 pinned=1", &mutation))
+        << server.Log() << "\nmutation result: "
+        << (mutation.wait_for(0s) == std::future_status::ready
+                ? mutation.get()
+                : "still pending");
     // Keep cleaner stopped until rollback has released the actual old-owner
     // pin. Otherwise promotion during the pause could turn the predecessor
     // into an untagged local copy and conceal a wrong-owner unpin bug.

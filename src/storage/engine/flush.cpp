@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "flush_policy.h"
 #include "impl.h"
 
 namespace lavik::storage {
@@ -25,6 +26,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     if (!status.ok()) {
       CompleteShutdownFlush(status);
       store->durability_progress_.NotifyAll(*store->worker_);
+      store->tx_cleaner_capacity_progress_.NotifyAll(*store->worker_);
       co_return status;
     }
     if (store->worker_->stop_requested()) {
@@ -34,6 +36,13 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     // Normal progress is notified by I/O completion, without a timer wait.
     if (store->write_failed_ || RuntimeFailureLatched())
       store->durability_progress_.NotifyAll(*store->worker_);
+    // External shutdown/configuration callers cannot post owner notifications.
+    // Actual cleaner completions and block returns wake capacity waiters at
+    // once; this only delivers control-state changes from outside the runtime.
+    if (store->write_failed_ || RuntimeFailureLatched() ||
+        shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+      store->tx_cleaner_capacity_progress_.NotifyAll(*store->worker_);
 
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       status = co_await FlushWorkerForShutdown(store);
@@ -150,20 +159,13 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       SealIdleTxBlocksLocal(*store);
     }
     RequestIndirectKeyCleaning(*store);
-    status = co_await MaybeRunTxCleaner();
-    if (!status.ok() &&
-        !(absl::IsCancelled(status) &&
-          shutdown_flush_requested_.load(std::memory_order_acquire))) {
-      // Cleaner races (pins, foreground replacement) and allocation pressure
-      // are retryable background-maintenance failures. They must never stop
-      // this worker's periodic flush loop or masquerade as completion of a
-      // shutdown drain. MaybeRunTxCleaner has already re-armed dirty state;
-      // record the failure and retry after the configured cooldown.
-      spdlog::warn("worker[{}] transaction cleaner round failed; retrying: {}",
-                   store->worker_->id(), status.message());
-    }
+    // Sealed work drives maintenance independently of client admission. This
+    // also catches lease releases from outside the runtime and work arriving
+    // while the previous coalesced driver was returning.
+    RequestTxCleaner(HasSealedTxBacklog());
   }
   store->durability_progress_.NotifyAll(*store->worker_);
+  store->tx_cleaner_capacity_progress_.NotifyAll(*store->worker_);
   co_return absl::OkStatus();
 }
 
@@ -360,15 +362,22 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         // the process pauses; ordinary release builds contain no hook.
         static std::atomic<bool> pause_claimed = false;
         const char* pause_text = std::getenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_MS");
+        const char* pause_file = std::getenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE");
         bool expected_pause = false;
-        if (pause_text != nullptr &&
+        if ((pause_text != nullptr || pause_file != nullptr) &&
             pause_claimed.compare_exchange_strong(expected_pause, true)) {
-          char* end = nullptr;
-          const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
-          if (end != pause_text && *end == '\0' && pause_ms != 0) {
-            absl::Status paused = co_await bycorf::SleepFor(
-                *store->worker_, std::chrono::milliseconds(pause_ms));
+          if (pause_file != nullptr) {
+            const auto paused = co_await fault_injection::PauseWhileFileExists(
+                "LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE");
             if (!paused.ok()) co_return finish(paused);
+          } else {
+            char* end = nullptr;
+            const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
+            if (end != pause_text && *end == '\0' && pause_ms != 0) {
+              absl::Status paused = co_await bycorf::SleepFor(
+                  *store->worker_, std::chrono::milliseconds(pause_ms));
+              if (!paused.ok()) co_return finish(paused);
+            }
           }
         });
     // The first flush of a block starts at the unused header slot, which is
@@ -396,7 +405,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
 
     for (std::size_t write_offset = write_begin; write_offset < write_bytes;) {
       const std::size_t chunk_bytes =
-          std::min(options_.flush_size_bytes_, write_bytes - write_offset);
+          std::min(kMaxFlushWriteBytes, write_bytes - write_offset);
+      LAVIK_FAULT_INJECT(
+          if (std::getenv("LAVIK_TRACE_FLUSH_SUBMISSIONS") != nullptr)
+              spdlog::info("test flush data submission bytes={}",
+                           chunk_bytes););
       auto written = co_await WriteStorageBuffer(
           *store->worker_, store->files_[file_id],
           std::span<const std::byte>(staging.data_ + write_offset, chunk_bytes),
@@ -610,6 +623,14 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // tail durable, it no longer retires the block. Sealing is what frees
     // the buffer, and sealing already cleared active_block by this point.
     if (IsActiveBlock(*store, pending->block_id_)) {
+      // Appends during this snapshot could only coalesce their RequestFlush
+      // calls. Recheck the remaining prefix now so a threshold-sized tail does
+      // not wait for another append or the age timer. Active streams rejoin
+      // the queue at its tail; sealed COW tails retain the ordering above.
+      if (state->committed_bytes_ - pending->committed_bytes_ >=
+          options_.flush_size_bytes_) {
+        RequestFlush(*store, pending->block_id_);
+      }
       continue;
     }
 

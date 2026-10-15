@@ -263,6 +263,9 @@ class ReplicationLogService final : public bycorf::Service {
     if (result_.ok()) result_ = co_await storage_->CompleteStorageStartup();
     if (result_.ok() && exercise_) {
       result_ = co_await Exercise();
+      if (!result_.ok()) {
+        (void)co_await ReportStorageFailure(current_stage_, 0, {});
+      }
     }
     worker.RequestStop();
     co_return result_;
@@ -548,10 +551,13 @@ class ReplicationLogService final : public bycorf::Service {
       actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }
     if (reply.continuation_ || actual != expected_reply) {
+      (void)co_await ReportStorageFailure("client command", db_id,
+                                          request->args_);
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                             "client replication command returned '" + actual +
-                                 "' instead of '" +
-                                 std::string(expected_reply) + "'");
+                             "client replication command returned '" +
+                                 actual.substr(0, 256) + "' instead of '" +
+                                 std::string(expected_reply.substr(0, 256)) +
+                                 "'");
     }
     co_return absl::OkStatus();
   }
@@ -606,9 +612,63 @@ class ReplicationLogService final : public bycorf::Service {
     }
     if (reply.close_connection_ || connection.closing_ ||
         actual != expected_reply) {
+      (void)co_await ReportStorageFailure(
+          "client dispatch", connection.selected_db_, request->args_);
       co_return absl::FailedPreconditionError(
           "replication capture dispatch returned '" + actual.substr(0, 256) +
           "' or requested connection closure");
+    }
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ReportStorageFailure(
+      std::string_view context, std::uint8_t db_id,
+      std::span<const std::string> args) {
+    // Capture owner-local counters before collecting asynchronous snapshots.
+    // Only failures take this path; bounded argument prefixes identify the
+    // command/key without dumping its multi-megabyte value or binary body.
+    const auto cleaner = storage_->TxCleanerStats();
+    const auto commits = storage_->TxCommitBatchStats();
+    const auto defrag = storage_->DefragStats();
+    std::cerr << "replication failure context=" << context
+              << " db=" << static_cast<unsigned>(db_id)
+              << " argc=" << args.size();
+    for (std::size_t i = 0; i < std::min<std::size_t>(args.size(), 6); ++i) {
+      std::string prefix = args[i].substr(0, 48);
+      for (char& c : prefix) {
+        if (static_cast<unsigned char>(c) < 32 ||
+            static_cast<unsigned char>(c) > 126)
+          c = '.';
+      }
+      std::cerr << " arg" << i << "_bytes=" << args[i].size() << " arg" << i
+                << "='" << prefix << "'";
+    }
+    std::cerr << " tx_backlog_bytes=" << cleaner.tx_backlog_bytes_total_
+              << " cleaner_running=" << cleaner.running_
+              << " cleaner_rounds=" << cleaner.rounds_
+              << " cleaner_failures=" << cleaner.failures_
+              << " cleaner_retired_blocks=" << cleaner.retired_blocks_
+              << " cleaner_cooldown_ms=" << cleaner.cooldown_ms_
+              << " commit_queue_depth=" << commits.queue_depth_
+              << " commit_queue_peak=" << commits.queue_peak_
+              << " committed_transactions=" << commits.transactions_
+              << " defrag_active=" << defrag.active_
+              << " defrag_pending=" << defrag.pending_
+              << " defrag_paused=" << defrag.paused_ << '\n';
+    const auto durability = co_await storage_->DurabilityStats();
+    std::cerr << "replication failure durability dirty_staging_bytes="
+              << durability.dirty_staging_bytes_
+              << " flushes_pending=" << durability.flushes_pending_
+              << " tx_commits_pending=" << durability.tx_commits_pending_
+              << '\n';
+    const auto metrics = co_await storage_->CollectMetrics();
+    for (const auto& device : metrics.devices_) {
+      std::cerr << "replication failure device=" << device.device_id_
+                << " capacity_blocks="
+                << device.capacity_bytes_ / lavik::storage::kStorageBlockBytes
+                << " foreground_available_blocks="
+                << device.available_bytes_ / lavik::storage::kStorageBlockBytes
+                << '\n';
     }
     co_return absl::OkStatus();
   }
@@ -3409,7 +3469,11 @@ class ReplicationLogService final : public bycorf::Service {
     if (!removed_large.ok()) co_return removed_large.status();
     for (const ReplicatedCommand& command : commands) {
       status = co_await lavik::ApplyReplicatedCommand(command);
-      if (!status.ok()) co_return status;
+      if (!status.ok()) {
+        (void)co_await ReportStorageFailure("published String replay",
+                                            command.db_id_, command.args_);
+        co_return status;
+      }
     }
     auto restored_length =
         co_await storage_->StringLength(2, "replication-set");
@@ -4302,44 +4366,60 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
+    current_stage_ = "transactional FULL publication";
     absl::Status status = co_await ExerciseTransactionalFullSyncPublication();
     if (!status.ok()) co_return status;
+    current_stage_ = "blocking initial-attempt admission";
     status = co_await ExerciseBlockingInitialAttemptAdmission();
     if (!status.ok()) co_return status;
+    current_stage_ = "replica backup admission";
     status = co_await ExerciseReplicaBackupAdmission();
     if (!status.ok()) co_return status;
+    current_stage_ = "scanned-key storage change order";
     status = co_await ExerciseScannedKeyStorageChangeOrder();
     if (!status.ok()) co_return status;
+    current_stage_ = "tailing mutation during partition scan";
     status = co_await ExerciseTailingMutationDuringNextPartitionScan();
     if (!status.ok()) co_return status;
+    current_stage_ = "empty FULL databases";
     status = co_await ExerciseEmptyFullSyncDbs();
     if (!status.ok()) co_return status;
+    current_stage_ = "shared-history quota";
     status = co_await ExerciseSharedHistoryQuota();
     if (!status.ok()) co_return status;
+    current_stage_ = "mutation precondition";
     status = co_await ExerciseMutationPrecondition();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "admission and ordering";
     status = co_await ExerciseAdmissionAndOrdering();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "backlog storage";
     status = co_await ExerciseBacklogStorage();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "published String commands";
     status = co_await ExercisePublishedStringCommands();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "published collection commands";
     status = co_await ExercisePublishedCollectionCommands();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "published wide-argument command";
     status = co_await ExercisePublishedWideArgumentCommand();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "FLUSH control barriers";
     status = co_await ExerciseFlushControlBarriers();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "FULL sync during tombstone reaping";
     status = co_await ExerciseFullSyncDuringTombstoneReaping();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "FULL command coverage";
     status = co_await ExerciseFullCommandCoverage();
     if (!status.ok()) co_return status;
 
@@ -4351,6 +4431,7 @@ class ReplicationLogService final : public bycorf::Service {
   StorageEngine* storage_ = nullptr;
   bycorf::Worker* worker_ = nullptr;
   bool exercise_ = false;
+  std::string_view current_stage_ = "exercise startup";
   absl::Status result_ = absl::UnknownError("test service did not run");
 };
 

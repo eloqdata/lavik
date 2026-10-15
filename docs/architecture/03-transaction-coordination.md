@@ -164,10 +164,11 @@ rolls back without publishing the attempted effects. This logical boundary is
 separate from the later durability decision.
 At most one drain coroutine runs
 per worker, replacing a detached coroutine per accepted transaction.
-The command layer waits for the storage Tx backlog before taking key intents
-for a new write transaction. That gate does not apply to a transaction already
-holding its receipt: its participants continue through writes and commit, even
-if the backlog crosses the admission threshold while they run.
+New transactions can append while older transaction blocks await cleanup.
+Foreground writes encounter capacity limits at write-buffer allocation,
+physical-block allocation, and the worker-local commit queue. Sealed transaction
+bytes do not impose a separate command-level admission gate, and opening a
+grouped transaction does not join a cleaner round while holding key intents.
 
 Multi-step commands inside EXEC or Lua have a command-local undo boundary
 within the outer storage transaction. MSET and MSETNX complete their write
@@ -193,6 +194,9 @@ tagged-record fences before appending its own `kTxCommit` decision. A batch
 appends all ready decisions before requesting their shared flush; grouped
 decision publication waits for that flush. One receipt on an otherwise idle
 queue stays on the direct low-latency path.
+The coordinator releases each receipt's writer lease once that receipt can no
+longer append, after grouped decision durability or terminal failure. Keeping
+the remaining batch metadata alive does not keep completed writers active.
 
 Owner-local grouped successors retain predecessor decisions in their receipts
 and may publish staged versions before those predecessors become durable. The

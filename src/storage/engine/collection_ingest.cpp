@@ -175,15 +175,14 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
       writes.mutation_precondition_ = *mutation_precondition;
     }
   } else {
-    // The key intent is held, but no transaction lease or store mutex is held
-    // yet. Ingest batches later borrow this accumulator and must not wait for
-    // reclamation while their own transaction is still open.
+    // Resolve the previous logical version before opening this accumulator;
+    // physical transaction-block cleanup runs independently of the new ingest.
     co_await store.store_state_mutex_.Lock();
     const auto predecessor = co_await AwaitGroupedDependencyLocked(
         store, partition.grouped_objects_[db_id].CurrentForMutation(key), 0);
     store.store_state_mutex_.Unlock(*store.worker_);
     if (!predecessor.ok()) co_return predecessor;
-    const auto space = co_await BeforeGroupedTransaction(store, 1U << 20);
+    const auto space = BeforeGroupedTransaction(store);
     if (!space.ok()) co_return space;
     InitializeTxWrites(tx::TxRuntime::Get()->next_txid_.fetch_add(
                            1, std::memory_order_relaxed),
