@@ -1732,6 +1732,11 @@ if (BUILD_TESTING)
     endif()
   endif()
 
+  add_executable(lavik_tx_backlog_admission_tests tests/tx_backlog_admission_test.cpp)
+  target_link_libraries(lavik_tx_backlog_admission_tests PRIVATE lavik::module GTest::gtest_main)
+  add_test(NAME lavik_tx_backlog_admission COMMAND lavik_tx_backlog_admission_tests)
+  set_tests_properties(lavik_tx_backlog_admission PROPERTIES TIMEOUT 60)
+
   add_executable(lavik_stream_records_test tests/stream_records_test.cpp)
   target_link_libraries(lavik_stream_records_test PRIVATE lavik::module GTest::gtest_main)
   add_test(NAME lavik_stream_records COMMAND lavik_stream_records_test)

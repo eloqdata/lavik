@@ -2053,7 +2053,8 @@ class StorageEngine {
   bool TxBacklogAtLimit() const noexcept;
   // Call before taking key intents. Wait only while sealed backlog retains a
   // live transaction; already admitted transactions must be able to commit,
-  // and read-only pins must not block new write transactions.
+  // and read-only pins must not block new write transactions. Progress wakes
+  // recheck this predicate; they do not reserve space or await a cleaner round.
   bycorf::Task<absl::Status> WaitForTxBacklog();
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
@@ -2068,6 +2069,7 @@ class StorageEngine {
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
+  friend class TxBacklogAdmissionTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

@@ -101,6 +101,7 @@ void StorageEngine::Impl::InitializeTxWrites(
   auto lease = std::shared_ptr<void>(new std::uint8_t{0}, [this](void* token) {
     delete static_cast<std::uint8_t*>(token);
     tx_cleaner_dirty_.store(true, std::memory_order_release);
+    NotifyTxBacklogProgress();
   });
   for (TxShardWrites& shard : writes) {
     shard.txid_ = txid;
@@ -191,6 +192,7 @@ absl::Status StorageEngine::Impl::ConfigureTxCleanerCooldown(
                                 std::memory_order_release);
   tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
+  NotifyTxBacklogProgress();
   return absl::OkStatus();
 }
 
@@ -259,22 +261,48 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
   // A new transaction waits while sealed pressure still belongs to a live
   // transaction. Once all leases are released, an old snapshot or full-sync
   // reader may keep those blocks allocated. Waiting for that reader can
-  // deadlock its own next command, so make one cleanup attempt and admit.
-  for (;;) {
-    if (shutdown_flush_requested_.load(std::memory_order_acquire))
-      co_return absl::UnavailableError("storage is shutting down");
-    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
-    const std::int64_t now = MonotonicMillis();
-    std::int64_t next = tx_backlog_retry_ms_.load(std::memory_order_acquire);
-    if (now >= next && tx_backlog_retry_ms_.compare_exchange_strong(
-                           next, now + 50, std::memory_order_acq_rel,
-                           std::memory_order_acquire)) {
-      const absl::Status cleaned = co_await MaybeRunTxCleaner(true);
-      if (!cleaned.ok() && !absl::IsFailedPrecondition(cleaned) &&
-          !absl::IsAborted(cleaned) && !absl::IsResourceExhausted(cleaned))
-        co_return cleaned;
+  // deadlock its own next command. Request cleanup independently of admission;
+  // one slow promotion must not retain a request whose admission is now clear.
+  WorkerStore& local = CurrentStore();
+  if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+      local.worker_->stop_requested())
+    co_return absl::UnavailableError("storage is shutting down");
+  if (RuntimeFailureLatched())
+    co_return absl::InternalError(
+        "storage failed while waiting for Tx backlog");
+  if (!TxBacklogAtLimit()) co_return absl::OkStatus();
+  struct WaiterRegistration {
+    Impl& engine_;
+    WorkerStore& local_;
+    WaiterRegistration(Impl& engine, WorkerStore& local)
+        : engine_(engine), local_(local) {
+      local_.tx_backlog_waiters_.fetch_add(1, std::memory_order_seq_cst);
+      engine_.tx_backlog_waiters_.fetch_add(1, std::memory_order_seq_cst);
     }
+    ~WaiterRegistration() {
+      local_.tx_backlog_waiters_.fetch_sub(1, std::memory_order_seq_cst);
+      engine_.tx_backlog_waiters_.fetch_sub(1, std::memory_order_seq_cst);
+    }
+  } registration(*this, local);
+  for (;;) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        local.worker_->stop_requested())
+      co_return absl::UnavailableError("storage is shutting down");
+    if (RuntimeFailureLatched())
+      co_return absl::InternalError(
+          "storage failed while waiting for Tx backlog");
     if (!TxBacklogAtLimit()) co_return absl::OkStatus();
+    // Capture before any owner RPC: progress may wake this worker while its
+    // probe is away, before it has registered a notification continuation.
+    const auto generation =
+        tx_backlog_progress_generation_.load(std::memory_order_seq_cst);
+    RequestTxCleaner(true);
+    if (!TxBacklogAtLimit()) co_return absl::OkStatus();
+    const auto cleaner_error =
+        tx_backlog_cleaner_error_.load(std::memory_order_acquire);
+    if (cleaner_error != absl::StatusCode::kOk)
+      co_return absl::Status(cleaner_error,
+                             "transaction cleaner failed during Tx admission");
     bool live_transaction = false;
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       if (stores_[owner]->tx_backlog_bytes_.load(std::memory_order_acquire) <
@@ -295,10 +323,127 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxBacklog() {
         break;
       }
     }
+    // A stop/failure can arrive while an owner probe is suspended, including
+    // one that concludes there are no remaining live writers.
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        local.worker_->stop_requested() || RuntimeFailureLatched())
+      continue;
     if (!live_transaction) co_return absl::OkStatus();
-    const absl::Status waited = co_await bycorf::SleepFor(
-        *bycorf::ThisWorker().self_, std::chrono::milliseconds(2));
-    if (!waited.ok()) co_return waited;
+#if LAVIK_FAULTS_ENABLED
+    if (tx_backlog_before_wait_for_test_) tx_backlog_before_wait_for_test_();
+#endif
+    if (tx_backlog_progress_generation_.load(std::memory_order_seq_cst) !=
+            generation ||
+        !TxBacklogAtLimit() || RuntimeFailureLatched() ||
+        shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        local.worker_->stop_requested())
+      continue;
+    // Notifications execute on this worker, so none can run between this
+    // final generation check and registering the owner-local continuation.
+    co_await local.tx_backlog_progress_.Wait();
+  }
+}
+
+void StorageEngine::Impl::NotifyTxBacklogProgress() noexcept {
+  tx_backlog_progress_generation_.fetch_add(1, std::memory_order_seq_cst);
+  if (tx_backlog_waiters_.load(std::memory_order_seq_cst) == 0) return;
+  const auto& current = bycorf::ThisWorker();
+  // Foreign callers cannot publish to worker SPSC lanes. PeriodicFlush checks
+  // the generation for those rare config/shutdown/failure transitions. During
+  // runtime teardown stores may already be finalizing, so touch no owner state.
+  if (current.cross_core_ == nullptr || current.self_ == nullptr ||
+      current.self_->stop_requested())
+    return;
+  for (const auto& store : stores_) {
+    if (store->tx_backlog_waiters_.load(std::memory_order_seq_cst) == 0 ||
+        store->tx_backlog_notify_pending_.exchange(true,
+                                                   std::memory_order_acq_rel))
+      continue;
+    bycorf::PostNotification(
+        current.cross_core_, store->worker_->id(),
+        {store.get(), 0, [](void* context, std::uint64_t) noexcept {
+           auto& owner = *static_cast<WorkerStore*>(context);
+           owner.engine_->DeliverTxBacklogProgressLocal(owner);
+         }});
+  }
+}
+
+void StorageEngine::Impl::DeliverTxBacklogProgressLocal(WorkerStore& store) {
+  // Clear before reading the generation: a later producer either belongs to
+  // this delivery or queues another one. Duplicate hints are harmless.
+  store.tx_backlog_notify_pending_.store(false, std::memory_order_release);
+  const auto generation =
+      tx_backlog_progress_generation_.load(std::memory_order_seq_cst);
+  if (store.tx_backlog_wake_generation_ == generation) return;
+  store.tx_backlog_wake_generation_ = generation;
+  store.tx_backlog_progress_.NotifyAll(*store.worker_);
+}
+
+void StorageEngine::Impl::RequestTxCleaner(bool force) {
+  if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+      bycorf::ThisWorker().self_->stop_requested() ||
+      tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+    return;
+  if (!force && (tx_cleaner_running_.load(std::memory_order_acquire) ||
+                 !tx_cleaner_dirty_.load(std::memory_order_acquire) ||
+                 MonotonicMillis() <
+                     tx_cleaner_next_run_ms_.load(std::memory_order_acquire)))
+    return;
+  bool expected = false;
+  if (!tx_cleaner_scheduled_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel, std::memory_order_acquire))
+    return;
+  TxCleanerRequest request(this, [](Impl* engine) {
+    engine->tx_cleaner_scheduled_.store(false, std::memory_order_release);
+  });
+  // The frame owns request before publication, including allocation failure
+  // and Spawn's stop-time discard path. A queued task is visible to shutdown.
+  auto task = RunRequestedTxCleaner(std::move(request), force);
+  bycorf::ThisWorker().self_->SpawnBackground(std::move(task));
+}
+
+Task<absl::Status> StorageEngine::Impl::RunRequestedTxCleaner(
+    TxCleanerRequest request, bool force) {
+  (void)request;
+  auto* worker = bycorf::ThisWorker().self_;
+  for (;;) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        worker->stop_requested() || RuntimeFailureLatched() ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+      co_return absl::OkStatus();
+    if (force) {
+      if (tx_backlog_waiters_.load(std::memory_order_seq_cst) == 0 ||
+          !TxBacklogAtLimit())
+        co_return absl::OkStatus();
+      const auto now = MonotonicMillis();
+      const auto next = tx_backlog_retry_ms_.load(std::memory_order_acquire);
+      if (now < next) {
+        // One timer owns the pressure retry, including when another foreground
+        // cleaner is running or a new waiter arrives just after the last round.
+        const auto waited = co_await bycorf::SleepFor(
+            *worker, std::chrono::milliseconds(next - now));
+        if (!waited.ok()) co_return waited;
+        continue;
+      }
+      tx_backlog_retry_ms_.store(now + 50, std::memory_order_release);
+    }
+    const auto status = co_await MaybeRunTxCleaner(force);
+    if (!status.ok() &&
+        !(absl::IsCancelled(status) &&
+          shutdown_flush_requested_.load(std::memory_order_acquire))) {
+      // Keep the full error in the log; admission receives its published code.
+      spdlog::warn("transaction cleaner round failed; retrying: {}",
+                   status.message());
+    }
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        worker->stop_requested() || RuntimeFailureLatched() ||
+        tx_backlog_waiters_.load(std::memory_order_seq_cst) == 0 ||
+        !TxBacklogAtLimit())
+      co_return status;
+    // One background retry serves every parked request. Preserve the old
+    // pressure retry cadence even when a round makes no progress or returns
+    // a retryable error, without giving each request its own polling timer.
+    force = true;
   }
 }
 
@@ -408,13 +553,30 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
         status = absl::FailedPreconditionError(
             "injected retryable transaction cleaner failure");
       });
-  if (status.ok()) status = co_await RunTxCleaner();
+  if (status.ok()) {
+#if LAVIK_FAULTS_ENABLED
+    if (tx_cleaner_round_for_test_)
+      status = tx_cleaner_round_for_test_();
+    else
+#endif
+      status = co_await RunTxCleaner();
+  }
   if (!status.ok()) {
     if (!(absl::IsCancelled(status) &&
           shutdown_flush_requested_.load(std::memory_order_acquire)))
       tx_cleaner_failures_.fetch_add(1, std::memory_order_relaxed);
     tx_cleaner_dirty_.store(true, std::memory_order_release);
   }
+  const bool retryable = absl::IsFailedPrecondition(status) ||
+                         absl::IsAborted(status) ||
+                         absl::IsResourceExhausted(status);
+  const auto admission_error =
+      status.ok() || retryable ? absl::StatusCode::kOk : status.code();
+  // Publish only after an actual round: a concurrent caller that lost the
+  // running CAS must not erase another round's error. This is an admission
+  // result, not a new permanent engine failure latch.
+  tx_backlog_cleaner_error_.store(admission_error, std::memory_order_release);
+  if (admission_error != absl::StatusCode::kOk) NotifyTxBacklogProgress();
   co_return status;
 }
 
@@ -606,6 +768,9 @@ Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
   // be removed even though dependent references remain until cold retirement.
   store.tx_backlog_bytes_.fetch_sub(retired_backlog_bytes,
                                     std::memory_order_release);
+  // Wake at each completed block retirement, while the round can continue
+  // retiring other blocks. Admission still checks every pressured owner.
+  NotifyTxBacklogProgress();
   if (returned.ok()) {
     // UUID and extent dependencies stay live until the source allocation bit
     // is durably clear, even after the tagged winners have moved.

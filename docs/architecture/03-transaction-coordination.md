@@ -168,6 +168,10 @@ The command layer waits for the storage Tx backlog before taking key intents
 for a new write transaction. That gate does not apply to a transaction already
 holding its receipt: its participants continue through writes and commit, even
 if the backlog crosses the admission threshold while they run.
+Admission waiters suspend on progress notifications and recheck the gate after
+waking; a notification does not reserve capacity or grant admission. Backlog
+admission can request a coalesced background cleaner round without waiting for
+that entire round to finish.
 
 Multi-step commands inside EXEC or Lua have a command-local undo boundary
 within the outer storage transaction. MSET and MSETNX complete their write

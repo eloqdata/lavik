@@ -22,9 +22,11 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
   const auto interval = std::chrono::milliseconds(options_.flush_max_ms_);
   while (!store->worker_->stop_requested()) {
     absl::Status status = co_await bycorf::SleepFor(*store->worker_, interval);
+    DeliverTxBacklogProgressLocal(*store);
     if (!status.ok()) {
       CompleteShutdownFlush(status);
       store->durability_progress_.NotifyAll(*store->worker_);
+      store->tx_backlog_progress_.NotifyAll(*store->worker_);
       co_return status;
     }
     if (store->worker_->stop_requested()) {
@@ -150,20 +152,16 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       SealIdleTxBlocksLocal(*store);
     }
     RequestIndirectKeyCleaning(*store);
-    status = co_await MaybeRunTxCleaner();
-    if (!status.ok() &&
-        !(absl::IsCancelled(status) &&
-          shutdown_flush_requested_.load(std::memory_order_acquire))) {
-      // Cleaner races (pins, foreground replacement) and allocation pressure
-      // are retryable background-maintenance failures. They must never stop
-      // this worker's periodic flush loop or masquerade as completion of a
-      // shutdown drain. MaybeRunTxCleaner has already re-armed dirty state;
-      // record the failure and retry after the configured cooldown.
-      spdlog::warn("worker[{}] transaction cleaner round failed; retrying: {}",
-                   store->worker_->id(), status.message());
-    }
+    // Keep periodic flush available to deliver rare non-runtime progress
+    // notifications while a cleaner round is suspended in promotion I/O.
+    // A waiter can register as the previous driver exits. This owner-local
+    // fallback requests another coalesced driver without waiting for the
+    // ordinary cooldown; pressure retry pacing remains inside that driver.
+    RequestTxCleaner(tx_backlog_waiters_.load(std::memory_order_seq_cst) != 0 &&
+                     TxBacklogAtLimit());
   }
   store->durability_progress_.NotifyAll(*store->worker_);
+  store->tx_backlog_progress_.NotifyAll(*store->worker_);
   co_return absl::OkStatus();
 }
 

@@ -1099,7 +1099,9 @@ their Tx blocks can become reclaimable. Once leases have ended, a snapshot may
 still pin the sealed blocks; admission does not wait for that reader to release
 them. The admission threshold is independent of the device's remaining
 free-block count. Writes continue while the cleaner retires old blocks;
-standalone grouped writes attempt cleanup before acquiring a transaction lease
+transaction lease completion and individual Tx-block retirement notify
+admission waiters, which recheck whether the backlog still requires waiting.
+Standalone grouped writes attempt cleanup before acquiring a transaction lease
 when the current stream cannot hold the planned append. The allocator decides
 whether a successor block is available.
 Transaction receipts hold a shared lease until the transaction can no longer
@@ -1109,10 +1111,11 @@ makes the membership of eligible transactions complete even when
 workers append concurrently. A final snapshot after promotion confirms that
 no live tagged winner still needs each decision. Online cleaning yields to
 shutdown between record relocations, retaining the source allocation and any
-outstanding destination durability fences. The shutdown flush makes staged
-copies durable before publishing its clean-shutdown proof. When a shutdown
-checkpoint is enabled, worker 0 ignores the online cooldown
-and completes this lifecycle to a fixed point after commit and flush drain;
+outstanding destination durability fences. Shutdown joins queued and running
+background cleaner work before freezing append streams. The shutdown flush
+makes staged copies durable before publishing its clean-shutdown proof. When a
+shutdown checkpoint is enabled, worker 0 ignores the online cooldown and
+completes this lifecycle to a fixed point after commit and flush drain;
 failure skips the checkpoint rather than weakening cold recovery.
 
 ## Crash-consistency invariants and failure behavior

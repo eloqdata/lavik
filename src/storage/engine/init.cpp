@@ -2184,6 +2184,7 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
   // participation and deadlock shutdown.
   shutdown_checkpoint_for_flush_ = ShutdownCheckpointEnabled();
   shutdown_flush_requested_.store(true, std::memory_order_release);
+  NotifyTxBacklogProgress();
   unsigned completed =
       shutdown_flush_completed_.load(std::memory_order_acquire);
   while (completed < worker_count_) {
@@ -2439,10 +2440,13 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
   // Join it locally before freezing append streams; doing this through the
   // global QuiesceExpiration helper would make workers submit to and wait on
   // themselves while every periodic flush owns the same shutdown barrier.
-  // Tomb Raider also touches indexes and record accounting across workers;
-  // join its cancellable round before any worker freezes append streams.
+  // Tomb Raider and the Tx cleaner also touch indexes and record accounting
+  // across workers. Join their rounds before any worker freezes append streams;
+  // a queued Tx cleaner is included even before its coroutine starts running.
   while (store->expiry_cycle_running_ || store->indirect_key_cleaner_running_ ||
-         tomb_raider_running_.load(std::memory_order_acquire)) {
+         tomb_raider_running_.load(std::memory_order_acquire) ||
+         tx_cleaner_scheduled_.load(std::memory_order_acquire) ||
+         tx_cleaner_running_.load(std::memory_order_acquire)) {
     absl::Status status = co_await bycorf::SleepFor(
         *store->worker_, std::chrono::milliseconds(1));
     if (!status.ok()) co_return status;
