@@ -175,7 +175,7 @@ class HashGroupEncoder {
 };
 
 // These versioned, little-endian payload codecs are independent of the outer
-// record framing. Outer records must checksum these COMPLETE payloads and
+// record framing. When enabled, CRC covers these COMPLETE payloads. Writers
 // include all group writes in the same durability/commit boundary as the root.
 absl::StatusOr<std::string> EncodeGroupedHashRoot(const GroupedHashRoot& root);
 absl::StatusOr<GroupedHashRoot> DecodeGroupedHashRoot(std::string_view bytes);
@@ -188,7 +188,8 @@ struct HashGroupMetadata {
 
 // Checks only the envelope, for recovery of extent-backed groups without
 // materializing their values. The caller must independently verify the
-// physical payload checksum and extent identity; this is not a payload check.
+// physical payload checksum when present and extent identity; this is not a
+// payload check.
 absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes);
 absl::StatusOr<std::string> EncodeHashGroup(const HashGroupSnapshot& group);

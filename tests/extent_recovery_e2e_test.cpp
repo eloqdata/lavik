@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -223,6 +224,49 @@ void CreateDataFile(const std::string& path, std::uint64_t bytes) {
   }
 }
 
+// Inspect persisted flags so round trips cannot hide a writer that ignores
+// the startup option. A recovered append block may contain both policies.
+unsigned RecordCrcPolicies(const std::string& path) {
+  using namespace lavik::storage;
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  const auto blocks =
+      static_cast<std::uint64_t>(input.tellg()) / kStorageBlockBytes;
+  unsigned policies = 0;
+  std::array<std::byte, kBlockHeaderBytes> pages{};
+  for (std::uint64_t id = DataBlockBegin(blocks); id < blocks; ++id) {
+    input.seekg(id * kStorageBlockBytes);
+    input.read(reinterpret_cast<char*>(pages.data()), pages.size());
+    if (!input) Fail("reading mixed CRC block header failed");
+    BlockHeader block;
+    if (!DecodeBlockHeaderPages(pages, &block) ||
+        block.kind_ != BlockKind::kRecords || block.record_count_ == 0)
+      continue;
+    std::vector<std::byte> body(block.committed_bytes_ - kBlockHeaderBytes);
+    input.read(reinterpret_cast<char*>(body.data()), body.size());
+    if (!input) Fail("reading mixed CRC records failed");
+    std::size_t offset = 0;
+    unsigned records = 0;
+    while (offset + kRecordHeaderBaseBytes <= body.size()) {
+      std::uint64_t magic = 0;
+      std::memcpy(&magic, body.data() + offset, sizeof(magic));
+      if (magic == 0) {
+        offset += kRecordAlignment;
+        continue;
+      }
+      RecordHeader record;
+      std::string_view key;
+      if (!DecodeRecordHeader(std::span(body).subspan(offset), &record, &key) ||
+          record.total_disk_bytes_ > body.size() - offset)
+        Fail("invalid mixed CRC record header");
+      policies |= record.no_crc_ ? 1 : 2;
+      offset += record.total_disk_bytes_;
+      ++records;
+    }
+    if (records != block.record_count_) Fail("mixed CRC record count mismatch");
+  }
+  return policies;
+}
+
 RespClient Connect(std::uint16_t port) {
   const auto deadline = std::chrono::steady_clock::now() + 30s;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -403,6 +447,60 @@ int main(int argc, char** argv) {
     const std::string data_path = prefix + ".data";
     const std::string log_path = prefix + ".log";
     const std::uint16_t port = FindFreePort();
+    (void)::unlink(data_path.c_str());
+    (void)::unlink(log_path.c_str());
+
+    // Alternate startup policies on one device. Previously written records,
+    // extent payloads and indirect keys retain their own verification policy.
+    // Keep defrag paused so relocation cannot convert every older record to
+    // the current policy before inspecting the mixed flags. The final boot
+    // reads both policies with CRC generation enabled again.
+    CreateDataFile(data_path, 512ULL * 1024 * 1024);
+    std::vector<std::pair<std::string, std::string>> mixed_records;
+    for (int boot = 0; boot < 4; ++boot) {
+      std::vector<std::string> arguments{"--defrag-paused"};
+      if (boot % 2 != 0) arguments.emplace_back("--record-crc");
+      ServerProcess server(argv[1], port, data_path, log_path, 2, arguments);
+      RespClient client = ConnectReady(port);
+      if (boot == 0) {
+        // Catalog extents use the shared writer but must keep mandatory CRCs.
+        if (client.CommandBulkLength(
+                {"FUNCTION", "LOAD",
+                 "#!lua name=cccc\n"
+                 "redis.register_function('crc_policy_probe', "
+                 "function(keys, args) return 42 end)"},
+                'c') != 4) {
+          Fail("loading CRC policy probe function failed");
+        }
+      }
+      Expect(client.Command({"FCALL", "crc_policy_probe", "0"}), ":42",
+             "catalog recovery across CRC policy switches");
+      for (const auto& [key, payload] : mixed_records) {
+        if (client.CommandBulkLength({"GET", key}, payload.front()) !=
+            static_cast<std::int64_t>(payload.size())) {
+          Fail("mixed CRC record changed after policy switch");
+        }
+      }
+      if (boot < 3) {
+        const std::string prefix = "crc-boot-" + std::to_string(boot);
+        for (const auto& [key, payload] :
+             std::vector<std::pair<std::string, std::string>>{
+                 {prefix, std::string(200, 'i')},
+                 {prefix + "-extent", std::string(9 * 1024 * 1024, 'e')},
+                 {prefix + std::string(3000, 'k'), std::string(200, 'l')},
+                 {prefix + std::string(9 * 1024 * 1024, 'K'),
+                  std::string(200, 'L')}}) {
+          Expect(client.Command({"SET", key, payload}), "+OK", "mixed CRC SET");
+          mixed_records.emplace_back(key, payload);
+        }
+      }
+      server.Stop();
+      const unsigned policies = RecordCrcPolicies(data_path);
+      if (policies != (boot == 0 ? 1U : 3U)) {
+        Fail("persisted record CRC flags at boot " + std::to_string(boot) +
+             " do not match startup policies: " + std::to_string(policies));
+      }
+    }
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
 

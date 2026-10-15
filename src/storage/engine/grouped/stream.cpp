@@ -87,6 +87,9 @@ struct StorageEngine::Impl::StreamPageAccess {
   std::string_view key_;
   const Digest& digest_;
   GroupedObject::Handle object_;
+  bool unlocked_ = false;
+  std::uint64_t bytes_since_yield_ = 0;
+  unsigned pages_since_yield_ = 0;
   std::vector<MemoryReservation> reservations_{};
   std::map<std::size_t, LoadedOrderedGroup> pages_{};
   std::map<std::size_t, MemoryReservation> page_reservations_{};
@@ -94,6 +97,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   Task<absl::Status> Load(std::size_t index) {
     if (pages_.contains(index)) co_return absl::OkStatus();
     const auto& groups = object_->ordered_directory().groups();
+    const auto encoded_bytes = groups[index].encoded_bytes_;
     const GroupedRecordId id{groups[index].id_, 0};
     const auto* physical = object_->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing Stream page");
@@ -119,6 +123,19 @@ struct StorageEngine::Impl::StreamPageAccess {
       if (!remembered.ok()) co_return remembered;
     }
     pages_.emplace(index, std::move(*page));
+    if (unlocked_) {
+      // A hot append touches a few small pages. Avoid a scheduler round per
+      // lookup while bounding longer synchronous preparation by bytes and
+      // page count. Oversized indivisible pages yield after decoding; their
+      // owned snapshot and admission are already retained by this cache.
+      constexpr std::uint64_t kYieldBytes = 256 * 1024;
+      bytes_since_yield_ += std::min(encoded_bytes, kYieldBytes);
+      if (++pages_since_yield_ >= 32 || bytes_since_yield_ >= kYieldBytes) {
+        bytes_since_yield_ = 0;
+        pages_since_yield_ = 0;
+        co_await bycorf::Yield(*store_.worker_);
+      }
+    }
     co_return absl::OkStatus();
   }
   Task<absl::StatusOr<std::size_t>> Route(std::string_view wanted) {
@@ -571,6 +588,26 @@ struct StorageEngine::Impl::StreamPageAccess {
            Record(std::string_view("\0", 1), bytes));
     co_return result;
   }
+  Task<absl::Status> Finish(OrderedCollectionMutationPlan plan,
+                            std::uint64_t expire_at_ms, TxShardWrites* tx,
+                            ReplicationCommandAppend* replication,
+                            const MutationPrecondition* mutation_precondition,
+                            PreparedStreamMutation* prepared) {
+    if (prepared != nullptr) {
+      // Plan owns the decoded after-images, so their admission must outlive
+      // this page cache and the caller's subsequent store-lock wait.
+      prepared->reservations_ = std::move(reservations_);
+      for (auto& [index, charge] : page_reservations_)
+        prepared->reservations_.push_back(std::move(charge));
+      prepared->plan_ = std::move(plan);
+      prepared->expire_at_ms_ = expire_at_ms;
+      co_return absl::OkStatus();
+    }
+    co_return co_await engine_.CommitGroupedOrderedMutationLocked(
+        store_, partition_, db_id_, key_, digest_, object_, std::move(plan),
+        expire_at_ms, tx, replication, mutation_precondition);
+  }
+
   Task<absl::StatusOr<OrderedCollectionMutationPlan>> Plan(
       std::vector<StreamRecordChange> changes, std::uint64_t length,
       std::vector<std::uint64_t> retired = {}) {
@@ -632,13 +669,15 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
     GroupedObject::Handle object, const CompactValueCallback& callback,
     std::uint32_t node_max_entries, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    PreparedStreamMutation* prepared) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid grouped Stream append view");
   const auto& directory = object->ordered_directory();
   const auto length = directory.root().logical_size();
-  StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+  StreamPageAccess cache{*this, store,  partition, db_id,
+                         key,   digest, object,    prepared != nullptr};
   auto& pages = cache.pages_;
   auto load = [&](std::size_t index) { return cache.Load(index); };
   auto route = [&](std::string_view wanted) { return cache.Route(wanted); };
@@ -668,6 +707,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   if (!added.ok()) co_return added;
   auto admitted = incoming.Reserve(6);
   if (!admitted.ok()) co_return admitted.status();
+  cache.reservations_.push_back(std::move(*admitted));
   auto records = DecodeStreamRecords(update->encoded_, 1);
   if (!records.ok()) co_return records.status();
   // One header, entry, node-count, node and group-count, with no groups. This
@@ -748,10 +788,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   auto plan =
       co_await cache.Plan(std::move(changes), final_length, std::move(retired));
   if (!plan.ok()) co_return plan.status();
-  co_return co_await CommitGroupedOrderedMutationLocked(
-      store, partition, db_id, key, digest, object, std::move(*plan),
+  co_return co_await cache.Finish(
+      std::move(*plan),
       update->expire_at_ms_.value_or(object->version().root_.expire_at_ms_), tx,
-      replication, mutation_precondition);
+      replication, mutation_precondition, prepared);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
@@ -759,8 +799,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
-  StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    const MutationPrecondition* mutation_precondition,
+    PreparedStreamMutation* prepared) {
+  StreamPageAccess cache{*this, store,  partition, db_id,
+                         key,   digest, object,    prepared != nullptr};
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -806,10 +848,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
                      .record_ = Record(std::string_view("\0", 1), bytes)});
   auto plan = co_await cache.Plan(std::move(changes), length);
   if (!plan.ok()) co_return plan.status();
-  co_return co_await CommitGroupedOrderedMutationLocked(
-      store, partition, db_id, key, digest, object, std::move(*plan),
-      object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
+  co_return co_await cache.Finish(std::move(*plan),
+                                  object->version().root_.expire_at_ms_, tx,
+                                  replication, mutation_precondition, prepared);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
@@ -1005,8 +1046,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
-  StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    const MutationPrecondition* mutation_precondition,
+    PreparedStreamMutation* prepared) {
+  StreamPageAccess cache{*this, store,  partition, db_id,
+                         key,   digest, object,    prepared != nullptr};
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -1036,10 +1079,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
   auto plan = co_await cache.Plan(std::move(changes), result->length_,
                                   std::move(retired));
   if (!plan.ok()) co_return plan.status();
-  co_return co_await CommitGroupedOrderedMutationLocked(
-      store, partition, db_id, key, digest, object, std::move(*plan),
-      object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
+  co_return co_await cache.Finish(std::move(*plan),
+                                  object->version().root_.expire_at_ms_, tx,
+                                  replication, mutation_precondition, prepared);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
@@ -1048,8 +1090,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamDeleteAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
-  StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+    const MutationPrecondition* mutation_precondition,
+    PreparedStreamMutation* prepared) {
+  StreamPageAccess cache{*this, store,  partition, db_id,
+                         key,   digest, object,    prepared != nullptr};
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -1160,10 +1204,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
                      .record_ = Record(std::string_view("\0", 1), new_header)});
   auto plan = co_await cache.Plan(std::move(changes), length - deleted.size());
   if (!plan.ok()) co_return plan.status();
-  co_return co_await CommitGroupedOrderedMutationLocked(
-      store, partition, db_id, key, digest, object, std::move(*plan),
-      object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
+  co_return co_await cache.Finish(std::move(*plan),
+                                  object->version().root_.expire_at_ms_, tx,
+                                  replication, mutation_precondition, prepared);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
@@ -1172,11 +1215,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
     GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamAckAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    PreparedStreamMutation* prepared) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid Stream ACK view");
-  StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+  StreamPageAccess cache{*this, store,  partition, db_id,
+                         key,   digest, object,    prepared != nullptr};
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -1253,10 +1298,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
   auto plan = co_await cache.Plan(
       std::move(changes), object->ordered_directory().root().logical_size());
   if (!plan.ok()) co_return plan.status();
-  co_return co_await CommitGroupedOrderedMutationLocked(
-      store, partition, db_id, key, digest, object, std::move(*plan),
-      object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
+  co_return co_await cache.Finish(std::move(*plan),
+                                  object->version().root_.expire_at_ms_, tx,
+                                  replication, mutation_precondition, prepared);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
@@ -1265,11 +1309,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     GroupedObject::Handle object, const CompactValueCallback& callback,
     const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    PreparedStreamMutation* prepared) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid partial Stream group view");
-  StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+  StreamPageAccess cache{*this, store,  partition, db_id,
+                         key,   digest, object,    prepared != nullptr};
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto header_payload = StreamRecordPayload(*header);
@@ -1431,6 +1477,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
   if (!incoming_size.ok()) co_return incoming_size;
   auto incoming_charge = incoming_budget.Reserve(8);
   if (!incoming_charge.ok()) co_return incoming_charge.status();
+  cache.reservations_.push_back(std::move(*incoming_charge));
   std::string partial(*header_payload);
   SetCount(partial, 44, entries.size());
   for (const auto& entry : entries) {
@@ -1515,10 +1562,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
         std::move(changes), object->ordered_directory().root().logical_size(),
         std::move(retired));
     if (!plan.ok()) co_return plan.status();
-    co_return co_await CommitGroupedOrderedMutationLocked(
-        store, partition, db_id, key, digest, object, std::move(*plan),
-        object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition);
+    co_return co_await cache.Finish(
+        std::move(*plan), object->version().root_.expire_at_ms_, tx,
+        replication, mutation_precondition, prepared);
   }
   if (!*group && !access.create_)
     co_return absl::InvalidArgumentError("partial Stream group was created");
@@ -1617,10 +1663,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
       std::move(changes), object->ordered_directory().root().logical_size(),
       std::move(retired));
   if (!plan.ok()) co_return plan.status();
-  co_return co_await CommitGroupedOrderedMutationLocked(
-      store, partition, db_id, key, digest, object, std::move(*plan),
-      object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
+  co_return co_await cache.Finish(std::move(*plan),
+                                  object->version().root_.expire_at_ms_, tx,
+                                  replication, mutation_precondition, prepared);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(

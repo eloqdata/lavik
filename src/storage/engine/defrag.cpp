@@ -22,7 +22,7 @@ namespace lavik::storage {
 namespace {
 
 bool CheckPayloadOnKeyOwner(const RecordHeader& record) noexcept {
-  // These keys are contained in the checksummed header; routing and deciding
+  // These keys are contained in the header; routing and deciding
   // whether the record is still current need no payload bytes. Extent/key
   // manifests and transaction/group records retain the eager validation path.
   return record.kind_ == RecordKind::kValue &&
@@ -623,9 +623,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   if (EffectiveRecordDbEpoch(partition, record.db_id_) != record.db_epoch_) {
     co_return std::optional<RelocationDurabilityFence>{};
   }
-  const bool verify_payload = CheckPayloadOnKeyOwner(record);
+  const bool verify_payload = !record.no_crc_ && CheckPayloadOnKeyOwner(record);
   if (verify_payload &&
-      Crc32c(std::as_bytes(std::span(value))) != record.payload_checksum_) {
+      !ValidateRecordPayload(record, std::as_bytes(std::span(value)))) {
     co_return absl::InternalError("payload checksum mismatch during defrag");
   }
   const RelocationSource source{
@@ -1027,9 +1027,9 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     // An obsolete inline string cannot become a recovery winner through this
     // pass. Let its key owner prove that it is still current before spending
     // CPU on the payload; the immutable scan buffer stays alive across that
-    // await. Every payload that is actually copied is checked before writing.
+    // await. Every copied payload with a CRC is checked before writing.
     if (!CheckPayloadOnKeyOwner(record) &&
-        Crc32c(payload) != record.payload_checksum_) {
+        !ValidateRecordPayload(record, payload)) {
       source.defragging_ = false;
       co_return absl::Status(absl::StatusCode::kInternal,
                              "payload checksum mismatch during defrag");

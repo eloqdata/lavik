@@ -196,7 +196,8 @@ such allocated block to free space without replaying its contents.
 Records are 8-byte aligned and carry their database and value type, key
 representation, logical and physical sizes, transaction ID, database and
 replication epochs, logical mutation sequence, absolute expiration time,
-physical LSN, allocation epoch, and payload and header checksums. A key digest
+physical LSN, allocation epoch, and a per-record CRC policy with payload and
+header checksum fields. A key digest
 is deliberately absent from authoritative ordinary records: cold recovery
 reconstructs it from the complete key under a fresh random seed. An optional
 shutdown checkpoint can persist both its snapshot digests and their seed as
@@ -210,7 +211,7 @@ The version-1 record wire layout has a 72-byte base header at explicit byte
 offsets. A nonzero transaction ID and expiration timestamp each add one aligned
 8-byte extension, so ordinary fixed metadata is 72, 80, or 88 bytes. The base packs
 record kind, database, value type, external-payload state, indirect-key state,
-grouped-root and auxiliary-group markers, and extension presence into one
+grouped-root and auxiliary-group markers, CRC policy, and extension presence into one
 16-bit word. An auxiliary group carries an additional 32-byte checked
 identity containing its object incarnation, routing identity, retirement bit
 and optional nested-command transaction decision.
@@ -228,6 +229,18 @@ Header length is derived from
 those flags and key length; total record length is derived from header and
 payload length. Neither derived length is stored. The decoded `RecordHeader`
 is a runtime view rather than a persisted C++ object representation.
+
+Data record and value/key extent CRC generation is disabled by default and
+selected at startup through `record-crc`. Each record persists a `no_crc` bit;
+zero retains the checksummed interpretation of earlier records in this layout.
+No-CRC records keep both checksum fields zero. Readers, recovery and defrag
+honor each stored object's policy independently of the current startup option,
+so records from alternating settings coexist. Structural, identity and bounds
+validation always applies. Rewritten records use the current write policy;
+reused extents retain their own persisted policy, protected by their block
+header CRC. Device labels, block headers, fixed metadata, shutdown checkpoints,
+system-state/catalog extents and replication frames always retain their CRCs.
+Readers predating these flags cannot consume no-CRC objects.
 
 The compact Stream payload uses the current `LXS1` layout, including persisted
 macro-node entry counts that preserve approximate-trim boundaries across
@@ -265,7 +278,7 @@ A KeyRecord is durable before a referencing user record can enter staging.
 Indivisible values and oversized KeyRecords use a record containing an extent
 manifest. Each reference identifies a dedicated extent block by block ID,
 allocation epoch, byte count, and payload checksum. The extent header repeats
-its index, length, and checksum. User value manifests contain only value bytes;
+its index, length, and checksum, plus an independent no-CRC flag. User value manifests contain only value bytes;
 they never repeat the original long key.
 
 Every allocated user-record block retains its UUID references, including
@@ -494,13 +507,14 @@ publishes no key.
 Creation within transactions, multi-key and native candidate/loading adapters
 retains their separate preparation contracts.
 
-Existing grouped Hash/Set point writes and typed List/Sorted Set writes also
-prepare private pages without worker store state, including under retained
-EXEC/Lua key intents. They carry immutable predecessor metadata and admitted
-page ownership through preparation, then reacquire state and validate population
-and logical identity before any publication or successful no-op. Sorted Set
-preparation covers both the ordered and member graphs. GC-only physical moves
-are refreshed, not treated as conflicting logical writes. Random Set pops,
+Existing grouped Hash/Set point writes, String segment writes and typed
+List/Sorted Set/Stream writes also prepare private pages without worker store
+state, including under retained EXEC/Lua key intents. They carry immutable
+predecessor metadata and admitted page ownership through preparation, then
+reacquire state and validate population and logical identity before any
+publication or successful no-op. Sorted Set preparation covers both the ordered
+and member graphs. GC-only physical moves are refreshed, not treated as
+conflicting logical writes. Random Set pops,
 full-image callbacks, promotion and candidate ingestion retain their separate
 preparation contracts; all paths share the same atomic grouped writer.
 

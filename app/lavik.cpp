@@ -77,6 +77,9 @@ int main(int argc, char** argv) {
                  "Storage backend: uring or spdk")
       ->check(CLI::IsMember({"uring", "spdk"}))
       ->capture_default_str();
+  app.add_flag("--record-crc,!--no-record-crc", options.record_crc_,
+               "Enable CRC for newly written data records and value extents")
+      ->capture_default_str();
   app.add_option("-b,--bind", options.bind_addresses_,
                  "Bind address or hostname; repeat for multiple addresses")
       ->capture_default_str();
