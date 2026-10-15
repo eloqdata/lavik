@@ -26,6 +26,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     if (!status.ok()) {
       CompleteShutdownFlush(status);
       store->durability_progress_.NotifyAll(*store->worker_);
+      store->tx_cleaner_capacity_progress_.NotifyAll(*store->worker_);
       co_return status;
     }
     if (store->worker_->stop_requested()) {
@@ -35,6 +36,13 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     // Normal progress is notified by I/O completion, without a timer wait.
     if (store->write_failed_ || RuntimeFailureLatched())
       store->durability_progress_.NotifyAll(*store->worker_);
+    // External shutdown/configuration callers cannot post owner notifications.
+    // Actual cleaner completions and block returns wake capacity waiters at
+    // once; this only delivers control-state changes from outside the runtime.
+    if (store->write_failed_ || RuntimeFailureLatched() ||
+        shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+      store->tx_cleaner_capacity_progress_.NotifyAll(*store->worker_);
 
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       status = co_await FlushWorkerForShutdown(store);
@@ -157,6 +165,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     RequestTxCleaner(HasSealedTxBacklog());
   }
   store->durability_progress_.NotifyAll(*store->worker_);
+  store->tx_cleaner_capacity_progress_.NotifyAll(*store->worker_);
   co_return absl::OkStatus();
 }
 

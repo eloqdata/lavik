@@ -1432,22 +1432,21 @@ int main(int argc, char** argv) {
     // periodic flush coroutine or report a shutdown drain as complete. The
     // same process must run a later round and retire the transaction block.
     // Fresh media makes later retirement evidence belong to this fixture.
-    // An initial background round may consume the one-shot failure before
-    // CONFIG disables cleaning, even without any recovered sealed blocks.
+    // Pause from startup so an empty initial round cannot consume the
+    // one-shot failure before this fixture has sealed its own transaction.
     CreateDataFile(retry_data_path, 512ULL * 1024 * 1024);
     ServerProcess retry_server(argv[1], port, retry_data_path, log_path, {}, {},
-                               true);
+                               true, 4, {}, {}, {}, false, {}, {}, true);
     RespClient retry = ConnectReady(port);
-    Expect(retry.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
-           "+OK", "hold cleanup until the retry fixture seals its own block");
+    Expect(retry.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
+           "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("0"),
+           "transaction cleaner is paused before the retry fixture");
     const std::uint64_t retry_retired_baseline = TxCleanerRetiredBlocks(retry);
     Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
                           "cleaner-retry-b{tx}", "durable-b"}),
            "+OK", "seed retryable cleaner failure");
-    // Require new retirement after the failure, regardless of whether it was
-    // observed during startup or while cleaning this newly sealed stream.
-    // The focused pipeline test separately controls the exact failing round
-    // and proves a retry occurs without another foreground request.
+    // The first enabled round must fail; subsequent retirement proves the
+    // background driver retries without another foreground write.
     const std::string retry_fill(5 * 1024 * 1024, 'r');
     Expect(retry.Command({"MSET", "cleaner-retry-fill-a{tx}", retry_fill,
                           "cleaner-retry-fill-b{tx}", retry_fill}),

@@ -263,6 +263,9 @@ class ReplicationLogService final : public bycorf::Service {
     if (result_.ok()) result_ = co_await storage_->CompleteStorageStartup();
     if (result_.ok() && exercise_) {
       result_ = co_await Exercise();
+      if (!result_.ok()) {
+        (void)co_await ReportStorageFailure(current_stage_, 0, {});
+      }
     }
     worker.RequestStop();
     co_return result_;
@@ -4363,44 +4366,60 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> Exercise() {
+    current_stage_ = "transactional FULL publication";
     absl::Status status = co_await ExerciseTransactionalFullSyncPublication();
     if (!status.ok()) co_return status;
+    current_stage_ = "blocking initial-attempt admission";
     status = co_await ExerciseBlockingInitialAttemptAdmission();
     if (!status.ok()) co_return status;
+    current_stage_ = "replica backup admission";
     status = co_await ExerciseReplicaBackupAdmission();
     if (!status.ok()) co_return status;
+    current_stage_ = "scanned-key storage change order";
     status = co_await ExerciseScannedKeyStorageChangeOrder();
     if (!status.ok()) co_return status;
+    current_stage_ = "tailing mutation during partition scan";
     status = co_await ExerciseTailingMutationDuringNextPartitionScan();
     if (!status.ok()) co_return status;
+    current_stage_ = "empty FULL databases";
     status = co_await ExerciseEmptyFullSyncDbs();
     if (!status.ok()) co_return status;
+    current_stage_ = "shared-history quota";
     status = co_await ExerciseSharedHistoryQuota();
     if (!status.ok()) co_return status;
+    current_stage_ = "mutation precondition";
     status = co_await ExerciseMutationPrecondition();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "admission and ordering";
     status = co_await ExerciseAdmissionAndOrdering();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "backlog storage";
     status = co_await ExerciseBacklogStorage();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "published String commands";
     status = co_await ExercisePublishedStringCommands();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "published collection commands";
     status = co_await ExercisePublishedCollectionCommands();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "published wide-argument command";
     status = co_await ExercisePublishedWideArgumentCommand();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "FLUSH control barriers";
     status = co_await ExerciseFlushControlBarriers();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "FULL sync during tombstone reaping";
     status = co_await ExerciseFullSyncDuringTombstoneReaping();
     if (!status.ok()) co_return status;
 
+    current_stage_ = "FULL command coverage";
     status = co_await ExerciseFullCommandCoverage();
     if (!status.ok()) co_return status;
 
@@ -4412,6 +4431,7 @@ class ReplicationLogService final : public bycorf::Service {
   StorageEngine* storage_ = nullptr;
   bycorf::Worker* worker_ = nullptr;
   bool exercise_ = false;
+  std::string_view current_stage_ = "exercise startup";
   absl::Status result_ = absl::UnknownError("test service did not run");
 };
 

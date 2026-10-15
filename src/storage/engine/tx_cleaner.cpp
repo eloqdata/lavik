@@ -192,6 +192,7 @@ absl::Status StorageEngine::Impl::ConfigureTxCleanerCooldown(
   tx_cleaner_next_run_ms_.store(0, std::memory_order_release);
   tx_cleaner_dirty_.store(true, std::memory_order_release);
   RequestTxCleaner(false);
+  if (cooldown_ms == 0) NotifyTxCleanerCapacityWaiters();
   return absl::OkStatus();
 }
 
@@ -346,6 +347,74 @@ Task<absl::Status> StorageEngine::Impl::RunRequestedTxCleaner(
   }
 }
 
+void StorageEngine::Impl::NotifyTxCleanerCapacityWaiters() noexcept {
+  // Publish every reason to recheck before inspecting registrations. The
+  // seq_cst generation/count handshake covers registration racing a producer
+  // that sees zero waiters and therefore sends no message.
+  tx_cleaner_capacity_generation_.fetch_add(1, std::memory_order_seq_cst);
+  const auto& current = bycorf::ThisWorker();
+  if (current.self_ == nullptr || current.cross_core_ == nullptr) return;
+  for (const auto& owned : stores_) {
+    if (!owned) continue;
+    auto& store = *owned;
+    if (store.worker_ == nullptr ||
+        store.tx_cleaner_capacity_waiters_.load(std::memory_order_seq_cst) == 0)
+      continue;
+    if (store.worker_ == current.self_) {
+      store.tx_cleaner_capacity_progress_.NotifyAll(*store.worker_);
+    } else {
+      // Like block-pin handback, the notification borrows the stable store,
+      // not a coroutine-local waiter. Callbacks run only in owner event loops;
+      // all loops and detached frames stop before stores are finalized. No
+      // detached task retains an Impl pointer beyond that lifecycle boundary.
+      bycorf::PostNotification(
+          current.cross_core_, store.worker_->id(),
+          {&store, 0, [](void* context, std::uint64_t) noexcept {
+             auto& target = *static_cast<WorkerStore*>(context);
+             target.tx_cleaner_capacity_progress_.NotifyAll(*target.worker_);
+           }});
+    }
+  }
+}
+
+Task<bool> StorageEngine::Impl::AwaitRunningTxCleanerForCapacity(
+    WorkerStore& store, std::uint64_t completed_before,
+    std::uint64_t space_before) {
+  store.tx_cleaner_capacity_waiters_.fetch_add(1, std::memory_order_seq_cst);
+  struct Registration {
+    std::atomic<unsigned>& count_;
+    ~Registration() { count_.fetch_sub(1, std::memory_order_seq_cst); }
+  } registration{store.tx_cleaner_capacity_waiters_};
+  for (;;) {
+    const auto generation =
+        tx_cleaner_capacity_generation_.load(std::memory_order_seq_cst);
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        store.worker_->stop_requested() || store.write_failed_ ||
+        RuntimeFailureLatched() ||
+        tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0)
+      co_return false;
+    if (tx_cleaner_completed_rounds_.load(std::memory_order_acquire) !=
+        completed_before)
+      co_return true;
+    if (!tx_cleaner_running_.load(std::memory_order_acquire)) {
+      // Observing the guard's release store also makes its completion visible.
+      // Recheck: the round may have ended between our two loads above.
+      co_return tx_cleaner_completed_rounds_.load(std::memory_order_acquire) !=
+          completed_before;
+    }
+    if (space_reclaim_generation_.load(std::memory_order_acquire) !=
+        space_before)
+      co_return true;
+    if (tx_cleaner_capacity_generation_.load(std::memory_order_seq_cst) !=
+        generation)
+      continue;
+    // All notifications execute on this worker. With no await between the
+    // recheck and registration in Wait(), remote delivery cannot get ahead of
+    // the park. A retrying runner alone never keeps this waiter suspended.
+    co_await store.tx_cleaner_capacity_progress_.Wait();
+  }
+}
+
 void StorageEngine::Impl::SealIdleTxBlocksLocal(WorkerStore& store) {
   if (tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0) return;
   constexpr std::int64_t kIdleSealMs = 60'000;
@@ -404,9 +473,14 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
     co_return absl::OkStatus();
   }
   struct RunningGuard {
-    std::atomic<bool>* running_;
-    ~RunningGuard() { running_->store(false, std::memory_order_release); }
-  } guard{&tx_cleaner_running_};
+    Impl* engine_;
+    ~RunningGuard() {
+      engine_->tx_cleaner_completed_rounds_.fetch_add(
+          1, std::memory_order_release);
+      engine_->tx_cleaner_running_.store(false, std::memory_order_release);
+      engine_->NotifyTxCleanerCapacityWaiters();
+    }
+  } guard{this};
 
   tx_cleaner_dirty_.store(false, std::memory_order_release);
   tx_cleaner_next_run_ms_.store(now + static_cast<std::int64_t>(cooldown),
@@ -425,7 +499,7 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner(bool force) {
   if (status.ok()) {
 #if LAVIK_FAULTS_ENABLED
     if (tx_cleaner_round_for_test_)
-      status = tx_cleaner_round_for_test_();
+      status = co_await tx_cleaner_round_for_test_();
     else
 #endif
       status = co_await RunTxCleaner();
@@ -684,6 +758,7 @@ Task<absl::Status> StorageEngine::Impl::RetireTxBlockLocal(
     }
     tx_cleaner_retired_blocks_.fetch_add(1, std::memory_order_relaxed);
     space_reclaim_generation_.fetch_add(1, std::memory_order_release);
+    NotifyTxCleanerCapacityWaiters();
   }
   co_return returned;
 }

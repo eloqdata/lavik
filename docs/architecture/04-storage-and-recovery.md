@@ -872,6 +872,14 @@ as runnable progress, so a full-device write reports exhaustion instead of
 waiting forever. Resuming defrag allows later allocation to wait for and use
 the reclaimed block.
 
+A foreground writer that has released worker store state also waits for an
+already running transaction-cleaner round before treating exhaustion as final.
+Returning a block wakes capacity waiters immediately; round completion wakes
+them even if leases or pins prevented reclamation. Each allocation joins at
+most one round, so the cleaner's persistent retry loop cannot make a writer
+wait for its own live transaction. Relocation uses the protected reserve and
+does not join this foreground wait.
+
 Current reclaimed-block lifecycle is:
 
 ```text

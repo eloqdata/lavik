@@ -1643,6 +1643,10 @@ class StorageEngine::Impl {
   struct WorkerStore {
     Impl* engine_ = nullptr;
     bycorf::AsyncNotification block_pin_progress_;
+    // Only genuinely exhausted foreground allocations wait here. Notification
+    // delivery remains on this owner; producers inspect just the atomic count.
+    AsyncNotification tx_cleaner_capacity_progress_;
+    std::atomic<unsigned> tx_cleaner_capacity_waiters_{0};
     std::atomic<bool> remote_reads_ready_{false};
     std::atomic<std::uint64_t> remote_population_generation_{0};
     unsigned remote_population_holds_ = 0;
@@ -3387,6 +3391,7 @@ class StorageEngine::Impl {
             });
       }
     }
+    if (!already_failed) NotifyTxCleanerCapacityWaiters();
   }
   bool RuntimeFailureLatched() const noexcept {
     return runtime_failure_latched_.load(std::memory_order_acquire);
@@ -4606,6 +4611,12 @@ class StorageEngine::Impl {
   // suspending or imposing a second disk-capacity admission policy.
   absl::Status BeforeGroupedTransaction(WorkerStore& store);
   Task<absl::Status> MaybeRunTxCleaner(bool force = false);
+  // Called without store_state_mutex_ after a real foreground FULL. Join only
+  // an already running physical round, never the persistent retry driver.
+  Task<bool> AwaitRunningTxCleanerForCapacity(WorkerStore& store,
+                                              std::uint64_t completed_before,
+                                              std::uint64_t space_before);
+  void NotifyTxCleanerCapacityWaiters() noexcept;
   // The coroutine parameter owns the scheduled flag even if Spawn discards
   // a task before its first resume. Shutdown joins both queued and running
   // work.
@@ -4946,7 +4957,7 @@ class StorageEngine::Impl {
 #if LAVIK_FAULTS_ENABLED
   // Substitute only the physical round, preserving its scheduling, retry,
   // result publication and lifecycle behavior in deterministic runtime tests.
-  std::function<absl::Status()> tx_cleaner_round_for_test_;
+  std::function<Task<absl::Status>()> tx_cleaner_round_for_test_;
   // Observe the runner's planned retry delay without replacing its timers or
   // round execution. Also reports a runtime configuration shortening a wait.
   std::function<void(std::uint64_t)> tx_cleaner_retry_delay_for_test_;
@@ -4957,6 +4968,10 @@ class StorageEngine::Impl {
   std::atomic<std::int64_t> tx_cleaner_next_run_ms_{0};
   std::atomic<bool> tx_cleaner_dirty_{true};
   std::atomic<bool> tx_cleaner_running_{false};
+  // Completion changes even if another physical round starts immediately;
+  // allocator waiters must not mistake running false->true for the same round.
+  std::atomic<std::uint64_t> tx_cleaner_completed_rounds_{0};
+  std::atomic<std::uint64_t> tx_cleaner_capacity_generation_{0};
   std::atomic<bool> tx_cleaner_scheduled_{false};
   std::atomic<std::uint64_t> tx_cleaner_rounds_{0};
   std::atomic<std::uint64_t> tx_cleaner_failures_{0};

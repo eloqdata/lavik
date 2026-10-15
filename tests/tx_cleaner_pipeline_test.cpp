@@ -54,9 +54,11 @@ class TxCleanerPipelineTestPeer : public testing::Test {
       engine.stores_.push_back(std::move(store));
     }
     On(0);
-    engine.tx_cleaner_round_for_test_ = [this] {
+    engine.tx_cleaner_round_for_test_ = [this]() -> Task<absl::Status> {
       ++rounds_;
-      return round_ ? round_() : absl::OkStatus();
+      round_owner_ = bycorf::ThisWorker().id_;
+      if (pause_round_) co_await round_continue_.Wait();
+      co_return round_ ? round_() : absl::OkStatus();
     };
     engine.tx_cleaner_retry_delay_for_test_ = [this](std::uint64_t delay_ms) {
       retry_delays_.push_back(delay_ms);
@@ -68,9 +70,16 @@ class TxCleanerPipelineTestPeer : public testing::Test {
       On(0);
       storage_.ConfigureTxCleanerCooldown(0).IgnoreError();
       receipts_.clear();
+      // A failed assertion must not leave the real runner borrowing a test's
+      // stack lambda, nor destroy an allocator still registered for a wake.
+      round_ = {};
+      ResumeRound();
       // Leave the round hook alive until a queued or timer-suspended driver
       // exits, including after an assertion fails midway through the test.
-      EXPECT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+      EXPECT_TRUE(
+          PumpUntil([&] { return DriverIdle() && CapacityTasksDone(); }));
+      for (auto& task : capacity_tasks_) task.reset();
+      capacity_probe_.reset();
       storage_.impl_->tx_cleaner_round_for_test_ = {};
       storage_.impl_->tx_cleaner_retry_delay_for_test_ = {};
       for (unsigned round = 0; round < 2; ++round) Pump();
@@ -124,11 +133,124 @@ class TxCleanerPipelineTestPeer : public testing::Test {
 
   void BeginShutdown() {
     storage_.impl_->shutdown_flush_requested_.store(true);
+    // The fixture has no PeriodicFlush; deliver its shutdown recheck here.
+    storage_.impl_->NotifyTxCleanerCapacityWaiters();
   }
 
   bool DriverIdle() const {
     return !storage_.impl_->tx_cleaner_scheduled_.load() &&
            !storage_.impl_->tx_cleaner_running_.load();
+  }
+
+  void PrepareFullDevice() {
+    auto& engine = *storage_.impl_;
+    engine.devices_.push_back(
+        StorageDevice{.capacity_blocks_ = 16, .data_block_count_ = 15});
+    engine.ConfigureDefragReserves();
+    auto allocator = std::make_unique<DeviceAllocator>();
+    allocator->owner_ = 0;
+    allocator->next_pristine_ = 16;
+    // All remaining blocks belong to the existing maintenance reserve. No
+    // bitmap I/O is needed: there are no pristine or cold blocks to activate.
+    for (std::uint64_t id = 1; id <= 8; ++id)
+      allocator->ready_blocks_.push_back(id);
+    engine.device_allocators_.push_back(std::move(allocator));
+    for (unsigned owner = 0; owner < kWorkers; ++owner) {
+      Store(owner).home_devices_.push_back(0);
+      Store(owner).home_device_allocations_.push_back(0);
+    }
+  }
+
+  void ResumeRound(bool pause_successor = false) {
+    On(round_owner_);
+    pause_round_ = pause_successor;
+    round_continue_.NotifyAll(workers_[round_owner_]);
+  }
+
+  template <typename T>
+  void StartTask(Task<T>& task, unsigned owner) {
+    On(owner);
+    std::move(task)
+        .operator co_await()
+        .await_suspend(std::noop_coroutine())
+        .resume();
+  }
+
+  Task<absl::StatusOr<ReservedBlock>> AllocateForeground(unsigned owner,
+                                                         bool unlock_writer) {
+    auto& store = Store(owner);
+    // Match a real rollover: retain the stream gate, but allow maintenance
+    // to take store state while AcquireWriteBlock waits for capacity.
+    co_await store.active_block_allocation_mutex_.Lock();
+    UnlockGuard gate(&store.active_block_allocation_mutex_, store.worker_);
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    auto result =
+        co_await storage_.impl_->AcquireWriteBlock(store, false, unlock_writer);
+    // Probe without enqueuing a second lock waiter. If restoration regresses,
+    // take the missing lock so the guard can still clean up safely.
+    auto probe = store.store_state_mutex_.Lock();
+    capacity_lock_restored_[owner] = !probe.await_ready();
+    co_return result;
+  }
+
+  void StartCapacity(unsigned owner, bool unlock_writer = true) {
+    capacity_tasks_[owner].emplace(AllocateForeground(owner, unlock_writer));
+    StartTask(*capacity_tasks_[owner], owner);
+  }
+
+  bool CapacityDone(unsigned owner) const {
+    return capacity_tasks_[owner] && capacity_tasks_[owner]->done();
+  }
+
+  bool CapacityTasksDone() const {
+    for (const auto& task : capacity_tasks_)
+      if (task && !task->done()) return false;
+    return !capacity_probe_ || capacity_probe_->done();
+  }
+
+  absl::StatusOr<ReservedBlock> CapacityResult(unsigned owner) {
+    return std::move(*capacity_tasks_[owner]).TakeResult();
+  }
+
+  bool StoreLockAvailable(unsigned owner) {
+    On(owner);
+    auto lock = Store(owner).store_state_mutex_.Lock();
+    if (!lock.await_ready()) return false;
+    Store(owner).store_state_mutex_.Unlock(workers_[owner]);
+    return true;
+  }
+
+  unsigned CapacityWaiters(unsigned owner) {
+    return Store(owner).tx_cleaner_capacity_waiters_.load();
+  }
+
+  bool CleanerRoundRunning() const {
+    return storage_.impl_->tx_cleaner_running_.load();
+  }
+
+  std::uint64_t CompletedCleanerRounds() const {
+    return storage_.impl_->tx_cleaner_completed_rounds_.load();
+  }
+
+  std::uint64_t ReclaimGeneration() const {
+    return storage_.impl_->space_reclaim_generation_.load();
+  }
+
+  void StartCapacityProbe(unsigned owner, std::uint64_t completed,
+                          std::uint64_t space) {
+    capacity_probe_.emplace(storage_.impl_->AwaitRunningTxCleanerForCapacity(
+        Store(owner), completed, space));
+    StartTask(*capacity_probe_, owner);
+  }
+
+  void ReleaseCapacityBlock() {
+    On(0);
+    // Supply one durably reclaimed block on its allocator owner. The real
+    // allocator, admission limits and capacity-wait protocol remain intact.
+    storage_.impl_->device_allocators_[0]->ready_blocks_.push_back(9);
+    storage_.impl_->space_reclaim_generation_.fetch_add(1);
+    storage_.impl_->NotifyTxCleanerCapacityWaiters();
   }
 
   void PreparePromotion() {
@@ -294,6 +416,13 @@ class TxCleanerPipelineTestPeer : public testing::Test {
   std::function<absl::Status()> round_;
   std::vector<std::uint64_t> retry_delays_;
   unsigned rounds_ = 0;
+  unsigned round_owner_ = 0;
+  bool pause_round_ = false;
+  AsyncNotification round_continue_;
+  std::array<std::optional<Task<absl::StatusOr<ReservedBlock>>>, kWorkers>
+      capacity_tasks_;
+  std::optional<Task<bool>> capacity_probe_;
+  std::array<bool, kWorkers> capacity_lock_restored_{};
   unsigned promotion_scans_ = 0;
   bool pause_promotion_scan_ = false;
   absl::Status promotion_scan_result_;
@@ -565,6 +694,223 @@ TEST_F(TxCleanerPipelineTestPeer, StorageFailureStopsRetryAndRejectsWrite) {
   EXPECT_FALSE(PrepareWrite(1).ok());
   ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
   EXPECT_EQ(rounds_, completed_rounds);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, FullDoesNotWaitForMerelyScheduledCleaner) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  RequestCleaning();
+  ASSERT_FALSE(DriverIdle());
+  ASSERT_EQ(rounds_, 0);
+
+  StartCapacity(0);
+
+  // The owner-local allocator can prove FULL synchronously. A scheduled
+  // runner that has not started an actual round must not delay that result.
+  ASSERT_TRUE(CapacityDone(0));
+  EXPECT_TRUE(absl::IsResourceExhausted(CapacityResult(0).status()));
+  EXPECT_TRUE(capacity_lock_restored_[0]);
+  EXPECT_EQ(rounds_, 0);
+  EXPECT_EQ(CapacityWaiters(0), 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       WriterThatRetainsStoreStateDoesNotWaitForCleanerCapacity) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+
+  StartCapacity(0, false);
+
+  // Replica reset and similar atomic writers retain store state. Joining a
+  // cleaner that needs that same lock would prevent the round from ending.
+  ASSERT_TRUE(CapacityDone(0));
+  EXPECT_TRUE(absl::IsResourceExhausted(CapacityResult(0).status()));
+  EXPECT_TRUE(capacity_lock_restored_[0]);
+  EXPECT_EQ(CapacityWaiters(0), 0);
+  EXPECT_TRUE(CleanerRoundRunning());
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       FirstReclaimedBlockWakesAllocatorBeforeCleanerRoundCompletes) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityWaiters(1) == 1; }));
+  EXPECT_TRUE(StoreLockAvailable(1));
+
+  ReleaseCapacityBlock();
+
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(1); }));
+  const auto allocated = CapacityResult(1);
+  ASSERT_TRUE(allocated.ok()) << allocated.status();
+  EXPECT_EQ(allocated->block_id_, 9);
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_EQ(CapacityWaiters(1), 0);
+  EXPECT_TRUE(CleanerRoundRunning());
+  EXPECT_EQ(CompletedCleanerRounds(), 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       CompetingAllocatorsKeepWaitingOnlyWithinTheObservedRound) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(0);
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil(
+      [&] { return CapacityWaiters(0) == 1 && CapacityWaiters(1) == 1; }));
+
+  ReleaseCapacityBlock();
+
+  ASSERT_TRUE(PumpUntil([&] {
+    return CapacityDone(0) != CapacityDone(1) &&
+           CapacityWaiters(0) + CapacityWaiters(1) == 1;
+  }));
+  const unsigned winner = CapacityDone(0) ? 0 : 1;
+  const unsigned loser = 1 - winner;
+  ASSERT_TRUE(CapacityResult(winner).ok());
+  EXPECT_TRUE(StoreLockAvailable(loser));
+  // The other worker lost this reclaimed block. Completing the round without
+  // more space must return FULL, even if its live lease keeps the background
+  // driver scheduled and a successor round starts before it resumes.
+  ResumeRound(true);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(loser); }));
+  EXPECT_TRUE(absl::IsResourceExhausted(CapacityResult(loser).status()));
+  EXPECT_TRUE(capacity_lock_restored_[0]);
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_EQ(CapacityWaiters(0) + CapacityWaiters(1), 0);
+  EXPECT_NE(receipts_[0].transaction_lease_, nullptr);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       NoProgressRoundReturnsFullWithoutWaitingForOwnLease) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityWaiters(1) == 1; }));
+
+  ResumeRound(true);
+
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(1); }));
+  EXPECT_TRUE(absl::IsResourceExhausted(CapacityResult(1).status()));
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_NE(receipts_[0].transaction_lease_, nullptr);
+  EXPECT_EQ(CapacityWaiters(1), 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       FailedCapacityRoundReturnsFullAndPreservesCleanerError) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  round_ = [] { return absl::DataLossError("capacity cleaner failure"); };
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityWaiters(1) == 1; }));
+
+  ResumeRound(true);
+
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(1); }));
+  EXPECT_TRUE(absl::IsResourceExhausted(CapacityResult(1).status()));
+  EXPECT_TRUE(absl::IsDataLoss(PrepareWrite(1)));
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_EQ(CapacityWaiters(1), 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       CapacityRecheckDoesNotJoinSuccessorAfterMissedRoundCompletion) {
+  AddLiveBacklog();
+  pause_round_ = true;
+  round_ = [this] {
+    CompleteBacklog();
+    return absl::OkStatus();
+  };
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  const auto completed = CompletedCleanerRounds();
+  const auto space = ReclaimGeneration();
+  ResumeRound();
+  ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 2; }));
+
+  // Model completion and restart between the failed allocation and waiter
+  // registration. running=true now belongs to a different round.
+  StartCapacityProbe(1, completed, space);
+
+  ASSERT_TRUE(capacity_probe_->done());
+  EXPECT_TRUE(std::move(*capacity_probe_).TakeResult());
+  EXPECT_EQ(CapacityWaiters(1), 0);
+  EXPECT_TRUE(CleanerRoundRunning());
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DisablingCleanerWakesCapacityWaiter) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityWaiters(1) == 1; }));
+
+  On(0);
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(0).ok());
+
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(1); }));
+  EXPECT_TRUE(absl::IsResourceExhausted(CapacityResult(1).status()));
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_TRUE(CleanerRoundRunning());
+  EXPECT_EQ(CapacityWaiters(1), 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, ShutdownWakesCapacityWaiter) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityWaiters(1) == 1; }));
+
+  On(0);
+  BeginShutdown();
+
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(1); }));
+  EXPECT_TRUE(absl::IsUnavailable(CapacityResult(1).status()));
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_EQ(CapacityWaiters(1), 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, StorageFailureWakesCapacityWaiter) {
+  PrepareFullDevice();
+  AddLiveBacklog();
+  pause_round_ = true;
+  RequestCleaning(0);
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  StartCapacity(1);
+  ASSERT_TRUE(PumpUntil([&] { return CapacityWaiters(1) == 1; }));
+
+  On(0);
+  storage_.FenceRequestServingUntilRestart();
+
+  ASSERT_TRUE(PumpUntil([&] { return CapacityDone(1); }));
+  EXPECT_TRUE(absl::IsFailedPrecondition(CapacityResult(1).status()));
+  EXPECT_TRUE(capacity_lock_restored_[1]);
+  EXPECT_EQ(CapacityWaiters(1), 0);
 }
 
 TEST_F(TxCleanerPipelineTestPeer, UnchangedPromotionDoesNotRereadSource) {

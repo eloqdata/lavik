@@ -1468,9 +1468,10 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
 
 // Allocates a block for this writer inline. `unlock_writer` releases the
 // store-state mutex across the allocation so appends behind this one keep
-// flowing; the caller must revalidate whatever it read before the call. Every
-// refusal surfaces as an error to exactly this caller — waiters queue on
-// mutexes end to end, so there is no notification to miss.
+// flowing; the caller must revalidate whatever it read before the call. The
+// caller retains its stream allocation gate while capacity waits release store
+// state. A final refusal belongs to this elected allocator; queued appends
+// recheck the stream after acquiring that gate.
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     WorkerStore& store, bool for_defrag, bool unlock_writer) {
   if (unlock_writer) {
@@ -1514,26 +1515,64 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   // recovery (never half-kept). Defrag keeps allocating from its reserve.
   if (for_defrag ||
       !shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    // Capture before allocation can suspend: a cleaner finishing between FULL
+    // and waiter registration still earns one final allocation attempt. These
+    // loads occur only when acquiring a physical block, not on every append.
+    const bool may_wait_for_cleaner = !for_defrag && unlock_writer;
+    const auto completed_before =
+        may_wait_for_cleaner
+            ? tx_cleaner_completed_rounds_.load(std::memory_order_acquire)
+            : 0;
+    auto space_before =
+        may_wait_for_cleaner
+            ? space_reclaim_generation_.load(std::memory_order_acquire)
+            : 0;
     allocated = co_await AllocateBlock(
         store, for_defrag ? AllocationPurpose::kDefrag
                           : AllocationPurpose::kForeground);
+    if (may_wait_for_cleaner) {
+      while (!allocated.ok() && allocated.status()
+                                    .GetPayload(kDiskSpaceExhaustionTypeUrl)
+                                    .has_value()) {
+        const bool retry = co_await AwaitRunningTxCleanerForCapacity(
+            store, completed_before, space_before);
+        if (!retry) break;
+        const bool finished =
+            tx_cleaner_completed_rounds_.load(std::memory_order_acquire) !=
+            completed_before;
+        space_before =
+            space_reclaim_generation_.load(std::memory_order_acquire);
+        allocated =
+            co_await AllocateBlock(store, AllocationPurpose::kForeground);
+        // Several owners can wake for one block. A loser can wait for further
+        // progress in this same round, but completion permits only this final
+        // retry: never follow the persistent driver's next no-progress round.
+        if (finished) break;
+      }
+    }
   }
   if (unlock_writer) {
     co_await store.store_state_mutex_.Lock();
   }
-  if (allocated.ok() && (store.write_failed_ || RuntimeFailureLatched())) {
+  if (store.write_failed_ || RuntimeFailureLatched()) {
     // The writer fail-stopped while the allocation waited; report that
     // instead of appending into a stream that will never flush.
-    if (unlock_writer) {
-      store.store_state_mutex_.Unlock(*store.worker_);
-    }
-    (void)co_await ReturnReservedBlock(*allocated);
-    if (unlock_writer) {
-      co_await store.store_state_mutex_.Lock();
+    if (allocated.ok()) {
+      if (unlock_writer) {
+        store.store_state_mutex_.Unlock(*store.worker_);
+      }
+      (void)co_await ReturnReservedBlock(*allocated);
+      if (unlock_writer) {
+        co_await store.store_state_mutex_.Lock();
+      }
     }
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "storage writer is stopped after an IO failure");
   }
+  if (!allocated.ok() && !for_defrag &&
+      (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+       store.worker_->stop_requested()))
+    co_return absl::UnavailableError("storage is shutting down");
   co_return allocated;
 }
 
