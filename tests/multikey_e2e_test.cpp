@@ -286,7 +286,8 @@ class ServerProcess {
                 std::string_view standby_pause_ms = {},
                 std::string_view fail_replication_transaction_containing = {},
                 bool shutdown_checkpoint = false,
-                std::string_view record_pause_key = {}) {
+                std::string_view record_pause_key = {},
+                std::string_view record_pause_file = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -304,6 +305,10 @@ class ServerProcess {
       if (!record_pause_key.empty()) {
         (void)::setenv("LAVIK_RECORD_WRITE_PAUSE_KEY",
                        std::string(record_pause_key).c_str(), 1);
+      }
+      if (!record_pause_file.empty()) {
+        (void)::setenv("LAVIK_RECORD_WRITE_PAUSE_FILE",
+                       std::string(record_pause_file).c_str(), 1);
       }
       if (!tx_active_pause_ms.empty()) {
         (void)::setenv("LAVIK_TX_ACTIVE_BLOCK_PAUSE_MS",
@@ -500,6 +505,9 @@ int main(int argc, char** argv) {
       lavik::test::TestDataPath("lavik-multikey-" + suffix + ".data");
   const std::string log_path =
       lavik::test::TestDataPath("lavik-multikey-" + suffix + ".log");
+  const std::string pressure_pause_path = data_path + ".publication-pause";
+  const std::string retry_data_path =
+      lavik::test::TestDataPath("lavik-multikey-retry-" + suffix + ".data");
   const std::string source_data = lavik::test::TestDataPath(
       "lavik-multikey-repl-source-" + suffix + ".data");
   const std::string replica_data = lavik::test::TestDataPath(
@@ -514,6 +522,8 @@ int main(int argc, char** argv) {
       lavik::test::TestDataPath("lavik-multikey-gate-" + suffix + ".log");
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
+  (void)::unlink(pressure_pause_path.c_str());
+  (void)::unlink(retry_data_path.c_str());
   (void)::unlink(source_data.c_str());
   (void)::unlink(replica_data.c_str());
   (void)::unlink(gate_source_data.c_str());
@@ -1088,9 +1098,9 @@ int main(int argc, char** argv) {
            "+OK", "persist a sealed transaction block for recovery");
     recovered_server.Stop();
 
-    ServerProcess block_recovery_server(argv[1], port, data_path, log_path, {},
-                                        {}, false, 4, {}, {}, {}, false,
-                                        "{tx-pressure}paused");
+    ServerProcess block_recovery_server(
+        argv[1], port, data_path, log_path, {}, {}, false, 4, {}, {}, {}, false,
+        "{tx-pressure}paused", pressure_pause_path);
     RespClient block_recovery = ConnectReady(port);
     const std::uint64_t recovered_cleaner_baseline =
         TxCleanerRetiredBlocks(block_recovery);
@@ -1124,12 +1134,12 @@ int main(int argc, char** argv) {
     Expect(block_recovery.Command(
                {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
            ":0", "FLUSHDB values remain invalidated");
-    // One admitted transaction may cross the new-transaction backlog limit.
-    // It must finish its own writes and commit; after its lease ends, the
-    // next transaction may start while cleanup of sealed blocks is pending.
+    // A sealed Tx backlog is work for the cleaner, not an admission limit.
+    // Disable maintenance while measuring the fixture so asynchronous cleanup
+    // cannot erase the observed backlog before INFO samples it.
     Expect(block_recovery.Command(
-               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
-           "+OK", "hold periodic cleaning during large transaction fixture");
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+           "+OK", "hold cleaning during large transaction fixture");
     const std::uint64_t block_baseline =
         InfoStat(block_recovery, "tx_cleaner_retired_blocks:");
     std::string large_value(1024 * 1024, 'q');
@@ -1155,11 +1165,21 @@ int main(int argc, char** argv) {
                                    "{tx-pressure}last", "last"}),
            "+OK", "new transaction admitted after prior lease ended");
 #if LAVIK_TEST_FAULTS_AVAILABLE
-    // The previous admission observed expired leases. A later seal must
-    // invalidate that proof: hold a new transaction after it fills two blocks,
-    // then verify an unrelated transaction waits before taking key intents.
-    const auto pause_count = CountOccurrences(
-        ReadFile(log_path), "record write publication pause armed");
+    // Hold a live transaction after it fills several blocks. Independent
+    // writes on the same storage owner must finish while that lease is still
+    // live: free capacity, rather than the age or size of its backlog, admits
+    // the new writes. The file gate makes this a dependency assertion instead
+    // of comparing a short timeout with the duration of an injected sleep.
+    Expect(block_recovery.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "60000"}),
+           "+OK", "enable asynchronous cleaning during live transaction");
+    const int pause_fd = ::open(pressure_pause_path.c_str(),
+                                O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+    if (pause_fd < 0) Fail("could not create transaction publication gate");
+    ::close(pause_fd);
+    const auto pause_count =
+        CountOccurrences(ReadFile(log_path),
+                         "fault pause reached: LAVIK_RECORD_WRITE_PAUSE_FILE");
     auto active_pressure = std::async(std::launch::async, [&] {
       RespClient client = Connect(port);
       auto args = pressure_args;
@@ -1167,22 +1187,48 @@ int main(int argc, char** argv) {
       args.push_back("finish");
       return client.Command(args);
     });
-    if (!WaitForLogMarkerCount(log_path, "record write publication pause armed",
-                               pause_count + 1))
+    if (!WaitForLogMarkerCount(
+            log_path, "fault pause reached: LAVIK_RECORD_WRITE_PAUSE_FILE",
+            pause_count + 1)) {
+      (void)::unlink(pressure_pause_path.c_str());
       Fail("new transaction did not reach its publication pause");
-    auto blocked_pressure = std::async(std::launch::async, [port] {
+    }
+    try {
+      if (InfoStat(block_recovery, "tx_backlog_bytes_max:") <=
+          16ULL * 1024 * 1024)
+        Fail("paused live transaction did not retain a large sealed backlog");
+    } catch (...) {
+      (void)::unlink(pressure_pause_path.c_str());
+      throw;
+    }
+    auto independent_pressure = std::async(std::launch::async, [&] {
       RespClient client = Connect(port);
-      return client.Command(
-          {"MSET", "pressure-unrelated-a", "a", "pressure-unrelated-b", "b"});
+      std::array<std::string, 2> replies;
+      replies[0] =
+          client.Command({"SET", "{tx-pressure}independent-set", large_value});
+      replies[1] = client.Command({"MSET", "{tx-pressure}independent-a", "a",
+                                   "{tx-pressure}independent-b", "b"});
+      return replies;
     });
-    if (blocked_pressure.wait_for(200ms) == std::future_status::ready)
-      Fail("new sealed blocks did not restore transaction backpressure");
+    const bool independent_finished =
+        independent_pressure.wait_for(10s) == std::future_status::ready;
+    const bool original_still_held =
+        active_pressure.wait_for(0ms) != std::future_status::ready;
+    // Always open the gate before reporting failure, so future destruction
+    // cannot wait on the transaction that this test intentionally suspended.
+    (void)::unlink(pressure_pause_path.c_str());
     if (active_pressure.wait_for(10s) != std::future_status::ready ||
-        blocked_pressure.wait_for(10s) != std::future_status::ready)
-      Fail("transaction backpressure did not release after commit");
-    Expect(active_pressure.get(), "+OK", "transaction crossing backlog limit");
-    Expect(blocked_pressure.get(), "+OK",
-           "transaction admitted after new lease ended");
+        independent_pressure.wait_for(10s) != std::future_status::ready)
+      Fail("transaction did not finish after publication gate opened");
+    Expect(active_pressure.get(), "+OK", "transaction spanning several blocks");
+    const auto independent_replies = independent_pressure.get();
+    Expect(independent_replies[0], "+OK", "independent grouped SET");
+    Expect(independent_replies[1], "+OK", "independent MSET");
+    if (!independent_finished || !original_still_held)
+      Fail("available capacity did not admit writes before old lease ended");
+    Expect(block_recovery.Command({"GET", "{tx-pressure}independent-set"}),
+           Bulk(large_value),
+           "independent write while old transaction was live");
 #endif
     Expect(block_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
@@ -1203,6 +1249,12 @@ int main(int argc, char** argv) {
     RespClient rollback = ConnectReady(port);
     Expect(rollback.Command({"GET", pressure_keys.front()}), Bulk(large_value),
            "large transaction remains readable after restart");
+    Expect(rollback.Command({"GET", "{tx-pressure}independent-set"}),
+           Bulk(large_value), "independent grouped write survives restart");
+    Expect(rollback.Command({"MGET", "{tx-pressure}independent-a",
+                             "{tx-pressure}independent-b"}),
+           "*2\r\n" + Bulk("a") + "\r\n" + Bulk("b"),
+           "independent transaction survives restart");
     Expect(rollback.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner during rollback");
     for (std::string_view key :
@@ -1369,27 +1421,30 @@ int main(int argc, char** argv) {
     // A retryable cleaner failure is observable but must not terminate the
     // periodic flush coroutine or report a shutdown drain as complete. The
     // same process must run a later round and retire the transaction block.
-    ServerProcess retry_server(argv[1], port, data_path, log_path, {}, {},
+    // Fresh media makes later retirement evidence belong to this fixture.
+    // An initial background round may consume the one-shot failure before
+    // CONFIG disables cleaning, even without any recovered sealed blocks.
+    CreateDataFile(retry_data_path, 512ULL * 1024 * 1024);
+    ServerProcess retry_server(argv[1], port, retry_data_path, log_path, {}, {},
                                true);
     RespClient retry = ConnectReady(port);
     Expect(retry.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
            "+OK", "hold cleanup until the retry fixture seals its own block");
-    const std::uint64_t failure_baseline =
-        InfoStat(retry, "tx_cleaner_failures:");
     const std::uint64_t retry_retired_baseline = TxCleanerRetiredBlocks(retry);
     Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
                           "cleaner-retry-b{tx}", "durable-b"}),
            "+OK", "seed retryable cleaner failure");
-    // Seal this fixture's stream rather than depending on a recovered block
-    // from an earlier test. The fault is then exercised by periodic cleanup.
+    // Require new retirement after the failure, regardless of whether it was
+    // observed during startup or while cleaning this newly sealed stream.
+    // The focused pipeline test separately controls the exact failing round
+    // and proves a retry occurs without another foreground request.
     const std::string retry_fill(5 * 1024 * 1024, 'r');
     Expect(retry.Command({"MSET", "cleaner-retry-fill-a{tx}", retry_fill,
                           "cleaner-retry-fill-b{tx}", retry_fill}),
            "+OK", "seal the retry fixture transaction stream");
     Expect(retry.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable retryable cleaner fixture");
-    if (!WaitForCleanerStat(retry, "tx_cleaner_failures:", failure_baseline,
-                            10s)) {
+    if (!WaitForCleanerStat(retry, "tx_cleaner_failures:", 0, 10s)) {
       Fail("injected cleaner failure was not recorded");
     }
     if (!WaitForCleanerBlockRetirement(retry, retry_retired_baseline)) {
@@ -1401,7 +1456,8 @@ int main(int argc, char** argv) {
         "value after cleaner retry");
     retry_server.Stop();
 
-    ServerProcess retry_recovered_server(argv[1], port, data_path, log_path);
+    ServerProcess retry_recovered_server(argv[1], port, retry_data_path,
+                                         log_path);
     RespClient retry_recovered = ConnectReady(port);
     Expect(retry_recovered.Command(
                {"MGET", "cleaner-retry-a{tx}", "cleaner-retry-b{tx}"}),
@@ -1419,6 +1475,8 @@ int main(int argc, char** argv) {
 
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
+  (void)::unlink(pressure_pause_path.c_str());
+  (void)::unlink(retry_data_path.c_str());
   (void)::unlink(source_data.c_str());
   (void)::unlink(replica_data.c_str());
   (void)::unlink(gate_source_data.c_str());

@@ -919,14 +919,6 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       }
     } cascade_completion{attempt_cascade};
 
-    // A woken list move is a fresh write attempt, long after its original
-    // command admission. Wait before taking its database gate and key intents.
-    if (waiter && (request.kind_ == CommandKind::kBLMove ||
-                   request.kind_ == CommandKind::kBRPopLPush)) {
-      const absl::Status admitted = co_await g_storage->WaitForTxBacklog();
-      if (!admitted.ok()) co_return status_reply(admitted);
-    }
-
     while (!TryBeginCommandDbOperation(request.db_id_)) {
       // A FULL/backup cut can delay the first key lookup without making the
       // key unavailable. Only a registered waiter has observed an empty key;

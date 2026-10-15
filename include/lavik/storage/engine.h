@@ -72,8 +72,9 @@ struct StorageEngineOptions {
   bool shutdown_checkpoint_ = false;
   // Maximum partial-block age before periodic flushing requests submission.
   std::uint32_t flush_max_ms_ = 100;
-  // Minimum delay between transaction cleaner rounds.
-  // Zero disables the cleaner; it can be changed at runtime through CONFIG.
+  // Delay between idle transaction-cleaner checks. Sealed work keeps draining
+  // independently, with bounded retries when pins or leases prevent progress.
+  // Zero disables online cleaning; runtime CONFIG can change this setting.
   std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;
   std::size_t flush_size_bytes_ = 128 * 1024;
   // Bounded, per-worker staging memory for commands waiting to enter the
@@ -2048,14 +2049,6 @@ class StorageEngine {
   TxCleanerTotals TxCleanerStats() const noexcept;
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  // Report whether a worker has about 16 MiB of sealed Tx records whose
-  // writer leases have not yet been proved to have all expired.
-  bool TxBacklogAtLimit() const noexcept;
-  // Call before taking key intents. Wait only while sealed backlog retains a
-  // live transaction; already admitted transactions must be able to commit,
-  // and read-only pins must not block new write transactions. Progress wakes
-  // recheck this predicate; they do not reserve space or await a cleaner round.
-  bycorf::Task<absl::Status> WaitForTxBacklog();
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
@@ -2069,7 +2062,7 @@ class StorageEngine {
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
-  friend class TxBacklogAdmissionTestPeer;
+  friend class TxCleanerPipelineTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

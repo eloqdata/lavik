@@ -2184,7 +2184,6 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
   // participation and deadlock shutdown.
   shutdown_checkpoint_for_flush_ = ShutdownCheckpointEnabled();
   shutdown_flush_requested_.store(true, std::memory_order_release);
-  NotifyTxBacklogProgress();
   unsigned completed =
       shutdown_flush_completed_.load(std::memory_order_acquire);
   while (completed < worker_count_) {

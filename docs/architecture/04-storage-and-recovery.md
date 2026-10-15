@@ -1091,19 +1091,21 @@ bitmap retirement still order its cold-free return;
 UUID and extent dependencies follow the same source-block lifetime.
 
 Each worker keeps one transaction append stream. The active append block does
-not count toward the reported sealed Tx-record backlog. New write transactions
-wait before taking key intents when one worker has about 16 MiB of sealed Tx
-records and one of those blocks still names a live transaction lease. Already
-admitted transactions continue to append and commit across block rollovers so
-their Tx blocks can become reclaimable. Once leases have ended, a snapshot may
-still pin the sealed blocks; admission does not wait for that reader to release
-them. The admission threshold is independent of the device's remaining
-free-block count. Writes continue while the cleaner retires old blocks;
-transaction lease completion and individual Tx-block retirement notify
-admission waiters, which recheck whether the backlog still requires waiting.
-Standalone grouped writes attempt cleanup before acquiring a transaction lease
-when the current stream cannot hold the planned append. The allocator decides
-whether a successor block is available.
+not count toward the reported sealed Tx-record backlog. That backlog describes
+cleanup work rather than a write-admission limit. A sealed block can return its
+staging buffer after flushing and releasing read pins while its physical
+allocation remains protected by transaction dependencies. Writers can reuse
+that memory for a new physical block without awaiting reclamation of the old
+block; the buffer pool and allocator enforce their actual capacity limits.
+
+Sealing a block and releasing a transaction's final writer lease request one
+coalesced background cleaner. It continues while sealed work remains, backing
+off when leases, pins, or retryable failures prevent progress. Periodic flush
+also starts pending cleaning, including progress originating outside a worker.
+Standalone grouped writes request this work without joining its completion;
+serious cleaner errors remain observable by subsequent standalone grouped
+writes. Online cleaning can be disabled through its runtime configuration.
+
 Transaction receipts hold a shared lease until the transaction can no longer
 append. The cleaner first observes released leases, then takes a second
 worker-wide snapshot of block membership and commit decisions. That ordering

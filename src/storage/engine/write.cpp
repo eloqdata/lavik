@@ -826,6 +826,14 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxCommitCapacity() {
 }
 
 Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
+  const auto release_writer_leases = [](WorkerStore::PendingTxCommit& pending) {
+    // Only queue-owned receipts reach this boundary, after their last append
+    // or terminal failure. Grouped decisions also finish their durability
+    // wait before release. Retaining the other receipt metadata must not let
+    // an unrelated later transaction keep these blocks' writer leases alive.
+    for (TxShardWrites& shard : pending.writes_)
+      shard.transaction_lease_.reset();
+  };
   while (!store->tx_commit_queue_.empty()) {
     std::vector<WorkerStore::PendingTxCommit> batch;
     const std::size_t count =
@@ -946,6 +954,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
               shard.grouped_decision_->FailPending();
             }
           }
+          release_writer_leases(*pending);
         }
         if (!decisions_durable.ok())
           spdlog::warn("transaction batch decision flush failed: {}",
@@ -984,6 +993,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
           if (!committed.ok()) {
             spdlog::warn("transaction {} commit append failed: {}",
                          pending.txid_, committed.message());
+            release_writer_leases(pending);
           } else if (defer_decisions) {
             decision_fences.push_back(decision);
             deferred_pending.push_back(&pending);
@@ -991,7 +1001,11 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
               for (const auto& shard : pending.writes_)
                 if (shard.grouped_decision_)
                   deferred_decisions.insert(shard.grouped_decision_.get());
+          } else {
+            release_writer_leases(pending);
           }
+        } else {
+          release_writer_leases(pending);
         }
       } else {
         spdlog::warn("transaction {} batch durability failed: {}",
@@ -1001,6 +1015,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
             shard.grouped_decision_->FailPending();
           }
         }
+        release_writer_leases(pending);
       }
     }
     if (!decision_fences.empty()) co_await flush_decisions();
@@ -2728,8 +2743,15 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         // value while this foreground append has not acquired its final stream.
         spdlog::info("record write publication pause armed");
         store.store_state_mutex_.Unlock(*store.worker_);
-        auto paused = co_await bycorf::SleepFor(
-            *store.worker_, std::chrono::milliseconds(1000));
+        absl::Status paused;
+        const char* pause_file = std::getenv("LAVIK_RECORD_WRITE_PAUSE_FILE");
+        if (pause_file != nullptr && *pause_file != '\0') {
+          paused = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_RECORD_WRITE_PAUSE_FILE");
+        } else {
+          paused = co_await bycorf::SleepFor(*store.worker_,
+                                             std::chrono::milliseconds(1000));
+        }
         co_await store.store_state_mutex_.Lock();
         if (!paused.ok()) co_return paused;
       });

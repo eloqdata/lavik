@@ -2155,23 +2155,6 @@ class StorageEngine::Impl {
     // beyond the dense BlockState. Recovery rebuilds it from Tx records.
     absl::flat_hash_map<std::uint64_t, TxBlockRuntime> tx_blocks_;
     std::atomic<std::uint64_t> tx_backlog_bytes_{0};
-    // Only the owner, under store_state_mutex_, can prove all sealed-block
-    // leases expired. Expiration is monotonic until membership changes. A new
-    // seal or an append to a counted block invalidates that proof before
-    // publishing the additional backlog. Readers may then skip owner RPCs
-    // while snapshots pin already-settled blocks; no data is cached here.
-    std::atomic<bool> tx_backlog_may_have_writers_{true};
-    // Waiters and their continuation queue belong to this worker. Producers
-    // only inspect the counters and post a coalesced owner notification.
-    AsyncNotification tx_backlog_progress_;
-    std::atomic<std::uint32_t> tx_backlog_waiters_{0};
-    std::atomic<bool> tx_backlog_notify_pending_{false};
-    std::uint64_t tx_backlog_wake_generation_ = 0;
-    // A positive admission probe first revisits this block. Validate its
-    // allocation identity before trusting it: retirement/reuse must not make
-    // a new transaction wait on an unrelated allocation's lease. Owner-only.
-    std::optional<std::pair<std::uint64_t, std::uint64_t>>
-        tx_backlog_writer_block_;
     // Deferred manifests carried by retirement receipts are released after
     // source bitmap retirement. UUID dependencies use the separate maps above.
     absl::flat_hash_map<std::uint64_t, std::vector<ExtentManifest>>
@@ -2775,11 +2758,7 @@ class StorageEngine::Impl {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  bool TxBacklogAtLimit() const noexcept;
-  Task<absl::Status> WaitForTxBacklog();
-  void NotifyTxBacklogProgress() noexcept;
-  void DeliverTxBacklogProgressLocal(WorkerStore& store);
-  Task<bool> HasLiveBacklogTxLeaseLocal(WorkerStore& store);
+  bool HasSealedTxBacklog() const noexcept;
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes,
                           MutationPrecondition mutation_precondition);
 
@@ -3372,7 +3351,6 @@ class StorageEngine::Impl {
     // zero begins the asynchronous NodeControl barrier.
     const bool already_failed =
         runtime_failure_latched_.exchange(true, std::memory_order_acq_rel);
-    if (!already_failed) NotifyTxBacklogProgress();
     const auto& current = bycorf::ThisWorker();
     if (!already_failed && current.cross_core_ != nullptr) {
       // Failure can originate on a different data/control worker. Keep each
@@ -3416,7 +3394,7 @@ class StorageEngine::Impl {
   friend class TombRaiderTestPeer;
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
-  friend class TxBacklogAdmissionTestPeer;
+  friend class TxCleanerPipelineTestPeer;
   friend class StorageEngine::RemoteReadAwaitable;
 
   struct DurableSystemState {
@@ -4612,12 +4590,10 @@ class StorageEngine::Impl {
 
   Task<absl::Status> PeriodicFlush(WorkerStore* store);
 
-  // Called before acquiring a standalone grouped transaction's lease, with no
-  // store mutex held. A borrowed EXEC lease must never wait for its own
-  // transaction to become reclaimable. The estimate is only a pressure
-  // signal, not a reservation or a second disk-capacity admission policy.
-  Task<absl::Status> BeforeGroupedTransaction(WorkerStore& store,
-                                              std::uint64_t append_bytes);
+  // Called before acquiring a standalone grouped transaction's lease. Request
+  // background maintenance and propagate its latest serious error without
+  // suspending or imposing a second disk-capacity admission policy.
+  absl::Status BeforeGroupedTransaction(WorkerStore& store);
   Task<absl::Status> MaybeRunTxCleaner(bool force = false);
   // The coroutine parameter owns the scheduled flag even if Spawn discards
   // a task before its first resume. Shutdown joins both queued and running
@@ -4946,21 +4922,11 @@ class StorageEngine::Impl {
   std::atomic<unsigned> active_extent_reclaims_{0};
   std::atomic<std::uint64_t> space_reclaim_generation_{0};
   std::atomic<std::uint32_t> tx_cleaner_cooldown_ms_{60'000};
-  // A single pressure-driven cleaner attempt serves all admission waiters.
-  std::atomic<std::int64_t> tx_backlog_retry_ms_{0};
-  // Only completed cleaner rounds publish this result. A fatal maintenance
-  // error remains visible to pressured admissions without fencing unrelated
-  // writes; a later successful or retryable round clears it.
-  std::atomic<absl::StatusCode> tx_backlog_cleaner_error_{
-      absl::StatusCode::kOk};
-  // Sequential consistency pairs waiter registration with the producer's
-  // no-waiters fast path; a release/acquire pair on two separate atomics would
-  // allow both sides to miss the other and lose the only progress wakeup.
-  std::atomic<std::uint64_t> tx_backlog_progress_generation_{0};
-  std::atomic<std::uint32_t> tx_backlog_waiters_{0};
+  // Actual round results remain visible to grouped writes until a later
+  // successful or retryable round clears them; this is not a permanent fence.
+  std::atomic<absl::StatusCode> tx_cleaner_error_{absl::StatusCode::kOk};
 #if LAVIK_FAULTS_ENABLED
-  std::function<void()> tx_backlog_before_wait_for_test_;
-  // Substitute only the physical round, preserving its admission, retry,
+  // Substitute only the physical round, preserving its scheduling, retry,
   // result publication and lifecycle behavior in deterministic runtime tests.
   std::function<absl::Status()> tx_cleaner_round_for_test_;
 #endif
