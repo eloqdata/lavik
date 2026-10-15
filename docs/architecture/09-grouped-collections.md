@@ -94,7 +94,7 @@ maximum scores, but no member boundaries. Stream directories retain bounded
 per-page maximum routing keys and a fixed header with their logical version;
 unknown or ambiguous long-name boundaries fall back to checked page reads.
 These runtime-only bounds do not change the durable page format. Recovery checks the complete chain,
-rank totals, numeric score boundaries and every live extent checksum while
+rank totals, numeric score boundaries and every present live extent checksum while
 retaining only routing metadata. Full-page decoding validates local item
 ordering; Sorted Set materialization also checks
 score/binary-member ordering across adjacent pages.
@@ -459,7 +459,7 @@ classification can still resolve the original key. Every live group, root and
 extent joins physical-owner accounting before orphan reclamation.
 
 For Sorted Sets, reconstruction requires both complete directories
-and validates reachable member snapshots and extent checksums as well as the
+and validates reachable member snapshots and present extent checksums as well as the
 ordered graph. GC, deletion and snapshot pins cover both identity spaces.
 Logical collection streams traverse only ordered pages, emitting each member
 once; ingestion reconstructs the destination's member index from those pages.

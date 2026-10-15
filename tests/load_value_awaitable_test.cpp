@@ -202,19 +202,20 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     Encode(bytes.data() + location_.record_offset());
     InstallDiskImage(bytes);
   }
-  ExtentRef ExtentReference() {
+  ExtentRef ExtentReference(bool no_crc = false) {
     return {1, 7, static_cast<std::uint32_t>(value_.size()),
-            Crc32c(std::as_bytes(std::span(value_)))};
+            no_crc ? 0 : Crc32c(std::as_bytes(std::span(value_)))};
   }
-  void InstallExtent(bool corrupt = false) {
+  void InstallExtent(bool corrupt = false, bool no_crc = false) {
     block_.kind_ = BlockKind::kPayloadExtent;
-    auto ref = ExtentReference();
+    auto ref = ExtentReference(no_crc);
     std::vector<std::byte> bytes(
         AlignDirect(kBlockHeaderBytes + value_.size()));
     BlockHeader header;
     header.block_id_ = 1;
     header.allocation_epoch_ = 7;
     header.kind_ = BlockKind::kPayloadExtent;
+    header.extent_no_crc_ = no_crc;
     header.layout_worker_count_ = 1;
     header.committed_bytes_ = kBlockHeaderBytes + value_.size();
     header.extent_payload_bytes_ = value_.size();
@@ -365,6 +366,41 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, ExtentWithoutCrcSkipsPayloadCheck) {
+  ASSERT_NO_FATAL_FAILURE(InstallExtent(true, true));
+  std::array<std::byte, 2> output{};
+  {
+    auto read = ExtentSlice(ExtentReference(true), 0, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    auto status = std::move(task).TakeResult();
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                               output.size()),
+              value_.substr(0, output.size()));
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+}
+
+TEST_F(LoadValueAwaitableTestPeer, RecordWithoutCrcWorksOnDiskAndInStaging) {
+  // The encoder must clear this stale CRC when the persisted policy is off.
+  header_.no_crc_ = true;
+  header_.payload_checksum_ ^= 1;
+  {
+    auto read = Read();
+    ASSERT_NO_FATAL_FAILURE(Complete(read));
+    ExpectValue(read.await_resume());
+  }
+  ASSERT_NO_FATAL_FAILURE(Stage());
+  {
+    auto read = Read();
+    ASSERT_TRUE(read.await_ready());
+    ExpectValue(read.await_resume());
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
 }
 
 TEST_F(LoadValueAwaitableTestPeer, CompletionTransfersLeaseAndReleasesPin) {

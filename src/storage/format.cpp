@@ -213,10 +213,10 @@ constexpr unsigned kRecordHasTxidShift = 11;
 constexpr unsigned kRecordHasExpiryShift = 12;
 constexpr unsigned kRecordGroupedShift = 13;
 constexpr unsigned kRecordAuxiliaryGroupShift = 14;
+constexpr unsigned kRecordNoCrcShift = 15;
 constexpr std::uint16_t kRecordKindMask = 0x3;
 constexpr std::uint16_t kRecordDbMask = 0xf;
 constexpr std::uint16_t kRecordTypeMask = 0x7;
-constexpr std::uint16_t kRecordReservedMask = 0x8000;
 
 template <typename T>
 void StoreRecordField(std::span<std::byte> output, std::size_t offset,
@@ -276,7 +276,8 @@ constexpr std::uint16_t RecordMetadata(const RecordHeader& header) noexcept {
        << kRecordHasExpiryShift) |
       (static_cast<std::uint16_t>(header.grouped_) << kRecordGroupedShift) |
       (static_cast<std::uint16_t>(header.auxiliary_group_)
-       << kRecordAuxiliaryGroupShift));
+       << kRecordAuxiliaryGroupShift) |
+      (static_cast<std::uint16_t>(header.no_crc_) << kRecordNoCrcShift));
 }
 
 bool ValidGroupedRecordHeader(const RecordHeader& header) noexcept {
@@ -366,6 +367,12 @@ std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
   const absl::string_view input(reinterpret_cast<const char*>(bytes.data()),
                                 bytes.size());
   return static_cast<std::uint32_t>(absl::ComputeCrc32c(input));
+}
+
+bool ValidateRecordPayload(const RecordHeader& header,
+                           std::span<const std::byte> payload) noexcept {
+  return payload.size() == header.payload_bytes_ &&
+         (header.no_crc_ || Crc32c(payload) == header.payload_checksum_);
 }
 
 std::uint64_t Crc64(std::span<const std::byte> bytes) noexcept {
@@ -598,7 +605,11 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
        decoded.kind_ != BlockKind::kRedisExportBacklog &&
        decoded.kind_ != BlockKind::kTransaction &&
        decoded.kind_ != BlockKind::kCheckpointIndex) ||
-      decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
+      decoded.reserved_ != std::array<std::uint8_t, 2>{} ||
+      decoded.extent_no_crc_ > 1 ||
+      (decoded.extent_no_crc_ != 0 &&
+       (decoded.kind_ != BlockKind::kPayloadExtent ||
+        decoded.extent_payload_checksum_ != 0))) {
     return false;
   }
   if (decoded.kind_ == BlockKind::kRecords ||
@@ -700,7 +711,7 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   StoreRecordField(output, kRecordAllocationEpochOffset,
                    header.allocation_epoch_);
   StoreRecordField(output, kRecordPayloadChecksumOffset,
-                   header.payload_checksum_);
+                   header.no_crc_ ? 0 : header.payload_checksum_);
   std::size_t optional_offset = kRecordOptionalOffset;
   if (has_txid) {
     StoreRecordField(output, optional_offset, header.txid_);
@@ -735,7 +746,9 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   // alignment tail still needs deterministic zeroes for the header checksum.
   std::fill(output.begin() + encoded_bytes, output.end(), std::byte{0});
   StoreRecordField(output, kRecordHeaderChecksumOffset, std::uint32_t{0});
-  StoreRecordField(output, kRecordHeaderChecksumOffset, Crc32c(output));
+  if (!header.no_crc_) {
+    StoreRecordField(output, kRecordHeaderChecksumOffset, Crc32c(output));
+  }
   return true;
 }
 
@@ -751,9 +764,6 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   }
   const std::uint16_t metadata =
       LoadRecordField<std::uint16_t>(input, kRecordMetadataOffset);
-  if ((metadata & kRecordReservedMask) != 0) {
-    return false;
-  }
   const bool has_txid = RecordMetadataBit(metadata, kRecordHasTxidShift);
   const bool has_expiry = RecordMetadataBit(metadata, kRecordHasExpiryShift);
   const bool auxiliary_group =
@@ -808,6 +818,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
           LoadRecordField<std::uint32_t>(input, kRecordPayloadChecksumOffset),
       .header_checksum_ =
           LoadRecordField<std::uint32_t>(input, kRecordHeaderChecksumOffset),
+      .no_crc_ = RecordMetadataBit(metadata, kRecordNoCrcShift),
   };
   std::size_t optional_offset = kRecordOptionalOffset;
   if (has_txid) {
@@ -874,8 +885,13 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.key_indirect_)) {
     return false;
   }
-  if (RecordHeaderChecksum(input.first(header_bytes)) !=
-      decoded.header_checksum_) {
+  // No-CRC records have canonical zero checksum fields. Besides avoiding
+  // stale staging bytes, this rejects a flipped policy bit on CRC records
+  // unless both original checksums happened to be zero.
+  if (decoded.no_crc_
+          ? (decoded.header_checksum_ != 0 || decoded.payload_checksum_ != 0)
+          : RecordHeaderChecksum(input.first(header_bytes)) !=
+                decoded.header_checksum_) {
     return false;
   }
   *header = decoded;

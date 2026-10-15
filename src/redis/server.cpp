@@ -2199,6 +2199,7 @@ int RunServer(ServerOptions options) {
       "registered_buffer_bytes={} per worker "
       "storage_write_buffers={} "
       "storage_read_buffer_bytes={} "
+      "record_crc={} "
       "replication_publish_queue_bytes={} per worker max_memory={} "
       "maxmemory_clients={} "
       "client_query_buffer_limit={} "
@@ -2216,7 +2217,8 @@ int RunServer(ServerOptions options) {
       options.spdk_max_completions_per_poll_,
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
-      options.replication_publish_queue_bytes_, options.max_memory_bytes_,
+      options.record_crc_, options.replication_publish_queue_bytes_,
+      options.max_memory_bytes_,
       FormatClientBufferLimit(options.maxmemory_clients_),
       options.client_query_buffer_limit_bytes_, options.flush_max_ms_,
       options.flush_size_bytes_, options.defrag_max_active_per_device_,
@@ -2278,6 +2280,7 @@ int RunServer(ServerOptions options) {
                                         : storage::kLogicalDatabaseCount;
   storage_options.data_files_ = std::move(options.data_files_);
   storage_options.reset_data_files_ = options.load_rdb_replace_;
+  storage_options.record_crc_ = options.record_crc_;
   storage_options.shutdown_checkpoint_ = options.shutdown_checkpoint_;
   storage_options.flush_max_ms_ = options.flush_max_ms_;
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;

@@ -1636,7 +1636,10 @@ Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
 StorageEngine::Impl::WriteExtentValueLocked(
     WorkerStore& store, std::string_view first, std::string_view second,
     RecordPayloadCursor* cursor, [[maybe_unused]] std::string_view fault_key,
-    bool shutdown_metadata) {
+    bool shutdown_metadata, bool force_crc) {
+  // System-state/catalog extents remain checksummed regardless of the data
+  // write policy; ordinary extents carry their own policy through relocation.
+  const bool no_crc = !force_crc && !options_.record_crc_;
   if (cursor != nullptr && (!first.empty() || !second.empty())) {
     co_return absl::InvalidArgumentError(
         "extent writer requires either spans or a payload cursor");
@@ -1774,7 +1777,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
       }
       const auto payload = std::span<const std::byte>(
           staging.data_ + kBlockHeaderBytes, payload_bytes);
-      const std::uint32_t payload_checksum = Crc32c(payload);
+      const std::uint32_t payload_checksum = no_crc ? 0 : Crc32c(payload);
       refs->back() = ExtentRef{
           .block_id_ = reserved->block_id_,
           .allocation_epoch_ = reserved->allocation_epoch_,
@@ -1797,6 +1800,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
           .checksum_ = 0,
           .layout_worker_count_ = worker_count_,
           .kind_ = BlockKind::kPayloadExtent,
+          .extent_no_crc_ = static_cast<std::uint8_t>(no_crc),
           .reserved_ = {},
           .extent_index_ = extent_index,
           .extent_payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
@@ -3408,6 +3412,7 @@ acquire_active_stream:
       .allocation_epoch_ = updated.allocation_epoch_,
       .payload_checksum_ = 0,
       .header_checksum_ = 0,
+      .no_crc_ = !options_.record_crc_,
   };
   std::span<std::byte> record_output(staging.data_ + record_offset,
                                      record_header_bytes);
@@ -3421,13 +3426,15 @@ acquire_active_stream:
          (request.kind_ == RecordKind::kValue &&
           request.value_type_ == ValueType::kString && !request.external_ &&
           !request.key_indirect_ && !auxiliary && !grouped_root));
-  record.payload_checksum_ =
-      request.relocation_ != nullptr &&
-              request.relocation_->verified_payload_checksum_.has_value()
-          ? *request.relocation_->verified_payload_checksum_
-          : Crc32c(std::span<const std::byte>(
-                staging.data_ + record_offset + record_header_bytes,
-                payload_bytes));
+  if (!record.no_crc_) {
+    record.payload_checksum_ =
+        request.relocation_ != nullptr &&
+                request.relocation_->verified_payload_checksum_.has_value()
+            ? *request.relocation_->verified_payload_checksum_
+            : Crc32c(std::span<const std::byte>(
+                  staging.data_ + record_offset + record_header_bytes,
+                  payload_bytes));
+  }
   if (!EncodeRecordHeader(record, request.key_, record_output)) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");

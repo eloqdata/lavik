@@ -83,6 +83,17 @@ TEST(RedisConfigTest, TokenizesQuotesEscapesAndComments) {
   EXPECT_FALSE(ParseRedisConfigLine("bind \"unterminated").ok());
 }
 
+TEST(RedisConfigTest, RecordCrcDefaultsOffAndAcceptsExplicitStartupPolicy) {
+  ServerOptions options;
+  EXPECT_FALSE(options.record_crc_);
+  ASSERT_TRUE(ApplyRedisConfigDirective({"record-crc", "yes"}, &options).ok());
+  EXPECT_TRUE(options.record_crc_);
+  ASSERT_TRUE(ApplyRedisConfigDirective({"record-crc", "no"}, &options).ok());
+  EXPECT_FALSE(options.record_crc_);
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"record-crc", "maybe"}, &options).ok());
+}
+
 TEST(RedisConfigTest, ParsesRedisMemorySizes) {
   ASSERT_TRUE(ParseMemorySize("64mb").ok());
   EXPECT_EQ(*ParseMemorySize("64mb"), 64ULL * 1024 * 1024);

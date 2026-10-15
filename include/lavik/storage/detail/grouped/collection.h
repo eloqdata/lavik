@@ -162,17 +162,18 @@ struct OrderedGroupMetadata {
 };
 
 // Recovery reads this checked envelope only after the outer-header winner and
-// every extent checksum are known. Entry payload syntax/order is validated by
-// DecodeOrderedGroup when loaded; this parser never claims to inspect values.
-// Score bounds remain zero here; the streaming decoder below derives them.
+// every present extent checksum are known. Entry payload syntax/order is
+// validated by DecodeOrderedGroup when loaded; this parser never inspects
+// values. Score bounds remain zero here; the streaming decoder below derives
+// them.
 absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes);
 
 // Reconstructs routing metadata from the existing page encoding in bounded
-// space. Feed the complete payload in order, after verifying each fragment's
-// physical checksum. Member bytes are skipped, never retained. This validates
-// framing and numeric score order, not member uniqueness or equal-score member
-// ordering; full page decoding remains responsible for those checks.
+// space. Feed the complete payload in order, after verifying any physical
+// checksum present on each fragment. Member bytes are skipped, never retained.
+// This validates framing and numeric score order, not member uniqueness or
+// equal-score member ordering; full page decoding checks those properties.
 class OrderedGroupMetadataDecoder {
  public:
   explicit OrderedGroupMetadataDecoder(std::size_t encoded_bytes) noexcept

@@ -427,7 +427,7 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
                                     bytes.data(), kBlockHeaderBytes),
                                 &header) ||
         header.kind_ != BlockKind::kPayloadExtent ||
-        header.block_id_ != ref.block_id_ ||
+        header.extent_no_crc_ != 0 || header.block_id_ != ref.block_id_ ||
         header.allocation_epoch_ != ref.allocation_epoch_ ||
         header.extent_index_ != expected_index ||
         header.extent_payload_bytes_ != ref.payload_bytes_ ||
@@ -600,7 +600,9 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
   co_await store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
   if (replace_catalog) {
-    auto written = co_await WriteExtentValueLocked(store, catalog_dump);
+    auto written = co_await WriteExtentValueLocked(
+        store, catalog_dump, {}, nullptr, {}, /*shutdown_metadata=*/false,
+        /*force_crc=*/true);
     if (!written.ok()) co_return written.status();
     new_catalog = std::move(*written);
     next.catalog_extents_ = new_catalog;
@@ -612,8 +614,9 @@ Task<absl::Status> StorageEngine::Impl::CommitSystemState(
     if (new_catalog != nullptr) SpawnExtentReclaim(store, new_catalog);
     co_return manifest_body.status();
   }
-  auto manifest_written = co_await WriteExtentValueLocked(
-      store, *manifest_body, {}, nullptr, {}, shutdown_metadata);
+  auto manifest_written =
+      co_await WriteExtentValueLocked(store, *manifest_body, {}, nullptr, {},
+                                      shutdown_metadata, /*force_crc=*/true);
   if (!manifest_written.ok()) {
     if (new_catalog != nullptr) SpawnExtentReclaim(store, new_catalog);
     co_return manifest_written.status();

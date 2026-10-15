@@ -804,9 +804,9 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
             absl::InternalError("inline string length does not match metadata");
         continue;
       }
-      if (Crc32c(std::span<const std::byte>(payload_data,
-                                            record.payload_bytes_)) !=
-          record.payload_checksum_) {
+      if (!ValidateRecordPayload(
+              record, std::span<const std::byte>(payload_data,
+                                                 record.payload_bytes_))) {
         results[index] = absl::InternalError("record value checksum mismatch");
         continue;
       }
@@ -1375,9 +1375,9 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
     return absl::InternalError("extent header does not match manifest");
   const auto payload = std::span<const std::byte>(
       buffer.data_ + kBlockHeaderBytes, ref_.payload_bytes_);
-  // Even a partial read validates the entire extent before publishing bytes.
+  // A checksummed extent is validated in full even for a partial read.
   // This runs in the resumed task's budget, never on the I/O completion poller.
-  if (Crc32c(payload) != ref_.payload_checksum_)
+  if (!header.extent_no_crc_ && Crc32c(payload) != ref_.payload_checksum_)
     return absl::InternalError("extent payload checksum mismatch");
   std::memcpy(destination_.data(), payload.data() + source_offset_,
               destination_.size());
@@ -1888,7 +1888,7 @@ StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
       !record.auxiliary_group_ && record.payload_bytes_ != record.logical_size_)
     return absl::InternalError("inline value length does not match metadata");
   return Payload{record.txid_, record.header_bytes_, record.payload_bytes_,
-                 record.payload_checksum_};
+                 record.payload_checksum_, record.no_crc_};
 }
 
 StorageEngine::Impl::LoadValueAwaitable::Result
@@ -1896,7 +1896,8 @@ StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
                                                       Payload payload,
                                                       bool staged) {
   const auto* value = data + payload.offset_;
-  if (Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
+  if (!payload.no_crc_ &&
+      Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
     return absl::InternalError("record value checksum mismatch");
   if (staged || payload.bytes_ > engine_.DirectGetValueLimit()) {
     std::memmove(lease_.io_buffer().data_, value, payload.bytes_);
@@ -1947,8 +1948,9 @@ StorageEngine::Impl::DecodeRemoteValue(ReadBufferLease lease,
     return absl::Status(absl::StatusCode::kInternal,
                         "inline value length does not match metadata");
   }
-  if (Crc32c(std::span<const std::byte>(payload_data, record.payload_bytes_)) !=
-      record.payload_checksum_) {
+  if (!ValidateRecordPayload(
+          record,
+          std::span<const std::byte>(payload_data, record.payload_bytes_))) {
     return absl::Status(absl::StatusCode::kInternal,
                         "record value checksum mismatch");
   }

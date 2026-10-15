@@ -303,7 +303,10 @@ struct BlockHeader {
   std::uint32_t checksum_ = 0;
   std::uint32_t layout_worker_count_ = 0;
   BlockKind kind_ = BlockKind::kRecords;
-  std::array<std::uint8_t, 3> reserved_{};
+  // Zero preserves checksumming for existing extents. The block header CRC
+  // always protects this policy, independently of the parent record's policy.
+  std::uint8_t extent_no_crc_ = 0;
+  std::array<std::uint8_t, 2> reserved_{};
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_bytes_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
@@ -404,6 +407,9 @@ struct RecordHeader {
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t payload_checksum_ = 0;
   std::uint32_t header_checksum_ = 0;
+  // Persisted in metadata bit 15: zero means legacy checksummed records.
+  // Readers obey this bit, never the current process's write policy.
+  bool no_crc_ = false;
 };
 
 struct ExtentManifestHeader {
@@ -464,7 +470,7 @@ constexpr std::size_t AlignRecord(std::size_t size) noexcept {
 // copying RecordHeader's C++ object representation. txid and expiration are
 // sparse extensions, so the overwhelmingly common standalone non-expiring
 // record pays only for the 72-byte base. An auxiliary group adds its
-// incarnation and routing identity, covered by the header checksum.
+// incarnation and routing identity, covered by the header CRC when enabled.
 inline constexpr std::size_t kRecordHeaderBaseBytes = 72;
 inline constexpr std::size_t kRecordHeaderOptionalBytes = 8;
 inline constexpr std::size_t kRecordAuxiliaryGroupIdentityBytes = 32;
@@ -516,6 +522,10 @@ static_assert(RecordHeaderBytes(kMaxStringBytes, true) ==
               kRecordHeaderBaseBytes + sizeof(IndirectKeyId));
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept;
+// Validate a record payload according to its durable policy. Framing and
+// identity checks remain the caller's responsibility even without CRC.
+bool ValidateRecordPayload(const RecordHeader& header,
+                           std::span<const std::byte> payload) noexcept;
 // Redis-compatible CRC64 used for the Function dump durability token.
 std::uint64_t Crc64(std::span<const std::byte> bytes) noexcept;
 

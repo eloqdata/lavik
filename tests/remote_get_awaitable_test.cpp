@@ -423,6 +423,22 @@ TEST_F(RemoteGetTestPeer, CorruptShortAndFailedReadsReleaseResources) {
   }
 }
 
+TEST_F(RemoteGetTestPeer, ReadsRecordWithoutCrc) {
+  header_.no_crc_ = true;
+  header_.payload_checksum_ ^= 1;
+  {
+    auto read = Read();
+    ASSERT_FALSE(read.await_ready());
+    ASSERT_NO_FATAL_FAILURE(Complete(read));
+    auto result = read.await_resume();
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result->ok()) << result->status();
+    EXPECT_EQ(result->value().view().encoded_, value_);
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
 TEST_F(RemoteGetTestPeer, FlushReturnsStagingBufferAcrossLastRemoteUnpin) {
   ASSERT_NO_FATAL_FAILURE(
       CheckFlushedBufferRelease(UnpinPoint::kBeforeRelease));
