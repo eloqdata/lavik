@@ -135,6 +135,9 @@ class PendingWrite {
     if (result.kind_ == '$' && result.text_ != "-1") {
       result.text_ = Bytes(std::stoull(result.text_));
       Check(Bytes(2) == "\r\n", "invalid pending bulk reply");
+    } else if (result.kind_ == '*' && result.text_ != "-1") {
+      const auto count = std::stoull(result.text_);
+      for (std::size_t i = 0; i < count; ++i) result.items_.push_back(Read());
     }
     return result;
   }
@@ -624,6 +627,258 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
   EXPECT_EQ(client.Command({"GET", "other-string"}).text_, "progress");
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
+
+class GroupedStreamWriteConcurrencyE2e
+    : public testing::TestWithParam<const char*> {};
+
+TEST_P(GroupedStreamWriteConcurrencyE2e,
+       PrivatePlanYieldsWorkerButRetainsKeyAndRecovers) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped preparation/extent pause hooks";
+#endif
+  const std::string operation = GetParam();
+  const std::string key = "stream-target";
+  const std::string initial(20000, 'o');
+  const std::string added(operation == "extent" ? 9 * 1024 * 1024 : 20000, 'n');
+  const bool append = operation == "append" || operation == "extent" ||
+                      operation == "exec" || operation == "lua";
+  std::vector<std::string> mutation;
+  if (append)
+    mutation = {"XADD", key, "MAXLEN", "=", "2", "4-0", "f", added};
+  else if (operation == "trim")
+    mutation = {"XTRIM", key, "MAXLEN", "=", "2"};
+  else if (operation == "delete")
+    mutation = {"XDEL", key, "2-0"};
+  else if (operation == "header")
+    mutation = {"XSETID", key, "4-0"};
+  else if (operation == "ack")
+    mutation = {"XACK", key, "g", "1-0"};
+  else if (operation == "group")
+    mutation = {"XGROUP", "CREATECONSUMER", key, "g", "new"};
+  else
+    mutation = {"XTRIM", key, "MAXLEN", "99"};
+  if (operation == "lua") {
+    std::vector<std::string> script{"EVAL", "return redis.call(unpack(ARGV))",
+                                    "1", key};
+    script.insert(script.end(), mutation.begin(), mutation.end());
+    mutation = std::move(script);
+  }
+  std::vector<std::string> expected_ids;
+  if (append)
+    expected_ids = {"3-0", "4-0", "5-0"};
+  else if (operation == "trim")
+    expected_ids = {"2-0", "3-0", "5-0"};
+  else if (operation == "delete")
+    expected_ids = {"1-0", "3-0", "5-0"};
+  else
+    expected_ids = {"1-0", "2-0", "3-0", "5-0"};
+  auto check_stream = [&](Client& client) {
+    EXPECT_EQ(client.Command({"XLEN", key}).text_,
+              std::to_string(expected_ids.size()));
+    const auto messages = client.Command({"XRANGE", key, "-", "+"});
+    ASSERT_EQ(messages.items_.size(), expected_ids.size());
+    for (std::size_t i = 0; i < expected_ids.size(); ++i) {
+      const auto& row = messages.items_[i].items_;
+      ASSERT_EQ(row.size(), 2);
+      EXPECT_EQ(row[0].text_, expected_ids[i]);
+      ASSERT_EQ(row[1].items_.size(), 2);
+      EXPECT_EQ(row[1].items_[1].text_, expected_ids[i] == "5-0"   ? "after"
+                                        : expected_ids[i] == "4-0" ? added
+                                                                   : initial);
+    }
+    const auto pending = client.Command({"XPENDING", key, "g"});
+    ASSERT_EQ(pending.items_.size(), 4);
+    EXPECT_EQ(pending.items_[0].text_, operation == "ack" ? "1" : "2");
+    if (operation == "group") {
+      const auto consumers = client.Command({"XINFO", "CONSUMERS", key, "g"});
+      ASSERT_EQ(consumers.items_.size(), 2);
+      bool found = false;
+      for (const auto& consumer : consumers.items_) {
+        ASSERT_GE(consumer.items_.size(), 2);
+        found |= consumer.items_[1].text_ == "new";
+      }
+      EXPECT_TRUE(found);
+    }
+    EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+  };
+  PrivateDisk disk;
+  disk.PreserveOnFailure();
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    for (const auto* id : {"1-0", "2-0", "3-0"})
+      ASSERT_EQ(client.Command({"XADD", key, id, "f", initial}).text_, id);
+    ASSERT_EQ(client.Command({"XGROUP", "CREATE", key, "g", "0"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "2",
+                            "STREAMS", key, ">"})
+                  .kind_,
+              '*');
+    ASSERT_EQ(client.Command({"EXPIRE", key, "3600"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_FALSE(disk.Auxiliaries(key).empty());
+  {
+    ScopedFault pause_key("LAVIK_GROUPED_WRITE_PAUSE_KEY", key.c_str());
+    ScopedFault pause_phase("LAVIK_GROUPED_WRITE_PAUSE_PHASE",
+                            operation == "extent" ? "extent" : "prepare");
+    WritePauseGate gate(disk, "LAVIK_GROUPED_WRITE_HOLD_FILE");
+    Server server(disk, 1);
+    server.PreserveOnFailure();
+    Client client(server.port());
+    PendingWrite first(server.port()), second(server.port());
+    if (operation == "exec") {
+      first.Send({"MULTI"});
+      ASSERT_EQ(first.Read().text_, "OK");
+      first.Send(mutation);
+      ASSERT_EQ(first.Read().text_, "QUEUED");
+      mutation = {"EXEC"};
+    }
+    gate.Arm();
+    first.Send(mutation);
+    ASSERT_TRUE(AwaitMarker(server, gate.marker())) << server.Log();
+    second.Send({"XADD", key, "5-0", "f", "after"});
+    // These writes require store state on this same worker. The successor
+    // uses the held Stream key and must remain blocked through preparation.
+    EXPECT_EQ(client.Command({"SET", "other-string", "progress"}).text_, "OK");
+    EXPECT_EQ(client.Command({"HSET", "other-hash", "f", initial}).text_, "1");
+    EXPECT_TRUE(gate.IsHeld());
+    EXPECT_FALSE(first.HasReply());
+    EXPECT_FALSE(second.HasReply());
+    gate.Release();
+    const auto result = first.Read();
+    ASSERT_NE(result.kind_, '-') << result.text_ << server.Log();
+    if (operation == "exec") {
+      ASSERT_EQ(result.items_.size(), 1);
+      EXPECT_EQ(result.items_[0].text_, "4-0");
+    }
+    ASSERT_EQ(second.Read().text_, "5-0");
+    check_stream(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  check_stream(client);
+  EXPECT_EQ(client.Command({"GET", "other-string"}).text_, "progress");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedWriteSemanticsE2e, StreamNoOpsAndErrorsKeepTtlAndWatch) {
+  PrivateDisk disk;
+  Server server(disk, 1);
+  Client client(server.port()), watcher(server.port());
+  const std::string key = "stream-noop";
+  ASSERT_EQ(
+      client.Command({"XADD", key, "2-0", "f", std::string(20000, 'v')}).text_,
+      "2-0");
+  ASSERT_EQ(client.Command({"XGROUP", "CREATE", key, "g", "0"}).text_, "OK");
+  ASSERT_EQ(client.Command({"EXPIRE", key, "3600"}).text_, "1");
+  const auto expiry = client.Command({"PEXPIRETIME", key}).text_;
+  ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
+  EXPECT_EQ(client.Command({"XTRIM", key, "MAXLEN", "99"}).text_, "0");
+  EXPECT_EQ(client.Command({"XACK", key, "g", "9-0"}).text_, "0");
+  EXPECT_EQ(client.Command({"XDEL", key, "9-0"}).text_, "0");
+  EXPECT_EQ(client.Command({"XSETID", key, "1-0"}).kind_, '-');
+  EXPECT_EQ(client.Command({"XADD", key, "1-0", "f", "invalid"}).kind_, '-');
+  EXPECT_EQ(client.Command({"SET", "independent", "progress"}).text_, "OK");
+  EXPECT_EQ(client.Command({"PEXPIRETIME", key}).text_, expiry);
+  ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+  ASSERT_EQ(watcher.Command({"XLEN", key}).text_, "QUEUED");
+  const auto executed = watcher.Command({"EXEC"});
+  ASSERT_EQ(executed.items_.size(), 1);
+  EXPECT_EQ(executed.items_[0].text_, "1");
+}
+
+TEST(GroupedWriteSemanticsE2e,
+     StreamPreparationFailureKeepsExecUsableAndRecovers) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires page-read/encoder preparation failure hooks";
+#endif
+  const std::string key = "stream-prepare-failure";
+  const std::string value(20000, 'v');
+  for (const auto* fault_name :
+       {"LAVIK_FAIL_VALUE_READ_KEY", "LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY"}) {
+    SCOPED_TRACE(fault_name);
+    const std::string error =
+        std::string_view(fault_name) == "LAVIK_FAIL_VALUE_READ_KEY"
+            ? "injected value payload read failure"
+            : "OOM preparing group encoders";
+    PrivateDisk disk;
+    disk.PreserveOnFailure();
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      for (const auto* id : {"1-0", "2-0"})
+        ASSERT_EQ(client.Command({"XADD", key, id, "f", value}).text_, id);
+      ASSERT_EQ(client.Command({"XGROUP", "CREATE", key, "g", "0"}).text_,
+                "OK");
+      ASSERT_EQ(client
+                    .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
+                              "STREAMS", key, ">"})
+                    .kind_,
+                '*');
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    ASSERT_FALSE(disk.Auxiliaries(key).empty());
+    {
+      ScopedFault fault(fault_name, key.c_str());
+      Server server(disk, 1);
+      server.PreserveOnFailure();
+      Client client(server.port());
+      const std::vector<std::string> append{"XADD", key, "MAXLEN",          "1",
+                                            "3-0",  "f", "must-not-publish"};
+      const auto failed = client.Command(append);
+      ASSERT_EQ(failed.kind_, '-');
+      EXPECT_NE(failed.text_.find(error), std::string::npos);
+      ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+      ASSERT_EQ(client.Command(append).text_, "QUEUED");
+      ASSERT_EQ(client.Command({"XTRIM", key, "MAXLEN", "1"}).text_, "QUEUED");
+      ASSERT_EQ(client.Command({"SET", "independent", "after-failure"}).text_,
+                "QUEUED");
+      const auto executed = client.Command({"EXEC"});
+      ASSERT_EQ(executed.items_.size(), 3);
+      for (std::size_t i = 0; i < 2; ++i) {
+        EXPECT_EQ(executed.items_[i].kind_, '-');
+        EXPECT_NE(executed.items_[i].text_.find(error), std::string::npos);
+      }
+      EXPECT_EQ(executed.items_[2].text_, "OK");
+      EXPECT_EQ(client.Command({"XLEN", key}).text_, "2");
+      EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after-failure");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    Server recovered(disk, 3);
+    Client client(recovered.port());
+    const auto messages = client.Command({"XRANGE", key, "-", "+"});
+    ASSERT_EQ(messages.items_.size(), 2);
+    for (std::size_t i = 0; i < 2; ++i) {
+      const auto& row = messages.items_[i].items_;
+      ASSERT_EQ(row.size(), 2);
+      EXPECT_EQ(row[0].text_, std::to_string(i + 1) + "-0");
+      ASSERT_EQ(row[1].items_.size(), 2);
+      EXPECT_EQ(row[1].items_[1].text_, value);
+    }
+    const auto pending = client.Command({"XPENDING", key, "g"});
+    ASSERT_EQ(pending.items_.size(), 4);
+    EXPECT_EQ(pending.items_[0].text_, "1");
+    EXPECT_EQ(pending.items_[1].text_, "1-0");
+    EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after-failure");
+    // Failed appends must not advance the logical ID or poison a later batch.
+    EXPECT_EQ(client.Command({"XADD", key, "3-0", "f", "retry"}).text_, "3-0");
+    ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    TypedMutations, GroupedStreamWriteConcurrencyE2e,
+    testing::Values("append", "trim", "delete", "header", "ack", "group",
+                    "noop", "exec", "lua", "extent"),
+    [](const testing::TestParamInfo<const char*>& parameter) {
+      return parameter.param;
+    });
 
 TEST(GroupedWriteSemanticsE2e, EncoderPreflightAdmissionFailureKeepsOldGraph) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE

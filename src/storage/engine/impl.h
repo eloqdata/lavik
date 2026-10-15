@@ -2344,13 +2344,24 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
 
+  // Private Stream plans retain every page/input charge until publication.
+  // Charges precede the plan so its owned strings die before credit returns.
+  struct PreparedStreamMutation {
+    std::vector<MemoryReservation> reservations_;
+    OrderedCollectionMutationPlan plan_;
+    std::uint64_t expire_at_ms_ = 0;
+  };
+  // A prepared output suppresses publication; the caller releases store state
+  // while preparing and revalidates its retained logical view after reacquiring
+  // it, including successful no-ops. Key intent remains held throughout.
   Task<absl::Status> ExecuteGroupedStreamGroupLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, const CompactValueCallback& callback,
       const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      PreparedStreamMutation* prepared = nullptr);
 
   struct StreamPageAccess;
   Task<absl::Status> ExecuteGroupedStreamInspect(
@@ -2363,14 +2374,16 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, const CompactValueCallback& callback,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      PreparedStreamMutation* prepared = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamTrimLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, const CompactValueCallback& callback,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      PreparedStreamMutation* prepared = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamDeleteLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2378,7 +2391,8 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, const CompactValueCallback& callback,
       const StreamDeleteAccess& access, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      PreparedStreamMutation* prepared = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamAckLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2386,7 +2400,8 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, const CompactValueCallback& callback,
       const StreamAckAccess& access, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      PreparedStreamMutation* prepared = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2400,7 +2415,8 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, const CompactValueCallback& callback,
       std::uint32_t node_max_entries, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      PreparedStreamMutation* prepared = nullptr);
 
   Task<absl::Status> ExecuteCompact(
       std::uint8_t db_id, std::string_view key, ValueType value_type,

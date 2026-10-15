@@ -71,6 +71,10 @@ an external or older page. Binary search compares resident bounds and reads a
 page only when a bound is unavailable or its capped prefix cannot decide the
 comparison. Request-local page ownership stays on the key's worker; loaders
 revalidate logical identity and retry physical relocation.
+Typed mutations prepare admitted private plans outside worker store state
+while retaining key intent and database admission. They reacquire store state
+and validate the captured population and logical version before committing,
+including successful no-ops; candidate ingestion retains its separate path.
 
 | Operation | Storage access |
 |---|---|

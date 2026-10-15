@@ -59,10 +59,12 @@ The resident String directory and physical index use direct positional indexing,
 without binary search or hash routing. Physical index pages share unchanged
 entries with snapshot/undo versions. Incremental writes preserve segment IDs;
 whole replacement or shrinking may create a fresh incarnation or a compact value.
-For grouped Strings, GETRANGE/GETBIT read only intersecting segments;
-SETRANGE/SETBIT/APPEND replace intersecting segments and any changed tail link
-through the shared grouped publication boundary. General whole-value callbacks
-materialize grouped Strings and reuse unchanged segments in their after-image.
+For grouped Strings, GETRANGE/GETBIT retain an immutable routing view and read
+only intersecting segments outside worker store state. The page loader checks
+population and physical lifetime across I/O. SETRANGE/SETBIT/APPEND replace
+intersecting segments and any changed tail link through the shared grouped
+publication boundary. General whole-value callbacks materialize grouped Strings
+and reuse unchanged segments in their after-image.
 Strings below the promotion threshold use compact whole-value reads and writes.
 Dedicated KeyRecords store original key bytes whole regardless of this
 user-value promotion threshold.
@@ -256,14 +258,15 @@ metadata before staging root bytes. Root index replacement and side-view
 publication then occur without suspension. Physical auxiliary writes alone
 make no user-visible mutation.
 
-Existing Hash/Set point writers and typed List/Sorted Set writers retain key
-intent and database admission while releasing worker store state for page reads
-and private mutation planning. This includes both Sorted Set graphs and retained
-EXEC/Lua key holds, but not native candidate ingestion. Plans retain their page
-admission through commit. Reacquisition checks population and logical root
-identity even for no-ops and last-element deletion; physical relocation alone
-is allowed. The writer refreshes GC coordinates and assigns durable revisions
-under store state. Full-image, promotion and random Set-pop adapters retain
+Existing Hash/Set point writers, String segment writers and typed List,
+Sorted Set and Stream writers retain key intent and database admission while
+releasing worker store state for page reads and private mutation planning.
+This includes both Sorted Set graphs and retained EXEC/Lua key holds, but not
+native candidate ingestion. Plans retain their page admission through commit.
+Reacquisition checks population and logical root identity even for no-ops and
+last-element deletion; physical relocation alone is allowed. The writer
+refreshes GC coordinates and assigns durable revisions under store state.
+Full-image, promotion and random Set-pop adapters retain
 their separate preparation paths and share the same publication boundary.
 
 Ordinary single-key creation prepares initial pages without worker store state,
