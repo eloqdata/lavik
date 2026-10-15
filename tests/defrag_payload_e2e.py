@@ -93,6 +93,8 @@ def server(workers, *, paused=False):
         "--recv-buffers-per-worker=0",
         "--registered-buffer-mb-per-worker=64",
         "--max-memory=1G",
+        # Corruption checks require CRCs on records written before each restart.
+        "--record-crc",
         "--no-shutdown-checkpoint",
         "--flush-max-ms=10",
         "--log-dir=" + str(WORKDIR / ("logs-" + str(workers))),
