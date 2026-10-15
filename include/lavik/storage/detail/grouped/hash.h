@@ -87,7 +87,7 @@ struct HashGroupEdit;
 // Command-owned, fully checked group payload for a small replacement leaf,
 // including its envelope. Inline writers borrow these bytes through the write
 // instead of allocating and copying another complete serialization.
-// Only ApplyHashGroupEdits can construct this certificate. No borrowed request
+// Only checked Hash editors can construct this certificate. No borrowed request
 // or read-buffer data survives it; it is never retained in the resident index.
 class PreparedHashGroupPayload {
  public:
@@ -104,6 +104,7 @@ class PreparedHashGroupPayload {
   std::uint64_t incarnation() const noexcept { return incarnation_; }
 
  private:
+  friend class HashGroupPointProbe;
   friend absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
       std::string_view, const DigestSeed&, HashGroupEditKind,
       std::span<const HashEntryView>);
@@ -138,6 +139,46 @@ struct HashGroupEdit {
   // Empty for no-ops. A split returns complete leaves; the caller publishes a
   // retirement marker for the original leaf in the same command decision.
   std::vector<HashGroupSnapshot> leaves_;
+};
+
+// A bounded, owned copy of a fully validated leaf and one existing field's
+// byte offsets. No read lease or per-field strings survive lookup. Equal-size
+// replacement and deletion cannot change routing or require a split, so they
+// can transfer the checked bytes directly to the normal group encoder.
+class HashGroupPointProbe {
+ public:
+  // Only a returned probe certifies the complete leaf, including unrelated
+  // fields. nullopt selects the ordinary fully checked decoded fallback for
+  // an oversized leaf or absent field; it is not a validation certificate.
+  // Caller admits page scratch before lookup.
+  static absl::StatusOr<std::optional<HashGroupPointProbe>> Create(
+      std::string_view payload, const DigestSeed& seed, std::string_view field);
+  GroupedRecordId id() const noexcept { return payload_.id(); }
+  std::string_view field() const noexcept {
+    return payload_.record_payload().substr(entry_offset_ + 8,
+                                            value_offset_ - entry_offset_ - 8);
+  }
+  std::string_view value() const noexcept {
+    return payload_.record_payload().substr(value_offset_, value_bytes_);
+  }
+  // nullopt removes the matched field; a value must have the original length.
+  // Consumes the owned bytes, preserving the validated identities of every
+  // other field. No borrowed view may survive this call.
+  absl::StatusOr<HashGroupSnapshot> Apply(
+      std::optional<std::string_view> replacement) &&;
+
+ private:
+  HashGroupPointProbe(PreparedHashGroupPayload payload,
+                      std::size_t entry_offset, std::size_t value_offset,
+                      std::size_t value_bytes)
+      : payload_(std::move(payload)),
+        entry_offset_(entry_offset),
+        value_offset_(value_offset),
+        value_bytes_(value_bytes) {}
+  PreparedHashGroupPayload payload_;
+  std::size_t entry_offset_;
+  std::size_t value_offset_;
+  std::size_t value_bytes_;
 };
 
 // Apply ordered operands to one encoded leaf, checking all old fields for

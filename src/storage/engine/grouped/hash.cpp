@@ -341,6 +341,77 @@ absl::Status VisitHashGroupFields(
   return absl::OkStatus();
 }
 
+absl::StatusOr<std::optional<HashGroupPointProbe>> HashGroupPointProbe::Create(
+    std::string_view payload, const DigestSeed& seed, std::string_view field) {
+  auto metadata = DecodeHashGroupMetadata(payload, payload.size());
+  if (!metadata.ok()) return metadata.status();
+  if (metadata->retired_)
+    return absl::DataLossError("cannot probe a retired Hash leaf");
+  if (payload.size() - kGroupHeaderBytes > kCollectionGroupTargetBytes ||
+      metadata->field_count_ == 0)
+    return std::nullopt;
+  // An absent member takes the checked decoded fallback. Locate first without
+  // hashing or allocating a duplicate set, so insertion does not validate the
+  // same leaf twice. A hit still checks every field before certifying bytes.
+  auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
+  if (!reader.ok()) return absl::DataLossError(reader.status().message());
+  if (reader->size() != metadata->field_count_)
+    return absl::DataLossError(
+        "Hash group inner count disagrees with envelope");
+  std::optional<HashEntryView> matched;
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return absl::DataLossError(entry.status().message());
+    if (entry->field_ == field) {
+      matched = *entry;
+      break;
+    }
+  }
+  if (!matched) return std::nullopt;
+  auto valid = VisitHashGroupFields(
+      payload, metadata->field_count_, metadata->id_, seed,
+      [](const HashEntryView&) { return absl::OkStatus(); });
+  if (!valid.ok()) return valid;
+  const auto entry_offset = matched->field_.data() - payload.data() - 8;
+  const auto value_offset = matched->value_.data() - payload.data();
+  return HashGroupPointProbe(
+      PreparedHashGroupPayload(std::string(payload), metadata->field_count_,
+                               metadata->id_, metadata->incarnation_),
+      entry_offset, value_offset, matched->value_.size());
+}
+
+absl::StatusOr<HashGroupSnapshot> HashGroupPointProbe::Apply(
+    std::optional<std::string_view> replacement) && {
+  if (replacement && replacement->size() != value_bytes_)
+    return absl::InvalidArgumentError("Hash point replacement changes size");
+  HashGroupSnapshot result{.incarnation_ = payload_.incarnation(),
+                           .id_ = payload_.id(),
+                           .value_ = {}};
+  auto& bytes = payload_.bytes_;
+  if (replacement) {
+    // The replacement may borrow this probe's old value. memmove also keeps
+    // that synchronous use valid without allocating another encoded page.
+    if (!replacement->empty())
+      std::memmove(bytes.data() + value_offset_, replacement->data(),
+                   replacement->size());
+  } else {
+    --payload_.count_;
+    if (payload_.count_ == 0) {
+      bytes.resize(kGroupHeaderBytes);
+    } else {
+      bytes.erase(entry_offset_, value_offset_ + value_bytes_ - entry_offset_);
+      std::span<char> compact(bytes.data() + kGroupHeaderBytes,
+                              bytes.size() - kGroupHeaderBytes);
+      Store(compact, 16, payload_.count_, 4);
+      Store(compact, 24, compact.size(), 8);
+    }
+    EncodeGroupHeader({bytes.data(), kGroupHeaderBytes}, result,
+                      payload_.count_, bytes.size() - kGroupHeaderBytes);
+  }
+  result.prepared_.emplace(std::move(payload_));
+  return result;
+}
+
 absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
     std::span<const HashEntryView> edits) {

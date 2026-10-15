@@ -818,6 +818,87 @@ TEST(GroupedCollectionTest,
   EXPECT_GT(split->groups_[1].entries_[0].value_.size(), kExtentPayloadBytes);
 }
 
+TEST(GroupedCollectionTest, UnsplitPagePreservesStorageAndIdentity) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    for (const bool exact_fit : {false, true}) {
+      auto page = Page(7, 3, kind);
+      page.previous_ = 3;
+      page.next_ = 9;
+      page.entries_.reserve(32);
+      for (auto& entry : page.entries_) entry.value_.resize(256, '\0');
+      const auto expected = page.entries_;
+      const auto* storage = page.entries_.data();
+      const auto capacity = page.entries_.capacity();
+      auto encoded = EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      const auto target =
+          exact_fit ? encoded->size() : kCollectionGroupTargetBytes;
+
+      auto split = SplitOrderedGroup(std::move(page), 20, target);
+      ASSERT_TRUE(split.ok()) << split.status();
+      ASSERT_EQ(split->groups_.size(), 1);
+      const auto& kept = split->groups_.front();
+      EXPECT_EQ(kept.entries_.data(), storage);
+      EXPECT_EQ(kept.entries_.capacity(), capacity);
+      EXPECT_EQ(kept.entries_, expected);
+      EXPECT_EQ(kept.kind_, kind);
+      EXPECT_EQ(kept.incarnation_, 17);
+      EXPECT_EQ(kept.id_, 7);
+      EXPECT_EQ(kept.previous_, 3);
+      EXPECT_EQ(kept.next_, 9);
+      EXPECT_EQ(split->next_group_id_, 20);
+    }
+  }
+}
+
+TEST(GroupedCollectionTest, UnsplitOversizedMemberPreservesStorageAndIdentity) {
+  auto page = Page(7, 1, OrderedCollectionKind::kSortedSet);
+  page.previous_ = 3;
+  page.next_ = 9;
+  page.entries_.front().value_.resize(kCollectionGroupTargetBytes + 1, 'x');
+  const auto* storage = page.entries_.data();
+  const auto* member = page.entries_.front().value_.data();
+  const auto expected = page.entries_;
+
+  auto split = SplitOrderedGroup(std::move(page), 20);
+  ASSERT_TRUE(split.ok()) << split.status();
+  ASSERT_EQ(split->groups_.size(), 1);
+  const auto& kept = split->groups_.front();
+  EXPECT_EQ(kept.entries_.data(), storage);
+  EXPECT_EQ(kept.entries_.front().value_.data(), member);
+  EXPECT_EQ(kept.entries_, expected);
+  EXPECT_EQ(kept.id_, 7);
+  EXPECT_EQ(kept.previous_, 3);
+  EXPECT_EQ(kept.next_, 9);
+  EXPECT_EQ(split->next_group_id_, 20);
+}
+
+TEST(GroupedCollectionTest, UnsplitPageStillValidatesIdentityAndEntries) {
+  const auto valid = Page(7, 3, OrderedCollectionKind::kSortedSet);
+  auto reject = [&](auto change) {
+    auto page = valid;
+    change(page);
+    EXPECT_FALSE(SplitOrderedGroup(std::move(page), 20).ok());
+  };
+  reject([](auto& page) { page.incarnation_ = 0; });
+  reject([](auto& page) { page.id_ = 0; });
+  reject([](auto& page) { page.previous_ = page.id_; });
+  reject([](auto& page) { page.next_ = page.id_; });
+  reject([](auto& page) { page.previous_ = page.next_ = 3; });
+  reject([](auto& page) { page.next_ = 20; });
+  reject([](auto& page) { page.retired_ = true; });
+  reject([](auto& page) { page.entries_.clear(); });
+  reject([](auto& page) { std::swap(page.entries_[0], page.entries_[1]); });
+  reject([](auto& page) {
+    page.entries_.back().value_ = page.entries_.front().value_;
+  });
+  reject([](auto& page) {
+    page.entries_.front().score_ = std::numeric_limits<double>::quiet_NaN();
+  });
+  reject([](auto& page) { page.kind_ = OrderedCollectionKind::kList; });
+}
+
 TEST(GroupedCollectionTest, SplitPreservesOrderIdsAndNeighbourLinks) {
   auto page = Page(7, 12);
   page.previous_ = 3;

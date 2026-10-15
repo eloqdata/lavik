@@ -24,6 +24,7 @@
 #include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
+#include "zset_work_budget.h"
 
 namespace lavik::storage {
 namespace {
@@ -914,6 +915,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     probed_pages.emplace(i, std::move(page));
   };
+  SortedSetPageWorkBudget page_work;
   auto read_page_impl = [&]<typename Page>(std::size_t i)
       -> Task<absl::StatusOr<
           std::conditional_t<std::is_same_v<Page, LoadedOrderedGroup>,
@@ -941,14 +943,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                                      "LAVIK_FAIL_ZSET_ORDERED_READ_PAGE",
                                      i + 1))) co_return absl::
             UnavailableError("injected ordered-page read failure"););
-    if (ReadOnly(operation) || prepared != nullptr) {
-      co_await bycorf::Yield(*store.worker_);
-      if (shutdown_flush_requested_)
-        co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
-    }
     GroupedScratchBudget budget;
     auto checked = add_page_budget(&budget, i);
     if (!checked.ok()) co_return checked;
+    if (ReadOnly(operation) || prepared != nullptr) {
+      if (ReadOnly(operation) || page_work.Add(budget.bytes()))
+        co_await bycorf::Yield(*store.worker_);
+      if (shutdown_flush_requested_)
+        co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
+    }
     auto admission = budget.Reserve(2);
     if (!admission.ok()) co_return admission.status();
     auto load = [&] {
@@ -1183,11 +1186,6 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       selected.insert(route->id_);
     }
     for (const auto id : selected) {
-      if (ReadOnly(operation) || prepared != nullptr) {
-        co_await bycorf::Yield(*store.worker_);
-        if (shutdown_flush_requested_)
-          co_return absl::CancelledError("member read cancelled by shutdown");
-      }
       const auto current =
           partition.grouped_objects_[db_id].CurrentForMutation(key);
       if (!current || !current->SameLogicalRoot(*object) ||
@@ -1203,6 +1201,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       GroupedScratchBudget budget;
       auto checked = budget.AddGroup(*physical, current->ExtentsFor(id));
       if (!checked.ok()) co_return checked;
+      if (ReadOnly(operation) || prepared != nullptr) {
+        // Only an immutable size estimate crosses this yield. The loader
+        // refreshes the physical location and checks the logical view again.
+        if (ReadOnly(operation) || page_work.Add(budget.bytes()))
+          co_await bycorf::Yield(*store.worker_);
+        if (shutdown_flush_requested_)
+          co_return absl::CancelledError("member read cancelled by shutdown");
+      }
       auto admission = budget.Reserve(2);
       if (!admission.ok()) co_return admission.status();
       auto retain_score = [&](const auto& entry) -> absl::Status {
@@ -1232,10 +1238,54 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         if (!status.ok()) co_return status;
         continue;
       }
-      auto leaf = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                 digest, object, id);
-      if (!leaf.ok()) co_return leaf.status();
-      for (const auto& entry : leaf->snapshot_.value_.entries_) {
+      HashGroupSnapshot snapshot;
+      if (!ReadOnly(operation) && members.size() == 1) {
+        auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                                  digest, object, id);
+        if (!leaf.ok()) co_return leaf.status();
+        const auto bytes = leaf->loaded_.value();
+        const std::string_view payload(
+            reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        auto point = HashGroupPointProbe::Create(
+            payload, object->directory().root().seed_, members.begin()->first);
+        if (!point.ok()) co_return point.status();
+        if (*point) {
+          status = retain_score(
+              HashEntryView{members.begin()->first, (**point).value()});
+          if (!status.ok()) co_return status;
+          // Copy only one bounded encoded leaf. Its offsets survive moves,
+          // and releasing the read lease here avoids holding pool buffers
+          // while ordered-page preparation performs more asynchronous reads.
+          member_probe.emplace(std::move(*admission), object,
+                               HashGroupSnapshot{}, std::move(*point));
+          continue;
+        }
+        LAVIK_FAULT_INJECT(
+            if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY",
+                                    key)) co_return absl::
+                UnavailableError(
+                    "injected member-index owned decode failure"););
+        auto decoded = DecodeHashGroup(payload);
+        if (!decoded.ok()) co_return decoded.status();
+        snapshot = std::move(*decoded);
+        for (const auto& entry : snapshot.value_.entries_) {
+          if (!id.ContainsHash(
+                  ComputeDigest(entry.field_, object->directory().root().seed_)
+                      .value_))
+            co_return absl::DataLossError("Hash field outside its group route");
+        }
+      } else {
+        LAVIK_FAULT_INJECT(
+            if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY",
+                                    key)) co_return absl::
+                UnavailableError(
+                    "injected member-index owned decode failure"););
+        auto leaf = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
+                                                   digest, object, id);
+        if (!leaf.ok()) co_return leaf.status();
+        snapshot = std::move(leaf->snapshot_);
+      }
+      for (const auto& entry : snapshot.value_.entries_) {
         status = retain_score(entry);
         if (!status.ok()) co_return status;
       }
@@ -1244,8 +1294,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       // The exclusive key intent and final snapshot validation protect the
       // logical contents across GC relocation and unlocked preparation.
       if (!ReadOnly(operation) && members.size() == 1)
-        member_probe.emplace(std::move(*admission), object,
-                             std::move(leaf->snapshot_));
+        member_probe.emplace(std::move(*admission), object, std::move(snapshot),
+                             std::nullopt);
     }
     if (operation.kind_ == SortedSetOperationKind::kScores) {
       status = ApplyInputs(operation, &members, &result);
@@ -1453,26 +1503,72 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     } else {
       status = check_plan_read(i);
       if (!status.ok()) co_return status;
+      if (prepared != nullptr) {
+        if (page_work.Add(metadata[i].encoded_bytes_))
+          co_await bycorf::Yield(*store.worker_);
+        if (shutdown_flush_requested_)
+          co_return absl::CancelledError(
+              "Sorted Set plan cancelled by shutdown");
+      }
       auto page = co_await LoadOrderedGroupSnapshot(
           store, partition, db_id, key, digest, object, metadata[i].id_);
       if (!page.ok()) co_return page.status();
       loaded.emplace(i, std::move(page->snapshot_));
     }
   }
-  for (const auto i : modified) {
-    auto& entries = loaded.at(i).entries_;
-    std::erase_if(entries, [&](const auto& entry) {
-      const auto member = members.find(entry.value_);
-      return member != members.end() && member->second.touched_;
-    });
-  }
-  for (const auto& [member, state] : pending)
-    loaded.at(state->destination_)
-        .entries_.push_back({std::string(member), *state->after_});
+  if (operation.kind_ == SortedSetOperationKind::kAdd &&
+      operation.entries_.size() == 1 && pending.size() == 1 &&
+      pending.front().second->before_) {
+    // A point score update owns the existing member already. Keep that
+    // allocation and the page's ordered subsequences instead of deleting the
+    // member, copying the request, and sorting the entire destination. Batch
+    // inputs retain the general path because repeated members apply in order.
+    const auto& [member, state] = pending.front();
+    auto& source = loaded.at(state->source_).entries_;
+    const auto entry =
+        std::find_if(source.begin(), source.end(),
+                     [&](const auto& at) { return at.value_ == member; });
+    if (entry == source.end())
+      co_return absl::DataLossError("missing Sorted Set point-update source");
+    entry->score_ = *state->after_;
+    if (state->source_ == state->destination_) {
+      if (entry != source.begin() && OrderedEntryLess(*entry, *(entry - 1))) {
+        const auto position =
+            std::lower_bound(source.begin(), entry, *entry, OrderedEntryLess);
+        std::rotate(position, entry, entry + 1);
+      } else if (entry + 1 != source.end() &&
+                 OrderedEntryLess(*(entry + 1), *entry)) {
+        const auto position =
+            std::lower_bound(entry + 1, source.end(), *entry, OrderedEntryLess);
+        std::rotate(entry, entry + 1, position);
+      }
+    } else {
+      auto moved = std::move(*entry);
+      source.erase(entry);
+      auto& destination = loaded.at(state->destination_).entries_;
+      const auto position = std::lower_bound(
+          destination.begin(), destination.end(), moved, OrderedEntryLess);
+      destination.insert(position, std::move(moved));
+    }
+  } else {
+    for (const auto i : modified) {
+      auto& entries = loaded.at(i).entries_;
+      std::erase_if(entries, [&](const auto& entry) {
+        const auto member = members.find(entry.value_);
+        return member != members.end() && member->second.touched_;
+      });
+    }
+    for (const auto& [member, state] : pending)
+      loaded.at(state->destination_)
+          .entries_.push_back({std::string(member), *state->after_});
 
-  for (const auto i : modified) {
-    auto& entries = loaded.at(i).entries_;
-    std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+    // Removal preserves the order of every surviving entry.
+    if (!pending.empty()) {
+      for (const auto i : modified) {
+        auto& entries = loaded.at(i).entries_;
+        std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+      }
+    }
   }
   // A score move can overflow its destination while freeing the adjacent
   // source. Reuse both already admitted pages when they still fit together;

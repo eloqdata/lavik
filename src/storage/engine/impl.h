@@ -2502,19 +2502,21 @@ class StorageEngine::Impl {
   };
   // A single-member writer may hand its checked lookup leaf to index
   // preparation. Ownership is command-local, and the original admission
-  // follows the decoded strings until the prepared after-image is released.
+  // follows its bounded checked bytes or decoded fallback until the prepared
+  // after-image is released. The encoded form owns no physical read lease.
   struct SortedSetMemberProbe {
     MemoryReservation admission_;
     GroupedObject::Handle source_;
     HashGroupSnapshot snapshot_;
+    std::optional<HashGroupPointProbe> encoded_;
   };
   // Full-image writers derive changes from complete ordered before/after
   // pages. Typed writers may supply exact changes after checking old members
   // against both graphs and generating the ordered plan from those changes.
   // Borrowed names must outlive this coroutine; the result owns all index
-  // writes. Only touched prefix leaves are decoded and retained scratch is
+  // writes. Only touched prefix leaves are loaded and retained scratch is
   // admitted. A probe must belong to this exact immutable predecessor and
-  // the only changed leaf. Unlocked callers yield before preparing each leaf.
+  // the only changed leaf. Unlocked callers yield after a bounded page budget.
   Task<absl::StatusOr<SortedSetMemberMutation>> PrepareSortedSetMembers(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

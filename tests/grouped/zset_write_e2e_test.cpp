@@ -231,6 +231,156 @@ TEST(GroupedSortedSetWriteE2e,
   EXPECT_EQ(client.Command({"ZRANGE", key, "0", "-1"}).items_.size(), 256);
 }
 
+TEST(GroupedSortedSetWriteE2e,
+     EncodedMemberEditsKeepBinaryOrderingAndExecFailureAtomic) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires member-index owned decode failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "encoded-member-edit";
+  auto member = [](unsigned i) {
+    auto value = "member-" + std::to_string(i);
+    value.resize(256, '\0');
+    value.back() = static_cast<char>(0xff - i % 2);
+    return value;
+  };
+  std::map<std::string, double> expected;
+  auto verify = [&](Client& client) {
+    auto reply = client.Command({"ZRANGE", key, "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(reply.items_.size(), expected.size() * 2);
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& [name, score] : expected) {
+      ordered.emplace_back(score, name);
+      EXPECT_EQ(std::stod(client.Command({"ZSCORE", key, name}).text_), score);
+    }
+    std::sort(ordered.begin(), ordered.end());
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+      EXPECT_EQ(reply.items_[i * 2].text_, ordered[i].second);
+      EXPECT_EQ(std::stod(reply.items_[i * 2 + 1].text_), ordered[i].first);
+    }
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 256; ++i) {
+      seed.push_back(std::to_string(i));
+      seed.push_back(member(i));
+      expected.emplace(member(i), i);
+    }
+    ASSERT_EQ(client.Command(seed).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Cold recovery plus an owned-decoder fault proves existing-member edits
+    // use checked encoded bytes. The ordinary batch failure also verifies
+    // that neither index leaks a private after-image into a later EXEC item.
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY", key.c_str());
+    Server server(disk, 3);
+    Client client(server.port());
+    for (const auto& [increment, score] :
+         std::vector<std::pair<std::string, double>>{
+             {"1.25", 101.25}, {"-2.5", 98.75}, {"2.25", 101}}) {
+      ASSERT_EQ(
+          std::stod(
+              client.Command({"ZINCRBY", key, increment, member(100)}).text_),
+          score);
+      expected[member(100)] = score;
+      verify(client);
+    }
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "1000", member(100)}).text_,
+              "1");
+    expected[member(100)] = 1000;
+    verify(client);
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "-100", member(100)}).text_,
+              "1");
+    expected[member(100)] = -100;
+    ASSERT_EQ(client.Command({"ZADD", key, "NX", "9", member(100)}).text_, "0");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "0", member(100)}).text_, "-100");
+    ASSERT_EQ(client.Command({"ZREM", key, member(101)}).text_, "1");
+    expected.erase(member(101));
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "inf", member(102)}).text_,
+              "1");
+    expected[member(102)] = std::numeric_limits<double>::infinity();
+    const auto nan = client.Command({"ZINCRBY", key, "-inf", member(102)});
+    EXPECT_EQ(nan.kind_, '-');
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(102)}).text_, "inf");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "800", member(10), "900", member(11)})
+            .text_,
+        "QUEUED");
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "2", member(12)}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"SET", "unrelated", "after failure"}).text_,
+              "QUEUED");
+    auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 3);
+    EXPECT_EQ(executed.items_[0].kind_, '-');
+    EXPECT_NE(executed.items_[0].text_.find("owned decode failure"),
+              std::string::npos);
+    EXPECT_EQ(executed.items_[1].text_, "14");
+    EXPECT_EQ(executed.items_[2].text_, "OK");
+    expected[member(12)] = 14;
+    verify(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  verify(client);
+  EXPECT_EQ(client.Command({"GET", "unrelated"}).text_, "after failure");
+}
+
+TEST(GroupedSortedSetWriteE2e, DuplicateMemberInputsKeepSequentialConditions) {
+  PrivateDisk disk;
+  const std::string key = "duplicate-zadd";
+  const auto member = [](unsigned i) {
+    return std::to_string(i) + std::string(128, 'm');
+  };
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    ASSERT_EQ(
+        client
+            .Command({"ZADD", key, "CH", "500", member(100), "50", member(100)})
+            .text_,
+        "2");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(100)}).text_, "50");
+    ASSERT_EQ(client
+                  .Command({"ZADD", key, "GT", "CH", "200", member(100), "150",
+                            member(100)})
+                  .text_,
+              "1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(100)}).text_, "200");
+    ASSERT_EQ(client
+                  .Command({"ZADD", key, "LT", "CH", "100", member(100), "120",
+                            member(100)})
+                  .text_,
+              "1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(100)}).text_, "100");
+    ASSERT_EQ(client.Command({"ZADD", key, "NX", "1", "new", "2", "new"}).text_,
+              "1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, "new"}).text_, "1");
+    ASSERT_EQ(client
+                  .Command({"ZADD", key, "XX", "CH", "3", "new", "4", "new",
+                            "5", "missing"})
+                  .text_,
+              "2");
+    EXPECT_EQ(client.Command({"ZSCORE", key, "new"}).text_, "4");
+    EXPECT_EQ(client.Command({"ZSCORE", key, "missing"}).text_, "-1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZSCORE", key, member(100)}).text_, "100");
+  EXPECT_EQ(client.Command({"ZSCORE", key, "new"}).text_, "4");
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "257");
+}
+
 TEST(GroupedSortedSetWriteE2e, AdjacentScoreMovesReusePagesAcrossRecovery) {
   PrivateDisk disk;
   auto member = [](unsigned i) { return std::string(1024, 'a' + i); };
