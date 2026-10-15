@@ -267,6 +267,8 @@ Task<absl::Status> StorageEngine::Impl::RunRequestedTxCleaner(
     TxCleanerRequest request, bool force) {
   (void)request;
   auto* worker = bycorf::ThisWorker().self_;
+  constexpr std::uint64_t kRetryMs = 50;
+  std::uint64_t failure_delay_ms = kRetryMs;
   for (;;) {
     if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
         worker->stop_requested() || RuntimeFailureLatched() ||
@@ -289,18 +291,56 @@ Task<absl::Status> StorageEngine::Impl::RunRequestedTxCleaner(
         tx_cleaner_cooldown_ms_.load(std::memory_order_acquire) == 0 ||
         !HasSealedTxBacklog())
       co_return status;
+    if (status.ok()) failure_delay_ms = kRetryMs;
     if (status.ok() && tx_cleaner_retired_blocks_.load(
                            std::memory_order_relaxed) != retired_before) {
       // Retirement can remove decision dependencies for another pass. Keep
       // draining without imposing an idle cooldown, but let ready work run.
       co_await bycorf::Yield(*worker);
     } else {
-      // Leases, read pins and failed promotion can temporarily prevent any
-      // retirement. One bounded background retry serves the whole engine;
-      // neither a waiting request nor another append is needed for progress.
-      const auto waited =
-          co_await bycorf::SleepFor(*worker, std::chrono::milliseconds(50));
-      if (!waited.ok()) co_return waited;
+      // Leases and read pins need frequent progress checks, but a persistent
+      // failed round must not repeatedly scan storage and log at that rate.
+      // The delay is at most a uint32 cooldown; widen before doubling so even
+      // the largest accepted configuration cannot wrap back to a short retry.
+      if (!status.ok()) {
+        const auto cooldown =
+            tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
+        if (cooldown == 0) co_return status;
+        failure_delay_ms = std::min<std::uint64_t>(
+            std::max(failure_delay_ms * 2, kRetryMs), cooldown);
+      }
+      const auto wait_started = MonotonicMillis();
+#if LAVIK_FAULTS_ENABLED
+      std::optional<std::uint64_t> observed_delay;
+#endif
+      for (;;) {
+        const auto cooldown =
+            tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
+        if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+            worker->stop_requested() || RuntimeFailureLatched() ||
+            cooldown == 0 || !HasSealedTxBacklog())
+          co_return status;
+        const auto delay_ms =
+            status.ok() ? kRetryMs
+                        : std::min<std::uint64_t>(failure_delay_ms, cooldown);
+#if LAVIK_FAULTS_ENABLED
+        if (observed_delay != delay_ms) {
+          observed_delay = delay_ms;
+          if (tx_cleaner_retry_delay_for_test_)
+            tx_cleaner_retry_delay_for_test_(delay_ms);
+        }
+#endif
+        const auto elapsed_ms =
+            static_cast<std::uint64_t>(MonotonicMillis() - wait_started);
+        if (elapsed_ms >= delay_ms) break;
+        // Keep configuration and shutdown responsive even when persistent
+        // errors have reached a long cooldown. Lowered cooldowns also shorten
+        // an already pending retry; these timer wakes do not run a new round.
+        const auto waited = co_await bycorf::SleepFor(
+            *worker, std::chrono::milliseconds(
+                         std::min(kRetryMs, delay_ms - elapsed_ms)));
+        if (!waited.ok()) co_return waited;
+      }
     }
     force = true;
   }

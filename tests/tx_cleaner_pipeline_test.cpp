@@ -11,9 +11,11 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "../src/storage/engine/impl.h"
 #include "gtest/gtest.h"
@@ -56,6 +58,9 @@ class TxCleanerPipelineTestPeer : public testing::Test {
       ++rounds_;
       return round_ ? round_() : absl::OkStatus();
     };
+    engine.tx_cleaner_retry_delay_for_test_ = [this](std::uint64_t delay_ms) {
+      retry_delays_.push_back(delay_ms);
+    };
   }
 
   void TearDown() override {
@@ -67,6 +72,7 @@ class TxCleanerPipelineTestPeer : public testing::Test {
       // exits, including after an assertion fails midway through the test.
       EXPECT_TRUE(PumpUntil([&] { return DriverIdle(); }));
       storage_.impl_->tx_cleaner_round_for_test_ = {};
+      storage_.impl_->tx_cleaner_retry_delay_for_test_ = {};
       for (unsigned round = 0; round < 2; ++round) Pump();
     }
     for (unsigned owner = 0; owner < kWorkers; ++owner) {
@@ -286,6 +292,7 @@ class TxCleanerPipelineTestPeer : public testing::Test {
   StorageEngine storage_{StorageEngineOptions{}};
   std::deque<TxShardWrites> receipts_;
   std::function<absl::Status()> round_;
+  std::vector<std::uint64_t> retry_delays_;
   unsigned rounds_ = 0;
   unsigned promotion_scans_ = 0;
   bool pause_promotion_scan_ = false;
@@ -396,6 +403,70 @@ TEST_F(TxCleanerPipelineTestPeer,
   EXPECT_TRUE(PrepareWrite(1).ok());
 }
 
+TEST_F(TxCleanerPipelineTestPeer,
+       RepeatedFailuresBackOffAndSuccessRestoresFastProgressChecks) {
+  AddLiveBacklog();
+  round_ = [this] {
+    if (rounds_ <= 3)
+      return absl::DataLossError("persistent cleaner corruption fixture");
+    if (rounds_ == 5)
+      return absl::ResourceExhaustedError("transient cleaner fixture");
+    if (rounds_ == 6) CompleteBacklog();
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(250).ok());
+  RequestCleaning();
+
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 3; }));
+  EXPECT_TRUE(absl::IsDataLoss(PrepareWrite(1)));
+  EXPECT_FALSE(storage_.RuntimeFailureLatched());
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 4; }));
+  EXPECT_TRUE(PrepareWrite(1).ok());
+  ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+
+  // The real runner executed every timer and round. Observe its scheduling
+  // decisions, not elapsed wall time, so loaded CI workers cannot turn this
+  // into a flaky latency assertion. Success without retirement resets the
+  // failure streak and returns leases/read pins to their normal fast retry.
+  EXPECT_EQ(retry_delays_,
+            (std::vector<std::uint64_t>{100, 200, 250, 50, 100}));
+  EXPECT_EQ(rounds_, 6);
+  EXPECT_TRUE(PrepareWrite(1).ok());
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       FailureBackoffTracksChangedCooldownWithoutRestartingDriver) {
+  AddLiveBacklog();
+  round_ = [this] {
+    if (rounds_ < 4)
+      return absl::DataLossError("persistent cleaner corruption fixture");
+    CompleteBacklog();
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(150).ok());
+  RequestCleaning();
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 2; }));
+  EXPECT_EQ(retry_delays_, (std::vector<std::uint64_t>{100, 150}));
+
+  // Raising the cap keeps the existing runner and its failure history. Even
+  // the largest legal cooldown is accepted without overflowing timer math.
+  ASSERT_TRUE(
+      storage_
+          .ConfigureTxCleanerCooldown(std::numeric_limits<std::uint32_t>::max())
+          .ok());
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 3; }));
+  EXPECT_TRUE(absl::IsDataLoss(PrepareWrite(1)));
+  EXPECT_EQ(retry_delays_, (std::vector<std::uint64_t>{100, 150, 300}));
+
+  // A lower setting applies to the already pending error wait. It does not
+  // require another append, a new driver, or expiration of the old cap.
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(20).ok());
+  ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+  EXPECT_EQ(retry_delays_, (std::vector<std::uint64_t>{100, 150, 300, 20}));
+  EXPECT_EQ(rounds_, 4);
+  EXPECT_TRUE(PrepareWrite(1).ok());
+}
+
 TEST_F(TxCleanerPipelineTestPeer, DisablingMaintenanceDrainsRetryDriver) {
   AddLiveBacklog();
   RequestCleaning();
@@ -410,6 +481,21 @@ TEST_F(TxCleanerPipelineTestPeer, DisablingMaintenanceDrainsRetryDriver) {
   EXPECT_TRUE(PrepareWrite(1).ok());
   EXPECT_TRUE(DriverIdle());
   EXPECT_NE(receipts_[0].transaction_lease_, nullptr);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DisablingMaintenanceDrainsFailureBackoff) {
+  AddLiveBacklog();
+  round_ = [] { return absl::DataLossError("persistent cleaner fixture"); };
+  RequestCleaning();
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 3; }));
+  ASSERT_EQ(retry_delays_, (std::vector<std::uint64_t>{100, 200, 400}));
+  EXPECT_TRUE(absl::IsDataLoss(PrepareWrite(1)));
+
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(0).ok());
+
+  ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+  EXPECT_EQ(rounds_, 3);
+  EXPECT_TRUE(PrepareWrite(1).ok());
 }
 
 TEST_F(TxCleanerPipelineTestPeer, DisabledCleanerDoesNotFenceWritesOnOldError) {
@@ -438,6 +524,20 @@ TEST_F(TxCleanerPipelineTestPeer, ShutdownDrainsRetryAndRejectsNewWrite) {
   EXPECT_TRUE(absl::IsUnavailable(PrepareWrite(1)));
   ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
   EXPECT_EQ(rounds_, completed_rounds);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, ShutdownDrainsFailureBackoff) {
+  AddLiveBacklog();
+  round_ = [] { return absl::DataLossError("persistent cleaner fixture"); };
+  RequestCleaning();
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 3; }));
+  ASSERT_EQ(retry_delays_, (std::vector<std::uint64_t>{100, 200, 400}));
+
+  BeginShutdown();
+
+  EXPECT_TRUE(absl::IsUnavailable(PrepareWrite(1)));
+  ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+  EXPECT_EQ(rounds_, 3);
 }
 
 TEST_F(TxCleanerPipelineTestPeer,

@@ -4947,6 +4947,9 @@ class StorageEngine::Impl {
   // Substitute only the physical round, preserving its scheduling, retry,
   // result publication and lifecycle behavior in deterministic runtime tests.
   std::function<absl::Status()> tx_cleaner_round_for_test_;
+  // Observe the runner's planned retry delay without replacing its timers or
+  // round execution. Also reports a runtime configuration shortening a wait.
+  std::function<void(std::uint64_t)> tx_cleaner_retry_delay_for_test_;
   // Replace only the physical scan, retaining promotion validation, progress
   // tracking and destination durability waits in deterministic runtime tests.
   std::function<Task<absl::Status>()> tx_promotion_scan_for_test_;

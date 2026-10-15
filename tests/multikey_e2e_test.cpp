@@ -287,7 +287,8 @@ class ServerProcess {
                 std::string_view fail_replication_transaction_containing = {},
                 bool shutdown_checkpoint = false,
                 std::string_view record_pause_key = {},
-                std::string_view record_pause_file = {}) {
+                std::string_view record_pause_file = {},
+                bool start_tx_cleaner_paused = false) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -329,6 +330,9 @@ class ServerProcess {
       }
       if (fail_tx_cleaner_once) {
         (void)::setenv("LAVIK_FAIL_TX_CLEANER_ONCE", "1", 1);
+      }
+      if (start_tx_cleaner_paused) {
+        (void)::setenv("LAVIK_TX_CLEANER_START_PAUSED", "1", 1);
       }
       std::vector<std::string> arguments{
           binary,
@@ -1100,8 +1104,14 @@ int main(int argc, char** argv) {
 
     ServerProcess block_recovery_server(
         argv[1], port, data_path, log_path, {}, {}, false, 4, {}, {}, {}, false,
-        "{tx-pressure}paused", pressure_pause_path);
+        "{tx-pressure}paused", pressure_pause_path, true);
     RespClient block_recovery = ConnectReady(port);
+    // Recovery makes sealed blocks immediately eligible for background
+    // cleaning. Pause it from process startup so this baseline precedes any
+    // retirement and the CONFIG transition below exercises recovered work.
+    Expect(block_recovery.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
+           "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("0"),
+           "transaction cleaner is paused during block recovery");
     const std::uint64_t recovered_cleaner_baseline =
         TxCleanerRetiredBlocks(block_recovery);
     Expect(block_recovery.Command(
