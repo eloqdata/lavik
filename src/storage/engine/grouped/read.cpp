@@ -249,6 +249,11 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
   }
   if (snapshot == nullptr)
     co_return absl::DataLossError("missing grouped materialization view");
+  if (snapshot->is_ordered() && snapshot->ordered_directory().root().kind_ ==
+                                    OrderedCollectionKind::kString) {
+    co_return co_await LoadGroupedStringValue(
+        store, partition, db_id, key, digest, std::move(snapshot), pinned);
+  }
   GroupedScratchBudget budget;
   auto include_group = [&](GroupedRecordId id) -> absl::Status {
     const auto* entry = snapshot->FindGroup(id);
@@ -269,7 +274,8 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
   }
   // Legacy full-image consumers hold both decoded entries and their encoded
   // image. Reserve before the first page, not after constructing that image.
-  // The returned read buffer has its own independent admitted lifetime.
+  // The returned read lease follows the buffer pool's separate lifetime; this
+  // temporary reservation ends after materialization, before the network send.
   auto scratch = budget.Reserve(2);
   if (!scratch.ok()) co_return scratch.status();
   absl::StatusOr<std::string> encoded;

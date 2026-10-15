@@ -85,6 +85,11 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   auto ReadLocal() {
     return storage_.impl_->LoadValueLocal(Store(), 0, key_, location_, 1);
   }
+  auto ReadGrouped(bool pinned = false) {
+    return storage_.impl_->LoadGroupedValue(Store(), Store().partitions_[0], 0,
+                                            key_, digest_, location_,
+                                            pinned ? grouped_ : nullptr);
+  }
   bool HasHelper(const Awaitable& read) { return read.slow_.valid(); }
 
   void Encode(std::byte* data) {
@@ -108,6 +113,108 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     }
     auto buffer = storage_.impl_->StagingBufferFor(Store(), block_);
     Encode(buffer.data_ + location_.record_offset());
+  }
+  void StageGroupedPage(std::size_t page, bool valid_checksum = true) {
+    auto& header = grouped_headers_[page];
+    const auto& payload = grouped_payloads_[page];
+    header.payload_checksum_ = Crc32c(std::as_bytes(std::span(payload)));
+    if (!valid_checksum) header.payload_checksum_ ^= 1;
+    const auto staging = storage_.impl_->StagingBufferFor(Store(), block_);
+    auto* data = staging.data_ + grouped_locations_[page].record_offset();
+    ASSERT_TRUE(EncodeRecordHeader(header, key_,
+                                   std::span(data, header.header_bytes_)));
+    std::memcpy(data + header.header_bytes_, payload.data(), payload.size());
+  }
+  void InstallGroupedString(std::size_t bytes) {
+    digest_ = ComputeDigest(key_);
+    value_.resize(bytes);
+    for (std::size_t i = 0; i < bytes; ++i)
+      value_[i] = static_cast<char>(i % 251);
+    auto& store = Store();
+    store.partition_grouped_objects_.resize(kLogicalDatabaseCount);
+    store.partitions_[0].grouped_objects_ = store.partition_grouped_objects_;
+    block_.in_memory_ = true;
+    if (block_.staging_slot_ == 0) {
+      block_.staging_slot_ = store.staging_slots_.size();
+      store.staging_slots_.emplace_back();
+      ASSERT_TRUE(Pool().TryAcquireWriteBuffer(
+          &store.staging_slots_.back().write_buffer_id_));
+    }
+    const auto count = (bytes + kStringGroupBytes - 1) / kStringGroupBytes;
+    const OrderedCollectionRoot root{
+        .kind_ = OrderedCollectionKind::kString,
+        .incarnation_ = 17,
+        .item_count_ = bytes,
+        .first_group_ = 1,
+        .last_group_ = count,
+        .next_group_id_ = count + 1,
+        .group_count_ = static_cast<std::uint32_t>(count),
+        .revision_ = 9};
+    location_ = RecordLocation(
+        1, 9, 7, 0, bytes,
+        RecordLocation::PackedMetadata::Encode(
+            kBlockHeaderBytes, 256, 0, true, false, false, false, false, false,
+            RecordKind::kValue, ValueType::kString, false, true));
+    std::vector<RecoveredOrderedGroup> records;
+    std::vector<GroupedRecordLocation> locations;
+    grouped_payloads_.clear();
+    grouped_headers_.clear();
+    grouped_locations_.clear();
+    std::uint32_t offset = kBlockHeaderBytes + 256;
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto segment = std::string_view(value_).substr(
+          i * kStringGroupBytes, kStringGroupBytes);
+      OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kString,
+                                .incarnation_ = 17,
+                                .id_ = i + 1,
+                                .previous_ = i,
+                                .next_ = i + 1 == count ? 0 : i + 2,
+                                .entries_ = {{.value_ = std::string(segment)}}};
+      auto encoded = EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      RecordHeader header = header_;
+      header.auxiliary_group_ = true;
+      header.group_incarnation_ = page.incarnation_;
+      header.group_prefix_ = page.id_;
+      header.header_bytes_ =
+          RecordHeaderBytes(key_.size(), false, false, false, true);
+      header.logical_size_ = segment.size();
+      header.payload_bytes_ = encoded->size();
+      header.total_disk_bytes_ =
+          AlignRecord(header.header_bytes_ + encoded->size());
+      const RecordLocation physical(
+          1, 9, 7, 0, segment.size(),
+          RecordLocation::PackedMetadata::Encode(
+              offset, header.total_disk_bytes_, 0, true, false, false, false,
+              false, false, RecordKind::kValue, ValueType::kString));
+      records.emplace_back(OrderedGroupEntry{.incarnation_ = 17,
+                                             .id_ = page.id_,
+                                             .previous_ = page.previous_,
+                                             .next_ = page.next_,
+                                             .sequence_ = 9,
+                                             .lsn_ = 9,
+                                             .item_count_ = segment.size(),
+                                             .encoded_bytes_ = encoded->size(),
+                                             .record_token_ = i + 1});
+      locations.push_back({.id_ = {i + 1, 0}, .location_ = physical});
+      grouped_payloads_.push_back(std::move(*encoded));
+      grouped_headers_.push_back(header);
+      grouped_locations_.push_back(physical);
+      ASSERT_NO_FATAL_FAILURE(StageGroupedPage(i));
+      offset += header.total_disk_bytes_;
+    }
+    auto directory = OrderedGroupDirectory::Recover(root, 9, records, {});
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    auto object = GroupedObject::CreateOrdered(
+        {.root_ = location_, .db_epoch_ = 1, .replication_epoch_ = 1},
+        std::move(*directory), locations);
+    ASSERT_TRUE(object.ok()) << object.status();
+    ASSERT_TRUE(store.partitions_[0]
+                    .grouped_objects_[0]
+                    .Publish(digest_, key_, grouped_, *object)
+                    .ok());
+    grouped_ = std::move(*object);
+    IndexLocation();
   }
   void IndexLocation() {
     ASSERT_NE(Store()
@@ -260,6 +367,10 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   Digest digest_{17};
   RecordHeader header_;
   RecordLocation location_;
+  GroupedObject::Handle grouped_;
+  std::vector<std::string> grouped_payloads_;
+  std::vector<RecordHeader> grouped_headers_;
+  std::vector<RecordLocation> grouped_locations_;
 };
 
 TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
@@ -522,6 +633,92 @@ TEST_F(LoadValueAwaitableTestPeer, ConcurrentLogicalMutationIsNotRelocation) {
   IndexLocation();
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   EXPECT_TRUE(absl::IsNotFound(std::move(task).TakeResult().status()));
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       GroupedStringAssemblyLeavesTheSinglePageSlotAvailable) {
+  // Include grouped lengths that fit in a fixed read slot: reserving that
+  // slot for the output before loading a page would deadlock this fixture.
+  for (std::size_t bytes : {2 * kStringGroupBytes, 2 * kStringGroupBytes + 17,
+                            3 * kStringGroupBytes, 1024UL * 1024 + 3}) {
+    SCOPED_TRACE(bytes);
+    ASSERT_NO_FATAL_FAILURE(InstallGroupedString(bytes));
+    for (bool pinned : {false, true}) {
+      auto task = ReadGrouped(pinned);
+      Start(task);
+      ASSERT_TRUE(task.done());  // Every page is resident; no I/O is needed.
+      auto result = std::move(task).TakeResult();
+      ASSERT_TRUE(result.ok()) << result.status();
+      ExpectValue(result);
+      EXPECT_EQ(result->lease_.buffer_id(), 0);
+      EXPECT_EQ(Pool().available_read_buffers(), 1);
+      // A later read may reuse the page slot without invalidating the reply.
+      auto next = ReadGrouped(pinned);
+      Start(next);
+      ASSERT_TRUE(next.done());
+      ExpectValue(std::move(next).TakeResult());
+      ExpectValue(result);
+    }
+  }
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       GroupedStringAssemblyRejectsCorruptSegmentsAndReleasesSlots) {
+  for (bool pinned : {false, true}) {
+    for (int corruption = 0; corruption != 5; ++corruption) {
+      SCOPED_TRACE(testing::Message()
+                   << "pinned=" << pinned << " corruption=" << corruption);
+      ASSERT_NO_FATAL_FAILURE(InstallGroupedString(2 * kStringGroupBytes + 17));
+      // Corrupt the second page, after the first page has filled part of the
+      // private output. Recompute CRC except for its dedicated failure case.
+      auto& payload = grouped_payloads_[1];
+      if (corruption == 0) payload[48] ^= 1;  // Segment byte count.
+      if (corruption == 1) payload[40] ^= 1;  // Next link.
+      if (corruption == 2) payload[16] ^= 1;  // Incarnation.
+      if (corruption == 3) payload[24] ^= 1;  // Page ID.
+      ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, corruption != 4));
+      auto task = ReadGrouped(pinned);
+      Start(task);
+      ASSERT_TRUE(task.done());
+      const auto result = std::move(task).TakeResult();
+      EXPECT_EQ(result.status().code(), corruption == 4
+                                            ? absl::StatusCode::kInternal
+                                            : absl::StatusCode::kDataLoss);
+      EXPECT_EQ(Pool().available_read_buffers(), 1);
+    }
+  }
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       GroupedStringAssemblyRechecksPopulationAfterPageBufferWait) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(2 * kStringGroupBytes + 17));
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  auto task = ReadGrouped(true);
+  Start(task);
+  EXPECT_FALSE(task.done());
+  Invalidate(true);
+  held->Reset();
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsNotFound(std::move(task).TakeResult().status()));
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       GroupedStringAssemblyRejectsOomBeforeTakingPageBuffer) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(2 * kStringGroupBytes));
+  struct RestoreLimit {
+    ~RestoreLimit() { (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1); }
+  } restore;
+  ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  auto task = ReadGrouped(true);
+  Start(task);
+  ASSERT_TRUE(task.done());  // Admission fails before waiting on the held slot.
+  EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult().status()));
+  held->Reset();
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
 }  // namespace lavik::storage

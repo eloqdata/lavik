@@ -37,6 +37,86 @@ struct Encoder {
   }
 };
 
+TEST(RecordPayloadCursorTest, InlineWriterFillsOnlyTheAdmittedDestination) {
+  for (const std::size_t bytes : {0, 1, 15, 16, 31, 8192}) {
+    const std::string input(bytes, '\xff');
+    Encoder encoder{bytes, {"", input, ""}};
+    const InlineRecordPayload payload(encoder);
+    EXPECT_EQ(payload.encoded_bytes(), bytes);
+    // Constructing the borrowed writer must not consume any fragments: the
+    // actual append may still suspend or retry its physical allocation.
+    EXPECT_EQ(encoder.next_, 0);
+    std::vector<std::byte> output(bytes + 2, std::byte{0x5a});
+    auto destination = std::span(output).subspan(1, bytes);
+    ASSERT_TRUE(payload.WriteTo(destination).ok());
+    EXPECT_EQ(std::memcmp(destination.data(), input.data(), bytes), 0);
+    EXPECT_EQ(output.front(), std::byte{0x5a});
+    EXPECT_EQ(output.back(), std::byte{0x5a});
+  }
+}
+
+TEST(RecordPayloadCursorTest,
+     InlineWriterRejectsIncorrectDestinationBeforeRead) {
+  for (const std::size_t bytes : {2, 4}) {
+    Encoder encoder{3, {"abc"}};
+    const InlineRecordPayload payload(encoder);
+    std::vector<std::byte> output(bytes, std::byte{0x5a});
+    EXPECT_TRUE(absl::IsDataLoss(payload.WriteTo(output)));
+    EXPECT_EQ(encoder.next_, 0);
+    EXPECT_EQ(output, std::vector<std::byte>(bytes, std::byte{0x5a}));
+  }
+}
+
+TEST(RecordPayloadCursorTest, MalformedInlineWriterCannotOverrunStagingRange) {
+  for (auto spans : {std::vector<std::string_view>{"ab"},
+                     std::vector<std::string_view>{"abcd"},
+                     std::vector<std::string_view>{"abc", "", "d"}}) {
+    Encoder encoder{3, std::move(spans)};
+    const InlineRecordPayload payload(encoder);
+    std::array<std::byte, 5> output;
+    output.fill(std::byte{0x5a});
+    EXPECT_TRUE(
+        absl::IsDataLoss(payload.WriteTo(std::span(output).subspan(1, 3))));
+    EXPECT_EQ(output.front(), std::byte{0x5a});
+    EXPECT_EQ(output.back(), std::byte{0x5a});
+  }
+  Encoder nonempty{0, {"x"}};
+  const InlineRecordPayload empty(nonempty);
+  EXPECT_TRUE(absl::IsDataLoss(empty.WriteTo({})));
+}
+
+TEST(RecordPayloadCursorTest, DirectInlineWriterPreservesBorrowedPageFraming) {
+  OrderedGroupSnapshot list{.incarnation_ = 17, .id_ = 1};
+  HashGroupSnapshot hash{.incarnation_ = 17};
+  for (int i = 0; i < 100; ++i) {
+    std::string value(i * 3, static_cast<char>(i));
+    list.entries_.push_back({.value_ = value});
+    hash.value_.entries_.push_back(
+        {.field_ = std::to_string(i), .value_ = value});
+  }
+  auto ordered = OrderedGroupEncoder::Create(list);
+  ASSERT_TRUE(ordered.ok());
+  auto prefix = HashGroupEncoder::Create(hash);
+  ASSERT_TRUE(prefix.ok());
+  const InlineRecordPayload ordered_payload(*ordered);
+  const InlineRecordPayload hash_payload(*prefix);
+  std::vector<std::byte> ordered_bytes(ordered_payload.encoded_bytes());
+  std::vector<std::byte> hash_bytes(hash_payload.encoded_bytes());
+  ASSERT_TRUE(ordered_payload.WriteTo(ordered_bytes).ok());
+  ASSERT_TRUE(hash_payload.WriteTo(hash_bytes).ok());
+  const auto expected_ordered = EncodeOrderedGroup(list);
+  const auto expected_hash = EncodeHashGroup(hash);
+  ASSERT_TRUE(expected_ordered.ok());
+  ASSERT_TRUE(expected_hash.ok());
+  EXPECT_EQ(
+      std::string_view(reinterpret_cast<const char*>(ordered_bytes.data()),
+                       ordered_bytes.size()),
+      *expected_ordered);
+  EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(hash_bytes.data()),
+                             hash_bytes.size()),
+            *expected_hash);
+}
+
 TEST(RecordPayloadCursorTest, InlineEncodingChecksExactProducerLength) {
   for (const std::size_t bytes : {0, 1, 15, 16, 31, 256}) {
     const std::string input(bytes, '\xff');

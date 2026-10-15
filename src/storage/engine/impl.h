@@ -4413,6 +4413,12 @@ class StorageEngine::Impl {
                           std::uint8_t db_id, std::string_view key,
                           const Digest& digest, GroupedObject::Handle object,
                           bool pinned = false);
+  // Assemble checked String segments into the returned lease without
+  // retaining decoded pages or a second whole-value image.
+  Task<absl::StatusOr<LoadedValue>> LoadGroupedStringValue(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, bool pinned);
   // Consumes an unstarted preflight encoder with the same snapshot lifetime
   // contract as WriteHashGroupRecordLocked, including across extent IO.
   Task<absl::StatusOr<GroupedRecordLocation>> WriteOrderedGroupRecordLocked(
@@ -4428,6 +4434,10 @@ class StorageEngine::Impl {
   struct RecordWriteRequest {
     std::string_view key_{};
     std::string_view value_{};
+    // Optional preflighted inline auxiliary encoder, mutually exclusive with
+    // value_ and external_. Borrowed through allocation waits, then consumed
+    // synchronously into the unpublished staging tail after final validation.
+    const InlineRecordPayload* inline_payload_ = nullptr;
     Digest digest_{};
     std::uint64_t expire_at_ms_ = 0;
     std::uint64_t mutation_sequence_ = 0;
@@ -4453,7 +4463,7 @@ class StorageEngine::Impl {
     bool mark_watched_ : 1 = false;
     bool indirect_key_record_ : 1 = false;
   };
-  static_assert(sizeof(RecordWriteRequest) == 136);
+  static_assert(sizeof(RecordWriteRequest) == 144);
 
   // Validate grouped metadata after resolving the logical-size sentinel and
   // the transaction receipt's effective txid.

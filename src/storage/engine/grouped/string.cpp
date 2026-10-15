@@ -31,13 +31,18 @@ OrderedCollectionRoot StringRoot(std::size_t bytes, std::uint64_t incarnation) {
 }
 
 OrderedGroupSnapshot StringPage(const OrderedCollectionRoot& root,
+                                std::uint64_t id) {
+  return {.kind_ = OrderedCollectionKind::kString,
+          .incarnation_ = root.incarnation_,
+          .id_ = id,
+          .previous_ = id - 1,
+          .next_ = id == root.last_group_ ? 0 : id + 1,
+          .entries_ = {}};
+}
+
+OrderedGroupSnapshot StringPage(const OrderedCollectionRoot& root,
                                 std::uint64_t id, std::string bytes) {
-  OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kString,
-                            .incarnation_ = root.incarnation_,
-                            .id_ = id,
-                            .previous_ = id - 1,
-                            .next_ = id == root.last_group_ ? 0 : id + 1,
-                            .entries_ = {}};
+  auto page = StringPage(root, id);
   // An initializer_list exposes const entries, forcing the vector to copy
   // the segment even when its initializer moves the string.
   page.entries_.emplace_back().value_ = std::move(bytes);
@@ -66,11 +71,12 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
   if (previous && (before.size() != previous->version().root_.logical_size_ ||
                    value.size() < before.size()))
     previous.reset();
-  // Whole replacements allocate all segments privately; incremental callbacks
-  // retain only changed segment bodies. Admission covers both possibilities.
-  auto admission = TryReserveMemory(
-      value.size() +
-      ((value.size() + kStringGroupBytes - 1) / kStringGroupBytes) * 512);
+  // The caller retains this immutable value through the awaited commit. Only
+  // page descriptors are allocated here; all borrowed bytes reach staging
+  // before the commit queue takes its receipts, which retain no page payloads.
+  const auto groups =
+      (value.size() + kStringGroupBytes - 1) / kStringGroupBytes;
+  auto admission = TryReserveMemory(groups * 512);
   if (!admission) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM preparing String segments");
@@ -80,6 +86,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
       .expected_sequence_ = previous ? previous->revision() : 0,
       .changed_ = true,
       .writes_ = {}};
+  plan.writes_.reserve(groups);
   for (std::size_t offset = 0; offset < value.size();
        offset += kStringGroupBytes) {
     const auto bytes = value.substr(offset, kStringGroupBytes);
@@ -89,7 +96,9 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
         before.substr(offset, kStringGroupBytes) == bytes &&
         !(id == previous->group_count() && id != plan.root_.last_group_))
       continue;
-    plan.writes_.push_back(StringPage(plan.root_, id, std::string(bytes)));
+    auto page = StringPage(plan.root_, id);
+    page.borrowed_string_ = bytes;
+    plan.writes_.push_back(std::move(page));
   }
   if (plan.writes_.empty())
     co_return co_await UpdateGroupedExpirationLocked(

@@ -348,6 +348,121 @@ TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
   EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
 }
 
+std::string BinaryString(std::size_t bytes, unsigned seed) {
+  std::string value(bytes, '\0');
+  for (std::size_t i = 0; i < bytes; ++i)
+    value[i] = static_cast<char>((i * 37 + i / 8192 + seed) % 256);
+  return value;
+}
+
+TEST(GroupedStringWriteE2e, WholeBinaryReplacementsKeepOptionsAndRecover) {
+  PrivateDisk disk;
+  // Exercise compact/grouped promotion, the fixed read-slot boundary, full
+  // segments and a partial tail. Binary bytes expose accidental C-string
+  // assumptions in borrowed payloads and direct reply assembly.
+  const std::vector<std::size_t> sizes{127,   8192,  16383, 16384,
+                                       16385, 24576, 24577, 1024 * 1024 + 19};
+  std::vector<std::string> values;
+  for (const auto size : sizes) values.push_back(BinaryString(size, 91));
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      const auto key = "binary-" + std::to_string(i);
+      const auto original = BinaryString(sizes[i], 7);
+      ASSERT_EQ(client.Command({"SET", key, original, "PX", "600000"}).text_,
+                "OK");
+      EXPECT_EQ(client.Command({"GET", key}).text_, original);
+      EXPECT_EQ(client.Command({"SET", key, "rejected", "NX"}).text_, "-1");
+      EXPECT_EQ(
+          client.Command({"SET", key, values[i], "XX", "GET", "KEEPTTL"}).text_,
+          original);
+      EXPECT_EQ(client.Command({"GET", key}).text_, values[i]);
+      EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+    }
+    // A compact replacement must also read the complete old grouped String
+    // for SET GET before its graph retires.
+    EXPECT_EQ(client.Command({"SET", "binary-7", "small", "GET"}).text_,
+              values.back());
+    EXPECT_EQ(client.Command({"GET", "binary-7"}).text_, "small");
+    ASSERT_EQ(client.Command({"SET", "binary-7", values.back()}).text_, "OK");
+    client.Durable();
+    // Destruction kills the process; shutdown cannot make the writes durable.
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (std::size_t i = 0; i < values.size(); ++i)
+    EXPECT_EQ(client.Command({"GET", "binary-" + std::to_string(i)}).text_,
+              values[i]);
+}
+
+TEST(GroupedStringWriteE2e, InlineEncodingFailureKeepsPreviousValueAndWriter) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires inline encoder failure hook";
+#endif
+  PrivateDisk disk;
+  const auto before = BinaryString(1024 * 1024 + 13, 23);
+  const auto after = BinaryString(before.size(), 47);
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", "encode-failure", before}).text_, "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_INLINE_GROUP_ENCODE_KEY",
+                            "encode-failure");
+    Server server(disk, 2);
+    Client client(server.port());
+    const auto failed = client.Command({"SET", "encode-failure", after});
+    ASSERT_EQ(failed.kind_, '-') << failed.text_;
+    EXPECT_NE(failed.text_.find("injected inline group encoding fault"),
+              std::string::npos);
+    EXPECT_EQ(client.Command({"GET", "encode-failure"}).text_, before);
+    ASSERT_EQ(client.Command({"SET", "healthy", "still writable"}).text_, "OK");
+    EXPECT_EQ(client.Command({"GET", "healthy"}).text_, "still writable");
+    // The one-shot failure left only an unpublished staging tail. Retrying
+    // must overwrite it without exposing a partial page or leaking a lease.
+    ASSERT_EQ(client.Command({"SET", "encode-failure", after}).text_, "OK");
+    EXPECT_EQ(client.Command({"GET", "encode-failure"}).text_, after);
+    client.Durable();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", "encode-failure"}).text_, after);
+  EXPECT_EQ(client.Command({"GET", "healthy"}).text_, "still writable");
+}
+
+TEST(GroupedStringWriteE2e, QueuedWholeReplacementsRetainBorrowedArguments) {
+  PrivateDisk disk;
+  const auto first = BinaryString(1024 * 1024 + 1, 17);
+  const auto second = BinaryString(1024 * 1024 + 31, 29);
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    EXPECT_EQ(client.Command({"SET", "queued", first}).text_, "QUEUED");
+    EXPECT_EQ(client.Command({"GET", "queued"}).text_, "QUEUED");
+    EXPECT_EQ(client.Command({"SET", "queued", second, "GET"}).text_, "QUEUED");
+    EXPECT_EQ(client.Command({"GET", "queued"}).text_, "QUEUED");
+    const auto exec = client.Command({"EXEC"});
+    ASSERT_EQ(exec.items_.size(), 4);
+    EXPECT_EQ(exec.items_[0].text_, "OK");
+    EXPECT_EQ(exec.items_[1].text_, first);
+    EXPECT_EQ(exec.items_[2].text_, first);
+    EXPECT_EQ(exec.items_[3].text_, second);
+    // Replace the connection's parser/reply owners before deferred commit
+    // drain. Queued storage work must retain staged bytes, never request views.
+    ASSERT_EQ(client.Command({"SET", "unrelated", first}).text_, "OK");
+    EXPECT_EQ(client.Command({"GET", "queued"}).text_, second);
+    client.Durable();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", "queued"}).text_, second);
+}
+
 class StringPreparationGate {
  public:
   StringPreparationGate(const PrivateDisk& disk, const char* key,

@@ -134,13 +134,17 @@ absl::Status ValidateEntries(OrderedCollectionKind kind,
 }
 
 absl::StatusOr<std::size_t> ValidateGroup(const OrderedGroupSnapshot& group) {
+  const bool borrowed_string = group.borrowed_string_.has_value();
+  if (borrowed_string && (group.kind_ != OrderedCollectionKind::kString ||
+                          !group.entries_.empty()))
+    return absl::InvalidArgumentError("invalid borrowed String segment");
   if (group.incarnation_ == 0 || group.id_ == 0 ||
       group.previous_ == group.id_ || group.next_ == group.id_ ||
       (group.previous_ != 0 && group.previous_ == group.next_) ||
       group.entries_.size() > std::numeric_limits<std::uint32_t>::max() ||
-      (group.retired_ ? (!group.entries_.empty() || group.previous_ != 0 ||
-                         group.next_ != 0)
-                      : group.entries_.empty())) {
+      (group.retired_ ? (!group.entries_.empty() || borrowed_string ||
+                         group.previous_ != 0 || group.next_ != 0)
+                      : (group.entries_.empty() && !borrowed_string))) {
     return absl::InvalidArgumentError("invalid ordered page identity or state");
   }
   auto status = ValidateEntries(group.kind_, group.entries_);
@@ -148,8 +152,8 @@ absl::StatusOr<std::size_t> ValidateGroup(const OrderedGroupSnapshot& group) {
   if (group.kind_ == OrderedCollectionKind::kString) {
     const auto size = OrderedGroupSize(group);
     if (group.retired_ ||
-        (group.entries_.size() != 1 || size == 0 || size > kStringGroupBytes ||
-         group.previous_ != group.id_ - 1 ||
+        ((!borrowed_string && group.entries_.size() != 1) || size == 0 ||
+         size > kStringGroupBytes || group.previous_ != group.id_ - 1 ||
          (group.next_ != 0 &&
           (group.next_ != group.id_ + 1 || size != kStringGroupBytes))))
       return absl::InvalidArgumentError("invalid fixed String segment");
@@ -400,12 +404,13 @@ std::optional<std::string_view> OrderedGroupEncoder::Next() noexcept {
     phase_ = 1;
     return std::string_view(header_.data(), header_.size());
   }
+  if (group_->kind_ == OrderedCollectionKind::kString) {
+    if (entry_ != 0) return std::nullopt;
+    ++entry_;
+    return OrderedStringBytes(*group_);
+  }
   if (entry_ == group_->entries_.size()) return std::nullopt;
   const auto& entry = group_->entries_[entry_];
-  if (group_->kind_ == OrderedCollectionKind::kString) {
-    ++entry_;
-    return entry.value_;
-  }
   if (phase_ == 1) {
     phase_ = 2;
     Store(entry_header_, 0, entry.value_.size(), 4);
@@ -669,10 +674,11 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
                                           const OrderedGroupSnapshot& right) {
   if (left.kind_ != right.kind_ || left.incarnation_ != right.incarnation_ ||
       left.retired_ || right.retired_ || left.next_ != right.id_ ||
-      right.previous_ != left.id_ || left.entries_.empty() ||
-      right.entries_.empty()) {
+      right.previous_ != left.id_ || OrderedGroupSize(left) == 0 ||
+      OrderedGroupSize(right) == 0) {
     return absl::DataLossError("inconsistent ordered page neighbours");
   }
+  if (left.kind_ == OrderedCollectionKind::kString) return absl::OkStatus();
   return ValidateOrderedEntryBoundary(left.kind_, left.entries_.back(),
                                       right.entries_.front());
 }
