@@ -116,16 +116,23 @@ racing closure is either rejected or remains visible to the drain.
 
 ## Request pipeline
 
-1. `ReadCommandBatch` reads into a connection-local buffer and feeds
-   `RespCommandParser`. Up to 128 parsed commands are retained in wire order.
+1. `ReadCommandBatch` feeds `RespCommandParser` through a small connection-local
+   buffer. Large bulk bodies can instead receive directly into parser-owned
+   argument storage after their first payload bytes arrive. The opt-in Bycorf
+   read drains already-received buffers without waiting to fill the destination;
+   TLS continues through its decrypted read path. Up to 128 parsed commands are
+   retained in wire order.
    Ordinary connections collectively hold at most `maxmemory-clients`, which
    accepts an absolute byte size or a percentage of effective maxmemory and
    defaults to 5%. The effective limit is divided into fixed worker shares.
    This abuse-control quota is independent of retained-memory admission; the
    server does not reserve temporary request bytes against `maxmemory` a second
-   time. Admission runs once after each socket read;
-   parsed wire bytes follow their command until execution finishes, while blank
-   input is retired as soon as the parser returns to its idle state. The
+   time. Ordinary reads admit received bytes; direct bulk reads admit bounded
+   destination windows before allocation. Prepaid bytes become received-byte
+   charges without a second admission, and unread reservations are released
+   on connection teardown. Parsed wire bytes follow their command until
+   execution finishes, while blank input is retired as soon as the parser
+   returns to its idle state. The
    offending connection receives an error and closes when its worker's share is
    exhausted. Zero disables this client-specific limit. As in Valkey, every
    nonzero process-wide client allowance has a 128 KiB
@@ -136,14 +143,13 @@ racing closure is either rejected or remains visible to the drain.
    Independently, `client-query-buffer-limit` bounds the wire bytes retained
    while one connection incrementally assembles a command. It defaults to 1
    GiB and, like Redis, accepts an absolute value from 1 MiB through
-   `LONG_MAX`. Lavik consumes the small socket input window directly into
-   argument strings, so this is a parser-retained-byte limit rather than a
-   requirement for a second contiguous query buffer. Completed pipelined and
+   `LONG_MAX`. Both receive paths assemble argument strings without requiring
+   a second contiguous command buffer. Completed pipelined and
    `MULTI` commands remain governed by `maxmemory-clients` after parser
    ownership ends. `CONFIG SET client-query-buffer-limit` updates a process-wide
-   atomic. Existing connections refresh it once per socket-read parsing round,
-   avoiding an atomic load for each RESP token while ensuring a partially read
-   command is checked against the new limit when more bytes arrive.
+   atomic. Existing connections refresh it once per socket-read parsing round
+   and before committing a direct read, so a partially read command is checked
+   against the new limit when more bytes arrive.
 2. `BuildCommandRequest` resolves case-insensitive static metadata from the
    command table and copies the connection's current database ID into the
    request.

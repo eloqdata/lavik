@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -117,6 +118,194 @@ TEST(RespParserTest, AppliesLowerRuntimeLimitToIncompleteCommand) {
 
   EXPECT_EQ(rejected.state_, RespParseState::kError);
   EXPECT_EQ(rejected.status_.code(), absl::StatusCode::kResourceExhausted);
+}
+
+TEST(RespParserTest, DirectBulkReadsRequirePayloadAndValidateWindows) {
+  RespCommandParser parser;
+  EXPECT_EQ(parser.BulkReadReservationSize(), 0);
+  EXPECT_TRUE(parser.BulkReadBuffer().empty());
+  EXPECT_EQ(parser.CommitBulkRead(0).code(),
+            absl::StatusCode::kInvalidArgument);
+  ASSERT_EQ(parser.Parse("*1\r\n$536870912\r\n").state_,
+            RespParseState::kNeedMoreData);
+  EXPECT_EQ(parser.BulkReadReservationSize(), 0);
+  EXPECT_EQ(parser.PrepareBulkRead(1).code(),
+            absl::StatusCode::kInvalidArgument);
+  ASSERT_EQ(parser.Parse("x").state_, RespParseState::kNeedMoreData);
+  const auto reservation = parser.BulkReadReservationSize();
+  EXPECT_EQ(reservation, 1024 * 1024);
+  EXPECT_EQ(parser.PrepareBulkRead(0).code(),
+            absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(parser.PrepareBulkRead(reservation + 1).code(),
+            absl::StatusCode::kInvalidArgument);
+  ASSERT_TRUE(parser.PrepareBulkRead(reservation).ok());
+  EXPECT_EQ(parser.BulkReadReservationSize(), 0);
+  EXPECT_EQ(parser.PrepareBulkRead(1).code(),
+            absl::StatusCode::kInvalidArgument);
+  auto window = parser.BulkReadBuffer();
+  EXPECT_EQ(window.size(), 256 * 1024);
+  EXPECT_EQ(parser.CommitBulkRead(window.size() + 1).code(),
+            absl::StatusCode::kInvalidArgument);
+  ASSERT_TRUE(parser.CommitBulkRead(0).ok());
+  EXPECT_EQ(parser.BulkReadBuffer().data(), window.data());
+  window[0] = 'y';
+  ASSERT_TRUE(parser.CommitBulkRead(1).ok());
+  EXPECT_EQ(parser.BulkReadBuffer().data(), window.data() + 1);
+  parser.Reset();
+  ASSERT_EQ(parser.Parse("*1\r\n$32767\r\nx").state_,
+            RespParseState::kNeedMoreData);
+  EXPECT_EQ(parser.BulkReadReservationSize(), 0);
+}
+
+TEST(RespParserTest, DirectBulkReadsUseBoundedWindowsForMultiMegabytePayloads) {
+  std::string body(2 * 1024 * 1024 + 13, '\0');
+  for (std::size_t i = 0; i < body.size(); ++i) body[i] = i % 251;
+  const std::string header = "*1\r\n$" + std::to_string(body.size()) + "\r\n";
+  RespCommandParser parser(header.size() + body.size() + 2);
+  ASSERT_EQ(parser.Parse(header + body.substr(0, 1)).state_,
+            RespParseState::kNeedMoreData);
+  std::size_t position = 1, reservations = 0;
+  while (position < body.size()) {
+    if (parser.BulkReadBuffer().empty()) {
+      const auto bytes = parser.BulkReadReservationSize();
+      ASSERT_GT(bytes, 0);
+      ASSERT_LE(bytes, 1024 * 1024);
+      ASSERT_TRUE(parser.PrepareBulkRead(bytes).ok());
+      ++reservations;
+    }
+    const auto window = parser.BulkReadBuffer();
+    ASSERT_FALSE(window.empty());
+    ASSERT_LE(window.size(), 256 * 1024);
+    ASSERT_LE(window.size(), body.size() - position);
+    std::memcpy(window.data(), body.data() + position, window.size());
+    ASSERT_TRUE(parser.CommitBulkRead(window.size()).ok());
+    position += window.size();
+  }
+  EXPECT_EQ(reservations, 3);
+  EXPECT_TRUE(parser.BulkReadBuffer().empty());
+  EXPECT_EQ(parser.BulkReadReservationSize(), 0);
+  EXPECT_EQ(parser.CommitBulkRead(0).code(),
+            absl::StatusCode::kInvalidArgument);
+  auto parsed = parser.Parse("\r\n");
+  ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_;
+  ASSERT_EQ(parsed.command_.args_.size(), 1);
+  EXPECT_EQ(parsed.command_.args_[0], body);
+  EXPECT_TRUE(parser.idle());
+}
+
+TEST(RespParserTest, DirectBulkReadsAllowPartialCommitsAndParseFallback) {
+  std::string body(48000, '\0');
+  for (std::size_t i = 0; i < body.size(); ++i) body[i] = i % 251;
+  RespCommandParser parser;
+  ASSERT_EQ(parser.Parse("*1\r\n$48000\r\n" + body.substr(0, 19)).state_,
+            RespParseState::kNeedMoreData);
+  ASSERT_TRUE(parser.PrepareBulkRead(512).ok());
+  auto window = parser.BulkReadBuffer();
+  std::memcpy(window.data(), body.data() + 19, 7);
+  ASSERT_TRUE(parser.CommitBulkRead(7).ok());
+  ASSERT_EQ(parser.BulkReadBuffer().size(), 505);
+  auto partial = parser.Parse(std::string_view(body).substr(26, 100));
+  ASSERT_EQ(partial.state_, RespParseState::kNeedMoreData);
+  EXPECT_TRUE(partial.command_.args_.empty());
+  EXPECT_EQ(parser.BulkReadBuffer().data(), window.data() + 107);
+  EXPECT_EQ(parser.BulkReadBuffer().size(), 405);
+  // The same call fills the remaining prepared tail, then appends beyond it.
+  auto parsed = parser.Parse(body.substr(126) + "\r\n");
+  ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_;
+  ASSERT_EQ(parsed.command_.args_.size(), 1);
+  EXPECT_EQ(parsed.command_.args_[0], body);
+  EXPECT_TRUE(parser.BulkReadBuffer().empty());
+}
+
+TEST(RespParserTest, DirectBulkReadsPreserveMultipleArgumentsAndPipelining) {
+  RespCommandParser parser;
+  const std::string first(32768, 'a'),
+      second = "txt:" + std::string(48000, 'b');
+  ASSERT_EQ(parser.Parse("*2\r\n$32768\r\na").state_,
+            RespParseState::kNeedMoreData);
+  for (const auto* body : {&first, &second}) {
+    ASSERT_EQ(parser.BulkReadReservationSize(), body->size() - 1);
+    ASSERT_TRUE(parser.PrepareBulkRead(body->size() - 1).ok());
+    auto window = parser.BulkReadBuffer();
+    ASSERT_EQ(window.size(), body->size() - 1);
+    std::memcpy(window.data(), body->data() + 1, window.size());
+    ASSERT_TRUE(parser.CommitBulkRead(window.size()).ok());
+    ASSERT_EQ(parser.Parse("\r").state_, RespParseState::kNeedMoreData);
+    if (body == &first)
+      ASSERT_EQ(parser.Parse("\n=48004\r\nt").state_,
+                RespParseState::kNeedMoreData);
+  }
+  const std::string pipeline = "\n*1\r\n$4\r\nPING\r\n";
+  auto parsed = parser.Parse(pipeline);
+  ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_;
+  EXPECT_EQ(parsed.consumed_, 1);
+  EXPECT_EQ(parsed.command_.args_,
+            (std::vector<std::string>{first, second.substr(4)}));
+  auto next = parser.Parse(std::string_view(pipeline).substr(parsed.consumed_));
+  ASSERT_EQ(next.state_, RespParseState::kOk);
+  EXPECT_EQ(next.command_.args_, (std::vector<std::string>{"PING"}));
+}
+
+TEST(RespParserTest, DirectBulkReadsHonorQueryLimitsAtPreparationAndCommit) {
+  const std::string prefix = "*1\r\n$48000\r\nx";
+  RespCommandParser parser(prefix.size() + 10);
+  ASSERT_EQ(parser.Parse(prefix).state_, RespParseState::kNeedMoreData);
+  EXPECT_EQ(parser.BulkReadReservationSize(), 10);
+  EXPECT_EQ(parser.PrepareBulkRead(11).code(),
+            absl::StatusCode::kInvalidArgument);
+  ASSERT_TRUE(parser.PrepareBulkRead(10).ok());
+  auto window = parser.BulkReadBuffer();
+  std::memset(window.data(), 'y', window.size());
+  ASSERT_TRUE(parser.CommitBulkRead(3).ok());
+  parser.SetQueryBufferLimit(prefix.size() + 5);
+  // A runtime change preserves the prepaid storage across a suspended read.
+  EXPECT_EQ(parser.BulkReadBuffer().size(), 7);
+  EXPECT_EQ(parser.CommitBulkRead(3).code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(parser.BulkReadBuffer().data(), window.data() + 3);
+  ASSERT_TRUE(parser.CommitBulkRead(2).ok());
+  parser.SetQueryBufferLimit(prefix.size() + 4);
+  EXPECT_EQ(parser.CommitBulkRead(1).code(),
+            absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(parser.BulkReadBuffer().data(), window.data() + 5);
+  auto fallback = parser.Parse("z");
+  EXPECT_EQ(fallback.state_, RespParseState::kError);
+  EXPECT_EQ(fallback.status_.code(), absl::StatusCode::kResourceExhausted);
+}
+
+TEST(RespParserTest, DirectBulkResetDiscardsUnwrittenBody) {
+  RespCommandParser parser;
+  ASSERT_EQ(parser.Parse("*1\r\n$48000\r\nx").state_,
+            RespParseState::kNeedMoreData);
+  ASSERT_TRUE(parser.PrepareBulkRead(47999).ok());
+  parser.BulkReadBuffer()[0] = 'y';
+  ASSERT_TRUE(parser.CommitBulkRead(1).ok());
+  parser.Reset();
+  EXPECT_TRUE(parser.idle());
+  EXPECT_EQ(parser.BulkReadReservationSize(), 0);
+  EXPECT_TRUE(parser.BulkReadBuffer().empty());
+  EXPECT_EQ(parser.CommitBulkRead(1).code(),
+            absl::StatusCode::kInvalidArgument);
+  auto parsed = parser.Parse("*1\r\n$4\r\nPING\r\n");
+  ASSERT_EQ(parsed.state_, RespParseState::kOk);
+  EXPECT_EQ(parsed.command_.args_, (std::vector<std::string>{"PING"}));
+}
+
+TEST(RespParserTest, DirectBulkReadsRetainTerminatorAndVerbatimValidation) {
+  for (const char type : {'$', '='}) {
+    RespCommandParser parser;
+    ASSERT_EQ(
+        parser.Parse("*1\r\n" + std::string(1, type) + "48000\r\nx").state_,
+        RespParseState::kNeedMoreData);
+    ASSERT_TRUE(parser.PrepareBulkRead(47999).ok());
+    auto window = parser.BulkReadBuffer();
+    std::memset(window.data(), 'x', window.size());
+    ASSERT_TRUE(parser.CommitBulkRead(window.size()).ok());
+    const auto parsed = parser.Parse(type == '$' ? "\rx" : "\r\n");
+    EXPECT_EQ(parsed.state_, RespParseState::kError);
+    EXPECT_EQ(parsed.status_.code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_TRUE(parsed.command_.args_.empty());
+  }
 }
 
 TEST(RespParserTest, RejectsArrayLengthsAboveValkeyLimit) {
