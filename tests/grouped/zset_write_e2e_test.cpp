@@ -19,6 +19,7 @@
 #include <limits>
 #include <optional>
 
+#include "lavik/storage/detail/grouped/collection.h"
 #include "write_e2e_support.h"
 
 namespace {
@@ -293,6 +294,208 @@ TEST(GroupedSortedSetWriteE2e, AdjacentScoreMovesReusePagesAcrossRecovery) {
   Server recovered(disk, 4);
   Client client(recovered.port());
   verify(client, false);
+}
+
+TEST(GroupedSortedSetWriteE2e, HeadInsertionsReuseNeighborCapacityAndRecover) {
+  PrivateDisk disk;
+  const std::string key = "head-neighbor";
+  auto member = [](unsigned i) {
+    auto value = std::to_string(i);
+    value.resize(256, '\0');
+    return value;
+  };
+  std::map<std::string, double> expected;
+  auto verify = [&](Client& client) {
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_,
+              std::to_string(expected.size()));
+    auto reply = client.Command({"ZRANGE", key, "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(reply.items_.size(), expected.size() * 2);
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& [value, score] : expected) {
+      ordered.emplace_back(score, value);
+      EXPECT_EQ(std::stod(client.Command({"ZSCORE", key, value}).text_), score);
+    }
+    std::sort(ordered.begin(), ordered.end());
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+      EXPECT_EQ(reply.items_[2 * i].text_, ordered[i].second);
+      EXPECT_EQ(std::stod(reply.items_[2 * i + 1].text_), ordered[i].first);
+    }
+  };
+  auto latest_root = [&] {
+    std::optional<OrderedCollectionRoot> latest;
+    std::uint64_t sequence = 0;
+    disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+                          std::string_view name, std::string_view payload) {
+      if (name != key || record.auxiliary_group_ || !record.grouped_ ||
+          record.mutation_sequence_ < sequence)
+        return;
+      auto root = DecodeOrderedCollectionRoot(payload);
+      Check(root.ok(), "decode head-insertion Sorted Set root");
+      latest = *root;
+      sequence = record.mutation_sequence_;
+    });
+    Check(latest.has_value(), "missing head-insertion Sorted Set root");
+    return *latest;
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    // Exactly 30 framed 256-byte members fit each 8 KiB ordered page.
+    for (unsigned i = 0; i < 90; ++i) {
+      seed.insert(seed.end(), {std::to_string(i), member(i)});
+      expected[member(i)] = i;
+    }
+    ASSERT_EQ(client.Command(seed).text_, "90");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(latest_root().group_count_, 3);
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    for (unsigned i = 90; i < 150; ++i) {
+      const auto score = 89 - static_cast<int>(i);
+      ASSERT_EQ(
+          client.Command({"ZADD", key, std::to_string(score), member(i)}).text_,
+          "1");
+      expected[member(i)] = score;
+    }
+    verify(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Each first overflow needs one new page; the next 29 inserts must fill it
+  // by redistribution instead of creating a succession of one-member pages.
+  EXPECT_EQ(latest_root().group_count_, 5);
+  EXPECT_EQ(latest_root().next_group_id_, 6);
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    verify(client);
+    for (unsigned i = 0; i < 30; ++i) {
+      const auto value = member(89 - i);
+      const auto score = -61 - static_cast<int>(i);
+      ASSERT_EQ(client.Command({"ZREM", key, value}).text_, "1");
+      ASSERT_EQ(
+          client.Command({"ZADD", key, std::to_string(score), value}).text_,
+          "1");
+      expected[value] = score;
+    }
+    // Move across disjoint page intervals and back, including an outer
+    // transaction. Both the score index and the member index must agree.
+    for (unsigned i = 0; i < 6; ++i) {
+      ASSERT_EQ(client.Command({"ZINCRBY", key, "1000", member(149)}).text_,
+                "940");
+      expected[member(149)] = 940;
+      verify(client);
+      ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+      ASSERT_EQ(client.Command({"ZINCRBY", key, "-1000", member(149)}).text_,
+                "QUEUED");
+      const auto executed = client.Command({"EXEC"});
+      ASSERT_EQ(executed.items_.size(), 1);
+      ASSERT_EQ(executed.items_.front().text_, "-60");
+      expected[member(149)] = -60;
+    }
+    verify(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_LE(latest_root().group_count_, 6);
+  Server recovered(disk, 4);
+  Client client(recovered.port());
+  verify(client);
+}
+
+TEST(GroupedSortedSetWriteE2e, OverflowNeighborReadFailureKeepsBothIndexes) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires plan-page read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "overflow-neighbor";
+  auto member = [](unsigned i) {
+    auto value = std::to_string(i);
+    value.resize(256, 'x');
+    return value;
+  };
+  auto verify = [&](Client& client, bool inserted) {
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_, inserted ? "90" : "89");
+    auto reply = client.Command({"ZRANGE", key, "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(reply.items_.size(), inserted ? 180 : 178);
+    std::size_t offset = 0;
+    if (inserted) {
+      EXPECT_EQ(reply.items_[offset++].text_, member(90));
+      EXPECT_EQ(reply.items_[offset++].text_, "-1");
+    }
+    for (unsigned i = 0; i < 90; ++i) {
+      if (i == 30) continue;
+      const auto score = i == 1 ? "1.5" : std::to_string(i);
+      EXPECT_EQ(reply.items_[offset++].text_, member(i));
+      EXPECT_EQ(reply.items_[offset++].text_, score);
+      EXPECT_EQ(client.Command({"ZSCORE", key, member(i)}).text_, score);
+    }
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(30)}).text_, "-1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(91)}).text_, "-1");
+  };
+  auto ordered_ids = [&] {
+    std::set<std::uint64_t> ids;
+    for (const auto& [sequence, groups] : disk.Auxiliaries(key))
+      for (const auto& [prefix, bits] : groups)
+        if (bits == 0 && prefix != 0) ids.insert(prefix);
+    return ids;
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 90; ++i)
+      seed.insert(seed.end(), {std::to_string(i), member(i)});
+    ASSERT_EQ(client.Command(seed).text_, "90");
+    // Page two has room for exactly one entry from the still-full head.
+    ASSERT_EQ(client.Command({"ZREM", key, member(30)}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto ids = ordered_ids();
+  ASSERT_EQ(ids.size(), 3);
+  {
+    ScopedEnvironment fault_key("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
+    ScopedEnvironment fault_page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "2");
+    Server server(disk, 3);
+    Client client(server.port());
+    // No overflow: page two must remain unread despite its spare capacity.
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "0.5", member(1)}).text_, "1.5");
+    auto failed = client.Command({"ZADD", key, "-1", member(90)});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZADD", key, "-2", member(91)}).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"SET", "independent", "after-failure"}).text_,
+              "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 2);
+    EXPECT_EQ(executed.items_[0].kind_, '-');
+    EXPECT_EQ(executed.items_[1].text_, "OK");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(90)}).text_, "-1");
+    verify(client, false);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_EQ(ordered_ids(), ids);
+  {
+    Server recovered(disk, 4);
+    Client client(recovered.port());
+    verify(client, false);
+    EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after-failure");
+    ASSERT_EQ(client.Command({"ZADD", key, "-1", member(90)}).text_, "1");
+    verify(client, true);
+    client.Durable();
+    ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+  EXPECT_EQ(ordered_ids(), ids);
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  verify(client, true);
 }
 
 TEST(GroupedSortedSetWriteE2e, PlannerSkipsUnchangedNeighborButChecksNewLinks) {
