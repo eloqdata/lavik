@@ -348,6 +348,241 @@ TEST(GroupedStringWriteE2e, FixedSegmentsPointWritesTtlAndRecovery) {
   EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
 }
 
+class StringPreparationGate {
+ public:
+  StringPreparationGate(const PrivateDisk& disk, const char* key,
+                        const char* phase)
+      : path_(disk.path() + ".string-prepare"),
+        key_("LAVIK_GROUPED_WRITE_PAUSE_KEY", key),
+        phase_("LAVIK_GROUPED_WRITE_PAUSE_PHASE", phase),
+        hold_("LAVIK_GROUPED_WRITE_HOLD_FILE", path_.c_str()) {}
+  ~StringPreparationGate() {
+    ::unlink(path_.c_str());
+    ::unlink((path_ + ".arm").c_str());
+  }
+  void Arm() const {
+    std::ofstream hold(path_);
+    Check(hold.good(), "create String preparation hold");
+    std::ofstream arm(path_ + ".arm");
+    Check(arm.good(), "arm String preparation hold");
+  }
+  void Release() const {
+    Check(::unlink(path_.c_str()) == 0, "release String preparation hold");
+  }
+  bool Wait(const Server& server) const {
+    const auto until = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < until) {
+      if (server.Log().find(
+              "fault pause reached: LAVIK_GROUPED_WRITE_HOLD_FILE") !=
+          std::string::npos)
+        return true;
+      if (!server.Running()) return false;
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
+  }
+
+ private:
+  std::string path_;
+  ScopedEnvironment key_, phase_, hold_;
+};
+
+TEST(GroupedStringWriteE2e, ColdSegmentsReleaseWorkerStateAndRetainKeyIntent) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires grouped preparation pause hook";
+#endif
+  for (const std::string mode : {"SETRANGE", "APPEND", "SETBIT", "noop",
+                                 "GETRANGE", "GETBIT", "EXEC", "Lua"}) {
+    SCOPED_TRACE(mode);
+    PrivateDisk disk;
+    const std::string key = "string-prepare";
+    std::string value(1024 * 1024, 'v');
+    std::string expiry;
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      ASSERT_EQ(client.Command({"SET", key, value}).text_, "OK");
+      ASSERT_EQ(client.Command({"EXPIRE", key, "3600"}).text_, "1");
+      expiry = client.Command({"PEXPIRETIME", key}).text_;
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    const bool read_only = mode == "GETRANGE" || mode == "GETBIT";
+    {
+      StringPreparationGate gate(disk, key.c_str(),
+                                 read_only ? "read" : "prepare");
+      // On failure the child dies before futures join, so no held command
+      // can strand a future's destructor while the gate remains armed.
+      std::future<Reply> held, same_key, independent;
+      Server server(disk, 1);
+      Client client(server.port());
+      gate.Arm();
+      held = std::async(std::launch::async, [port = server.port(), key, mode] {
+        Client writer(port);
+        if (mode == "EXEC") {
+          Check(writer.Command({"MULTI"}).text_ == "OK", "begin String EXEC");
+          Check(
+              writer.Command({"SETRANGE", key, "8191", "AB"}).text_ == "QUEUED",
+              "queue String range");
+          Check(writer.Command({"APPEND", key, "tail"}).text_ == "QUEUED",
+                "queue String append");
+          return writer.Command({"EXEC"});
+        }
+        if (mode == "Lua")
+          return writer.Command({"EVAL",
+                                 "redis.call('SETRANGE', KEYS[1], 8191, 'AB'); "
+                                 "return redis.call('APPEND', KEYS[1], 'tail')",
+                                 "1", key});
+        if (mode == "SETRANGE")
+          return writer.Command({mode, key, "8191", "AB"});
+        if (mode == "APPEND") return writer.Command({mode, key, "tail"});
+        if (mode == "GETRANGE")
+          return writer.Command({mode, key, "8190", "8193"});
+        if (mode == "GETBIT") return writer.Command({mode, key, "0"});
+        return writer.Command({"SETBIT", key, "0", mode == "noop" ? "0" : "1"});
+      });
+      ASSERT_TRUE(gate.Wait(server)) << server.Log();
+      same_key = std::async(std::launch::async, [port = server.port(), key] {
+        Client writer(port);
+        return writer.Command({"SETRANGE", key, "16383", "CD"});
+      });
+      independent = std::async(std::launch::async, [port = server.port()] {
+        Client writer(port);
+        // Both operations require worker store state; PING or ordinary GET
+        // could pass while the tested preparation still owned the mutex.
+        Check(writer.Command({"SET", "independent", "progress"}).text_ == "OK",
+              "unrelated String write");
+        return writer.Command(
+            {"HSET", "independent-hash", "field", std::string(20000, 'h')});
+      });
+      ASSERT_EQ(independent.wait_for(5s), std::future_status::ready)
+          << server.Log();
+      EXPECT_EQ(independent.get().text_, "1");
+      EXPECT_EQ(held.wait_for(0s), std::future_status::timeout);
+      EXPECT_EQ(same_key.wait_for(0s), std::future_status::timeout);
+      gate.Release();
+      ASSERT_EQ(held.wait_for(5s), std::future_status::ready) << server.Log();
+      ASSERT_EQ(same_key.wait_for(5s), std::future_status::ready)
+          << server.Log();
+      const auto first = held.get();
+      ASSERT_NE(first.kind_, '-') << first.text_;
+      if (mode == "SETRANGE" || mode == "EXEC" || mode == "Lua")
+        value.replace(8191, 2, "AB");
+      if (mode == "APPEND" || mode == "EXEC" || mode == "Lua") value += "tail";
+      if (mode == "SETBIT") value[0] = static_cast<char>(0xf6);
+      if (mode == "EXEC") {
+        ASSERT_EQ(first.items_.size(), 2);
+        EXPECT_EQ(first.items_[0].text_, "1048576");
+        EXPECT_EQ(first.items_[1].text_, "1048580");
+      } else {
+        EXPECT_EQ(first.text_,
+                  mode == "GETRANGE" ? "vvvv"
+                  : mode == "GETBIT" || mode == "SETBIT" || mode == "noop"
+                      ? "0"
+                      : std::to_string(value.size()));
+      }
+      EXPECT_EQ(same_key.get().text_, std::to_string(value.size()));
+      value.replace(16383, 2, "CD");
+      EXPECT_EQ(client.Command({"GET", key}).text_, value);
+      EXPECT_EQ(client.Command({"PEXPIRETIME", key}).text_, expiry);
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    // Recovery redistributes old page ownership. An unlocked preparation
+    // must not leave torn roots or retire pages still needed by another owner.
+    Server recovered(disk, 3);
+    Client client(recovered.port());
+    EXPECT_EQ(client.Command({"GET", key}).text_, value);
+    EXPECT_EQ(client.Command({"GET", "independent"}).text_, "progress");
+    ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+}
+
+TEST(GroupedStringWriteE2e, SegmentNoOpsPreserveWatchAndTtl) {
+  PrivateDisk disk;
+  Server server(disk, 1);
+  Client client(server.port()), watcher(server.port());
+  const std::string key = "string-noop", value(32768, 'v');
+  ASSERT_EQ(client.Command({"SET", key, value}).text_, "OK");
+  ASSERT_EQ(client.Command({"EXPIRE", key, "3600"}).text_, "1");
+  const auto expiry = client.Command({"PEXPIRETIME", key}).text_;
+  for (const std::string mode : {"ordinary", "EXEC", "Lua"}) {
+    SCOPED_TRACE(mode);
+    ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
+    if (mode == "EXEC") ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    if (mode == "Lua") {
+      EXPECT_EQ(
+          client
+              .Command({"EVAL", "return redis.call('SETBIT', KEYS[1], 0, 0)",
+                        "1", key})
+              .text_,
+          "0");
+    } else {
+      EXPECT_EQ(client.Command({"SETBIT", key, "0", "0"}).text_,
+                mode == "EXEC" ? "QUEUED" : "0");
+      EXPECT_EQ(
+          client.Command({"SETRANGE", key, "9223372036854775807", ""}).text_,
+          mode == "EXEC" ? "QUEUED" : "32768");
+    }
+    if (mode == "EXEC") {
+      const auto executed = client.Command({"EXEC"});
+      ASSERT_EQ(executed.items_.size(), 2);
+      EXPECT_EQ(executed.items_[0].text_, "0");
+      EXPECT_EQ(executed.items_[1].text_, "32768");
+    }
+    EXPECT_EQ(client.Command({"GETRANGE", key, "32768", "32769"}).text_, "");
+    EXPECT_EQ(client.Command({"GETBIT", key, "262144"}).text_, "0");
+    EXPECT_EQ(client.Command({"PEXPIRETIME", key}).text_, expiry);
+    ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(watcher.Command({"GET", key}).text_, "QUEUED");
+    const auto watched = watcher.Command({"EXEC"});
+    ASSERT_EQ(watched.items_.size(), 1);
+    EXPECT_EQ(watched.items_.front().text_, value);
+  }
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
+TEST(GroupedStringWriteE2e, SegmentReadFailureKeepsOldValueAndWorkerUsable) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires payload read-failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "string-read-failure", value(32768, 'v');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", key, value}).text_, "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_VALUE_READ_KEY", key.c_str());
+    Server server(disk, 1);
+    Client client(server.port());
+    const auto failed = client.Command({"SETRANGE", key, "8191", "AB"});
+    ASSERT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("injected value payload read failure"),
+              std::string::npos);
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SETBIT", key, "0", "1"}).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"SET", "independent", "after-failure"}).text_,
+              "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 2);
+    EXPECT_EQ(executed.items_[0].kind_, '-');
+    EXPECT_EQ(executed.items_[1].text_, "OK");
+    EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after-failure");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", key}).text_, value);
+  EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after-failure");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 TEST(GroupedStringWriteE2e, LongKeysPromoteAndRecover) {
   PrivateDisk disk;
   const std::string direct_key(8193, 'd');

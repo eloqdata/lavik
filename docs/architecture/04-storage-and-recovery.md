@@ -494,13 +494,14 @@ publishes no key.
 Creation within transactions, multi-key and native candidate/loading adapters
 retains their separate preparation contracts.
 
-Existing grouped Hash/Set point writes and typed List/Sorted Set writes also
-prepare private pages without worker store state, including under retained
-EXEC/Lua key intents. They carry immutable predecessor metadata and admitted
-page ownership through preparation, then reacquire state and validate population
-and logical identity before any publication or successful no-op. Sorted Set
-preparation covers both the ordered and member graphs. GC-only physical moves
-are refreshed, not treated as conflicting logical writes. Random Set pops,
+Existing grouped Hash/Set point writes, String segment writes and typed
+List/Sorted Set/Stream writes also prepare private pages without worker store
+state, including under retained EXEC/Lua key intents. They carry immutable
+predecessor metadata and admitted page ownership through preparation, then
+reacquire state and validate population and logical identity before any
+publication or successful no-op. Sorted Set preparation covers both the ordered
+and member graphs. GC-only physical moves are refreshed, not treated as
+conflicting logical writes. Random Set pops,
 full-image callbacks, promotion and candidate ingestion retain their separate
 preparation contracts; all paths share the same atomic grouped writer.
 

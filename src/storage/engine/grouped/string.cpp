@@ -243,6 +243,22 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       if (!status.ok()) co_return status;
     }
   } else {
+    const bool prepare_unlocked =
+        read_only || CanPrepareGroupedWriteUnlocked(partition);
+    const auto snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
+    if (prepare_unlocked) {
+      // The command retains key intent and database admission, including
+      // EXEC/Lua. The immutable directory owns metadata; the page loader pins
+      // each physical read and retries GC relocation without changing its view.
+      // Keep only owned state while unrelated keys use the worker mutex.
+      found = nullptr;
+      unlock.Unlock();
+      LAVIK_FAULT_INJECT({
+        const auto paused = co_await PauseGroupedWriteForTest(
+            *store.worker_, key, read_only ? "read" : "prepare");
+        if (!paused.ok()) co_return paused;
+      });
+    }
     OrderedCollectionMutationPlan plan{
         .root_ = StringRoot(new_size, grouped->incarnation()),
         .expected_sequence_ = grouped->revision(),
@@ -255,12 +271,25 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     if (!read_only && new_size > old_size && old_size % kStringGroupBytes == 0)
       begin_id = std::min<std::uint64_t>(begin_id, grouped->group_count());
     for (auto id = begin_id; id <= last_id; ++id) {
+      // Hot-page reads and zero-filled growth need not suspend. Bound their
+      // preparation work while leaving ordinary single-page edits yield-free.
+      if (prepare_unlocked && id != begin_id &&
+          (id - begin_id) % (256 * 1024 / kStringGroupBytes) == 0)
+        co_await bycorf::Yield(*store.worker_);
       const auto base = (id - 1) * kStringGroupBytes;
       std::string bytes;
       if (id <= grouped->group_count()) {
         auto loaded = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, grouped, id);
-        if (!loaded.ok()) co_return loaded.status();
+        if (!loaded.ok()) {
+          if (read_only &&
+              (EffectiveRecordDbEpoch(partition, db_id) != snapshot.db_epoch_ ||
+               partition.replication_epoch_ != snapshot.replication_epoch_ ||
+               partition.grouped_generations_[db_id] !=
+                   grouped->version().index_generation_))
+            co_return StringSegmentResult{};
+          co_return loaded.status();
+        }
         bytes = std::move(loaded->snapshot_.entries_.front().value_);
       }
       if (!read_only)
@@ -269,12 +298,27 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       if (!bit || (start >= base && start < base + bytes.size()))
         apply(bytes, base);
       if (operation.kind_ == Kind::kSetBit && start < old_size &&
-          result.bit_ == operation.bit_)
-        co_return result;
+          result.bit_ == operation.bit_) {
+        // A no-op still depends on the observed bit and must pass the same
+        // logical/authority validation as a changed plan after reacquiring.
+        plan.changed_ = false;
+        break;
+      }
       if (!read_only)
         plan.writes_.push_back(StringPage(plan.root_, id, std::move(bytes)));
     }
     if (!read_only) {
+      if (prepare_unlocked) {
+        co_await store.store_state_mutex_.Lock();
+        unlock.Adopt();
+        const auto valid = ValidateGroupedWriteSnapshot(
+            store, partition, db_id, key, grouped, snapshot,
+            mutation_precondition != nullptr
+                ? mutation_precondition
+                : (tx != nullptr ? &tx->mutation_precondition_ : nullptr));
+        if (!valid.ok()) co_return valid;
+      }
+      if (!plan.changed_) co_return result;
       const auto status = co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, grouped, std::move(plan),
           location.expire_at_ms_, tx, replication, mutation_precondition);

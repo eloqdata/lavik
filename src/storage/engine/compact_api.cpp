@@ -193,6 +193,69 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       co_return absl::InvalidArgumentError("metadata callback mutated");
     co_return absl::OkStatus();
   }
+  if (grouped && !read_only &&
+      (access.stream_group_ || access.stream_header_ || access.stream_trim_ ||
+       access.stream_delete_ || access.stream_ack_ ||
+       access.stream_append_node_max_entries_)) {
+    auto execute = [&](PreparedStreamMutation* prepared) -> Task<absl::Status> {
+      if (access.stream_group_)
+        co_return co_await ExecuteGroupedStreamGroupLocked(
+            store, partition, db_id, key, digest, grouped, callback,
+            *access.stream_group_, false, tx, replication,
+            mutation_precondition, prepared);
+      if (access.stream_header_)
+        co_return co_await ExecuteGroupedStreamHeaderLocked(
+            store, partition, db_id, key, digest, grouped, callback, tx,
+            replication, mutation_precondition, prepared);
+      if (access.stream_trim_)
+        co_return co_await ExecuteGroupedStreamTrimLocked(
+            store, partition, db_id, key, digest, grouped, callback, tx,
+            replication, mutation_precondition, prepared);
+      if (access.stream_delete_)
+        co_return co_await ExecuteGroupedStreamDeleteLocked(
+            store, partition, db_id, key, digest, grouped, callback,
+            *access.stream_delete_, tx, replication, mutation_precondition,
+            prepared);
+      if (access.stream_ack_)
+        co_return co_await ExecuteGroupedStreamAckLocked(
+            store, partition, db_id, key, digest, grouped, callback,
+            *access.stream_ack_, tx, replication, mutation_precondition,
+            prepared);
+      co_return co_await ExecuteGroupedStreamAppendLocked(
+          store, partition, db_id, key, digest, grouped, callback,
+          *access.stream_append_node_max_entries_, tx, replication,
+          mutation_precondition, prepared);
+    };
+    if (!CanPrepareGroupedWriteUnlocked(partition))
+      co_return co_await execute(nullptr);
+    const auto snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
+    PreparedStreamMutation prepared;
+    // Key intent and database admission also cover EXEC/Lua callbacks. Only
+    // the worker's append/index state is released for checked page reads and
+    // private planning; no callback is retried after producing a reply effect.
+    found = nullptr;
+    unlock.Unlock();
+    LAVIK_FAULT_INJECT({
+      const auto paused =
+          co_await PauseGroupedWriteForTest(*store.worker_, key, "prepare");
+      if (!paused.ok()) co_return paused;
+    });
+    const auto status = co_await execute(&prepared);
+    if (!status.ok()) co_return status;
+    co_await store.store_state_mutex_.Lock();
+    unlock.Adopt();
+    const auto valid = ValidateGroupedWriteSnapshot(
+        store, partition, db_id, key, grouped, snapshot,
+        mutation_precondition != nullptr
+            ? mutation_precondition
+            : (tx != nullptr ? &tx->mutation_precondition_ : nullptr));
+    if (!valid.ok()) co_return valid;
+    if (!prepared.plan_.changed_) co_return absl::OkStatus();
+    co_return co_await CommitGroupedOrderedMutationLocked(
+        store, partition, db_id, key, digest, grouped,
+        std::move(prepared.plan_), prepared.expire_at_ms_, tx, replication,
+        mutation_precondition);
+  }
   if (grouped && access.stream_group_) {
     if (value_type != ValueType::kStream)
       co_return absl::InvalidArgumentError("invalid Stream group access");
@@ -208,34 +271,6 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
                                                    digest, grouped, callback,
                                                    *access.stream_inspect_);
   }
-  if (grouped && access.stream_header_) {
-    if (read_only || value_type != ValueType::kStream)
-      co_return absl::InvalidArgumentError("invalid Stream header access");
-    co_return co_await ExecuteGroupedStreamHeaderLocked(
-        store, partition, db_id, key, digest, grouped, callback, tx,
-        replication, mutation_precondition);
-  }
-  if (grouped && access.stream_trim_) {
-    if (read_only || value_type != ValueType::kStream)
-      co_return absl::InvalidArgumentError("invalid Stream trim access");
-    co_return co_await ExecuteGroupedStreamTrimLocked(
-        store, partition, db_id, key, digest, grouped, callback, tx,
-        replication, mutation_precondition);
-  }
-  if (grouped && access.stream_delete_) {
-    if (read_only || value_type != ValueType::kStream)
-      co_return absl::InvalidArgumentError("invalid Stream delete access");
-    co_return co_await ExecuteGroupedStreamDeleteLocked(
-        store, partition, db_id, key, digest, grouped, callback,
-        *access.stream_delete_, tx, replication, mutation_precondition);
-  }
-  if (grouped && access.stream_ack_) {
-    if (read_only || value_type != ValueType::kStream)
-      co_return absl::InvalidArgumentError("invalid Stream ACK access");
-    co_return co_await ExecuteGroupedStreamAckLocked(
-        store, partition, db_id, key, digest, grouped, callback,
-        *access.stream_ack_, tx, replication, mutation_precondition);
-  }
   if (grouped && access.stream_range_) {
     if (!read_only || value_type != ValueType::kStream)
       co_return absl::InvalidArgumentError("invalid Stream range access");
@@ -244,14 +279,6 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     co_return co_await ExecuteGroupedStreamRange(store, partition, db_id, key,
                                                  digest, grouped, callback,
                                                  *access.stream_range_);
-  }
-  if (grouped && access.stream_append_node_max_entries_) {
-    if (read_only || value_type != ValueType::kStream)
-      co_return absl::InvalidArgumentError("invalid Stream append access");
-    co_return co_await ExecuteGroupedStreamAppendLocked(
-        store, partition, db_id, key, digest, grouped, callback,
-        *access.stream_append_node_max_entries_, tx, replication,
-        mutation_precondition);
   }
   std::optional<MemoryReservation> callback_admission;
   // Keep the preexisting bounded inline workspace available when the
