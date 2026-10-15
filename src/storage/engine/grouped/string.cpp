@@ -32,12 +32,16 @@ OrderedCollectionRoot StringRoot(std::size_t bytes, std::uint64_t incarnation) {
 
 OrderedGroupSnapshot StringPage(const OrderedCollectionRoot& root,
                                 std::uint64_t id, std::string bytes) {
-  return {.kind_ = OrderedCollectionKind::kString,
-          .incarnation_ = root.incarnation_,
-          .id_ = id,
-          .previous_ = id - 1,
-          .next_ = id == root.last_group_ ? 0 : id + 1,
-          .entries_ = {{.value_ = std::move(bytes)}}};
+  OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kString,
+                            .incarnation_ = root.incarnation_,
+                            .id_ = id,
+                            .previous_ = id - 1,
+                            .next_ = id == root.last_group_ ? 0 : id + 1,
+                            .entries_ = {}};
+  // An initializer_list exposes const entries, forcing the vector to copy
+  // the segment even when its initializer moves the string.
+  page.entries_.emplace_back().value_ = std::move(bytes);
+  return page;
 }
 
 }  // namespace
