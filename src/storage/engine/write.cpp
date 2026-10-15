@@ -17,6 +17,7 @@
 #include <exception>
 
 #include "absl/strings/str_cat.h"
+#include "flush_policy.h"
 #include "grouped/dependency_test_hook.h"
 #include "impl.h"
 #include "lavik/memory.h"
@@ -1224,6 +1225,11 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       co_return restored.status();
     }
     current = *restored;
+    // An old physical winner may have been classified as obsolete by an
+    // earlier Tx promotion scan. Its pages can belong to different physical
+    // owners, so invalidate their runtime scan proofs before completing this
+    // inverse publication. Ordinary forward writes do not need this barrier.
+    InvalidateTxPromotionAfterRewind();
     if (restored_group_slot.has_value()) {
       auto published = restored_group_slot->Commit(entry.previous_grouped_);
       if (!published.ok()) {
@@ -1836,7 +1842,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
       absl::Status write_status = absl::OkStatus();
       for (std::size_t offset = write_begin; offset < write_bytes;) {
         const std::size_t chunk =
-            std::min(options_.flush_size_bytes_, write_bytes - offset);
+            std::min(kMaxFlushWriteBytes, write_bytes - offset);
         auto written = co_await WriteStorageBuffer(
             *store.worker_, store.files_[file_id],
             std::span<const std::byte>(staging.data_ + offset, chunk),
@@ -3778,9 +3784,14 @@ acquire_active_stream:
   staging_state->record_count_ = updated.record_count_;
   staging_state->max_lsn_ = updated.max_lsn_;
   state.live_bytes_ += location.total_disk_bytes();
-  state.flush_queued_ = updated.committed_bytes_ == kStorageBlockBytes;
-  if (transaction_append && state.flush_queued_)
+  // Queued partial flushes remain queued across later appends. Queue ownership
+  // belongs to RequestFlush/the flusher; it does not mean the stream is sealed.
+  if (transaction_append && updated.committed_bytes_ == kStorageBlockBytes)
     NoteTxBlockSealedLocal(store, updated.block_id_);
+  if (state.committed_bytes_ - staging_state->durable_bytes_ >=
+      options_.flush_size_bytes_) {
+    RequestFlush(store, updated.block_id_);
+  }
   // A superseded record stays in its block's live_bytes until this record's
   // flush completes (the RecordIdentity above carries it there): the old copy
   // is the key's only durable version until then, and retiring it now lets

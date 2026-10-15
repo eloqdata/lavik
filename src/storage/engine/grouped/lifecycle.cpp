@@ -259,6 +259,7 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
         co_return absl::ResourceExhaustedError(
             "group dependency pin count exhausted");
       ++found->second.dependency_pins_;
+      found->second.NotePromotionProgress();
       tx_cleaner_dirty_.store(true, std::memory_order_release);
       co_return absl::OkStatus();
     };

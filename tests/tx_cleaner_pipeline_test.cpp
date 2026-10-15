@@ -22,10 +22,10 @@ namespace lavik::storage {
 
 #if LAVIK_FAULTS_ENABLED
 
-// These tests substitute the physical cleaner round, not its scheduler or
-// foreground preparation. Real workers exercise task ownership, cross-worker
-// coalescing, timer retries and result publication. Physical retirement and
-// persistence are covered by multikey and low-capacity storage E2E tests.
+// These tests substitute either a physical cleaner round or its promotion
+// scan. Real workers exercise scheduling and the promotion state machine,
+// including dependency invalidation and destination durability waits. Physical
+// retirement and persistence also have multikey and low-capacity E2E coverage.
 class TxCleanerPipelineTestPeer : public testing::Test {
  protected:
   static constexpr unsigned kWorkers = 2;
@@ -125,6 +125,141 @@ class TxCleanerPipelineTestPeer : public testing::Test {
            !storage_.impl_->tx_cleaner_running_.load();
   }
 
+  void PreparePromotion() {
+    On(0);
+    auto& engine = *storage_.impl_;
+    engine.devices_.push_back(StorageDevice{.capacity_blocks_ = 3});
+    engine.block_state_lookup_.push_back({promotion_blocks_.data(), 1, 3});
+    ResetPromotionSource(7);
+    engine.tx_promotion_scan_for_test_ = [this] { return ScanPromotion(); };
+  }
+
+  void ResetPromotionSource(std::uint64_t epoch) {
+    On(0);
+    auto& source = promotion_blocks_[0];
+    source.Reset(0, epoch);
+    source.allocated_ = true;
+    source.kind_ = BlockKind::kTransaction;
+    source.committed_bytes_ = kBlockHeaderBytes + 1024;
+    source.live_bytes_ = 1024;
+    Store(0).tx_blocks_.erase(1);
+    auto& runtime = Store(0).tx_blocks_[1];
+    runtime.allocation_epoch_ = epoch;
+    runtime.live_tagged_bytes_ = 1024;
+    runtime.counted_backlog_ = true;
+    runtime.backlog_bytes_ = 1024;
+  }
+
+  Task<absl::Status> ScanPromotion() {
+    ++promotion_scans_;
+    if (pause_promotion_scan_) co_await promotion_continue_.Wait();
+    co_return promotion_scan_result_;
+  }
+
+  void ResumePromotionScan() {
+    On(0);
+    pause_promotion_scan_ = false;
+    promotion_continue_.NotifyAll(workers_[0]);
+  }
+
+  Task<absl::Status> Promotion(std::uint64_t epoch = 7) {
+    // Keep the inspected snapshot alive across the real promotion's waits.
+    const TxCleanerBlock inspected{
+        .block_id_ = 1,
+        .allocation_epoch_ = epoch,
+        .live_tagged_bytes_ = 1024,
+        .sealed_and_durable_ = true,
+    };
+    co_return co_await storage_.impl_->PromoteTxBlockLocal(
+        Store(0), inspected,
+        std::make_shared<const absl::flat_hash_set<std::uint64_t>>(), false);
+  }
+
+  void StartPromotion(Task<absl::Status>& task) {
+    On(0);
+    std::move(task)
+        .operator co_await()
+        .await_suspend(std::noop_coroutine())
+        .resume();
+  }
+
+  absl::Status FinishPromotion(Task<absl::Status>& task) {
+    if (!PumpUntil([&] { return task.done(); }))
+      return absl::DeadlineExceededError("promotion fixture did not finish");
+    return std::move(task).TakeResult();
+  }
+
+  absl::Status Promote(std::uint64_t epoch = 7) {
+    auto task = Promotion(epoch);
+    StartPromotion(task);
+    return FinishPromotion(task);
+  }
+
+  bool PinPromotionDependency() {
+    On(0);
+    const RecordLocation source(
+        1, 1, promotion_blocks_[0].allocation_epoch_, 0, 128,
+        RecordLocation::PackedMetadata::Encode(
+            kBlockHeaderBytes, 128, 0, false, false, false, false, false, true,
+            RecordKind::kValue, ValueType::kString));
+    return storage_.impl_->PinTxDependencyLocal(Store(0), source);
+  }
+
+  void UnpinPromotionDependency() {
+    On(0);
+    storage_.impl_->UnpinTxDependencyLocal(
+        Store(0), 1, promotion_blocks_[0].allocation_epoch_);
+  }
+
+  void RetirePromotionRecord() {
+    On(0);
+    storage_.impl_->DropTaggedRecordLocal(
+        Store(0), 1, promotion_blocks_[0].allocation_epoch_, 128);
+  }
+
+  void RewindPromotionIndex() {
+    // Rollback can restore a source record from another key owner.
+    On(1);
+    storage_.impl_->InvalidateTxPromotionAfterRewind();
+  }
+
+  void OwePromotionFence() {
+    On(0);
+    auto& destination = promotion_blocks_[1];
+    destination.Reset(0, 11);
+    destination.allocated_ = true;
+    destination.in_memory_ = true;
+    // Model an already-running flush so the real fence waits for its notify
+    // without dispatching fixture buffers to a nonexistent device.
+    destination.flush_in_progress_ = true;
+    destination.staging_slot_ = 1;
+    Store(0).staging_slots_.resize(2);
+    Store(0).staging_slots_[1].durable_bytes_ = kBlockHeaderBytes;
+    Store(0).pending_relocation_fences_[1] = {
+        {.block_id_ = 2,
+         .allocation_epoch_ = 11,
+         .block_owner_ = 0,
+         .committed_bytes_ = kBlockHeaderBytes + 4096}};
+  }
+
+  bool HasPromotionFence() {
+    On(0);
+    return Store(0).pending_relocation_fences_.contains(1);
+  }
+
+  void CompletePromotionFence() {
+    On(0);
+    Store(0).staging_slots_[1].durable_bytes_ = kBlockHeaderBytes + 4096;
+    promotion_blocks_[1].flush_in_progress_ = false;
+    Store(0).durability_progress_.NotifyAll(workers_[0]);
+  }
+
+  void FailPromotionFence(bool failed) {
+    On(0);
+    Store(0).write_failed_ = failed;
+    Store(0).durability_progress_.NotifyAll(workers_[0]);
+  }
+
   void Pump() {
     for (unsigned owner = 0; owner < kWorkers; ++owner) {
       On(owner);
@@ -147,10 +282,15 @@ class TxCleanerPipelineTestPeer : public testing::Test {
   std::array<bycorf::Worker, kWorkers> workers_;
   std::array<int, kWorkers> wake_fds_{-1, -1};
   std::array<bool, kWorkers> initialized_{};
+  std::array<BlockState, 2> promotion_blocks_;
   StorageEngine storage_{StorageEngineOptions{}};
   std::deque<TxShardWrites> receipts_;
   std::function<absl::Status()> round_;
   unsigned rounds_ = 0;
+  unsigned promotion_scans_ = 0;
+  bool pause_promotion_scan_ = false;
+  absl::Status promotion_scan_result_;
+  AsyncNotification promotion_continue_;
 };
 
 TEST_F(TxCleanerPipelineTestPeer, GroupedWriteDoesNotWaitForLiveBacklog) {
@@ -325,6 +465,170 @@ TEST_F(TxCleanerPipelineTestPeer, StorageFailureStopsRetryAndRejectsWrite) {
   EXPECT_FALSE(PrepareWrite(1).ok());
   ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
   EXPECT_EQ(rounds_, completed_rounds);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, UnchangedPromotionDoesNotRereadSource) {
+  PreparePromotion();
+
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+
+  EXPECT_EQ(promotion_scans_, 1);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       DependencyPinnedBlockStillScansMovableRecordsOnce) {
+  PreparePromotion();
+  ASSERT_TRUE(PinPromotionDependency());
+
+  // A pin can protect only some records in a block. It must not prevent the
+  // first scan from finding unrelated current records that can be relocated.
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 1);
+
+  UnpinPromotionDependency();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       RecordRetirementAndDependencyChangesInvalidatePromotion) {
+  PreparePromotion();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+
+  ASSERT_TRUE(PinPromotionDependency());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
+  UnpinPromotionDependency();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 3);
+  RetirePromotionRecord();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 4);
+
+  // Equal before/after pin counts are insufficient: a dependency may have
+  // changed which records are movable between two cleaner rounds.
+  ASSERT_TRUE(PinPromotionDependency());
+  UnpinPromotionDependency();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 5);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DependencyChangeDuringScanRequiresRescan) {
+  PreparePromotion();
+  pause_promotion_scan_ = true;
+  auto task = Promotion();
+  StartPromotion(task);
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(promotion_scans_, 1);
+
+  EXPECT_TRUE(PinPromotionDependency());
+  UnpinPromotionDependency();
+  ResumePromotionScan();
+  EXPECT_EQ(FinishPromotion(task), absl::OkStatus());
+
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, RollbackDuringScanRequiresRescan) {
+  PreparePromotion();
+  pause_promotion_scan_ = true;
+  auto task = Promotion();
+  StartPromotion(task);
+  EXPECT_FALSE(task.done());
+
+  RewindPromotionIndex();
+  ResumePromotionScan();
+  EXPECT_EQ(FinishPromotion(task), absl::OkStatus());
+
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, FailedOrCancelledScanIsRetried) {
+  PreparePromotion();
+  promotion_scan_result_ = absl::DataLossError("promotion fixture failure");
+  EXPECT_TRUE(absl::IsDataLoss(Promote()));
+  promotion_scan_result_ = absl::CancelledError("promotion fixture shutdown");
+  EXPECT_TRUE(absl::IsCancelled(Promote()));
+  promotion_scan_result_ = absl::OkStatus();
+
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 3);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, RollbackInvalidatesCompletedPromotion) {
+  PreparePromotion();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+
+  RewindPromotionIndex();
+
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, ReusedAllocationRequiresFreshPromotion) {
+  PreparePromotion();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+
+  ResetPromotionSource(8);
+
+  EXPECT_TRUE(absl::IsFailedPrecondition(Promote(7)));
+  EXPECT_EQ(promotion_scans_, 1);
+  EXPECT_EQ(Promote(8), absl::OkStatus());
+  EXPECT_EQ(Promote(8), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       CompletedScanStillWaitsForPendingRelocationDurability) {
+  PreparePromotion();
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  OwePromotionFence();
+
+  auto task = Promotion();
+  StartPromotion(task);
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(promotion_scans_, 1);
+  EXPECT_TRUE(HasPromotionFence());
+
+  CompletePromotionFence();
+  EXPECT_EQ(FinishPromotion(task), absl::OkStatus());
+  EXPECT_FALSE(HasPromotionFence());
+  EXPECT_EQ(promotion_scans_, 1);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       FailedRelocationFenceKeepsDebtAndPreventsScanProof) {
+  PreparePromotion();
+  OwePromotionFence();
+  auto failed = Promotion();
+  StartPromotion(failed);
+  EXPECT_FALSE(failed.done());
+  EXPECT_EQ(promotion_scans_, 1);
+
+  FailPromotionFence(true);
+  EXPECT_TRUE(absl::IsInternal(FinishPromotion(failed)));
+  EXPECT_TRUE(HasPromotionFence());
+  FailPromotionFence(false);
+
+  auto retry = Promotion();
+  StartPromotion(retry);
+  EXPECT_FALSE(retry.done());
+  EXPECT_EQ(promotion_scans_, 2);
+  CompletePromotionFence();
+  EXPECT_EQ(FinishPromotion(retry), absl::OkStatus());
+  EXPECT_FALSE(HasPromotionFence());
+  EXPECT_EQ(Promote(), absl::OkStatus());
+  EXPECT_EQ(promotion_scans_, 2);
 }
 
 #else

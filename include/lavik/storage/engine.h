@@ -76,6 +76,9 @@ struct StorageEngineOptions {
   // independently, with bounded retries when pins or leases prevent progress.
   // Zero disables online cleaning; runtime CONFIG can change this setting.
   std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;
+  // Dirty bytes that request a flush without waiting for the age timer. A
+  // ready snapshot submits its available bytes, up to the independent I/O cap;
+  // timer, durability and shutdown flushes also submit smaller dirty prefixes.
   std::size_t flush_size_bytes_ = 128 * 1024;
   // Bounded, per-worker staging memory for commands waiting to enter the
   // shared in-memory replication backlog.

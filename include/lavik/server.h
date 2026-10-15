@@ -97,6 +97,7 @@ struct ServerOptions {
   std::size_t client_query_buffer_limit_bytes_ = kDefaultClientQueryBufferLimit;
   // Bound partial-block age without waiting for size-triggered submission.
   std::uint32_t flush_max_ms_ = 100;
+  // Dirty-byte trigger, independent of the maximum physical write size.
   std::size_t flush_size_bytes_ = 128ULL * 1024;
   std::vector<std::string> data_files_{"lavik.data"};
   // Build and publish an index checkpoint after a clean shutdown drain. The

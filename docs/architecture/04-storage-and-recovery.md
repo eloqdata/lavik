@@ -777,11 +777,15 @@ registered slot to its storage owner.
 
 ### Flush and durability
 
-A configured periodic interval, a full block, an extent-dependent overwrite,
-a transaction fence or commit, defrag, and shutdown can all request a flush.
+A configured dirty-byte threshold or periodic interval, a full block, an
+extent-dependent overwrite, a transaction fence or commit, defrag, and shutdown
+can all request a flush. The threshold starts work without requiring a full
+submission-sized batch; explicit durability requests also flush smaller tails.
 The flush snapshots the staged prefix, zero-pads its tail to a direct-I/O page,
 and advances the append cursor to the following page so an already durable data
-page is never modified again.
+page is never modified again. Appends can accumulate beyond that immutable
+snapshot while its I/O is in flight. Submission sizes follow the available
+snapshot data within a bounded I/O size, independently of the trigger threshold.
 
 The durable order is:
 
@@ -816,9 +820,10 @@ shutdown boundary and does not substitute for the certificate.
 
 The first flush durably clears the header slot not selected for the new
 allocation before committing the selected slot. Later header writes alternate
-slots. A dirty tail appended while a snapshot is in flight is requeued at the
-front when a sealed stream completes, preserving append and copy-on-write
-child-before-root ordering.
+slots. A dirty tail appended while a snapshot is in flight is requeued when it
+reaches the trigger threshold, without waiting for the periodic timer. A sealed
+stream's remaining tail is requeued at the front regardless of size, preserving
+append and copy-on-write child-before-root ordering.
 
 An ordinary successful command is therefore not necessarily crash-durable at
 reply time. `StorageDurabilityStats` reports dirty staging bytes, pending
@@ -1089,6 +1094,14 @@ can survive a crash without the old decision even while their Tx source blocks
 remain allocated. Destination durability, source pins, and the allocation
 bitmap retirement still order its cold-free return;
 UUID and extent dependencies follow the same source-block lifetime.
+
+Promotion and retirement are separate phases. A successful scan can leave
+obsolete records charged to the source until their successors' commit
+retirements settle. The cleaner remembers completed scans while the relevant
+state remains unchanged, checks retirement conditions in memory, and retains
+any outstanding destination durability obligations. Accounting or dependency
+progress permits another scan; rollback that restores earlier winners also
+invalidates remembered scans before those winners can be overlooked.
 
 Each worker keeps one transaction append stream. The active append block does
 not count toward the reported sealed Tx-record backlog. That backlog describes

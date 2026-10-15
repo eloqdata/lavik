@@ -2141,6 +2141,17 @@ class StorageEngine::Impl {
       std::uint64_t allocation_epoch_ = 0;
       std::uint64_t live_tagged_bytes_ = 0;
       std::uint32_t dependency_pins_ = 0;
+      // A complete promotion scan can leave obsolete copies charged until
+      // their successors' decisions retire them. Retain that proof
+      // until this allocation's accounting/dependencies or a rollback change.
+      // These are owner-local runtime hints, never durable state.
+      std::uint64_t promotion_generation_ = 1;
+      std::uint64_t scanned_promotion_generation_ = 0;
+      std::uint64_t scanned_rewind_generation_ = 0;
+      void NotePromotionProgress() noexcept {
+        if (++promotion_generation_ == 0) ++promotion_generation_;
+        scanned_promotion_generation_ = 0;
+      }
       std::int64_t last_append_ms_ = 0;
       bool counted_backlog_ = false;
       std::uint32_t backlog_bytes_ = 0;
@@ -4617,6 +4628,12 @@ class StorageEngine::Impl {
       WorkerStore& store, const TxCleanerBlock& block,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed,
       bool shutdown_drain);
+  // Restoring an old index/graph can make a previously skipped physical
+  // record current again on any owner. Only inverse publication invalidates
+  // scans globally; ordinary writes use per-allocation progress instead.
+  void InvalidateTxPromotionAfterRewind() noexcept {
+    tx_promotion_rewind_generation_.fetch_add(1, std::memory_order_release);
+  }
   Task<absl::Status> RetireTxBlockLocal(WorkerStore& store,
                                         const TxCleanerBlock& block);
 
@@ -4925,10 +4942,14 @@ class StorageEngine::Impl {
   // Actual round results remain visible to grouped writes until a later
   // successful or retryable round clears them; this is not a permanent fence.
   std::atomic<absl::StatusCode> tx_cleaner_error_{absl::StatusCode::kOk};
+  std::atomic<std::uint64_t> tx_promotion_rewind_generation_{0};
 #if LAVIK_FAULTS_ENABLED
   // Substitute only the physical round, preserving its scheduling, retry,
   // result publication and lifecycle behavior in deterministic runtime tests.
   std::function<absl::Status()> tx_cleaner_round_for_test_;
+  // Replace only the physical scan, retaining promotion validation, progress
+  // tracking and destination durability waits in deterministic runtime tests.
+  std::function<Task<absl::Status>()> tx_promotion_scan_for_test_;
 #endif
   std::atomic<std::int64_t> tx_cleaner_next_run_ms_{0};
   std::atomic<bool> tx_cleaner_dirty_{true};

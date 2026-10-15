@@ -18,6 +18,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "device_affinity.h"
+#include "flush_policy.h"
 #include "impl.h"
 
 namespace lavik::storage {
@@ -250,6 +251,12 @@ absl::Status InitializeAddedDeviceMetadata(
 }  // namespace
 
 absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
+  // Cross-owner recovery tests must retain their tagged source until the
+  // client explicitly enables cleaning. Pausing after the listener opens can
+  // race the autonomous cleaner's first pass over recovered sealed blocks.
+  LAVIK_FAULT_INJECT(
+      if (std::getenv("LAVIK_TX_CLEANER_START_PAUSED") != nullptr)
+          tx_cleaner_cooldown_ms_.store(0, std::memory_order_release););
   if (options_.database_count_ == 0 ||
       options_.database_count_ > kLogicalDatabaseCount) {
     return absl::InvalidArgumentError("invalid runtime database count");
@@ -691,14 +698,14 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       options_.flush_size_bytes_ > kStorageBlockBytes ||
       (options_.flush_size_bytes_ & (options_.flush_size_bytes_ - 1)) != 0 ||
       options_.flush_size_bytes_ % direct_io_alignment_ != 0) {
-    return absl::Status(
-        absl::StatusCode::kInvalidArgument,
-        "flush size must be a power of two between the direct-I/O alignment "
-        "and the 8 MiB storage block size");
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "flush trigger size must be a power of two between the "
+                        "direct-I/O alignment "
+                        "and the 8 MiB storage block size");
   }
   spdlog::info("storage direct-I/O alignment={} bytes", direct_io_alignment_);
-  spdlog::info("storage flush submission size={} bytes",
-               options_.flush_size_bytes_);
+  spdlog::info("storage flush trigger={} bytes maximum submission={} bytes",
+               options_.flush_size_bytes_, kMaxFlushWriteBytes);
 
   absl::Status system_state = LoadSystemState();
   if (!system_state.ok()) return system_state;

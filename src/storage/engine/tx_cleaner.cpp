@@ -126,6 +126,7 @@ void StorageEngine::Impl::NoteTxRecordLocal(
   } else {
     block.commit_ends_.insert_or_assign(txid, record_end);
   }
+  block.NotePromotionProgress();
   block.txids_.Record(txid,
                       receipt != nullptr
                           ? std::weak_ptr<void>(receipt->transaction_lease_)
@@ -150,6 +151,7 @@ void StorageEngine::Impl::DropTaggedRecordLocal(WorkerStore& store,
   }
   assert(found->second.live_tagged_bytes_ >= bytes);
   found->second.live_tagged_bytes_ -= bytes;
+  found->second.NotePromotionProgress();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
@@ -161,6 +163,7 @@ bool StorageEngine::Impl::PinTxDependencyLocal(
     return false;
   }
   ++found->second.dependency_pins_;
+  found->second.NotePromotionProgress();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
   return true;
 }
@@ -175,6 +178,7 @@ void StorageEngine::Impl::UnpinTxDependencyLocal(
   }
   assert(found->second.dependency_pins_ != 0);
   --found->second.dependency_pins_;
+  found->second.NotePromotionProgress();
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
@@ -514,15 +518,31 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
     ~RemoteAdmission() { state_.OpenRemotePins(); }
   } remote_admission{*source};
   const bool has_live_records = tx_block->second.live_tagged_bytes_ != 0;
+  const auto promotion_generation = tx_block->second.promotion_generation_;
+  const auto rewind_generation =
+      tx_promotion_rewind_generation_.load(std::memory_order_acquire);
+  // Eligibility has already established settled leases and a complete commit
+  // decision snapshot. No later append/decision can make an omitted record
+  // movable; only accounting/dependency progress or inverse publication can.
+  const bool scan_needed =
+      has_live_records &&
+      (tx_block->second.scanned_promotion_generation_ != promotion_generation ||
+       tx_block->second.scanned_rewind_generation_ != rewind_generation);
   source->defragging_ = true;
   const auto [file_id, offset] = FileOffset(block.block_id_);
   store.store_state_mutex_.Unlock(*store.worker_);
 
   absl::Status promoted = absl::OkStatus();
-  if (has_live_records)
-    promoted =
-        co_await SalvageBlockRecords(store, block.block_id_, *source, file_id,
-                                     offset, committed, !shutdown_drain);
+  if (scan_needed) {
+#if LAVIK_FAULTS_ENABLED
+    if (tx_promotion_scan_for_test_)
+      promoted = co_await tx_promotion_scan_for_test_();
+    else
+#endif
+      promoted =
+          co_await SalvageBlockRecords(store, block.block_id_, *source, file_id,
+                                       offset, committed, !shutdown_drain);
+  }
   std::vector<RelocationDurabilityFence> fences;
   co_await store.store_state_mutex_.Lock();
   if (const auto owed = store.pending_relocation_fences_.find(block.block_id_);
@@ -542,6 +562,23 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
   // retire it just because relocation already removed its live tagged bytes.
   co_await store.store_state_mutex_.Lock();
   store.pending_relocation_fences_.erase(block.block_id_);
+  if (scan_needed) {
+    const auto current = store.tx_blocks_.find(block.block_id_);
+    if (current != store.tx_blocks_.end() &&
+        current->second.allocation_epoch_ == block.allocation_epoch_ &&
+        current->second.promotion_generation_ == promotion_generation &&
+        tx_promotion_rewind_generation_.load(std::memory_order_acquire) ==
+            rewind_generation) {
+      // A successful full scan has processed every currently movable record.
+      // Remaining charged bytes can belong to superseded versions awaiting
+      // their successors' durable retirement. Another block's progress must
+      // not reread these bytes. Changes during either the scan or fence waits
+      // invalidate this proof, including our own relocation accounting; never
+      // stamp the newer generation as though it had already been scanned.
+      current->second.scanned_promotion_generation_ = promotion_generation;
+      current->second.scanned_rewind_generation_ = rewind_generation;
+    }
+  }
   store.store_state_mutex_.Unlock(*store.worker_);
   co_return absl::OkStatus();
 }
