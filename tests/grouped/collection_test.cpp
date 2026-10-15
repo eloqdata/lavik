@@ -91,6 +91,37 @@ std::vector<LoadedOrderedGroup> Loaded(
   return result;
 }
 
+OrderedCollectionRoot StringRoot(std::uint64_t bytes) {
+  const auto groups = (bytes + kStringGroupBytes - 1) / kStringGroupBytes;
+  return {.kind_ = OrderedCollectionKind::kString,
+          .incarnation_ = 17,
+          .item_count_ = bytes,
+          .first_group_ = 1,
+          .last_group_ = groups,
+          .next_group_id_ = groups + 1,
+          .group_count_ = static_cast<std::uint32_t>(groups),
+          .revision_ = 1};
+}
+
+std::vector<RecoveredOrderedGroup> StringCandidates(
+    const OrderedCollectionRoot& root, std::uint64_t revision = 1) {
+  std::vector<RecoveredOrderedGroup> records;
+  for (std::uint64_t id = 1; id <= root.group_count_; ++id) {
+    const auto bytes = std::min<std::uint64_t>(
+        kStringGroupBytes, root.item_count_ - (id - 1) * kStringGroupBytes);
+    records.push_back({{.incarnation_ = root.incarnation_,
+                        .id_ = id,
+                        .previous_ = id - 1,
+                        .next_ = id == root.group_count_ ? 0 : id + 1,
+                        .sequence_ = revision,
+                        .lsn_ = revision,
+                        .item_count_ = bytes,
+                        .encoded_bytes_ = kOrderedGroupHeaderBytes + bytes,
+                        .record_token_ = id}});
+  }
+  return records;
+}
+
 std::vector<OrderedCollectionEntry> Materialize(
     const OrderedGroupDirectory& directory,
     const std::vector<OrderedGroupSnapshot>& before,
@@ -435,6 +466,204 @@ TEST(GroupedCollectionTest, StringSegmentsValidateLengthsAndDirectPositions) {
   (*retired)[12] = static_cast<char>(OrderedCollectionKind::kString);
   (*retired)[13] = 1;
   EXPECT_FALSE(DecodeOrderedGroup(*retired).ok());
+}
+
+TEST(GroupedCollectionTest, StringPointUpdatesShareUntouchedDirectoryChunks) {
+  auto root = StringRoot(128 * kStringGroupBytes);
+  auto records = StringCandidates(root);
+  auto original = OrderedGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(original.ok()) << original.status();
+
+  // Replacing distant segments must neither copy unrelated metadata chunks
+  // nor modify a reader's retained predecessor.
+  std::array changed{records[95], records[63]};
+  for (auto& record : changed) {
+    record.sequence_ = record.lsn_ = 2;
+    record.record_token_ += 1000;
+  }
+  root.revision_ = 2;
+  auto updated = original->Apply(root, 2, changed, 2);
+  ASSERT_TRUE(updated.ok()) << updated.status();
+  EXPECT_EQ(&updated->groups()[0], &original->groups()[0]);
+  EXPECT_EQ(&updated->groups()[127], &original->groups()[127]);
+  for (const std::size_t index : {63, 95}) {
+    EXPECT_NE(&updated->groups()[index], &original->groups()[index]);
+    EXPECT_EQ(updated->groups()[index].record_token_, index + 1001);
+    EXPECT_EQ(original->groups()[index].record_token_, index + 1);
+    EXPECT_EQ(original->groups()[index].sequence_, 1);
+  }
+  EXPECT_EQ(updated->total_group_bytes(), original->total_group_bytes());
+
+  auto again = changed.front();
+  again.sequence_ = again.lsn_ = 3;
+  again.record_token_ += 1000;
+  root.revision_ = 3;
+  auto latest = updated->Apply(root, 3, std::span(&again, 1), 3);
+  ASSERT_TRUE(latest.ok()) << latest.status();
+  EXPECT_EQ(&latest->groups()[63], &updated->groups()[63]);
+  EXPECT_EQ(updated->groups()[95].record_token_, 1096);
+  EXPECT_EQ(latest->groups()[95].record_token_, 2096);
+  records.insert(records.end(), changed.begin(), changed.end());
+  records.push_back(again);
+  auto recovered = OrderedGroupDirectory::Recover(root, 3, records, {});
+  ASSERT_TRUE(recovered.ok()) << recovered.status();
+  EXPECT_EQ(latest->total_group_bytes(), recovered->total_group_bytes());
+  for (std::size_t i = 0; i < latest->groups().size(); ++i) {
+    EXPECT_EQ(latest->groups()[i].record_token_,
+              recovered->groups()[i].record_token_);
+    EXPECT_EQ(latest->groups()[i].sequence_, recovered->groups()[i].sequence_);
+    EXPECT_EQ(latest->CountBefore(i), i * kStringGroupBytes);
+  }
+}
+
+TEST(GroupedCollectionTest, StringGrowthPreservesPrefixAndChecksTailBoundary) {
+  for (const std::uint64_t groups : {1, 31, 32, 33, 63, 64, 65, 128}) {
+    for (const auto tail_bytes : std::array<std::uint64_t, 3>{
+             1, kStringGroupBytes - 1, kStringGroupBytes}) {
+      const auto before_root =
+          StringRoot((groups - 1) * kStringGroupBytes + tail_bytes);
+      const auto before = StringCandidates(before_root);
+      auto original =
+          OrderedGroupDirectory::Recover(before_root, 1, before, {});
+      ASSERT_TRUE(original.ok()) << original.status();
+      for (const auto growth : std::array<std::uint64_t, 3>{
+               1, kStringGroupBytes + 17, 2 * kStringGroupBytes}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "groups=" << groups << " tail=" << tail_bytes
+                     << " growth=" << growth);
+        auto root = StringRoot(before_root.item_count_ + growth);
+        root.revision_ = 2;
+        auto after = StringCandidates(root, 2);
+        std::vector<RecoveredOrderedGroup> changed(after.begin() + groups - 1,
+                                                   after.end());
+        std::reverse(changed.begin(), changed.end());
+        auto updated = original->Apply(root, 2, changed, 2);
+        ASSERT_TRUE(updated.ok()) << updated.status();
+        for (std::size_t i = 0; i + 1 < groups; ++i) after[i] = before[i];
+        auto recovered = OrderedGroupDirectory::Recover(root, 2, after, {});
+        ASSERT_TRUE(recovered.ok()) << recovered.status();
+        EXPECT_EQ(updated->total_group_bytes(), recovered->total_group_bytes());
+        ASSERT_EQ(updated->groups().size(), root.group_count_);
+        for (std::size_t i = 0; i < updated->groups().size(); ++i) {
+          EXPECT_EQ(updated->groups()[i].item_count_, after[i].item_count_);
+          EXPECT_EQ(updated->groups()[i].next_, after[i].next_);
+          EXPECT_EQ(updated->groups()[i].previous_, after[i].previous_);
+          EXPECT_EQ(updated->groups()[i].sequence_, after[i].sequence_);
+        }
+        if (groups > 32)
+          EXPECT_EQ(&updated->groups()[0], &original->groups()[0]);
+        EXPECT_EQ(original->groups().back().next_, 0);
+        EXPECT_EQ(original->groups().back().item_count_, tail_bytes);
+        EXPECT_EQ(original->root().item_count_, before_root.item_count_);
+        auto last = updated->FindRank(root.item_count_ - 1);
+        ASSERT_TRUE(last.has_value());
+        EXPECT_EQ(last->group_index_, root.group_count_ - 1);
+        EXPECT_EQ(last->offset_, after.back().item_count_ - 1);
+
+        // The old tail is the last entry of this reversed mutation list.
+        // Even a full old tail must acquire the next segment's link.
+        changed.pop_back();
+        EXPECT_TRUE(
+            absl::IsDataLoss(original->Apply(root, 2, changed, 2).status()));
+      }
+    }
+  }
+}
+
+TEST(GroupedCollectionTest,
+     StringUpdatesRejectMalformedDuplicateAndMissingPages) {
+  auto root = StringRoot(2 * kStringGroupBytes - 1);
+  const auto records = StringCandidates(root);
+  auto original = OrderedGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(original.ok()) << original.status();
+  root.revision_ = 2;
+  auto valid = records.front();
+  valid.sequence_ = valid.lsn_ = 2;
+  for (unsigned fault = 0; fault < 10; ++fault) {
+    auto changed = valid;
+    switch (fault) {
+      case 0:
+        changed.id_ = 0;
+        break;
+      case 1:
+        changed.id_ = 3;
+        break;
+      case 2:
+        ++changed.incarnation_;
+        break;
+      case 3:
+        changed.retired_ = true;
+        break;
+      case 4:
+        changed.sequence_ = 1;
+        break;
+      case 5:
+        changed.lsn_ = 0;
+        break;
+      case 6:
+        changed.record_token_ = 0;
+        break;
+      case 7:
+        changed.previous_ = 1;
+        break;
+      case 8:
+        changed.next_ = 0;
+        break;
+      case 9:
+        --changed.item_count_;
+        break;
+    }
+    EXPECT_TRUE(absl::IsDataLoss(
+        original->Apply(root, 2, std::span(&changed, 1), 2).status()))
+        << fault;
+  }
+  const std::array duplicates{valid, valid};
+  EXPECT_TRUE(
+      absl::IsDataLoss(original->Apply(root, 2, duplicates, 2).status()));
+  EXPECT_EQ(original->groups().front().sequence_, 1);
+
+  root = StringRoot(4 * kStringGroupBytes + 17);
+  root.revision_ = 2;
+  const auto after = StringCandidates(root, 2);
+  const std::array complete{after[4], after[1], after[2], after[3]};
+  ASSERT_TRUE(original->Apply(root, 2, complete, 2).ok());
+  // The supplied count can match the number of new IDs while still omitting
+  // one of them, or replacing that gap with a duplicate new ID.
+  const std::array gap{after[4], after[1], after[3]};
+  EXPECT_TRUE(absl::IsDataLoss(original->Apply(root, 2, gap, 2).status()));
+  const std::array duplicate_append{after[4], after[1], after[4], after[3]};
+  EXPECT_TRUE(
+      absl::IsDataLoss(original->Apply(root, 2, duplicate_append, 2).status()));
+  auto wrong_tail = complete;
+  wrong_tail.front().item_count_ = kStringGroupBytes;
+  EXPECT_TRUE(
+      absl::IsDataLoss(original->Apply(root, 2, wrong_tail, 2).status()));
+  EXPECT_EQ(original->groups().size(), 2);
+  EXPECT_EQ(original->groups().back().item_count_, kStringGroupBytes - 1);
+}
+
+TEST(GroupedCollectionTest,
+     StringByteDeltasCheckFinalTotalWithoutIntermediateOverflow) {
+  auto root = StringRoot(2 * kStringGroupBytes);
+  auto records = StringCandidates(root);
+  records[0].encoded_bytes_ = UINT64_MAX - 10;
+  records[1].encoded_bytes_ = 10;
+  auto original = OrderedGroupDirectory::Recover(root, 1, records, {});
+  ASSERT_TRUE(original.ok()) << original.status();
+  root.revision_ = 2;
+  for (auto& record : records) record.sequence_ = record.lsn_ = 2;
+  records[0].encoded_bytes_ = UINT64_MAX;
+  records[1].encoded_bytes_ = 0;
+  auto updated = original->Apply(root, 2, records, 2);
+  ASSERT_TRUE(updated.ok()) << updated.status();
+  EXPECT_EQ(updated->total_group_bytes(), UINT64_MAX);
+  EXPECT_TRUE(absl::IsDataLoss(
+      original->Apply(root, 2, std::span(records.data(), 1), 2).status()));
+  records[0].encoded_bytes_ = 0;
+  updated = original->Apply(root, 2, records, 2);
+  ASSERT_TRUE(updated.ok()) << updated.status();
+  EXPECT_EQ(updated->total_group_bytes(), 0);
+  EXPECT_EQ(original->total_group_bytes(), UINT64_MAX);
 }
 
 TEST(GroupedCollectionTest, SortedSetRootChecksMemberIndexPresence) {
