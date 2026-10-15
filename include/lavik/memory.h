@@ -133,10 +133,10 @@ class RetainedMemoryCharge {
   std::size_t bytes_ = 0;
 };
 
-// Accounts request bytes read from ordinary client connections until their
-// command finishes. One instance belongs to one connection and must remain on
-// the worker where it was created; this keeps acquire/release operations local
-// to that worker's cache line.
+// Accounts received request bytes and prepaid direct-bulk destinations from
+// ordinary client connections until their command finishes or the connection
+// closes. One instance belongs to one connection and must remain on the worker
+// where it was created; acquire/release touches only that worker's cache line.
 class ClientBufferReservation {
  public:
   ClientBufferReservation() noexcept;
@@ -144,9 +144,10 @@ class ClientBufferReservation {
   ClientBufferReservation& operator=(const ClientBufferReservation&) = delete;
   ~ClientBufferReservation();
 
-  // Acquires bytes from the calling worker's share of the 5% client-buffer
-  // budget. The check happens once after a socket read, not for every parser
-  // append. Failure leaves the reservation unchanged.
+  // Acquires bytes from the calling worker's configured client-buffer share.
+  // Ordinary reads acquire received bytes; direct bulk reads acquire a bounded
+  // destination before allocation and do not recharge it as data arrives.
+  // Failure leaves the reservation unchanged.
   [[nodiscard]] bool TryAcquire(std::size_t bytes) noexcept;
   // Releases bytes after parser-discarded input or a completed command. The
   // caller must not release more than it has acquired.

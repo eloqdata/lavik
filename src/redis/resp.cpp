@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cassert>
 #include <charconv>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -36,10 +37,9 @@ namespace {
 constexpr long long kMaxArrayLen = std::numeric_limits<int>::max();
 constexpr std::size_t kInitialArgCapacity = 1024;
 constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
-// TODO(memory-control): Once retained-memory admission is settled, let bulk
-// arguments >= 32 KiB expose their final string storage as the ReadSome()
-// destination. This removes the RequestInputBuffer-to-string copy without
-// pinning a shared provided buffer across an await or a stalled client.
+constexpr std::size_t kDirectBulkThreshold = 32 * 1024;
+constexpr std::size_t kDirectBulkReservation = 1024 * 1024;
+constexpr std::size_t kDirectBulkReadBytes = 256 * 1024;
 constexpr std::size_t kMaxLengthTextBytes = 32;
 absl::Status AppendArgument(std::string* output, std::string_view value) {
   if (value.size() > std::numeric_limits<std::size_t>::max() - output->size()) {
@@ -168,11 +168,58 @@ void RespCommandParser::ResetCommand() {
   command_ = RespCommand{};
   arguments_remaining_ = 0;
   bulk_remaining_ = 0;
+  bulk_prepared_ = 0;
   terminator_bytes_ = 0;
   command_bytes_ = 0;
 }
 
 void RespCommandParser::Reset() { ResetCommand(); }
+
+std::size_t RespCommandParser::BulkReadReservationSize() const noexcept {
+  if (state_ != State::kBulkData || current_argument_.empty() ||
+      bulk_prepared_ != 0 ||
+      current_argument_.size() + bulk_remaining_ < kDirectBulkThreshold ||
+      command_bytes_ >= query_buffer_limit_)
+    return 0;
+  return std::min({bulk_remaining_, kDirectBulkReservation,
+                   query_buffer_limit_ - command_bytes_});
+}
+
+absl::Status RespCommandParser::PrepareBulkRead(std::size_t bytes) {
+  if (bytes == 0 || bytes > BulkReadReservationSize())
+    return absl::InvalidArgumentError("invalid RESP bulk read reservation");
+  // Resize makes the whole writable range valid string storage. Tracking its
+  // unread tail prevents initialized but unreceived bytes becoming payload.
+  // Allocation failure follows Parse's process-fatal allocation policy.
+  current_argument_.resize(current_argument_.size() + bytes);
+  bulk_prepared_ = bytes;
+  return absl::OkStatus();
+}
+
+std::span<char> RespCommandParser::BulkReadBuffer() noexcept {
+  if (state_ != State::kBulkData) return {};
+  const auto bytes = std::min(bulk_prepared_, kDirectBulkReadBytes);
+  return {current_argument_.data() + current_argument_.size() - bulk_prepared_,
+          bytes};
+}
+
+absl::Status RespCommandParser::CommitBulkRead(std::size_t bytes) {
+  if (state_ != State::kBulkData || bulk_prepared_ == 0 ||
+      bytes > std::min(bulk_prepared_, kDirectBulkReadBytes))
+    return absl::InvalidArgumentError("invalid RESP bulk read length");
+  // The query limit can change while a socket read is suspended. Recheck
+  // accounting before advancing any logical state, even for an earlier span.
+  if (!Account(bytes))
+    return absl::ResourceExhaustedError(
+        "client request exceeds the query buffer limit");
+  bulk_prepared_ -= bytes;
+  bulk_remaining_ -= bytes;
+  if (bulk_remaining_ == 0) {
+    terminator_bytes_ = 0;
+    state_ = State::kBulkTerminator;
+  }
+  return absl::OkStatus();
+}
 
 bool RespCommandParser::Account(std::size_t bytes) {
   if (bytes > query_buffer_limit_ ||
@@ -312,6 +359,7 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                     absl::OutOfRangeError("RESP bulk string too large"), pos);
               }
               bulk_remaining_ = static_cast<std::size_t>(parsed);
+              assert(bulk_prepared_ == 0);
               current_argument_.clear();
               state_ = State::kBulkData;
             }
@@ -409,7 +457,18 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
           // length_error handler on every ordinary RESP argument is redundant.
           // Allocation failure remains process-fatal through the coroutine's
           // unhandled-exception policy.
-          current_argument_.append(input.substr(pos, take));
+          if (bulk_prepared_ == 0) [[likely]] {
+            current_argument_.append(input.substr(pos, take));
+          } else {
+            const auto prepared = std::min(take, bulk_prepared_);
+            std::memcpy(current_argument_.data() + current_argument_.size() -
+                            bulk_prepared_,
+                        input.data() + pos, prepared);
+            bulk_prepared_ -= prepared;
+            if (take > prepared)
+              current_argument_.append(
+                  input.substr(pos + prepared, take - prepared));
+          }
           bulk_remaining_ -= take;
           if (!consume(take)) {
             return Error(absl::ResourceExhaustedError(

@@ -62,7 +62,11 @@ It accepts either a percentage such as `5%` or an absolute size such as
 `512mb`; the default is `5%`, and `0` disables this client-specific limit.
 Every nonzero value has a 128 KiB effective minimum so an accidentally tiny
 setting does not make administrative commands unusable. The process-wide value
-is divided into fixed worker shares and checked once after each socket read.
+is divided into fixed worker shares. Ordinary reads charge received bytes;
+large bulk reads charge bounded destination windows before allocation, then
+consume that reservation as data arrives. Unread reservations are released
+when the connection closes. The quota tracks received and reserved request
+bytes, not allocator capacity or exact heap usage.
 
 `--client-query-buffer-limit` is the independent per-connection hard limit for
 an incomplete command. It accepts an absolute Redis-style memory size, defaults
@@ -72,7 +76,8 @@ configuration files. The connection closes if incremental parsing crosses the
 limit; completed commands continue to count against `maxmemory-clients` until
 execution or transaction teardown releases them. `CONFIG GET/SET
 client-query-buffer-limit` reads or changes the live process-wide value;
-existing connections apply a change before their next parsing round.
+existing connections apply a change before their next parsing round and before
+committing bytes received directly into a large argument.
 
 The process budget is split evenly across workers and unused capacity is not
 borrowed across workers. SET/MSET/INCR performs one worker-local retained-growth
@@ -218,7 +223,8 @@ sum by (result) (rate(lavik_storage_defrag_runs_total[5m]))
 - `lavik_client_request_buffer_limit_bytes`: effective client request-buffer
   limit after resolving percentages and the nonzero 128 KiB floor.
 - `lavik_client_buffered_request_bytes`: wire bytes currently retained by
-  ordinary parsers, ready command batches, and queued transactions.
+  ordinary parsers, ready command batches, and queued transactions, plus
+  prepaid destination bytes for incomplete direct bulk reads.
 - `lavik_fullsync_reserved_memory_bytes`: reusable retained-memory headroom
   promised to active full-sync coverage maps.
 - `lavik_memory_admission_pending_bytes`: short-lived worker-local permits

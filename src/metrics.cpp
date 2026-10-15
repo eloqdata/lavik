@@ -667,7 +667,7 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "lavik_client_request_buffer_limit_bytes ",
       memory_metrics.client_buffer_limit_bytes_, "\n",
       "# HELP lavik_client_buffered_request_bytes Ordinary client request "
-      "bytes read but not yet retired.\n"
+      "bytes received or reserved for direct reads but not yet retired.\n"
       "# TYPE lavik_client_buffered_request_bytes gauge\n"
       "lavik_client_buffered_request_bytes ",
       memory_metrics.client_buffered_bytes_, "\n",

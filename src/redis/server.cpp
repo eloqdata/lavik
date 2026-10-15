@@ -1044,6 +1044,8 @@ Task<absl::Status> ReadCommandBatch(
     const std::atomic<std::size_t>* query_buffer_limit,
     std::size_t* unassigned_input_bytes,
     std::optional<absl::Status>* deferred_error) {
+  constexpr std::size_t kBulkBytesPerYield = 256 * 1024;
+  std::size_t bulk_bytes_since_yield = 0;
   while (ready->empty()) {
     // CONFIG SET may run on another worker while this coroutine is suspended
     // in ReadSome(). Refresh once per parsing round; token-level loads would
@@ -1081,6 +1083,55 @@ Task<absl::Status> ReadCommandBatch(
       break;
     }
     if (!ready->empty()) co_return absl::OkStatus();
+
+    const std::size_t bulk_reservation = parser->BulkReadReservationSize();
+    if (bulk_reservation != 0) {
+      // A direct destination includes bytes the peer has not sent yet. Charge
+      // that bounded window before allocation, then let received bytes inherit
+      // its allowance instead of charging them again. The connection owns any
+      // unread remainder until teardown; completed commands retain the usual
+      // wire-byte charge through execution (or MULTI).
+      if (!client_buffers->TryAcquire(bulk_reservation)) [[unlikely]] {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "client request buffers exceed the memory limit");
+      }
+      const auto prepared = parser->PrepareBulkRead(bulk_reservation);
+      if (!prepared.ok()) [[unlikely]] {
+        client_buffers->Release(bulk_reservation);
+        co_return prepared;
+      }
+    }
+    if (auto body = parser->BulkReadBuffer(); !body.empty()) {
+      body = body.first(
+          std::min(body.size(), kBulkBytesPerYield - bulk_bytes_since_yield));
+      auto read_result =
+          co_await stream.ReadSomeBuffered(std::as_writable_bytes(body));
+      if (!read_result.ok()) [[unlikely]]
+        co_return read_result.status();
+      if (*read_result == 0) [[unlikely]] {
+        co_return absl::UnavailableError("peer closed connection");
+      }
+      // The limit may have shrunk while the direct read was suspended. Never
+      // dispatch a command using a stale guard merely because its destination
+      // was admitted before CONFIG SET ran.
+      parser->SetQueryBufferLimit(
+          query_buffer_limit->load(std::memory_order_acquire));
+      const auto committed = parser->CommitBulkRead(*read_result);
+      if (!committed.ok()) [[unlikely]]
+        co_return committed;
+      assert(*read_result <=
+             std::numeric_limits<std::size_t>::max() - *unassigned_input_bytes);
+      *unassigned_input_bytes += *read_result;
+      // Buffered reads can finish without suspending. Bound uninterrupted
+      // receive work so a large body cannot monopolize the connection worker.
+      bulk_bytes_since_yield += *read_result;
+      if (bulk_bytes_since_yield == kBulkBytesPerYield) {
+        bulk_bytes_since_yield = 0;
+        co_await Yield(*ThisWorker().self_);
+      }
+      continue;
+    }
 
     std::span<std::byte> buffer = input->AppendBuffer();
     auto read_result = co_await stream.ReadSome(buffer);

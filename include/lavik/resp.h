@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -64,6 +65,27 @@ class RespCommandParser {
 
   RespParseResult Parse(std::string_view input);
 
+  // Suggests bounded additional body storage for a partially received large
+  // bulk argument. Returns zero until payload arrives, while prepared storage
+  // remains, or when the current query limit leaves no allowance. The caller
+  // must admit this many request-buffer bytes before allocating them.
+  [[nodiscard]] std::size_t BulkReadReservationSize() const noexcept;
+  // Preallocates 1..BulkReadReservationSize() bytes in the final argument.
+  // This does not consume input or account wire bytes; unused space stays
+  // owned by the parser until filled or Reset. Invalid sizes leave it intact.
+  absl::Status PrepareBulkRead(std::size_t bytes);
+  // Returns the next bounded writable body window, excluding the terminator.
+  // Commit bytes written here instead of passing them to Parse. The span is
+  // invalidated by Parse, Reset, or another preparation; none may run while a
+  // transport read owns it. The caller retains its admission across the read.
+  // A lower query limit does not revoke this admitted span; Commit rechecks it.
+  [[nodiscard]] std::span<char> BulkReadBuffer() noexcept;
+  // Commits at most the exposed window's bytes and rechecks the latest query
+  // limit. Partial/zero commits are allowed while a prepared window remains;
+  // failure leaves logical parser state intact. Parse still consumes CRLF and
+  // returns completed commands. It can also fill a partially used window.
+  absl::Status CommitBulkRead(std::size_t bytes);
+
   void Reset();
   // Changes the guard without disturbing partially parsed state. If the new
   // limit is already below the retained command size, the next input byte is
@@ -97,6 +119,9 @@ class RespCommandParser {
   std::string current_argument_;
   std::size_t arguments_remaining_ = 0;
   std::size_t bulk_remaining_ = 0;
+  // String size includes this prepared but unwritten tail. Received payload
+  // ends before it; bulk_remaining_ includes it. Parse-only callers keep zero.
+  std::size_t bulk_prepared_ = 0;
   std::size_t terminator_bytes_ = 0;
   std::size_t command_bytes_ = 0;
   std::size_t query_buffer_limit_ = kDefaultClientQueryBufferLimit;
