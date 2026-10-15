@@ -47,9 +47,10 @@ class CaptureMemoryScope {
   unsigned previous_;
 };
 
-std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
-  std::string encoded(source.size(), '\0');
-  auto task = source.Read(0, std::as_writable_bytes(std::span(encoded)));
+std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source,
+                              std::uint64_t offset, std::size_t count) {
+  std::string encoded(count, '\0');
+  auto task = source.Read(offset, std::as_writable_bytes(std::span(encoded)));
   // This in-memory source never suspends. Detect any future asynchronous
   // dependency instead of resuming a coroutine owned by another operation.
   auto handle = std::move(task).ReleaseHandle();
@@ -60,14 +61,18 @@ std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
   return encoded;
 }
 
-TEST(ReplicationCommandTest, PreparedCaptureChargeFollowsMovedEffects) {
+std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
+  return ReadCommandSource(source, 0, source.size());
+}
+
+TEST(ReplicationCommandTest, CaptureChargeFollowsMovedEffects) {
   CaptureMemoryScope memory;
   const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
   {
-    std::vector<lavik::CapturedReplicationCommand> pending;
+    lavik::CapturedReplicationCommands pending;
     {
       lavik::ReplicationCommandCapture capture;
-      ASSERT_TRUE(capture.ReserveAdditionalCommands(2, 4096).ok());
+      ASSERT_TRUE(capture.ReserveAdditionalCommands(2).ok());
       capture.Record(0, {"DEL", "destination"});
       capture.Record(0, {"SADD", "destination", std::string(2048, 'v')});
       auto effects = capture.Take();
@@ -75,24 +80,21 @@ TEST(ReplicationCommandTest, PreparedCaptureChargeFollowsMovedEffects) {
     }
     ASSERT_EQ(pending.size(), 2);
     ASSERT_NE(pending[0].retained_charge_, nullptr);
-    EXPECT_EQ(pending[0].retained_charge_, pending[1].retained_charge_);
-    EXPECT_GE(lavik::WorkerMemoryAccountingBytes(0) - baseline, 4096);
+    EXPECT_NE(pending[0].retained_charge_, pending[1].retained_charge_);
+    EXPECT_GE(lavik::WorkerMemoryAccountingBytes(0) - baseline, 2048);
     EXPECT_EQ(pending[1].args_.back(), std::string(2048, 'v'));
   }
   EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
 }
 
-TEST(ReplicationCommandTest, CapturePreparationOomPreservesEarlierEffects) {
+TEST(ReplicationCommandTest, CaptureCountOverflowPreservesEarlierEffects) {
   CaptureMemoryScope memory;
   const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
   {
     lavik::ReplicationCommandCapture capture;
-    ASSERT_TRUE(capture.ReserveAdditionalCommands(1, 1024).ok());
+    ASSERT_TRUE(capture.ReserveAdditionalCommands(1).ok());
     capture.Record(0, {"SET", "prefix", "kept"});
     const auto charged = lavik::WorkerMemoryAccountingBytes(0);
-    EXPECT_EQ(
-        capture.ReserveAdditionalCommands(1, 1024ULL * 1024 * 1024).code(),
-        absl::StatusCode::kResourceExhausted);
     EXPECT_EQ(
         capture
             .ReserveAdditionalCommands(std::numeric_limits<std::size_t>::max())
@@ -107,11 +109,53 @@ TEST(ReplicationCommandTest, CapturePreparationOomPreservesEarlierEffects) {
   EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
 }
 
+TEST(ReplicationCommandTest, AdmittedCaptureAccountsAboveSoftBudget) {
+  CaptureMemoryScope memory;
+  const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
+  {
+    lavik::RetainedMemoryCharge occupied;
+    occupied.Account(lavik::CurrentMemoryAccountingShard(),
+                     1024ULL * 1024 * 1024);
+    ASSERT_TRUE(lavik::WouldExceedMemoryLimit(0));
+    const auto before = lavik::WorkerMemoryAccountingBytes(0);
+    {
+      lavik::ReplicationCommandCapture capture;
+      std::vector<std::string> args{"SET", "key", std::string(2048, 'v')};
+      ASSERT_TRUE(capture.ReserveAdditionalCommands(1).ok());
+      capture.Record(0, std::move(args));
+      EXPECT_GE(lavik::WorkerMemoryAccountingBytes(0) - before, 2048);
+      auto effects = capture.Take();
+      ASSERT_EQ(effects.commands_.size(), 1);
+      EXPECT_EQ(effects.commands_[0].args_.back(), std::string(2048, 'v'));
+    }
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), before);
+  }
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST(ReplicationCommandTest, CopiedCaptureOwnsItsAllocationCharge) {
+  CaptureMemoryScope memory;
+  const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
+  {
+    lavik::CapturedReplicationCommand original{
+        0, {"SET", "key", std::string(2048, 'v')}};
+    const auto before_copy = lavik::WorkerMemoryAccountingBytes(0);
+    {
+      auto copied = original;
+      EXPECT_NE(copied.retained_charge_, original.retained_charge_);
+      EXPECT_GE(lavik::WorkerMemoryAccountingBytes(0) - before_copy, 2048);
+      EXPECT_EQ(copied.args_, original.args_);
+    }
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), before_copy);
+  }
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
+}
+
 TEST(ReplicationCommandTest, UnusedCapturePreparationDoesNotBurdenNextCommand) {
   CaptureMemoryScope memory;
   const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
   lavik::ReplicationCommandCapture capture;
-  ASSERT_TRUE(capture.ReserveAdditionalCommands(2, 4096).ok());
+  ASSERT_TRUE(capture.ReserveAdditionalCommands(2).ok());
   capture.MarkHandled();
   ASSERT_GT(lavik::WorkerMemoryAccountingBytes(0), baseline);
   capture.ReleaseUnusedPreparation();
@@ -120,7 +164,7 @@ TEST(ReplicationCommandTest, UnusedCapturePreparationDoesNotBurdenNextCommand) {
   EXPECT_TRUE(empty.handled_);
   EXPECT_TRUE(empty.commands_.empty());
 
-  ASSERT_TRUE(capture.ReserveAdditionalCommands(1, 1024).ok());
+  ASSERT_TRUE(capture.ReserveAdditionalCommands(1).ok());
   capture.Record(0, {"SET", "kept", "value"});
   const auto charged = lavik::WorkerMemoryAccountingBytes(0);
   capture.ReleaseUnusedPreparation();
@@ -234,28 +278,6 @@ TEST(ReplicationCommandTest, StagingBudgetIncludesShortArgumentOwners) {
   const auto bytes = lavik::storage::ReplicationCommandStagingBytes(args);
   ASSERT_TRUE(bytes.has_value());
   EXPECT_GE(*bytes, args.size() * sizeof(std::string));
-}
-
-TEST(ReplicationCommandTest, TransactionReservationCoversMaterializedPrefix) {
-  std::vector<std::string> command_args{"SET", "key", std::string(1024, 'v')};
-  constexpr std::size_t kParticipantCapacity = 8;
-  const auto reserved = lavik::storage::ReplicationTransactionReservationBytes(
-      kParticipantCapacity, 2, command_args);
-  ASSERT_TRUE(reserved.has_value());
-
-  auto encoded = lavik::EncodeReplicationTransactionEnvelope(
-      lavik::ReplicationTransactionEnvelope{
-          .id_ = std::numeric_limits<std::uint64_t>::max(),
-          .payload_flow_ = 0,
-          .participants_ = {0, 1},
-      });
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  std::vector<std::string> prefix{std::move(*encoded)};
-  const auto materialized =
-      lavik::storage::ReplicationTransactionAllocationBytes(
-          kParticipantCapacity, prefix, command_args);
-  ASSERT_TRUE(materialized.has_value());
-  EXPECT_GE(*reserved, *materialized);
 }
 
 TEST(ReplicationCommandTest, TransactionEnvelopeRoundTripsCanonicalBitmap) {
@@ -380,42 +402,61 @@ TEST(ReplicationCommandTest, RejectsMalformedWideFormat) {
   EXPECT_FALSE(lavik::DecodeReplicationCommand(valid + "extra").ok());
 }
 
-TEST(ReplicationCommandTest, EnforcesCompleteEncodingLimit) {
-  const std::string one_mebibyte(1024 * 1024, 'x');
+TEST(ReplicationCommandTest, StreamsLegacyEncodingBeyondOneGiB) {
+  std::string one_mebibyte(1024 * 1024, 'x');
+  one_mebibyte.front() = 'a';
+  one_mebibyte.back() = 'z';
   std::vector<std::string_view> args(1024, one_mebibyte);
   constexpr std::size_t kHeaderBytes = 8 + 1024 * sizeof(std::uint32_t);
-  args.back() = std::string_view(one_mebibyte).substr(kHeaderBytes);
-
-  auto exact = lavik::ReplicationCommandPayloadSource::Create(0, args);
-  ASSERT_TRUE(exact.ok()) << exact.status();
-  EXPECT_EQ(exact->size(), lavik::kMaxNativeReplicationEventBytes);
-
-  args.back() = std::string_view(one_mebibyte).substr(kHeaderBytes - 1);
-  auto oversized = lavik::ReplicationCommandPayloadSource::Create(0, args);
-
-  EXPECT_FALSE(oversized.ok());
-  EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
+  // Reused views exercise the former aggregate limit without allocating a
+  // gigabyte. Reads still visit the actual source bytes at large offsets.
+  auto source = lavik::ReplicationCommandPayloadSource::Create(0, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+  EXPECT_EQ(source->size(),
+            lavik::kMaxNativeReplicationArgumentBytes + kHeaderBytes);
+  EXPECT_EQ(ReadCommandSource(
+                *source, lavik::kMaxNativeReplicationArgumentBytes - 8, 16),
+            std::string(16, 'x'));
+  EXPECT_EQ(
+      ReadCommandSource(*source, source->size() - one_mebibyte.size() - 1, 3),
+      "zax");
+  EXPECT_EQ(ReadCommandSource(*source, source->size() - 2, 2), "xz");
 }
 
-TEST(ReplicationCommandTest, EnforcesCompleteWideEncodingLimit) {
+TEST(ReplicationCommandTest, StreamsWideEncodingBeyondOneGiB) {
   constexpr std::size_t count = 65536;
   constexpr std::size_t payload_bytes = 16 * 1024;
   constexpr std::size_t header_bytes = 10 + count * sizeof(std::uint32_t);
-  const std::string payload(payload_bytes, 'x');
+  std::string payload(payload_bytes, 'x');
+  payload.front() = 'a';
+  payload.back() = 'z';
   std::vector<std::string_view> args(count, payload);
-  // Reuse one payload to test the 1 GiB accounting boundary without owning
-  // that much memory. Leave exactly the widened header's worth of headroom.
-  for (std::size_t i = 0; i < header_bytes / payload_bytes; ++i) args[i] = {};
-  args[header_bytes / payload_bytes] =
-      std::string_view(payload).substr(header_bytes % payload_bytes);
-  auto exact = lavik::ReplicationCommandPayloadSource::Create(0, args);
-  ASSERT_TRUE(exact.ok()) << exact.status();
-  EXPECT_EQ(exact->size(), lavik::kMaxNativeReplicationEventBytes);
+  auto source = lavik::ReplicationCommandPayloadSource::Create(0, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+  EXPECT_EQ(source->size(),
+            lavik::kMaxNativeReplicationArgumentBytes + header_bytes);
+  EXPECT_EQ(ReadCommandSource(
+                *source, lavik::kMaxNativeReplicationArgumentBytes - 8, 16),
+            std::string(16, 'x'));
+  EXPECT_EQ(ReadCommandSource(*source, source->size() - payload_bytes - 1, 3),
+            "zax");
+  EXPECT_EQ(ReadCommandSource(*source, source->size() - 2, 2), "xz");
+}
 
-  args[header_bytes / payload_bytes] =
-      std::string_view(payload).substr(header_bytes % payload_bytes - 1);
-  auto oversized = lavik::ReplicationCommandPayloadSource::Create(0, args);
-  EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
+TEST(ReplicationCommandTest, PreservesArgumentAndCountBounds) {
+  const std::vector<std::string_view> empty;
+  EXPECT_EQ(
+      lavik::ReplicationCommandPayloadSource::Create(0, empty).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  // Validate the argument-length bound before looking for payload bytes, so
+  // the test needs only a header rather than an oversized allocation.
+  std::string encoded("LRC1\x02\0\x01\0\0\0", 10);
+  encoded.append("\0\0\0\x40", 4);
+  EXPECT_EQ(lavik::DecodeReplicationCommand(encoded).status().message(),
+            "truncated replication command payload");
+  encoded[10] = 1;
+  EXPECT_EQ(lavik::DecodeReplicationCommand(encoded).status().message(),
+            "invalid replication command argument length");
 }
 
 }  // namespace

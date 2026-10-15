@@ -190,13 +190,16 @@ def revoked(root, mode, command, boundary):
             expected = "old" if before else None
             # The result of a disconnected FLUSH is uncertain to that client;
             # verify the committed outcome and new writes after reconnecting.
+            # Asynchronous authority retirement also closes recent reconnects.
+            # Poll with a fresh connection so one retired socket cannot strand
+            # the whole recovery wait after authority has already returned.
+            H.wait_until(
+                "Owner authority restored and outcome visible",
+                30,
+                lambda: F.redis_call(source, ["GET", "{flush}old"]) == expected,
+            )
             recovered = Client(source)
             try:
-                H.wait_until(
-                    "Owner authority restored and outcome visible",
-                    30,
-                    lambda: recovered.call("GET", "{flush}old") == expected,
-                )
                 H.wait_until(
                     "flush outcome replayed",
                     30,

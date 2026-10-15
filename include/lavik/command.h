@@ -36,6 +36,7 @@
 #include "lavik/cluster/topology.h"
 #include "lavik/read_trace.h"
 #include "lavik/resp_version.h"
+#include "lavik/retained_allocator.h"
 #include "lavik/set_trace.h"
 #include "lavik/storage/engine.h"
 
@@ -61,20 +62,53 @@ using bycorf::Task;
 
 struct CapturedReplicationCommand {
   CapturedReplicationCommand() = default;
-  CapturedReplicationCommand(std::uint8_t db_id, std::vector<std::string> args)
-      : db_id_(db_id), args_(std::move(args)) {}
+  CapturedReplicationCommand(std::uint8_t db_id, std::vector<std::string> args);
+  CapturedReplicationCommand(const CapturedReplicationCommand& other)
+      : CapturedReplicationCommand(other.db_id_, other.args_) {}
+  CapturedReplicationCommand& operator=(
+      const CapturedReplicationCommand& other) {
+    if (this != &other) *this = CapturedReplicationCommand(other);
+    return *this;
+  }
+  CapturedReplicationCommand(CapturedReplicationCommand&&) noexcept = default;
+  CapturedReplicationCommand& operator=(CapturedReplicationCommand&&) noexcept =
+      default;
 
-  // Shared capture admission follows commands through EXEC/Lua's intermediate
-  // vectors until encoding transfers ownership to the replication envelope.
-  // Declared first so argument buffers die before their allowance is released.
+  // Actual retained argument storage follows effects through EXEC/Lua. The
+  // enclosing write is already admitted, so this charge may cross the soft
+  // budget. Argument buffers die before their accounting owner.
   std::shared_ptr<RetainedMemoryCharge> retained_charge_;
   std::uint8_t db_id_ = 0;
   std::vector<std::string> args_;
 };
 
+// Accepted effects may grow beyond the soft budget. Their vector allocation
+// is accounted independently of each argument owner, including when effects
+// move from one child capture into a long-lived Lua or EXEC aggregate.
+template <typename T>
+class ReplicationCaptureAllocator : public RetainedAllocator<T> {
+ public:
+  using propagate_on_container_swap = std::true_type;
+  ReplicationCaptureAllocator() noexcept
+      : RetainedAllocator<T>(
+            RetainedAllocationDomain{.externally_admitted_ = true}) {}
+  template <typename U>
+  ReplicationCaptureAllocator(
+      const ReplicationCaptureAllocator<U>& other) noexcept
+      : RetainedAllocator<T>(other.domain()) {}
+  template <typename U>
+  struct rebind {
+    using other = ReplicationCaptureAllocator<U>;
+  };
+};
+
+using CapturedReplicationCommands =
+    std::vector<CapturedReplicationCommand,
+                ReplicationCaptureAllocator<CapturedReplicationCommand>>;
+
 struct CapturedReplicationEffects {
   bool handled_ = false;
-  std::vector<CapturedReplicationCommand> commands_;
+  CapturedReplicationCommands commands_;
 };
 
 // EXEC handlers record outcome-dependent commands here (absolute deadlines,
@@ -83,16 +117,13 @@ struct CapturedReplicationEffects {
 // several owners, so recording is safe from any participant worker.
 class ReplicationCommandCapture {
  public:
-  // Reserve every outcome-dependent effect before the first mutation. The
-  // coordinator supplies the retained capacity of its prepared arguments;
-  // subsequent Record calls only move those arguments into preallocated slots.
-  // Repeated preparation must use the same coordinator accounting owner.
-  absl::Status ReserveAdditionalCommands(std::size_t count,
-                                         std::size_t payload_bytes = 0);
-  // After a prepared command finishes without effects, release its unused
-  // slots and allowance before the next EXEC command. Recorded effects retain
-  // their shared charge until the replication envelope takes ownership.
+  // Reserve effect slots without a second soft-budget admission. The retained
+  // allocator charges slots immediately; each recorded command owns its args.
+  absl::Status ReserveAdditionalCommands(std::size_t count);
+  // Release unused slots after a command finishes without effects.
   void ReleaseUnusedPreparation();
+  // Preserve argument accounting through nested EVAL/EXEC captures.
+  void Record(CapturedReplicationCommand command);
   void MarkHandled();
   void Record(std::uint8_t db_id, std::vector<std::string> args);
   CapturedReplicationEffects Take();
@@ -101,11 +132,9 @@ class ReplicationCommandCapture {
   std::shared_ptr<CapturedPubSubPublication> TakeCapturedPubSubPublication();
 
  private:
-  std::shared_ptr<RetainedMemoryCharge> prepared_charge_;
-  unsigned preparation_owner_ = 0;
   mutable std::mutex mutex_;
   bool handled_ = false;
-  std::vector<CapturedReplicationCommand> commands_;
+  CapturedReplicationCommands commands_;
   // A source-side EXEC must publish its replication envelope before local
   // subscriber-visible delivery. Keep the command-time recipient snapshot
   // beside the corresponding replication effects so every failure path drops
@@ -580,12 +609,12 @@ void MarkReplicationCommandHandled(const CommandRequest& request);
 // Standalone multi-key commands use the same envelope as replicated EXEC so
 // all effects are replayed atomically by every participant flow.
 std::vector<std::string> EncodeReplicationCommandEffects(
-    std::vector<CapturedReplicationCommand> commands);
+    CapturedReplicationCommands commands);
 
 // Reserves one ordered replication marker on every shard participating in a
-// standalone cross-key command. Construction may fail retained-memory
-// admission, so callers must check status() before scheduling the transaction
-// or entering storage. Destruction aborts an unresolved marker.
+// standalone cross-key command. Callers must check status() for representation
+// limits before scheduling the transaction. The accepted write may exceed the
+// soft memory budget; destruction aborts an unresolved marker.
 class ReplicationTransactionGuard {
  public:
   using ParticipantsEnteredHook = void (*)(void*) noexcept;
@@ -606,9 +635,8 @@ class ReplicationTransactionGuard {
 
   // Returns false when a participant already made publication impossible.
   bool Commit() noexcept;
-  // Replaces the canonical body while the transaction is pending. The method
-  // obtains retained-memory headroom before growing the shared envelope, so a
-  // caller can place this boundary before making its primary mutation visible.
+  // Move a canonical body into the pending transaction and account its actual
+  // storage. Soft memory pressure cannot reject an already admitted write.
   absl::Status TrySetCommandArgs(
       std::vector<std::string> canonical_args) noexcept;
   void SetCommandArgs(std::vector<std::string> canonical_args) noexcept;

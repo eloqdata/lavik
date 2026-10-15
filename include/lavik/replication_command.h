@@ -30,9 +30,9 @@
 namespace lavik {
 
 inline constexpr std::string_view kReplicatedExecCommand = "__LAVIK_EXEC_V1";
-// Fragmentation changes only transport granularity. Every producer and
-// receiver applies this limit to the complete canonical event.
-inline constexpr std::uint64_t kMaxNativeReplicationEventBytes =
+// Bound each argument independently. A transaction's aggregate effects may
+// exceed this size and still travel as one fragmented logical event.
+inline constexpr std::uint64_t kMaxNativeReplicationArgumentBytes =
     1024ULL * 1024 * 1024;
 
 // Fixed command header size, excluding the per-argument length table. Keep
@@ -77,7 +77,8 @@ bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept;
 // Replication log frames may split this byte stream, but the receiver still
 // observes one logical command and one LSN.
 // V1 carries up to UINT16_MAX arguments; larger commands use V2 with a
-// four-byte count bounded by INT32_MAX and the complete-event byte limit.
+// four-byte count bounded by INT32_MAX. Argument lengths retain their own
+// bound; the aggregate event is limited only by representable sizes.
 class ReplicationCommandPayloadSource final
     : public storage::ReplicationLogPayloadSource {
  public:
@@ -100,6 +101,9 @@ class ReplicationCommandPayloadSource final
  private:
   ReplicationCommandPayloadSource() = default;
 
+  // Codec buffers remain charged until the source is destroyed. Accepted
+  // replication may allocate them beyond the soft memory budget.
+  RetainedMemoryCharge metadata_charge_;
   std::string header_;
   std::vector<std::string_view> args_;
   std::uint64_t size_ = 0;

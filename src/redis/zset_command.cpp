@@ -2011,7 +2011,7 @@ struct MultiContext {
   const CommandRequest* request_ = nullptr;
   std::vector<ZSet> inputs_;
   ZSet output_;
-  std::vector<CapturedReplicationCommand> replacement_effects_;
+  CapturedReplicationCommands replacement_effects_;
   std::vector<std::string> replacement_args_;
   std::vector<double> weights_;
   std::vector<storage::TxShardWrites> writes_;
@@ -2061,7 +2061,7 @@ void ClearMultiPayloads(MultiContext* context) noexcept {
     charge.inherited_.Reset();
   }
   ZSet{}.swap(context->output_);
-  std::vector<CapturedReplicationCommand>{}.swap(context->replacement_effects_);
+  CapturedReplicationCommands{}.swap(context->replacement_effects_);
   std::vector<std::string>{}.swap(context->replacement_args_);
   context->output_charge_.Reset();
 }
@@ -2069,28 +2069,14 @@ void ClearMultiPayloads(MultiContext* context) noexcept {
 absl::Status PrepareMultiCapture(const MultiContext& context) {
   const auto& capture = context.request_->replication_capture_;
   if (!capture) return absl::OkStatus();
-  std::size_t bytes = 0;
-  constexpr auto limit = std::numeric_limits<std::size_t>::max();
-  for (const auto& effect : context.replacement_effects_) {
-    if (effect.args_.capacity() > (limit - bytes) / sizeof(std::string))
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set capture size overflow");
-    bytes += effect.args_.capacity() * sizeof(std::string);
-    for (const auto& argument : effect.args_) {
-      if (argument.capacity() >= limit - bytes)
-        return absl::ResourceExhaustedError(
-            "OOM Sorted Set capture size overflow");
-      bytes += argument.capacity() + 1;
-    }
-  }
-  return capture->ReserveAdditionalCommands(context.replacement_effects_.size(),
-                                            bytes);
+  return capture->ReserveAdditionalCommands(
+      context.replacement_effects_.size());
 }
 
-std::vector<CapturedReplicationCommand> BuildZSetReplacement(
-    const CommandRequest& request, std::size_t destination_arg,
-    const ZSet& output) {
-  std::vector<CapturedReplicationCommand> effects;
+CapturedReplicationCommands BuildZSetReplacement(const CommandRequest& request,
+                                                 std::size_t destination_arg,
+                                                 const ZSet& output) {
+  CapturedReplicationCommands effects;
   effects.reserve(output.empty() ? 1 : 2);
   effects.push_back(CapturedReplicationCommand{
       request.db_id_, {"DEL", request.args_[destination_arg]}});
@@ -2223,8 +2209,7 @@ absl::Status ComputeMulti(MultiContext* context) {
     ~ClearOnFailure() {
       if (published_) return;
       ZSet{}.swap(context_->output_);
-      std::vector<CapturedReplicationCommand>{}.swap(
-          context_->replacement_effects_);
+      CapturedReplicationCommands{}.swap(context_->replacement_effects_);
       std::vector<std::string>{}.swap(context_->replacement_args_);
     }
   } cleanup{context};
@@ -2255,16 +2240,7 @@ absl::Status ComputeMulti(MultiContext* context) {
   if (!add_strings(context->replacement_args_))
     return absl::ResourceExhaustedError(
         "OOM Sorted Set replication size overflow");
-  if (context->replacement_effects_.capacity() >
-      (limit - *retained) / sizeof(CapturedReplicationCommand))
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set replication size overflow");
-  *retained += context->replacement_effects_.capacity() *
-               sizeof(CapturedReplicationCommand);
-  for (const auto& effect : context->replacement_effects_)
-    if (!add_strings(effect.args_))
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set replication size overflow");
+  // Captured effects account their own argument and vector allocations.
   if (admission->bytes() && *retained > admission->bytes())
     return absl::ResourceExhaustedError(
         "OOM Sorted Set output exceeds admission");

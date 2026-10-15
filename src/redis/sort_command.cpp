@@ -477,7 +477,7 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
 std::vector<std::string> SortReplicationEffects(
     const CommandRequest& request, std::string_view destination,
     std::span<const std::string> values) {
-  std::vector<CapturedReplicationCommand> effects;
+  CapturedReplicationCommands effects;
   effects.push_back(CapturedReplicationCommand{
       request.db_id_, {"DEL", std::string(destination)}});
   if (!values.empty()) {

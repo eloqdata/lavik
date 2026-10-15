@@ -50,7 +50,7 @@ class Worker;
 
 namespace lavik {
 class ReplicationHistory;
-}
+}  // namespace lavik
 
 namespace lavik::storage {
 
@@ -577,8 +577,17 @@ struct ReplicationCommandAppend {
   std::uint8_t db_id_ = 0;
   std::uint16_t partition_id_ = 0;
   std::uint64_t partition_sequence_ = 0;
+  // Lifetime-only ownership of already-admitted canonical storage. Shared
+  // full-sync copies keep the same charge alive without re-admitting it;
+  // declare it before the arguments so their buffers die before the charge.
+  std::shared_ptr<const void> retained_owner_{};
   std::vector<std::string> args_;
 };
+
+// Accounts an accepted command's vector/string capacities without another
+// soft-budget admission. Existing captured ownership is preserved. A physical
+// copy must clear retained_owner_ before calling this for its distinct buffers.
+void AccountReplicationCommand(ReplicationCommandAppend* command);
 
 // Conservative owner/ring metadata included in each command's fixed staging
 // waterline. Compile-time checks beside both queue types keep this allowance
@@ -616,6 +625,22 @@ struct ReplicationPublisherAdmission {
   std::uint64_t log_epoch_ = 0;
   std::vector<std::uint64_t> fullsync_session_ids_;
   std::vector<UnstartedGuard> fullsync_unstarted_guards_;
+};
+
+// One stable priority is shared by every participant of an admission attempt
+// and retained across retries. Uncontended single-worker admission needs none.
+absl::StatusOr<std::uint64_t> NextReplicationPublisherPriority();
+
+// Intrusive, worker-local admission intent. The coordinator owns this node and
+// must keep its address stable until FinishReplicationPublisherAdmission and
+// every outstanding call using the node have returned.
+// A granted tentative reservation retains its intent until all participants
+// have granted, or its token is returned before waiting and retrying.
+struct ReplicationPublisherWaiter {
+  std::uint64_t priority_ = 0;
+  ReplicationPublisherWaiter* previous_ = nullptr;
+  ReplicationPublisherWaiter* next_ = nullptr;
+  bool queued_ = false;
 };
 
 // One command whose backlog-owned and full-sync-owned copies were allocated
@@ -678,29 +703,24 @@ enum class ReplicationTransactionResolution : std::uint8_t {
 // then derives one payload record and participant-local marker records from
 // the binary metadata. This object is not wire-level commit state.
 struct ReplicationTransaction {
+  // Charges outlive their buffers and retain the original accounting owner,
+  // even when another participant drops the last transaction reference.
+  RetainedMemoryCharge retained_charge_;
   std::uint64_t id_ = 0;
   std::uint8_t db_id_ = 0;
   std::vector<unsigned> participants_;
   unsigned payload_flow_ = 0;
   std::string envelope_metadata_;
   std::vector<std::string> command_args_;
-  // All participant markers share this object. Charge the envelope once on
-  // its origin shard so participant workers neither duplicate the payload nor
-  // return its bytes to whichever worker releases the last shared_ptr.
-  RetainedMemoryCharge retained_charge_;
   std::atomic<ReplicationTransactionResolution> resolution_{
       ReplicationTransactionResolution::kPending};
 };
 
-// Returns a conservative pre-allocation reservation for a transaction and the
-// retained footprint after its prefix has been materialized. The participant
-// capacity is included because that vector moves into the shared owner.
-std::optional<std::size_t> ReplicationTransactionReservationBytes(
-    std::size_t participant_capacity, std::size_t participant_count,
-    std::span<const std::string> command_args) noexcept;
+// Returns the retained footprint of a materialized transaction, including
+// both vectors' allocated capacities and heap storage owned by its strings.
 std::optional<std::size_t> ReplicationTransactionAllocationBytes(
     std::size_t participant_capacity, std::span<const std::string> prefix,
-    std::span<const std::string> command_args) noexcept;
+    const std::vector<std::string>& command_args) noexcept;
 
 enum class ListOperationKind : std::uint8_t {
   kPushLeft,
@@ -1194,8 +1214,9 @@ struct TxShardWrites {
   };
   std::vector<Fence> fences_;
   std::vector<Retired> retirements_;
-  // Final metadata is collected while the key lock is held. Replication
-  // collapses repeated writes to the same key before publishing the command.
+  // Final metadata is collected while the key lock is held and collapsed
+  // before publication. Its charge outlives the actual vector/key buffers.
+  RetainedMemoryCharge expiration_charge_;
   std::vector<ExpirationEffect> expiration_effects_;
   // Collected under participant key locks, but invisible to full-sync
   // sessions until the coordinator has made the global commit decision.
@@ -1502,21 +1523,27 @@ class StorageEngine {
 
   bycorf::Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                                   std::size_t capacity_bytes);
-  // Updates this worker flow's lazy block quota. Shrinkage drops complete
-  // oldest events until the retained block count fits, except that live
-  // consumer cursors stay pinned and make the smaller value a target quota;
+  // Updates this worker flow's reconnect-window target. Shrinkage drops
+  // complete oldest events until the retained block count fits, except that
+  // live consumer cursors and an unfinished append make it a target quota. An
+  // admitted complete event may exceed this target and the soft memory budget;
   // growth allocates nothing until a later append needs another block.
   bycorf::Task<absl::Status> SetReplicationLogCapacity(
       std::size_t capacity_bytes);
-  // Selects whether a live retention cursor blocks publication at capacity.
-  // Disabling the policy wakes blocked publishers, which revoke lagging
-  // coverage and continue; enabling it affects the next capacity conflict.
+  // Selects whether excess retention blocks new publisher admission and raw
+  // appends until ACK progress or cancellation. Disabling revokes lagging
+  // coverage and reclaims safe complete events; enabling it affects the next
+  // capacity conflict.
   bycorf::Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
   // Changes the worker-local in-memory publisher admission waterline. A
   // shrink never drops queued commands; new admissions wait for occupancy to
   // fall below the new limit. A growth wakes waiters immediately.
   bycorf::Task<absl::Status> SetReplicationPublishQueueCapacity(
       std::size_t capacity_bytes);
+  // Appends a complete owner-worker event without prior publisher admission.
+  // This raw path reserves capacity before the first fragment and may wait for
+  // retained backlog space. Admitted dataset publication uses an internal path
+  // that may exceed the soft memory budget without delaying command replies.
   bycorf::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
   // Inserts an ordered publisher fence and returns the first LSN assigned
@@ -1546,9 +1573,10 @@ class StorageEngine {
   bycorf::Task<absl::Status> ReleaseRedisExportDiskBacklog(
       std::uint64_t session_id);
   // Pins history needed by one ONLINE/downstream session. The cursor is the
-  // first LSN not yet acknowledged by that session. At capacity, the runtime
-  // policy either waits for the slowest retained cursor or revokes lagging
-  // coverage. Both calls are worker-local and never perform IO.
+  // first LSN not yet acknowledged by that session. ACK advancement and
+  // session release immediately reclaim complete safe events when memory or
+  // retention exceeds its target. Both calls are worker-local and perform no
+  // IO.
   absl::Status RetainReplicationLog(std::uint64_t session_id,
                                     std::uint64_t keep_from_lsn);
   void ReleaseReplicationLogRetention(std::uint64_t session_id);
@@ -1563,11 +1591,29 @@ class StorageEngine {
   // command/transaction gates. The log and each full-sync session already
   // hold fixed retained-memory budgets; this token reserves byte waterline and
   // ring-slot credit in their FIFOs. A request larger than the normal limit is
-  // admitted only when it can be the sole staged item.
+  // admitted only when it can be the sole staged item. Unreclaimed backlog
+  // borrowing blocks new grants; already admitted writes keep publishing
+  // asynchronously without delaying their replies for replica ACKs.
   bycorf::Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
       std::optional<ReplicationPublisherTarget> target = std::nullopt);
+  // Registers a stable ordered intent and attempts a grant without waiting.
+  // An empty result retains the intent but owns no capacity. Even a successful
+  // result retains the intent: the coordinator must collect every participant
+  // result, return every partial grant on failure, and only then wait/retry.
+  absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
+  TryAcquireReplicationPublisherAdmission(
+      ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target = std::nullopt);
+  // Waits for this registered intent to reach the head with enough capacity.
+  // The caller must hold no tentative publisher grants while awaiting this.
+  bycorf::Task<absl::Status> WaitReplicationPublisherAdmission(
+      ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target = std::nullopt);
+  // Removes an intent after global success or cancellation. This does not
+  // return any granted capacity; release its token separately when necessary.
+  void FinishReplicationPublisherAdmission(ReplicationPublisherWaiter& waiter);
   void ReleaseReplicationPublisherAdmission(
       const ReplicationPublisherAdmission& admission,
       std::size_t logical_bytes);
@@ -1591,18 +1637,22 @@ class StorageEngine {
       const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
       std::uint16_t partition_id, std::vector<std::string> args,
       std::optional<std::vector<std::string>> fullsync_projection =
-          std::nullopt);
+          std::nullopt,
+      std::shared_ptr<const void> retained_owner = {});
   absl::Status PublishPreparedReplicationCommand(
       const ReplicationPublisherAdmission& admission,
       PreparedReplicationCommandPublication publication);
-  // Outcome-dependent EXEC effects cannot be prepared before execution. If
-  // their allocation fails, invalidate the admitted history instead of
-  // leaving a durable mutation outside an otherwise resumable history.
+  // Publishes outcome-dependent effects of an admitted command. Their
+  // allocations may exceed the soft budget; retained_owner keeps canonical
+  // accounting alive through both backlog and full-sync publication.
+  // An unexpected publication failure invalidates history rather than leaving
+  // a committed mutation outside an otherwise resumable history.
   absl::Status PublishLateAdmittedReplicationCommand(
       const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
       std::uint16_t partition_id, std::vector<std::string> args,
       std::optional<std::vector<std::string>> fullsync_projection =
-          std::nullopt);
+          std::nullopt,
+      std::shared_ptr<const void> retained_owner = {});
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 

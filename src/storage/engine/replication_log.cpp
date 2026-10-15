@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <new>
 #include <optional>
 
 #include "impl.h"
@@ -37,13 +38,22 @@ bool AddAllocationCharge(std::size_t requested, std::size_t* total) noexcept {
 }
 
 template <typename Queue>
-void PrepareAdmittedQueueSlot(Queue* queue, std::size_t admitted_items) {
+absl::Status PrepareAdmittedQueueSlot(Queue* queue,
+                                      std::size_t admitted_items) {
   if (admitted_items == std::numeric_limits<std::size_t>::max() ||
       queue->size() >
           std::numeric_limits<std::size_t>::max() - admitted_items - 1) {
-    throw std::length_error("replication publisher item count overflow");
+    return absl::ResourceExhaustedError(
+        "replication publisher item count overflow");
   }
-  queue->PrepareCapacity(queue->size() + admitted_items + 1);
+  const std::size_t required = queue->size() + admitted_items + 1;
+  if (queue->growth_bytes_for_capacity(required) ==
+      std::numeric_limits<std::size_t>::max()) {
+    return absl::ResourceExhaustedError(
+        "replication publisher queue is too large");
+  }
+  queue->PrepareCapacity(required);
+  return absl::OkStatus();
 }
 
 template <typename String>
@@ -51,9 +61,12 @@ bool AddCommandArgumentAllocationBytes(std::span<const String> args,
                                        std::size_t* total) noexcept {
   const std::size_t sso_capacity = std::string{}.capacity();
   for (const auto& arg : args) {
-    if (arg.size() <= sso_capacity) continue;
-    if (arg.size() == std::numeric_limits<std::size_t>::max() ||
-        !AddAllocationCharge(arg.size() + 1, total)) {
+    // Captured arguments can move here with spare capacity; accounting only
+    // their current length would forget the retained allocation after adopt.
+    const std::size_t capacity = arg.capacity();
+    if (capacity <= sso_capacity) continue;
+    if (capacity == std::numeric_limits<std::size_t>::max() ||
+        !AddAllocationCharge(capacity + 1, total)) {
       return false;
     }
   }
@@ -146,6 +159,26 @@ bool PublisherHasCapacity(std::size_t logical_bytes, std::size_t capacity,
 
 }  // namespace
 
+void AccountReplicationCommand(ReplicationCommandAppend* command) {
+  if (command == nullptr || command->retained_owner_ != nullptr) return;
+  std::size_t bytes = 0;
+  if (!AddAllocationCharge(sizeof(RetainedMemoryCharge) + 64, &bytes) ||
+      (command->args_.capacity() != 0 &&
+       !AddAllocationCharge(command->args_.capacity() * sizeof(std::string),
+                            &bytes))) {
+    throw std::bad_alloc();
+  }
+  for (const auto& argument : command->args_) {
+    if (argument.capacity() > std::string{}.capacity() &&
+        !AddAllocationCharge(argument.capacity() + 1, &bytes)) {
+      throw std::bad_alloc();
+    }
+  }
+  auto charge = std::make_shared<RetainedMemoryCharge>();
+  charge->Account(CurrentMemoryAccountingShard(), bytes);
+  command->retained_owner_ = std::move(charge);
+}
+
 std::optional<std::size_t> ReplicationCommandStagingBytes(
     std::span<const std::string> args) noexcept {
   return CommandStagingBytes(args);
@@ -156,23 +189,15 @@ std::optional<std::size_t> ReplicationCommandStagingBytes(
   return CommandStagingBytes(args);
 }
 
-namespace {
-
-std::optional<std::size_t> TransactionOwnerAllocationBytes(
-    std::size_t participant_capacity, std::size_t prefix_count,
-    std::span<const std::string> prefix,
-    std::span<const std::string> command_args,
-    bool reserve_maximum_metadata) noexcept {
-  if (prefix_count >
-      std::numeric_limits<std::size_t>::max() - command_args.size()) {
-    return std::nullopt;
-  }
-  const std::size_t argument_count = prefix_count + command_args.size();
+std::optional<std::size_t> ReplicationTransactionAllocationBytes(
+    std::size_t participant_capacity, std::span<const std::string> prefix,
+    const std::vector<std::string>& command_args) noexcept {
   std::size_t total = 0;
-  if (argument_count != 0 &&
-      (argument_count >
+  if (command_args.capacity() != 0 &&
+      (command_args.capacity() >
            std::numeric_limits<std::size_t>::max() / sizeof(std::string) ||
-       !AddAllocationCharge(argument_count * sizeof(std::string), &total))) {
+       !AddAllocationCharge(command_args.capacity() * sizeof(std::string),
+                            &total))) {
     return std::nullopt;
   }
   if (participant_capacity != 0 &&
@@ -181,45 +206,14 @@ std::optional<std::size_t> TransactionOwnerAllocationBytes(
        !AddAllocationCharge(participant_capacity * sizeof(unsigned), &total))) {
     return std::nullopt;
   }
-  // LTX1 uses one generated metadata string. Reserve its largest valid bitmap
-  // before allocation exists so source admission still covers the eventual
-  // retained owner on every supported worker count.
-  constexpr std::size_t kMaximumMetadataBytes = 4 + sizeof(std::uint64_t) +
-                                                2 * sizeof(std::uint16_t) +
-                                                (kLogicalStorageShards + 7) / 8;
-  if ((reserve_maximum_metadata &&
-       !AddAllocationCharge(kMaximumMetadataBytes + 1, &total)) ||
-      !AddCommandArgumentAllocationBytes(prefix, &total) ||
-      !AddCommandArgumentAllocationBytes(command_args, &total) ||
+  if (!AddCommandArgumentAllocationBytes(prefix, &total) ||
+      !AddCommandArgumentAllocationBytes(
+          std::span<const std::string>(command_args), &total) ||
       !AddAllocationCharge(sizeof(ReplicationTransaction) + 64, &total)) {
     return std::nullopt;
   }
+  // Codec sources own their buffers and allocation charges independently.
   return total;
-}
-
-}  // namespace
-
-std::optional<std::size_t> ReplicationTransactionReservationBytes(
-    std::size_t participant_capacity, std::size_t participant_count,
-    std::span<const std::string> command_args) noexcept {
-  if (participant_count == 0 || participant_count > kLogicalStorageShards) {
-    return std::nullopt;
-  }
-  return TransactionOwnerAllocationBytes(
-      participant_capacity, 1, std::span<const std::string>{}, command_args,
-      /*reserve_maximum_metadata=*/true);
-}
-
-std::optional<std::size_t> ReplicationTransactionAllocationBytes(
-    std::size_t participant_capacity, std::span<const std::string> prefix,
-    std::span<const std::string> command_args) noexcept {
-  if (prefix.size() >
-      std::numeric_limits<std::size_t>::max() - command_args.size()) {
-    return std::nullopt;
-  }
-  return TransactionOwnerAllocationBytes(participant_capacity, prefix.size(),
-                                         prefix, command_args,
-                                         /*reserve_maximum_metadata=*/false);
 }
 
 Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
@@ -254,9 +248,8 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
         "insufficient retained-memory budget for replication publisher "
         "staging");
   }
-  // Establish the standby invariant before publishing an active history. If
-  // maxmemory cannot cover the successor, enabling replication fails cleanly
-  // instead of letting the first rollover discover the missing reservation.
+  // History activation admits its initial block. Accepted writes allocate
+  // subsequent blocks only when publication actually consumes them.
   auto standby = AllocateReplicationLogBlock();
   if (!standby.ok()) co_return standby.status();
   log.publisher_staging_charge_.Adopt(&*staging, staging_bytes);
@@ -265,9 +258,12 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   log.next_lsn_ = 1;
   log.max_blocks_ =
       std::max<std::size_t>(1, capacity_bytes / kStorageBlockBytes);
+  log.append_min_blocks_ = 0;
+  log.append_admitted_ = false;
+  log.borrowed_blocks_ = 0;
+  log.spare_blocks_.clear();
   log.publish_queue_.clear();
   log.standby_block_.emplace(std::move(*standby));
-  log.standby_refill_pending_ = false;
   log.publish_queue_bytes_ = 0;
   log.publisher_admitted_bytes_ = 0;
   log.publisher_admitted_items_ = 0;
@@ -288,58 +284,12 @@ Task<absl::Status> StorageEngine::Impl::SetReplicationLogCapacity(
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   const std::size_t requested_blocks = capacity_bytes / kStorageBlockBytes;
-  // Cursor progress and this administrative path are worker-local and do not
-  // acquire the append mutex. A publisher may be suspended while owning that
-  // mutex, so quota changes must publish and wake it before any eager trim.
-  if (log.state_ == ReplicationLogState::kActive &&
-      !log.retained_lsn_by_session_.empty()) {
-    if (requested_blocks > log.max_blocks_) {
-      log.capacity_backpressured_ = false;
-    }
-    log.max_blocks_ = requested_blocks;
-    log.retention_advanced_.NotifyAll(*store.worker_);
-    // A shrink beneath live retained history is a target quota. Existing
-    // blocks remain until ACK progress or the configured revocation policy
-    // lets a later append reclaim complete events.
-    co_return absl::OkStatus();
-  }
-  co_await log.mutex_.Lock();
-  UnlockGuard unlock(&log.mutex_, store.worker_);
-  if (log.state_ == ReplicationLogState::kDisabled) {
-    co_return absl::OkStatus();
-  }
-  if (log.state_ == ReplicationLogState::kInvalid) {
-    log.max_blocks_ = requested_blocks;
-    co_return absl::OkStatus();
-  }
-
+  // This is a target quota while consumers pin older events or an accepted
+  // append is still producing fragments. ACK/completion eagerly retries it.
   log.max_blocks_ = requested_blocks;
-  std::optional<std::uint64_t> retained_lsn;
-  for (const auto& [session_id, lsn] : log.retained_lsn_by_session_) {
-    (void)session_id;
-    retained_lsn = !retained_lsn.has_value() || lsn < *retained_lsn
-                       ? std::optional<std::uint64_t>(lsn)
-                       : retained_lsn;
-  }
-  while (log.blocks_.size() > log.max_blocks_) {
-    if (log.blocks_.empty() || !log.blocks_.front().sealed_) break;
-    if (retained_lsn.has_value() &&
-        log.blocks_.front().last_lsn_ >= *retained_lsn) {
-      // Shrinking the reconnect window must not punch a hole beneath a live
-      // ONLINE replica as part of CONFIG SET. Keep the excess blocks for now;
-      // a subsequent append applies the current wait-or-revoke policy.
-      break;
-    }
-    // Never split a fragmented logical event while reducing the retained
-    // reconnect window.
-    std::uint64_t evicted_through = log.blocks_.front().last_lsn_;
-    do {
-      evicted_through =
-          std::max(evicted_through, log.blocks_.front().last_lsn_);
-      log.blocks_.pop_front();
-    } while (!log.blocks_.empty() && log.blocks_.front().sealed_ &&
-             log.blocks_.front().first_lsn_ <= evicted_through);
-  }
+  if (log.state_ == ReplicationLogState::kActive)
+    ReclaimReplicationLogDebt(store);
+  log.retention_advanced_.NotifyAll(*store.worker_);
   co_return absl::OkStatus();
 }
 
@@ -349,9 +299,7 @@ Task<absl::Status> StorageEngine::Impl::SetReplicationBacklogBackpressure(
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   if (!enabled) {
-    // A publisher waiting at the hard cap owns log.mutex_. Waking through the
-    // worker-local notification avoids queueing CONFIG behind that mutex and
-    // lets the publisher observe the new revoke-on-pressure policy.
+    ReclaimReplicationLogDebt(store);
     log.retention_advanced_.NotifyAll(*store.worker_);
   }
   co_return absl::OkStatus();
@@ -422,8 +370,56 @@ bool StorageEngine::Impl::ReplicationLogActive() const noexcept {
   return CurrentStore().replication_log_.state_ == ReplicationLogState::kActive;
 }
 
+absl::StatusOr<std::uint64_t> NextReplicationPublisherPriority() {
+  static std::atomic<std::uint64_t> next{1};
+  std::uint64_t priority = next.load(std::memory_order_relaxed);
+  do {
+    if (priority == std::numeric_limits<std::uint64_t>::max()) {
+      return absl::ResourceExhaustedError(
+          "replication publisher priority space exhausted");
+    }
+  } while (!next.compare_exchange_weak(priority, priority + 1,
+                                       std::memory_order_relaxed));
+  return priority;
+}
+
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 StorageEngine::Impl::AcquireReplicationPublisherAdmission(
+    std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  WorkerStore& store = CurrentStore();
+  if (store.replication_publisher_waiters_head_ == nullptr) {
+    // The ordinary owner-local write neither allocates a queue node nor
+    // contends on a global priority counter when capacity is already free.
+    auto granted = TryGrantReplicationPublisherAdmission(logical_bytes, target);
+    if (!granted.ok()) co_return granted.status();
+    if (granted->has_value()) co_return std::move(**granted);
+  }
+  auto priority = NextReplicationPublisherPriority();
+  if (!priority.ok()) co_return priority.status();
+  ReplicationPublisherWaiter waiter{.priority_ = *priority};
+  for (;;) {
+    auto granted =
+        TryAcquireReplicationPublisherAdmission(waiter, logical_bytes, target);
+    if (!granted.ok()) {
+      FinishReplicationPublisherAdmission(waiter);
+      co_return granted.status();
+    }
+    if (granted->has_value()) {
+      FinishReplicationPublisherAdmission(waiter);
+      co_return std::move(**granted);
+    }
+    auto ready = co_await WaitReplicationPublisherAdmission(
+        waiter, logical_bytes, target);
+    if (!ready.ok()) {
+      FinishReplicationPublisherAdmission(waiter);
+      co_return ready;
+    }
+  }
+}
+
+absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
+StorageEngine::Impl::TryGrantReplicationPublisherAdmission(
     std::size_t logical_bytes,
     std::optional<ReplicationPublisherTarget> target) {
   WorkerStore& store = CurrentStore();
@@ -432,7 +428,7 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
       (target->partition_id_ >= kLogicalStorageShards ||
        target->db_id_ >= kLogicalDatabaseCount ||
        target->partition_id_ % worker_count_ != store.worker_->id())) {
-    co_return absl::InvalidArgumentError(
+    return absl::InvalidArgumentError(
         "replication publisher target does not belong to this worker");
   }
   auto session_needs_credit = [&](std::uint64_t session_id) {
@@ -443,116 +439,206 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
            capture->second.db_phases_[target->db_id_] !=
                WorkerStore::FullSyncCapture::DbPhase::kUnstarted;
   };
-  if (logical_bytes == 0) logical_bytes = 1;
-  if (store.replication_publisher_next_ticket_ ==
-      std::numeric_limits<std::uint64_t>::max()) {
-    co_return absl::ResourceExhaustedError(
-        "replication publisher admission ticket space exhausted");
+  logical_bytes = std::max<std::size_t>(logical_bytes, 1);
+  const std::size_t capacity =
+      replication_publish_queue_bytes_.load(std::memory_order_acquire);
+  if (log.state_ == ReplicationLogState::kActive &&
+      (log.capacity_backpressured_ ||
+       !PublisherHasCapacity(logical_bytes, capacity, log.publish_queue_bytes_,
+                             log.publisher_admitted_bytes_))) {
+    return std::nullopt;
   }
-  const std::uint64_t ticket = store.replication_publisher_next_ticket_++;
+  for (const auto& [session_id, session] : store.fullsync_sessions_) {
+    if (session.db_epoch_invalidated_ || !session_needs_credit(session_id)) {
+      continue;
+    }
+    if (!PublisherHasCapacity(logical_bytes, capacity,
+                              session.publish_queue_bytes_,
+                              session.publisher_admitted_bytes_)) {
+      return std::nullopt;
+    }
+  }
+  ReplicationPublisherAdmission admission;
+  if (log.state_ == ReplicationLogState::kActive) {
+    admission.log_epoch_ = log.log_epoch_;
+  }
+  admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
+  admission.fullsync_unstarted_guards_.reserve(
+      target.has_value() ? store.fullsync_sessions_.size() : 0);
+  for (const auto& [session_id, session] : store.fullsync_sessions_) {
+    if (session.db_epoch_invalidated_) continue;
+    if (session_needs_credit(session_id)) {
+      admission.fullsync_session_ids_.push_back(session_id);
+    } else if (target.has_value()) {
+      admission.fullsync_unstarted_guards_.push_back(
+          ReplicationPublisherAdmission::UnstartedGuard{
+              .session_id_ = session_id,
+              .partition_id_ = target->partition_id_,
+              .db_id_ = target->db_id_,
+          });
+    }
+  }
+
+  // The queue's fixed staging charge already covers its ring slots. Admission
+  // reserves those slots, but event payloads and backlog blocks are allocated
+  // on demand after admission, with immediate retained-memory accounting.
+  absl::Status prepared;
+  if (admission.log_epoch_ != 0) {
+    prepared = PrepareAdmittedQueueSlot(&log.publish_queue_,
+                                        log.publisher_admitted_items_);
+  }
+  for (std::uint64_t session_id : admission.fullsync_session_ids_) {
+    if (!prepared.ok()) break;
+    auto& session = store.fullsync_sessions_.at(session_id);
+    prepared = PrepareAdmittedQueueSlot(&session.publish_queue_,
+                                        session.publisher_admitted_items_);
+  }
+  if (!prepared.ok()) {
+    RecordMemoryRejection();
+    return prepared;
+  }
+
+  if (admission.log_epoch_ != 0) {
+    log.publisher_admitted_bytes_ += logical_bytes;
+    ++log.publisher_admitted_items_;
+  }
+  for (std::uint64_t session_id : admission.fullsync_session_ids_) {
+    auto& session = store.fullsync_sessions_.at(session_id);
+    session.publisher_admitted_bytes_ += logical_bytes;
+    ++session.publisher_admitted_items_;
+  }
+  for (const auto& guard : admission.fullsync_unstarted_guards_) {
+    const std::uint32_t target_id =
+        (static_cast<std::uint32_t>(guard.partition_id_) << 8) | guard.db_id_;
+    ++store.fullsync_sessions_.at(guard.session_id_)
+          .unstarted_admissions_[target_id];
+  }
+  return admission;
+}
+
+absl::StatusOr<std::optional<ReplicationPublisherAdmission>>
+StorageEngine::Impl::TryAcquireReplicationPublisherAdmission(
+    ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  WorkerStore& store = CurrentStore();
+  if (waiter.priority_ == 0) {
+    return absl::InvalidArgumentError("publisher admission priority is zero");
+  }
+  if (target.has_value() &&
+      (target->partition_id_ >= kLogicalStorageShards ||
+       target->db_id_ >= kLogicalDatabaseCount ||
+       target->partition_id_ % worker_count_ != store.worker_->id())) {
+    return absl::InvalidArgumentError(
+        "replication publisher target does not belong to this worker");
+  }
+  if (!waiter.queued_) {
+    // Newer priorities normally append in O(1). An older cross-worker request
+    // may arrive late; insertion never evicts an existing tentative grant.
+    // Its coordinator must return that grant if any other participant fails.
+    auto* previous = store.replication_publisher_waiters_tail_;
+    while (previous != nullptr && previous->priority_ > waiter.priority_) {
+      previous = previous->previous_;
+    }
+    if (previous != nullptr && previous->priority_ == waiter.priority_) {
+      return absl::InvalidArgumentError(
+          "duplicate publisher admission priority");
+    }
+    waiter.previous_ = previous;
+    waiter.next_ = previous == nullptr
+                       ? store.replication_publisher_waiters_head_
+                       : previous->next_;
+    if (waiter.next_ != nullptr)
+      waiter.next_->previous_ = &waiter;
+    else
+      store.replication_publisher_waiters_tail_ = &waiter;
+    if (previous != nullptr)
+      previous->next_ = &waiter;
+    else
+      store.replication_publisher_waiters_head_ = &waiter;
+    waiter.queued_ = true;
+  }
+  if (store.replication_publisher_waiters_head_ != &waiter) {
+    return std::nullopt;
+  }
+  return TryGrantReplicationPublisherAdmission(logical_bytes, target);
+}
+
+Task<absl::Status> StorageEngine::Impl::WaitReplicationPublisherAdmission(
+    ReplicationPublisherWaiter& waiter, std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  logical_bytes = std::max<std::size_t>(logical_bytes, 1);
   bool recorded_fullsync_wait = false;
   for (;;) {
-    if (ticket != store.replication_publisher_serving_ticket_) {
+    if (!waiter.queued_) {
+      co_return absl::CancelledError("publisher admission intent cancelled");
+    }
+    if (store.replication_publisher_waiters_head_ != &waiter) {
       co_await store.replication_publisher_admission_ready_.Wait();
       continue;
     }
     const std::size_t capacity =
         replication_publish_queue_bytes_.load(std::memory_order_acquire);
-    const bool log_available =
-        log.state_ != ReplicationLogState::kActive ||
-        PublisherHasCapacity(logical_bytes, capacity, log.publish_queue_bytes_,
-                             log.publisher_admitted_bytes_);
-    bool available = log_available;
-    if (available) {
-      for (const auto& [session_id, session] : store.fullsync_sessions_) {
-        if (session.db_epoch_invalidated_ ||
-            !session_needs_credit(session_id)) {
+    if (log.state_ == ReplicationLogState::kActive &&
+        (log.capacity_backpressured_ ||
+         !PublisherHasCapacity(logical_bytes, capacity,
+                               log.publish_queue_bytes_,
+                               log.publisher_admitted_bytes_))) {
+      co_await log.publisher_capacity_ready_.Wait();
+      continue;
+    }
+    bool fullsync_available = true;
+    for (const auto& [session_id, session] : store.fullsync_sessions_) {
+      if (session.db_epoch_invalidated_) continue;
+      if (target.has_value()) {
+        const auto& partition = PartitionFor(store, target->partition_id_);
+        const auto capture = partition.fullsync_subscribers_.find(session_id);
+        if (capture == partition.fullsync_subscribers_.end() ||
+            capture->second.db_phases_[target->db_id_] ==
+                WorkerStore::FullSyncCapture::DbPhase::kUnstarted) {
           continue;
         }
-        if (!PublisherHasCapacity(logical_bytes, capacity,
-                                  session.publish_queue_bytes_,
-                                  session.publisher_admitted_bytes_)) {
-          available = false;
-          break;
-        }
+      }
+      if (!PublisherHasCapacity(logical_bytes, capacity,
+                                session.publish_queue_bytes_,
+                                session.publisher_admitted_bytes_)) {
+        fullsync_available = false;
+        break;
       }
     }
-    if (available) {
-      ReplicationPublisherAdmission admission;
-      if (log.state_ == ReplicationLogState::kActive) {
-        admission.log_epoch_ = log.log_epoch_;
-      }
-      admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
-      admission.fullsync_unstarted_guards_.reserve(
-          target.has_value() ? store.fullsync_sessions_.size() : 0);
-      for (auto& [session_id, session] : store.fullsync_sessions_) {
-        if (session.db_epoch_invalidated_) continue;
-        if (session_needs_credit(session_id)) {
-          admission.fullsync_session_ids_.push_back(session_id);
-        } else if (target.has_value()) {
-          admission.fullsync_unstarted_guards_.push_back(
-              ReplicationPublisherAdmission::UnstartedGuard{
-                  .session_id_ = session_id,
-                  .partition_id_ = target->partition_id_,
-                  .db_id_ = target->db_id_,
-              });
-        }
-      }
-
-      try {
-        // Fixed owner-local staging charges reserve the queue's memory for its
-        // lifetime. Admission only needs to materialize the future ring slots
-        // before mutation so publication cannot allocate afterward.
-        if (admission.log_epoch_ != 0) {
-          PrepareAdmittedQueueSlot(&log.publish_queue_,
-                                   log.publisher_admitted_items_);
-        }
-        for (std::uint64_t session_id : admission.fullsync_session_ids_) {
-          auto& session = store.fullsync_sessions_.at(session_id);
-          PrepareAdmittedQueueSlot(&session.publish_queue_,
-                                   session.publisher_admitted_items_);
-        }
-      } catch (const std::length_error&) {
-        ++store.replication_publisher_serving_ticket_;
-        store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "replication publisher queue is too large");
-      }
-
-      if (admission.log_epoch_ != 0) {
-        log.publisher_admitted_bytes_ += logical_bytes;
-        ++log.publisher_admitted_items_;
-      }
-      for (std::uint64_t session_id : admission.fullsync_session_ids_) {
-        auto& session = store.fullsync_sessions_.at(session_id);
-        session.publisher_admitted_bytes_ += logical_bytes;
-        ++session.publisher_admitted_items_;
-      }
-      for (const auto& guard : admission.fullsync_unstarted_guards_) {
-        const std::uint32_t target_id =
-            (static_cast<std::uint32_t>(guard.partition_id_) << 8) |
-            guard.db_id_;
-        ++store.fullsync_sessions_.at(guard.session_id_)
-              .unstarted_admissions_[target_id];
-      }
-      ++store.replication_publisher_serving_ticket_;
-      store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
-      co_return admission;
+    if (fullsync_available) co_return absl::OkStatus();
+    if (!recorded_fullsync_wait) {
+      ++store.fullsync_publisher_capacity_waits_;
+      recorded_fullsync_wait = true;
     }
-    // Either queue may free space. The worker-lifetime notification is also
-    // signalled when a full-sync session is cancelled, so a disconnected
-    // replica can never leave source writes asleep on destroyed state.
-    if (!log_available) {
-      co_await log.publisher_capacity_ready_.Wait();
-    } else {
-      if (!recorded_fullsync_wait) {
-        ++store.fullsync_publisher_capacity_waits_;
-        recorded_fullsync_wait = true;
-      }
-      co_await store.fullsync_publisher_capacity_ready_.Wait();
-    }
+    // Notifications belong to the worker, never a removable FULL session.
+    // The predicate check and Wait registration do not yield in between.
+    co_await store.fullsync_publisher_capacity_ready_.Wait();
   }
+}
+
+void StorageEngine::Impl::FinishReplicationPublisherAdmission(
+    ReplicationPublisherWaiter& waiter) {
+  if (!waiter.queued_) return;
+  WorkerStore& store = CurrentStore();
+  if (waiter.previous_ != nullptr)
+    waiter.previous_->next_ = waiter.next_;
+  else
+    store.replication_publisher_waiters_head_ = waiter.next_;
+  if (waiter.next_ != nullptr)
+    waiter.next_->previous_ = waiter.previous_;
+  else
+    store.replication_publisher_waiters_tail_ = waiter.previous_;
+  waiter.previous_ = nullptr;
+  waiter.next_ = nullptr;
+  waiter.queued_ = false;
+  store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
+  // Cancellation may remove a head currently asleep on either capacity
+  // notification. Wake it as well so its coordinator can join all waiters
+  // before destroying the intrusive nodes.
+  store.replication_log_.publisher_capacity_ready_.NotifyAll(*store.worker_);
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
 }
 
 std::optional<ReplicationPublisherAdmission>
@@ -568,8 +654,7 @@ StorageEngine::Impl::TryAcquireFullSyncReplacementAdmission(
   if (store.fullsync_sessions_.empty()) return admission;
   // Active expiration is background maintenance. Never bypass a foreground
   // publisher that already owns or is waiting for the admission ticket.
-  if (store.replication_publisher_next_ticket_ !=
-      store.replication_publisher_serving_ticket_) {
+  if (store.replication_publisher_waiters_head_ != nullptr) {
     return std::nullopt;
   }
 
@@ -593,32 +678,30 @@ StorageEngine::Impl::TryAcquireFullSyncReplacementAdmission(
     }
   }
 
-  try {
-    admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
-    admission.fullsync_unstarted_guards_.reserve(
-        store.fullsync_sessions_.size());
-    for (const auto& [session_id, session] : store.fullsync_sessions_) {
-      if (session.db_epoch_invalidated_) continue;
-      if (session_needs_credit(session_id)) {
-        admission.fullsync_session_ids_.push_back(session_id);
-        continue;
-      }
-      admission.fullsync_unstarted_guards_.push_back(
-          ReplicationPublisherAdmission::UnstartedGuard{
-              .session_id_ = session_id,
-              .partition_id_ = target.partition_id_,
-              .db_id_ = target.db_id_,
-          });
+  admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
+  admission.fullsync_unstarted_guards_.reserve(store.fullsync_sessions_.size());
+  for (const auto& [session_id, session] : store.fullsync_sessions_) {
+    if (session.db_epoch_invalidated_) continue;
+    if (session_needs_credit(session_id)) {
+      admission.fullsync_session_ids_.push_back(session_id);
+      continue;
     }
+    admission.fullsync_unstarted_guards_.push_back(
+        ReplicationPublisherAdmission::UnstartedGuard{
+            .session_id_ = session_id,
+            .partition_id_ = target.partition_id_,
+            .db_id_ = target.db_id_,
+        });
+  }
 
-    for (std::uint64_t session_id : admission.fullsync_session_ids_) {
-      auto& session = store.fullsync_sessions_.at(session_id);
-      PrepareAdmittedQueueSlot(&session.publish_queue_,
-                               session.publisher_admitted_items_);
+  for (std::uint64_t session_id : admission.fullsync_session_ids_) {
+    auto& session = store.fullsync_sessions_.at(session_id);
+    if (!PrepareAdmittedQueueSlot(&session.publish_queue_,
+                                  session.publisher_admitted_items_)
+             .ok()) {
+      RecordMemoryRejection();
+      return std::nullopt;
     }
-  } catch (const std::length_error&) {
-    RecordMemoryRejection();
-    return std::nullopt;
   }
 
   for (std::uint64_t session_id : admission.fullsync_session_ids_) {
@@ -678,6 +761,7 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
   if (log.state_ != ReplicationLogState::kActive) return false;
 
   if (command.args_.empty()) return false;
+  AccountReplicationCommand(&command);
   const auto staging_bytes = ReplicationCommandStagingBytes(command.args_);
   if (!staging_bytes.has_value()) {
     log.state_ = ReplicationLogState::kInvalid;
@@ -739,6 +823,24 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
         "ephemeral replication command staging size overflow");
   }
 
+  std::size_t event_bytes = ReplicationCommandFixedHeaderBytes(args.size());
+  if (args.size() >
+          static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+      args.size() > (std::numeric_limits<std::size_t>::max() - event_bytes) /
+                        sizeof(std::uint32_t)) {
+    co_return absl::OutOfRangeError(
+        "replication command argument count exceeds encoding bounds");
+  }
+  event_bytes += args.size() * sizeof(std::uint32_t);
+  for (const auto& argument : args) {
+    if (argument.size() > kMaxNativeReplicationArgumentBytes ||
+        argument.size() >
+            std::numeric_limits<std::size_t>::max() - event_bytes) {
+      co_return absl::OutOfRangeError(
+          "replication command exceeds encoding bounds");
+    }
+    event_bytes += argument.size();
+  }
   auto admission = co_await AcquireReplicationPublisherAdmission(*staging_bytes,
                                                                  std::nullopt);
   if (!admission.ok()) co_return admission.status();
@@ -768,7 +870,8 @@ absl::StatusOr<PreparedReplicationCommandPublication>
 StorageEngine::Impl::PrepareAdmittedReplicationCommand(
     const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
     std::uint16_t partition_id, std::vector<std::string> args,
-    std::optional<std::vector<std::string>> fullsync_projection) {
+    std::optional<std::vector<std::string>> fullsync_projection,
+    std::shared_ptr<const void> retained_owner) {
   if (partition_id >= kLogicalStorageShards ||
       partition_id % worker_count_ != bycorf::ThisWorker().id_ ||
       (kind != ReplicationEventKind::kCatalogMutation &&
@@ -785,40 +888,41 @@ StorageEngine::Impl::PrepareAdmittedReplicationCommand(
     return absl::ResourceExhaustedError(
         "admitted replication sequence space exhausted");
   }
-  try {
-    ReplicationCommandAppend command{
-        .kind_ = kind,
-        .db_id_ = 0,
-        .partition_id_ = partition_id,
-        .partition_sequence_ = sequence,
-        .args_ = std::move(args),
-    };
-    PreparedReplicationCommandPublication publication;
-    if (!admission.fullsync_session_ids_.empty() &&
-        (!fullsync_projection.has_value() || !fullsync_projection->empty())) {
-      if (fullsync_projection.has_value()) {
-        publication.fullsync_command_ =
-            std::make_shared<ReplicationCommandAppend>(ReplicationCommandAppend{
-                .kind_ = command.kind_,
-                .db_id_ = command.db_id_,
-                .partition_id_ = command.partition_id_,
-                .partition_sequence_ = command.partition_sequence_,
-                .args_ = std::move(*fullsync_projection),
-            });
-      } else {
-        publication.fullsync_command_ =
-            std::make_shared<ReplicationCommandAppend>(command);
-      }
+  ReplicationCommandAppend command{
+      .kind_ = kind,
+      .db_id_ = 0,
+      .partition_id_ = partition_id,
+      .partition_sequence_ = sequence,
+      .retained_owner_ = std::move(retained_owner),
+      .args_ = std::move(args),
+  };
+  AccountReplicationCommand(&command);
+  PreparedReplicationCommandPublication publication;
+  if (!admission.fullsync_session_ids_.empty() &&
+      (!fullsync_projection.has_value() || !fullsync_projection->empty())) {
+    if (fullsync_projection.has_value()) {
+      auto fullsync_command =
+          std::make_shared<ReplicationCommandAppend>(ReplicationCommandAppend{
+              .kind_ = command.kind_,
+              .db_id_ = command.db_id_,
+              .partition_id_ = command.partition_id_,
+              .partition_sequence_ = command.partition_sequence_,
+              .args_ = std::move(*fullsync_projection),
+          });
+      AccountReplicationCommand(fullsync_command.get());
+      publication.fullsync_command_ = std::move(fullsync_command);
+    } else {
+      auto fullsync_command =
+          std::make_shared<ReplicationCommandAppend>(command);
+      fullsync_command->retained_owner_.reset();
+      AccountReplicationCommand(fullsync_command.get());
+      publication.fullsync_command_ = std::move(fullsync_command);
     }
-    if (admission.log_epoch_ != 0) {
-      publication.backlog_command_ = std::move(command);
-    }
-    return publication;
-  } catch (const std::length_error&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "admitted replication command is too large");
   }
+  if (admission.log_epoch_ != 0) {
+    publication.backlog_command_ = std::move(command);
+  }
+  return publication;
 }
 
 absl::Status StorageEngine::Impl::PublishPreparedReplicationCommand(
@@ -851,10 +955,11 @@ absl::Status StorageEngine::Impl::PublishPreparedReplicationCommand(
 absl::Status StorageEngine::Impl::PublishLateAdmittedReplicationCommand(
     const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
     std::uint16_t partition_id, std::vector<std::string> args,
-    std::optional<std::vector<std::string>> fullsync_projection) {
+    std::optional<std::vector<std::string>> fullsync_projection,
+    std::shared_ptr<const void> retained_owner) {
   auto publication = PrepareAdmittedReplicationCommand(
       admission, kind, partition_id, std::move(args),
-      std::move(fullsync_projection));
+      std::move(fullsync_projection), std::move(retained_owner));
   if (!publication.ok()) {
     WorkerStore& store = CurrentStore();
     if (admission.log_epoch_ != 0 &&
@@ -920,30 +1025,23 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
 
 namespace {
 
-std::vector<std::string> BuildReplicationTransactionEnvelope(
-    const ReplicationTransaction& transaction, unsigned worker) {
-  assert(!transaction.participants_.empty());
-  const unsigned payload_flow = transaction.payload_flow_;
-  assert(std::find(transaction.participants_.begin(),
-                   transaction.participants_.end(),
-                   payload_flow) != transaction.participants_.end());
-  assert(IsReplicationTransactionEnvelope(transaction.envelope_metadata_));
-  assert(!transaction.command_args_.empty());
-
-  // Every participant must retain an ordered log record so reconnect cursors
-  // can advance atomically. Only the deterministic payload flow needs the
-  // canonical command, however; the other records are rendezvous markers.
-  // The canonical envelope fixes that choice before workers publish, so the
-  // durable representation is independent of which worker finishes first.
-  std::vector<std::string> envelope;
-  const bool carries_payload = worker == payload_flow;
-  envelope.reserve(carries_payload ? 1 + transaction.command_args_.size() : 1);
-  envelope.push_back(transaction.envelope_metadata_);
+absl::StatusOr<ReplicationCommandPayloadSource>
+BuildReplicationTransactionEnvelope(const ReplicationTransaction& transaction,
+                                    unsigned worker) {
+  assert(!transaction.envelope_metadata_.empty());
+  const bool carries_payload = worker == transaction.payload_flow_;
+  // Borrow the immutable transaction strings until append completes. Only the
+  // small view table is copied; even a large canonical body has one owner.
+  std::vector<std::string_view, RetainedAllocator<std::string_view>> args{
+      RetainedAllocator<std::string_view>(
+          RetainedAllocationDomain{.externally_admitted_ = true})};
+  args.reserve(carries_payload ? 1 + transaction.command_args_.size() : 1);
+  args.push_back(transaction.envelope_metadata_);
   if (carries_payload) {
-    envelope.insert(envelope.end(), transaction.command_args_.begin(),
-                    transaction.command_args_.end());
+    for (const auto& argument : transaction.command_args_)
+      args.push_back(argument);
   }
-  return envelope;
+  return ReplicationCommandPayloadSource::Create(transaction.db_id_, args);
 }
 
 }  // namespace
@@ -1039,6 +1137,17 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     WorkerStore* store) {
   auto& log = store->replication_log_;
   while (!log.publish_queue_.empty()) {
+    struct ReclaimPublicationDebt {
+      Impl* impl;
+      WorkerStore* store;
+      std::uint64_t epoch;
+      ~ReclaimPublicationDebt() {
+        if (store->replication_log_.log_epoch_ == epoch)
+          impl->ReclaimReplicationLogDebt(*store);
+      }
+    } reclaim{this, store, log.publish_queue_.front().log_epoch_};
+    // Release codec buffers and canonical payload references before reclaiming
+    // debt and waking admissions. An old publisher cannot reclaim a new epoch.
     auto pending = std::move(log.publish_queue_.front());
     log.publish_queue_.pop_front();
     if (pending.fence_ != nullptr) {
@@ -1060,10 +1169,17 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     }
     if (pending.transaction_ != nullptr) {
       while (
+          pending.log_epoch_ == log.log_epoch_ &&
+          log.state_ == ReplicationLogState::kActive &&
           pending.transaction_->resolution_.load(std::memory_order_acquire) ==
-          ReplicationTransactionResolution::kPending) {
+              ReplicationTransactionResolution::kPending) {
         co_await bycorf::Yield(*store->worker_);
       }
+      // Disable can replace this history while the transaction is unresolved.
+      // Its accounting was already reset: an old resolution
+      // must neither invalidate the new epoch nor consume its queue credits.
+      if (pending.log_epoch_ != log.log_epoch_) continue;
+      if (log.state_ != ReplicationLogState::kActive) break;
       const ReplicationTransactionResolution resolution =
           pending.transaction_->resolution_.load(std::memory_order_acquire);
       if (resolution == ReplicationTransactionResolution::kDiscard) {
@@ -1101,7 +1217,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
               "canonical replication transaction queue accounting overflow");
           break;
         }
-        // The shared canonical payload already owns retained-memory admission.
+        // The shared canonical payload already accounts its retained memory.
         // This FIFO has one consumer, so waiting for queued_without_pending to
         // shrink would wait on items that only this coroutine can drain. Let
         // the oldest admitted item temporarily exceed the byte waterline;
@@ -1115,23 +1231,13 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
         log.publisher_capacity_ready_.NotifyAll(*store->worker_);
       }
       pending.staging_bytes_ = *final_staging_bytes;
-      try {
-        pending.append_ = ReplicationCommandAppend{
-            .kind_ = ReplicationEventKind::kTransaction,
-            .db_id_ = pending.transaction_->db_id_,
-            .partition_id_ =
-                static_cast<std::uint16_t>(bycorf::ThisWorker().id_),
-            .partition_sequence_ = pending.transaction_->id_,
-            .args_ = BuildReplicationTransactionEnvelope(
-                *pending.transaction_, bycorf::ThisWorker().id_),
-        };
-      } catch (const std::length_error&) {
-        log.state_ = ReplicationLogState::kInvalid;
-        spdlog::warn(
-            "replication transaction marker is too large; invalidating "
-            "history");
-        break;
-      }
+      pending.append_ = ReplicationCommandAppend{
+          .kind_ = ReplicationEventKind::kTransaction,
+          .db_id_ = pending.transaction_->db_id_,
+          .partition_id_ = static_cast<std::uint16_t>(bycorf::ThisWorker().id_),
+          .partition_sequence_ = pending.transaction_->id_,
+          .args_ = {},
+      };
 #if LAVIK_FAULTS_ENABLED
       static std::atomic<bool> catalog_transaction_publish_failed{false};
       const char* failure_marker =
@@ -1162,23 +1268,37 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       continue;
     }
 
-    auto source = ReplicationCommandPayloadSource::Create(
-        pending.append_.db_id_, pending.append_.args_);
-    if (!source.ok()) {
+    auto command_source =
+        pending.transaction_ != nullptr
+            ? BuildReplicationTransactionEnvelope(*pending.transaction_,
+                                                  bycorf::ThisWorker().id_)
+            : ReplicationCommandPayloadSource::Create(pending.append_.db_id_,
+                                                      pending.append_.args_);
+    if (!command_source.ok()) {
       log.state_ = ReplicationLogState::kInvalid;
       spdlog::warn("replication command encoding failed: {}",
-                   source.status().message());
+                   command_source.status().message());
       break;
     }
-    auto appended = co_await AppendReplicationLog(ReplicationLogAppend{
-        .kind_ = pending.append_.kind_,
-        .partition_id_ = pending.append_.partition_id_,
-        .partition_sequence_ = pending.append_.partition_sequence_,
-        .payload_ = {},
-        .payload_source_ = &*source,
-    });
+    auto appended = co_await AppendReplicationLog(
+        ReplicationLogAppend{
+            .kind_ = pending.append_.kind_,
+            .partition_id_ = pending.append_.partition_id_,
+            .partition_sequence_ = pending.append_.partition_sequence_,
+            .payload_ = {},
+            .payload_source_ = &*command_source,
+        },
+        /*already_admitted=*/true);
     if (!appended.ok()) {
-      log.state_ = ReplicationLogState::kInvalid;
+      // Disable may wake an old publisher after replacing its history. Its
+      // pending charge was already cleared; keep draining any new epoch's
+      // queue without invalidating it or subtracting the old item's charge.
+      if (pending.log_epoch_ != log.log_epoch_) {
+        continue;
+      }
+      if (log.state_ == ReplicationLogState::kActive) {
+        log.state_ = ReplicationLogState::kInvalid;
+      }
       spdlog::warn("replication backlog append failed: {}",
                    appended.status().message());
       break;
@@ -1202,6 +1322,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     log.publisher_capacity_ready_.NotifyAll(*store->worker_);
   }
   log.publisher_running_ = false;
+  log.retention_advanced_.NotifyAll(*store->worker_);
   co_return absl::OkStatus();
 }
 
@@ -1225,43 +1346,39 @@ StorageEngine::Impl::PrepareFlushReplication(
     co_return absl::OutOfRangeError(
         "replication control barrier identity exhausted");
   }
-  try {
-    std::vector<std::string> args{db_id ? "FLUSHDB" : "FLUSHALL",
-                                  std::to_string(barrier_id)};
-    if (db_id)
-      args.push_back(std::to_string(db_epochs[*db_id]));
+  std::vector<std::string> args{db_id ? "FLUSHDB" : "FLUSHALL",
+                                std::to_string(barrier_id)};
+  if (db_id)
+    args.push_back(std::to_string(db_epochs[*db_id]));
+  else
+    for (const auto epoch : db_epochs) args.push_back(std::to_string(epoch));
+  PreparedFlushPublication publication;
+  publication.flows_.reserve(worker_count_);
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto capture = [this]() -> Task<std::uint64_t> {
+      co_return CurrentStore().replication_log_.log_epoch_;
+    };
+    std::uint64_t epoch;
+    if (target == bycorf::ThisWorker().id_)
+      epoch = co_await capture();
     else
-      for (const auto epoch : db_epochs) args.push_back(std::to_string(epoch));
-    PreparedFlushPublication publication;
-    publication.flows_.reserve(worker_count_);
-    for (unsigned target = 0; target < worker_count_; ++target) {
-      auto capture = [this]() -> Task<std::uint64_t> {
-        co_return CurrentStore().replication_log_.log_epoch_;
-      };
-      std::uint64_t epoch;
-      if (target == bycorf::ThisWorker().id_)
-        epoch = co_await capture();
-      else
-        epoch = co_await bycorf::SubmitTaskTo(target, capture);
-      publication.flows_.push_back({
-          .log_epoch_ = epoch,
-          .command_ =
-              {
-                  .kind_ = ReplicationEventKind::kControl,
-                  .db_id_ = db_id.value_or(0),
-                  // Control barriers are history-local, not partition
-                  // mutations.
-                  .partition_id_ = 0,
-                  .partition_sequence_ = barrier_id,
-                  .args_ = args,
-              },
-      });
-    }
-    co_return publication;
-  } catch (const std::length_error&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("FLUSH publication is too large");
+      epoch = co_await bycorf::SubmitTaskTo(target, capture);
+    publication.flows_.push_back({
+        .log_epoch_ = epoch,
+        .command_ =
+            {
+                .kind_ = ReplicationEventKind::kControl,
+                .db_id_ = db_id.value_or(0),
+                // Control barriers are history-local, not partition
+                // mutations.
+                .partition_id_ = 0,
+                .partition_sequence_ = barrier_id,
+                .args_ = args,
+            },
+    });
+    AccountReplicationCommand(&publication.flows_.back().command_);
   }
+  co_return publication;
 }
 
 Task<absl::Status> StorageEngine::Impl::PublishFlushReplication(
@@ -1306,24 +1423,135 @@ Task<absl::Status> StorageEngine::Impl::ReclaimReplicationLogPrefix(
   auto& log = store.replication_log_;
   while (!log.blocks_.empty()) {
     const auto& front = log.blocks_.front();
-    if (!force_all && (!front.sealed_ || front.last_lsn_ >= keep_from_lsn)) {
+    if (!force_all && (!front.sealed_ || front.last_lsn_ >= keep_from_lsn ||
+                       front.last_lsn_ >= log.next_lsn_)) {
       break;
     }
     log.blocks_.pop_front();
+    if (log.borrowed_blocks_ != 0) --log.borrowed_blocks_;
   }
+  if (!force_all) ReclaimReplicationLogDebt(store);
   co_return absl::OkStatus();
 }
 
-auto StorageEngine::Impl::AllocateReplicationLogBlock()
+absl::Status StorageEngine::Impl::EnsureReplicationLogPool(
+    WorkerStore& store, std::size_t required_blocks) {
+  auto& log = store.replication_log_;
+  const std::size_t before = log.spare_blocks_.size();
+  std::size_t owned = log.blocks_.size() + log.spare_blocks_.size() +
+                      (log.standby_block_.has_value() ? 1 : 0);
+  while (owned < required_blocks) {
+    auto block = AllocateReplicationLogBlock();
+    if (!block.ok()) {
+      // A failed raw-API expansion must preserve the existing pool and its
+      // memory ownership, without retaining a partially admitted expansion.
+      while (log.spare_blocks_.size() > before) log.spare_blocks_.pop_back();
+      return block.status();
+    }
+    log.spare_blocks_.push_back(std::move(*block));
+    ++owned;
+  }
+  if (log.spare_blocks_.size() != before) {
+    // A publisher may be waiting for a pinned allocation below the configured
+    // quota after an optional growth failed. Newly owned blocks unblock it
+    // even if that consumer has not advanced its ACK yet.
+    log.retention_advanced_.NotifyAll(*store.worker_);
+  }
+  return absl::OkStatus();
+}
+
+void StorageEngine::Impl::TrimReplicationLogPool(WorkerStore& store) {
+  auto& log = store.replication_log_;
+  // Raw appends own the prepared complete-event pool until all fragments are
+  // committed. Otherwise an idle allocation is the first place to repay a
+  // borrowed block; freeing any block returns the same allocator-byte budget.
+  const std::size_t keep = std::max(log.max_blocks_, log.append_min_blocks_);
+  auto excess = [&] {
+    return log.blocks_.size() + log.spare_blocks_.size() +
+               (log.standby_block_.has_value() ? 1 : 0) >
+           keep;
+  };
+  auto repay = [&] {
+    if (log.borrowed_blocks_ != 0) --log.borrowed_blocks_;
+  };
+  while (!log.spare_blocks_.empty() &&
+         (excess() ||
+          (log.borrowed_blocks_ != 0 && log.append_min_blocks_ == 0))) {
+    log.spare_blocks_.pop_back();
+    repay();
+  }
+  if (log.standby_block_.has_value() &&
+      (excess() ||
+       (log.borrowed_blocks_ != 0 && log.append_min_blocks_ == 0))) {
+    log.standby_block_.reset();
+    repay();
+  }
+}
+
+void StorageEngine::Impl::ReclaimReplicationLogDebt(WorkerStore& store) {
+  auto& log = store.replication_log_;
+  // A payload source can suspend with a direct view into its active block.
+  // The append guard retries reclamation after the whole event is visible.
+  if (log.append_min_blocks_ != 0) return;
+  const auto borrowed_before = log.borrowed_blocks_;
+  const auto blocks_before = log.blocks_.size();
+  TrimReplicationLogPool(store);
+  auto pressure = [&] {
+    return log.borrowed_blocks_ != 0 || log.blocks_.size() > log.max_blocks_;
+  };
+  if (pressure() &&
+      !replication_backlog_backpressure_.load(std::memory_order_acquire) &&
+      !log.retained_lsn_by_session_.empty()) {
+    ++log.coverage_revocations_;
+    log.retained_lsn_by_session_.clear();
+  }
+  std::uint64_t keep_from = log.next_lsn_;
+  for (const auto& [session_id, lsn] : log.retained_lsn_by_session_) {
+    (void)session_id;
+    keep_from = std::min(keep_from, lsn);
+  }
+  while (pressure() && !log.blocks_.empty() &&
+         log.blocks_.front().last_lsn_ < keep_from) {
+    // Fragmented events occupy dedicated blocks. Reclaim through their final
+    // fragment in one synchronous step so the visible floor is always an
+    // event boundary. A fully ACKed active block is equally safe to destroy.
+    std::uint64_t evicted_through = log.blocks_.front().last_lsn_;
+    do {
+      evicted_through =
+          std::max(evicted_through, log.blocks_.front().last_lsn_);
+      log.blocks_.pop_front();
+      if (log.borrowed_blocks_ != 0) --log.borrowed_blocks_;
+    } while (!log.blocks_.empty() &&
+             log.blocks_.front().first_lsn_ <= evicted_through);
+  }
+  const bool was_backpressured = log.capacity_backpressured_;
+  log.capacity_backpressured_ = pressure();
+  if (!was_backpressured && log.capacity_backpressured_) ++log.capacity_waits_;
+  if (borrowed_before != log.borrowed_blocks_ ||
+      blocks_before != log.blocks_.size() ||
+      was_backpressured != log.capacity_backpressured_) {
+    log.retention_advanced_.NotifyAll(*store.worker_);
+  }
+  if (was_backpressured && !log.capacity_backpressured_)
+    log.publisher_capacity_ready_.NotifyAll(*store.worker_);
+}
+
+auto StorageEngine::Impl::AllocateReplicationLogBlock(bool already_admitted)
     -> absl::StatusOr<WorkerStore::ReplicationLogBlock> {
   using Block = ::lavik::detail::ReplicationLogBlock;
   auto allocated = Block::Allocate(kStorageBlockBytes);
   if (!allocated.ok()) {
-    // Standby and publisher memory have priority under process pressure.
     if (const auto& history = CurrentStore().replication_history_) {
       history->ReclaimSecondary(Block::AllocationBytes(kStorageBlockBytes));
       allocated = Block::Allocate(kStorageBlockBytes);
     }
+  }
+  if (!allocated.ok() && already_admitted) {
+    // The dataset mutation is committed. A soft budget must not tear a hole
+    // in its replication history; retained allocators still account both the
+    // payload bytes and sparse index before another admission can run.
+    allocated = Block::Allocate(kStorageBlockBytes, true);
+    if (allocated.ok()) ++CurrentStore().replication_log_.borrowed_blocks_;
   }
   if (!allocated.ok()) {
     RecordMemoryRejection();
@@ -1332,172 +1560,78 @@ auto StorageEngine::Impl::AllocateReplicationLogBlock()
   return WorkerStore::ReplicationLogBlock(std::move(*allocated));
 }
 
-void StorageEngine::Impl::EnsureReplicationLogStandby(WorkerStore& store) {
-  auto& log = store.replication_log_;
-  if (log.state_ != ReplicationLogState::kActive ||
-      log.standby_block_.has_value() || log.standby_refill_pending_) {
-    return;
-  }
-  if (shutdown_flush_requested_.load(std::memory_order_acquire)) return;
-  log.standby_refill_pending_ = true;
-  store.worker_->Spawn(RefillReplicationLogStandby(&store, log.log_epoch_));
-}
-
-Task<absl::Status> StorageEngine::Impl::RefillReplicationLogStandby(
-    WorkerStore* store, std::uint64_t log_epoch) {
-  auto& log = store->replication_log_;
-  co_await log.mutex_.Lock();
-  const bool should_allocate =
-      log.standby_refill_pending_ &&
-      log.state_ == ReplicationLogState::kActive &&
-      log.log_epoch_ == log_epoch && !log.standby_block_.has_value() &&
-      !shutdown_flush_requested_.load(std::memory_order_acquire);
-  log.mutex_.Unlock(*store->worker_);
-
-  absl::StatusOr<WorkerStore::ReplicationLogBlock> allocated{
-      absl::CancelledError("replication backlog standby is no longer needed")};
-  if (should_allocate) allocated = AllocateReplicationLogBlock();
-
-  co_await log.mutex_.Lock();
-  bool published = false;
-  if (allocated.ok() && log.standby_refill_pending_ &&
-      log.state_ == ReplicationLogState::kActive &&
-      log.log_epoch_ == log_epoch && !log.standby_block_.has_value() &&
-      !shutdown_flush_requested_.load(std::memory_order_acquire)) {
-    log.standby_block_.emplace(std::move(*allocated));
-    published = true;
-  }
-  // Keep this true through allocation and stale-owner destruction. Disable
-  // and shutdown use it as a completion handshake before worker state dies.
-  if (!published && allocated.ok()) {
-    allocated = absl::CancelledError("replication standby became stale");
-  }
-  log.standby_refill_pending_ = false;
-  log.mutex_.Unlock(*store->worker_);
-  co_return absl::OkStatus();
-}
-
 Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     WorkerStore& store, std::uint64_t protected_lsn) {
   auto& log = store.replication_log_;
-  if (!log.blocks_.empty() && !log.blocks_.back().sealed_) {
+  const std::uint64_t log_epoch = log.log_epoch_;
+  if (!log.blocks_.empty() && !log.blocks_.back().sealed_)
     co_return absl::OkStatus();
-  }
-  if (log.max_blocks_ == 0) {
+  if (log.max_blocks_ == 0)
     co_return InvalidState("replication log has no capacity");
-  }
-
-  auto retained_lsn = [&]() -> std::optional<std::uint64_t> {
-    std::optional<std::uint64_t> retained_lsn;
-    for (const auto& [session_id, lsn] : log.retained_lsn_by_session_) {
-      (void)session_id;
-      if (!retained_lsn.has_value() || lsn < *retained_lsn) {
-        retained_lsn = lsn;
-      }
-    }
-    return retained_lsn;
-  };
-  std::optional<WorkerStore::ReplicationLogBlock> recycled;
-  auto evict_event = [&]() {
-    std::uint64_t evicted_through = log.blocks_.front().last_lsn_;
-    do {
-      evicted_through =
-          std::max(evicted_through, log.blocks_.front().last_lsn_);
-      // Reuse one retired allocation for the next active block. Retention has
-      // already authorized eviction; reset its identity and charge before it
-      // can publish new bytes. Multi-block events still disappear as a whole.
-      if (!recycled) {
-        recycled.emplace(std::move(log.blocks_.front()));
-        recycled->history_charge_.Reset();
-        recycled->Reset();
-      }
-      log.blocks_.pop_front();
-    } while (!log.blocks_.empty() && log.blocks_.front().sealed_ &&
-             log.blocks_.front().first_lsn_ <= evicted_through);
-  };
 
   for (;;) {
-    const auto retained = retained_lsn();
-    const std::uint64_t keep_from = retained.has_value()
-                                        ? std::min(protected_lsn, *retained)
-                                        : protected_lsn;
+    std::uint64_t keep_from = protected_lsn;
+    for (const auto& [session_id, lsn] : log.retained_lsn_by_session_) {
+      (void)session_id;
+      keep_from = std::min(keep_from, lsn);
+    }
     const bool evictable = !log.blocks_.empty() &&
                            log.blocks_.front().sealed_ &&
                            log.blocks_.front().last_lsn_ < keep_from;
-
-    const bool backpressure =
-        replication_backlog_backpressure_.load(std::memory_order_acquire);
-    if (log.capacity_backpressured_ &&
-        (!backpressure || !retained.has_value())) {
-      log.capacity_backpressured_ = false;
+    const std::size_t target =
+        std::max(log.max_blocks_, log.append_min_blocks_);
+    if (log.blocks_.size() >= target && evictable) {
+      // Reuse a complete safe event before growing the reconnect window.
+      std::uint64_t through = log.blocks_.front().last_lsn_;
+      do {
+        through = std::max(through, log.blocks_.front().last_lsn_);
+        auto& retired = log.blocks_.front();
+        retired.history_charge_.Reset();
+        retired.Reset();
+        log.spare_blocks_.push_back(std::move(retired));
+        log.blocks_.pop_front();
+      } while (!log.blocks_.empty() &&
+               log.blocks_.front().first_lsn_ <= through);
     }
-    if (log.capacity_backpressured_) {
-      if (evictable) {
-        // Reclaim one complete event as soon as ACK progress permits. Waiting
-        // for a larger fraction of a multi-gigabyte window would unnecessarily
-        // turn small replica lag into prolonged zero write throughput.
-        evict_event();
-        log.capacity_backpressured_ = false;
-      } else {
-        co_await log.retention_advanced_.Wait();
-        if (log.state_ != ReplicationLogState::kActive) {
-          co_return InvalidState(
-              "replication log stopped while waiting for replica ACK");
-        }
-        continue;
+    if (log.append_admitted_ || log.blocks_.size() < target) {
+      if (log.spare_blocks_.empty() && !log.standby_block_.has_value()) {
+        auto allocated = AllocateReplicationLogBlock(log.append_admitted_);
+        if (!allocated.ok()) co_return allocated.status();
+        log.spare_blocks_.push_back(std::move(*allocated));
       }
+      break;
     }
-
-    if (log.blocks_.size() < log.max_blocks_) break;
-    if (evictable) {
-      evict_event();
-      continue;
-    }
-    if (!log.blocks_.empty() &&
-        log.blocks_.front().last_lsn_ >= protected_lsn &&
-        (!retained.has_value() || *retained >= protected_lsn)) {
-      co_return absl::ResourceExhaustedError(
-          "replication event exhausted the hard backlog capacity");
-    }
-    if (retained.has_value()) {
-      if (backpressure) {
-        // The pin represents history an online consumer has not ACKed. Keep
-        // successful primary writes inside that history by propagating this
-        // wait through the publisher queue to foreground admission.
-        log.capacity_backpressured_ = true;
-        ++log.capacity_waits_;
-        co_await log.retention_advanced_.Wait();
-        if (log.state_ != ReplicationLogState::kActive) {
-          co_return InvalidState(
-              "replication log stopped while waiting for replica ACK");
-        }
-        continue;
-      }
-      // With backpressure disabled, the bounded backlog is a reconnect window
-      // rather than an unbounded pin. Consumers discover the resulting floor
-      // gap and reconnect with whole-group full sync.
+    if (!replication_backlog_backpressure_.load(std::memory_order_acquire)) {
       ++log.coverage_revocations_;
       log.retained_lsn_by_session_.clear();
       continue;
     }
-    evict_event();
+    // Only raw callers wait here. Accepted publication continues so replicas
+    // can receive every participant marker and the complete payload.
+    log.capacity_backpressured_ = true;
+    ++log.capacity_waits_;
+    co_await log.retention_advanced_.Wait();
+    if (log.state_ != ReplicationLogState::kActive ||
+        log.log_epoch_ != log_epoch)
+      co_return InvalidState("replication log stopped while waiting for ACK");
   }
 
   ReplicationHistory::PrimaryCharge history_charge;
-  if (const auto& history = CurrentStore().replication_history_)
+  if (const auto& history = store.replication_history_)
     history_charge = history->ChargePrimary(kStorageBlockBytes);
-  if (recycled) {
-    log.blocks_.push_back(std::move(*recycled));
-  } else if (log.standby_block_.has_value()) {
+  if (!log.spare_blocks_.empty()) {
+    log.blocks_.push_back(std::move(log.spare_blocks_.back()));
+    log.spare_blocks_.pop_back();
+  } else {
     log.blocks_.push_back(std::move(*log.standby_block_));
     log.standby_block_.reset();
-  } else {
-    auto allocated = AllocateReplicationLogBlock();
-    if (!allocated.ok()) co_return allocated.status();
-    log.blocks_.push_back(std::move(*allocated));
   }
   log.blocks_.back().history_charge_ = std::move(history_charge);
-  EnsureReplicationLogStandby(store);
+  if (log.append_admitted_ &&
+      (log.borrowed_blocks_ != 0 || log.blocks_.size() > log.max_blocks_)) {
+    if (!log.capacity_backpressured_) ++log.capacity_waits_;
+    log.capacity_backpressured_ = true;
+  }
   co_return absl::OkStatus();
 }
 
@@ -1517,7 +1651,7 @@ Task<absl::Status> StorageEngine::Impl::SealReplicationLogActiveBlock(
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
-    ReplicationLogAppend event) {
+    ReplicationLogAppend event, bool already_admitted) {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   if (log.state_ != ReplicationLogState::kActive) {
@@ -1537,17 +1671,28 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
   const std::uint64_t logical_payload_bytes =
       event.payload_source_ == nullptr ? event.payload_.size()
                                        : event.payload_source_->size();
-  if (logical_payload_bytes > kMaxRecordPayloadBytes ||
-      logical_payload_bytes > std::numeric_limits<std::size_t>::max()) {
+  if (logical_payload_bytes > std::numeric_limits<std::size_t>::max()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
-                           "replication event exceeds the 1 GiB limit");
+                           "replication event exceeds addressable size");
   }
   const std::size_t frame_payload_capacity =
       kStorageBlockBytes - sizeof(ReplicationFrameHeader);
-  if (logical_payload_bytes >
-      static_cast<std::uint64_t>(log.max_blocks_) * frame_payload_capacity) {
-    co_return absl::ResourceExhaustedError(
-        "replication event exceeds this flow's backlog capacity");
+  const std::size_t required_blocks =
+      logical_payload_bytes == 0
+          ? 1
+          : 1 + (logical_payload_bytes - 1) / frame_payload_capacity;
+  // Replication events span blocks independently of the storage-record size
+  // limit. Every fragment index must remain representable before any append.
+  if (required_blocks - 1 > std::numeric_limits<std::uint32_t>::max()) {
+    co_return absl::OutOfRangeError(
+        "replication event exceeds the fragment index range");
+  }
+  if (!already_admitted) {
+    // The raw API has no preceding dataset mutation. Establish its complete
+    // guarantee before writing even the first fragment, independently of the
+    // configured reconnect-window target.
+    absl::Status prepared = EnsureReplicationLogPool(store, required_blocks);
+    if (!prepared.ok()) co_return prepared;
   }
   if (log.next_lsn_ == std::numeric_limits<std::uint64_t>::max()) {
     log.state_ = ReplicationLogState::kInvalid;
@@ -1557,6 +1702,33 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
 
   const std::size_t payload_size =
       static_cast<std::size_t>(logical_payload_bytes);
+  const std::uint64_t log_epoch = log.log_epoch_;
+  // Protect the incomplete event from ACK/configuration-triggered trimming.
+  // Accepted writes may borrow blocks and never wait for an ACK mid-event.
+  log.append_min_blocks_ = required_blocks;
+  log.append_admitted_ = already_admitted;
+  struct AppendGuard {
+    Impl* impl;
+    WorkerStore* store;
+    WorkerStore::ReplicationLogRuntime& log;
+    std::uint64_t epoch;
+    ~AppendGuard() {
+      if (log.log_epoch_ == epoch) {
+        log.append_min_blocks_ = 0;
+        const bool admitted = std::exchange(log.append_admitted_, false);
+        if (admitted)
+          impl->ReclaimReplicationLogDebt(*store);
+        else {
+          impl->TrimReplicationLogPool(*store);
+          if (log.borrowed_blocks_ == 0 &&
+              log.blocks_.size() <= log.max_blocks_) {
+            log.capacity_backpressured_ = false;
+            log.publisher_capacity_ready_.NotifyAll(*store->worker_);
+          }
+        }
+      }
+    }
+  } append_guard{this, &store, log, log_epoch};
   const std::uint64_t lsn = log.next_lsn_;
   const std::size_t single_frame_bytes =
       payload_size <= frame_payload_capacity
@@ -1581,7 +1753,10 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
   do {
     absl::Status ready = co_await EnsureReplicationLogActiveBlock(store, lsn);
     if (!ready.ok()) {
-      log.state_ = ReplicationLogState::kInvalid;
+      if (log.state_ == ReplicationLogState::kActive &&
+          log.log_epoch_ == log_epoch) {
+        log.state_ = ReplicationLogState::kInvalid;
+      }
       co_return ready;
     }
     auto& block = log.blocks_.back();
@@ -1648,7 +1823,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     }
     block.CommitAppend(lsn, fragment_index, frame_bytes);
     payload_offset += payload_bytes;
-    ++fragment_index;
+    if (!last) ++fragment_index;
     emitted = true;
     if (block.committed_bytes_ == kStorageBlockBytes) {
       absl::Status sealed = co_await SealReplicationLogActiveBlock(store);
@@ -1676,9 +1851,8 @@ StorageEngine::Impl::ReadReplicationLog(ReplicationLogCursor next,
                                         std::size_t max_frames) {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
-  // This worker-local copy-out never suspends. A publisher may hold its
-  // coroutine mutex while waiting for a consumer pin to advance; acquiring
-  // that mutex here would prevent the consumer from relieving backpressure.
+  // This worker-local copy-out never suspends. Reading committed history must
+  // remain independent of an append waiting for the consumer's ACK.
   // next_lsn_ is the commit boundary: never expose an unfinished event.
   if (log.state_ != ReplicationLogState::kActive) {
     co_return InvalidState("replication log is not active");
@@ -1807,6 +1981,7 @@ absl::Status StorageEngine::Impl::RetainReplicationLog(
     if (keep_from_lsn == found->second) return absl::OkStatus();
     found->second = keep_from_lsn;
   }
+  ReclaimReplicationLogDebt(store);
   log.retention_advanced_.NotifyAll(*store.worker_);
   return absl::OkStatus();
 }
@@ -1816,6 +1991,7 @@ void StorageEngine::Impl::ReleaseReplicationLogRetention(
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   if (log.retained_lsn_by_session_.erase(session_id) != 0) {
+    ReclaimReplicationLogDebt(store);
     log.retention_advanced_.NotifyAll(*store.worker_);
   }
 }
@@ -1855,6 +2031,10 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     log.log_epoch_ = 0;
     log.next_lsn_ = 1;
     log.max_blocks_ = 0;
+    log.append_min_blocks_ = 0;
+    log.append_admitted_ = false;
+    log.borrowed_blocks_ = 0;
+    log.spare_blocks_.clear();
     log.capacity_backpressured_ = false;
     for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
       auto& pending = log.publish_queue_[index];
@@ -1876,18 +2056,6 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   log.standby_block_.reset();
   log.mutex_.Unlock(*store.worker_);
 
-  // A refill may have dropped the log mutex while allocating. Let it observe
-  // the disabled epoch and destroy its stale owner before this API returns;
-  // callers may tear down the worker immediately afterward.
-  for (;;) {
-    co_await log.mutex_.Lock();
-    const bool pending = log.standby_refill_pending_;
-    log.mutex_.Unlock(*store.worker_);
-    if (!pending) break;
-    absl::Status waited =
-        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
-  }
   co_return absl::OkStatus();
 }
 

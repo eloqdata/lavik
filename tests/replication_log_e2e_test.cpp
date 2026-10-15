@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -31,6 +32,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "../src/redis/list_command.h"
 #include "../src/redis/set_command.h"
@@ -45,6 +47,7 @@
 #include "lavik/replication_command.h"
 #include "lavik/replication_history.h"
 #include "lavik/resp.h"
+#include "lavik/session.h"
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
 #include "lavik/storage/scan_hash_map.h"
@@ -190,6 +193,7 @@ class RepeatedByteSource final : public ReplicationLogPayloadSource {
 
   bycorf::Task<absl::Status> Read(std::uint64_t offset,
                                   std::span<std::byte> output) override {
+    read_ = true;
     if (offset > size_ || output.size() > size_ - offset) {
       co_return absl::Status(absl::StatusCode::kOutOfRange,
                              "test payload source read is out of range");
@@ -198,9 +202,47 @@ class RepeatedByteSource final : public ReplicationLogPayloadSource {
     co_return absl::OkStatus();
   }
 
+  bool read_ = false;
+
  private:
   std::size_t size_ = 0;
   char byte_ = 0;
+};
+
+class PausedFragmentSource final : public ReplicationLogPayloadSource {
+ public:
+  explicit PausedFragmentSource(bycorf::Worker& worker) : worker_(worker) {}
+
+  std::uint64_t size() const noexcept override { return 17 * kMiB; }
+
+  bycorf::Task<absl::Status> Read(std::uint64_t offset,
+                                  std::span<std::byte> output) override {
+    if (offset > size() || output.size() > size() - offset) {
+      co_return absl::OutOfRangeError("paused fragment source read overflow");
+    }
+    // At the second Read the first fragment is already committed and sealed,
+    // while AppendReplicationLog still owns the current event's block views.
+    if (offset != 0 && !second_read_started_) {
+      second_read_started_ = true;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (!released_) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          co_return absl::DeadlineExceededError(
+              "fragment source was not released");
+        }
+        co_await bycorf::Yield(worker_);
+      }
+    }
+    std::fill(output.begin(), output.end(), std::byte{'F'});
+    co_return absl::OkStatus();
+  }
+
+  bool second_read_started_ = false;
+  bool released_ = false;
+
+ private:
+  bycorf::Worker& worker_;
 };
 
 class ReplicationLogService final : public bycorf::Service {
@@ -237,6 +279,19 @@ class ReplicationLogService final : public bycorf::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  template <typename Predicate>
+  bycorf::Task<bool> WaitForCondition(Predicate ready) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!ready()) {
+      if (std::chrono::steady_clock::now() >= deadline) co_return false;
+      const auto slept =
+          co_await bycorf::SleepFor(*worker_, std::chrono::milliseconds(1));
+      if (!slept.ok()) co_return false;
+    }
+    co_return true;
+  }
+
   bycorf::Task<absl::Status> ExerciseScannedKeyStorageChangeOrder() {
     constexpr std::uint8_t kDb = 0;
     for (bool acknowledge_baseline : {false, true}) {
@@ -501,15 +556,15 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
-  absl::Status LimitRetainedHeadroom() {
+  absl::Status LimitRetainedHeadroom(std::uint64_t admission_headroom = 128 *
+                                                                        1024) {
     lavik::RefreshMemoryStats();
     const std::uint64_t used = lavik::GetMemoryStats().used_bytes_;
-    constexpr std::uint64_t kAdmissionHeadroom = 128 * 1024;
-    if (used > std::numeric_limits<std::uint64_t>::max() - kAdmissionHeadroom) {
+    if (used > std::numeric_limits<std::uint64_t>::max() - admission_headroom) {
       return absl::ResourceExhaustedError(
           "cannot construct transaction-guard admission test limit");
     }
-    const std::uint64_t steady_target = used + kAdmissionHeadroom;
+    const std::uint64_t steady_target = used + admission_headroom;
     const std::uint64_t steady_allowance = steady_target / 9 + 1;
     if (steady_target >
         std::numeric_limits<std::uint64_t>::max() - steady_allowance) {
@@ -523,46 +578,272 @@ class ReplicationLogService final : public bycorf::Service {
     return lavik::InitMemoryLimit(steady_target + steady_allowance, 1);
   }
 
-  bycorf::Task<absl::Status> ExerciseTransactionGuardAdmission(
-      std::vector<std::string> args) {
+  bycorf::Task<absl::Status> DispatchClientCommand(
+      lavik::ConnectionContext& connection, std::vector<std::string> args,
+      std::string_view expected_reply) {
     auto request = lavik::BuildCommandRequest(
-        lavik::RespCommand{.args_ = std::move(args)}, 0);
+        lavik::RespCommand{.args_ = std::move(args)}, connection.selected_db_);
+    if (!request.ok()) co_return request.status();
+    lavik::ReplyBuilder builder;
+    auto reply = co_await lavik::DispatchCommand(connection, *request, builder);
+    std::string actual(reply.encoded_);
+    if (reply.disk_value_.valid()) {
+      const auto bytes = reply.disk_value_.network_bytes();
+      actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+    if (reply.continuation_) {
+      for (const auto& fragment : reply.continuation_->fragments_)
+        actual.append(fragment);
+      if (reply.continuation_->source_) {
+        for (;;) {
+          auto next = co_await reply.continuation_->source_();
+          if (!next.ok()) co_return next.status();
+          if (next->empty()) break;
+          actual.append(*next);
+          if (actual.size() > expected_reply.size()) break;
+        }
+      }
+    }
+    if (reply.close_connection_ || connection.closing_ ||
+        actual != expected_reply) {
+      co_return absl::FailedPreconditionError(
+          "replication capture dispatch returned '" + actual.substr(0, 256) +
+          "' or requested connection closure");
+    }
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::StatusOr<ReplicatedCommand>> ReadSinglePublishedCommand(
+      unsigned expected_fragments) {
+    auto status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    ReplicationLogCursor cursor;
+    std::string encoded;
+    unsigned fragments = 0;
+    do {
+      auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+      if (!batch.ok()) co_return batch.status();
+      if (batch->frames_.size() != 1 || batch->frames_[0].header_.lsn_ != 1 ||
+          batch->frames_[0].header_.fragment_index_ != fragments) {
+        co_return absl::FailedPreconditionError(
+            "captured transaction lost its complete ordered event");
+      }
+      encoded.append(batch->frames_[0].payload_);
+      ++fragments;
+      cursor = batch->next_;
+    } while (cursor.lsn_ == 1);
+    if (fragments != expected_fragments)
+      co_return absl::FailedPreconditionError(
+          "captured transaction used an unexpected fragment count");
+    auto decoded = lavik::DecodeReplicationCommand(encoded);
+    if (!decoded.ok()) co_return decoded.status();
+    co_return ReplicationTransactionBody(std::move(*decoded));
+  }
+
+  struct PinnedPublication {
+    ReplicatedCommand command_;
+    lavik::storage::ReplicationLogInfo history_;
+  };
+
+  bycorf::Task<absl::StatusOr<PinnedPublication>> DispatchPinnedCommand(
+      lavik::ConnectionContext& connection, std::vector<std::string> args,
+      std::string expected_reply, unsigned expected_fragments) {
+    constexpr std::uint64_t kConsumer = 919;
+    auto status = storage_->RetainReplicationLog(kConsumer, 1);
+    if (!status.ok()) co_return status;
+    bool finished = false;
+    absl::Status command_status = absl::UnknownError("command did not run");
+    auto run = [&]() -> bycorf::Task<absl::Status> {
+      command_status = co_await DispatchClientCommand(
+          connection, std::move(args), expected_reply);
+      finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(run());
+    // Retain the complete event while checking the reply. An admitted write
+    // must finish even while the consumer still pins its excess blocks.
+    auto body = co_await ReadSinglePublishedCommand(expected_fragments);
+    const auto history = storage_->LocalReplicationLogInfo();
+    Check(co_await WaitForCondition([&] { return finished; }),
+          "completed write waited for its consumer to release retention");
+    storage_->ReleaseReplicationLogRetention(kConsumer);
+    if (!command_status.ok()) co_return command_status;
+    if (!body.ok()) co_return body.status();
+    co_return PinnedPublication{std::move(*body), history};
+  }
+
+  bycorf::Task<absl::Status> ExerciseEvalCaptureContinuation() {
+    constexpr std::uint8_t kDb = 10;
+    constexpr std::uint64_t kEpoch = 40;
+    const std::string first = "capture-prefix";
+    const std::string second = "capture-continuation";
+    const std::string script =
+        "if ARGV[1] == 'warm' then return 1 end; "
+        "redis.call('SET', KEYS[1], 'kept'); "
+        "redis.call('SET', KEYS[2], string.rep('x', 9*1024*1024)); "
+        "return {redis.call('GET', KEYS[1]), redis.call('STRLEN', KEYS[2])}";
+    lavik::ConnectionContext connection;
+    connection.selected_db_ = kDb;
+    auto status = co_await DispatchClientCommand(
+        connection, {"MSET", first, "old", second, "old"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    // Warm the Lua VM/bytecode while memory is unrestricted. Primary String
+    // segment preparation remains subject to ordinary memory admission; leave
+    // it enough scratch while the dynamically produced replication event must
+    // still exceed this history's one-block reconnect quota.
+    status = co_await DispatchClientCommand(
+        connection, {"EVAL", script, "2", first, second, "warm"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await storage_->EnableReplicationLog(kEpoch, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = LimitRetainedHeadroom(24 * kMiB);
+    if (!status.ok()) co_return status;
+    auto publication = co_await DispatchPinnedCommand(
+        connection, {"EVAL", script, "2", first, second, "run"},
+        "*2\r\n$4\r\nkept\r\n:9437184\r\n", 2);
+    const auto restored = lavik::InitMemoryLimit(512 * kMiB, 1);
+    if (!restored.ok()) co_return restored;
+    if (!publication.ok()) co_return publication.status();
+    status = co_await DispatchClientCommand(connection, {"PING"}, "+PONG\r\n");
+    if (!status.ok()) co_return status;
+    auto& body = publication->command_;
+    const auto& history = publication->history_;
+    Check(history.state_ == ReplicationLogState::kActive &&
+              history.log_epoch_ == kEpoch && history.tail_lsn_ == 1,
+          "continuation allocation invalidated the admitted script history");
+    Check(body.args_.size() >= 2 && body.args_[1] == "4" &&
+              ReplicatedEffectAt(body, 0) ==
+                  std::vector<std::string>({"SET", first, "kept"}) &&
+              ReplicatedEffectAt(body, 1) ==
+                  std::vector<std::string>(
+                      {"SET", second, std::string(9 * kMiB, 'x')}),
+          "admitted Lua script lost its prefix or dynamically grown effect");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(
+        connection, {"SET", first, "before-replay"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await lavik::ApplyReplicatedCommand(body);
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(connection, {"GET", first},
+                                            "$4\r\nkept\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(connection, {"STRLEN", second},
+                                            ":9437184\r\n");
+    if (!status.ok()) co_return status;
+    std::cout << "EVAL continuation exceeds backlog quota and replays PASS\n";
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseExecCaptureContinuation() {
+    constexpr std::uint8_t kDb = 10;
+    constexpr std::uint64_t kEpoch = 42;
+    const std::string hash = "capture-fallback-hash";
+    const std::string source = "capture-large-pop";
+    const std::string after = "capture-after-growth";
+    lavik::ConnectionContext connection;
+    connection.selected_db_ = kDb;
+    auto status = co_await DispatchClientCommand(
+        connection, {"HSET", hash, "f", "old"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(
+        connection, {"SADD", source, std::string(9 * kMiB, 'S')}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(connection, {"SET", after, "old"},
+                                            "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await storage_->EnableReplicationLog(kEpoch, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(connection, {"MULTI"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    for (auto args :
+         std::vector<std::vector<std::string>>{{"HSET", hash, "f", "kept"},
+                                               {"SPOP", source},
+                                               {"SET", after, "kept"}}) {
+      status = co_await DispatchClientCommand(connection, std::move(args),
+                                              "+QUEUED\r\n");
+      if (!status.ok()) co_return status;
+    }
+    // Removing a large grouped Set member reserves several decoded-page
+    // copies. Keep that primary-data scratch admissible; replication still
+    // has to finish its two-block event against a one-block backlog quota.
+    status = LimitRetainedHeadroom(96 * kMiB);
+    if (!status.ok()) co_return status;
+    const auto expected = "*3\r\n:0\r\n$" + std::to_string(9 * kMiB) + "\r\n" +
+                          std::string(9 * kMiB, 'S') + "\r\n+OK\r\n";
+    auto publication =
+        co_await DispatchPinnedCommand(connection, {"EXEC"}, expected, 2);
+    const auto restored = lavik::InitMemoryLimit(512 * kMiB, 1);
+    if (!restored.ok()) co_return restored;
+    if (!publication.ok()) co_return publication.status();
+    status = co_await DispatchClientCommand(connection, {"PING"}, "+PONG\r\n");
+    if (!status.ok()) co_return status;
+    const auto& body = publication->command_;
+    const auto& history = publication->history_;
+    Check(history.state_ == ReplicationLogState::kActive &&
+              history.log_epoch_ == kEpoch && history.tail_lsn_ == 1 &&
+              ReplicatedEffectAt(body, 0) ==
+                  std::vector<std::string>({"HSET", hash, "f", "kept"}) &&
+              ReplicatedEffectAt(body, 1) ==
+                  std::vector<std::string>(
+                      {"SREM", source, std::string(9 * kMiB, 'S')}) &&
+              ReplicatedEffectAt(body, 2) ==
+                  std::vector<std::string>({"SET", after, "kept"}),
+          "EXEC lost an earlier or later effect around continuation growth");
+    status =
+        co_await DispatchClientCommand(connection, {"SCARD", source}, ":0\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(connection, {"HGET", hash, "f"},
+                                            "$4\r\nkept\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await DispatchClientCommand(connection, {"GET", after},
+                                            "$4\r\nkept\r\n");
+    if (!status.ok()) co_return status;
+    std::cout << "EXEC continuation preserves fallback and later write PASS\n";
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
+  bycorf::Task<absl::Status> ExerciseTransactionGuardAdmission() {
+    auto request = lavik::BuildCommandRequest(
+        lavik::RespCommand{
+            .args_ = {"MSET", "guard-key", std::string(kMiB, 'T')}},
+        0);
     if (!request.ok()) co_return request.status();
 
     absl::Status status = LimitRetainedHeadroom();
     if (!status.ok()) co_return status;
 
-    lavik::ReplyBuilder builder;
-    lavik::CommandReply reply;
-    switch (request->kind_) {
-      case lavik::CommandKind::kLMPop:
-        reply = co_await lavik::ExecuteListMultiKey(*request, builder);
-        break;
-      case lavik::CommandKind::kSUnionStore:
-        reply = co_await lavik::ExecuteSetMultiKey(*request, builder);
-        break;
-      case lavik::CommandKind::kZUnionStore:
-        reply = co_await lavik::ExecuteZSetMultiKey(*request, builder);
-        break;
-      case lavik::CommandKind::kSort:
-        reply = co_await lavik::ExecuteSortCommand(*request, builder);
-        break;
-      default:
-        status = absl::InvalidArgumentError(
-            "unsupported transaction-guard admission test command");
-        break;
+    lavik::RefreshMemoryStats();
+    const auto before = lavik::GetMemoryStats().used_bytes_;
+    {
+      // Publisher admission already accepted this transaction. Materializing
+      // its canonical copy must account the allocation without a second soft
+      // memory gate. Final TTL collection must obey the same rule.
+      lavik::ReplicationTransactionGuard guard(*request, {worker_->id()});
+      Check(guard.status().ok() && guard.active(),
+            "transaction continuation rejected its canonical payload");
+      lavik::RefreshMemoryStats();
+      Check(lavik::GetMemoryStats().used_bytes_ >= before + kMiB &&
+                !lavik::TryReserveMemory(1).has_value(),
+            "transaction continuation did not charge its overbudget payload");
+      const auto before_ttl = lavik::GetMemoryStats().used_bytes_;
+      std::array<lavik::storage::TxShardWrites, 1> writes;
+      writes[0].expiration_effects_.push_back(
+          {.key_ = "guard-key",
+           .expire_at_ms_ = 4000000000000ULL,
+           .db_id_ = 0,
+           .exists_ = true});
+      guard.SetFinalExpirations(writes);
+      lavik::RefreshMemoryStats();
+      Check(
+          guard.Commit() && lavik::GetMemoryStats().used_bytes_ > before_ttl,
+          "overbudget TTL collection failed or omitted its allocation charge");
     }
-
+    lavik::RefreshMemoryStats();
+    Check(lavik::GetMemoryStats().used_bytes_ == before,
+          "destroyed transaction retained its canonical payload charge");
     const absl::Status restored = lavik::InitMemoryLimit(512 * kMiB, 1);
     if (!restored.ok()) co_return restored;
-    if (!status.ok()) co_return status;
-    constexpr std::string_view kExpected =
-        "-OOM command not allowed when used memory > 'maxmemory'.\r\n";
-    if (reply.encoded_ != kExpected) {
-      co_return absl::FailedPreconditionError(
-          request->args_.front() + " transaction guard returned '" +
-          std::string(reply.encoded_) + "' instead of a Redis OOM error");
-    }
     co_return absl::OkStatus();
   }
 
@@ -1536,13 +1817,29 @@ class ReplicationLogService final : public bycorf::Service {
     Check(batched->size() == 2 && (*batched)[0].id_ == queued->front().id_ &&
               (*batched)[1].id_ == (*batched)[0].id_ + 1,
           "full-sync publish batch did not preserve FIFO item order");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, (*batched)[0].id_);
+    const auto first_id = (*batched)[0].id_;
+    const auto second_id = (*batched)[1].id_;
+    queued->clear();
+    batched->clear();
+    // Drain publisher ownership before measuring the memory held by FULL.
+    // Client replies themselves need neither this fence nor a replica ACK.
+    auto published = co_await storage_->FenceReplicationLog();
+    if (!published.ok()) co_return published.status();
+    storage_->AcknowledgeFullSyncPublishItem(kSession, first_id);
     auto batch_tail = storage_->PeekFullSyncPublishItems(kSession, 2);
     if (!batch_tail.ok()) co_return batch_tail.status();
+    Check(batch_tail->size() == 1 && batch_tail->front().id_ == second_id,
+          "full-sync publish ACK did not release exactly one FIFO item");
+    batch_tail->clear();
+    lavik::RefreshMemoryStats();
+    const auto before_fullsync_ack = lavik::GetMemoryStats().used_bytes_;
+    storage_->AcknowledgeFullSyncPublishItem(kSession, second_id);
+    lavik::RefreshMemoryStats();
     Check(
-        batch_tail->size() == 1 && batch_tail->front().id_ == (*batched)[1].id_,
-        "full-sync publish ACK did not release exactly one FIFO item");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, batch_tail->front().id_);
+        lavik::GetMemoryStats().used_bytes_ < before_fullsync_ack &&
+            storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_ ==
+                0,
+        "FULL ACK did not immediately release its payload memory");
 
     absl::Status queue_capacity =
         co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
@@ -2015,8 +2312,204 @@ class ReplicationLogService final : public bycorf::Service {
     co_return co_await storage_->SetReplicationBacklogBackpressure(true);
   }
 
-  // Keep the FLUSH control-barrier phase independent so failures leave the
-  // surrounding replication-log exercise at a clear lifecycle boundary.
+  bycorf::Task<absl::Status> ExerciseInFlightBacklogShrink() {
+    constexpr std::uint64_t kEpoch = 902;
+    absl::Status status =
+        co_await storage_->EnableReplicationLog(kEpoch, 3 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(kEpoch, 1);
+    if (!status.ok()) co_return status;
+    PausedFragmentSource source(*worker_);
+    bool append_done = false;
+    absl::StatusOr<std::uint64_t> append_result =
+        absl::UnknownError("in-flight shrink append did not run");
+    auto append = [&]() -> bycorf::Task<absl::Status> {
+      append_result = co_await storage_->AppendReplicationLog(
+          ReplicationLogAppend{.partition_id_ = 9,
+                               .partition_sequence_ = 1,
+                               .payload_ = {},
+                               .payload_source_ = &source});
+      append_done = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(append());
+    Check(co_await WaitForCondition(
+              [&] { return source.second_read_started_ || append_done; }),
+          "fragmented append did not reach its second source read");
+    Check(source.second_read_started_ && !append_done &&
+              storage_->LocalReplicationLogInfo().block_count_ == 2,
+          "in-flight shrink fixture did not hold an emitted first fragment");
+    status = co_await storage_->SetReplicationLogCapacity(8 * kMiB);
+    Check(status.ok(), "backlog shrink could not run during source read");
+    const auto shrunk = storage_->LocalReplicationLogInfo();
+    Check(shrunk.state_ == ReplicationLogState::kActive &&
+              shrunk.log_epoch_ == kEpoch && shrunk.tail_lsn_ == 0 &&
+              shrunk.capacity_bytes_ == 8 * kMiB && shrunk.block_count_ == 2,
+          "runtime shrink trimmed the current event's first fragment");
+    source.released_ = true;
+    Check(co_await WaitForCondition([&] { return append_done; }),
+          "in-flight event waited for backlog growth after shrink");
+    Check(append_result.ok() && *append_result == 1,
+          "in-flight shrink failed a previously fitting append");
+    const auto complete = storage_->LocalReplicationLogInfo();
+    Check(complete.state_ == ReplicationLogState::kActive &&
+              complete.log_epoch_ == kEpoch && complete.tail_lsn_ == 1 &&
+              complete.capacity_bytes_ == 8 * kMiB &&
+              complete.block_count_ == 3,
+          "in-flight event did not retain all three fragments after shrink");
+    ReplicationLogCursor cursor;
+    std::uint64_t bytes = 0;
+    unsigned fragments = 0;
+    do {
+      auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+      if (!batch.ok()) co_return batch.status();
+      Check(batch->frames_.size() == 1,
+            "in-flight shrink lost a retained fragment");
+      const auto& frame = batch->frames_.front();
+      Check(frame.header_.lsn_ == 1 &&
+                frame.header_.fragment_index_ == fragments &&
+                std::all_of(frame.payload_.begin(), frame.payload_.end(),
+                            [](char byte) { return byte == 'F'; }),
+            "in-flight shrink corrupted fragment order or payload");
+      bytes += frame.payload_.size();
+      ++fragments;
+      cursor = batch->next_;
+    } while (cursor.lsn_ == 1);
+    Check(fragments == 3 && bytes == source.size(),
+          "in-flight shrink truncated the complete event");
+    status = storage_->RetainReplicationLog(kEpoch, 2);
+    if (!status.ok()) co_return status;
+    Check(storage_->LocalReplicationLogInfo().block_count_ <= 1 &&
+              storage_->LocalReplicationLogInfo().floor_lsn_ == 2,
+          "ACK retained the oversized in-flight event after shrink");
+    auto next = co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+        .partition_id_ = 9,
+        .partition_sequence_ = 2,
+        .payload_ = "next",
+        .payload_source_ = nullptr,
+    });
+    if (!next.ok()) co_return next.status();
+    const auto reclaimed = storage_->LocalReplicationLogInfo();
+    Check(*next == 2 && reclaimed.state_ == ReplicationLogState::kActive &&
+              reclaimed.log_epoch_ == kEpoch && reclaimed.block_count_ == 1 &&
+              reclaimed.floor_lsn_ == 2,
+          "in-flight event allowance survived into a subsequent append");
+    storage_->ReleaseReplicationLogRetention(kEpoch);
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
+  bycorf::Task<absl::Status> ExerciseBackpressuredPublisherReplacement() {
+    constexpr std::uint64_t kOldEpoch = 903;
+    constexpr std::uint64_t kNewEpoch = 904;
+    constexpr std::uint64_t kPin = 90;
+    absl::Status status =
+        co_await storage_->EnableReplicationLog(kOldEpoch, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(kPin, 1);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        0, {"SET", "replacement-old", std::string(9 * kMiB, 'O')}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    Check(storage_->LocalReplicationLogInfo().capacity_backpressured_,
+          "replacement fixture did not retain the oversized old event");
+    status = co_await storage_->DisableReplicationLog();
+    Check(status.ok(), "could not disable the backpressured publisher");
+
+    // Replacing a history with pinned excess blocks must release its state
+    // without invalidating or consuming the new history's publications.
+    status = co_await storage_->EnableReplicationLog(kNewEpoch, 8 * kMiB);
+    Check(status.ok(), "could not enable replacement replication history");
+    auto admission =
+        co_await storage_->AcquireReplicationPublisherAdmission(128);
+    Check(admission.ok(), "replacement publisher admission failed");
+    Check(storage_->TryEnqueueReplicationCommand(
+              lavik::storage::ReplicationCommandAppend{
+                  .partition_id_ = 9,
+                  .partition_sequence_ = 1,
+                  .args_ = {"SET", "replacement-new", "value"},
+              }),
+          "replacement command was not enqueued");
+    storage_->ReleaseReplicationPublisherAdmission(*admission, 128);
+    const auto queued = storage_->LocalReplicationLogInfo();
+    Check(queued.log_epoch_ == kNewEpoch && queued.tail_lsn_ == 0 &&
+              queued.publish_queue_bytes_ != 0,
+          "replacement fixture resumed the publisher before enqueue");
+    auto decoded = co_await ReadSinglePublishedCommand(1);
+    const auto published = storage_->LocalReplicationLogInfo();
+    Check(published.state_ == ReplicationLogState::kActive &&
+              published.log_epoch_ == kNewEpoch && published.tail_lsn_ == 1,
+          "old publisher resumed into or invalidated replacement history");
+    Check(decoded.ok() &&
+              decoded->args_ ==
+                  std::vector<std::string>({"SET", "replacement-new", "value"}),
+          "replacement history published the old event or lost the new one");
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
+  bycorf::Task<absl::Status> ExercisePendingTransactionReplacement() {
+    auto status = co_await storage_->EnableReplicationLog(906, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    auto admission =
+        co_await storage_->AcquireReplicationPublisherAdmission(128);
+    if (!admission.ok()) co_return admission.status();
+    auto transaction =
+        std::make_shared<lavik::storage::ReplicationTransaction>();
+    transaction->id_ = 906;
+    transaction->participants_ = {worker_->id()};
+    transaction->payload_flow_ = worker_->id();
+    transaction->envelope_metadata_ = EncodeTestTransactionEnvelope(
+        transaction->id_, transaction->payload_flow_,
+        transaction->participants_);
+    transaction->command_args_ = {"SET", "replacement-pending", "old"};
+    const auto transaction_bytes =
+        lavik::storage::ReplicationTransactionAllocationBytes(
+            transaction->participants_.capacity(),
+            std::span<const std::string>(&transaction->envelope_metadata_, 1),
+            transaction->command_args_);
+    Check(transaction_bytes.has_value(),
+          "pending replacement transaction size overflowed");
+    transaction->retained_charge_.Account(lavik::CurrentMemoryAccountingShard(),
+                                          *transaction_bytes);
+    Check(storage_->TryEnqueueReplicationTransaction(transaction),
+          "pending replacement transaction was not enqueued");
+    storage_->ReleaseReplicationPublisherAdmission(*admission, 128);
+    co_await bycorf::Yield(*worker_);
+    Check(storage_->LocalReplicationLogInfo().tail_lsn_ == 0,
+          "unresolved transaction unexpectedly published");
+
+    // The publisher has popped the transaction and is awaiting resolution.
+    // Replacing its epoch must release this wait even if the old foreground
+    // operation never resolves, then ignore a later invalidation resolution.
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    status = co_await storage_->EnableReplicationLog(907, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    admission = co_await storage_->AcquireReplicationPublisherAdmission(128);
+    if (!admission.ok()) co_return admission.status();
+    Check(storage_->TryEnqueueReplicationCommand(
+              lavik::storage::ReplicationCommandAppend{
+                  .partition_id_ = 9,
+                  .partition_sequence_ = 1,
+                  .args_ = {"SET", "replacement-resolved", "new"},
+              }),
+          "new epoch command was not enqueued after pending transaction");
+    storage_->ReleaseReplicationPublisherAdmission(*admission, 128);
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    transaction->resolution_.store(
+        lavik::storage::ReplicationTransactionResolution::kInvalidate,
+        std::memory_order_release);
+    co_await bycorf::Yield(*worker_);
+    const auto info = storage_->LocalReplicationLogInfo();
+    Check(info.state_ == ReplicationLogState::kActive &&
+              info.log_epoch_ == 907 && info.tail_lsn_ == 1 &&
+              info.publish_queue_bytes_ == 0,
+          "old transaction invalidated or consumed the replacement history");
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
   bycorf::Task<absl::Status> ExerciseFlushControlBarriers() {
     auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
     auto flush_survivor =
@@ -2197,34 +2690,25 @@ class ReplicationLogService final : public bycorf::Service {
           "replication log did not hold publisher staging plus one standby "
           "backlog block");
 
-    const std::string oversized_transaction_key(kMiB, 'T');
-    std::vector<std::vector<std::string>> transaction_commands{
-        {"LMPOP", "2", oversized_transaction_key, "list-other", "LEFT"},
-        {"SUNIONSTORE", "set-destination", oversized_transaction_key},
-        {"ZUNIONSTORE", "zset-destination", "1", oversized_transaction_key},
-        {"SORT", oversized_transaction_key, "STORE", "sort-destination"},
-    };
-    for (auto& args : transaction_commands) {
-      status = co_await ExerciseTransactionGuardAdmission(std::move(args));
-      if (!status.ok()) co_return status;
-    }
+    status = co_await ExerciseTransactionGuardAdmission();
+    if (!status.ok()) co_return status;
     status = co_await ExerciseBitOpPayloadAdmission();
     if (!status.ok()) co_return status;
     co_return absl::OkStatus();
   }
 
-  bycorf::Task<absl::Status> ExerciseReplicationCopyOom() {
+  bycorf::Task<absl::Status> ExerciseNewWriteMemoryAdmission() {
     absl::Status status;
-    // The parsed request already owns this value. Leave enough headroom for
-    // command dispatch itself but not the replication journal's second copy;
-    // SET must fail before publishing either durable state or a log event.
-    std::vector<std::string> admission_args{"SET", "replication-copy-oom",
+    // Continuation may exceed the soft budget only after a write has entered.
+    // An already exhausted steady-state budget still rejects a new SET before
+    // it changes either primary data or replication history.
+    std::vector<std::string> admission_args{"SET", "new-write-oom",
                                             std::string(kMiB, 'M')};
     lavik::RefreshMemoryStats();
     const std::uint64_t used = lavik::GetMemoryStats().used_bytes_;
     if (used > std::numeric_limits<std::uint64_t>::max() - 128 * 1024) {
       co_return absl::ResourceExhaustedError(
-          "cannot construct replication-copy admission test limit");
+          "cannot construct initial-write admission test limit");
     }
     status = lavik::InitMemoryLimit(used + 128 * 1024, 1);
     if (!status.ok()) co_return status;
@@ -2232,8 +2716,8 @@ class ReplicationLogService final : public bycorf::Service {
         0, std::move(admission_args),
         "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
     if (!status.ok()) co_return status;
-    Check(!co_await storage_->Exists(0, "replication-copy-oom"),
-          "rejected replication copy still mutated storage");
+    Check(!co_await storage_->Exists(0, "new-write-oom"),
+          "rejected new write still mutated storage");
     status = lavik::InitMemoryLimit(512 * kMiB, 1);
     if (!status.ok()) co_return status;
     co_return absl::OkStatus();
@@ -2243,10 +2727,13 @@ class ReplicationLogService final : public bycorf::Service {
     absl::Status status = co_await ExerciseFullSyncOverrides();
     if (!status.ok()) co_return status;
 
+    status = co_await ExerciseOrderedPublisherIntents();
+    if (!status.ok()) co_return status;
+
     CheckOrderingAdmission();
     status = co_await ExercisePublisherTransactionAdmission();
     if (!status.ok()) co_return status;
-    status = co_await ExerciseReplicationCopyOom();
+    status = co_await ExerciseNewWriteMemoryAdmission();
     if (!status.ok()) co_return status;
 
     status = co_await ExercisePartitionHandoff();
@@ -2254,8 +2741,242 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
+  bycorf::Task<absl::Status> ExerciseOrderedPublisherIntents() {
+    using lavik::storage::ReplicationPublisherWaiter;
+    auto status = co_await storage_->EnableReplicationLog(908, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
+    if (!status.ok()) co_return status;
+    auto older_id = lavik::storage::NextReplicationPublisherPriority();
+    auto younger_id = lavik::storage::NextReplicationPublisherPriority();
+    if (!older_id.ok()) co_return older_id.status();
+    if (!younger_id.ok()) co_return younger_id.status();
+    ReplicationPublisherWaiter older{.priority_ = *older_id};
+    ReplicationPublisherWaiter younger{.priority_ = *younger_id};
+
+    // Delivery order can differ between workers. The younger request arrives
+    // here first and must relinquish its tentative grant after another worker
+    // refuses it; its persistent intent must still rank behind the older ID.
+    auto younger_grant =
+        storage_->TryAcquireReplicationPublisherAdmission(younger, kMiB);
+    Check(younger_grant.ok() && younger_grant->has_value(),
+          "uncontended younger intent did not receive capacity");
+    auto older_grant =
+        storage_->TryAcquireReplicationPublisherAdmission(older, kMiB);
+    Check(older_grant.ok() && !older_grant->has_value(),
+          "older intent bypassed an outstanding tentative grant");
+    storage_->ReleaseReplicationPublisherAdmission(**younger_grant, kMiB);
+    younger_grant =
+        storage_->TryAcquireReplicationPublisherAdmission(younger, kMiB);
+    Check(younger_grant.ok() && !younger_grant->has_value(),
+          "retrying younger intent barged ahead of the stable older ID");
+    older_grant =
+        storage_->TryAcquireReplicationPublisherAdmission(older, kMiB);
+    Check(older_grant.ok() && older_grant->has_value(),
+          "older intent could not proceed after partial grant rollback");
+    storage_->FinishReplicationPublisherAdmission(older);
+
+    bool ready = false;
+    absl::Status ready_status = absl::UnknownError("intent wait did not run");
+    auto wait_younger = [&]() -> bycorf::Task<absl::Status> {
+      ready_status =
+          co_await storage_->WaitReplicationPublisherAdmission(younger, kMiB);
+      ready = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(wait_younger());
+    co_await bycorf::Yield(*worker_);
+    Check(!ready, "younger intent ignored an admitted command's capacity");
+    storage_->ReleaseReplicationPublisherAdmission(**older_grant, kMiB);
+    Check(co_await WaitForCondition([&] { return ready; }),
+          "returned capacity did not wake the next intent without a write");
+    if (!ready_status.ok()) co_return ready_status;
+    younger_grant =
+        storage_->TryAcquireReplicationPublisherAdmission(younger, kMiB);
+    Check(younger_grant.ok() && younger_grant->has_value(),
+          "awakened intent lost its place across a retry");
+    storage_->FinishReplicationPublisherAdmission(younger);
+
+    auto cancelled_id = lavik::storage::NextReplicationPublisherPriority();
+    if (!cancelled_id.ok()) co_return cancelled_id.status();
+    ReplicationPublisherWaiter cancelled{.priority_ = *cancelled_id};
+    auto blocked =
+        storage_->TryAcquireReplicationPublisherAdmission(cancelled, kMiB);
+    Check(blocked.ok() && !blocked->has_value(),
+          "cancellation fixture did not fill publisher capacity");
+    ready = false;
+    auto wait_cancelled = [&]() -> bycorf::Task<absl::Status> {
+      ready_status =
+          co_await storage_->WaitReplicationPublisherAdmission(cancelled, kMiB);
+      ready = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(wait_cancelled());
+    co_await bycorf::Yield(*worker_);
+    Check(!ready, "cancelled fixture never waited on capacity");
+    storage_->FinishReplicationPublisherAdmission(cancelled);
+    Check(co_await WaitForCondition([&] { return ready; }) &&
+              absl::IsCancelled(ready_status),
+          "removed intent remained asleep on an unchanged capacity signal");
+    storage_->ReleaseReplicationPublisherAdmission(**younger_grant, kMiB);
+
+    auto invalid = storage_->TryAcquireReplicationPublisherAdmission(
+        cancelled, 1,
+        lavik::storage::ReplicationPublisherTarget{.partition_id_ = 0,
+                                                   .db_id_ = 255});
+    Check(!invalid.ok() && absl::IsInvalidArgument(invalid.status()) &&
+              !cancelled.queued_,
+          "failed publisher request stranded an ordered intent");
+    auto final = co_await storage_->AcquireReplicationPublisherAdmission(kMiB);
+    if (!final.ok()) co_return final.status();
+    storage_->ReleaseReplicationPublisherAdmission(*final, kMiB);
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    status = co_await storage_->SetReplicationPublishQueueCapacity(16 * kMiB);
+    if (!status.ok()) co_return status;
+    std::cout << "Publisher stable priority, rollback, wakeup and cancellation "
+                 "PASS\n";
+    co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseReplicationContinuationDebt() {
+    struct RestoreMemoryLimit {
+      ~RestoreMemoryLimit() { (void)lavik::InitMemoryLimit(512 * kMiB, 1); }
+    } restore;
+    for (bool cancel_consumer : {false, true}) {
+      const std::uint64_t epoch = cancel_consumer ? 905 : 904;
+      // Repayment is required even when the borrowed event is below the
+      // configured reconnect window. The quota is a ceiling, not a reason to
+      // retain memory borrowed from other workloads indefinitely.
+      const std::size_t quota_blocks = cancel_consumer ? 1 : 8;
+      auto status = co_await storage_->EnableReplicationLog(
+          epoch, (cancel_consumer ? 3 : quota_blocks) * 8 * kMiB);
+      if (!status.ok()) co_return status;
+      lavik::RefreshMemoryStats();
+      const auto before_admission = lavik::GetMemoryStats().used_bytes_;
+      auto admission =
+          co_await storage_->AcquireReplicationPublisherAdmission(128);
+      if (!admission.ok()) co_return admission.status();
+      lavik::RefreshMemoryStats();
+      Check(lavik::GetMemoryStats().used_bytes_ < before_admission + kMiB,
+            "publisher admission preallocated a complete large event");
+      if (cancel_consumer) {
+        // A quota reduction after admission cannot strand the complete event.
+        status = co_await storage_->SetReplicationLogCapacity(8 * kMiB);
+        if (!status.ok()) co_return status;
+      }
+      status = storage_->RetainReplicationLog(epoch, 1);
+      if (!status.ok()) co_return status;
+      status = LimitRetainedHeadroom();
+      if (!status.ok()) co_return status;
+      lavik::RefreshMemoryStats();
+      const auto before_publication = lavik::GetMemoryStats().used_bytes_;
+      std::vector<std::string> args{"SET", "continued-event",
+                                    std::string(17 * kMiB, 'G')};
+      auto owner = std::make_shared<lavik::RetainedMemoryCharge>();
+      owner->Account(lavik::CurrentMemoryAccountingShard(),
+                     *lavik::storage::ReplicationCommandStagingBytes(args));
+      Check(storage_->TryEnqueueReplicationCommand({
+                .partition_id_ = 9,
+                .partition_sequence_ = 1,
+                .retained_owner_ = std::move(owner),
+                .args_ = std::move(args),
+            }),
+            "admitted continuation could not enqueue its canonical payload");
+      storage_->ReleaseReplicationPublisherAdmission(*admission, 128);
+      status = co_await WaitForReplicationTail(1);
+      if (!status.ok()) co_return status;
+      lavik::RefreshMemoryStats();
+      const auto pinned_bytes = lavik::GetMemoryStats().used_bytes_;
+      const auto pinned = storage_->LocalReplicationLogInfo();
+      Check(pinned.state_ == ReplicationLogState::kActive &&
+                pinned.log_epoch_ == epoch && pinned.block_count_ == 3 &&
+                pinned_bytes >= before_publication + 16 * kMiB &&
+                !lavik::TryReserveMemory(1).has_value(),
+            "continuation failed to publish or account its borrowed blocks");
+      auto body = co_await ReadSinglePublishedCommand(3);
+      if (!body.ok()) co_return body.status();
+      Check(body->args_ ==
+                std::vector<std::string>(
+                    {"SET", "continued-event", std::string(17 * kMiB, 'G')}),
+            "borrowed blocks lost part of the complete canonical event");
+
+      bool next_admitted = false;
+      absl::Status next_status = absl::UnknownError("next writer did not run");
+      auto next_writer = [&]() -> bycorf::Task<absl::Status> {
+        auto next = co_await storage_->AcquireReplicationPublisherAdmission(1);
+        next_status = next.status();
+        if (next.ok()) storage_->ReleaseReplicationPublisherAdmission(*next, 1);
+        next_admitted = true;
+        co_return absl::OkStatus();
+      };
+      worker_->Spawn(next_writer());
+      co_await bycorf::Yield(*worker_);
+      Check(!next_admitted,
+            "borrowed memory allowed another publisher admission");
+      if (cancel_consumer) {
+        storage_->ReleaseReplicationLogRetention(epoch);
+      } else {
+        status = storage_->RetainReplicationLog(epoch, 2);
+        if (!status.ok()) co_return status;
+      }
+      lavik::RefreshMemoryStats();
+      const auto reclaimed = storage_->LocalReplicationLogInfo();
+      Check(
+          reclaimed.state_ == ReplicationLogState::kActive &&
+              reclaimed.log_epoch_ == epoch && reclaimed.tail_lsn_ == 1 &&
+              reclaimed.block_count_ <= quota_blocks &&
+              lavik::GetMemoryStats().used_bytes_ + 16 * kMiB <= pinned_bytes,
+          "safe continuation blocks retained physical memory or reset history");
+      Check(
+          co_await WaitForCondition([&] { return next_admitted; }),
+          "ACK/cancellation failed to reopen admission without another write");
+      if (!next_status.ok()) co_return next_status;
+      storage_->ReleaseReplicationLogRetention(epoch);
+      status = co_await storage_->DisableReplicationLog();
+      if (!status.ok()) co_return status;
+      status = lavik::InitMemoryLimit(512 * kMiB, 1);
+      if (!status.ok()) co_return status;
+    }
+    std::cout
+        << "Replication continuation debt repaid by ACK/cancellation PASS\n";
+    co_return absl::OkStatus();
+  }
+
   bycorf::Task<absl::Status> ExerciseBacklogStorage() {
-    absl::Status status;
+    // The raw API still admits its physical pool. Large representable events
+    // must reach that budget check, without allocating a GiB in this test.
+    auto status = LimitRetainedHeadroom();
+    if (!status.ok()) co_return status;
+    lavik::RefreshMemoryStats();
+    const auto before_large = lavik::GetMemoryStats().used_bytes_;
+    const auto original_history = storage_->LocalReplicationLogInfo();
+    constexpr std::size_t max_fragmented_bytes =
+        (std::uint64_t{std::numeric_limits<std::uint32_t>::max()} + 1) *
+        (lavik::storage::kStorageBlockBytes -
+         sizeof(lavik::storage::ReplicationFrameHeader));
+    for (auto [size, expected] :
+         {std::pair{1024 * kMiB + 1, absl::StatusCode::kResourceExhausted},
+          std::pair{max_fragmented_bytes, absl::StatusCode::kResourceExhausted},
+          std::pair{max_fragmented_bytes + 1, absl::StatusCode::kOutOfRange}}) {
+      RepeatedByteSource source(size, 'L');
+      auto appended =
+          co_await storage_->AppendReplicationLog({.partition_id_ = 3,
+                                                   .partition_sequence_ = 1,
+                                                   .payload_ = {},
+                                                   .payload_source_ = &source});
+      lavik::RefreshMemoryStats();
+      const auto history = storage_->LocalReplicationLogInfo();
+      Check(
+          !appended.ok() && appended.status().code() == expected &&
+              !source.read_ && history.state_ == ReplicationLogState::kActive &&
+              history.log_epoch_ == original_history.log_epoch_ &&
+              history.tail_lsn_ == original_history.tail_lsn_ &&
+              lavik::GetMemoryStats().used_bytes_ == before_large,
+          "large raw append bypassed admission or changed history/accounting");
+    }
+    status = lavik::InitMemoryLimit(512 * kMiB, 1);
+    if (!status.ok()) co_return status;
     const auto before_oversized = storage_->LocalReplicationLogInfo();
     RepeatedByteSource too_large(9 * kMiB, 'x');
     auto oversized =
@@ -2265,14 +2986,12 @@ class ReplicationLogService final : public bycorf::Service {
             .payload_ = {},
             .payload_source_ = &too_large,
         });
-    Check(
-        !oversized.ok() &&
-            oversized.status().code() == absl::StatusCode::kResourceExhausted &&
-            storage_->LocalReplicationLogInfo().state_ ==
-                ReplicationLogState::kActive &&
-            storage_->LocalReplicationLogInfo().tail_lsn_ ==
-                before_oversized.tail_lsn_,
-        "one oversized event exceeded the hard backlog cap");
+    Check(oversized.ok() &&
+              storage_->LocalReplicationLogInfo().state_ ==
+                  ReplicationLogState::kActive &&
+              storage_->LocalReplicationLogInfo().tail_lsn_ ==
+                  before_oversized.tail_lsn_ + 1,
+          "soft backlog target rejected an event with admitted memory");
     auto after_oversized =
         co_await storage_->AppendReplicationLog(ReplicationLogAppend{
             .partition_id_ = 3,
@@ -2281,8 +3000,8 @@ class ReplicationLogService final : public bycorf::Service {
             .payload_source_ = nullptr,
         });
     if (!after_oversized.ok()) co_return after_oversized.status();
-    Check(*after_oversized == before_oversized.tail_lsn_ + 1,
-          "an oversized admission failure consumed an event LSN");
+    Check(*after_oversized == before_oversized.tail_lsn_ + 2,
+          "a large event changed subsequent event LSN ordering");
     status = co_await storage_->SetReplicationLogCapacity(2 * 8 * kMiB);
     if (!status.ok()) co_return status;
     Check(
@@ -2531,6 +3250,20 @@ class ReplicationLogService final : public bycorf::Service {
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseCanonicalTransactionGrowth();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseEvalCaptureContinuation();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseExecCaptureContinuation();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseInFlightBacklogShrink();
+    if (!status.ok()) co_return status;
+    std::cout << "In-flight backlog shrink PASS\n";
+    status = co_await ExerciseBackpressuredPublisherReplacement();
+    if (!status.ok()) co_return status;
+    std::cout << "Backpressured publisher replacement PASS\n";
+    status = co_await ExercisePendingTransactionReplacement();
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseReplicationContinuationDebt();
     if (!status.ok()) co_return status;
     co_return absl::OkStatus();
   }

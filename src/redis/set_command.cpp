@@ -409,7 +409,7 @@ absl::Status ComputeAggregate(SetMultiContext* context) {
 }
 
 std::vector<std::string> EncodeSetMoveEffects(const CommandRequest& request) {
-  std::vector<CapturedReplicationCommand> effects;
+  CapturedReplicationCommands effects;
   effects.reserve(2);
   effects.push_back(CapturedReplicationCommand{
       request.db_id_, {"SREM", request.args_[1], request.args_[3]}});
@@ -420,7 +420,7 @@ std::vector<std::string> EncodeSetMoveEffects(const CommandRequest& request) {
 
 std::vector<std::string> EncodeSetReplacement(
     const CommandRequest& request, const std::vector<std::string>& members) {
-  std::vector<CapturedReplicationCommand> effects;
+  CapturedReplicationCommands effects;
   effects.reserve(members.empty() ? 1 : 2);
   effects.push_back(
       CapturedReplicationCommand{request.db_id_, {"DEL", request.args_[1]}});

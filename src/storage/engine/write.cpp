@@ -1977,15 +1977,41 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     AppendReplicationExpirationEffect(
         &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
         kind == RecordKind::kValue ? expire_at_ms : 0);
+    // Admitted effects may grow beyond the backlog budget. Validate the
+    // encoding's argument and arithmetic bounds before changing data.
+    const auto argc = replication->args_.size();
+    const auto header_bytes = ReplicationCommandFixedHeaderBytes(argc);
+    if (argc == 0 ||
+        argc > static_cast<std::size_t>(
+                   std::numeric_limits<std::int32_t>::max()) ||
+        argc > (std::numeric_limits<std::size_t>::max() - header_bytes) /
+                   sizeof(std::uint32_t)) {
+      co_return absl::ResourceExhaustedError(
+          "replication command argument count exceeds encoding limit");
+    }
+    std::size_t bytes = header_bytes + argc * sizeof(std::uint32_t);
+    for (const auto& argument : replication->args_) {
+      if (argument.size() > kMaxNativeReplicationArgumentBytes ||
+          bytes > std::numeric_limits<std::size_t>::max() - argument.size()) {
+        co_return absl::ResourceExhaustedError(
+            "replication command exceeds encoding bounds");
+      }
+      bytes += argument.size();
+    }
     replication->db_id_ = db_id;
     replication->partition_id_ = partition.id_;
     replication->partition_sequence_ = mutation_sequence;
+    AccountReplicationCommand(replication);
     if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
       // Build the subscriber-owned copy before writing. Active sessions hold
       // fixed staging budgets; a physical allocation failure is fatal rather
       // than converted into a recoverable command error.
-      fullsync_command =
+      auto owned_copy =
           std::make_shared<ReplicationCommandAppend>(*replication);
+      // This copy owns distinct string buffers, so it needs its own charge.
+      owned_copy->retained_owner_.reset();
+      AccountReplicationCommand(owned_copy.get());
+      fullsync_command = std::move(owned_copy);
     }
   }
   absl::Status status = absl::OkStatus();
@@ -2075,12 +2101,33 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   }
   if (status.ok() && tx != nullptr) {
     ++tx->dataset_changes_;
+    const auto previous_capacity = tx->expiration_effects_.capacity();
     tx->expiration_effects_.push_back(TxShardWrites::ExpirationEffect{
         .key_ = std::string(key),
         .expire_at_ms_ = kind == RecordKind::kValue ? expire_at_ms : 0,
         .db_id_ = db_id,
         .exists_ = kind == RecordKind::kValue,
     });
+    // Account capacity growth and this key incrementally: a large MSET must
+    // not rescan every earlier expiration entry after each individual write.
+    const auto capacity = tx->expiration_effects_.capacity();
+    std::size_t bytes = tx->expiration_charge_.bytes();
+    if (capacity != previous_capacity) {
+      bytes += AllocatorUsableSizeForRequest(
+                   capacity * sizeof(TxShardWrites::ExpirationEffect)) -
+               (previous_capacity == 0
+                    ? 0
+                    : AllocatorUsableSizeForRequest(
+                          previous_capacity *
+                          sizeof(TxShardWrites::ExpirationEffect)));
+    }
+    const auto& key_copy = tx->expiration_effects_.back().key_;
+    if (key_copy.capacity() > std::string{}.capacity())
+      bytes += AllocatorUsableSizeForRequest(key_copy.capacity() + 1);
+    if (tx->expiration_charge_.bytes() == 0)
+      tx->expiration_charge_.Account(CurrentMemoryAccountingShard(), bytes);
+    else
+      tx->expiration_charge_.Resize(bytes);
   }
   if (status.ok() && tx == nullptr) {
     RecordDatasetChanges();

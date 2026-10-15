@@ -175,7 +175,7 @@ absl::StatusOr<bool> ParseListLeft(std::string_view value) {
 std::vector<std::string> EncodeListMoveEffects(
     std::uint8_t db_id, std::string_view source, std::string_view destination,
     bool source_left, bool destination_left, std::string_view value) {
-  std::vector<CapturedReplicationCommand> effects;
+  CapturedReplicationCommands effects;
   effects.reserve(2);
   effects.push_back(CapturedReplicationCommand{
       db_id, {source_left ? "LPOP" : "RPOP", std::string(source)}});

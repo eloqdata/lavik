@@ -89,18 +89,14 @@ absl::StatusOr<NativeReplayEffect> NativeReplay::PrepareEffect(
   std::ranges::sort(records, {}, &NativeHistoryRecord::flow_id_);
   std::vector<ReplicatedCommand> decoded;
   decoded.reserve(records.size());
-  std::uint64_t bytes = 0;
   for (std::size_t index = 0; index < records.size(); ++index) {
     const auto& record = records[index];
     if (record.flow_id_ >= applied_->size() || record.lsn_ == 0 ||
         record.lsn_ == std::numeric_limits<std::uint64_t>::max() ||
-        (index != 0 && records[index - 1].flow_id_ == record.flow_id_) ||
-        record.canonical_.size() > kMaxNativeReplicationEventBytes - bytes) {
+        (index != 0 && records[index - 1].flow_id_ == record.flow_id_)) {
       return absl::InvalidArgumentError(
-          "retained logical effect has invalid participants or exceeds its "
-          "byte bound");
+          "retained logical effect has invalid participants");
     }
-    bytes += record.canonical_.size();
     auto command = DecodeReplicationCommand(record.canonical_);
     if (!command.ok()) return command.status();
     decoded.push_back(std::move(*command));
