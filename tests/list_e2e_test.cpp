@@ -4076,16 +4076,30 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(blocked_zpop.get(), "*3\r\n" + Bulk("blocking-zset") + "\r\n" +
                                       Bulk("ready") + "\r\n" + Bulk("4"));
 
+    // Thread launch order does not guarantee waiter registration order.
+    auto wait_for_chained_blocked_clients = [&](std::uint64_t expected) {
+      const std::string field =
+          "blocked_clients:" + std::to_string(expected) + "\r\n";
+      const auto deadline = std::chrono::steady_clock::now() + 2s;
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (client.Command({"INFO", "CLIENTS"}).find(field) !=
+            std::string::npos) {
+          return true;
+        }
+        std::this_thread::sleep_for(10ms);
+      }
+      return false;
+    };
     auto first_chained_zpop = std::async(std::launch::async, [port] {
       RespClient blocked(port);
       return blocked.Command({"BZPOPMIN", "blocking-zset-chain", "2"});
     });
-    std::this_thread::sleep_for(30ms);
+    ASSERT_TRUE(wait_for_chained_blocked_clients(1));
     auto second_chained_zpop = std::async(std::launch::async, [port] {
       RespClient blocked(port);
       return blocked.Command({"BZPOPMIN", "blocking-zset-chain", "2"});
     });
-    std::this_thread::sleep_for(50ms);
+    ASSERT_TRUE(wait_for_chained_blocked_clients(2));
     EXPECT_EQ(client.Command(
                   {"ZADD", "blocking-zset-chain", "1", "first", "2", "second"}),
               ":2");
