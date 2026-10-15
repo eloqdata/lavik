@@ -765,10 +765,15 @@ V1 uses a 16-bit argument count and an eight-byte fixed header; V2 uses a
 both versions. Writers retain V1 for up to 65,535 arguments and use V2 for
 larger commands, preserving old-reader compatibility for representable events.
 There is no command-codec capability negotiation; all nodes that may consume
-V2 events must be upgraded before those larger commands are issued.
-The complete-event byte budget bounds large batches and their length tables
-before allocation. Large arguments stream into the backlog without another
-complete flattened allocation. The native v1
+V2 events or events larger than 1 GiB must support them before those commands
+are issued. Older readers reject complete events above 1 GiB even when their
+individual arguments are valid. Each argument remains bounded by 1 GiB;
+argument counts, addressable sizes, and fragment indices retain their encoding
+bounds. The complete event has no additional fixed byte limit. Large arguments
+stream into the backlog without another complete flattened allocation. Receivers
+assemble a complete event before decoding its owned arguments, so reception
+and replay can require several times the event's payload size in memory.
+The native v1
 transport wraps each fragment in a versioned little-endian header containing
 magic, header and payload lengths, kind, and payload CRC32C. One logical event
 has one flow-local LSN and may span transport fragments and 8 MiB memory blocks,
@@ -794,9 +799,8 @@ queue staging allowances remain separate from these actual allocation charges.
 One command larger than its publisher-staging waterline may proceed only as the
 sole queued item so the queue cannot deadlock on an item that no consumer can
 make smaller. Command and EXEC admission reject an estimated event larger than
-the effective per-flow `repl-backlog-size` capacity or the 1 GiB native-event
-limit. Once admitted, dynamic effects such as Lua writes may exceed the backlog
-budget; the complete canonical event still has the 1 GiB encoding limit.
+the effective per-flow `repl-backlog-size` capacity. Once admitted, dynamic
+effects such as Lua writes may exceed the backlog budget and 1 GiB total size.
 The publisher allocates blocks on demand and completes accepted events
 without waiting for ACKs between participant markers and payload. Commands
 release their locks and publisher admission without waiting for background
@@ -1600,7 +1604,8 @@ names, overrides, reporting, and independent client semantics and authority.
 upstream to verify that blocked commands, WATCH and KEYS cannot cross dataset
 replacement. External Sentinel HA is outside the supported contract.
 `tests/replication_command_test.cpp` covers legacy wire compatibility, wide
-argument counts, malformed command bodies, and the complete-event byte limit.
+argument counts, malformed command bodies, individual argument bounds, and
+streamed complete events larger than 1 GiB.
 
 ## Source map
 

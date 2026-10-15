@@ -47,9 +47,10 @@ class CaptureMemoryScope {
   unsigned previous_;
 };
 
-std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
-  std::string encoded(source.size(), '\0');
-  auto task = source.Read(0, std::as_writable_bytes(std::span(encoded)));
+std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source,
+                              std::uint64_t offset, std::size_t count) {
+  std::string encoded(count, '\0');
+  auto task = source.Read(offset, std::as_writable_bytes(std::span(encoded)));
   // This in-memory source never suspends. Detect any future asynchronous
   // dependency instead of resuming a coroutine owned by another operation.
   auto handle = std::move(task).ReleaseHandle();
@@ -58,6 +59,10 @@ std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
   if (handle.done()) EXPECT_TRUE(handle.promise().value_.ok());
   handle.destroy();
   return encoded;
+}
+
+std::string ReadCommandSource(lavik::ReplicationCommandPayloadSource& source) {
+  return ReadCommandSource(source, 0, source.size());
 }
 
 TEST(ReplicationCommandTest, CaptureChargeFollowsMovedEffects) {
@@ -397,42 +402,61 @@ TEST(ReplicationCommandTest, RejectsMalformedWideFormat) {
   EXPECT_FALSE(lavik::DecodeReplicationCommand(valid + "extra").ok());
 }
 
-TEST(ReplicationCommandTest, EnforcesCompleteEncodingLimit) {
-  const std::string one_mebibyte(1024 * 1024, 'x');
+TEST(ReplicationCommandTest, StreamsLegacyEncodingBeyondOneGiB) {
+  std::string one_mebibyte(1024 * 1024, 'x');
+  one_mebibyte.front() = 'a';
+  one_mebibyte.back() = 'z';
   std::vector<std::string_view> args(1024, one_mebibyte);
   constexpr std::size_t kHeaderBytes = 8 + 1024 * sizeof(std::uint32_t);
-  args.back() = std::string_view(one_mebibyte).substr(kHeaderBytes);
-
-  auto exact = lavik::ReplicationCommandPayloadSource::Create(0, args);
-  ASSERT_TRUE(exact.ok()) << exact.status();
-  EXPECT_EQ(exact->size(), lavik::kMaxNativeReplicationEventBytes);
-
-  args.back() = std::string_view(one_mebibyte).substr(kHeaderBytes - 1);
-  auto oversized = lavik::ReplicationCommandPayloadSource::Create(0, args);
-
-  EXPECT_FALSE(oversized.ok());
-  EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
+  // Reused views exercise the former aggregate limit without allocating a
+  // gigabyte. Reads still visit the actual source bytes at large offsets.
+  auto source = lavik::ReplicationCommandPayloadSource::Create(0, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+  EXPECT_EQ(source->size(),
+            lavik::kMaxNativeReplicationArgumentBytes + kHeaderBytes);
+  EXPECT_EQ(ReadCommandSource(
+                *source, lavik::kMaxNativeReplicationArgumentBytes - 8, 16),
+            std::string(16, 'x'));
+  EXPECT_EQ(
+      ReadCommandSource(*source, source->size() - one_mebibyte.size() - 1, 3),
+      "zax");
+  EXPECT_EQ(ReadCommandSource(*source, source->size() - 2, 2), "xz");
 }
 
-TEST(ReplicationCommandTest, EnforcesCompleteWideEncodingLimit) {
+TEST(ReplicationCommandTest, StreamsWideEncodingBeyondOneGiB) {
   constexpr std::size_t count = 65536;
   constexpr std::size_t payload_bytes = 16 * 1024;
   constexpr std::size_t header_bytes = 10 + count * sizeof(std::uint32_t);
-  const std::string payload(payload_bytes, 'x');
+  std::string payload(payload_bytes, 'x');
+  payload.front() = 'a';
+  payload.back() = 'z';
   std::vector<std::string_view> args(count, payload);
-  // Reuse one payload to test the 1 GiB accounting boundary without owning
-  // that much memory. Leave exactly the widened header's worth of headroom.
-  for (std::size_t i = 0; i < header_bytes / payload_bytes; ++i) args[i] = {};
-  args[header_bytes / payload_bytes] =
-      std::string_view(payload).substr(header_bytes % payload_bytes);
-  auto exact = lavik::ReplicationCommandPayloadSource::Create(0, args);
-  ASSERT_TRUE(exact.ok()) << exact.status();
-  EXPECT_EQ(exact->size(), lavik::kMaxNativeReplicationEventBytes);
+  auto source = lavik::ReplicationCommandPayloadSource::Create(0, args);
+  ASSERT_TRUE(source.ok()) << source.status();
+  EXPECT_EQ(source->size(),
+            lavik::kMaxNativeReplicationArgumentBytes + header_bytes);
+  EXPECT_EQ(ReadCommandSource(
+                *source, lavik::kMaxNativeReplicationArgumentBytes - 8, 16),
+            std::string(16, 'x'));
+  EXPECT_EQ(ReadCommandSource(*source, source->size() - payload_bytes - 1, 3),
+            "zax");
+  EXPECT_EQ(ReadCommandSource(*source, source->size() - 2, 2), "xz");
+}
 
-  args[header_bytes / payload_bytes] =
-      std::string_view(payload).substr(header_bytes % payload_bytes - 1);
-  auto oversized = lavik::ReplicationCommandPayloadSource::Create(0, args);
-  EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
+TEST(ReplicationCommandTest, PreservesArgumentAndCountBounds) {
+  const std::vector<std::string_view> empty;
+  EXPECT_EQ(
+      lavik::ReplicationCommandPayloadSource::Create(0, empty).status().code(),
+      absl::StatusCode::kInvalidArgument);
+  // Validate the argument-length bound before looking for payload bytes, so
+  // the test needs only a header rather than an oversized allocation.
+  std::string encoded("LRC1\x02\0\x01\0\0\0", 10);
+  encoded.append("\0\0\0\x40", 4);
+  EXPECT_EQ(lavik::DecodeReplicationCommand(encoded).status().message(),
+            "truncated replication command payload");
+  encoded[10] = 1;
+  EXPECT_EQ(lavik::DecodeReplicationCommand(encoded).status().message(),
+            "invalid replication command argument length");
 }
 
 }  // namespace

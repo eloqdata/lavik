@@ -32,6 +32,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "../src/redis/list_command.h"
 #include "../src/redis/set_command.h"
@@ -192,6 +193,7 @@ class RepeatedByteSource final : public ReplicationLogPayloadSource {
 
   bycorf::Task<absl::Status> Read(std::uint64_t offset,
                                   std::span<std::byte> output) override {
+    read_ = true;
     if (offset > size_ || output.size() > size_ - offset) {
       co_return absl::Status(absl::StatusCode::kOutOfRange,
                              "test payload source read is out of range");
@@ -199,6 +201,8 @@ class RepeatedByteSource final : public ReplicationLogPayloadSource {
     std::fill(output.begin(), output.end(), static_cast<std::byte>(byte_));
     co_return absl::OkStatus();
   }
+
+  bool read_ = false;
 
  private:
   std::size_t size_ = 0;
@@ -2940,7 +2944,39 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> ExerciseBacklogStorage() {
-    absl::Status status;
+    // The raw API still admits its physical pool. Large representable events
+    // must reach that budget check, without allocating a GiB in this test.
+    auto status = LimitRetainedHeadroom();
+    if (!status.ok()) co_return status;
+    lavik::RefreshMemoryStats();
+    const auto before_large = lavik::GetMemoryStats().used_bytes_;
+    const auto original_history = storage_->LocalReplicationLogInfo();
+    constexpr std::size_t max_fragmented_bytes =
+        (std::uint64_t{std::numeric_limits<std::uint32_t>::max()} + 1) *
+        (lavik::storage::kStorageBlockBytes -
+         sizeof(lavik::storage::ReplicationFrameHeader));
+    for (auto [size, expected] :
+         {std::pair{1024 * kMiB + 1, absl::StatusCode::kResourceExhausted},
+          std::pair{max_fragmented_bytes, absl::StatusCode::kResourceExhausted},
+          std::pair{max_fragmented_bytes + 1, absl::StatusCode::kOutOfRange}}) {
+      RepeatedByteSource source(size, 'L');
+      auto appended =
+          co_await storage_->AppendReplicationLog({.partition_id_ = 3,
+                                                   .partition_sequence_ = 1,
+                                                   .payload_ = {},
+                                                   .payload_source_ = &source});
+      lavik::RefreshMemoryStats();
+      const auto history = storage_->LocalReplicationLogInfo();
+      Check(
+          !appended.ok() && appended.status().code() == expected &&
+              !source.read_ && history.state_ == ReplicationLogState::kActive &&
+              history.log_epoch_ == original_history.log_epoch_ &&
+              history.tail_lsn_ == original_history.tail_lsn_ &&
+              lavik::GetMemoryStats().used_bytes_ == before_large,
+          "large raw append bypassed admission or changed history/accounting");
+    }
+    status = lavik::InitMemoryLimit(512 * kMiB, 1);
+    if (!status.ok()) co_return status;
     const auto before_oversized = storage_->LocalReplicationLogInfo();
     RepeatedByteSource too_large(9 * kMiB, 'x');
     auto oversized =

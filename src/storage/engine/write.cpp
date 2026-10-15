@@ -1977,21 +1977,24 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     AppendReplicationExpirationEffect(
         &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
         kind == RecordKind::kValue ? expire_at_ms : 0);
-    // Soft-budget growth is allowed after publisher admission, but the final
-    // canonical encoding (including TTL) must still fit before data changes.
+    // Admitted effects may grow beyond the backlog budget. Validate the
+    // encoding's argument and arithmetic bounds before changing data.
     const auto argc = replication->args_.size();
-    if (argc == 0 || argc > static_cast<std::size_t>(
-                                std::numeric_limits<std::int32_t>::max())) {
+    const auto header_bytes = ReplicationCommandFixedHeaderBytes(argc);
+    if (argc == 0 ||
+        argc > static_cast<std::size_t>(
+                   std::numeric_limits<std::int32_t>::max()) ||
+        argc > (std::numeric_limits<std::size_t>::max() - header_bytes) /
+                   sizeof(std::uint32_t)) {
       co_return absl::ResourceExhaustedError(
           "replication command argument count exceeds encoding limit");
     }
-    std::size_t bytes =
-        ReplicationCommandFixedHeaderBytes(argc) + argc * sizeof(std::uint32_t);
+    std::size_t bytes = header_bytes + argc * sizeof(std::uint32_t);
     for (const auto& argument : replication->args_) {
-      if (argument.size() > kMaxNativeReplicationEventBytes ||
-          bytes > kMaxNativeReplicationEventBytes - argument.size()) {
+      if (argument.size() > kMaxNativeReplicationArgumentBytes ||
+          bytes > std::numeric_limits<std::size_t>::max() - argument.size()) {
         co_return absl::ResourceExhaustedError(
-            "replication event exceeds the 1 GiB event limit");
+            "replication command exceeds encoding bounds");
       }
       bytes += argument.size();
     }

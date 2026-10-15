@@ -35,12 +35,11 @@ constexpr std::uint8_t kLegacyVersion = 1;
 constexpr std::uint8_t kWideArgumentCountVersion = 2;
 constexpr std::size_t kLegacyMaxArgumentCount =
     std::numeric_limits<std::uint16_t>::max();
-// Match the RESP parser's count range. The complete-event budget also bounds
-// the length table, so a wide count never authorizes unbounded allocation.
+// Match the RESP parser's count range; validate table sizes before allocating.
 constexpr std::size_t kMaxArgumentCount =
     std::numeric_limits<std::int32_t>::max();
 constexpr std::size_t kMaxArgumentBytes =
-    static_cast<std::size_t>(kMaxNativeReplicationEventBytes);
+    static_cast<std::size_t>(kMaxNativeReplicationArgumentBytes);
 constexpr std::string_view kTransactionMagic = "LTX1";
 constexpr std::size_t kTransactionFixedBytes = 16;
 constexpr std::size_t kMaxTransactionBitmapBytes =
@@ -127,12 +126,13 @@ absl::StatusOr<std::size_t> CommandHeaderBytes(std::size_t argument_count) {
   }
   const std::size_t fixed_bytes =
       ReplicationCommandFixedHeaderBytes(argument_count);
-  // Check before reserving either the encoded table or the argument views.
-  // In V2 the count alone can describe a table larger than the event budget.
-  if (argument_count >
-      (kMaxNativeReplicationEventBytes - fixed_bytes) / sizeof(std::uint32_t)) {
+  // A large transaction can have a length table larger than one argument.
+  // Check both allocation products before reserving either table.
+  constexpr auto maximum = std::numeric_limits<std::size_t>::max();
+  if (argument_count > (maximum - fixed_bytes) / sizeof(std::uint32_t) ||
+      argument_count > maximum / sizeof(std::string_view)) {
     return absl::ResourceExhaustedError(
-        "replication command exceeds the native event limit");
+        "replication command header size overflow");
   }
   return fixed_bytes + argument_count * sizeof(std::uint32_t);
 }
@@ -257,13 +257,12 @@ ReplicationCommandPayloadSource::Create(
   source.metadata_charge_.Account(CurrentMemoryAccountingShard(), retained);
   for (std::string_view arg : args) {
     if (arg.size() > kMaxArgumentBytes ||
-        arg.size() > std::numeric_limits<std::uint32_t>::max() ||
-        source.size_ > std::numeric_limits<std::uint64_t>::max() - arg.size()) {
+        arg.size() > std::numeric_limits<std::uint32_t>::max()) {
       return Malformed("replication command argument is too large");
     }
-    if (source.size_ > kMaxNativeReplicationEventBytes - arg.size()) {
-      return absl::ResourceExhaustedError(
-          "replication command exceeds the native event limit");
+    if (source.size_ > std::numeric_limits<std::uint64_t>::max() - arg.size() ||
+        source.size_ > std::numeric_limits<std::size_t>::max() - arg.size()) {
+      return absl::ResourceExhaustedError("replication command size overflow");
     }
     PutU32(&source.header_, static_cast<std::uint32_t>(arg.size()));
     source.args_.push_back(arg);
@@ -314,10 +313,6 @@ bycorf::Task<absl::Status> ReplicationCommandPayloadSource::Read(
 // boundary instead of checking each argument copy independently.
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     std::string_view encoded) try {
-  if (encoded.size() > kMaxNativeReplicationEventBytes) {
-    return absl::ResourceExhaustedError(
-        "replication command exceeds the native event limit");
-  }
   if (encoded.size() < 6 || encoded.substr(0, kMagic.size()) != kMagic) {
     return Malformed("invalid replication command magic");
   }

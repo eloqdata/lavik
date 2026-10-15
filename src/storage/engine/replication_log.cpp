@@ -825,15 +825,19 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
 
   std::size_t event_bytes = ReplicationCommandFixedHeaderBytes(args.size());
   if (args.size() >
-      (kMaxRecordPayloadBytes - event_bytes) / sizeof(std::uint32_t)) {
+          static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
+      args.size() > (std::numeric_limits<std::size_t>::max() - event_bytes) /
+                        sizeof(std::uint32_t)) {
     co_return absl::OutOfRangeError(
-        "replication event exceeds the 1 GiB limit");
+        "replication command argument count exceeds encoding bounds");
   }
   event_bytes += args.size() * sizeof(std::uint32_t);
   for (const auto& argument : args) {
-    if (argument.size() > kMaxRecordPayloadBytes - event_bytes) {
+    if (argument.size() > kMaxNativeReplicationArgumentBytes ||
+        argument.size() >
+            std::numeric_limits<std::size_t>::max() - event_bytes) {
       co_return absl::OutOfRangeError(
-          "replication event exceeds the 1 GiB limit");
+          "replication command exceeds encoding bounds");
     }
     event_bytes += argument.size();
   }
@@ -1667,10 +1671,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
   const std::uint64_t logical_payload_bytes =
       event.payload_source_ == nullptr ? event.payload_.size()
                                        : event.payload_source_->size();
-  if (logical_payload_bytes > kMaxRecordPayloadBytes ||
-      logical_payload_bytes > std::numeric_limits<std::size_t>::max()) {
+  if (logical_payload_bytes > std::numeric_limits<std::size_t>::max()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
-                           "replication event exceeds the 1 GiB limit");
+                           "replication event exceeds addressable size");
   }
   const std::size_t frame_payload_capacity =
       kStorageBlockBytes - sizeof(ReplicationFrameHeader);
@@ -1678,6 +1681,12 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
       logical_payload_bytes == 0
           ? 1
           : 1 + (logical_payload_bytes - 1) / frame_payload_capacity;
+  // Replication events span blocks independently of the storage-record size
+  // limit. Every fragment index must remain representable before any append.
+  if (required_blocks - 1 > std::numeric_limits<std::uint32_t>::max()) {
+    co_return absl::OutOfRangeError(
+        "replication event exceeds the fragment index range");
+  }
   if (!already_admitted) {
     // The raw API has no preceding dataset mutation. Establish its complete
     // guarantee before writing even the first fragment, independently of the
@@ -1814,7 +1823,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     }
     block.CommitAppend(lsn, fragment_index, frame_bytes);
     payload_offset += payload_bytes;
-    ++fragment_index;
+    if (!last) ++fragment_index;
     emitted = true;
     if (block.committed_bytes_ == kStorageBlockBytes) {
       absl::Status sealed = co_await SealReplicationLogActiveBlock(store);

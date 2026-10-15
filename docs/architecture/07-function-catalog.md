@@ -68,8 +68,8 @@ A successful primary mutation follows one commit order:
 ```text
 complete target
   -> encode existing FUNCTION DUMP format
-  -> require the complete synthetic FUNCTION RESTORE event to fit the 1 GiB
-     native-event limit
+  -> require the dump argument to fit the 1 GiB catalog limit and validate
+     the synthetic FUNCTION RESTORE encoding
   -> hidden stage and cross-worker validation
   -> use the pre-mutation replication publication admission
   -> commit the complete dump to system-state v1

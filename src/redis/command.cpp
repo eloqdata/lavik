@@ -182,7 +182,6 @@ bool ReplicationEventExceedsBacklog(std::size_t bytes) noexcept {
   // Check the request estimate before starting a command or transaction.
   // Dynamic effects (including Lua writes) may outgrow this estimate: admitted
   // work must finish publishing even when it exceeds the backlog budget.
-  if (bytes > kMaxNativeReplicationEventBytes) return true;
   if (g_replication == nullptr || g_storage == nullptr) return false;
   const std::size_t total_blocks =
       g_replication->backlog_size_bytes() / storage::kStorageBlockBytes;
@@ -10941,7 +10940,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     co_await DropWatches(ctx);
     co_return BuiltReply(reply_builder.AppendError(
         "ERR replication publisher admission failed: canonical EXEC event "
-        "exceeds repl-backlog-size or the 1 GiB event limit"));
+        "exceeds repl-backlog-size"));
   }
   auto admission = co_await AcquireReplicationPublisherAdmission(logical_bytes);
   if (!admission.ok()) {
@@ -13281,7 +13280,7 @@ Task<CommandReply> ExecuteAdmittedWriteCommand(CommandRequest& request,
   if (ReplicationEventExceedsBacklog(event_bytes)) {
     co_return BuiltReply(reply_builder.AppendError(
         "ERR replication publisher admission failed: canonical event exceeds "
-        "repl-backlog-size or the 1 GiB event limit"));
+        "repl-backlog-size"));
   }
   // All writes complete publisher admission before
   // taking the cross-flow publication gate. Holding that gate while waiting
@@ -13408,7 +13407,7 @@ Task<absl::Status> RunReplicationAdmittedAttempt(
   const std::size_t event_bytes = ReplicationEventAdmissionBytes(request);
   if (ReplicationEventExceedsBacklog(event_bytes)) {
     co_return absl::ResourceExhaustedError(
-        "replication event exceeds repl-backlog-size or the 1 GiB event limit");
+        "replication event exceeds repl-backlog-size");
   }
   auto admission = co_await AcquireReplicationPublisherAdmission(
       RequestArgumentBytes(request), &request);

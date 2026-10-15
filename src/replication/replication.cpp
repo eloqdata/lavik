@@ -793,10 +793,11 @@ std::size_t EncodedRecordBytes(const SnapshotRecord& record) {
 
 absl::Status AppendReplicationString(std::string* output,
                                      std::string_view value) {
-  if (output->size() > kMaxNativeReplicationEventBytes ||
-      value.size() > kMaxNativeReplicationEventBytes - output->size()) {
+  // Frames bound transport buffers; a complete command may span any number
+  // that fits its fragment index and the receiver's string representation.
+  if (value.size() > output->max_size() - output->size()) {
     return absl::ResourceExhaustedError(
-        "replication command exceeds the native event limit");
+        "replication command exceeds the receiver's string limit");
   }
   absl::Status reserved =
       ReserveReplicationString(output, output->size() + value.size());
@@ -8766,7 +8767,9 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
       next_command_fragment = 0;
       staged_command.clear();
     }
-    if (staged_command_lsn != lsn || fragment != next_command_fragment) {
+    // The final fragment may use UINT32_MAX; only a successor would wrap.
+    if (staged_command_lsn != lsn || fragment != next_command_fragment ||
+        (!last && fragment == std::numeric_limits<std::uint32_t>::max())) {
       receiver_status = absl::InvalidArgumentError(
           "replication command fragment is out of order");
       break;
@@ -8778,8 +8781,10 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
       receiver_status = appended;
       break;
     }
-    ++next_command_fragment;
-    if (!last) continue;
+    if (!last) {
+      ++next_command_fragment;
+      continue;
+    }
     auto command = DecodeReplicationCommand(staged_command);
     if (!command.ok()) {
       receiver_status = command.status();
@@ -9181,7 +9186,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         staged_command.clear();
       }
       if (staged_command_lsn != source_lsn ||
-          fragment != next_command_fragment) {
+          fragment != next_command_fragment ||
+          (!last && fragment == std::numeric_limits<std::uint32_t>::max())) {
         co_return absl::InvalidArgumentError(
             "full-sync command fragment is out of order");
       }
@@ -9189,7 +9195,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           &staged_command,
           std::string_view(frame->second.data() + 31, reader.remaining()));
       if (!appended.ok()) co_return appended;
-      ++next_command_fragment;
+      if (!last) ++next_command_fragment;
       if (last) {
         auto command = DecodeReplicationCommand(staged_command);
         const bool publish =
@@ -10287,6 +10293,11 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           }
           const bool first = command_offset == 0;
           const bool last = command_offset + count == encoded.payload_bytes_;
+          if (!last &&
+              command_fragment == std::numeric_limits<std::uint32_t>::max()) {
+            co_return absl::ResourceExhaustedError(
+                "full-sync command exceeds the fragment index limit");
+          }
           std::uint8_t flags = 0;
           if (first) {
             flags |= static_cast<std::uint8_t>(
@@ -10328,11 +10339,12 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           batch_bytes += wire_bytes;
           ++fullsync_sequence;
           command_offset += count;
-          ++command_fragment;
           if (last) {
             ++command_index;
             command_offset = 0;
             command_fragment = 0;
+          } else {
+            ++command_fragment;
           }
         }
 
@@ -10429,6 +10441,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       const std::size_t count = std::min(kFragmentBytes, total - offset);
       const bool first = offset == 0;
       const bool last = offset + count == total;
+      if (!last && fragment == std::numeric_limits<std::uint32_t>::max()) {
+        co_return absl::ResourceExhaustedError(
+            "function catalog exceeds the fragment index limit");
+      }
       std::uint8_t flags = 0;
       if (first) {
         flags |=
@@ -10445,7 +10461,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       PutU16(payload, 0);
       PutU64(payload, 1);
       PutU64(payload, 1);
-      PutU32(payload, fragment++);
+      PutU32(payload, fragment);
       PutU8(payload, flags);
       const std::size_t payload_offset = payload.size();
       payload.resize(payload_offset + count);
@@ -10465,6 +10481,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       if (last) {
         co_return co_await WaitFullSyncRequest(ack_state, sequence);
       }
+      ++fragment;
       offset += count;
     } while (offset < total);
     co_return absl::InternalError("empty function catalog command");
