@@ -2251,8 +2251,11 @@ endforeach()
       NAME lavik_compact_collection_write_e2e
       COMMAND lavik_compact_collection_write_e2e_test $<TARGET_FILE:lavik>
     )
+    # The full write/recovery matrix can exceed ten minutes on ARM64 Debug
+    # runners. Allow time for all cases; their individual wait deadlines remain
+    # bounded by the fixtures.
     set_tests_properties(lavik_compact_collection_write_e2e PROPERTIES
-      TIMEOUT 600 RUN_SERIAL TRUE
+      TIMEOUT 900 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_adaptive_flush_e2e_test
