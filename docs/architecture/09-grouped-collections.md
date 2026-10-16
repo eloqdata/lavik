@@ -62,9 +62,10 @@ whole replacement or shrinking may create a fresh incarnation or a compact value
 Whole String writes borrow immutable input segments until every changed page
 has been encoded into staging. Published directories and queued commit receipts
 retain no borrowed input. Whole String reads validate each segment against the
-retained graph and assemble it directly into the returned read lease. That lease
-uses overflow storage so its lifetime cannot exhaust the fixed slots needed for
-page reads; admission covers its capacity and one page of temporary scratch.
+retained graph and assemble it directly into the returned read lease through
+the shared group-read windows described below. The output lease uses overflow
+storage so its lifetime cannot exhaust the fixed slots needed for page reads.
+Admission covers the output and active page/task scratch.
 For grouped Strings, GETRANGE/GETBIT retain an immutable routing view and read
 only intersecting segments outside worker store state. The page loader checks
 population and physical lifetime across I/O. SETRANGE/SETBIT/APPEND replace
@@ -334,6 +335,21 @@ replacement may demote to a compact record. The append funnel retires the old
 graph after publication while preserving transaction/snapshot ownership. This
 does not change the durable format or the incremental HSET/HMSET path.
 
+Whole String reads, full Hash/Set read-only commands and multi-page List ranges
+share bounded read windows for each physical owner of group records. The key
+owner retains the routing view, child tasks and output admission; only physical
+reads hop to another worker. Each request limits groups against their refreshed
+record owner, including after GC rerouting. Children validate and decode each page,
+then release its read lease before making that owner's capacity available.
+The parent joins every launched read before returning, including on error,
+and rechecks the population and view status after each join. Optional window
+admission covers scheduling metadata and task scratch; insufficient headroom
+falls back to serial reads without weakening output admission.
+Oversized groups retain sequential reads of their payload extents, each routed
+to its own owner; the group window does not impose a separate extent-owner limit.
+External group assembly keeps its output in overflow storage so waiting for
+extent buffers cannot exhaust the fixed pool.
+
 Hash/Set point operations load each affected prefix group once. Point reads
 scan encoded entries and retain only requested values. Multi-field reads group
 request positions by routing leaf, fill result slots in command order, and
@@ -374,13 +390,10 @@ than disguising it as an ordinary admission rejection.
 
 List length uses root metadata. Indexed/range reads validate the corresponding
 rank pages completely and copy only requested values into owned replies.
-Multi-page ranges overlap a bounded window of page reads, join every launched
-read before returning or reporting an error, revalidate the population after
-the join, and append results in rank order.
-The caller owns the child tasks and aggregate reply admission; each child
-releases its physical read lease after decoding. Admission covers one owned
-payload plus reply/page headers and the bounded task window, independently
-of read-buffer accounting. Indexed reads retain their direct single-page path.
+Multi-page ranges use the shared owner windows and assemble results in rank
+order. Admission covers one owned payload plus reply/page headers and the
+bounded task window, independently of read-buffer accounting. Indexed reads
+retain their direct single-page path.
 Read-only operations retain shared
 key intent and an immutable routing view, release worker store state before
 page I/O, and validate population and physical record lifetime in the page
@@ -595,6 +608,7 @@ the reusable containers have independent tests under `tests/containers/`.
 | Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/containers/cow_map.h`, `include/lavik/containers/fenwick_tree.h`, `include/lavik/containers/cow_array.h` |
 | Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped/object_index.h`, `src/storage/engine/grouped/object_index.cpp` |
 | Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/write.cpp`, `src/storage/engine/grouped/mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `include/lavik/storage/detail/grouped/commit.h` |
+| Shared group-read windows, owner limits and joined result ownership | `src/storage/engine/grouped/read_window.h`, `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/ordered_io.cpp`, `src/storage/engine/grouped/list.cpp` |
 | Root-only expiration/persistence publication | `src/storage/engine/grouped/metadata.cpp`, `src/storage/engine/grouped/object_index.cpp`, `write.cpp` |
 | Fixed String segments and direct byte-range operations | `src/storage/engine/grouped/string.cpp`, `src/redis/string_command.cpp` |
 | Foreground scratch admission and pinned key transfers | `include/lavik/storage/detail/grouped/scratch.h`, `src/storage/engine/transfer_api.cpp`, `src/storage/engine/grouped/restore.cpp` |

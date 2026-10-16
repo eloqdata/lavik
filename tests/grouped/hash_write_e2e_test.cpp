@@ -794,6 +794,17 @@ TEST(GroupedHashWriteE2e, OversizedFieldSplitsIntoExtentBackedLeaf) {
   EXPECT_EQ(client.Command({"HGET", "hash", "field0"}).text_, large);
   EXPECT_EQ(client.Command({"HGET", "hash", "field1"}).text_, "neighbor");
   EXPECT_EQ(client.Command({"HLEN", "hash"}).text_, "256");
+  const auto all = client.Command({"HGETALL", "hash"});
+  ASSERT_EQ(all.kind_, '*');
+  ASSERT_EQ(all.items_.size(), 512);
+  std::map<std::string, std::string> expected, actual;
+  for (unsigned i = 0; i < 256; ++i)
+    expected.emplace("field" + std::to_string(i), std::string(128, 'v'));
+  expected["field0"] = large;
+  expected["field1"] = "neighbor";
+  for (std::size_t i = 0; i < all.items_.size(); i += 2)
+    actual.emplace(all.items_[i].text_, all.items_[i + 1].text_);
+  EXPECT_EQ(actual, expected);
 }
 
 TEST(GroupedHashWriteE2e, SetUsesSameGroupedLifecycleWithSetType) {
@@ -820,6 +831,14 @@ TEST(GroupedHashWriteE2e, SetUsesSameGroupedLifecycleWithSetType) {
   EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "0"}).text_, "0");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", "new"}).text_, "1");
   EXPECT_EQ(client.Command({"SISMEMBER", "set", prefix + "255"}).text_, "1");
+  const auto members = client.Command({"SMEMBERS", "set"});
+  ASSERT_EQ(members.kind_, '*');
+  std::set<std::string> expected{"new"}, actual;
+  for (unsigned i = 1; i < 256; ++i)
+    expected.insert(prefix + std::to_string(i));
+  ASSERT_EQ(members.items_.size(), expected.size());
+  for (const auto& member : members.items_) actual.insert(member.text_);
+  EXPECT_EQ(actual, expected);
   for (const auto& member : {prefix + "0", prefix + "255"}) {
     const auto reply = client.Command({"SMISMEMBER", "set", member});
     ASSERT_EQ(reply.items_.size(), 1);

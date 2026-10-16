@@ -1125,8 +1125,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         }
       }
     } else {
-      auto loaded = co_await LoadGroupedHashValue(store, partition, db_id, key,
-                                                  digest, grouped);
+      auto loaded = co_await LoadGroupedHashValue(
+          store, partition, db_id, key, digest, grouped, false, read_only);
       if (!loaded.ok()) {
         if (read_epoch_changed()) co_return HashResult{};
         co_return loaded.status();
