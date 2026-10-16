@@ -881,8 +881,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
 
   auto add_page_budget = [&](GroupedScratchBudget* budget, std::size_t i) {
     // A retained directory protects logical routing, not the allocation of
-    // its old physical records. Earlier page IO (or the read-side yield)
-    // may let GC relocate and reclaim them. Resolve a current physical view
+    // its old physical records. Earlier page I/O or mutation checkpoints may
+    // let GC relocate and reclaim them. Resolve a current physical view
     // without suspending before inspecting its immutable size fields for
     // admission; the loader refreshes again before resolving physical IO.
     const auto& expected = object->version();
@@ -964,11 +964,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto checked = add_page_budget(&budget, i);
     if (!checked.ok()) co_return checked;
     if (ReadOnly(operation) || prepared != nullptr) {
-      // Window children already enter the worker's ready queue individually;
-      // yielding again before their reads adds a scheduler turn per page.
-      // Serial reads can complete from staging without suspending, so retain
-      // bounded cooperative checkpoints for that path.
-      if (limiter == nullptr && page_work.Add(budget.bytes()))
+      // Read-only scans rely on I/O suspension or queued window children for
+      // scheduling. Staging reads may complete synchronously; only unlocked
+      // mutation preparation adds explicit work checkpoints.
+      if (prepared != nullptr && page_work.Add(budget.bytes()))
         co_await bycorf::Yield(*store.worker_);
       if (shutdown_flush_requested_)
         co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
@@ -1123,9 +1122,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       // sorts members independently. Without a resident member index, select
       // one next lexical member per pass: O(N * (offset + output)) work, but
       // only one page, one candidate/boundary, and the admitted reply
-      // survive. Pages revalidate epochs and the scan yields at bounded work
-      // checkpoints, so a large OFFSET does not monopolize this worker or
-      // keep the store mutex across passes.
+      // survive. Pages revalidate epochs without retaining the store mutex
+      // across passes; only asynchronous reads suspend the serial scan.
       std::optional<SortedSetMember> skipped;
       std::uint64_t offset = operation.limit_ ? operation.offset_ : 0;
       for (;;) {
@@ -1375,9 +1373,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto checked = budget.AddGroup(*physical, current->ExtentsFor(id));
       if (!checked.ok()) co_return checked;
       if (ReadOnly(operation) || prepared != nullptr) {
-        // Only an immutable size estimate crosses this yield. The loader
-        // refreshes the physical location and checks the logical view again.
-        if (page_work.Add(budget.bytes()))
+        // Only unlocked mutation preparation adds an explicit checkpoint.
+        // The loader refreshes the physical location and logical view after
+        // any suspension; read-only lookups rely on their I/O waits.
+        if (prepared != nullptr && page_work.Add(budget.bytes()))
           co_await bycorf::Yield(*store.worker_);
         if (shutdown_flush_requested_)
           co_return absl::CancelledError("member read cancelled by shutdown");

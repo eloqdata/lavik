@@ -1950,25 +1950,17 @@ TEST_F(LoadValueAwaitableTestPeer,
 }
 
 TEST_F(LoadValueAwaitableTestPeer,
-       ResidentZsetSerialScanYieldsToOtherReadyWork) {
+       StagedZsetSerialScanCompletesWithoutExtraYield) {
   ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
-  // ZCOUNT keeps the serial page path. Every page is resident, so no disk
-  // suspension can accidentally provide the fairness checkpoint under test.
+  // ZCOUNT keeps the serial page path. Staging supplies every page without
+  // disk I/O, so the scan can finish before returning to the worker loop.
   auto task = ReadGroupedZset(
       {.kind_ = SortedSetOperationKind::kCount,
        .range_mode_ = SortedSetRangeMode::kScore,
        .minimum_score_ = {-std::numeric_limits<double>::infinity(), false},
        .maximum_score_ = {std::numeric_limits<double>::infinity(), false}});
   Start(task);
-  ASSERT_FALSE(task.done());
-  bool ran_before_scan_finished = false;
-  auto observer = [&]() -> Task<absl::Status> {
-    ran_before_scan_finished = !task.done();
-    co_return absl::OkStatus();
-  };
-  worker_.Spawn(observer());
-  ASSERT_NO_FATAL_FAILURE(Drain(task));
-  EXPECT_TRUE(ran_before_scan_finished);
+  ASSERT_TRUE(task.done());
   const auto result = std::move(task).TakeResult();
   ASSERT_TRUE(result.ok()) << result.status();
   EXPECT_EQ(result->count_, zset_values_.size());

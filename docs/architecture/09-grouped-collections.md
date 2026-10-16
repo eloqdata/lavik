@@ -440,9 +440,9 @@ Mixed-score BYLEX preserves global member ordering without a resident member
 index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset
 and result count. Read-only scans retain shared key intent and revalidate their
-population without retaining the store mutex. Serial scans use bounded
-cooperative checkpoints; parallel window children already run as separately
-queued tasks. Add, increment,
+population without retaining the store mutex. Read-only scans rely on storage
+waits and queued window tasks for scheduling, without explicit page-work
+checkpoints. Add, increment,
 remove and GEOADD use the member index to resolve old scores
 before locating ordered source pages and routing final scores against old page
 boundaries. Resident score bounds skip unrelated pages; equal-score runs still
