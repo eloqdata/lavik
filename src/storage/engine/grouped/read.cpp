@@ -248,6 +248,39 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
   const auto& directory = object->directory();
   const auto count = directory.root().field_count_;
   HashValue result;
+  auto read = [&](GroupedRecordId id, GroupReadLimiter* limiter = nullptr) {
+    if (!parallel)
+      return LoadHashGroupSnapshot(store, partition, db_id, key, digest, object,
+                                   id, pinned, limiter);
+    return LoadHashGroup<LoadedHashGroup>(
+        store, partition, db_id, key, digest, object, id, pinned,
+        [object, id](std::string_view payload, std::uint64_t sequence,
+                     std::uint32_t field_count,
+                     LoadedValue&&) -> absl::StatusOr<LoadedHashGroup> {
+          // Terminal full reads only move field/value bytes into replies.
+          // Reuse the persisted routing digest for duplicate detection and
+          // omit the process-local lookup digest they never consume. Keep
+          // this decoder when optional window admission falls back to serial.
+          LoadedHashGroup loaded{
+              .sequence_ = sequence,
+              .snapshot_ = {
+                  .incarnation_ = object->directory().root().incarnation_,
+                  .id_ = id,
+                  .value_ = {}}};
+          auto& fields = loaded.snapshot_.value_.entries_;
+          fields.reserve(field_count);
+          const auto valid = VisitHashGroupFields(
+              payload, field_count, id, object->directory().root().seed_,
+              [&](const HashEntryView& entry) {
+                fields.push_back({.field_ = std::string(entry.field_),
+                                  .value_ = std::string(entry.value_)});
+                return absl::OkStatus();
+              });
+          if (!valid.ok()) return valid;
+          return loaded;
+        },
+        limiter);
+  };
   struct Selection {
     GroupedRecordId id_;
     std::size_t offset_;
@@ -287,8 +320,7 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
   }
   if (!plan) {
     for (const auto& [prefix, metadata] : directory.groups()) {
-      auto loaded = co_await LoadHashGroupSnapshot(
-          store, partition, db_id, key, digest, object, metadata.id_, pinned);
+      auto loaded = co_await read(metadata.id_);
       if (!loaded.ok()) co_return loaded.status();
       for (auto& field : loaded->snapshot_.value_.entries_)
         result.entries_.push_back(std::move(field));
@@ -312,10 +344,7 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
                 "OOM grouped Hash read batch admission");
             break;
           }
-          window.Add(LoadHashGroupSnapshot(store, partition, db_id, key, digest,
-                                           object, selected[*ordinal].id_,
-                                           pinned, window.limiter()),
-                     *ordinal);
+          window.Add(read(selected[*ordinal].id_, window.limiter()), *ordinal);
         }
         if (!start_status.ok()) break;
       }

@@ -1279,6 +1279,20 @@ TEST(GroupedSortedSetWriteE2e, PageScanRepliesOwnBinaryMembersAcrossRecovery) {
     ASSERT_EQ(reverse.items_.size(), 9);
     for (std::size_t i = 0; i < reverse.items_.size(); ++i)
       EXPECT_EQ(reverse.items_[i].text_, members[67 - i]);
+    for (const bool reverse_score : {false, true}) {
+      std::vector<std::string> command{"ZRANGE", "borrowed-pages",
+                                       reverse_score ? "119" : "(8",
+                                       reverse_score ? "(8" : "119", "BYSCORE"};
+      if (reverse_score) command.push_back("REV");
+      command.insert(command.end(), {"LIMIT", "7", "99", "WITHSCORES"});
+      const auto score = client.Command(command);
+      ASSERT_EQ(score.items_.size(), 198) << score.text_;
+      for (std::size_t i = 0; i < 99; ++i) {
+        const auto rank = reverse_score ? 112 - i : 16 + i;
+        EXPECT_EQ(score.items_[2 * i].text_, members[rank]);
+        EXPECT_EQ(score.items_[2 * i + 1].text_, std::to_string(rank));
+      }
+    }
     EXPECT_EQ(client.Command({"ZRANK", "borrowed-pages", members.back()}).text_,
               "127");
     EXPECT_EQ(client.Command({"ZCOUNT", "borrowed-pages", "(60", "68"}).text_,

@@ -146,7 +146,8 @@ Task<absl::StatusOr<LoadedOrderedGroup>>
 StorageEngine::Impl::LoadOrderedGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, std::uint64_t page_id, bool pinned) {
+    GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
+    GroupReadLimiter* limiter) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
       [](std::string_view payload, std::uint64_t sequence,
@@ -160,7 +161,8 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
           return absl::DataLossError("ordered page score bounds mismatch");
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
-      });
+      },
+      limiter);
 }
 
 Task<absl::StatusOr<std::vector<std::string>>>

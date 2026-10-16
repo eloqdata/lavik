@@ -1125,8 +1125,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         }
       }
     } else {
+      const bool full_read = operation.kind_ == HashOperationKind::kGetAll ||
+                             operation.kind_ == HashOperationKind::kKeys ||
+                             operation.kind_ == HashOperationKind::kValues;
       auto loaded = co_await LoadGroupedHashValue(
-          store, partition, db_id, key, digest, grouped, false, read_only);
+          store, partition, db_id, key, digest, grouped, false, full_read);
       if (!loaded.ok()) {
         if (read_epoch_changed()) co_return HashResult{};
         co_return loaded.status();

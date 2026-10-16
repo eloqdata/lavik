@@ -25,6 +25,7 @@
 #include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
+#include "read_window.h"
 #include "zset_work_budget.h"
 
 namespace lavik::storage {
@@ -94,9 +95,11 @@ bool Matches(const auto& entry, const SortedSetOperation& operation) {
                             : entry.value_ <= high.value_)));
 }
 
-absl::StatusOr<SortedSetMember> CopyOutput(const auto& entry) {
-  auto admission = TryReserveMemory(entry.value_.size() + 64);
-  if (!admission) {
+absl::StatusOr<SortedSetMember> CopyOutput(const auto& entry,
+                                           bool prepaid = false) {
+  auto admission = prepaid ? std::optional<MemoryReservation>{}
+                           : TryReserveMemory(entry.value_.size() + 64);
+  if (!prepaid && !admission) {
     RecordMemoryRejection();
     return absl::ResourceExhaustedError(
         "OOM Sorted Set output member admission");
@@ -104,26 +107,38 @@ absl::StatusOr<SortedSetMember> CopyOutput(const auto& entry) {
   SortedSetMember output;
   output.member_ = entry.value_;
   output.score_ = entry.score_;
-  output.retained_charge_.Adopt(&*admission, output.member_.capacity() + 1);
+  if (prepaid)
+    output.retained_charge_.Account(CurrentMemoryAccountingShard(),
+                                    output.member_.capacity() + 1);
+  else
+    output.retained_charge_.Adopt(&*admission, output.member_.capacity() + 1);
   return output;
 }
 
-absl::Status AppendOutput(SortedSetMember member, SortedSetResult* result) {
+absl::Status AppendOutput(SortedSetMember member, SortedSetResult* result,
+                          bool prepaid = false) {
   auto& output = result->members_;
   if (output.size() == output.capacity()) {
     if (output.capacity() >
         std::numeric_limits<std::size_t>::max() / (2 * sizeof(SortedSetMember)))
       return absl::ResourceExhaustedError("Sorted Set output count overflow");
     const auto capacity = std::max<std::size_t>(8, output.capacity() * 2);
-    auto admission = TryReserveMemory(capacity * sizeof(SortedSetMember));
-    if (!admission) {
+    auto admission = prepaid
+                         ? std::optional<MemoryReservation>{}
+                         : TryReserveMemory(capacity * sizeof(SortedSetMember));
+    if (!prepaid && !admission) {
       RecordMemoryRejection();
       return absl::ResourceExhaustedError(
           "OOM Sorted Set output vector admission");
     }
     output.reserve(capacity);
-    result->retained_charge_.Adopt(&*admission,
-                                   output.capacity() * sizeof(SortedSetMember));
+    if (prepaid)
+      result->retained_charge_.Account(
+          CurrentMemoryAccountingShard(),
+          output.capacity() * sizeof(SortedSetMember));
+    else
+      result->retained_charge_.Adopt(
+          &*admission, output.capacity() * sizeof(SortedSetMember));
   }
   output.push_back(std::move(member));
   return absl::OkStatus();
@@ -263,7 +278,8 @@ struct ReadCursor {
               (operation.offset_ < 0 || operation.count_ == 0)));
   }
 
-  absl::Status Visit(const auto& entry, std::uint64_t rank) {
+  absl::Status Visit(const auto& entry, std::uint64_t rank,
+                     bool prepaid = false) {
     if (done_) return absl::OkStatus();
     if (operation_.kind_ == SortedSetOperationKind::kRank) {
       if (entry.value_ == operation_.members_.front()) {
@@ -289,9 +305,9 @@ struct ReadCursor {
       ++skipped_;
       return absl::OkStatus();
     }
-    auto copied = CopyOutput(entry);
+    auto copied = CopyOutput(entry, prepaid);
     if (!copied.ok()) return copied.status();
-    auto appended = AppendOutput(std::move(*copied), result_);
+    auto appended = AppendOutput(std::move(*copied), result_, prepaid);
     if (!appended.ok()) return appended;
     if (operation_.limit_ && operation_.count_ >= 0 &&
         result_->members_.size() >=
@@ -917,7 +933,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     probed_pages.emplace(i, std::move(page));
   };
   SortedSetPageWorkBudget page_work;
-  auto read_page_impl = [&]<typename Page>(std::size_t i)
+  auto read_page_impl = [&]<typename Page>(std::size_t i,
+                                           GroupReadLimiter* limiter = nullptr)
       -> Task<absl::StatusOr<
           std::conditional_t<std::is_same_v<Page, LoadedOrderedGroup>,
                              OwnedScanPage, AdmittedScanPage<Page>>>> {
@@ -953,19 +970,26 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (shutdown_flush_requested_)
         co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
     }
-    auto admission = budget.Reserve(2);
-    if (!admission.ok()) co_return admission.status();
+    MemoryReservation admission;
+    // A parallel wave admits all owned pages before launching children. Its
+    // reservation outlives the returned pages; serial probes own theirs here.
+    if (limiter == nullptr) {
+      auto reserved = budget.Reserve(2);
+      if (!reserved.ok()) co_return reserved.status();
+      admission = std::move(*reserved);
+    }
     auto load = [&] {
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
                                  metadata[i].id_);
       else
         return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
-                                        object, metadata[i].id_);
+                                        object, metadata[i].id_, false,
+                                        limiter);
     };
     auto page = co_await load();
     if (!page.ok()) co_return page.status();
-    co_return ResultPage{std::move(*admission), std::move(*page)};
+    co_return ResultPage{std::move(admission), std::move(*page)};
   };
   auto read_page = [&](std::size_t i) {
     return read_page_impl.template operator()<LoadedSortedSetPage>(i);
@@ -1151,19 +1175,155 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     const bool reverse = operation.reverse_;
     std::uint64_t rank = directory.CountBefore(reverse ? end_page : first_page);
-    for (std::size_t ordinal = 0;
-         !cursor.done_ && ordinal < end_page - first_page; ++ordinal) {
-      const auto i = reverse ? end_page - 1 - ordinal : first_page + ordinal;
-      auto page = co_await read_page(i);
-      if (!page.ok()) co_return page.status();
-      const auto& entries = page->page_.entries_;
+    auto page_index = [&](std::size_t ordinal) {
+      return reverse ? end_page - 1 - ordinal : first_page + ordinal;
+    };
+    auto consume_page = [&](const auto& entries, bool prepaid) {
       if (reverse) rank -= entries.size();
       for (std::size_t j = 0; !cursor.done_ && j < entries.size(); ++j) {
         const auto index = reverse ? entries.size() - 1 - j : j;
-        auto visited = cursor.Visit(entries[index], rank + index);
-        if (!visited.ok()) co_return visited;
+        auto visited = cursor.Visit(entries[index], rank + index, prepaid);
+        if (!visited.ok()) return visited;
       }
       if (!reverse) rank += entries.size();
+      return absl::OkStatus();
+    };
+    auto read_wave =
+        [&](std::size_t ordinal) -> Task<absl::StatusOr<std::size_t>> {
+      const auto capacity =
+          std::min<std::size_t>(end_page - first_page - ordinal,
+                                worker_count_ * GroupReadLimiter::kWidth);
+      auto plan = GroupReadPlan::TryCreate(
+          worker_count_, capacity,
+          worker_count_ * sizeof(std::size_t) +
+              capacity * sizeof(std::optional<OwnedScanPage>));
+      if (!plan) co_return 0;
+      std::vector<std::size_t> owner_counts(worker_count_);
+      GroupedScratchBudget budget;
+      std::uint64_t items = 0;
+      std::size_t count = 0;
+      // Keep a contiguous logical wave, even though its reads launch in owner
+      // order. A LIMIT can finish inside a boundary page whose matching count
+      // is unknown; never prefetch beyond that page and expose errors from
+      // pages the serial cursor would not have visited.
+      for (; count < capacity; ++count) {
+        const auto i = page_index(ordinal + count);
+        const auto* entry = object->FindGroup({metadata[i].id_, 0});
+        if (!entry)
+          co_return absl::DataLossError("missing Sorted Set physical page");
+        auto owner = BlockOwner(entry->block_id());
+        if (owner >= worker_count_) owner = store.worker_->id();
+        if (owner_counts[owner] == GroupReadLimiter::kWidth) break;
+        auto checked = add_page_budget(&budget, i);
+        if (!checked.ok()) co_return checked;
+        ++owner_counts[owner];
+        plan->Add(owner, count);
+        items += metadata[i].item_count_;
+        if (operation.range_mode_ == SortedSetRangeMode::kScore &&
+            operation.limit_ && operation.count_ >= 0) {
+          const auto low = operation.minimum_score_;
+          const auto high = operation.maximum_score_;
+          const bool whole_page =
+              (low.exclusive_ ? metadata[i].min_score_ > low.value_
+                              : metadata[i].min_score_ >= low.value_) &&
+              (high.exclusive_ ? metadata[i].max_score_ < high.value_
+                               : metadata[i].max_score_ <= high.value_);
+          const auto needed = static_cast<std::uint64_t>(operation.offset_) -
+                              cursor.skipped_ +
+                              static_cast<std::uint64_t>(operation.count_) -
+                              result.members_.size();
+          if (!whole_page || items >= needed) {
+            ++count;
+            break;
+          }
+        }
+      }
+      if (count <= 1 || !plan->ReserveWindow<OwnedScanPage>(4096)) co_return 0;
+      // Decoded pages, their output copies and vector growth are optional
+      // headroom above the original one-page scan. Prepay output as well as
+      // reads: otherwise a successful window reservation could starve the
+      // cursor's later per-member admission. A small LIMIT admits only this
+      // wave, not the entire remaining score range.
+      constexpr auto limit = std::numeric_limits<std::size_t>::max();
+      if (items > limit - result.members_.size()) co_return 0;
+      const auto maximum_output = result.members_.size() + items;
+      auto output_capacity = result.members_.capacity();
+      while (output_capacity < maximum_output) {
+        if (output_capacity > limit / 2) co_return 0;
+        output_capacity = std::max<std::size_t>(8, output_capacity * 2);
+      }
+      if (output_capacity > limit / sizeof(SortedSetMember)) co_return 0;
+      const auto vector_bytes = output_capacity == result.members_.capacity()
+                                    ? 0
+                                    : output_capacity * sizeof(SortedSetMember);
+      if (budget.bytes() > (limit - vector_bytes) / 3) co_return 0;
+      auto admission = TryReserveMemory(budget.bytes() * 3 + vector_bytes);
+      if (!admission) co_return 0;
+      std::vector<std::optional<OwnedScanPage>> pages(count);
+      GroupReadWindow<OwnedScanPage> window(store.worker_, worker_count_,
+                                            count);
+      absl::Status read_status;
+      for (unsigned owner = 0; owner < plan->owner_count(); ++owner) {
+        while (const auto selected = plan->Pop(owner)) {
+          if (window.size() == 1 &&
+              LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_READ_BATCH_START_KEY",
+                                  key)) {
+            read_status = absl::ResourceExhaustedError(
+                "OOM grouped Sorted Set read batch admission");
+            break;
+          }
+          window.Add(read_page_impl.template operator()<LoadedOrderedGroup>(
+                         page_index(ordinal + *selected), window.limiter()),
+                     *selected);
+        }
+        if (!read_status.ok()) break;
+      }
+      co_await window.Join();
+      // The last completion only queues the parent. Population replacement,
+      // shutdown or invalidation can occur before it resumes; validate again
+      // after joining every child, including a partially launched wave.
+      if (shutdown_flush_requested_)
+        co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
+      GroupedScratchBudget current;
+      auto checked = add_page_budget(&current, page_index(ordinal));
+      if (!checked.ok()) co_return checked;
+      const auto completed =
+          window.Collect([&](std::size_t selected, OwnedScanPage&& page) {
+            pages[selected].emplace(std::move(page));
+            return absl::OkStatus();
+          });
+      if (!read_status.ok()) co_return read_status;
+      if (!completed.ok()) co_return completed;
+      // No suspension while transferring prepaid output to retained charges.
+      // The enclosing reservation remains live until all owned pages are
+      // destroyed, and is released before the next wave can admit anything.
+      for (auto& page : pages) {
+        auto visited = consume_page(page->page_.snapshot_.entries_, true);
+        if (!visited.ok()) co_return visited;
+        page.reset();
+      }
+      co_return count;
+    };
+    for (std::size_t ordinal = 0;
+         !cursor.done_ && ordinal < end_page - first_page;) {
+      // Mutating range selection and the other scan modes retain their
+      // original borrowed-page lifecycle and memory floor.
+      if (operation.kind_ == SortedSetOperationKind::kRange &&
+          (operation.range_mode_ == SortedSetRangeMode::kRank ||
+           operation.range_mode_ == SortedSetRangeMode::kScore) &&
+          end_page - first_page - ordinal > 1) {
+        auto consumed = co_await read_wave(ordinal);
+        if (!consumed.ok()) co_return consumed.status();
+        if (*consumed != 0) {
+          ordinal += *consumed;
+          continue;
+        }
+      }
+      auto page = co_await read_page(page_index(ordinal));
+      if (!page.ok()) co_return page.status();
+      auto visited = consume_page(page->page_.entries_, false);
+      if (!visited.ok()) co_return visited;
+      ++ordinal;
     }
     if (operation.kind_ == SortedSetOperationKind::kRemoveRange) {
       auto deleted = co_await remove_selected();

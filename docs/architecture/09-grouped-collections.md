@@ -335,9 +335,10 @@ replacement may demote to a compact record. The append funnel retires the old
 graph after publication while preserving transaction/snapshot ownership. This
 does not change the durable format or the incremental HSET/HMSET path.
 
-Whole String reads, full Hash/Set read-only commands and multi-page List ranges
-share bounded read windows for each physical owner of group records. The key
-owner retains the routing view, child tasks and output admission; only physical
+Whole String reads, full Hash/Set read-only commands, multi-page List and
+Sorted Set rank/score ranges, and continuous Stream reply ranges share bounded
+read windows for each physical owner of group records. The key owner retains
+the routing view, child tasks and output admission; only physical
 reads hop to another worker. Each request limits groups against their refreshed
 record owner, including after GC rerouting. Children validate and decode each page,
 then release its read lease before making that owner's capacity available.
@@ -412,14 +413,18 @@ Sorted Set operations use a typed storage interface. Cardinality reads root
 metadata. Score lookups read only the selected member-prefix pages. Member
 ranks resolve the score through that index, search the score-bounded ordered
 pages for the exact member, and combine its page offset with the directory's
-Fenwick prefix count. Rank ranges start at the directory's
-selected pages; score ranges and score counts first
-seek their candidate interval using resident score bounds, then read matching
-pages in physical order. Range, rank, count, scan and random selection
-borrow member bytes from one owned read lease and validate complete page
-framing, ordering and uniqueness before consumption. Replies copy only
-admitted output members. Mutation source and boundary probes, and rewrite
-planning, use owned snapshots. Command-local probes retain admitted source
+Fenwick prefix count. Rank ranges start at the directory's selected pages;
+score ranges and score counts first seek their candidate interval using
+resident score bounds. Read-only rank/score ranges overlap contiguous page
+windows under the shared physical-owner limits, then consume decoded results
+in requested order. Boundary pages and LIMIT bound speculative reads; optional
+window admission falls back to the single-page path. Window children release
+physical read leases before joining, while admitted decoded pages and reply
+ownership survive until consumption. Other range modes, rank, count, scan and
+random selection borrow member bytes from one owned read lease. All these paths
+validate complete page framing, ordering and uniqueness before consumption.
+Replies copy only admitted output members. Mutation source and boundary probes,
+and rewrite planning, use owned snapshots. Command-local probes retain admitted source
 pages containing requested members within a fixed scratch bound and reuse
 them in planning. Unrelated or excess search pages are released immediately;
 large members retain the ordinary read fallback. Pop selection passes its owned pages
@@ -608,7 +613,7 @@ the reusable containers have independent tests under `tests/containers/`.
 | Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/containers/cow_map.h`, `include/lavik/containers/fenwick_tree.h`, `include/lavik/containers/cow_array.h` |
 | Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped/object_index.h`, `src/storage/engine/grouped/object_index.cpp` |
 | Physical reads, incremental publication, extent streaming and commit dependencies | `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/write.cpp`, `src/storage/engine/grouped/mutation.cpp`, `write.cpp`; `include/lavik/storage/detail/record_payload_cursor.h`, `include/lavik/storage/detail/grouped/commit.h` |
-| Shared group-read windows, owner limits and joined result ownership | `src/storage/engine/grouped/read_window.h`, `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/ordered_io.cpp`, `src/storage/engine/grouped/list.cpp` |
+| Shared group-read windows, owner limits and joined result ownership | `src/storage/engine/grouped/read_window.h`, `src/storage/engine/grouped/read.cpp`, `src/storage/engine/grouped/ordered_io.cpp`, `src/storage/engine/grouped/list.cpp`, `src/storage/engine/grouped/zset.cpp`, `src/storage/engine/transfer_api.cpp` |
 | Root-only expiration/persistence publication | `src/storage/engine/grouped/metadata.cpp`, `src/storage/engine/grouped/object_index.cpp`, `write.cpp` |
 | Fixed String segments and direct byte-range operations | `src/storage/engine/grouped/string.cpp`, `src/redis/string_command.cpp` |
 | Foreground scratch admission and pinned key transfers | `include/lavik/storage/detail/grouped/scratch.h`, `src/storage/engine/transfer_api.cpp`, `src/storage/engine/grouped/restore.cpp` |

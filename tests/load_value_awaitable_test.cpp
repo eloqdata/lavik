@@ -12,6 +12,7 @@
 #include "../src/storage/engine/impl.h"
 #include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 
@@ -27,6 +28,9 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   virtual unsigned WorkerCount() const { return 1; }
 
   void SetUp() override {
+    // Exercise the service's initialized admission model even when CTest runs
+    // this fixture alone. Unlimited pre-init reservations carry zero bytes.
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, WorkerCount()).ok());
     saved_context_ = std::move(bycorf::MutableThisWorker());
     wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     ASSERT_GE(wake_fd_, 0);
@@ -107,6 +111,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     if (wake_fd_ >= 0) close(wake_fd_);
     if (remote_wake_fd_ >= 0) close(remote_wake_fd_);
     bycorf::MutableThisWorker() = std::move(saved_context_);
+    EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   }
 
   auto& Store() { return *storage_.impl_->stores_[0]; }
@@ -135,10 +140,10 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                                             key_, digest_, location_,
                                             pinned ? grouped_ : nullptr);
   }
-  auto ReadGroupedHash() {
+  auto ReadGroupedHash(bool parallel = true) {
     return storage_.impl_->LoadGroupedHashValue(Store(), Store().partitions_[0],
                                                 0, key_, digest_, grouped_,
-                                                false, true);
+                                                false, parallel);
   }
   Task<absl::StatusOr<ListResult>> ReadGroupedList(std::int64_t first = 0,
                                                    std::int64_t last = -1) {
@@ -147,6 +152,27 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     co_return co_await storage_.impl_->ExecuteGroupedListLocked(
         Store(), Store().partitions_[0], 0, key_, digest_, operation, grouped_,
         nullptr, nullptr);
+  }
+  Task<absl::StatusOr<SortedSetResult>> ReadGroupedZset(
+      SortedSetOperation operation = {
+          .kind_ = SortedSetOperationKind::kRange}) {
+    co_return co_await storage_.impl_->ExecuteGroupedSortedSetLocked(
+        Store(), Store().partitions_[0], 0, key_, digest_, operation, grouped_,
+        nullptr, nullptr);
+  }
+  auto ReadGroupedStream(std::uint64_t count = UINT64_MAX) {
+    return storage_.impl_->ReadValueForTransferLocked(
+        0, key_, digest_, StreamRangeAccess{.first_ = {1, 0}, .count_ = count});
+  }
+  void CloseTransfer(TransferValue& source) {
+    source.reader_ = {};
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (storage_.impl_->active_settlements_.load() != 0 &&
+           std::chrono::steady_clock::now() < until)
+      RunReadRound();
+    ASSERT_EQ(storage_.impl_->active_settlements_.load(), 0);
+    ExpectNoPageLeases();
   }
   bool HasHelper(const Awaitable& read) { return read.slow_.valid(); }
 
@@ -334,59 +360,61 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     grouped_ = std::move(object);
     IndexLocation();
   }
-  void InstallGroupedHash(ValueType type) {
+  void InstallGroupedHash(ValueType type, std::size_t fields_per_page = 1) {
     ASSERT_TRUE(type == ValueType::kHash || type == ValueType::kSet);
     constexpr std::size_t count = 64;
     const DigestSeed seed{1, 2, 3, 4};
-    std::array<std::string, count> fields;
-    // Exactly one field in each six-bit prefix keeps both owners' page counts
+    std::array<std::vector<std::string>, count> fields;
+    // Equal field counts in each six-bit prefix keep both owners' page counts
     // deterministic, independently of the production split-size heuristic.
     std::size_t filled = 0;
-    for (std::size_t candidate = 0; candidate < 100000 && filled < count;
-         ++candidate) {
-      auto field = "field-" + std::to_string(candidate);
+    for (std::size_t candidate = 0;
+         candidate < 100000 && filled < count * fields_per_page; ++candidate) {
+      const auto number = std::to_string(candidate);
+      auto field = "field-" + std::string(6 - number.size(), '0') + number;
       field.append("\0\xff", 2);
       const auto prefix = ComputeDigest(field, seed).value_ >> 58;
-      if (fields[prefix].empty()) {
-        fields[prefix] = std::move(field);
+      if (fields[prefix].size() < fields_per_page) {
+        fields[prefix].push_back(std::move(field));
         ++filled;
       }
     }
-    ASSERT_EQ(filled, count);
-    ASSERT_NO_FATAL_FAILURE(PrepareGroupedCollection(type, count));
+    ASSERT_EQ(filled, count * fields_per_page);
+    ASSERT_NO_FATAL_FAILURE(PrepareGroupedCollection(type, filled));
     hash_entries_.clear();
     std::vector<RecoveredGroupedRecord> records;
     std::vector<GroupedRecordLocation> locations;
     for (std::size_t i = 0; i < count; ++i) {
-      std::string value;
-      if (type == ValueType::kHash) {
-        value = "value-" + std::to_string(i);
-        value.append("\0\xfe", 2);
-        value.append(17 + i % 31, static_cast<char>(i));
-      }
-      hash_entries_.emplace_back(fields[i], value);
       const GroupedRecordId id{static_cast<std::uint64_t>(i) << 58, 6};
-      HashGroupSnapshot page{
-          .incarnation_ = 17,
-          .id_ = id,
-          .value_ = {.entries_ = {{.digest_ = ComputeDigest(fields[i]),
-                                   .field_ = fields[i],
-                                   .value_ = std::move(value)}}}};
+      HashGroupSnapshot page{.incarnation_ = 17, .id_ = id};
+      for (const auto& field : fields[i]) {
+        std::string value;
+        if (type == ValueType::kHash) {
+          value = "value-" + std::to_string(i);
+          value.append("\0\xfe", 2);
+          value.append(17 + i % 31, static_cast<char>(i));
+        }
+        hash_entries_.emplace_back(field, value);
+        page.value_.entries_.push_back({.digest_ = ComputeDigest(field),
+                                        .field_ = field,
+                                        .value_ = std::move(value)});
+      }
       auto encoded = EncodeHashGroup(page);
       ASSERT_TRUE(encoded.ok()) << encoded.status();
       records.push_back({.incarnation_ = 17,
                          .id_ = id,
                          .sequence_ = 9,
                          .lsn_ = 9,
-                         .field_count_ = 1,
+                         .field_count_ = fields_per_page,
                          .encoded_bytes_ = encoded->size(),
                          .record_token_ = i + 1});
-      ASSERT_NO_FATAL_FAILURE(AppendGroupedPage(id, std::move(*encoded), 1));
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(id, std::move(*encoded), fields_per_page));
       locations.push_back({.id_ = id, .location_ = grouped_locations_.back()});
     }
     auto directory = HashGroupDirectory::Recover({.incarnation_ = 17,
                                                   .seed_ = seed,
-                                                  .field_count_ = count,
+                                                  .field_count_ = filled,
                                                   .group_count_ = count,
                                                   .revision_ = 9},
                                                  9, records, {});
@@ -398,51 +426,102 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     ASSERT_NO_FATAL_FAILURE(PublishGroupedCollection(std::move(*object)));
   }
   void InstallGroupedList(std::size_t pages = 70) {
+    InstallGroupedOrdered(OrderedCollectionKind::kList, pages);
+  }
+  void InstallGroupedZset(std::size_t pages = 70) {
+    InstallGroupedOrdered(OrderedCollectionKind::kSortedSet, pages);
+  }
+  void InstallGroupedOrdered(OrderedCollectionKind kind, std::size_t pages) {
     constexpr std::size_t per_page = 3;
-    ASSERT_NO_FATAL_FAILURE(
-        PrepareGroupedCollection(ValueType::kList, pages * per_page));
+    const bool sorted = kind == OrderedCollectionKind::kSortedSet;
+    ASSERT_NO_FATAL_FAILURE(PrepareGroupedCollection(
+        sorted ? ValueType::kSortedSet : ValueType::kList, pages * per_page));
     list_values_.clear();
+    zset_values_.clear();
     std::vector<RecoveredOrderedGroup> records;
     std::vector<GroupedRecordLocation> locations;
     for (std::size_t i = 0; i < pages; ++i) {
-      OrderedGroupSnapshot page{.kind_ = OrderedCollectionKind::kList,
+      OrderedGroupSnapshot page{.kind_ = kind,
                                 .incarnation_ = 17,
                                 .id_ = i + 1,
                                 .previous_ = i,
                                 .next_ = i + 1 == pages ? 0 : i + 2};
       for (std::size_t j = 0; j < per_page; ++j) {
-        auto value = "item-" + std::to_string(list_values_.size());
+        const auto rank = i * per_page + j;
+        const auto number = std::to_string(rank);
+        auto value = "item-" +
+                     (sorted ? std::string(6 - number.size(), '0') : "") +
+                     number;
         value.append("\0\xff", 2);
         value.append(17 + (i + j) % 31, static_cast<char>(i + j));
         list_values_.push_back(value);
-        page.entries_.push_back({.value_ = std::move(value)});
+        // Ties cross page boundaries; binary member order must remain stable
+        // when owner-bucket submission order differs from score/rank order.
+        const auto score = sorted ? static_cast<double>(rank / 4) : 0;
+        if (sorted) zset_values_.emplace_back(value, score);
+        page.entries_.push_back({.value_ = std::move(value), .score_ = score});
       }
       auto encoded = EncodeOrderedGroup(page);
       ASSERT_TRUE(encoded.ok()) << encoded.status();
-      records.emplace_back(OrderedGroupEntry{.incarnation_ = 17,
-                                             .id_ = page.id_,
-                                             .previous_ = page.previous_,
-                                             .next_ = page.next_,
-                                             .sequence_ = 9,
-                                             .lsn_ = 9,
-                                             .item_count_ = per_page,
-                                             .encoded_bytes_ = encoded->size(),
-                                             .record_token_ = i + 1});
+      records.emplace_back(
+          OrderedGroupEntry{.incarnation_ = 17,
+                            .id_ = page.id_,
+                            .previous_ = page.previous_,
+                            .next_ = page.next_,
+                            .sequence_ = 9,
+                            .lsn_ = 9,
+                            .item_count_ = per_page,
+                            .encoded_bytes_ = encoded->size(),
+                            .record_token_ = i + 1,
+                            .min_score_ = page.entries_.front().score_,
+                            .max_score_ = page.entries_.back().score_});
       const GroupedRecordId id{i + 1, 0};
       ASSERT_NO_FATAL_FAILURE(
           AppendGroupedPage(id, std::move(*encoded), per_page));
       locations.push_back({.id_ = id, .location_ = grouped_locations_.back()});
     }
-    auto directory = OrderedGroupDirectory::Recover(
-        {.kind_ = OrderedCollectionKind::kList,
-         .incarnation_ = 17,
-         .item_count_ = pages * per_page,
-         .first_group_ = 1,
-         .last_group_ = pages,
-         .next_group_id_ = pages + 1,
-         .group_count_ = static_cast<std::uint32_t>(pages),
-         .revision_ = 9},
-        9, records, {});
+    OrderedCollectionRoot root{
+        .kind_ = kind,
+        .incarnation_ = 17,
+        .item_count_ = pages * per_page,
+        .first_group_ = 1,
+        .last_group_ = pages,
+        .next_group_id_ = pages + 1,
+        .group_count_ = static_cast<std::uint32_t>(pages),
+        .revision_ = 9};
+    std::optional<HashGroupDirectory> members;
+    if (sorted) {
+      root.member_index_ = GroupedHashRoot{.incarnation_ = 17,
+                                           .field_count_ = pages * per_page,
+                                           .group_count_ = 1,
+                                           .revision_ = 9};
+      HashGroupSnapshot page{.incarnation_ = 17, .id_ = {0, 0}};
+      for (const auto& [member, score] : zset_values_)
+        page.value_.entries_.push_back(
+            {.digest_ = ComputeDigest(member),
+             .field_ = member,
+             .value_ = EncodeSortedSetMemberScore(score)});
+      auto encoded = EncodeHashGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      const RecoveredGroupedRecord member_record{
+          .incarnation_ = 17,
+          .id_ = {0, 0},
+          .sequence_ = 9,
+          .lsn_ = 9,
+          .field_count_ = pages * per_page,
+          .encoded_bytes_ = encoded->size(),
+          .record_token_ = pages + 1};
+      auto recovered = HashGroupDirectory::Recover(
+          *root.member_index_, 9, std::span(&member_record, 1), {});
+      ASSERT_TRUE(recovered.ok()) << recovered.status();
+      members.emplace(std::move(*recovered));
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(page.id_, std::move(*encoded), pages * per_page));
+      locations.push_back(
+          {.id_ = page.id_, .location_ = grouped_locations_.back()});
+    }
+    auto directory = OrderedGroupDirectory::Recover(root, 9, records, {}, 0,
+                                                    std::move(members));
     ASSERT_TRUE(directory.ok()) << directory.status();
     auto object = GroupedObject::CreateOrdered(
         {.root_ = location_, .db_epoch_ = 1, .replication_epoch_ = 1},
@@ -459,6 +538,154 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     std::sort(actual.begin(), actual.end());
     std::sort(expected.begin(), expected.end());
     EXPECT_EQ(actual, expected);
+  }
+  void InstallGroupedStream() {
+    // Transfer entry points route by Redis slot, while this fixture owns only
+    // partition zero. Use its real routing rule rather than widening stores.
+    for (unsigned candidate = 0;; ++candidate) {
+      key_ = "stream-" + std::to_string(candidate);
+      if (RedisSlot(key_) == 0) break;
+      ASSERT_LT(candidate, 1000000);
+    }
+    header_.key_bytes_ = key_.size();
+    constexpr std::size_t count = 210, per_page = 3;
+    std::string wire("LXS1");
+    auto put = [&](std::uint64_t value, unsigned width) {
+      for (unsigned i = 0; i < width; ++i)
+        wire.push_back(static_cast<char>(value >> (8 * i)));
+    };
+    auto string = [&](std::string_view value) {
+      put(value.size(), 4);
+      wire.append(value);
+    };
+    put(count, 8);
+    put(0, 8);
+    wire.append(16, '\0');
+    put(count, 8);
+    put(count, 4);
+    for (std::size_t i = 1; i <= count; ++i) {
+      put(i, 8);
+      put(0, 8);
+      put(2, 4);
+      string("field");
+      string(std::string("value\0", 6) + std::to_string(i));
+    }
+    put(1, 4);
+    put(count, 4);
+    put(0, 4);
+    auto decoded = DecodeStreamRecords(wire, count);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    stream_messages_.clear();
+    for (const auto& entry : *decoded) {
+      auto key = StreamRecordKey(entry.value_);
+      ASSERT_TRUE(key.ok()) << key.status();
+      if (key->front() == '\1') stream_messages_.push_back(entry.value_);
+    }
+    ASSERT_EQ(stream_messages_.size(), count);
+    ASSERT_NO_FATAL_FAILURE(
+        PrepareGroupedCollection(ValueType::kStream, count));
+    const auto pages = (decoded->size() + per_page - 1) / per_page;
+    std::vector<RecoveredOrderedGroup> records;
+    std::vector<GroupedRecordLocation> locations;
+    for (std::size_t i = 0; i < pages; ++i) {
+      const auto first = i * per_page;
+      const auto end = std::min(first + per_page, decoded->size());
+      OrderedGroupSnapshot page{
+          .kind_ = OrderedCollectionKind::kStream,
+          .incarnation_ = 17,
+          .id_ = i + 1,
+          .previous_ = i,
+          .next_ = i + 1 == pages ? 0 : i + 2,
+          .entries_ = {decoded->begin() + first, decoded->begin() + end}};
+      auto encoded = EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      records.emplace_back(OrderedGroupEntry{.incarnation_ = 17,
+                                             .id_ = page.id_,
+                                             .previous_ = page.previous_,
+                                             .next_ = page.next_,
+                                             .sequence_ = 9,
+                                             .lsn_ = 9,
+                                             .item_count_ = end - first,
+                                             .encoded_bytes_ = encoded->size(),
+                                             .record_token_ = i + 1});
+      const auto max_key = StreamRecordKey(page.entries_.back().value_);
+      ASSERT_TRUE(max_key.ok()) << max_key.status();
+      records.back().stream_max_key_.Set(*max_key);
+      const GroupedRecordId id{i + 1, 0};
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(id, std::move(*encoded), end - first));
+      locations.push_back({.id_ = id, .location_ = grouped_locations_.back()});
+    }
+    auto directory = OrderedGroupDirectory::Recover(
+        {.kind_ = OrderedCollectionKind::kStream,
+         .incarnation_ = 17,
+         .item_count_ = decoded->size(),
+         .first_group_ = 1,
+         .last_group_ = pages,
+         .next_group_id_ = pages + 1,
+         .group_count_ = static_cast<std::uint32_t>(pages),
+         .revision_ = 9,
+         .stream_length_ = count},
+        9, records, {});
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    auto object = GroupedObject::CreateOrdered(
+        {.root_ = location_, .db_epoch_ = 1, .replication_epoch_ = 1},
+        std::move(*directory), locations);
+    ASSERT_TRUE(object.ok()) << object.status();
+    ASSERT_NO_FATAL_FAILURE(PublishGroupedCollection(std::move(*object)));
+  }
+  void ExpectZset(const absl::StatusOr<SortedSetResult>& result,
+                  std::size_t first = 0, std::size_t end = SIZE_MAX,
+                  bool reverse = false) {
+    ASSERT_TRUE(result.ok()) << result.status();
+    if (end == SIZE_MAX) end = zset_values_.size();
+    ASSERT_EQ(result->members_.size(), end - first);
+    EXPECT_EQ(result->length_, zset_values_.size());
+    for (std::size_t i = 0; i < result->members_.size(); ++i) {
+      const auto& expected = zset_values_[reverse ? end - 1 - i : first + i];
+      EXPECT_EQ(result->members_[i].member_, expected.first) << i;
+      EXPECT_EQ(result->members_[i].score_, expected.second) << i;
+    }
+  }
+  void ReplaceHashField(std::size_t page, std::string_view old_field,
+                        std::string_view new_field) {
+    ASSERT_EQ(old_field.size(), new_field.size());
+    auto& payload = grouped_payloads_[page];
+    const auto offset = payload.find(old_field);
+    ASSERT_NE(offset, std::string::npos);
+    payload.replace(offset, old_field.size(), new_field);
+    // Repair CRC so only logical validation, not the physical checksum, can
+    // reject this page. Fixed field widths preserve the encoded framing.
+    ASSERT_NO_FATAL_FAILURE(StageGroupedPage(page));
+  }
+  void ExpectHashCorruption(std::string_view message) {
+    ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+    ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+    for (const bool scarce : {false, true}) {
+      SCOPED_TRACE(scarce ? "serial admission fallback" : "parallel batch");
+      const auto previous_shard = CurrentMemoryAccountingShard();
+      absl::Cleanup restore = [&] {
+        (void)InitMemoryLimit(1024ULL * 1024 * 1024, WorkerCount());
+        BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                      : previous_shard - 1);
+      };
+      if (scarce) {
+        BindMemoryAccountingShard(kMaxMemoryWorkers);
+        RefreshMemoryStats();
+        const auto target = GetMemoryStats().used_bytes_ + 96 * 1024;
+        ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+      }
+      auto task = ReadGroupedHash();
+      Start(task);
+      RunReadRound();
+      EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(),
+                scarce ? 1 : 32);
+      ASSERT_NO_FATAL_FAILURE(Drain(task));
+      const auto result = std::move(task).TakeResult();
+      EXPECT_TRUE(absl::IsDataLoss(result.status())) << result.status();
+      EXPECT_EQ(result.status().message(), message);
+      ExpectNoPageLeases();
+    }
   }
   void RelocateGroupedPagesToRemoteOwner() {
     ASSERT_EQ(WorkerCount(), 2);
@@ -628,7 +855,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   }
 
   template <typename T>
-  auto Start(Task<T>& task, bool background = false) {
+  std::coroutine_handle<> Start(Task<T>& task, bool background = false) {
     auto handle = std::move(task).operator co_await().await_suspend(
         std::noop_coroutine());
     if (background) worker_.RegisterBackground(handle);
@@ -682,6 +909,8 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   std::vector<RecordLocation> grouped_locations_;
   std::vector<std::pair<std::string, std::string>> hash_entries_;
   std::vector<std::string> list_values_;
+  std::vector<std::pair<std::string, double>> zset_values_;
+  std::vector<std::string> stream_messages_;
 };
 
 TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
@@ -1342,6 +1571,37 @@ TEST_P(GroupedHashParallelReadTest, RelocatedLeavesShareTheNewOwnersWindow) {
   ExpectNoPageLeases();
 }
 
+TEST_P(GroupedHashParallelReadTest, ValidChecksumDoesNotHideWrongFieldRoutes) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(
+      ReplaceHashField(1, hash_entries_[1].first, hash_entries_[0].first));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ExpectHashCorruption("Hash field outside its group route");
+}
+
+TEST_P(GroupedHashParallelReadTest, ValidChecksumDoesNotHideDuplicateFields) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam(), 2));
+  ASSERT_NO_FATAL_FAILURE(
+      ReplaceHashField(1, hash_entries_[3].first, hash_entries_[2].first));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ExpectHashCorruption("duplicate field in Hash group");
+}
+
+TEST_P(GroupedHashParallelReadTest,
+       MutableMaterializationStillBuildsProcessDigests) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto task = ReadGroupedHash(false);
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  const auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  ExpectHash(result);
+  for (const auto& entry : result->entries_)
+    EXPECT_EQ(entry.digest_, ComputeDigest(entry.field_));
+  ExpectNoPageLeases();
+}
+
 INSTANTIATE_TEST_SUITE_P(HashAndSet, GroupedHashParallelReadTest,
                          testing::Values(ValueType::kHash, ValueType::kSet));
 
@@ -1488,6 +1748,259 @@ TEST_F(LoadValueAwaitableTestPeer,
   EXPECT_EQ(first_result->values_, list_values_);
   EXPECT_EQ(second_result->values_, list_values_);
   ExpectNoPageLeases();
+}
+
+class GroupedZsetParallelReadTest : public GroupedCollectionTwoOwnerReadTest,
+                                    public testing::WithParamInterface<bool> {};
+
+TEST_P(GroupedZsetParallelReadTest,
+       RankPagesOverlapOnBothOwnersAndKeepPartialRanks) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedZset({.kind_ = SortedSetOperationKind::kRange,
+                               .reverse_ = GetParam(),
+                               .first_ = 1,
+                               .last_ = -2});
+  Start(task);
+  // Zset reads yield before acquiring their page. This first slice only
+  // reaches that checkpoint; the next submits without consuming its new CQEs.
+  RunReadRound();
+  EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), 0);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+    EXPECT_EQ(blocks_[owner].pin_count(), 16);
+    EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+  }
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectZset(std::move(task).TakeResult(), 1, zset_values_.size() - 1,
+             GetParam());
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupedZsetParallelReadTest,
+       ScoreBoundsAndLimitKeepCrossPageTiesInRequestedOrder) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto task = ReadGroupedZset({.kind_ = SortedSetOperationKind::kRange,
+                               .range_mode_ = SortedSetRangeMode::kScore,
+                               .reverse_ = GetParam(),
+                               .minimum_score_ = {2, true},
+                               .maximum_score_ = {48, false},
+                               .limit_ = true,
+                               .offset_ = 5,
+                               .count_ = 150});
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  // Matching ranks are [12, 196). OFFSET applies in traversal order, before
+  // LIMIT, including ties split across the first and last selected pages.
+  ExpectZset(std::move(task).TakeResult(), GetParam() ? 41 : 17,
+             GetParam() ? 191 : 167, GetParam());
+  ExpectNoPageLeases();
+}
+
+INSTANTIATE_TEST_SUITE_P(ForwardAndReverse, GroupedZsetParallelReadTest,
+                         testing::Bool());
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ZsetRangeFallsBackToSerialWhenWindowScratchDoesNotFit) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const auto previous_shard = CurrentMemoryAccountingShard();
+  absl::Cleanup restore = [&] {
+    (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+    BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                  : previous_shard - 1);
+  };
+  BindMemoryAccountingShard(kMaxMemoryWorkers);
+  RefreshMemoryStats();
+  const auto target = GetMemoryStats().used_bytes_ + 128 * 1024;
+  ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+  auto task = ReadGroupedZset();
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectZset(std::move(task).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       CorruptZsetPageJoinsBothOwnersBeforeReturning) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedZset();
+  Start(task);
+  RunReadRound();
+  RunReadRound();
+  EXPECT_EQ(blocks_[0].pin_count(), 16);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsInternal(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest, ZsetPartialStartFailureJoinsItsPage) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires grouped Zset batch-start failure injection";
+#endif
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  constexpr auto variable = "LAVIK_FAIL_ZSET_READ_BATCH_START_KEY";
+  const char* previous = std::getenv(variable);
+  const auto saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  absl::Cleanup restore = [&] {
+    if (saved)
+      setenv(variable, saved->c_str(), 1);
+    else
+      unsetenv(variable);
+  };
+  ASSERT_EQ(setenv(variable, key_.c_str(), 1), 0);
+  auto task = ReadGroupedZset();
+  Start(task);
+  RunReadRound();
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 1);
+  EXPECT_EQ(blocks_[1].pin_count(), 0);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+  ASSERT_EQ(unsetenv(variable), 0);
+  auto next = ReadGroupedZset();
+  Start(next);
+  ASSERT_NO_FATAL_FAILURE(Drain(next));
+  ExpectZset(std::move(next).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ConcurrentZsetRangesReleaseEachPageBeforeJoin) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto first = ReadGroupedZset();
+  auto second = ReadGroupedZset();
+  Start(first);
+  Start(second);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  const auto first_result = std::move(first).TakeResult();
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  ExpectZset(first_result);
+  ExpectZset(std::move(second).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ZsetLimitDoesNotReadAnUnneededFailingPage) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(2, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  for (const bool partial : {false, true}) {
+    // Six members consume two complete pages. The exclusive lower bound
+    // instead starts inside page two and LIMIT 1 ends there. In either case,
+    // the corrupt third page matches the bounds but must remain unread.
+    auto task = ReadGroupedZset({.kind_ = SortedSetOperationKind::kRange,
+                                 .range_mode_ = SortedSetRangeMode::kScore,
+                                 .minimum_score_ = {0, partial},
+                                 .maximum_score_ = {partial ? 1. : 2., false},
+                                 .limit_ = true,
+                                 .count_ = partial ? 1 : 6});
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectZset(std::move(task).TakeResult(), partial ? 4 : 0, partial ? 5 : 6);
+    ExpectNoPageLeases();
+  }
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       StreamInteriorWindowReadsSixteenPagesOnEachOwner) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedStream());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  TransferValue source;
+  {
+    auto open = ReadGroupedStream();
+    Start(open);
+    ASSERT_NO_FATAL_FAILURE(Drain(open));
+    auto result = std::move(open).TakeResult();
+    ASSERT_TRUE(result.ok()) << result.status();
+    source = std::move(*result);
+  }
+  ASSERT_TRUE(source.reader_);
+  std::vector<std::string> actual;
+  {
+    auto boundary = source.reader_();
+    Start(boundary);
+    ASSERT_NO_FATAL_FAILURE(Drain(boundary));
+    auto page = std::move(boundary).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    ASSERT_FALSE(page->done_);
+    actual = std::move(page->elements_);
+  }
+  const std::array pins{blocks_[0].pin_count(), blocks_[1].pin_count()};
+  // Snapshot graph pins survive the reader; count physical I/O pins above
+  // that baseline so the test distinguishes 32 active reads from 16 total.
+  {
+    auto window = source.reader_();
+    Start(window);
+    RunReadRound();
+    EXPECT_FALSE(window.done());
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      EXPECT_EQ(blocks_[owner].pin_count(), pins[owner] + 16);
+      EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+    }
+    ASSERT_NO_FATAL_FAILURE(Drain(window));
+    auto page = std::move(window).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    EXPECT_EQ(page->elements_.size(), 32 * 3);
+    actual.insert(actual.end(), page->elements_.begin(), page->elements_.end());
+  }
+  for (bool done = false; !done;) {
+    auto next = source.reader_();
+    Start(next);
+    ASSERT_NO_FATAL_FAILURE(Drain(next));
+    auto page = std::move(next).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    actual.insert(actual.end(), page->elements_.begin(), page->elements_.end());
+    done = page->done_;
+  }
+  EXPECT_EQ(actual, stream_messages_);
+  ASSERT_NO_FATAL_FAILURE(CloseTransfer(source));
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       StreamCountStopsBeforeAnUnneededCorruptInteriorPage) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedStream());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  TransferValue source;
+  {
+    auto open = ReadGroupedStream(1);
+    Start(open);
+    ASSERT_NO_FATAL_FAILURE(Drain(open));
+    auto result = std::move(open).TakeResult();
+    ASSERT_TRUE(result.ok()) << result.status();
+    source = std::move(*result);
+  }
+  {
+    auto read = source.reader_();
+    Start(read);
+    ASSERT_NO_FATAL_FAILURE(Drain(read));
+    const auto page = std::move(read).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    EXPECT_TRUE(page->done_);
+    ASSERT_EQ(page->elements_.size(), 1);
+    EXPECT_EQ(page->elements_[0], stream_messages_[0]);
+  }
+  ASSERT_NO_FATAL_FAILURE(CloseTransfer(source));
 }
 
 }  // namespace lavik::storage

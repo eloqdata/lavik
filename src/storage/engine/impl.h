@@ -4049,7 +4049,8 @@ class StorageEngine::Impl {
       GroupReadLimiter* limiter = nullptr);
   // Callers admit the decoded image. Full read commands may additionally
   // request per-owner windows; their optional admission can fall back to
-  // serial.
+  // serial. These terminal full-read results omit process-local field digests;
+  // callers needing lookup digests must leave parallel disabled.
   Task<absl::StatusOr<HashValue>> LoadGroupedHashValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4414,10 +4415,14 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, std::size_t first,
       std::size_t count, GroupReadLimiter* limiter = nullptr);
+  // Returns owned entries after releasing the physical lease. An optional
+  // caller-owned limiter accounts against the refreshed physical owner until
+  // decoding finishes; it must outlive this task, including cancellation.
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, std::uint64_t id, bool pinned = false);
+      GroupedObject::Handle object, std::uint64_t id, bool pinned = false,
+      GroupReadLimiter* limiter = nullptr);
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
