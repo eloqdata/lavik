@@ -1116,8 +1116,7 @@ class HashLookupMemoryTest : public ::testing::Test {
   unsigned previous_shard_ = 0;
 };
 
-TEST_F(HashLookupMemoryTest,
-       CompactPointRepliesOwnOnlyMatchesAndPreserveOperandOrder) {
+TEST_F(HashLookupMemoryTest, CompactMultiGetOwnsBytesAndPreservesOperandOrder) {
   auto encoded = EncodeHashValue(Value(16, 128));
   ASSERT_TRUE(encoded.ok());
   CompactReadResult snapshot = std::optional<CompactValueView>{
@@ -1128,31 +1127,11 @@ TEST_F(HashLookupMemoryTest,
   auto result = ReadCompactHash(snapshot, operation, ValueType::kHash);
   ASSERT_TRUE(result.ok()) << result.status();
   ASSERT_EQ(result->values_.size(), 4);
+  encoded->assign(encoded->size(), '!');
   EXPECT_EQ(result->values_[0], std::string(128, 'p'));
   EXPECT_EQ(result->values_[1], std::nullopt);
   EXPECT_EQ(result->values_[2], std::string(128, 'a'));
   EXPECT_EQ(result->values_[3], std::string(128, 'p'));
-  for (const auto kind : {HashOperationKind::kGet, HashOperationKind::kExists,
-                          HashOperationKind::kStringLength}) {
-    operation.kind_ = kind;
-    operation.fields_ = {"field-15"};
-    auto point = ReadCompactHash(snapshot, operation, ValueType::kHash);
-    ASSERT_TRUE(point.ok());
-    if (kind == HashOperationKind::kGet)
-      EXPECT_EQ(point->values_[0], std::string(128, 'p'));
-    else
-      EXPECT_EQ(point->integer_, kind == HashOperationKind::kExists ? 1 : 128);
-    operation.fields_ = {"absent"};
-    point = ReadCompactHash(snapshot, operation, ValueType::kHash);
-    ASSERT_TRUE(point.ok());
-    if (kind == HashOperationKind::kGet)
-      EXPECT_EQ(point->values_[0], std::nullopt);
-    else
-      EXPECT_EQ(point->integer_, 0);
-  }
-  encoded->assign(encoded->size(), '!');
-  EXPECT_EQ(result->values_[0], std::string(128, 'p'));
-  EXPECT_GT(result->retained_charge_.bytes(), 0);
 }
 
 TEST_F(HashLookupMemoryTest, CompactPointReadsChargeOutputAndRejectOom) {

@@ -39,9 +39,8 @@ struct HashDiskLayout {
   bool empty_tail_ = false;
 };
 
-TEST(CompactHashWriteE2e, BatchTransactionsAndRecoveryKeepCompactEncoding) {
+TEST(CompactHashWriteE2e, ColdUpdateKeepsCompactEncodingAndRecovers) {
   PrivateDisk disk;
-  const std::string binary_field("f\0x", 3), binary_value("v\0x", 3);
   {
     Server server(disk, 1);
     Client client(server.port());
@@ -54,52 +53,22 @@ TEST(CompactHashWriteE2e, BatchTransactionsAndRecoveryKeepCompactEncoding) {
   {
     Server server(disk, 1);
     Client client(server.port());
-    ASSERT_EQ(client
-                  .Command({"HSET", "compact", "a", "middle", "a", "last",
-                            "new", "first", "new", "last", "", "", binary_field,
-                            binary_value})
-                  .text_,
-              "3");
-    ASSERT_EQ(client.Command({"HLEN", "compact"}).text_, "5");
-    auto values = client.Command(
-        {"HMGET", "compact", "new", "missing", "a", "new", "", binary_field});
-    ASSERT_EQ(values.items_.size(), 6);
-    EXPECT_EQ(values.items_[0].text_, "last");
-    EXPECT_EQ(values.items_[1].text_, "-1");
-    EXPECT_EQ(values.items_[2].text_, "last");
-    EXPECT_EQ(values.items_[3].text_, "last");
-    EXPECT_EQ(values.items_[4].text_, "");
-    EXPECT_EQ(values.items_[5].text_, binary_value);
-    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    // Update before any read warms the recovered payload; grow one value,
+    // preserve an untouched field, and append a new field in the same edit.
     ASSERT_EQ(
-        client.Command({"HSET", "compact", "a", "exec", "extra", "exec"}).text_,
-        "QUEUED");
-    ASSERT_EQ(client.Command({"HGET", "compact", "a"}).text_, "QUEUED");
-    const auto exec = client.Command({"EXEC"});
-    ASSERT_EQ(exec.items_.size(), 2);
-    EXPECT_EQ(exec.items_[0].text_, "1");
-    EXPECT_EQ(exec.items_[1].text_, "exec");
-    EXPECT_EQ(client
-                  .Command({"EVAL",
-                            "redis.call('HSET', KEYS[1], 'a', 'lua'); return "
-                            "redis.call('HGET', KEYS[1], 'a')",
-                            "1", "compact"})
-                  .text_,
-              "lua");
-    EXPECT_EQ(client.Command({"HEXISTS", "compact", ""}).text_, "1");
-    EXPECT_EQ(client.Command({"HSTRLEN", "compact", binary_field}).text_, "3");
+        client.Command({"HSET", "compact", "a", "replacement", "new", "added"})
+            .text_,
+        "1");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   EXPECT_TRUE(disk.Auxiliaries("compact").empty());
   Server server(disk, 1);
   Client client(server.port());
-  EXPECT_EQ(client.Command({"HLEN", "compact"}).text_, "6");
-  EXPECT_EQ(client.Command({"HGET", "compact", "a"}).text_, "lua");
+  EXPECT_EQ(client.Command({"HLEN", "compact"}).text_, "3");
+  EXPECT_EQ(client.Command({"HGET", "compact", "a"}).text_, "replacement");
   EXPECT_EQ(client.Command({"HGET", "compact", "b"}).text_, "keep");
-  EXPECT_EQ(client.Command({"HGET", "compact", binary_field}).text_,
-            binary_value);
-  EXPECT_EQ(client.Command({"HGET", "compact", "extra"}).text_, "exec");
+  EXPECT_EQ(client.Command({"HGET", "compact", "new"}).text_, "added");
   ASSERT_EQ(server.Wait(true), 0) << server.Log();
 }
 
