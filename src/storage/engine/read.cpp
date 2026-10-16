@@ -63,11 +63,10 @@ class BatchReadAwaiter {
         --remaining_;
       }
     }
-    // A full io_uring SQ may submit and reap earlier operations while this
-    // loop is still preparing the batch. Unvisited operations are already in
-    // remaining_, so those completions cannot resume us early. The operation
-    // passed to each SubmitRead is itself guaranteed to complete
-    // asynchronously.
+    // Count the whole batch before submission and retire immediate rejections
+    // locally. Accepted operations remain outstanding while queued for backend
+    // capacity; each deferred completion retires one count, and only the last
+    // wakes the caller.
     return remaining_ != 0;
   }
 
