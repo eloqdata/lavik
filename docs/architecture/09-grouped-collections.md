@@ -355,9 +355,12 @@ Hash/Set point operations load each affected prefix group once. Point reads
 scan encoded entries and retain only requested values. Multi-field reads group
 request positions by routing leaf, fill result slots in command order, and
 release each page before loading the next; repeated operands retain repeated results.
-These reads validate all entry framing and duplicate occurrences of requested
-fields; full decodes additionally validate every field's uniqueness
-and route. Hash/Set field updates and removals validate complete affected
+Point reads validate entry framing and duplicate occurrences of requested
+fields. Full replies and read-only random selection consume published leaves
+without rebuilding field digests or a uniqueness set; the physical loader
+still validates record identity, framing and counts. Writers and strict
+materialization/recovery decoders validate every field's uniqueness and route.
+Hash/Set field updates and removals validate complete affected
 leaves using borrowed entry views, then own only changed replacement pages.
 Small replacements retain checked encoded bytes until publication; splits and
 oversized entries use owned fields and the bounded-state encoder. Other point
@@ -421,8 +424,10 @@ in requested order. Boundary pages and LIMIT bound speculative reads; optional
 window admission falls back to the single-page path. Window children release
 physical read leases before joining, while admitted decoded pages and reply
 ownership survive until consumption. Other range modes, rank, count, scan and
-random selection borrow member bytes from one owned read lease. All these paths
-validate complete page framing, ordering and uniqueness before consumption.
+random selection borrow member bytes from one owned read lease. These reads
+validate complete page framing, ordering and identity before consumption.
+Ordinary read-only scans trust the writer's member uniqueness without building
+a temporary hash set; write preparation and strict decoders retain that check.
 Replies retain only admitted output members. Mutation source and boundary probes,
 and rewrite planning, use owned snapshots. Command-local probes retain admitted source
 pages containing requested members within a fixed scratch bound and reuse
@@ -434,8 +439,10 @@ relocation does not invalidate owned payload bytes.
 Mixed-score BYLEX preserves global member ordering without a resident member
 index by repeatedly selecting
 the next member: its work can scale with the collection size times the offset
-and result count. Read-only scans retain shared key intent, yield between pages
-and revalidate their population without retaining the store mutex. Add, increment,
+and result count. Read-only scans retain shared key intent and revalidate their
+population without retaining the store mutex. Serial scans use bounded
+cooperative checkpoints; parallel window children already run as separately
+queued tasks. Add, increment,
 remove and GEOADD use the member index to resolve old scores
 before locating ordered source pages and routing final scores against old page
 boundaries. Resident score bounds skip unrelated pages; equal-score runs still

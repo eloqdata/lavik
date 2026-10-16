@@ -147,13 +147,13 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
-    GroupReadLimiter* limiter) {
+    GroupReadLimiter* limiter, SortedSetMemberValidation validation) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
-      [](std::string_view payload, std::uint64_t sequence,
-         const OrderedGroupEntry& route,
-         LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
-        auto decoded = DecodeOrderedGroup(payload);
+      [validation](std::string_view payload, std::uint64_t sequence,
+                   const OrderedGroupEntry& route,
+                   LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
+        auto decoded = DecodeOrderedGroup(payload, validation);
         if (!decoded.ok()) return decoded.status();
         if (decoded->kind_ == OrderedCollectionKind::kSortedSet &&
             (decoded->entries_.front().score_ != route.min_score_ ||
@@ -186,13 +186,15 @@ StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
                                        std::uint8_t db_id, std::string_view key,
                                        const Digest& digest,
                                        GroupedObject::Handle object,
-                                       std::uint64_t page_id) {
+                                       std::uint64_t page_id,
+                                       SortedSetMemberValidation validation) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
-      [](std::string_view payload, std::uint64_t,
-         const OrderedGroupEntry& route,
-         LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
-        auto entries = DecodeSortedSetGroupViews(payload);
+      [validation](
+          std::string_view payload, std::uint64_t,
+          const OrderedGroupEntry& route,
+          LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
+        auto entries = DecodeSortedSetGroupViews(payload, validation);
         if (!entries.ok()) return entries.status();
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)

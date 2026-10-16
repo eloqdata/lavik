@@ -4047,6 +4047,15 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
       GroupReadLimiter* limiter = nullptr);
+  // Owns field/value bytes after the physical lease is released. Published
+  // read-only pages trust writer uniqueness/routing and omit lookup digests.
+  // Mutation, import and callers needing process-local lookup digests use
+  // the strict snapshot.
+  Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupForRead(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
+      GroupReadLimiter* limiter = nullptr);
   // Callers admit the decoded image. Full read commands may additionally
   // request per-owner windows; their optional admission can fall back to
   // serial. These terminal full-read results omit process-local field digests;
@@ -4418,15 +4427,20 @@ class StorageEngine::Impl {
   // Returns owned entries after releasing the physical lease. An optional
   // caller-owned limiter accounts against the refreshed physical owner until
   // decoding finishes; it must outlive this task, including cancellation.
+  // Only read-only consumers may trust stored Sorted Set member uniqueness.
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned = false,
-      GroupReadLimiter* limiter = nullptr);
+      GroupReadLimiter* limiter = nullptr,
+      SortedSetMemberValidation validation =
+          SortedSetMemberValidation::kVerifyUnique);
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, std::uint64_t id);
+      GroupedObject::Handle object, std::uint64_t id,
+      SortedSetMemberValidation validation =
+          SortedSetMemberValidation::kVerifyUnique);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,

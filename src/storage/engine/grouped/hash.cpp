@@ -341,6 +341,27 @@ absl::Status VisitHashGroupFields(
   return absl::OkStatus();
 }
 
+absl::Status VisitPersistedHashGroupFields(
+    std::string_view payload, std::uint32_t field_count,
+    absl::FunctionRef<absl::Status(const HashEntryView&)> visitor) {
+  if (payload.size() < kGroupHeaderBytes ||
+      (field_count == 0 && payload.size() != kGroupHeaderBytes))
+    return absl::DataLossError("Hash group count does not match its payload");
+  if (field_count == 0) return absl::OkStatus();
+  auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
+  if (!reader.ok()) return absl::DataLossError(reader.status().message());
+  if (reader->size() != field_count)
+    return absl::DataLossError(
+        "Hash group inner count disagrees with envelope");
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return absl::DataLossError(entry.status().message());
+    auto status = visitor(*entry);
+    if (!status.ok()) return status;
+  }
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::optional<HashGroupPointProbe>> HashGroupPointProbe::Create(
     std::string_view payload, const DigestSeed& seed, std::string_view field) {
   auto metadata = DecodeHashGroupMetadata(payload, payload.size());

@@ -240,6 +240,39 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
       limiter);
 }
 
+Task<absl::StatusOr<LoadedHashGroup>> StorageEngine::Impl::LoadHashGroupForRead(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned,
+    GroupReadLimiter* limiter) {
+  return LoadHashGroup<LoadedHashGroup>(
+      store, partition, db_id, key, digest, object, id, pinned,
+      [object, id](std::string_view payload, std::uint64_t sequence,
+                   std::uint32_t field_count,
+                   LoadedValue&&) -> absl::StatusOr<LoadedHashGroup> {
+        // Read-only results move field/value bytes into replies. Published
+        // pages inherit uniqueness and routing from the writer; framing
+        // checks suffice here without hashing every field again.
+        LoadedHashGroup loaded{
+            .sequence_ = sequence,
+            .snapshot_ = {
+                .incarnation_ = object->directory().root().incarnation_,
+                .id_ = id,
+                .value_ = {}}};
+        auto& fields = loaded.snapshot_.value_.entries_;
+        fields.reserve(field_count);
+        const auto valid = VisitPersistedHashGroupFields(
+            payload, field_count, [&](const HashEntryView& entry) {
+              fields.push_back({.field_ = std::string(entry.field_),
+                                .value_ = std::string(entry.value_)});
+              return absl::OkStatus();
+            });
+        if (!valid.ok()) return valid;
+        return loaded;
+      },
+      limiter);
+}
+
 Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -252,34 +285,9 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
     if (!parallel)
       return LoadHashGroupSnapshot(store, partition, db_id, key, digest, object,
                                    id, pinned, limiter);
-    return LoadHashGroup<LoadedHashGroup>(
-        store, partition, db_id, key, digest, object, id, pinned,
-        [object, id](std::string_view payload, std::uint64_t sequence,
-                     std::uint32_t field_count,
-                     LoadedValue&&) -> absl::StatusOr<LoadedHashGroup> {
-          // Terminal full reads only move field/value bytes into replies.
-          // Reuse the persisted routing digest for duplicate detection and
-          // omit the process-local lookup digest they never consume. Keep
-          // this decoder when optional window admission falls back to serial.
-          LoadedHashGroup loaded{
-              .sequence_ = sequence,
-              .snapshot_ = {
-                  .incarnation_ = object->directory().root().incarnation_,
-                  .id_ = id,
-                  .value_ = {}}};
-          auto& fields = loaded.snapshot_.value_.entries_;
-          fields.reserve(field_count);
-          const auto valid = VisitHashGroupFields(
-              payload, field_count, id, object->directory().root().seed_,
-              [&](const HashEntryView& entry) {
-                fields.push_back({.field_ = std::string(entry.field_),
-                                  .value_ = std::string(entry.value_)});
-                return absl::OkStatus();
-              });
-          if (!valid.ok()) return valid;
-          return loaded;
-        },
-        limiter);
+    // Keep the read-only decoder when optional admission falls back to serial.
+    return LoadHashGroupForRead(store, partition, db_id, key, digest, object,
+                                id, pinned, limiter);
   };
   struct Selection {
     GroupedRecordId id_;

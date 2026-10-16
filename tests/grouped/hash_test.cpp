@@ -797,6 +797,109 @@ TEST(GroupedHashTest, PointLookupRejectsCorruptionAfterMatch) {
   EXPECT_EQ(status.message(), "Hash value has trailing bytes");
 }
 
+TEST(GroupedHashTest, PersistedVisitorBorrowsEmptyAndBinaryFields) {
+  auto value = Value(3);
+  value.entries_[0].field_ = std::string("f\0x", 3);
+  value.entries_[0].value_ = std::string("v\0x", 3);
+  value.entries_[1].field_.clear();
+  value.entries_[2].value_.clear();
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
+  ASSERT_TRUE(encoded.ok());
+  std::size_t visited = 0;
+  auto visit = [&](const HashEntryView& entry) {
+    EXPECT_EQ(entry.field_, value.entries_[visited].field_);
+    EXPECT_EQ(entry.value_, value.entries_[visited].value_);
+    EXPECT_GE(entry.field_.data(), encoded->data());
+    EXPECT_LE(entry.value_.data() + entry.value_.size(),
+              encoded->data() + encoded->size());
+    ++visited;
+    return absl::OkStatus();
+  };
+  ASSERT_TRUE(VisitPersistedHashGroupFields(*encoded, 3, visit).ok());
+  EXPECT_EQ(visited, 3);
+  auto empty = EncodeHashGroup({.incarnation_ = 17});
+  ASSERT_TRUE(empty.ok());
+  ASSERT_TRUE(VisitPersistedHashGroupFields(*empty, 0, visit).ok());
+  EXPECT_EQ(visited, 3);
+}
+
+TEST(GroupedHashTest, PersistedVisitorKeepsFramingChecksAndVisitorErrors) {
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(2)});
+  ASSERT_TRUE(encoded.ok());
+  auto check = [](const std::string& bytes) {
+    auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
+    EXPECT_TRUE(metadata.ok());
+    if (!metadata.ok()) return metadata.status();
+    return VisitPersistedHashGroupFields(
+        bytes, metadata->field_count_,
+        [](const HashEntryView&) { return absl::OkStatus(); });
+  };
+  auto broken = *encoded;
+  const auto second_header = broken.find("field-1") - 8;
+  broken.replace(second_header, 4, 4, '\xff');
+  auto status = check(broken);
+  EXPECT_TRUE(absl::IsDataLoss(status));
+  EXPECT_EQ(status.message(), "Hash entry is truncated");
+  broken = *encoded;
+  broken[kHashGroupHeaderBytes] ^= 1;
+  status = check(broken);
+  EXPECT_TRUE(absl::IsDataLoss(status));
+  EXPECT_EQ(status.message(), "invalid Hash value header");
+  broken = *encoded;
+  broken[kHashGroupHeaderBytes + 16] = 1;
+  status = check(broken);
+  EXPECT_TRUE(absl::IsDataLoss(status));
+  EXPECT_EQ(status.message(), "Hash group inner count disagrees with envelope");
+  broken = *encoded + "x";
+  const auto compact_bytes = broken.size() - kHashGroupHeaderBytes;
+  for (std::size_t i = 0; i < 4; ++i)
+    broken[36 + i] = static_cast<char>(compact_bytes >> (8 * i));
+  for (std::size_t i = 0; i < 8; ++i)
+    broken[kHashGroupHeaderBytes + 24 + i] =
+        static_cast<char>(compact_bytes >> (8 * i));
+  status = check(broken);
+  EXPECT_TRUE(absl::IsDataLoss(status));
+  EXPECT_EQ(status.message(), "Hash value has trailing bytes");
+  std::size_t visited = 0;
+  status =
+      VisitPersistedHashGroupFields(*encoded, 2, [&](const HashEntryView&) {
+        ++visited;
+        return absl::ResourceExhaustedError("visitor rejected output");
+      });
+  EXPECT_TRUE(absl::IsResourceExhausted(status));
+  EXPECT_EQ(status.message(), "visitor rejected output");
+  EXPECT_EQ(visited, 1);
+}
+
+TEST(GroupedHashTest, PersistedVisitorTrustsPublishedUniquenessAndRoutes) {
+  const auto seed = Seed(91);
+  const GroupedRecordId id{ComputeDigest("field-0", seed).value_, 64};
+  ASSERT_FALSE(id.ContainsHash(ComputeDigest("field-1", seed).value_));
+  auto encoded =
+      EncodeHashGroup({.incarnation_ = 17, .id_ = id, .value_ = Value(2)});
+  ASSERT_TRUE(encoded.ok());
+  auto visit = [](const HashEntryView&) { return absl::OkStatus(); };
+  EXPECT_TRUE(VisitPersistedHashGroupFields(*encoded, 2, visit).ok());
+  EXPECT_TRUE(
+      absl::IsDataLoss(VisitHashGroupFields(*encoded, 2, id, seed, visit)));
+
+  encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(3)});
+  ASSERT_TRUE(encoded.ok());
+  encoded->replace(encoded->find("field-2"), 7, "field-1");
+  std::vector<std::string> fields;
+  ASSERT_TRUE(VisitPersistedHashGroupFields(*encoded, 3,
+                                            [&](const HashEntryView& entry) {
+                                              fields.emplace_back(entry.field_);
+                                              return absl::OkStatus();
+                                            })
+                  .ok());
+  EXPECT_EQ(fields,
+            (std::vector<std::string>{"field-0", "field-1", "field-1"}));
+  EXPECT_TRUE(absl::IsDataLoss(DecodeHashGroup(*encoded).status()));
+  EXPECT_TRUE(
+      absl::IsDataLoss(VisitHashGroupFields(*encoded, 3, {}, seed, visit)));
+}
+
 TEST(GroupedHashTest,
      PointLookupLeavesUnrelatedDuplicateValidationToFullDecode) {
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(3)});

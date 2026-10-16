@@ -283,6 +283,72 @@ TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
   EXPECT_FALSE(DecodeSortedSetGroupViews(*list).ok());
 }
 
+TEST(GroupedCollectionTest, SortedSetStoredReadsTrustMemberUniqueness) {
+  auto page = Page(1, 3, OrderedCollectionKind::kSortedSet);
+  auto encoded = EncodeOrderedGroup(page);
+  ASSERT_TRUE(encoded.ok());
+  // Distinct scores preserve ordering even when a member is repeated. Writers
+  // reject this input; only explicit stored reads skip the hash-set check.
+  page.entries_.back().value_ = page.entries_.front().value_;
+  EXPECT_FALSE(EncodeOrderedGroup(page).ok());
+  encoded->replace(encoded->find("item-2"), 6, "item-0");
+  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedGroup(*encoded).status()));
+  EXPECT_TRUE(absl::IsDataLoss(DecodeSortedSetGroupViews(*encoded).status()));
+
+  constexpr auto trusted = SortedSetMemberValidation::kTrustStored;
+  auto owned = DecodeOrderedGroup(*encoded, trusted);
+  ASSERT_TRUE(owned.ok()) << owned.status();
+  EXPECT_EQ(owned->entries_, page.entries_);
+  auto views = DecodeSortedSetGroupViews(*encoded, trusted);
+  ASSERT_TRUE(views.ok()) << views.status();
+  ASSERT_EQ(views->size(), page.entries_.size());
+  for (std::size_t i = 0; i < views->size(); ++i) {
+    EXPECT_EQ((*views)[i].value_, page.entries_[i].value_);
+    EXPECT_EQ((*views)[i].score_, page.entries_[i].score_);
+  }
+}
+
+TEST(GroupedCollectionTest, SortedSetStoredReadsKeepStructuralValidation) {
+  auto encoded =
+      EncodeOrderedGroup(Page(1, 3, OrderedCollectionKind::kSortedSet));
+  ASSERT_TRUE(encoded.ok());
+  const auto rejected = [](const std::string& bytes) {
+    for (auto validation : {SortedSetMemberValidation::kVerifyUnique,
+                            SortedSetMemberValidation::kTrustStored}) {
+      EXPECT_TRUE(
+          absl::IsDataLoss(DecodeOrderedGroup(bytes, validation).status()));
+      EXPECT_TRUE(absl::IsDataLoss(
+          DecodeSortedSetGroupViews(bytes, validation).status()));
+    }
+  };
+  const auto set_score = [](std::string* bytes, std::size_t offset,
+                            double score) {
+    const auto bits = std::bit_cast<std::uint64_t>(score);
+    for (unsigned i = 0; i < 8; ++i)
+      (*bytes)[offset + 4 + i] = static_cast<char>(bits >> (8 * i));
+  };
+  auto bad = *encoded;
+  bad.pop_back();
+  rejected(bad);
+  bad = *encoded;
+  bad[kOrderedGroupHeaderBytes] = static_cast<char>(0xff);
+  rejected(bad);
+  bad = *encoded;
+  set_score(&bad, kOrderedGroupHeaderBytes,
+            std::numeric_limits<double>::quiet_NaN());
+  rejected(bad);
+  bad = *encoded;
+  set_score(&bad, kOrderedGroupHeaderBytes, 4);
+  rejected(bad);
+  bad = *encoded;
+  bad.replace(bad.find("item-1"), 6, "item-0");
+  set_score(&bad, kOrderedGroupHeaderBytes + kOrderedEntryHeaderBytes + 6, 0);
+  rejected(bad);
+  bad = *encoded;
+  std::fill_n(bad.begin() + 24, 8, '\0');
+  rejected(bad);
+}
+
 TEST(GroupedCollectionTest, StringAndStreamHaveDistinctDurableKinds) {
   for (const auto kind :
        {OrderedCollectionKind::kStream, OrderedCollectionKind::kString}) {

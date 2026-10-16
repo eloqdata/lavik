@@ -247,6 +247,17 @@ absl::Status VisitHashGroupFields(
     const DigestSeed& seed,
     absl::FunctionRef<absl::Status(const HashEntryView&)> visitor);
 
+// Read-only scans of published groups may trust the writer's field
+// uniqueness and prefix routing. The loader must first verify the record CRC
+// when present, outer envelope and physical identity; field_count comes from
+// that envelope. This traversal checks inner framing, lengths and count, but
+// neither hashes fields nor builds a duplicate set. Import, mutation and
+// general validation must use the strict visitor/decoder above. Payload
+// lifetime and unpublished-scratch requirements match VisitHashGroupFields.
+absl::Status VisitPersistedHashGroupFields(
+    std::string_view payload, std::uint32_t field_count,
+    absl::FunctionRef<absl::Status(const HashEntryView&)> visitor);
+
 // Splits one complete leaf into complete replacement leaves. The input is
 // scratch, never the published directory. A large indivisible field or a full
 // 64-bit collision may exceed target_bytes; it is never fragmented into a

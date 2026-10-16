@@ -428,10 +428,13 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   void InstallGroupedList(std::size_t pages = 70) {
     InstallGroupedOrdered(OrderedCollectionKind::kList, pages);
   }
-  void InstallGroupedZset(std::size_t pages = 70) {
-    InstallGroupedOrdered(OrderedCollectionKind::kSortedSet, pages);
+  void InstallGroupedZset(std::size_t pages = 70,
+                          bool equal_member_lengths = false) {
+    InstallGroupedOrdered(OrderedCollectionKind::kSortedSet, pages,
+                          equal_member_lengths);
   }
-  void InstallGroupedOrdered(OrderedCollectionKind kind, std::size_t pages) {
+  void InstallGroupedOrdered(OrderedCollectionKind kind, std::size_t pages,
+                             bool equal_member_lengths = false) {
     constexpr std::size_t per_page = 3;
     const bool sorted = kind == OrderedCollectionKind::kSortedSet;
     ASSERT_NO_FATAL_FAILURE(PrepareGroupedCollection(
@@ -453,7 +456,8 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                      (sorted ? std::string(6 - number.size(), '0') : "") +
                      number;
         value.append("\0\xff", 2);
-        value.append(17 + (i + j) % 31, static_cast<char>(i + j));
+        value.append(equal_member_lengths ? 17 : 17 + (i + j) % 31,
+                     static_cast<char>(i + j));
         list_values_.push_back(value);
         // Ties cross page boundaries; binary member order must remain stable
         // when owner-bucket submission order differs from score/rank order.
@@ -654,11 +658,11 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     const auto offset = payload.find(old_field);
     ASSERT_NE(offset, std::string::npos);
     payload.replace(offset, old_field.size(), new_field);
-    // Repair CRC so only logical validation, not the physical checksum, can
-    // reject this page. Fixed field widths preserve the encoded framing.
+    // Repair CRC to distinguish trusted terminal reads from strict logical
+    // validation. Fixed field widths preserve the encoded framing.
     ASSERT_NO_FATAL_FAILURE(StageGroupedPage(page));
   }
-  void ExpectHashCorruption(std::string_view message) {
+  void ExpectStoredHashFields(std::string_view strict_error) {
     ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
     ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
     for (const bool scarce : {false, true}) {
@@ -682,10 +686,18 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                 scarce ? 1 : 32);
       ASSERT_NO_FATAL_FAILURE(Drain(task));
       const auto result = std::move(task).TakeResult();
-      EXPECT_TRUE(absl::IsDataLoss(result.status())) << result.status();
-      EXPECT_EQ(result.status().message(), message);
+      ExpectHash(result);
       ExpectNoPageLeases();
     }
+    // Materialization feeds mutations and still validates the durable logical
+    // invariants before returning entries with process-local lookup digests.
+    auto strict = ReadGroupedHash(false);
+    Start(strict);
+    ASSERT_NO_FATAL_FAILURE(Drain(strict));
+    const auto result = std::move(strict).TakeResult();
+    EXPECT_TRUE(absl::IsDataLoss(result.status())) << result.status();
+    EXPECT_EQ(result.status().message(), strict_error);
+    ExpectNoPageLeases();
   }
   void RelocateGroupedPagesToRemoteOwner() {
     ASSERT_EQ(WorkerCount(), 2);
@@ -1571,20 +1583,24 @@ TEST_P(GroupedHashParallelReadTest, RelocatedLeavesShareTheNewOwnersWindow) {
   ExpectNoPageLeases();
 }
 
-TEST_P(GroupedHashParallelReadTest, ValidChecksumDoesNotHideWrongFieldRoutes) {
+TEST_P(GroupedHashParallelReadTest,
+       TerminalReadsReturnStoredFieldsWithoutRouteRehash) {
   ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
   ASSERT_NO_FATAL_FAILURE(
       ReplaceHashField(1, hash_entries_[1].first, hash_entries_[0].first));
+  hash_entries_[1].first = hash_entries_[0].first;
   ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
-  ExpectHashCorruption("Hash field outside its group route");
+  ExpectStoredHashFields("Hash field outside its group route");
 }
 
-TEST_P(GroupedHashParallelReadTest, ValidChecksumDoesNotHideDuplicateFields) {
+TEST_P(GroupedHashParallelReadTest,
+       TerminalReadsReturnStoredDuplicatesWithoutDeduplication) {
   ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam(), 2));
   ASSERT_NO_FATAL_FAILURE(
       ReplaceHashField(1, hash_entries_[3].first, hash_entries_[2].first));
+  hash_entries_[3].first = hash_entries_[2].first;
   ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
-  ExpectHashCorruption("duplicate field in Hash group");
+  ExpectStoredHashFields("duplicate field in Hash group");
 }
 
 TEST_P(GroupedHashParallelReadTest,
@@ -1764,10 +1780,8 @@ TEST_P(GroupedZsetParallelReadTest,
                                .first_ = 1,
                                .last_ = -2});
   Start(task);
-  // Zset reads yield before acquiring their page. This first slice only
-  // reaches that checkpoint; the next submits without consuming its new CQEs.
-  RunReadRound();
-  EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), 0);
+  // Children already enter through the scheduler's ready queue. Their first
+  // slice submits the complete wave without an extra per-page Yield.
   RunReadRound();
   EXPECT_FALSE(task.done());
   for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
@@ -1805,6 +1819,46 @@ INSTANTIATE_TEST_SUITE_P(ForwardAndReverse, GroupedZsetParallelReadTest,
                          testing::Bool());
 
 TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ZsetRangeReturnsStoredDuplicatesWithoutDeduplication) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset(70, true));
+  auto& payload = grouped_payloads_[1];
+  ASSERT_EQ(zset_values_[3].first.size(), zset_values_[5].first.size());
+  const auto offset = payload.find(zset_values_[3].first);
+  ASSERT_NE(offset, std::string::npos);
+  payload.replace(offset, zset_values_[3].first.size(), zset_values_[5].first);
+  zset_values_[3].first = zset_values_[5].first;
+  // The repeated member has different scores, so score/member order remains
+  // valid. A repaired CRC isolates the read's uniqueness-validation policy.
+  ASSERT_TRUE(absl::IsDataLoss(DecodeOrderedGroup(payload).status()));
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  for (const bool scarce : {false, true}) {
+    SCOPED_TRACE(scarce ? "serial admission fallback" : "parallel batch");
+    const auto previous_shard = CurrentMemoryAccountingShard();
+    absl::Cleanup restore = [&] {
+      (void)InitMemoryLimit(1024ULL * 1024 * 1024, WorkerCount());
+      BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                    : previous_shard - 1);
+    };
+    if (scarce) {
+      BindMemoryAccountingShard(kMaxMemoryWorkers);
+      RefreshMemoryStats();
+      const auto target = GetMemoryStats().used_bytes_ + 128 * 1024;
+      ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+    }
+    auto task = ReadGroupedZset();
+    Start(task);
+    RunReadRound();
+    EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), scarce ? 1 : 32);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectZset(std::move(task).TakeResult());
+    ExpectNoPageLeases();
+  }
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
        ZsetRangeFallsBackToSerialWhenWindowScratchDoesNotFit) {
   ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
   ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
@@ -1838,7 +1892,6 @@ TEST_F(GroupedCollectionTwoOwnerReadTest,
   auto task = ReadGroupedZset();
   Start(task);
   RunReadRound();
-  RunReadRound();
   EXPECT_EQ(blocks_[0].pin_count(), 16);
   EXPECT_EQ(blocks_[1].pin_count(), 16);
   ASSERT_NO_FATAL_FAILURE(Drain(task));
@@ -1865,7 +1918,6 @@ TEST_F(GroupedCollectionTwoOwnerReadTest, ZsetPartialStartFailureJoinsItsPage) {
   ASSERT_EQ(setenv(variable, key_.c_str(), 1), 0);
   auto task = ReadGroupedZset();
   Start(task);
-  RunReadRound();
   RunReadRound();
   EXPECT_FALSE(task.done());
   EXPECT_EQ(blocks_[0].pin_count(), 1);
@@ -1894,6 +1946,32 @@ TEST_F(LoadValueAwaitableTestPeer,
   ASSERT_NO_FATAL_FAILURE(Drain(second));
   ExpectZset(first_result);
   ExpectZset(std::move(second).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ResidentZsetSerialScanYieldsToOtherReadyWork) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  // ZCOUNT keeps the serial page path. Every page is resident, so no disk
+  // suspension can accidentally provide the fairness checkpoint under test.
+  auto task = ReadGroupedZset(
+      {.kind_ = SortedSetOperationKind::kCount,
+       .range_mode_ = SortedSetRangeMode::kScore,
+       .minimum_score_ = {-std::numeric_limits<double>::infinity(), false},
+       .maximum_score_ = {std::numeric_limits<double>::infinity(), false}});
+  Start(task);
+  ASSERT_FALSE(task.done());
+  bool ran_before_scan_finished = false;
+  auto observer = [&]() -> Task<absl::Status> {
+    ran_before_scan_finished = !task.done();
+    co_return absl::OkStatus();
+  };
+  worker_.Spawn(observer());
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(ran_before_scan_finished);
+  const auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(result->count_, zset_values_.size());
   ExpectNoPageLeases();
 }
 

@@ -910,7 +910,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!entry) return absl::DataLossError("missing Sorted Set physical page");
     return budget->AddGroup(*entry, current->ExtentsFor({metadata[i].id_, 0}));
   };
-  // A scan retains one physical read lease and borrowed member views.
+  // A serial scan retains one physical read lease and borrowed member views.
   // Keep scratch admitted until both disappear; replies own separate copies.
   SortedSetOrderedProbe local_probe{.source_ = object, .pages_ = {}};
   if (ordered_probe == nullptr) ordered_probe = &local_probe;
@@ -964,7 +964,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto checked = add_page_budget(&budget, i);
     if (!checked.ok()) co_return checked;
     if (ReadOnly(operation) || prepared != nullptr) {
-      if (ReadOnly(operation) || page_work.Add(budget.bytes()))
+      // Window children already enter the worker's ready queue individually;
+      // yielding again before their reads adds a scheduler turn per page.
+      // Serial reads can complete from staging without suspending, so retain
+      // bounded cooperative checkpoints for that path.
+      if (limiter == nullptr && page_work.Add(budget.bytes()))
         co_await bycorf::Yield(*store.worker_);
       if (shutdown_flush_requested_)
         co_return absl::CancelledError("Sorted Set read cancelled by shutdown");
@@ -978,13 +982,16 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       admission = std::move(*reserved);
     }
     auto load = [&] {
+      const auto validation = ReadOnly(operation)
+                                  ? SortedSetMemberValidation::kTrustStored
+                                  : SortedSetMemberValidation::kVerifyUnique;
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
-                                 metadata[i].id_);
+                                 metadata[i].id_, validation);
       else
         return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
-                                        object, metadata[i].id_, false,
-                                        limiter);
+                                        object, metadata[i].id_, false, limiter,
+                                        validation);
     };
     auto page = co_await load();
     if (!page.ok()) co_return page.status();
@@ -1116,9 +1123,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       // sorts members independently. Without a resident member index, select
       // one next lexical member per pass: O(N * (offset + output)) work, but
       // only one page, one candidate/boundary, and the admitted reply
-      // survive. Every page yields and revalidates epochs, so even a large
-      // OFFSET does not monopolize this worker or keep the store mutex across
-      // passes.
+      // survive. Pages revalidate epochs and the scan yields at bounded work
+      // checkpoints, so a large OFFSET does not monopolize this worker or
+      // keep the store mutex across passes.
       std::optional<SortedSetMember> skipped;
       std::uint64_t offset = operation.limit_ ? operation.offset_ : 0;
       for (;;) {
@@ -1370,7 +1377,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (ReadOnly(operation) || prepared != nullptr) {
         // Only an immutable size estimate crosses this yield. The loader
         // refreshes the physical location and checks the logical view again.
-        if (ReadOnly(operation) || page_work.Add(budget.bytes()))
+        if (page_work.Add(budget.bytes()))
           co_await bycorf::Yield(*store.worker_);
         if (shutdown_flush_requested_)
           co_return absl::CancelledError("member read cancelled by shutdown");
@@ -1394,13 +1401,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         const auto bytes = leaf->loaded_.value();
         const std::string_view payload(
             reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        // Keep the lease through the synchronous scan. Only requested doubles
-        // escape; full route/duplicate validation still covers unrelated
-        // fields. Any failure discards command-local member state before a
-        // reply exists.
-        status = VisitHashGroupFields(payload, leaf->field_count_, id,
-                                      object->directory().root().seed_,
-                                      retain_score);
+        // This read only extracts requested scores from a published leaf.
+        // Its writer already checked field uniqueness and routing; retain the
+        // lease and validate framing without rehashing unrelated members.
+        status = VisitPersistedHashGroupFields(payload, leaf->field_count_,
+                                               retain_score);
         if (!status.ok()) co_return status;
         continue;
       }
