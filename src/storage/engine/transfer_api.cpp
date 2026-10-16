@@ -16,6 +16,7 @@
 
 #include <array>
 
+#include "grouped/read_window.h"
 #include "impl.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/stream_records.h"
@@ -30,66 +31,52 @@ namespace {
 // settle; shutdown reclaims this owned tree only after storage I/O quiesces.
 class StreamPageWindow {
  public:
-  static constexpr std::size_t kWidth = 16;
   static constexpr std::size_t kBytes = 512 * 1024;
-  using Read = Task<absl::StatusOr<LoadedOrderedGroup>>;
+  using Reads = GroupReadWindow<LoadedOrderedGroup>;
+  using Read = Reads::Read;
 
-  StreamPageWindow(MemoryReservation admission, bycorf::Worker* worker)
-      : admission_(std::move(admission)), worker_(worker) {}
+  static std::size_t StorageBytes(unsigned owners, std::size_t size) {
+    constexpr auto limit = std::numeric_limits<std::size_t>::max();
+    if (size > limit / sizeof(std::optional<LoadedOrderedGroup>)) return limit;
+    const auto pages = AllocatorUsableSizeForRequest(
+        size * sizeof(std::optional<LoadedOrderedGroup>));
+    const auto reads = Reads::StorageBytes(owners, size);
+    const auto object = AllocatorUsableSizeForRequest(sizeof(StreamPageWindow));
+    if (pages > limit - object || reads > limit - object - pages) return limit;
+    return object + pages + reads;
+  }
+
+  StreamPageWindow(MemoryReservation admission, bycorf::Worker* worker,
+                   unsigned owners, std::size_t size)
+      : admission_(std::move(admission)),
+        pages_(size),
+        size_(size),
+        reads_(worker, owners, size) {}
 
   void Start(std::size_t slot, Read read) {
-    assert(slot < size_ && !reads_[slot].valid());
-    read.SetCompletionCallback(
-        this, [](void* context, std::coroutine_handle<>) noexcept {
-          auto& window = *static_cast<StreamPageWindow*>(context);
-          assert(window.pending_ != 0);
-          if (--window.pending_ == 0 && window.waiter_)
-            window.worker_->Enqueue(std::exchange(window.waiter_, {}));
-        });
-    const auto handle = std::move(read).ReleaseHandle();
-    reads_[slot] = Read(handle);
-    ++pending_;
-    worker_->Enqueue(handle);
+    assert(slot < size_ && !pages_[slot]);
+    reads_.Add(std::move(read), slot);
   }
 
-  auto Join() {
-    struct Awaiter {
-      StreamPageWindow* window_;
-      bool await_ready() const noexcept { return window_->pending_ == 0; }
-      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
-        window_->waiter_ = waiter;
-      }
-      void await_resume() const noexcept {}
-    };
-    return Awaiter{this};
-  }
+  GroupReadLimiter* limiter() noexcept { return reads_.limiter(); }
+  auto Join() { return reads_.Join(); }
 
   absl::Status Collect() {
-    assert(pending_ == 0);
-    absl::Status status;
-    for (std::size_t i = 0; i < size_; ++i) {
-      if (!reads_[i].valid()) continue;
-      auto result = std::move(reads_[i]).TakeResult();
-      reads_[i] = {};
-      if (result.ok())
-        pages_[i].emplace(std::move(*result));
-      else if (status.ok())
-        status = result.status();
-    }
-    return status;
+    return reads_.Collect([&](std::size_t i, LoadedOrderedGroup&& page) {
+      pages_[i].emplace(std::move(page));
+      return absl::OkStatus();
+    });
   }
 
   // The complete window becomes one logical output page. Its reservation
   // covers concurrent decoders, this metadata and the combined output vector.
   MemoryReservation admission_;
-  std::array<std::optional<LoadedOrderedGroup>, kWidth> pages_;
-  std::size_t size_ = 0;
+  std::vector<std::optional<LoadedOrderedGroup>> pages_;
+  std::size_t size_;
 
  private:
-  bycorf::Worker* worker_;
-  std::array<Read, kWidth> reads_;
-  std::size_t pending_ = 0;
-  std::coroutine_handle<> waiter_;
+  // Child frames and limiter waiters die before their output/admission.
+  Reads reads_;
 };
 
 }  // namespace
@@ -205,16 +192,21 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       // The first boundary page has already been consumed. Interior counts
       // bound COUNT without reading past its last required page. Sparse
       // selected-ID history never enters this path.
-      static_assert(sizeof(StreamPageWindow) + 4096 < StreamPageWindow::kBytes);
       const auto object = source.saved_.grouped_;
       const auto& groups = object->ordered_directory().groups();
       const auto available =
           source.end_page_ - source.first_page_ - source.cursor_;
       auto remaining = source.range_count_ - source.emitted_;
-      std::size_t size = 0, bytes = sizeof(StreamPageWindow) + 4096;
-      for (; size < StreamPageWindow::kWidth && size < available &&
-             remaining != 0;
-           ++size) {
+      // Keep a contiguous logical window for network backpressure and COUNT.
+      // Owner-local permits bound its actual I/O independently of page order;
+      // several owners may each have sixteen reads in flight. The byte cap
+      // still bounds decoded pages, queued tasks and their scheduling metadata.
+      const auto width =
+          std::min(available, std::size_t(engine->worker_count_) *
+                                  GroupReadLimiter::kWidth);
+      constexpr std::size_t kFrameBytes = 4096;
+      std::size_t size = 0, payload = 0, bytes = 0;
+      for (; size < width && remaining != 0; ++size) {
         const auto index =
             source.range_->reverse_ ? first - size : first + size;
         const auto& group = groups[index];
@@ -225,8 +217,15 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         GroupedScratchBudget budget;
         auto status = budget.AddGroup(*physical, object->ExtentsFor(id));
         if (!status.ok()) co_return status;
-        if (budget.bytes() > StreamPageWindow::kBytes - bytes) break;
-        bytes += budget.bytes();
+        const auto metadata =
+            StreamPageWindow::StorageBytes(engine->worker_count_, size + 1);
+        if (metadata > StreamPageWindow::kBytes - kFrameBytes ||
+            payload > StreamPageWindow::kBytes - kFrameBytes - metadata ||
+            budget.bytes() >
+                StreamPageWindow::kBytes - kFrameBytes - metadata - payload)
+          break;
+        payload += budget.bytes();
+        bytes = kFrameBytes + metadata + payload;
         remaining -= std::min(remaining, group.item_count_);
       }
       if (size < 2) co_return std::unique_ptr<StreamPageWindow>{};
@@ -238,9 +237,9 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_ADMISSION_KEY",
                               source.key_))
         co_return std::unique_ptr<StreamPageWindow>{};
-      auto window = std::make_unique<StreamPageWindow>(std::move(*admission),
-                                                       source.store_->worker_);
-      window->size_ = size;
+      auto window = std::make_unique<StreamPageWindow>(
+          std::move(*admission), source.store_->worker_, engine->worker_count_,
+          size);
       absl::Status status;
       for (std::size_t j = 0; j < size; ++j) {
         if (j == 1 &&
@@ -255,10 +254,11 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           source.probe_page_.reset();
           source.probe_reservation_.reset();
         } else {
-          window->Start(j, engine->LoadOrderedGroupSnapshot(
-                               *source.store_, *source.partition_,
-                               source.db_id_, source.key_, source.digest_,
-                               object, groups[index].id_, true));
+          window->Start(
+              j, engine->LoadOrderedGroupSnapshot(
+                     *source.store_, *source.partition_, source.db_id_,
+                     source.key_, source.digest_, object, groups[index].id_,
+                     true, window->limiter()));
         }
       }
       co_await window->Join();

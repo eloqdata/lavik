@@ -21,9 +21,9 @@
 
 namespace lavik::storage {
 
-// Bound uninterrupted page work during unlocked Sorted Set preparation without
-// scheduling a continuation for every small point-write page. Scratch estimates
-// include entry overhead as well as bytes, so many tiny members count as work.
+// Bound uninterrupted page work during unlocked Sorted Set mutation preparation
+// without scheduling a continuation for every small page. Estimates include
+// entry overhead as well as bytes, so many tiny members count as work.
 // A single oversized page remains indivisible; its charge forces a scheduling
 // opportunity before decoding it. This is local scheduling state, not
 // admission.

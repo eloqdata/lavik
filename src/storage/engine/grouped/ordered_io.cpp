@@ -16,6 +16,7 @@
 
 #include "../impl.h"
 #include "lavik/storage/detail/grouped/scratch.h"
+#include "read_window.h"
 
 namespace lavik::storage {
 
@@ -24,7 +25,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
-    Decode decode) {
+    Decode decode, GroupReadLimiter* limiter) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
@@ -69,6 +70,14 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     // the logical root is unchanged. Historical snapshots instead own pins.
     const auto location = MaterializeIndexLocation(*entry);
     const auto extents = object->ExtentsFor(id);
+    GroupReadLimiter::Permit permit;
+    if (limiter != nullptr) {
+      if (location.block_owner() >= worker_count_)
+        co_return absl::DataLossError("ordered page has no physical owner");
+      permit = co_await limiter->Acquire(location.block_owner());
+    }
+    // The read lease must be released before handing this owner's permit to
+    // another child. Completed children retain owned results, not read leases.
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents,
@@ -137,13 +146,14 @@ Task<absl::StatusOr<LoadedOrderedGroup>>
 StorageEngine::Impl::LoadOrderedGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, std::uint64_t page_id, bool pinned) {
+    GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
+    GroupReadLimiter* limiter, SortedSetMemberValidation validation) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
-      [](std::string_view payload, std::uint64_t sequence,
-         const OrderedGroupEntry& route,
-         LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
-        auto decoded = DecodeOrderedGroup(payload);
+      [validation](std::string_view payload, std::uint64_t sequence,
+                   const OrderedGroupEntry& route,
+                   LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
+        auto decoded = DecodeOrderedGroup(payload, validation);
         if (!decoded.ok()) return decoded.status();
         if (decoded->kind_ == OrderedCollectionKind::kSortedSet &&
             (decoded->entries_.front().score_ != route.min_score_ ||
@@ -151,7 +161,8 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
           return absl::DataLossError("ordered page score bounds mismatch");
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
-      });
+      },
+      limiter);
 }
 
 Task<absl::StatusOr<std::vector<std::string>>>
@@ -159,13 +170,14 @@ StorageEngine::Impl::LoadOrderedListRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, std::size_t first,
-    std::size_t count) {
+    std::size_t count, GroupReadLimiter* limiter) {
   return LoadOrderedGroup<std::vector<std::string>>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [first, count](std::string_view payload, std::uint64_t,
                      const OrderedGroupEntry&, LoadedValue&&) {
         return DecodeOrderedListRange(payload, first, count);
-      });
+      },
+      limiter);
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedSortedSetPage>>
@@ -174,13 +186,15 @@ StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
                                        std::uint8_t db_id, std::string_view key,
                                        const Digest& digest,
                                        GroupedObject::Handle object,
-                                       std::uint64_t page_id) {
+                                       std::uint64_t page_id,
+                                       SortedSetMemberValidation validation) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
-      [](std::string_view payload, std::uint64_t,
-         const OrderedGroupEntry& route,
-         LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
-        auto entries = DecodeSortedSetGroupViews(payload);
+      [validation](
+          std::string_view payload, std::uint64_t,
+          const OrderedGroupEntry& route,
+          LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
+        auto entries = DecodeSortedSetGroupViews(payload, validation);
         if (!entries.ok()) return entries.status();
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)
@@ -264,7 +278,16 @@ StorageEngine::Impl::LoadGroupedStringValue(
   const auto output_bytes = aligned_output + options.read_headroom_bytes_ +
                             options.read_tailroom_bytes_;
   std::size_t page_scratch = 0;
+  const auto groups = directory.groups();
+  std::size_t ordinal = 0;
   for (const auto& metadata : directory.groups()) {
+    // Fixed segment positions let children copy into disjoint output slices,
+    // independently of owner and completion order. Validate before launching.
+    if (metadata.id_ != ordinal + 1 ||
+        metadata.item_count_ !=
+            std::min(kStringGroupBytes, size - ordinal * kStringGroupBytes))
+      co_return absl::DataLossError("grouped String segment layout mismatch");
+    ++ordinal;
     const GroupedRecordId id{metadata.id_, 0};
     const auto* entry = object->FindGroup(id);
     if (entry == nullptr)
@@ -274,10 +297,10 @@ StorageEngine::Impl::LoadGroupedStringValue(
     if (!status.ok()) co_return status;
     page_scratch = std::max(page_scratch, page.bytes());
   }
-  // Admit the final capacity and at most one page, including any external
-  // layout, before allocating. No decoded segment strings or full-image
-  // encoding coexist with the output. The reservation is local to assembly;
-  // the returned lease retains the pool's existing cross-worker lifecycle.
+  // The required admission preserves the serial reader's memory floor. Extra
+  // window metadata and page scratch are optional: scarce headroom reduces
+  // concurrency instead of rejecting a read that can still run serially.
+  // No decoded segment strings or second whole-value image coexist here.
   GroupedScratchBudget budget;
   auto status = budget.AddBytes(AllocatorUsableSizeForRequest(output_bytes));
   if (!status.ok()) co_return status;
@@ -285,17 +308,35 @@ StorageEngine::Impl::LoadGroupedStringValue(
   if (!status.ok()) co_return status;
   auto scratch = budget.Reserve(1);
   if (!scratch.ok()) co_return scratch.status();
+
+  auto plan = GroupReadPlan::TryCreate(worker_count_, groups.size());
+  if (plan) {
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+      const auto* entry = object->FindGroup({groups[i].id_, 0});
+      // Retained metadata can predate relocation. Read only an atomic owner
+      // hint here; each child refreshes before acquiring its actual permit.
+      auto owner = BlockOwner(entry->block_id());
+      if (owner >= worker_count_) owner = store.worker_->id();
+      plan->Add(owner, i);
+    }
+    if (!plan->ReserveWindow<std::size_t>(page_scratch)) plan.reset();
+  }
+
   auto buffer = co_await store.buffers_.AcquireReadBuffer(minimum_output);
   if (!buffer.ok()) co_return buffer.status();
   const auto output = buffer->io_buffer();
   if (output.size_ < size)
     co_return absl::ResourceExhaustedError("grouped output buffer too small");
-  std::size_t written = 0;
-  for (const auto& metadata : directory.groups()) {
-    auto copied = co_await LoadOrderedGroup<std::size_t>(
+  // Destroy children before their borrowed output, key, view and admission.
+  // No child is detached, including when shutdown destroys this parent.
+  std::optional<GroupReadWindow<std::size_t>> window;
+  if (plan) window.emplace(store.worker_, worker_count_, plan->width());
+  auto read = [&](std::size_t i) {
+    const auto& metadata = groups[i];
+    return LoadOrderedGroup<std::size_t>(
         store, partition, db_id, key, digest, object, metadata.id_, pinned,
-        [metadata,
-         destination = std::span(output.data_ + written, size - written)](
+        [metadata, destination = std::span(output.data_ + i * kStringGroupBytes,
+                                           metadata.item_count_)](
             std::string_view payload, std::uint64_t,
             const OrderedGroupEntry& route,
             LoadedValue&&) -> absl::StatusOr<std::size_t> {
@@ -313,9 +354,54 @@ StorageEngine::Impl::LoadGroupedStringValue(
             return absl::DataLossError("grouped String aggregate mismatch");
           std::memcpy(destination.data(), bytes.data(), bytes.size());
           return bytes.size();
-        });
-    if (!copied.ok()) co_return copied.status();
-    written += *copied;
+        },
+        window ? window->limiter() : nullptr);
+  };
+  std::size_t written = 0;
+  if (!window) {
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+      auto copied = co_await read(i);
+      if (!copied.ok()) co_return copied.status();
+      written += *copied;
+    }
+  } else {
+    while (!plan->empty()) {
+      absl::Status start_status;
+      for (unsigned owner = 0; owner < plan->owner_count(); ++owner) {
+        for (std::size_t n = 0; n < GroupReadLimiter::kWidth; ++n) {
+          const auto i = plan->Pop(owner);
+          if (!i) break;
+          // Exercise a partial start without recovering from C++ allocation
+          // failure, which remains fatal by policy.
+          if (window->size() == 1 &&
+              LAVIK_FAULT_MATCHES("LAVIK_FAIL_STRING_READ_BATCH_START_KEY",
+                                  key)) {
+            start_status = absl::ResourceExhaustedError(
+                "OOM grouped String read batch admission");
+            break;
+          }
+          window->Add(read(*i), *i);
+        }
+        if (!start_status.ok()) break;
+      }
+      co_await window->Join();
+      // Joining adds a scheduling gap after the last child's validation.
+      // A population replacement in that gap invalidates even successful I/O.
+      const auto& version = object->version();
+      if (EffectiveRecordDbEpoch(partition, db_id) != version.db_epoch_ ||
+          partition.replication_epoch_ != version.replication_epoch_ ||
+          partition.grouped_generations_[db_id] != version.index_generation_)
+        co_return absl::NotFoundError("ordered population changed during read");
+      const auto readable = object->ReadStatus();
+      if (!readable.ok()) co_return readable;
+      const auto completed =
+          window->Collect([&](std::size_t, std::size_t bytes) {
+            written += bytes;
+            return absl::OkStatus();
+          });
+      if (!start_status.ok()) co_return start_status;
+      if (!completed.ok()) co_return completed;
+    }
   }
   if (written != size)
     co_return absl::DataLossError("grouped String aggregate mismatch");

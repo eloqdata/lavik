@@ -235,7 +235,17 @@ absl::StatusOr<OrderedCollectionRoot> DecodeOrderedCollectionRoot(
     std::string_view bytes);
 absl::StatusOr<std::string> EncodeOrderedGroup(
     const OrderedGroupSnapshot& group);
-absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(std::string_view bytes);
+
+// Writers, imports and recovery verify uniqueness before accepting a page.
+// Ordinary reads can trust that invariant on stored Sorted Set pages and avoid
+// rebuilding a member hash set. Both modes still validate framing, identity,
+// scores and strict (score, member) order; other collection kinds are
+// unchanged.
+enum class SortedSetMemberValidation { kVerifyUnique, kTrustStored };
+
+absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
+    std::string_view bytes, SortedSetMemberValidation validation =
+                                SortedSetMemberValidation::kVerifyUnique);
 
 // Validates a complete live List page, including entries outside the requested
 // interval, but allocates/copies only [first, first + count). The interval must
@@ -243,11 +253,13 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(std::string_view bytes);
 absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
     std::string_view bytes, std::size_t first, std::size_t count);
 
-// Validates a complete live Sorted Set page, including all member uniqueness,
-// score/order and framing checks, without copying members. Returned views
-// borrow bytes; callers must retain its owning read lease until they are done.
+// Validates a complete live Sorted Set page without copying members. Uniqueness
+// is checked by default; ordinary stored reads may select kTrustStored above.
+// Returned views borrow bytes; retain their owning read lease until done.
 absl::StatusOr<std::vector<OrderedCollectionEntryView>>
-DecodeSortedSetGroupViews(std::string_view bytes);
+DecodeSortedSetGroupViews(std::string_view bytes,
+                          SortedSetMemberValidation validation =
+                              SortedSetMemberValidation::kVerifyUnique);
 
 // Binary member ordering breaks score ties. NaN is invalid; infinities are
 // valid. Equal -0/+0 scores have the same order, matching Redis numeric order.

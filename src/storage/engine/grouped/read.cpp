@@ -17,6 +17,7 @@
 #include "../impl.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
+#include "read_window.h"
 
 namespace lavik::storage {
 
@@ -33,11 +34,12 @@ absl::Status StorageEngine::Impl::ValidateGroupedRead(
   return object.status();
 }
 
-Task<absl::StatusOr<StorageEngine::Impl::LoadedHashGroupPayload>>
-StorageEngine::Impl::LoadHashGroupPayload(
+template <typename Result, typename Decode>
+Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned,
+    Decode decode, GroupReadLimiter* limiter) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
   if (object->is_ordered() && !object->has_member_index())
     co_return absl::DataLossError("ordered view has no prefix groups");
@@ -92,32 +94,47 @@ StorageEngine::Impl::LoadHashGroupPayload(
     // across suspension exactly as before.
     auto extents =
         location.external() ? object->ExtentsFor(id) : ExtentManifest{};
+    GroupReadLimiter::Permit permit;
+    if (limiter != nullptr) {
+      if (location.block_owner() >= worker_count_)
+        co_return absl::DataLossError("Hash group has no physical owner");
+      permit = co_await limiter->Acquire(location.block_owner());
+    }
+    // The synchronous decoder and page lease finish before handing the permit
+    // to another child. Queued reads reacquire it for every relocation retry.
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
-      loaded =
-          co_await LoadExternalValueLocal(store, location, extents, nullptr);
+      loaded = co_await LoadExternalValueLocal(store, location, extents,
+                                               nullptr, true);
     } else if (location.block_owner() == store.worker_->id()) {
       loaded = co_await LoadValueLocal(store, db_id, key, location,
                                        original.replication_epoch_, nullptr,
                                        original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
-      // Page scratch excludes the parent key. Admit the remote reader's copy
-      // here for every caller, and retain admission through the awaited read.
-      auto key_admission =
-          TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
-      if (!key_admission) {
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "OOM grouped parent key copy admission");
+      // Batched readers join before releasing their caller's key. Borrow it
+      // across the awaited hop so concurrency does not multiply large key
+      // copies. Other payload readers retain their existing copy admission.
+      std::optional<MemoryReservation> key_admission;
+      std::string owned_key;
+      if (limiter == nullptr) {
+        key_admission =
+            TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
+        if (!key_admission) {
+          RecordMemoryRejection();
+          co_return absl::ResourceExhaustedError(
+              "OOM grouped parent key copy admission");
+        }
+        owned_key.assign(key);
       }
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
-          [this, owner, db_id, owned_key = std::string(key), location,
+          [this, owner, db_id,
+           read_key = limiter ? key : std::string_view(owned_key), location,
            epoch = original.replication_epoch_,
            db_epoch =
                original.db_epoch_]() -> Task<absl::StatusOr<LoadedValue>> {
-            co_return co_await LoadValueLocal(*stores_[owner], db_id, owned_key,
+            co_return co_await LoadValueLocal(*stores_[owner], db_id, read_key,
                                               location, epoch, nullptr,
                                               db_epoch);
           });
@@ -142,9 +159,8 @@ StorageEngine::Impl::LoadHashGroupPayload(
           envelope->field_count_ != location.logical_size_) {
         co_return absl::DataLossError("Hash group physical identity mismatch");
       }
-      co_return LoadedHashGroupPayload{.loaded_ = std::move(*loaded),
-                                       .sequence_ = location.mutation_sequence_,
-                                       .field_count_ = envelope->field_count_};
+      co_return decode(payload, location.mutation_sequence_,
+                       envelope->field_count_, std::move(*loaded));
     }
     if (pinned || loaded.status().code() != absl::StatusCode::kAborted) {
       co_return loaded.status();
@@ -181,48 +197,191 @@ StorageEngine::Impl::LoadHashGroupPayload(
   }
 }
 
+Task<absl::StatusOr<StorageEngine::Impl::LoadedHashGroupPayload>>
+StorageEngine::Impl::LoadHashGroupPayload(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
+  return LoadHashGroup<LoadedHashGroupPayload>(
+      store, partition, db_id, key, digest, std::move(object), id, pinned,
+      [](std::string_view, std::uint64_t sequence, std::uint32_t field_count,
+         LoadedValue&& loaded) -> absl::StatusOr<LoadedHashGroupPayload> {
+        return LoadedHashGroupPayload{.loaded_ = std::move(loaded),
+                                      .sequence_ = sequence,
+                                      .field_count_ = field_count};
+      });
+}
+
 Task<absl::StatusOr<LoadedHashGroup>>
 StorageEngine::Impl::LoadHashGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, GroupedRecordId id, bool pinned) {
-  auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                              digest, object, id, pinned);
-  if (!loaded.ok()) co_return loaded.status();
-  const auto bytes = loaded->loaded_.value();
-  const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
-                                 bytes.size());
-  auto decoded = DecodeHashGroup(payload);
-  if (!decoded.ok()) co_return decoded.status();
-  for (const auto& field : decoded->value_.entries_) {
-    if (!id.ContainsHash(
-            ComputeDigest(field.field_, object->directory().root().seed_)
-                .value_)) {
-      co_return absl::DataLossError("Hash field outside its group route");
-    }
-  }
-  co_return LoadedHashGroup{.sequence_ = loaded->sequence_,
-                            .snapshot_ = std::move(*decoded)};
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned,
+    GroupReadLimiter* limiter) {
+  return LoadHashGroup<LoadedHashGroup>(
+      store, partition, db_id, key, digest, object, id, pinned,
+      [object, id](std::string_view payload, std::uint64_t sequence,
+                   std::uint32_t,
+                   LoadedValue&&) -> absl::StatusOr<LoadedHashGroup> {
+        // The core validates the view before invoking this decoder. Keep its
+        // immutable seed alive without dereferencing a possibly null input
+        // while constructing the unstarted task.
+        auto decoded = DecodeHashGroup(payload);
+        if (!decoded.ok()) return decoded.status();
+        for (const auto& field : decoded->value_.entries_) {
+          if (!id.ContainsHash(
+                  ComputeDigest(field.field_, object->directory().root().seed_)
+                      .value_))
+            return absl::DataLossError("Hash field outside its group route");
+        }
+        return LoadedHashGroup{.sequence_ = sequence,
+                               .snapshot_ = std::move(*decoded)};
+      },
+      limiter);
+}
+
+Task<absl::StatusOr<LoadedHashGroup>> StorageEngine::Impl::LoadHashGroupForRead(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, GroupedRecordId id, bool pinned,
+    GroupReadLimiter* limiter) {
+  return LoadHashGroup<LoadedHashGroup>(
+      store, partition, db_id, key, digest, object, id, pinned,
+      [object, id](std::string_view payload, std::uint64_t sequence,
+                   std::uint32_t field_count,
+                   LoadedValue&&) -> absl::StatusOr<LoadedHashGroup> {
+        // Read-only results move field/value bytes into replies. Published
+        // pages inherit uniqueness and routing from the writer; framing
+        // checks suffice here without hashing every field again.
+        LoadedHashGroup loaded{
+            .sequence_ = sequence,
+            .snapshot_ = {
+                .incarnation_ = object->directory().root().incarnation_,
+                .id_ = id,
+                .value_ = {}}};
+        auto& fields = loaded.snapshot_.value_.entries_;
+        fields.reserve(field_count);
+        const auto valid = VisitPersistedHashGroupFields(
+            payload, field_count, [&](const HashEntryView& entry) {
+              fields.push_back({.field_ = std::string(entry.field_),
+                                .value_ = std::string(entry.value_)});
+              return absl::OkStatus();
+            });
+        if (!valid.ok()) return valid;
+        return loaded;
+      },
+      limiter);
 }
 
 Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, bool pinned) {
+    GroupedObject::Handle object, bool pinned, bool parallel) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
+  const auto& directory = object->directory();
+  const auto count = directory.root().field_count_;
   HashValue result;
-  for (const auto& [prefix, metadata] : object->directory().groups()) {
-    (void)prefix;
-    auto loaded = co_await LoadHashGroupSnapshot(
-        store, partition, db_id, key, digest, object, metadata.id_, pinned);
-    if (!loaded.ok()) co_return loaded.status();
-    for (auto& field : loaded->snapshot_.value_.entries_) {
-      result.entries_.push_back(std::move(field));
+  auto read = [&](GroupedRecordId id, GroupReadLimiter* limiter = nullptr) {
+    if (!parallel)
+      return LoadHashGroupSnapshot(store, partition, db_id, key, digest, object,
+                                   id, pinned, limiter);
+    // Keep the read-only decoder when optional admission falls back to serial.
+    return LoadHashGroupForRead(store, partition, db_id, key, digest, object,
+                                id, pinned, limiter);
+  };
+  struct Selection {
+    GroupedRecordId id_;
+    std::size_t offset_;
+    std::size_t count_;
+  };
+  // The caller already admits the complete decoded image. Optional planning
+  // adds only metadata and concurrent coroutine scratch, not another image.
+  std::optional<GroupReadPlan> plan;
+  std::vector<Selection> selected;
+  if (parallel && directory.groups().size() <= SIZE_MAX / sizeof(Selection)) {
+    plan = GroupReadPlan::TryCreate(
+        worker_count_, directory.groups().size(),
+        AllocatorUsableSizeForRequest(directory.groups().size() *
+                                      sizeof(Selection)));
+    if (plan) {
+      selected.reserve(directory.groups().size());
+      std::size_t offset = 0;
+      for (const auto& [prefix, metadata] : directory.groups()) {
+        if (metadata.field_count_ > count - offset)
+          co_return absl::DataLossError("grouped Hash aggregate mismatch");
+        const auto* entry = object->FindGroup(metadata.id_);
+        if (entry == nullptr)
+          co_return absl::DataLossError("missing Hash group");
+        auto owner = BlockOwner(entry->block_id());
+        if (owner >= worker_count_) owner = store.worker_->id();
+        plan->Add(owner, selected.size());
+        selected.push_back({metadata.id_, offset, metadata.field_count_});
+        offset += metadata.field_count_;
+      }
+      if (offset != count)
+        co_return absl::DataLossError("grouped Hash aggregate mismatch");
+      if (!plan->ReserveWindow<LoadedHashGroup>(4096)) {
+        std::vector<Selection>().swap(selected);
+        plan.reset();
+      }
     }
   }
-  if (result.entries_.size() != object->directory().root().field_count_) {
-    co_return absl::DataLossError("grouped Hash aggregate mismatch");
+  if (!plan) {
+    for (const auto& [prefix, metadata] : directory.groups()) {
+      auto loaded = co_await read(metadata.id_);
+      if (!loaded.ok()) co_return loaded.status();
+      for (auto& field : loaded->snapshot_.value_.entries_)
+        result.entries_.push_back(std::move(field));
+    }
+  } else {
+    // Owner waves may submit pages out of directory order. Their offsets keep
+    // field/value pairs and the original traversal order stable in the reply.
+    result.entries_.resize(count);
+    GroupReadWindow<LoadedHashGroup> window(store.worker_, worker_count_,
+                                            plan->width());
+    while (!plan->empty()) {
+      absl::Status start_status;
+      for (unsigned owner = 0; owner < plan->owner_count(); ++owner) {
+        for (std::size_t n = 0; n < GroupReadLimiter::kWidth; ++n) {
+          const auto ordinal = plan->Pop(owner);
+          if (!ordinal) break;
+          if (window.size() == 1 &&
+              LAVIK_FAULT_MATCHES("LAVIK_FAIL_HASH_READ_BATCH_START_KEY",
+                                  key)) {
+            start_status = absl::ResourceExhaustedError(
+                "OOM grouped Hash read batch admission");
+            break;
+          }
+          window.Add(read(selected[*ordinal].id_, window.limiter()), *ordinal);
+        }
+        if (!start_status.ok()) break;
+      }
+      co_await window.Join();
+      // The last child can complete before a population replacement runs;
+      // validate again after the join has returned to this parent.
+      const auto& version = object->version();
+      if (EffectiveRecordDbEpoch(partition, db_id) != version.db_epoch_ ||
+          partition.replication_epoch_ != version.replication_epoch_ ||
+          partition.grouped_generations_[db_id] != version.index_generation_)
+        co_return absl::NotFoundError("grouped population changed during read");
+      const auto readable = object->ReadStatus();
+      if (!readable.ok()) co_return readable;
+      const auto completed =
+          window.Collect([&](std::size_t ordinal, LoadedHashGroup&& loaded) {
+            auto& fields = loaded.snapshot_.value_.entries_;
+            const auto& selection = selected[ordinal];
+            if (fields.size() != selection.count_)
+              return absl::DataLossError("grouped Hash aggregate mismatch");
+            std::move(fields.begin(), fields.end(),
+                      result.entries_.begin() + selection.offset_);
+            return absl::OkStatus();
+          });
+      if (!start_status.ok()) co_return start_status;
+      if (!completed.ok()) co_return completed;
+    }
   }
+  if (result.entries_.size() != count)
+    co_return absl::DataLossError("grouped Hash aggregate mismatch");
   co_return result;
 }
 

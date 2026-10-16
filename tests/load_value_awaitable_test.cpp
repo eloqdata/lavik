@@ -5,10 +5,14 @@
 
 #include <sys/eventfd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "../src/storage/engine/impl.h"
+#include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
+#include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
 
@@ -20,7 +24,13 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   using Result = Awaitable::Result;
   using ExtentRead = StorageEngine::Impl::ReadExtentAwaitable;
 
+  virtual std::size_t ReadBufferCount() const { return 1; }
+  virtual unsigned WorkerCount() const { return 1; }
+
   void SetUp() override {
+    // Exercise the service's initialized admission model even when CTest runs
+    // this fixture alone. Unlimited pre-init reservations carry zero bytes.
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, WorkerCount()).ok());
     saved_context_ = std::move(bycorf::MutableThisWorker());
     wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     ASSERT_GE(wake_fd_, 0);
@@ -29,7 +39,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     bycorf::SetThisWorker(0, &cross_core_, &worker_);
     ASSERT_TRUE(worker_.Init({.recv_buffer_count_ = 0}).ok());
     auto& engine = *storage_.impl_;
-    engine.worker_count_ = 1;
+    engine.worker_count_ = WorkerCount();
     engine.stores_.push_back(
         std::make_unique<StorageEngine::Impl::WorkerStore>());
     auto& store = *engine.stores_[0];
@@ -41,17 +51,37 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     store.partitions_[0].replication_epoch_ = 1;
     store.files_.push_back(bycorf::FixedFile{});
     engine.db_epochs_[0].store(1);
-    engine.devices_.push_back(StorageDevice{.capacity_blocks_ = 2});
-    engine.block_state_lookup_.push_back({&block_, 1, 2});
+    engine.devices_.push_back(
+        StorageDevice{.capacity_blocks_ = WorkerCount() + 1});
+    engine.block_state_lookup_.push_back(
+        {blocks_.data(), 1, WorkerCount() + 1});
     block_.Reset(0, 7);
     block_.allocated_ = true;
 
     RegisteredBufferPoolOptions options;
     options.storage_write_buffer_count_ = 1;
-    options.registered_bytes_ =
-        options.write_buffer_bytes_ + options.read_slot_bytes_;
+    options.registered_bytes_ = options.write_buffer_bytes_ +
+                                ReadBufferCount() * options.read_slot_bytes_;
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
-    ASSERT_EQ(Pool().available_read_buffers(), 1);
+    ASSERT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+    if (WorkerCount() == 2) {
+      remote_wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+      ASSERT_GE(remote_wake_fd_, 0);
+      cross_core_.mailbox(1).wake_fd_ = remote_wake_fd_;
+      remote_worker_.BindCrossCore(1, &cross_core_);
+      bycorf::SetThisWorker(1, &cross_core_, &remote_worker_);
+      ASSERT_TRUE(remote_worker_.Init({.recv_buffer_count_ = 0}).ok());
+      engine.stores_.push_back(
+          std::make_unique<StorageEngine::Impl::WorkerStore>());
+      auto& remote = *engine.stores_[1];
+      remote.engine_ = &engine;
+      remote.worker_ = &remote_worker_;
+      remote.files_.push_back(bycorf::FixedFile{});
+      ASSERT_TRUE(remote.buffers_.Init(remote_worker_, options).ok());
+      blocks_[1].Reset(1, 7);
+      blocks_[1].allocated_ = true;
+      bycorf::SetThisWorker(0, &cross_core_, &worker_);
+    }
 
     header_.header_bytes_ = RecordHeaderBytes(key_.size());
     header_.key_bytes_ = key_.size();
@@ -70,14 +100,24 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   }
 
   void TearDown() override {
+    bycorf::SetThisWorker(0, &cross_core_, &worker_);
     worker_.Shutdown();
+    if (WorkerCount() == 2) {
+      bycorf::SetThisWorker(1, &cross_core_, &remote_worker_);
+      remote_worker_.Shutdown();
+      bycorf::SetThisWorker(0, &cross_core_, &worker_);
+    }
     storage_.impl_.reset();
     if (wake_fd_ >= 0) close(wake_fd_);
+    if (remote_wake_fd_ >= 0) close(remote_wake_fd_);
     bycorf::MutableThisWorker() = std::move(saved_context_);
+    EXPECT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   }
 
   auto& Store() { return *storage_.impl_->stores_[0]; }
-  RegisteredBufferPool& Pool() { return Store().buffers_; }
+  RegisteredBufferPool& Pool(unsigned owner = 0) {
+    return storage_.impl_->stores_[owner]->buffers_;
+  }
   auto Read() {
     return storage_.impl_->LoadValue(Store(), Store().partitions_[0], 0, key_,
                                      digest_, location_, {});
@@ -85,10 +125,54 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   auto ReadLocal() {
     return storage_.impl_->LoadValueLocal(Store(), 0, key_, location_, 1);
   }
+  Task<Result> ReadExternalGrouped() {
+    const auto metadata = RecordLocation::PackedMetadata::Encode(
+        location_.record_offset(), location_.total_disk_bytes(), 0, false, true,
+        false, false, false, false, RecordKind::kValue, ValueType::kString);
+    const RecordLocation location(1, 9, 7, 0, value_.size(), metadata);
+    auto manifest = std::make_shared<const std::vector<ExtentRef>>(
+        std::vector<ExtentRef>{ExtentReference()});
+    co_return co_await storage_.impl_->LoadExternalValueLocal(
+        Store(), location, std::move(manifest), nullptr, true);
+  }
   auto ReadGrouped(bool pinned = false) {
     return storage_.impl_->LoadGroupedValue(Store(), Store().partitions_[0], 0,
                                             key_, digest_, location_,
                                             pinned ? grouped_ : nullptr);
+  }
+  auto ReadGroupedHash(bool parallel = true) {
+    return storage_.impl_->LoadGroupedHashValue(Store(), Store().partitions_[0],
+                                                0, key_, digest_, grouped_,
+                                                false, parallel);
+  }
+  Task<absl::StatusOr<ListResult>> ReadGroupedList(std::int64_t first = 0,
+                                                   std::int64_t last = -1) {
+    const ListOperation operation{
+        .kind_ = ListOperationKind::kRange, .first_ = first, .second_ = last};
+    co_return co_await storage_.impl_->ExecuteGroupedListLocked(
+        Store(), Store().partitions_[0], 0, key_, digest_, operation, grouped_,
+        nullptr, nullptr);
+  }
+  Task<absl::StatusOr<SortedSetResult>> ReadGroupedZset(
+      SortedSetOperation operation = {
+          .kind_ = SortedSetOperationKind::kRange}) {
+    co_return co_await storage_.impl_->ExecuteGroupedSortedSetLocked(
+        Store(), Store().partitions_[0], 0, key_, digest_, operation, grouped_,
+        nullptr, nullptr);
+  }
+  auto ReadGroupedStream(std::uint64_t count = UINT64_MAX) {
+    return storage_.impl_->ReadValueForTransferLocked(
+        0, key_, digest_, StreamRangeAccess{.first_ = {1, 0}, .count_ = count});
+  }
+  void CloseTransfer(TransferValue& source) {
+    source.reader_ = {};
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (storage_.impl_->active_settlements_.load() != 0 &&
+           std::chrono::steady_clock::now() < until)
+      RunReadRound();
+    ASSERT_EQ(storage_.impl_->active_settlements_.load(), 0);
+    ExpectNoPageLeases();
   }
   bool HasHelper(const Awaitable& read) { return read.slow_.valid(); }
 
@@ -182,11 +266,12 @@ class LoadValueAwaitableTestPeer : public testing::Test {
       header.payload_bytes_ = encoded->size();
       header.total_disk_bytes_ =
           AlignRecord(header.header_bytes_ + encoded->size());
+      const auto owner = static_cast<unsigned>(i % WorkerCount());
       const RecordLocation physical(
-          1, 9, 7, 0, segment.size(),
+          owner + 1, 9, 7, 0, segment.size(),
           RecordLocation::PackedMetadata::Encode(
-              offset, header.total_disk_bytes_, 0, true, false, false, false,
-              false, false, RecordKind::kValue, ValueType::kString));
+              offset, header.total_disk_bytes_, owner, true, false, false,
+              false, false, false, RecordKind::kValue, ValueType::kString));
       records.emplace_back(OrderedGroupEntry{.incarnation_ = 17,
                                              .id_ = page.id_,
                                              .previous_ = page.previous_,
@@ -215,6 +300,428 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                     .ok());
     grouped_ = std::move(*object);
     IndexLocation();
+  }
+  void PrepareGroupedCollection(ValueType type, std::size_t count) {
+    digest_ = ComputeDigest(key_);
+    auto& store = Store();
+    store.partition_grouped_objects_.resize(kLogicalDatabaseCount);
+    store.partitions_[0].grouped_objects_ = store.partition_grouped_objects_;
+    block_.in_memory_ = true;
+    if (block_.staging_slot_ == 0) {
+      block_.staging_slot_ = store.staging_slots_.size();
+      store.staging_slots_.emplace_back();
+      ASSERT_TRUE(Pool().TryAcquireWriteBuffer(
+          &store.staging_slots_.back().write_buffer_id_));
+    }
+    location_ = RecordLocation(
+        1, 9, 7, 0, count,
+        RecordLocation::PackedMetadata::Encode(
+            kBlockHeaderBytes, 256, 0, true, false, false, false, false, false,
+            RecordKind::kValue, type, false, true));
+    grouped_payloads_.clear();
+    grouped_headers_.clear();
+    grouped_locations_.clear();
+  }
+  void AppendGroupedPage(GroupedRecordId id, std::string payload,
+                         std::uint32_t count) {
+    const auto i = grouped_locations_.size();
+    const auto offset = i == 0
+                            ? kBlockHeaderBytes + 256
+                            : grouped_locations_.back().record_offset() +
+                                  grouped_locations_.back().total_disk_bytes();
+    const auto owner = static_cast<unsigned>(i % WorkerCount());
+    RecordHeader header = header_;
+    header.value_type_ = location_.value_type();
+    header.auxiliary_group_ = true;
+    header.group_incarnation_ = 17;
+    header.group_prefix_ = id.prefix_;
+    header.group_prefix_bits_ = id.bits_;
+    header.header_bytes_ =
+        RecordHeaderBytes(key_.size(), false, false, false, true);
+    header.logical_size_ = count;
+    header.payload_bytes_ = payload.size();
+    header.total_disk_bytes_ =
+        AlignRecord(header.header_bytes_ + payload.size());
+    grouped_locations_.emplace_back(
+        owner + 1, 9, 7, 0, count,
+        RecordLocation::PackedMetadata::Encode(
+            offset, header.total_disk_bytes_, owner, true, false, false, false,
+            false, false, RecordKind::kValue, location_.value_type()));
+    grouped_payloads_.push_back(std::move(payload));
+    grouped_headers_.push_back(header);
+    ASSERT_NO_FATAL_FAILURE(StageGroupedPage(i));
+  }
+  void PublishGroupedCollection(GroupedObject::Handle object) {
+    ASSERT_TRUE(Store()
+                    .partitions_[0]
+                    .grouped_objects_[0]
+                    .Publish(digest_, key_, grouped_, object)
+                    .ok());
+    grouped_ = std::move(object);
+    IndexLocation();
+  }
+  void InstallGroupedHash(ValueType type, std::size_t fields_per_page = 1) {
+    ASSERT_TRUE(type == ValueType::kHash || type == ValueType::kSet);
+    constexpr std::size_t count = 64;
+    const DigestSeed seed{1, 2, 3, 4};
+    std::array<std::vector<std::string>, count> fields;
+    // Equal field counts in each six-bit prefix keep both owners' page counts
+    // deterministic, independently of the production split-size heuristic.
+    std::size_t filled = 0;
+    for (std::size_t candidate = 0;
+         candidate < 100000 && filled < count * fields_per_page; ++candidate) {
+      const auto number = std::to_string(candidate);
+      auto field = "field-" + std::string(6 - number.size(), '0') + number;
+      field.append("\0\xff", 2);
+      const auto prefix = ComputeDigest(field, seed).value_ >> 58;
+      if (fields[prefix].size() < fields_per_page) {
+        fields[prefix].push_back(std::move(field));
+        ++filled;
+      }
+    }
+    ASSERT_EQ(filled, count * fields_per_page);
+    ASSERT_NO_FATAL_FAILURE(PrepareGroupedCollection(type, filled));
+    hash_entries_.clear();
+    std::vector<RecoveredGroupedRecord> records;
+    std::vector<GroupedRecordLocation> locations;
+    for (std::size_t i = 0; i < count; ++i) {
+      const GroupedRecordId id{static_cast<std::uint64_t>(i) << 58, 6};
+      HashGroupSnapshot page{.incarnation_ = 17, .id_ = id};
+      for (const auto& field : fields[i]) {
+        std::string value;
+        if (type == ValueType::kHash) {
+          value = "value-" + std::to_string(i);
+          value.append("\0\xfe", 2);
+          value.append(17 + i % 31, static_cast<char>(i));
+        }
+        hash_entries_.emplace_back(field, value);
+        page.value_.entries_.push_back({.digest_ = ComputeDigest(field),
+                                        .field_ = field,
+                                        .value_ = std::move(value)});
+      }
+      auto encoded = EncodeHashGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      records.push_back({.incarnation_ = 17,
+                         .id_ = id,
+                         .sequence_ = 9,
+                         .lsn_ = 9,
+                         .field_count_ = fields_per_page,
+                         .encoded_bytes_ = encoded->size(),
+                         .record_token_ = i + 1});
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(id, std::move(*encoded), fields_per_page));
+      locations.push_back({.id_ = id, .location_ = grouped_locations_.back()});
+    }
+    auto directory = HashGroupDirectory::Recover({.incarnation_ = 17,
+                                                  .seed_ = seed,
+                                                  .field_count_ = filled,
+                                                  .group_count_ = count,
+                                                  .revision_ = 9},
+                                                 9, records, {});
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    auto object = GroupedObject::Create(
+        {.root_ = location_, .db_epoch_ = 1, .replication_epoch_ = 1},
+        std::move(*directory), locations);
+    ASSERT_TRUE(object.ok()) << object.status();
+    ASSERT_NO_FATAL_FAILURE(PublishGroupedCollection(std::move(*object)));
+  }
+  void InstallGroupedList(std::size_t pages = 70) {
+    InstallGroupedOrdered(OrderedCollectionKind::kList, pages);
+  }
+  void InstallGroupedZset(std::size_t pages = 70,
+                          bool equal_member_lengths = false) {
+    InstallGroupedOrdered(OrderedCollectionKind::kSortedSet, pages,
+                          equal_member_lengths);
+  }
+  void InstallGroupedOrdered(OrderedCollectionKind kind, std::size_t pages,
+                             bool equal_member_lengths = false) {
+    constexpr std::size_t per_page = 3;
+    const bool sorted = kind == OrderedCollectionKind::kSortedSet;
+    ASSERT_NO_FATAL_FAILURE(PrepareGroupedCollection(
+        sorted ? ValueType::kSortedSet : ValueType::kList, pages * per_page));
+    list_values_.clear();
+    zset_values_.clear();
+    std::vector<RecoveredOrderedGroup> records;
+    std::vector<GroupedRecordLocation> locations;
+    for (std::size_t i = 0; i < pages; ++i) {
+      OrderedGroupSnapshot page{.kind_ = kind,
+                                .incarnation_ = 17,
+                                .id_ = i + 1,
+                                .previous_ = i,
+                                .next_ = i + 1 == pages ? 0 : i + 2};
+      for (std::size_t j = 0; j < per_page; ++j) {
+        const auto rank = i * per_page + j;
+        const auto number = std::to_string(rank);
+        auto value = "item-" +
+                     (sorted ? std::string(6 - number.size(), '0') : "") +
+                     number;
+        value.append("\0\xff", 2);
+        value.append(equal_member_lengths ? 17 : 17 + (i + j) % 31,
+                     static_cast<char>(i + j));
+        list_values_.push_back(value);
+        // Ties cross page boundaries; binary member order must remain stable
+        // when owner-bucket submission order differs from score/rank order.
+        const auto score = sorted ? static_cast<double>(rank / 4) : 0;
+        if (sorted) zset_values_.emplace_back(value, score);
+        page.entries_.push_back({.value_ = std::move(value), .score_ = score});
+      }
+      auto encoded = EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      records.emplace_back(
+          OrderedGroupEntry{.incarnation_ = 17,
+                            .id_ = page.id_,
+                            .previous_ = page.previous_,
+                            .next_ = page.next_,
+                            .sequence_ = 9,
+                            .lsn_ = 9,
+                            .item_count_ = per_page,
+                            .encoded_bytes_ = encoded->size(),
+                            .record_token_ = i + 1,
+                            .min_score_ = page.entries_.front().score_,
+                            .max_score_ = page.entries_.back().score_});
+      const GroupedRecordId id{i + 1, 0};
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(id, std::move(*encoded), per_page));
+      locations.push_back({.id_ = id, .location_ = grouped_locations_.back()});
+    }
+    OrderedCollectionRoot root{
+        .kind_ = kind,
+        .incarnation_ = 17,
+        .item_count_ = pages * per_page,
+        .first_group_ = 1,
+        .last_group_ = pages,
+        .next_group_id_ = pages + 1,
+        .group_count_ = static_cast<std::uint32_t>(pages),
+        .revision_ = 9};
+    std::optional<HashGroupDirectory> members;
+    if (sorted) {
+      root.member_index_ = GroupedHashRoot{.incarnation_ = 17,
+                                           .field_count_ = pages * per_page,
+                                           .group_count_ = 1,
+                                           .revision_ = 9};
+      HashGroupSnapshot page{.incarnation_ = 17, .id_ = {0, 0}};
+      for (const auto& [member, score] : zset_values_)
+        page.value_.entries_.push_back(
+            {.digest_ = ComputeDigest(member),
+             .field_ = member,
+             .value_ = EncodeSortedSetMemberScore(score)});
+      auto encoded = EncodeHashGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      const RecoveredGroupedRecord member_record{
+          .incarnation_ = 17,
+          .id_ = {0, 0},
+          .sequence_ = 9,
+          .lsn_ = 9,
+          .field_count_ = pages * per_page,
+          .encoded_bytes_ = encoded->size(),
+          .record_token_ = pages + 1};
+      auto recovered = HashGroupDirectory::Recover(
+          *root.member_index_, 9, std::span(&member_record, 1), {});
+      ASSERT_TRUE(recovered.ok()) << recovered.status();
+      members.emplace(std::move(*recovered));
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(page.id_, std::move(*encoded), pages * per_page));
+      locations.push_back(
+          {.id_ = page.id_, .location_ = grouped_locations_.back()});
+    }
+    auto directory = OrderedGroupDirectory::Recover(root, 9, records, {}, 0,
+                                                    std::move(members));
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    auto object = GroupedObject::CreateOrdered(
+        {.root_ = location_, .db_epoch_ = 1, .replication_epoch_ = 1},
+        std::move(*directory), locations);
+    ASSERT_TRUE(object.ok()) << object.status();
+    ASSERT_NO_FATAL_FAILURE(PublishGroupedCollection(std::move(*object)));
+  }
+  void ExpectHash(const absl::StatusOr<HashValue>& result) {
+    ASSERT_TRUE(result.ok()) << result.status();
+    std::vector<std::pair<std::string, std::string>> actual;
+    for (const auto& entry : result->entries_)
+      actual.emplace_back(entry.field_, entry.value_);
+    auto expected = hash_entries_;
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(actual, expected);
+  }
+  void InstallGroupedStream() {
+    // Transfer entry points route by Redis slot, while this fixture owns only
+    // partition zero. Use its real routing rule rather than widening stores.
+    for (unsigned candidate = 0;; ++candidate) {
+      key_ = "stream-" + std::to_string(candidate);
+      if (RedisSlot(key_) == 0) break;
+      ASSERT_LT(candidate, 1000000);
+    }
+    header_.key_bytes_ = key_.size();
+    constexpr std::size_t count = 210, per_page = 3;
+    std::string wire("LXS1");
+    auto put = [&](std::uint64_t value, unsigned width) {
+      for (unsigned i = 0; i < width; ++i)
+        wire.push_back(static_cast<char>(value >> (8 * i)));
+    };
+    auto string = [&](std::string_view value) {
+      put(value.size(), 4);
+      wire.append(value);
+    };
+    put(count, 8);
+    put(0, 8);
+    wire.append(16, '\0');
+    put(count, 8);
+    put(count, 4);
+    for (std::size_t i = 1; i <= count; ++i) {
+      put(i, 8);
+      put(0, 8);
+      put(2, 4);
+      string("field");
+      string(std::string("value\0", 6) + std::to_string(i));
+    }
+    put(1, 4);
+    put(count, 4);
+    put(0, 4);
+    auto decoded = DecodeStreamRecords(wire, count);
+    ASSERT_TRUE(decoded.ok()) << decoded.status();
+    stream_messages_.clear();
+    for (const auto& entry : *decoded) {
+      auto key = StreamRecordKey(entry.value_);
+      ASSERT_TRUE(key.ok()) << key.status();
+      if (key->front() == '\1') stream_messages_.push_back(entry.value_);
+    }
+    ASSERT_EQ(stream_messages_.size(), count);
+    ASSERT_NO_FATAL_FAILURE(
+        PrepareGroupedCollection(ValueType::kStream, count));
+    const auto pages = (decoded->size() + per_page - 1) / per_page;
+    std::vector<RecoveredOrderedGroup> records;
+    std::vector<GroupedRecordLocation> locations;
+    for (std::size_t i = 0; i < pages; ++i) {
+      const auto first = i * per_page;
+      const auto end = std::min(first + per_page, decoded->size());
+      OrderedGroupSnapshot page{
+          .kind_ = OrderedCollectionKind::kStream,
+          .incarnation_ = 17,
+          .id_ = i + 1,
+          .previous_ = i,
+          .next_ = i + 1 == pages ? 0 : i + 2,
+          .entries_ = {decoded->begin() + first, decoded->begin() + end}};
+      auto encoded = EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      records.emplace_back(OrderedGroupEntry{.incarnation_ = 17,
+                                             .id_ = page.id_,
+                                             .previous_ = page.previous_,
+                                             .next_ = page.next_,
+                                             .sequence_ = 9,
+                                             .lsn_ = 9,
+                                             .item_count_ = end - first,
+                                             .encoded_bytes_ = encoded->size(),
+                                             .record_token_ = i + 1});
+      const auto max_key = StreamRecordKey(page.entries_.back().value_);
+      ASSERT_TRUE(max_key.ok()) << max_key.status();
+      records.back().stream_max_key_.Set(*max_key);
+      const GroupedRecordId id{i + 1, 0};
+      ASSERT_NO_FATAL_FAILURE(
+          AppendGroupedPage(id, std::move(*encoded), end - first));
+      locations.push_back({.id_ = id, .location_ = grouped_locations_.back()});
+    }
+    auto directory = OrderedGroupDirectory::Recover(
+        {.kind_ = OrderedCollectionKind::kStream,
+         .incarnation_ = 17,
+         .item_count_ = decoded->size(),
+         .first_group_ = 1,
+         .last_group_ = pages,
+         .next_group_id_ = pages + 1,
+         .group_count_ = static_cast<std::uint32_t>(pages),
+         .revision_ = 9,
+         .stream_length_ = count},
+        9, records, {});
+    ASSERT_TRUE(directory.ok()) << directory.status();
+    auto object = GroupedObject::CreateOrdered(
+        {.root_ = location_, .db_epoch_ = 1, .replication_epoch_ = 1},
+        std::move(*directory), locations);
+    ASSERT_TRUE(object.ok()) << object.status();
+    ASSERT_NO_FATAL_FAILURE(PublishGroupedCollection(std::move(*object)));
+  }
+  void ExpectZset(const absl::StatusOr<SortedSetResult>& result,
+                  std::size_t first = 0, std::size_t end = SIZE_MAX,
+                  bool reverse = false) {
+    ASSERT_TRUE(result.ok()) << result.status();
+    if (end == SIZE_MAX) end = zset_values_.size();
+    ASSERT_EQ(result->members_.size(), end - first);
+    EXPECT_EQ(result->length_, zset_values_.size());
+    for (std::size_t i = 0; i < result->members_.size(); ++i) {
+      const auto& expected = zset_values_[reverse ? end - 1 - i : first + i];
+      EXPECT_EQ(result->members_[i].member_, expected.first) << i;
+      EXPECT_EQ(result->members_[i].score_, expected.second) << i;
+    }
+  }
+  void ReplaceHashField(std::size_t page, std::string_view old_field,
+                        std::string_view new_field) {
+    ASSERT_EQ(old_field.size(), new_field.size());
+    auto& payload = grouped_payloads_[page];
+    const auto offset = payload.find(old_field);
+    ASSERT_NE(offset, std::string::npos);
+    payload.replace(offset, old_field.size(), new_field);
+    // Repair CRC to distinguish trusted terminal reads from strict logical
+    // validation. Fixed field widths preserve the encoded framing.
+    ASSERT_NO_FATAL_FAILURE(StageGroupedPage(page));
+  }
+  void ExpectStoredHashFields(std::string_view strict_error) {
+    ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+    ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+    for (const bool scarce : {false, true}) {
+      SCOPED_TRACE(scarce ? "serial admission fallback" : "parallel batch");
+      const auto previous_shard = CurrentMemoryAccountingShard();
+      absl::Cleanup restore = [&] {
+        (void)InitMemoryLimit(1024ULL * 1024 * 1024, WorkerCount());
+        BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                      : previous_shard - 1);
+      };
+      if (scarce) {
+        BindMemoryAccountingShard(kMaxMemoryWorkers);
+        RefreshMemoryStats();
+        const auto target = GetMemoryStats().used_bytes_ + 96 * 1024;
+        ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+      }
+      auto task = ReadGroupedHash();
+      Start(task);
+      RunReadRound();
+      EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(),
+                scarce ? 1 : 32);
+      ASSERT_NO_FATAL_FAILURE(Drain(task));
+      const auto result = std::move(task).TakeResult();
+      ExpectHash(result);
+      ExpectNoPageLeases();
+    }
+    // Materialization feeds mutations and still validates the durable logical
+    // invariants before returning entries with process-local lookup digests.
+    auto strict = ReadGroupedHash(false);
+    Start(strict);
+    ASSERT_NO_FATAL_FAILURE(Drain(strict));
+    const auto result = std::move(strict).TakeResult();
+    EXPECT_TRUE(absl::IsDataLoss(result.status())) << result.status();
+    EXPECT_EQ(result.status().message(), strict_error);
+    ExpectNoPageLeases();
+  }
+  void RelocateGroupedPagesToRemoteOwner() {
+    ASSERT_EQ(WorkerCount(), 2);
+    for (std::size_t i = 0; i < grouped_locations_.size(); i += 2) {
+      auto& old = grouped_locations_[i];
+      const RecordLocation replacement(
+          2, old.mutation_sequence_, 7, 0, old.logical_size_,
+          RecordLocation::PackedMetadata::Encode(
+              old.record_offset(), old.total_disk_bytes(), 1, false, false,
+              false, false, false, false, RecordKind::kValue,
+              old.value_type()));
+      const auto& header = grouped_headers_[i];
+      auto moved = GroupedObject::RelocateGroup(
+          grouped_, {header.group_prefix_, header.group_prefix_bits_}, old,
+          replacement);
+      ASSERT_TRUE(moved.ok()) << moved.status();
+      ASSERT_TRUE(Store()
+                      .partitions_[0]
+                      .grouped_objects_[0]
+                      .Publish(digest_, key_, grouped_, *moved)
+                      .ok());
+      grouped_ = std::move(*moved);
+      old = replacement;
+    }
   }
   void IndexLocation() {
     ASSERT_NE(Store()
@@ -277,10 +784,14 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     char path[] = "/tmp/lavik-awaitable-XXXXXX";
     const int fd = mkstemp(path);
     ASSERT_GE(fd, 0);
-    const auto offset = storage_.impl_->FileOffset(1).second;
-    const auto written = pwrite(fd, bytes.data(), bytes.size(), offset);
+    // The two-owner fixture uses the same encoded image at both physical
+    // blocks; its directory selects alternating pages from each owner.
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      const auto offset = storage_.impl_->FileOffset(owner + 1).second;
+      const auto written = pwrite(fd, bytes.data(), bytes.size(), offset);
+      EXPECT_EQ(written, static_cast<ssize_t>(bytes.size()));
+    }
     close(fd);
-    ASSERT_EQ(written, static_cast<ssize_t>(bytes.size()));
     struct Opened : bycorf::IoCompletion {
       bool done_ = false;
       int result_ = -1;
@@ -288,26 +799,46 @@ class LoadValueAwaitableTestPeer : public testing::Test {
         result_ = result;
         done_ = true;
       }
-    } opened;
-    ASSERT_TRUE(worker_.RegisterFixedFiles(1).ok());
-    auto submitted =
-        worker_.SubmitOpenDirect(path, O_RDONLY | O_DIRECT, 0, {0}, &opened);
-    if (submitted.ok()) {
-      const auto until =
-          std::chrono::steady_clock::now() + std::chrono::seconds(5);
-      while (!opened.done_ && std::chrono::steady_clock::now() < until)
-        worker_.RunOnce(false);
+    };
+    absl::Cleanup cleanup = [&] {
+      unlink(path);
+      bycorf::SetThisWorker(0, &cross_core_, &worker_);
+    };
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      auto& worker = owner == 0 ? worker_ : remote_worker_;
+      bycorf::SetThisWorker(owner, &cross_core_, &worker);
+      Opened opened;
+      ASSERT_TRUE(worker.RegisterFixedFiles(1).ok());
+      auto submitted =
+          worker.SubmitOpenDirect(path, O_RDONLY | O_DIRECT, 0, {0}, &opened);
+      if (submitted.ok()) {
+        const auto until =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!opened.done_ && std::chrono::steady_clock::now() < until)
+          worker.RunOnce(false);
+      }
+      ASSERT_TRUE(submitted.ok()) << submitted;
+      ASSERT_TRUE(opened.done_);
+      ASSERT_EQ(opened.result_, 0);
     }
-    unlink(path);
-    ASSERT_TRUE(submitted.ok()) << submitted;
-    ASSERT_TRUE(opened.done_);
-    ASSERT_EQ(opened.result_, 0);
   }
   void InstallRecord() {
     std::vector<std::byte> bytes(
         AlignDirect(location_.record_offset() + location_.total_disk_bytes()));
     Encode(bytes.data() + location_.record_offset());
     InstallDiskImage(bytes);
+  }
+  void InstallGroupedDiskImage() {
+    ASSERT_FALSE(grouped_locations_.empty());
+    const auto& last = grouped_locations_.back();
+    const auto bytes =
+        AlignDirect(last.record_offset() + last.total_disk_bytes());
+    const auto staging = storage_.impl_->StagingBufferFor(Store(), block_);
+    ASSERT_LE(bytes, staging.size_);
+    ASSERT_NO_FATAL_FAILURE(InstallDiskImage(std::span(staging.data_, bytes)));
+    // Keep the graph and its locations unchanged while evicting its staging
+    // image. Every subsequent page must acquire a slot and complete real I/O.
+    block_.in_memory_ = false;
   }
   ExtentRef ExtentReference(bool no_crc = false) {
     return {1, 7, static_cast<std::uint32_t>(value_.size()),
@@ -336,7 +867,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   }
 
   template <typename T>
-  auto Start(Task<T>& task, bool background = false) {
+  std::coroutine_handle<> Start(Task<T>& task, bool background = false) {
     auto handle = std::move(task).operator co_await().await_suspend(
         std::noop_coroutine());
     if (background) worker_.RegisterBackground(handle);
@@ -348,8 +879,22 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     const auto until =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!task.done() && std::chrono::steady_clock::now() < until)
-      worker_.RunOnce(false);
+      RunReadRound();
     ASSERT_TRUE(task.done());
+  }
+  void RunReadRound() {
+    worker_.RunOnce(false);
+    if (WorkerCount() == 2) {
+      bycorf::SetThisWorker(1, &cross_core_, &remote_worker_);
+      remote_worker_.RunOnce(false);
+      bycorf::SetThisWorker(0, &cross_core_, &worker_);
+    }
+  }
+  void ExpectNoPageLeases() {
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      EXPECT_EQ(blocks_[owner].pin_count(), 0);
+      EXPECT_EQ(Pool(owner).available_read_buffers(), ReadBufferCount());
+    }
   }
   bool HelperIsBackground(Awaitable& read) {
     return worker_.IsBackground(
@@ -357,10 +902,13 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   }
 
   bycorf::CurrentWorker saved_context_;
-  bycorf::CrossCore cross_core_{1};
+  bycorf::CrossCore cross_core_{2};
   int wake_fd_ = -1;
+  int remote_wake_fd_ = -1;
   bycorf::Worker worker_;
-  BlockState block_;
+  bycorf::Worker remote_worker_;
+  std::array<BlockState, 2> blocks_;
+  BlockState& block_ = blocks_[0];
   StorageEngine storage_{StorageEngineOptions{}};
   std::string key_ = "direct-key";
   std::string value_ = "direct value";
@@ -371,6 +919,10 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   std::vector<std::string> grouped_payloads_;
   std::vector<RecordHeader> grouped_headers_;
   std::vector<RecordLocation> grouped_locations_;
+  std::vector<std::pair<std::string, std::string>> hash_entries_;
+  std::vector<std::string> list_values_;
+  std::vector<std::pair<std::string, double>> zset_values_;
+  std::vector<std::string> stream_messages_;
 };
 
 TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
@@ -477,6 +1029,34 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ConcurrentExternalGroupedReadsProgressWithOnePageSlot) {
+  value_.resize(4097);
+  for (std::size_t i = 0; i < value_.size(); ++i)
+    value_[i] = static_cast<char>(i % 251);
+  ASSERT_LT(value_.size(), RegisteredBufferPoolOptions{}.read_payload_bytes());
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  auto first = ReadExternalGrouped();
+  auto second = ReadExternalGrouped();
+  Start(first);
+  Start(second);
+  EXPECT_FALSE(first.done());
+  EXPECT_FALSE(second.done());
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  auto first_result = std::move(first).TakeResult();
+  ASSERT_TRUE(first_result.ok()) << first_result.status();
+  EXPECT_EQ(first_result->lease_.buffer_id(), 0);
+  // Even these small outputs must leave the sole fixed slot for extent I/O.
+  // Retain the first output until the second read has also completed.
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  auto second_result = std::move(second).TakeResult();
+  ASSERT_TRUE(second_result.ok()) << second_result.status();
+  EXPECT_EQ(second_result->lease_.buffer_id(), 0);
+  ExpectValue(first_result);
+  ExpectValue(second_result);
+  ExpectNoPageLeases();
 }
 
 TEST_F(LoadValueAwaitableTestPeer, ExtentWithoutCrcSkipsPayloadCheck) {
@@ -646,7 +1226,7 @@ TEST_F(LoadValueAwaitableTestPeer,
     for (bool pinned : {false, true}) {
       auto task = ReadGrouped(pinned);
       Start(task);
-      ASSERT_TRUE(task.done());  // Every page is resident; no I/O is needed.
+      ASSERT_NO_FATAL_FAILURE(Drain(task));
       auto result = std::move(task).TakeResult();
       ASSERT_TRUE(result.ok()) << result.status();
       ExpectValue(result);
@@ -655,7 +1235,7 @@ TEST_F(LoadValueAwaitableTestPeer,
       // A later read may reuse the page slot without invalidating the reply.
       auto next = ReadGrouped(pinned);
       Start(next);
-      ASSERT_TRUE(next.done());
+      ASSERT_NO_FATAL_FAILURE(Drain(next));
       ExpectValue(std::move(next).TakeResult());
       ExpectValue(result);
     }
@@ -679,7 +1259,7 @@ TEST_F(LoadValueAwaitableTestPeer,
       ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, corruption != 4));
       auto task = ReadGrouped(pinned);
       Start(task);
-      ASSERT_TRUE(task.done());
+      ASSERT_NO_FATAL_FAILURE(Drain(task));
       const auto result = std::move(task).TakeResult();
       EXPECT_EQ(result.status().code(), corruption == 4
                                             ? absl::StatusCode::kInternal
@@ -719,6 +1299,778 @@ TEST_F(LoadValueAwaitableTestPeer,
   EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult().status()));
   held->Reset();
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ConcurrentGroupedStringReadsProgressWithOnePageSlot) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(35 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto first = ReadGrouped();
+  auto second = ReadGrouped(true);
+  Start(first);
+  Start(second);
+  EXPECT_FALSE(first.done());
+  EXPECT_FALSE(second.done());
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  auto first_result = std::move(first).TakeResult();
+  ASSERT_TRUE(first_result.ok()) << first_result.status();
+  EXPECT_EQ(first_result->lease_.buffer_id(), 0);
+  // Retain the first reply while the other batch finishes. Completed page
+  // reads must release their sole shared slot before their batch joins.
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  auto second_result = std::move(second).TakeResult();
+  ASSERT_TRUE(second_result.ok()) << second_result.status();
+  EXPECT_EQ(second_result->lease_.buffer_id(), 0);
+  ExpectValue(first_result);
+  ExpectValue(second_result);
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+class GroupedStringParallelReadTest : public LoadValueAwaitableTestPeer {
+ protected:
+  std::size_t ReadBufferCount() const override { return 32; }
+};
+
+TEST_F(GroupedStringParallelReadTest, DiskPagesOverlapWithinTheOwnerWindow) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(35 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  // A wide scheduler slice admits the complete first window before returning
+  // to the poller. RunOnce(false) flushes these reads at its end, so no CQE can
+  // have released their physical pins when this round returns.
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGrouped();
+  Start(task);
+  worker_.RunOnce(false);
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(block_.pin_count(), 16);
+  EXPECT_EQ(Pool().available_read_buffers(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  // Distinct binary contents and a partial tail detect copying in completion
+  // order or reusing an output offset across the following windows.
+  ExpectValue(std::move(task).TakeResult());
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+}
+
+TEST_F(GroupedStringParallelReadTest,
+       ScarceScratchHeadroomFallsBackToSerialReads) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(35 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const auto previous_shard = CurrentMemoryAccountingShard();
+  absl::Cleanup restore = [&] {
+    (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+    BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                  : previous_shard - 1);
+  };
+  BindMemoryAccountingShard(kMaxMemoryWorkers);
+  RefreshMemoryStats();
+  // Leave room for the roughly 280 KiB reply and one page of scratch, but
+  // not sixteen page reads. An optional concurrency reservation must not turn
+  // this otherwise admissible read into OOM.
+  const auto target = GetMemoryStats().used_bytes_ + 384 * 1024;
+  ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, 1).ok());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGrouped();
+  Start(task);
+  worker_.RunOnce(false);
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(block_.pin_count(), 1);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount() - 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectValue(std::move(task).TakeResult());
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+}
+
+TEST_F(GroupedStringParallelReadTest, ChildrenKeepTheirBackgroundTaskClass) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(35 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetBackgroundBudgetUs(1000000).ok());
+  auto task = ReadGrouped(true);
+  auto handle =
+      std::move(task).operator co_await().await_suspend(std::noop_coroutine());
+  worker_.RegisterBackground(handle);
+  worker_.Enqueue(handle);
+  (void)worker_.TakeSchedulerStats();
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectValue(std::move(task).TakeResult());
+  const auto stats = worker_.TakeSchedulerStats();
+  EXPECT_EQ(stats.foreground_resumes_, 0);
+  EXPECT_GT(stats.background_resumes_, 16);
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+}
+
+TEST_F(GroupedStringParallelReadTest,
+       CorruptPageJoinsOtherStartedReadsBeforeReturning) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(35 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGrouped(true);
+  Start(task);
+  worker_.RunOnce(false);
+  EXPECT_EQ(block_.pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsInternal(std::move(task).TakeResult().status()));
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1));
+  block_.in_memory_ = true;
+  auto next = ReadGrouped();
+  Start(next);
+  ASSERT_NO_FATAL_FAILURE(Drain(next));
+  ExpectValue(std::move(next).TakeResult());
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+}
+
+TEST_F(GroupedStringParallelReadTest, PartialStartFailureJoinsTheStartedRead) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires grouped String batch-start failure injection";
+#endif
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(3 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  constexpr auto variable = "LAVIK_FAIL_STRING_READ_BATCH_START_KEY";
+  const char* previous = std::getenv(variable);
+  const auto saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  const auto restore = [&] {
+    if (saved)
+      setenv(variable, saved->c_str(), 1);
+    else
+      unsetenv(variable);
+  };
+  absl::Cleanup restore_environment = restore;
+  ASSERT_EQ(setenv(variable, key_.c_str(), 1), 0);
+  auto task = ReadGrouped(true);
+  Start(task);
+  worker_.RunOnce(false);
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(block_.pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult().status()));
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+
+  restore();
+  auto next = ReadGrouped();
+  Start(next);
+  ASSERT_NO_FATAL_FAILURE(Drain(next));
+  ExpectValue(std::move(next).TakeResult());
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount());
+}
+
+class GroupedStringTwoOwnerReadTest : public GroupedStringParallelReadTest {
+ protected:
+  unsigned WorkerCount() const override { return 2; }
+};
+
+TEST_F(GroupedStringTwoOwnerReadTest, EachPhysicalOwnerHasItsOwnReadWindow) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(69 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGrouped();
+  Start(task);
+  worker_.RunOnce(false);
+  bycorf::SetThisWorker(1, &cross_core_, &remote_worker_);
+  remote_worker_.RunOnce(false);
+  bycorf::SetThisWorker(0, &cross_core_, &worker_);
+  // Both rings have flushed their first window, and neither has polled the
+  // resulting read CQEs. A request-wide cap of 16 would strand the other
+  // owner's capacity; removing owner limits would consume all 32 slots.
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 16);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  EXPECT_EQ(Pool(0).available_read_buffers(), 16);
+  EXPECT_EQ(Pool(1).available_read_buffers(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectValue(std::move(task).TakeResult());
+  EXPECT_EQ(blocks_[0].pin_count(), 0);
+  EXPECT_EQ(blocks_[1].pin_count(), 0);
+  EXPECT_EQ(Pool(0).available_read_buffers(), ReadBufferCount());
+  EXPECT_EQ(Pool(1).available_read_buffers(), ReadBufferCount());
+}
+
+TEST_F(GroupedStringTwoOwnerReadTest,
+       RelocationKeepsTheNewOwnerWithinItsReadWindow) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedString(69 * kStringGroupBytes + 17));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGrouped();
+  Start(task);
+  // The parent has already planned 16 children for each owner. Publish an
+  // unchanged logical graph whose pages now all live on owner 1 before the
+  // queued children refresh their routes, exercising its permit wait queue.
+  ASSERT_NO_FATAL_FAILURE(RelocateGroupedPagesToRemoteOwner());
+  worker_.RunOnce(false);
+  bycorf::SetThisWorker(1, &cross_core_, &remote_worker_);
+  remote_worker_.RunOnce(false);
+  bycorf::SetThisWorker(0, &cross_core_, &worker_);
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 0);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  EXPECT_EQ(Pool(0).available_read_buffers(), ReadBufferCount());
+  EXPECT_EQ(Pool(1).available_read_buffers(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectValue(std::move(task).TakeResult());
+  EXPECT_EQ(blocks_[1].pin_count(), 0);
+  EXPECT_EQ(Pool(1).available_read_buffers(), ReadBufferCount());
+}
+
+class GroupedCollectionTwoOwnerReadTest : public LoadValueAwaitableTestPeer {
+ protected:
+  std::size_t ReadBufferCount() const override { return 32; }
+  unsigned WorkerCount() const override { return 2; }
+};
+
+class GroupedHashParallelReadTest
+    : public GroupedCollectionTwoOwnerReadTest,
+      public testing::WithParamInterface<ValueType> {};
+
+TEST_P(GroupedHashParallelReadTest, EachOwnerReadsSixteenLeaves) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedHash();
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+    EXPECT_EQ(blocks_[owner].pin_count(), 16);
+    EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+  }
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectHash(std::move(task).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupedHashParallelReadTest, CorruptLeafJoinsBothOwnersBeforeReturning) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedHash();
+  Start(task);
+  RunReadRound();
+  EXPECT_EQ(blocks_[0].pin_count(), 16);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsInternal(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupedHashParallelReadTest, RelocatedLeavesShareTheNewOwnersWindow) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedHash();
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(RelocateGroupedPagesToRemoteOwner());
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 0);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectHash(std::move(task).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupedHashParallelReadTest,
+       TerminalReadsReturnStoredFieldsWithoutRouteRehash) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(
+      ReplaceHashField(1, hash_entries_[1].first, hash_entries_[0].first));
+  hash_entries_[1].first = hash_entries_[0].first;
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ExpectStoredHashFields("Hash field outside its group route");
+}
+
+TEST_P(GroupedHashParallelReadTest,
+       TerminalReadsReturnStoredDuplicatesWithoutDeduplication) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam(), 2));
+  ASSERT_NO_FATAL_FAILURE(
+      ReplaceHashField(1, hash_entries_[3].first, hash_entries_[2].first));
+  hash_entries_[3].first = hash_entries_[2].first;
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ExpectStoredHashFields("duplicate field in Hash group");
+}
+
+TEST_P(GroupedHashParallelReadTest,
+       MutableMaterializationStillBuildsProcessDigests) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto task = ReadGroupedHash(false);
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  const auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  ExpectHash(result);
+  for (const auto& entry : result->entries_)
+    EXPECT_EQ(entry.digest_, ComputeDigest(entry.field_));
+  ExpectNoPageLeases();
+}
+
+INSTANTIATE_TEST_SUITE_P(HashAndSet, GroupedHashParallelReadTest,
+                         testing::Values(ValueType::kHash, ValueType::kSet));
+
+class GroupedHashSingleSlotReadTest
+    : public LoadValueAwaitableTestPeer,
+      public testing::WithParamInterface<ValueType> {};
+
+TEST_P(GroupedHashSingleSlotReadTest,
+       ConcurrentReadsReleaseEachLeafBeforeJoin) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto first = ReadGroupedHash();
+  auto second = ReadGroupedHash();
+  Start(first);
+  Start(second);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  const auto first_result = std::move(first).TakeResult();
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  ExpectHash(first_result);
+  ExpectHash(std::move(second).TakeResult());
+  ExpectNoPageLeases();
+}
+
+INSTANTIATE_TEST_SUITE_P(HashAndSet, GroupedHashSingleSlotReadTest,
+                         testing::Values(ValueType::kHash, ValueType::kSet));
+
+TEST_F(GroupedCollectionTwoOwnerReadTest, HashPartialStartFailureJoinsItsLeaf) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires grouped Hash batch-start failure injection";
+#endif
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(ValueType::kHash));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  constexpr auto variable = "LAVIK_FAIL_HASH_READ_BATCH_START_KEY";
+  const char* previous = std::getenv(variable);
+  const auto saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  absl::Cleanup restore = [&] {
+    if (saved)
+      setenv(variable, saved->c_str(), 1);
+    else
+      unsetenv(variable);
+  };
+  ASSERT_EQ(setenv(variable, key_.c_str(), 1), 0);
+  auto task = ReadGroupedHash();
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 1);
+  EXPECT_EQ(blocks_[1].pin_count(), 0);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+  ASSERT_EQ(unsetenv(variable), 0);
+  auto next = ReadGroupedHash();
+  Start(next);
+  ASSERT_NO_FATAL_FAILURE(Drain(next));
+  ExpectHash(std::move(next).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ListRangeUsesBothOwnersAndPreservesPartialPageRanks) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedList());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedList(1, -2);
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 16);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  const auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  const std::vector<std::string> expected(list_values_.begin() + 1,
+                                          list_values_.end() - 1);
+  EXPECT_EQ(result->values_, expected);
+  EXPECT_EQ(result->length_, list_values_.size());
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ListRangeFallsBackToSerialWhenWindowScratchDoesNotFit) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedList());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const auto previous_shard = CurrentMemoryAccountingShard();
+  absl::Cleanup restore = [&] {
+    (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+    BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                  : previous_shard - 1);
+  };
+  BindMemoryAccountingShard(kMaxMemoryWorkers);
+  RefreshMemoryStats();
+  // The selected values and one page loader fit, while 32 concurrent page
+  // tasks need more scratch. Preserve the existing read's admission floor.
+  const auto target = GetMemoryStats().used_bytes_ + 128 * 1024;
+  ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+  auto task = ReadGroupedList(1, -2);
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  const auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  const std::vector<std::string> expected(list_values_.begin() + 1,
+                                          list_values_.end() - 1);
+  EXPECT_EQ(result->values_, expected);
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       CorruptListPageJoinsBothOwnersBeforeReturning) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedList());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedList();
+  Start(task);
+  RunReadRound();
+  EXPECT_EQ(blocks_[0].pin_count(), 16);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsInternal(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ConcurrentListRangesReleaseEachPageBeforeJoin) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedList());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto first = ReadGroupedList();
+  auto second = ReadGroupedList();
+  Start(first);
+  Start(second);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  const auto first_result = std::move(first).TakeResult();
+  ASSERT_TRUE(first_result.ok()) << first_result.status();
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  const auto second_result = std::move(second).TakeResult();
+  ASSERT_TRUE(second_result.ok()) << second_result.status();
+  EXPECT_EQ(first_result->values_, list_values_);
+  EXPECT_EQ(second_result->values_, list_values_);
+  ExpectNoPageLeases();
+}
+
+class GroupedZsetParallelReadTest : public GroupedCollectionTwoOwnerReadTest,
+                                    public testing::WithParamInterface<bool> {};
+
+TEST_P(GroupedZsetParallelReadTest,
+       RankPagesOverlapOnBothOwnersAndKeepPartialRanks) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedZset({.kind_ = SortedSetOperationKind::kRange,
+                               .reverse_ = GetParam(),
+                               .first_ = 1,
+                               .last_ = -2});
+  Start(task);
+  // Children already enter through the scheduler's ready queue. Their first
+  // slice submits the complete wave without an extra per-page Yield.
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+    EXPECT_EQ(blocks_[owner].pin_count(), 16);
+    EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+  }
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectZset(std::move(task).TakeResult(), 1, zset_values_.size() - 1,
+             GetParam());
+  ExpectNoPageLeases();
+}
+
+TEST_P(GroupedZsetParallelReadTest,
+       ScoreBoundsAndLimitKeepCrossPageTiesInRequestedOrder) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto task = ReadGroupedZset({.kind_ = SortedSetOperationKind::kRange,
+                               .range_mode_ = SortedSetRangeMode::kScore,
+                               .reverse_ = GetParam(),
+                               .minimum_score_ = {2, true},
+                               .maximum_score_ = {48, false},
+                               .limit_ = true,
+                               .offset_ = 5,
+                               .count_ = 150});
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  // Matching ranks are [12, 196). OFFSET applies in traversal order, before
+  // LIMIT, including ties split across the first and last selected pages.
+  ExpectZset(std::move(task).TakeResult(), GetParam() ? 41 : 17,
+             GetParam() ? 191 : 167, GetParam());
+  ExpectNoPageLeases();
+}
+
+INSTANTIATE_TEST_SUITE_P(ForwardAndReverse, GroupedZsetParallelReadTest,
+                         testing::Bool());
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ZsetRangeReturnsStoredDuplicatesWithoutDeduplication) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset(70, true));
+  auto& payload = grouped_payloads_[1];
+  ASSERT_EQ(zset_values_[3].first.size(), zset_values_[5].first.size());
+  const auto offset = payload.find(zset_values_[3].first);
+  ASSERT_NE(offset, std::string::npos);
+  payload.replace(offset, zset_values_[3].first.size(), zset_values_[5].first);
+  zset_values_[3].first = zset_values_[5].first;
+  // The repeated member has different scores, so score/member order remains
+  // valid. A repaired CRC isolates the read's uniqueness-validation policy.
+  ASSERT_TRUE(absl::IsDataLoss(DecodeOrderedGroup(payload).status()));
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  for (const bool scarce : {false, true}) {
+    SCOPED_TRACE(scarce ? "serial admission fallback" : "parallel batch");
+    const auto previous_shard = CurrentMemoryAccountingShard();
+    absl::Cleanup restore = [&] {
+      (void)InitMemoryLimit(1024ULL * 1024 * 1024, WorkerCount());
+      BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                    : previous_shard - 1);
+    };
+    if (scarce) {
+      BindMemoryAccountingShard(kMaxMemoryWorkers);
+      RefreshMemoryStats();
+      const auto target = GetMemoryStats().used_bytes_ + 128 * 1024;
+      ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+    }
+    auto task = ReadGroupedZset();
+    Start(task);
+    RunReadRound();
+    EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), scarce ? 1 : 32);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectZset(std::move(task).TakeResult());
+    ExpectNoPageLeases();
+  }
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ZsetRangeFallsBackToSerialWhenWindowScratchDoesNotFit) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  const auto previous_shard = CurrentMemoryAccountingShard();
+  absl::Cleanup restore = [&] {
+    (void)InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+    BindMemoryAccountingShard(previous_shard == 0 ? kMaxMemoryWorkers
+                                                  : previous_shard - 1);
+  };
+  BindMemoryAccountingShard(kMaxMemoryWorkers);
+  RefreshMemoryStats();
+  const auto target = GetMemoryStats().used_bytes_ + 128 * 1024;
+  ASSERT_TRUE(InitMemoryLimit((target * 10 + 8) / 9, WorkerCount()).ok());
+  auto task = ReadGroupedZset();
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count() + blocks_[1].pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  ExpectZset(std::move(task).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       CorruptZsetPageJoinsBothOwnersBeforeReturning) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  auto task = ReadGroupedZset();
+  Start(task);
+  RunReadRound();
+  EXPECT_EQ(blocks_[0].pin_count(), 16);
+  EXPECT_EQ(blocks_[1].pin_count(), 16);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsInternal(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest, ZsetPartialStartFailureJoinsItsPage) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires grouped Zset batch-start failure injection";
+#endif
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  constexpr auto variable = "LAVIK_FAIL_ZSET_READ_BATCH_START_KEY";
+  const char* previous = std::getenv(variable);
+  const auto saved =
+      previous ? std::optional<std::string>(previous) : std::nullopt;
+  absl::Cleanup restore = [&] {
+    if (saved)
+      setenv(variable, saved->c_str(), 1);
+    else
+      unsetenv(variable);
+  };
+  ASSERT_EQ(setenv(variable, key_.c_str(), 1), 0);
+  auto task = ReadGroupedZset();
+  Start(task);
+  RunReadRound();
+  EXPECT_FALSE(task.done());
+  EXPECT_EQ(blocks_[0].pin_count(), 1);
+  EXPECT_EQ(blocks_[1].pin_count(), 0);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult().status()));
+  ExpectNoPageLeases();
+  ASSERT_EQ(unsetenv(variable), 0);
+  auto next = ReadGroupedZset();
+  Start(next);
+  ASSERT_NO_FATAL_FAILURE(Drain(next));
+  ExpectZset(std::move(next).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ConcurrentZsetRangesReleaseEachPageBeforeJoin) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto first = ReadGroupedZset();
+  auto second = ReadGroupedZset();
+  Start(first);
+  Start(second);
+  ASSERT_NO_FATAL_FAILURE(Drain(first));
+  const auto first_result = std::move(first).TakeResult();
+  ASSERT_NO_FATAL_FAILURE(Drain(second));
+  ExpectZset(first_result);
+  ExpectZset(std::move(second).TakeResult());
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       StagedZsetSerialScanCompletesWithoutExtraYield) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  // ZCOUNT keeps the serial page path. Staging supplies every page without
+  // disk I/O, so the scan can finish before returning to the worker loop.
+  auto task = ReadGroupedZset(
+      {.kind_ = SortedSetOperationKind::kCount,
+       .range_mode_ = SortedSetRangeMode::kScore,
+       .minimum_score_ = {-std::numeric_limits<double>::infinity(), false},
+       .maximum_score_ = {std::numeric_limits<double>::infinity(), false}});
+  Start(task);
+  ASSERT_TRUE(task.done());
+  const auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(result->count_, zset_values_.size());
+  ExpectNoPageLeases();
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       ZsetLimitDoesNotReadAnUnneededFailingPage) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedZset());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(2, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  for (const bool partial : {false, true}) {
+    // Six members consume two complete pages. The exclusive lower bound
+    // instead starts inside page two and LIMIT 1 ends there. In either case,
+    // the corrupt third page matches the bounds but must remain unread.
+    auto task = ReadGroupedZset({.kind_ = SortedSetOperationKind::kRange,
+                                 .range_mode_ = SortedSetRangeMode::kScore,
+                                 .minimum_score_ = {0, partial},
+                                 .maximum_score_ = {partial ? 1. : 2., false},
+                                 .limit_ = true,
+                                 .count_ = partial ? 1 : 6});
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectZset(std::move(task).TakeResult(), partial ? 4 : 0, partial ? 5 : 6);
+    ExpectNoPageLeases();
+  }
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       StreamInteriorWindowReadsSixteenPagesOnEachOwner) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedStream());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  ASSERT_TRUE(worker_.SetForegroundBudgetUs(1000000).ok());
+  ASSERT_TRUE(remote_worker_.SetForegroundBudgetUs(1000000).ok());
+  TransferValue source;
+  {
+    auto open = ReadGroupedStream();
+    Start(open);
+    ASSERT_NO_FATAL_FAILURE(Drain(open));
+    auto result = std::move(open).TakeResult();
+    ASSERT_TRUE(result.ok()) << result.status();
+    source = std::move(*result);
+  }
+  ASSERT_TRUE(source.reader_);
+  std::vector<std::string> actual;
+  {
+    auto boundary = source.reader_();
+    Start(boundary);
+    ASSERT_NO_FATAL_FAILURE(Drain(boundary));
+    auto page = std::move(boundary).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    ASSERT_FALSE(page->done_);
+    actual = std::move(page->elements_);
+  }
+  const std::array pins{blocks_[0].pin_count(), blocks_[1].pin_count()};
+  // Snapshot graph pins survive the reader; count physical I/O pins above
+  // that baseline so the test distinguishes 32 active reads from 16 total.
+  {
+    auto window = source.reader_();
+    Start(window);
+    RunReadRound();
+    EXPECT_FALSE(window.done());
+    for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
+      EXPECT_EQ(blocks_[owner].pin_count(), pins[owner] + 16);
+      EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+    }
+    ASSERT_NO_FATAL_FAILURE(Drain(window));
+    auto page = std::move(window).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    EXPECT_EQ(page->elements_.size(), 32 * 3);
+    actual.insert(actual.end(), page->elements_.begin(), page->elements_.end());
+  }
+  for (bool done = false; !done;) {
+    auto next = source.reader_();
+    Start(next);
+    ASSERT_NO_FATAL_FAILURE(Drain(next));
+    auto page = std::move(next).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    actual.insert(actual.end(), page->elements_.begin(), page->elements_.end());
+    done = page->done_;
+  }
+  EXPECT_EQ(actual, stream_messages_);
+  ASSERT_NO_FATAL_FAILURE(CloseTransfer(source));
+}
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       StreamCountStopsBeforeAnUnneededCorruptInteriorPage) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedStream());
+  ASSERT_NO_FATAL_FAILURE(StageGroupedPage(1, false));
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  TransferValue source;
+  {
+    auto open = ReadGroupedStream(1);
+    Start(open);
+    ASSERT_NO_FATAL_FAILURE(Drain(open));
+    auto result = std::move(open).TakeResult();
+    ASSERT_TRUE(result.ok()) << result.status();
+    source = std::move(*result);
+  }
+  {
+    auto read = source.reader_();
+    Start(read);
+    ASSERT_NO_FATAL_FAILURE(Drain(read));
+    const auto page = std::move(read).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    EXPECT_TRUE(page->done_);
+    ASSERT_EQ(page->elements_.size(), 1);
+    EXPECT_EQ(page->elements_[0], stream_messages_[0]);
+  }
+  ASSERT_NO_FATAL_FAILURE(CloseTransfer(source));
 }
 
 }  // namespace lavik::storage

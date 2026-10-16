@@ -134,8 +134,11 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       if (!admission.ok()) co_return admission.status();
       page_scratch.emplace(std::move(*admission));
     }
-    auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                 digest, object, selection.id_);
+    auto read = pop ? LoadHashGroupSnapshot(store, partition, db_id, key,
+                                            digest, object, selection.id_)
+                    : LoadHashGroupForRead(store, partition, db_id, key, digest,
+                                           object, selection.id_);
+    auto loaded = co_await std::move(read);
     if (!loaded.ok()) co_return loaded.status();
     auto& entries = loaded->snapshot_.value_.entries_;
     std::size_t duplicate_bytes = 0;

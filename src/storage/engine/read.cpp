@@ -1527,8 +1527,16 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   if (trace != nullptr) {
     trace->buffer_acquire_start_ns_ = ReadTraceNowNanos();
   }
-  auto acquired = co_await store.buffers_.AcquireReadBuffer(
-      static_cast<std::size_t>(value_bytes));
+  // Group assembly holds its output while awaiting extent read buffers. If
+  // several groups hold fixed slots for output, even a pool that can satisfy
+  // one serial group can deadlock. Keep these outputs in overflow storage,
+  // including when a custom large read slot could otherwise fit the payload.
+  const auto minimum_output =
+      grouped_payload
+          ? std::max<std::size_t>(value_bytes,
+                                  options_.buffers_.read_payload_bytes() + 1)
+          : static_cast<std::size_t>(value_bytes);
+  auto acquired = co_await store.buffers_.AcquireReadBuffer(minimum_output);
   if (!acquired.ok()) {
     co_return acquired.status();
   }

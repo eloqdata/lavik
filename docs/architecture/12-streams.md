@@ -112,7 +112,9 @@ which has no separate persistent owner index.
 Range, XREAD and XREADGROUP replies pin the command-position root and selected
 pages, then drain admitted decoded pages under network backpressure. Continuous
 message ranges may read a bounded window concurrently after their first
-boundary page; directory counts limit that window to pages needed by COUNT.
+boundary page, using the shared per-physical-owner group limit. Directory
+counts limit that window to pages needed by COUNT, and an aggregate byte budget
+bounds decoded pages and scheduling metadata independently of owner count.
 Sparse selected-ID history and ordinary collection transfers read pages on
 demand. A range window is admitted on the key owner and returned as one logical
 page with its own retained-memory charge, reducing cross-worker pulls while

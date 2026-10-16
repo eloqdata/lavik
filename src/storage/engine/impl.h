@@ -86,6 +86,8 @@ using bycorf::FixedFile;
 using bycorf::Task;
 using bycorf::Worker;
 
+class GroupReadLimiter;
+
 // Storage operations occasionally pin immutable physical state, release the
 // worker-local metadata mutex across IO, then reacquire it for publication.
 class UnlockGuard {
@@ -4025,6 +4027,15 @@ class StorageEngine::Impl {
       RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
       std::optional<absl::Status> failure = std::nullopt);
 
+  // The synchronous decoder must consume its checked payload before the
+  // lease and optional owner permit are released, or move the owning lease
+  // into its result. Snapshot decoders release pages before a window joins.
+  template <typename Result, typename Decode>
+  Task<absl::StatusOr<Result>> LoadHashGroup(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned,
+      Decode decode, GroupReadLimiter* limiter = nullptr);
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
   Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
@@ -4034,11 +4045,25 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false);
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
+      GroupReadLimiter* limiter = nullptr);
+  // Owns field/value bytes after the physical lease is released. Published
+  // read-only pages trust writer uniqueness/routing and omit lookup digests.
+  // Mutation, import and callers needing process-local lookup digests use
+  // the strict snapshot.
+  Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupForRead(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
+      GroupReadLimiter* limiter = nullptr);
+  // Callers admit the decoded image. Full read commands may additionally
+  // request per-owner windows; their optional admission can fall back to
+  // serial. These terminal full-read results omit process-local field digests;
+  // callers needing lookup digests must leave parallel disabled.
   Task<absl::StatusOr<HashValue>> LoadGroupedHashValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, bool pinned = false);
+      GroupedObject::Handle object, bool pinned = false, bool parallel = false);
   Task<absl::StatusOr<LoadedValue>> LoadGroupedValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4393,20 +4418,29 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
-      Decode decode);
+      Decode decode, GroupReadLimiter* limiter = nullptr);
   Task<absl::StatusOr<std::vector<std::string>>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, std::size_t first,
-      std::size_t count);
+      std::size_t count, GroupReadLimiter* limiter = nullptr);
+  // Returns owned entries after releasing the physical lease. An optional
+  // caller-owned limiter accounts against the refreshed physical owner until
+  // decoding finishes; it must outlive this task, including cancellation.
+  // Only read-only consumers may trust stored Sorted Set member uniqueness.
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, std::uint64_t id, bool pinned = false);
+      GroupedObject::Handle object, std::uint64_t id, bool pinned = false,
+      GroupReadLimiter* limiter = nullptr,
+      SortedSetMemberValidation validation =
+          SortedSetMemberValidation::kVerifyUnique);
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, std::uint64_t id);
+      GroupedObject::Handle object, std::uint64_t id,
+      SortedSetMemberValidation validation =
+          SortedSetMemberValidation::kVerifyUnique);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,
@@ -4414,7 +4448,9 @@ class StorageEngine::Impl {
                           const Digest& digest, GroupedObject::Handle object,
                           bool pinned = false);
   // Assemble checked String segments into the returned lease without
-  // retaining decoded pages or a second whole-value image.
+  // retaining decoded pages or a second whole-value image. Admitted readers
+  // overlap up to 16 groups per physical owner and join before releasing
+  // output.
   Task<absl::StatusOr<LoadedValue>> LoadGroupedStringValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

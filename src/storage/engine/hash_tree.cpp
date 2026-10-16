@@ -886,8 +886,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     // The physical read buffer has its own independent admission.
     auto scratch = budget.Reserve(1);
     if (!scratch.ok()) co_return scratch.status();
-    auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                 digest, grouped, route->id_);
+    auto loaded = co_await LoadHashGroupForRead(store, partition, db_id, key,
+                                                digest, grouped, route->id_);
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1125,8 +1125,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         }
       }
     } else {
-      auto loaded = co_await LoadGroupedHashValue(store, partition, db_id, key,
-                                                  digest, grouped);
+      const bool full_read = operation.kind_ == HashOperationKind::kGetAll ||
+                             operation.kind_ == HashOperationKind::kKeys ||
+                             operation.kind_ == HashOperationKind::kValues;
+      auto loaded = co_await LoadGroupedHashValue(
+          store, partition, db_id, key, digest, grouped, false, full_read);
       if (!loaded.ok()) {
         if (read_epoch_changed()) co_return HashResult{};
         co_return loaded.status();
