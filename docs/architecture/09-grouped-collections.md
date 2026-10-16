@@ -423,7 +423,7 @@ physical read leases before joining, while admitted decoded pages and reply
 ownership survive until consumption. Other range modes, rank, count, scan and
 random selection borrow member bytes from one owned read lease. All these paths
 validate complete page framing, ordering and uniqueness before consumption.
-Replies copy only admitted output members. Mutation source and boundary probes,
+Replies retain only admitted output members. Mutation source and boundary probes,
 and rewrite planning, use owned snapshots. Command-local probes retain admitted source
 pages containing requested members within a fixed scratch bound and reuse
 them in planning. Unrelated or excess search pages are released immediately;

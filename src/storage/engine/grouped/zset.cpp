@@ -18,6 +18,7 @@
 #include <map>
 #include <set>
 #include <type_traits>
+#include <utility>
 
 #include "../impl.h"
 #include "absl/container/inlined_vector.h"
@@ -95,8 +96,7 @@ bool Matches(const auto& entry, const SortedSetOperation& operation) {
                             : entry.value_ <= high.value_)));
 }
 
-absl::StatusOr<SortedSetMember> CopyOutput(const auto& entry,
-                                           bool prepaid = false) {
+absl::StatusOr<SortedSetMember> MakeOutput(auto&& entry, bool prepaid = false) {
   auto admission = prepaid ? std::optional<MemoryReservation>{}
                            : TryReserveMemory(entry.value_.size() + 64);
   if (!prepaid && !admission) {
@@ -105,7 +105,7 @@ absl::StatusOr<SortedSetMember> CopyOutput(const auto& entry,
         "OOM Sorted Set output member admission");
   }
   SortedSetMember output;
-  output.member_ = entry.value_;
+  output.member_ = std::forward<decltype(entry)>(entry).value_;
   output.score_ = entry.score_;
   if (prepaid)
     output.retained_charge_.Account(CurrentMemoryAccountingShard(),
@@ -243,7 +243,7 @@ struct ScanBoundary {
     if (operation.scan_pattern_ != "*" &&
         !RedisGlobMatch(operation.scan_pattern_, entry.value_))
       return absl::OkStatus();
-    auto copy = CopyOutput(entry);
+    auto copy = MakeOutput(entry);
     if (!copy.ok()) return copy.status();
     return AppendOutput(std::move(*copy), result);
   }
@@ -278,8 +278,7 @@ struct ReadCursor {
               (operation.offset_ < 0 || operation.count_ == 0)));
   }
 
-  absl::Status Visit(const auto& entry, std::uint64_t rank,
-                     bool prepaid = false) {
+  absl::Status Visit(auto&& entry, std::uint64_t rank, bool prepaid = false) {
     if (done_) return absl::OkStatus();
     if (operation_.kind_ == SortedSetOperationKind::kRank) {
       if (entry.value_ == operation_.members_.front()) {
@@ -305,7 +304,7 @@ struct ReadCursor {
       ++skipped_;
       return absl::OkStatus();
     }
-    auto copied = CopyOutput(entry, prepaid);
+    auto copied = MakeOutput(std::forward<decltype(entry)>(entry), prepaid);
     if (!copied.ok()) return copied.status();
     auto appended = AppendOutput(std::move(*copied), result_, prepaid);
     if (!appended.ok()) return appended;
@@ -349,7 +348,7 @@ absl::Status ReadCompact(std::span<const OrderedCollectionEntry> entries,
       std::optional<SortedSetMember> candidate;
       for (const auto& entry : entries) {
         if (!BetterLexCandidate(entry, operation, after, candidate)) continue;
-        auto copied = CopyOutput(entry);
+        auto copied = MakeOutput(entry);
         if (!copied.ok()) return copied.status();
         candidate.emplace(std::move(*copied));
       }
@@ -575,7 +574,7 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
         selection.Prepare(entries.size(), operation.count_, true, &result);
     if (!status.ok()) return status;
     for (const auto& [rank, slot] : selection.draws_) {
-      auto copied = CopyOutput(entries[rank]);
+      auto copied = MakeOutput(entries[rank]);
       if (!copied.ok()) return copied.status();
       result.members_[slot] = std::move(*copied);
     }
@@ -616,7 +615,7 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
         std::min<std::uint64_t>(operation.pop_count_, entries.size());
     for (std::size_t i = 0; i < count; ++i) {
       const auto at = operation.reverse_ ? entries.size() - 1 - i : i;
-      auto copied = CopyOutput(entries[at]);
+      auto copied = MakeOutput(entries[at]);
       if (!copied.ok()) return copied.status();
       auto appended = AppendOutput(std::move(*copied), &result);
       if (!appended.ok()) return appended;
@@ -1051,7 +1050,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         if (at->offset_ >= entries.size())
           co_return absl::DataLossError(
               "Sorted Set random page cardinality mismatch");
-        auto copied = CopyOutput(entries[at->offset_]);
+        auto copied = MakeOutput(entries[at->offset_]);
         if (!copied.ok()) co_return copied.status();
         result.members_[slot] = std::move(*copied);
         ++draw;
@@ -1095,7 +1094,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       for (std::size_t j = 0;
            result.members_.size() < count && j < entries.size(); ++j) {
         const auto at = operation.reverse_ ? entries.size() - 1 - j : j;
-        auto copied = CopyOutput(entries[at]);
+        auto copied = MakeOutput(entries[at]);
         if (!copied.ok()) co_return copied.status();
         auto appended = AppendOutput(std::move(*copied), &result);
         if (!appended.ok()) co_return appended;
@@ -1135,7 +1134,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           for (const auto& entry : page->page_.entries_) {
             if (!BetterLexCandidate(entry, operation, after, candidate))
               continue;
-            auto copied = CopyOutput(entry);
+            auto copied = MakeOutput(entry);
             if (!copied.ok()) co_return copied.status();
             candidate.emplace(std::move(*copied));
           }
@@ -1178,11 +1177,17 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto page_index = [&](std::size_t ordinal) {
       return reverse ? end_page - 1 - ordinal : first_page + ordinal;
     };
-    auto consume_page = [&](const auto& entries, bool prepaid) {
+    auto consume_page = [&](auto& entries, bool prepaid) {
       if (reverse) rank -= entries.size();
       for (std::size_t j = 0; !cursor.done_ && j < entries.size(); ++j) {
         const auto index = reverse ? entries.size() - 1 - j : j;
-        auto visited = cursor.Visit(entries[index], rank + index, prepaid);
+        // A prepaid wave owns decoded strings after releasing its read leases.
+        // Transfer selected members into the reply instead of allocating and
+        // copying them again; Visit filters before consuming the entry. The
+        // serial path still copies its borrowed page views.
+        auto visited = prepaid ? cursor.Visit(std::move(entries[index]),
+                                              rank + index, true)
+                               : cursor.Visit(entries[index], rank + index);
         if (!visited.ok()) return visited;
       }
       if (!reverse) rank += entries.size();
@@ -1239,11 +1244,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         }
       }
       if (count <= 1 || !plan->ReserveWindow<OwnedScanPage>(4096)) co_return 0;
-      // Decoded pages, their output copies and vector growth are optional
-      // headroom above the original one-page scan. Prepay output as well as
-      // reads: otherwise a successful window reservation could starve the
-      // cursor's later per-member admission. A small LIMIT admits only this
-      // wave, not the entire remaining score range.
+      // Admit encoded/decoded page scratch and output vector growth before
+      // launching. Selected strings move into the reply, so no third payload
+      // copy needs headroom. Prepay output ownership too: a window reservation
+      // must not starve later per-member admission. A small LIMIT admits only
+      // this wave, not the entire remaining score range.
       constexpr auto limit = std::numeric_limits<std::size_t>::max();
       if (items > limit - result.members_.size()) co_return 0;
       const auto maximum_output = result.members_.size() + items;
@@ -1256,8 +1261,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       const auto vector_bytes = output_capacity == result.members_.capacity()
                                     ? 0
                                     : output_capacity * sizeof(SortedSetMember);
-      if (budget.bytes() > (limit - vector_bytes) / 3) co_return 0;
-      auto admission = TryReserveMemory(budget.bytes() * 3 + vector_bytes);
+      if (budget.bytes() > (limit - vector_bytes) / 2) co_return 0;
+      auto admission = TryReserveMemory(budget.bytes() * 2 + vector_bytes);
       if (!admission) co_return 0;
       std::vector<std::optional<OwnedScanPage>> pages(count);
       GroupReadWindow<OwnedScanPage> window(store.worker_, worker_count_,
