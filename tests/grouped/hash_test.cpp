@@ -1289,8 +1289,10 @@ TEST_F(HashLookupMemoryTest, CompactReadsChargeOutputAndRejectOom) {
   const auto before = GetWorkerMemoryStats(0);
   for (const auto kind :
        {HashOperationKind::kGet, HashOperationKind::kGetMany,
-        HashOperationKind::kScan, HashOperationKind::kRandomFields,
-        HashOperationKind::kReadSnapshot, HashOperationKind::kReadPage}) {
+        HashOperationKind::kGetAll, HashOperationKind::kKeys,
+        HashOperationKind::kValues, HashOperationKind::kScan,
+        HashOperationKind::kRandomFields, HashOperationKind::kReadSnapshot,
+        HashOperationKind::kReadPage}) {
     HashOperation op{.kind_ = kind, .fields_ = {"field-0"}};
     if (kind == HashOperationKind::kGetMany) op.fields_.push_back("field-0");
     {
