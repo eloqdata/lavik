@@ -40,6 +40,7 @@
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/transaction.h"
+#include "set_aggregate.h"
 #include "zset_command.h"
 
 namespace lavik {
@@ -68,6 +69,8 @@ struct LockedKey {
 };
 
 struct SortSource {
+  RetainedMemoryCharge retained_charge_;
+  RetainedMemoryCharge vector_charge_;
   storage::ValueType type_ = storage::ValueType::kList;
   std::vector<std::string> elements_;
 };
@@ -78,12 +81,14 @@ struct PatternReference {
 };
 
 struct SortItem {
-  std::string value_;
-  std::optional<std::string> comparison_;
+  std::string* value_ = nullptr;
+  const std::string* comparison_ = nullptr;
   double score_ = 0;
 };
 
 struct SortProduct {
+  RetainedMemoryCharge retained_charge_;
+  RetainedMemoryCharge working_charge_;
   std::vector<std::optional<std::string>> reply_values_;
   std::vector<std::string> stored_values_;
 };
@@ -193,6 +198,25 @@ Task<absl::Status> HoldSortLocks(void*, const tx::ShardSlice&) {
   co_return absl::OkStatus();
 }
 
+absl::Status AdmitSortWorking(RetainedMemoryCharge* charge, std::size_t extra) {
+  if (extra == 0) return absl::OkStatus();
+  if (extra > std::numeric_limits<std::size_t>::max() - charge->bytes()) {
+    return absl::ResourceExhaustedError(
+        "OOM SORT working set exceeds maxmemory");
+  }
+  auto admitted = TryReserveMemory(extra);
+  if (!admitted) {
+    return absl::ResourceExhaustedError(
+        "OOM SORT working set exceeds maxmemory");
+  }
+  if (charge->bytes() == 0) {
+    charge->Adopt(&*admitted, extra);
+  } else {
+    charge->Resize(charge->bytes() + extra);
+  }
+  return absl::OkStatus();
+}
+
 Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
                                                       const LockedKey& key) {
   auto read = [&]() -> Task<absl::StatusOr<SortSource>> {
@@ -209,6 +233,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       auto result = co_await g_storage->ExecuteListLocked(
           db_id, key.name_, key.digest_, operation);
       if (!result.ok()) co_return result.status();
+      source.retained_charge_ = std::move(result->retained_charge_);
       source.elements_ = std::move(result->values_);
       co_return source;
     }
@@ -218,6 +243,18 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       auto result = co_await g_storage->ExecuteSetLocked(
           db_id, key.name_, key.digest_, operation);
       if (!result.ok()) co_return result.status();
+      const auto admitted = AdmitSetReadResult(&*result);
+      if (!admitted.ok()) co_return admitted;
+      source.retained_charge_ = std::move(result->retained_charge_);
+      std::size_t vector_bytes = 0;
+      if (!AddSetWorkingBytes(&vector_bytes, result->values_.size(),
+                              sizeof(std::string))) {
+        co_return absl::ResourceExhaustedError(
+            "OOM SORT working set exceeds maxmemory");
+      }
+      const auto vector_admitted =
+          AdmitSortWorking(&source.vector_charge_, vector_bytes);
+      if (!vector_admitted.ok()) co_return vector_admitted;
       source.elements_.reserve(result->values_.size());
       for (auto& member : result->values_) {
         if (!member.has_value()) {
@@ -321,91 +358,51 @@ Task<absl::StatusOr<std::optional<std::string>>> ReadPatternReferenceLocked(
   co_return co_await SubmitTaskTo(key->owner_, read);
 }
 
-Task<absl::StatusOr<std::optional<std::string>>> LookupPatternValue(
+// std::map keeps these value addresses stable as subsequent BY/GET patterns
+// populate the cache. Sort items borrow comparisons instead of owning copies.
+Task<absl::StatusOr<const std::string*>> LookupPatternValue(
     std::uint8_t db_id, std::string_view pattern, std::string_view substitute,
-    std::span<const LockedKey> keys, PatternCache* cache) {
+    std::span<const LockedKey> keys, PatternCache* cache,
+    RetainedMemoryCharge* charge) {
   auto reference = ResolvePattern(pattern, substitute);
-  if (!reference.has_value()) co_return std::optional<std::string>{};
+  if (!reference.has_value()) co_return nullptr;
   auto cache_key = std::make_pair(reference->key_, reference->field_);
   auto cached = cache->find(cache_key);
-  if (cached != cache->end()) {
-    co_return cached->second;
+  if (cached == cache->end()) {
+    auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys);
+    if (!value.ok()) co_return value.status();
+    std::size_t bytes = 256;
+    if (!AddSetWorkingBytes(&bytes, cache_key.first.capacity() + 1) ||
+        (cache_key.second &&
+         !AddSetWorkingBytes(&bytes, cache_key.second->capacity() + 1)) ||
+        (value->has_value() &&
+         !AddSetWorkingBytes(&bytes, (*value)->capacity() + 1))) {
+      co_return absl::ResourceExhaustedError(
+          "OOM SORT working set exceeds maxmemory");
+    }
+    const auto admitted = AdmitSortWorking(charge, bytes);
+    if (!admitted.ok()) co_return admitted;
+    cached = cache->emplace(std::move(cache_key), std::move(*value)).first;
   }
-  auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys);
-  if (!value.ok()) co_return value.status();
-  cache->emplace(std::move(cache_key), *value);
-  co_return *value;
+  co_return cached->second ? &*cached->second : nullptr;
 }
 
 Task<absl::StatusOr<SortProduct>> BuildSortProduct(
     const CommandRequest& request, const SortOptions& options,
     SortSource source, std::span<const LockedKey> keys,
     bool deterministic_set_order) {
+  SortProduct product;
   PatternCache cache;
-  std::vector<SortItem> items;
-  items.reserve(source.elements_.size());
-  for (std::string& element : source.elements_) {
-    SortItem item{
-        .value_ = std::move(element), .comparison_ = std::nullopt, .score_ = 0};
-    if (!options.dont_sort_) {
-      if (options.by_.has_value()) {
-        auto comparison = co_await LookupPatternValue(
-            request.db_id_, *options.by_, item.value_, keys, &cache);
-        if (!comparison.ok()) co_return comparison.status();
-        item.comparison_ = std::move(*comparison);
-      } else {
-        item.comparison_ = item.value_;
-      }
-      if (!options.alpha_) {
-        if (item.comparison_.has_value() &&
-            !ParseRedisDouble(*item.comparison_, &item.score_, true)) {
-          co_return absl::InvalidArgumentError(
-              "One or more scores can't be converted into double");
-        }
-      }
-    }
-    items.push_back(std::move(item));
-  }
-
   bool dont_sort = options.dont_sort_;
   bool alpha = options.alpha_;
+  bool compare_members = !options.by_.has_value();
   if (dont_sort && source.type_ == storage::ValueType::kSet &&
       (options.store_arg_.has_value() || deterministic_set_order)) {
     dont_sort = false;
     alpha = true;
-    for (SortItem& item : items) item.comparison_ = item.value_;
+    compare_members = true;
   }
-  if (!dont_sort) {
-    auto ascending = [&](const SortItem& left, const SortItem& right) {
-      int comparison = 0;
-      if (alpha) {
-        if (!left.comparison_.has_value() || !right.comparison_.has_value()) {
-          if (left.comparison_.has_value() == right.comparison_.has_value()) {
-            comparison = 0;
-          } else {
-            comparison = left.comparison_.has_value() ? 1 : -1;
-          }
-        } else {
-          comparison = options.store_arg_.has_value()
-                           ? left.comparison_->compare(*right.comparison_)
-                           : std::strcoll(left.comparison_->c_str(),
-                                          right.comparison_->c_str());
-        }
-      } else if (left.score_ < right.score_) {
-        comparison = -1;
-      } else if (left.score_ > right.score_) {
-        comparison = 1;
-      } else {
-        comparison = left.value_.compare(right.value_);
-      }
-      return options.descending_ ? comparison > 0 : comparison < 0;
-    };
-    std::sort(items.begin(), items.end(), ascending);
-  } else if (options.descending_) {
-    std::reverse(items.begin(), items.end());
-  }
-
-  const std::size_t size = items.size();
+  const std::size_t size = source.elements_.size();
   const std::uint64_t nonnegative_start =
       options.limit_start_ < 0
           ? 0
@@ -420,29 +417,136 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
                       std::min<std::uint64_t>(count, size - begin));
   }
 
-  SortProduct product;
   const std::size_t per_item = options.gets_.empty() ? 1 : options.gets_.size();
-  product.reply_values_.reserve((end - begin) * per_item);
+  std::size_t output_count = 0;
+  std::size_t working_bytes = 4096;
+  if (!AddSetWorkingBytes(&output_count, end - begin, per_item) ||
+      !AddSetWorkingBytes(&working_bytes, size, sizeof(SortItem)) ||
+      !AddSetWorkingBytes(&working_bytes, output_count,
+                          sizeof(std::optional<std::string>))) {
+    co_return absl::ResourceExhaustedError(
+        "OOM SORT working set exceeds maxmemory");
+  }
+  const auto admitted =
+      AdmitSortWorking(&product.working_charge_, working_bytes);
+  if (!admitted.ok()) co_return admitted;
+
+  // Items borrow the stable source vector. Comparing members directly avoids
+  // copying every member into both an item and its comparison string.
+  std::vector<SortItem> items;
+  items.reserve(source.elements_.size());
+  const auto comparison_value =
+      [&](const SortItem& item) -> const std::string* {
+    if (compare_members) return item.value_;
+    return item.comparison_;
+  };
+  for (std::string& element : source.elements_) {
+    SortItem item{.value_ = &element};
+    if (!dont_sort) {
+      if (!compare_members) {
+        auto comparison =
+            co_await LookupPatternValue(request.db_id_, *options.by_, element,
+                                        keys, &cache, &product.working_charge_);
+        if (!comparison.ok()) co_return comparison.status();
+        item.comparison_ = *comparison;
+      }
+      const std::string* comparison = comparison_value(item);
+      // LIMIT restricts the result, not numeric validation of the source.
+      if (!alpha && comparison != nullptr &&
+          !ParseRedisDouble(*comparison, &item.score_, true)) {
+        co_return absl::InvalidArgumentError(
+            "One or more scores can't be converted into double");
+      }
+    }
+    items.push_back(std::move(item));
+  }
+
+  if (!dont_sort && begin != end) {
+    auto ascending = [&](const SortItem& left, const SortItem& right) {
+      int comparison = 0;
+      if (alpha) {
+        const std::string* left_value = comparison_value(left);
+        const std::string* right_value = comparison_value(right);
+        if (left_value == nullptr || right_value == nullptr) {
+          if ((left_value == nullptr) == (right_value == nullptr)) {
+            comparison = 0;
+          } else {
+            comparison = left_value != nullptr ? 1 : -1;
+          }
+        } else {
+          comparison =
+              options.store_arg_.has_value()
+                  ? left_value->compare(*right_value)
+                  : std::strcoll(left_value->c_str(), right_value->c_str());
+        }
+      } else if (left.score_ < right.score_) {
+        comparison = -1;
+      } else if (left.score_ > right.score_) {
+        comparison = 1;
+      } else {
+        comparison = left.value_->compare(*right.value_);
+      }
+      return options.descending_ ? comparison > 0 : comparison < 0;
+    };
+    // Partition away ranks outside LIMIT, then order only the returned slice.
+    // All comparison values have already been loaded and validated above.
+    if (end < size) {
+      std::nth_element(items.begin(), items.begin() + end, items.end(),
+                       ascending);
+    }
+    if (begin != 0) {
+      std::nth_element(items.begin(), items.begin() + begin,
+                       items.begin() + end, ascending);
+    }
+    std::sort(items.begin() + begin, items.begin() + end, ascending);
+  } else if (dont_sort && options.descending_) {
+    std::reverse(items.begin(), items.end());
+  }
+
+  product.retained_charge_ = std::move(source.retained_charge_);
+  if (options.store_arg_.has_value()) {
+    product.stored_values_.reserve(output_count);
+  } else {
+    product.reply_values_.reserve(output_count);
+  }
+  auto append = [&](const std::string* value,
+                    std::string* owned = nullptr) -> absl::Status {
+    if (value != nullptr && owned == nullptr) {
+      const auto copied =
+          AdmitSortWorking(&product.working_charge_, value->size() + 1);
+      if (!copied.ok()) return copied;
+    }
+    if (options.store_arg_.has_value()) {
+      if (owned != nullptr)
+        product.stored_values_.push_back(std::move(*owned));
+      else
+        product.stored_values_.push_back(value ? *value : std::string{});
+    } else if (owned != nullptr) {
+      product.reply_values_.emplace_back(std::move(*owned));
+    } else if (value != nullptr) {
+      product.reply_values_.emplace_back(*value);
+    } else {
+      product.reply_values_.emplace_back(std::nullopt);
+    }
+    return absl::OkStatus();
+  };
   for (std::size_t i = begin; i < end; ++i) {
     if (options.gets_.empty()) {
-      product.reply_values_.emplace_back(items[i].value_);
+      const auto appended = append(items[i].value_, items[i].value_);
+      if (!appended.ok()) co_return appended;
       continue;
     }
     for (std::string_view pattern : options.gets_) {
-      if (pattern == "#") {
-        product.reply_values_.emplace_back(items[i].value_);
-        continue;
+      const std::string* selected = items[i].value_;
+      if (pattern != "#") {
+        auto value = co_await LookupPatternValue(request.db_id_, pattern,
+                                                 *items[i].value_, keys, &cache,
+                                                 &product.working_charge_);
+        if (!value.ok()) co_return value.status();
+        selected = *value;
       }
-      auto value = co_await LookupPatternValue(request.db_id_, pattern,
-                                               items[i].value_, keys, &cache);
-      if (!value.ok()) co_return value.status();
-      product.reply_values_.push_back(std::move(*value));
-    }
-  }
-  if (options.store_arg_.has_value()) {
-    product.stored_values_.reserve(product.reply_values_.size());
-    for (const auto& value : product.reply_values_) {
-      product.stored_values_.push_back(value.value_or(""));
+      const auto appended = append(selected);
+      if (!appended.ok()) co_return appended;
     }
   }
   co_return product;

@@ -140,10 +140,15 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                                             key_, digest_, location_,
                                             pinned ? grouped_ : nullptr);
   }
-  auto ReadGroupedHash(bool parallel = true) {
+  auto ReadGroupedHash() {
+    return storage_.impl_->ReadGroupedHashResult(
+        Store(), Store().partitions_[0], 0, key_, digest_, grouped_,
+        location_.value_type() == ValueType::kHash ? HashOperationKind::kGetAll
+                                                   : HashOperationKind::kKeys);
+  }
+  auto ReadMutableGroupedHash() {
     return storage_.impl_->LoadGroupedHashValue(Store(), Store().partitions_[0],
-                                                0, key_, digest_, grouped_,
-                                                false, parallel);
+                                                0, key_, digest_, grouped_);
   }
   Task<absl::StatusOr<ListResult>> ReadGroupedList(std::int64_t first = 0,
                                                    std::int64_t last = -1) {
@@ -543,6 +548,25 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     std::sort(expected.begin(), expected.end());
     EXPECT_EQ(actual, expected);
   }
+  void ExpectHash(const absl::StatusOr<HashResult>& result) {
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_TRUE(result->key_exists_);
+    ASSERT_EQ(result->length_, hash_entries_.size());
+    const std::size_t width =
+        location_.value_type() == ValueType::kHash ? 2 : 1;
+    ASSERT_EQ(result->values_.size(), hash_entries_.size() * width);
+    std::vector<std::pair<std::string, std::string>> actual;
+    for (std::size_t i = 0; i < result->values_.size(); i += width) {
+      ASSERT_TRUE(result->values_[i].has_value());
+      if (width == 2) ASSERT_TRUE(result->values_[i + 1].has_value());
+      actual.emplace_back(*result->values_[i],
+                          width == 2 ? *result->values_[i + 1] : std::string{});
+    }
+    auto expected = hash_entries_;
+    std::sort(actual.begin(), actual.end());
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(actual, expected);
+  }
   void InstallGroupedStream() {
     // Transfer entry points route by Redis slot, while this fixture owns only
     // partition zero. Use its real routing rule rather than widening stores.
@@ -691,7 +715,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     }
     // Materialization feeds mutations and still validates the durable logical
     // invariants before returning entries with process-local lookup digests.
-    auto strict = ReadGroupedHash(false);
+    auto strict = ReadMutableGroupedHash();
     Start(strict);
     ASSERT_NO_FATAL_FAILURE(Drain(strict));
     const auto result = std::move(strict).TakeResult();
@@ -1607,7 +1631,7 @@ TEST_P(GroupedHashParallelReadTest,
        MutableMaterializationStillBuildsProcessDigests) {
   ASSERT_NO_FATAL_FAILURE(InstallGroupedHash(GetParam()));
   ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
-  auto task = ReadGroupedHash(false);
+  auto task = ReadMutableGroupedHash();
   Start(task);
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   const auto result = std::move(task).TakeResult();

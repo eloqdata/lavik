@@ -802,6 +802,9 @@ enum class HashOperationKind : std::uint8_t {
   kRandomFields,
   kScan,
   kPopRandom,
+  // Capture immutable projected bytes for replies that outlive the key hold.
+  // with_values_ includes values; the result uses snapshot_ instead of values_.
+  kReadSnapshot,
 };
 
 // Views remain owned by the command request for the lifetime of the awaited
@@ -822,6 +825,27 @@ struct HashOperation {
   bool with_values_ = false;
 };
 
+// A command-time Hash/Set projection that survives page leases and key holds.
+// Offsets remain valid when blocks move, including small-string storage. Each
+// block packs only requested field/value bytes; no mutable HashEntry survives.
+struct HashReadSnapshot {
+  struct Slice {
+    std::size_t block_ = 0;
+    std::size_t offset_ = 0;
+    std::size_t size_ = 0;
+  };
+  std::vector<std::string> blocks_;
+  std::vector<Slice> values_;
+
+  // The returned view borrows this snapshot, which must remain immutable and
+  // alive until the caller has consumed the selected bytes.
+  std::string_view view(std::size_t index) const {
+    const auto& slice = values_[index];
+    return std::string_view(blocks_[slice.block_])
+        .substr(slice.offset_, slice.size_);
+  }
+};
+
 struct HashResult {
   // Page replies can cross worker/coroutine ownership boundaries. Keep this
   // first so the output buffers die before their retained allowance returns.
@@ -836,6 +860,9 @@ struct HashResult {
   // HGET/HMGET use nullopt for a missing field. HGETALL returns alternating
   // field/value entries; HKEYS and HVALS return one entry per element.
   std::vector<std::optional<std::string>> values_;
+  // Used only by kReadSnapshot. retained_charge_ also owns its allocation,
+  // vector capacities and packed byte blocks across worker handoffs.
+  std::unique_ptr<HashReadSnapshot> snapshot_;
 };
 
 // A compact collection is persisted as one type-tagged value record. Sorted

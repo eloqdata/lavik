@@ -27,6 +27,7 @@
 namespace lavik::storage {
 
 struct HashResult;
+enum class HashOperationKind : std::uint8_t;
 
 // Scans a group whose envelope and physical identity the loader has verified;
 // field_count must be that envelope's count, and field must route to this
@@ -65,6 +66,42 @@ absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
 absl::Status FindCompactHashFields(std::string_view payload,
                                    std::size_t field_count,
                                    std::span<HashFieldLookup> requests);
+
+// A sampled rank and its original draw position. Requests are sorted by rank;
+// repeated ranks retain separate output slots. The populated entry borrows the
+// payload and must be consumed before its read lease is released.
+struct HashRankLookup {
+  std::uint64_t rank_ = 0;
+  std::size_t result_index_ = 0;
+  HashEntryView entry_{};
+};
+
+// Check the header/count and traversed bounds, stopping after the greatest
+// requested rank. The grouped variant requires a loader-validated envelope.
+// Requests must be sorted by rank, and every rank must be below field_count.
+absl::Status FindCompactHashRanks(std::string_view payload,
+                                  std::size_t field_count,
+                                  std::span<HashRankLookup> requests);
+absl::Status FindHashGroupRanks(std::string_view payload,
+                                std::uint32_t field_count,
+                                std::span<HashRankLookup> requests);
+
+// Copies sampled fields and optional values into empty, pre-sized result
+// slots, preserving draw order. Admits copies before allocation and grows the
+// existing result charge. Discard result on failure.
+absl::Status RetainHashRankValues(HashResult& result,
+                                  std::span<const HashRankLookup> requests,
+                                  bool with_values);
+
+// Forms a full reply directly from a nonempty compact encoding. Copies only
+// the requested component(s), validating traversal and admitting output first.
+// kind must be kGetAll, kKeys, kValues or kReadSnapshot. The snapshot retains
+// projected fields and optional values in a packed block with offsets; no
+// borrowed bytes escape the call.
+absl::StatusOr<HashResult> ReadHashPayloadResult(std::string_view payload,
+                                                 HashOperationKind kind,
+                                                 std::uint64_t count,
+                                                 bool with_values = false);
 
 // Copies this page's matches to their distinct, empty slots in a pre-sized,
 // charged result. Admits all copies (including repeated operands) before any

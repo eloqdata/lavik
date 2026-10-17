@@ -28,7 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -40,6 +39,7 @@
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
 #include "lavik/tx/transaction.h"
+#include "set_aggregate.h"
 
 namespace lavik {
 using namespace bycorf;
@@ -261,18 +261,13 @@ Task<CommandReply> ExecuteSetCommandImpl(
   co_return BuiltReply(reply_builder.AppendError("ERR unreachable Set reply"));
 }
 
-enum class SetAggregate : std::uint8_t { kDifference, kIntersection, kUnion };
-
 struct SetMultiContext {
-  // Destroy charges after the strings and operation views. Inputs are produced
-  // on different owners, while aggregation and reply destruction may run on
-  // the coordinator; a worker-local reservation cannot represent that handoff.
-  std::vector<RetainedMemoryCharge> input_charges_;
-  std::vector<RetainedMemoryCharge> input_vector_charges_;
+  // Destroy charges after the strings and operation views. Aggregation can
+  // run inside an owner callback while reply destruction runs on the
+  // coordinator; a worker-local reservation cannot represent that handoff.
   RetainedMemoryCharge aggregate_charge_;
   RetainedMemoryCharge effect_charge_;
   const CommandRequest* request_ = nullptr;
-  std::vector<std::vector<std::string>> members_by_arg_;
   std::vector<std::string> output_;
   std::vector<storage::TxShardWrites> tx_writes_;
   std::string_view move_member_;
@@ -288,6 +283,8 @@ struct SetMultiContext {
   bool rollback_ = false;
   bool single_shard_ = false;
   std::size_t last_source_arg_ = 0;
+  std::uint64_t cardinality_limit_ = 0;
+  std::uint64_t cardinality_ = 0;
   SetAggregate aggregate_ = SetAggregate::kUnion;
 };
 
@@ -312,11 +309,6 @@ void ReleaseSetWorkingSet(SetMultiContext* context) noexcept {
   context->add_ = {};
   context->remove_ = {};
   std::vector<std::string>().swap(context->output_);
-  for (auto& input : context->members_by_arg_) {
-    std::vector<std::string>().swap(input);
-  }
-  for (auto& charge : context->input_charges_) charge.Reset();
-  for (auto& charge : context->input_vector_charges_) charge.Reset();
   context->aggregate_charge_.Reset();
   context->effect_charge_.Reset();
 }
@@ -327,84 +319,47 @@ storage::TxShardWrites* LocalWrites(SetMultiContext& context) {
              : &context.tx_writes_[bycorf::ThisWorker().id_];
 }
 
-absl::flat_hash_set<std::string> AggregateMembers(
-    const SetMultiContext& context) {
-  const auto& request = *context.request_;
-  const std::size_t first_source =
-      request.kind_ == CommandKind::kSInterCard ? 2
-      : request.kind_ == CommandKind::kSDiffStore ||
-              request.kind_ == CommandKind::kSInterStore ||
-              request.kind_ == CommandKind::kSUnionStore
-          ? 2
-          : 1;
-  absl::flat_hash_set<std::string> result;
-  if (first_source >= request.args_.size()) return result;
-  for (const std::string& member : context.members_by_arg_[first_source]) {
-    result.insert(member);
-  }
-  if (context.aggregate_ == SetAggregate::kUnion) {
-    for (std::size_t i = first_source + 1; i <= context.last_source_arg_; ++i) {
-      for (const std::string& member : context.members_by_arg_[i]) {
-        result.insert(member);
-      }
-    }
-    return result;
-  }
-  if (context.aggregate_ == SetAggregate::kDifference) {
-    for (std::size_t i = first_source + 1; i <= context.last_source_arg_; ++i) {
-      for (const std::string& member : context.members_by_arg_[i]) {
-        result.erase(member);
-      }
-    }
-    return result;
-  }
-  for (std::size_t i = first_source + 1; i <= context.last_source_arg_; ++i) {
-    absl::flat_hash_set<std::string_view> current;
-    current.reserve(context.members_by_arg_[i].size());
-    for (const std::string& member : context.members_by_arg_[i]) {
-      current.insert(member);
-    }
-    for (auto it = result.begin(); it != result.end();) {
-      if (!current.contains(*it)) {
-        auto remove = it++;
-        result.erase(remove);
-      } else {
-        ++it;
-      }
-    }
-  }
-  return result;
-}
-
-absl::Status ComputeAggregate(SetMultiContext* context) {
-  // This legacy algorithm still materializes all inputs. Reserve the peak of
-  // owning hash-table copies, rehash/intersection scratch, output copies and
-  // STORE's borrowed field/value vectors before any of those allocations.
-  std::size_t bytes = 4096;
-  for (const auto& input : context->members_by_arg_) {
-    if (!AddWorkingBytes(&bytes, input.size(), 256)) return SetMultiOom();
-    for (const auto& member : input) {
-      if (!AddWorkingBytes(&bytes, member.capacity() + 1, 3))
-        return SetMultiOom();
-    }
-  }
-  auto admission = TryReserveMemory(bytes);
-  if (!admission) return SetMultiOom();
-  context->aggregate_charge_.Adopt(&*admission, bytes);
+Task<absl::Status> ComputeAggregate(SetMultiContext* context) {
   try {
-    absl::flat_hash_set<std::string> members = AggregateMembers(*context);
-    context->output_.assign(std::make_move_iterator(members.begin()),
-                            std::make_move_iterator(members.end()));
-    std::sort(context->output_.begin(), context->output_.end());
-    context->add_.kind_ = storage::HashOperationKind::kSet;
-    context->add_.fields_.reserve(context->output_.size());
-    context->add_.values_.resize(context->output_.size());
-    for (const auto& member : context->output_) {
-      context->add_.fields_.push_back(member);
+    const auto& request = *context->request_;
+    const bool store = request.kind_ == CommandKind::kSDiffStore ||
+                       request.kind_ == CommandKind::kSInterStore ||
+                       request.kind_ == CommandKind::kSUnionStore;
+    const bool cardinality = request.kind_ == CommandKind::kSInterCard;
+    const std::size_t first_source = cardinality || store ? 2 : 1;
+    auto read = [&](std::size_t argument, storage::HashOperation operation)
+        -> Task<absl::StatusOr<storage::HashResult>> {
+      auto execute = [&]() -> Task<absl::StatusOr<storage::HashResult>> {
+        auto result = co_await g_storage->ExecuteSetLocked(
+            request.db_id_, request.args_[argument],
+            storage::ComputeDigest(request.args_[argument]), operation);
+        if (!result.ok()) co_return result.status();
+        auto admitted = AdmitSetReadResult(&*result);
+        if (!admitted.ok()) co_return admitted;
+        co_return result;
+      };
+      const unsigned owner = g_storage->OwnerForKey(request.args_[argument]);
+      if (owner == ThisWorker().id_) co_return co_await execute();
+      co_return co_await SubmitTaskTo(owner, execute);
+    };
+    auto aggregated = co_await AggregateSetPages(
+        request.args_, first_source, context->last_source_arg_,
+        context->aggregate_, cardinality, context->cardinality_limit_, read);
+    if (!aggregated.ok()) co_return aggregated.status();
+    context->aggregate_charge_ = std::move(aggregated->charge_);
+    context->output_ = std::move(aggregated->members_);
+    context->cardinality_ = aggregated->cardinality_;
+    if (store) {
+      context->add_.kind_ = storage::HashOperationKind::kSet;
+      context->add_.fields_.reserve(context->output_.size());
+      context->add_.values_.resize(context->output_.size());
+      for (const auto& member : context->output_) {
+        context->add_.fields_.push_back(member);
+      }
     }
-    return absl::OkStatus();
+    co_return absl::OkStatus();
   } catch (const std::length_error&) {
-    return SetMultiOom();
+    co_return SetMultiOom();
   }
 }
 
@@ -530,40 +485,13 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
             !result->values_.empty() && result->values_.front().has_value();
         continue;
       }
-      storage::HashOperation read;
-      read.kind_ = storage::HashOperationKind::kKeys;
-      auto result = co_await g_storage->ExecuteSetLocked(
-          request.db_id_, request.args_[key.arg_index_], key.digest_, read);
-      if (!result.ok()) co_return result.status();
-      std::size_t bytes = 0;
-      if (!AddWorkingBytes(&bytes, result->values_.size(),
-                           sizeof(std::string))) {
-        co_return SetMultiOom();
-      }
-      // Full kKeys results may come from the legacy compact path, which has no
-      // exported charge. Adopt their already-built strings on the producing
-      // owner before allocating the new vector or yielding to another owner.
-      if (result->retained_charge_.bytes() == 0) {
-        for (const auto& member : result->values_) {
-          if (member && !AddWorkingBytes(&bytes, member->capacity() + 1)) {
-            co_return SetMultiOom();
-          }
-        }
-      }
-      auto admission = TryReserveMemory(bytes);
-      if (!admission) co_return SetMultiOom();
-      context->input_vector_charges_[key.arg_index_].Adopt(&*admission, bytes);
-      context->input_charges_[key.arg_index_] =
-          std::move(result->retained_charge_);
-      auto& destination = context->members_by_arg_[key.arg_index_];
-      destination.reserve(result->values_.size());
-      for (auto& member : result->values_) {
-        destination.push_back(std::move(*member));
-      }
+    }
+    if (!move && context->single_shard_) {
+      auto aggregated = co_await ComputeAggregate(context);
+      if (!aggregated.ok()) co_return aggregated;
     }
     if (context->single_shard_ && store) {
-      auto prepared = ComputeAggregate(context);
-      if (prepared.ok()) prepared = co_await PrepareSetEffects(context);
+      auto prepared = co_await PrepareSetEffects(context);
       if (!prepared.ok()) co_return prepared;
       absl::Status replaced = co_await ReplaceDestination(context);
       if (!replaced.ok()) {
@@ -683,10 +611,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
 
   SetMultiContext context;
   context.request_ = &request;
-  context.input_charges_.resize(args.size());
-  context.input_vector_charges_.resize(args.size());
-  context.members_by_arg_.resize(args.size());
   context.last_source_arg_ = key_view->last_;
+  context.cardinality_limit_ = cardinality_limit;
   const bool store = request.kind_ == CommandKind::kSDiffStore ||
                      request.kind_ == CommandKind::kSInterStore ||
                      request.kind_ == CommandKind::kSUnionStore;
@@ -760,9 +686,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   }
 
   if (context.single_shard_ && move) {
-    // A single-shard Transaction cannot hold locks over multiple hops, so
-    // the source check, destination type check, and both writes share one
-    // callback in this special case.
+    // Keep the source check, destination type check, and both writes in the
+    // same owner callback for the single-shard case.
     auto single_move = [](void* opaque,
                           const tx::ShardSlice& slice) -> Task<absl::Status> {
       auto* ctx = static_cast<SetMultiContext*>(opaque);
@@ -789,7 +714,9 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
     };
     status = co_await transaction.Execute(single_move, &context, true);
   } else {
-    const bool release_after_read = !write || context.single_shard_;
+    // Pagewise aggregation and membership probes share the same snapshot:
+    // multi-owner reads retain all key holds until aggregation completes.
+    const bool release_after_read = context.single_shard_;
     status = co_await transaction.Execute(&SetReadShardCallback, &context,
                                           release_after_read);
   }
@@ -798,14 +725,14 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       // A multi-shard read hop retains its holds on failure; drop them before
       // answering. Single-shard hops already released in-band (the failing
       // hop itself was armed with release=true).
-      if (write && !context.single_shard_ && !transaction.releasing()) {
+      if (!context.single_shard_ && !transaction.releasing()) {
         (void)co_await transaction.Release();
       }
       co_return ClusterValidatorFailureReply(transaction, cluster_validator,
                                              request.connection_tls_,
                                              reply_builder);
     }
-    if (write && !context.single_shard_) {
+    if (!context.single_shard_) {
       (void)co_await transaction.Release();
     }
     co_return BuiltReply(AppendStorageError(reply_builder, status));
@@ -860,7 +787,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
     }
   } else if (store) {
     if (!context.single_shard_) {
-      status = ComputeAggregate(&context);
+      status = co_await ComputeAggregate(&context);
       if (status.ok()) status = co_await PrepareSetEffects(&context);
       if (!status.ok()) {
         (void)co_await transaction.Release();
@@ -875,8 +802,10 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
           co_await transaction.Execute(&SetFinishShardCallback, &context, true);
       if (!finished.ok()) status = finished;
     }
-  } else {
-    status = ComputeAggregate(&context);
+  } else if (!context.single_shard_) {
+    status = co_await ComputeAggregate(&context);
+    const auto released = co_await transaction.Release();
+    if (status.ok()) status = released;
   }
   if (!status.ok()) {
     if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
@@ -901,10 +830,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendInteger(1));
   }
   if (request.kind_ == CommandKind::kSInterCard) {
-    const std::uint64_t cardinality = context.output_.size();
-    co_return BuiltReply(reply_builder.AppendInteger(
-        cardinality_limit == 0 ? cardinality
-                               : std::min(cardinality, cardinality_limit)));
+    co_return BuiltReply(reply_builder.AppendInteger(context.cardinality_));
   }
   try {
     reply_builder.AppendSetHeader(context.output_.size());

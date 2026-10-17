@@ -20,6 +20,7 @@
 #include "../impl.h"
 #include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped/scratch.h"
+#include "lavik/storage/detail/hash_read.h"
 
 namespace lavik::storage {
 
@@ -125,57 +126,37 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       co_return absl::CancelledError("random sample interrupted by shutdown");
     if (!pop && page_index != 0) co_await bycorf::Yield(*store.worker_);
     const auto& selection = selected[page_index];
-    std::optional<MemoryReservation> page_scratch;
     if (!pop) {
-      GroupedScratchBudget budget;
-      const auto added = add_page(&budget, selection.id_);
-      if (!added.ok()) co_return added;
-      auto admission = budget.Reserve(1);
-      if (!admission.ok()) co_return admission.status();
-      page_scratch.emplace(std::move(*admission));
+      auto loaded = co_await LoadHashGroupPayload(
+          store, partition, db_id, key, digest, object, selection.id_);
+      if (!loaded.ok()) co_return loaded.status();
+      const auto bytes = loaded->loaded_.value();
+      const std::string_view payload(
+          reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      std::vector<HashRankLookup> requests;
+      requests.reserve(selection.end_ - selection.begin_);
+      for (auto i = selection.begin_; i < selection.end_; ++i)
+        requests.push_back({.rank_ = samples[i].first - selection.base_,
+                            .result_index_ = samples[i].second});
+      auto status = FindHashGroupRanks(payload, loaded->field_count_, requests);
+      if (!status.ok()) co_return status;
+      status = RetainHashRankValues(result, requests, operation.with_values_);
+      if (!status.ok()) co_return status;
+      // Borrowed entries die with this page. Only sampled output survives,
+      // including separate copies for repeated draws in their original order.
+      continue;
     }
-    auto read = pop ? LoadHashGroupSnapshot(store, partition, db_id, key,
-                                            digest, object, selection.id_)
-                    : LoadHashGroupForRead(store, partition, db_id, key, digest,
-                                           object, selection.id_);
-    auto loaded = co_await std::move(read);
+    auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
+                                                 digest, object, selection.id_);
     if (!loaded.ok()) co_return loaded.status();
     auto& entries = loaded->snapshot_.value_.entries_;
-    std::size_t duplicate_bytes = 0;
     for (auto i = selection.begin_; i < selection.end_; ++i) {
       const auto offset = samples[i].first - selection.base_;
       if (offset >= entries.size())
         co_return absl::DataLossError("random sample rank exceeds page");
-      if (i + 1 == selection.end_ || samples[i].first != samples[i + 1].first)
-        continue;
-      const auto& entry = entries[offset];
-      const auto bytes = entry.field_.size() +
-                         (operation.with_values_ ? entry.value_.size() : 0);
-      if (duplicate_bytes > max_size - 64 ||
-          bytes > max_size - duplicate_bytes - 64)
-        co_return absl::ResourceExhaustedError("random sample output overflow");
-      duplicate_bytes += bytes + 64;
-    }
-    auto copies = TryReserveMemory(duplicate_bytes);
-    if (!copies) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM repeated random sample output");
-    }
-    for (auto i = selection.begin_; i < selection.end_; ++i) {
-      auto& entry = entries[samples[i].first - selection.base_];
+      auto& entry = entries[offset];
       const auto slot = samples[i].second * width;
-      const bool move =
-          i + 1 == selection.end_ || samples[i].first != samples[i + 1].first;
-      if (move) {
-        result.values_[slot].emplace(std::move(entry.field_));
-        if (operation.with_values_)
-          result.values_[slot + 1].emplace(std::move(entry.value_));
-      } else {
-        result.values_[slot].emplace(entry.field_);
-        if (operation.with_values_)
-          result.values_[slot + 1].emplace(entry.value_);
-      }
+      result.values_[slot].emplace(std::move(entry.field_));
       for (std::size_t field = 0; field < width; ++field) {
         const auto capacity = result.values_[slot + field]->capacity();
         if (capacity >= max_size - output_bytes)
@@ -184,9 +165,8 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
         output_bytes += capacity + 1;
       }
     }
-    // Unique sampled strings move out of the decoded page; only repeated
-    // draws allocate another payload. Transfer their charge before releasing
-    // this page's admission so the next page accounts for retained output.
+    // Pops choose unique members, so their reply strings move out of the
+    // strict decoded page. Retain their charge before releasing write scratch.
     result.retained_charge_.Resize(output_bytes);
     if (pop) {
       for (auto i = selection.end_; i != selection.begin_;) {
