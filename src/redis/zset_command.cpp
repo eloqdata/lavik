@@ -1588,6 +1588,8 @@ Task<CommandReply> ExecuteImpl(
       if (!normalized.ok()) co_return Built(StorageError(builder, normalized));
       if (range_remove)
         operation.kind_ = storage::SortedSetOperationKind::kRemoveRange;
+      else
+        operation.packed_output_ = true;
     } else if (request.kind_ == CommandKind::kZRank ||
                request.kind_ == CommandKind::kZRevRank) {
       operation.kind_ = storage::SortedSetOperationKind::kRank;
@@ -1631,9 +1633,10 @@ Task<CommandReply> ExecuteImpl(
       co_return Built(builder.AppendInteger(*result->rank_));
     }
     const bool nested = with_scores && builder.version() == RespVersion::k3;
-    builder.AppendArrayHeader(result->members_.size() *
+    builder.AppendArrayHeader(result->member_count() *
                               (with_scores && !nested ? 2 : 1));
-    for (const auto& member : result->members_) {
+    for (std::size_t i = 0; i < result->member_count(); ++i) {
+      const auto member = result->member_view(i);
       if (nested) builder.AppendArrayHeader(2);
       builder.AppendBulkString(member.member_);
       if (with_scores) AppendScore(builder, member.score_);

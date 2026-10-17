@@ -2598,12 +2598,13 @@ class StorageEngine::Impl {
 
   // Full read-only replies retain only projected output under bounded owner
   // windows. Pages release their leases before joins, which recheck the view.
-  // kReadSnapshot uses packed blocks/offsets for ownership beyond key holds.
+  // kReadSnapshot and opt-in full replies use packed blocks/offsets; each page
+  // owns only its selected field/value bytes beyond the physical lease.
   Task<absl::StatusOr<HashResult>> ReadGroupedHashResult(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, HashOperationKind kind,
-      bool with_values = false);
+      bool with_values = false, bool packed_output = false);
 
   Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -4418,11 +4419,12 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr);
-  Task<absl::StatusOr<std::vector<std::string>>> LoadOrderedListRange(
+  Task<absl::StatusOr<ListResult>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, std::size_t first,
-      std::size_t count, GroupReadLimiter* limiter = nullptr);
+      std::size_t count, GroupReadLimiter* limiter = nullptr,
+      bool packed_output = false);
   // Returns owned entries after releasing the physical lease. An optional
   // caller-owned limiter accounts against the refreshed physical owner until
   // decoding finishes; it must outlive this task, including cancellation.
@@ -4440,6 +4442,13 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, std::uint64_t id,
       SortedSetMemberValidation validation =
           SortedSetMemberValidation::kVerifyUnique);
+  // Copies one checked page into a contiguous member block before releasing
+  // its lease. The caller admits page scratch/output before launch.
+  Task<absl::StatusOr<PackedSortedSetValues>> LoadPackedSortedSetPage(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, std::uint64_t id,
+      GroupReadLimiter* limiter = nullptr);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,

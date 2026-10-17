@@ -165,17 +165,31 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
       limiter);
 }
 
-Task<absl::StatusOr<std::vector<std::string>>>
-StorageEngine::Impl::LoadOrderedListRange(
+Task<absl::StatusOr<ListResult>> StorageEngine::Impl::LoadOrderedListRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, std::size_t first,
-    std::size_t count, GroupReadLimiter* limiter) {
-  return LoadOrderedGroup<std::vector<std::string>>(
+    std::size_t count, GroupReadLimiter* limiter, bool packed_output) {
+  return LoadOrderedGroup<ListResult>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
-      [first, count](std::string_view payload, std::uint64_t,
-                     const OrderedGroupEntry&, LoadedValue&&) {
-        return DecodeOrderedListRange(payload, first, count);
+      [first, count, packed_output](
+          std::string_view payload, std::uint64_t, const OrderedGroupEntry&,
+          LoadedValue&&) -> absl::StatusOr<ListResult> {
+        // The parent holds aggregate scratch until every child is joined.
+        // Pages own no charge: only the final result retains the admitted
+        // bytes, after this loader has released its physical read lease.
+        ListResult result;
+        if (packed_output) {
+          auto decoded = DecodePackedOrderedListRange(payload, first, count);
+          if (!decoded.ok()) return decoded.status();
+          result.packed_values_ =
+              std::make_unique<PackedValues>(std::move(*decoded));
+        } else {
+          auto decoded = DecodeOrderedListRange(payload, first, count);
+          if (!decoded.ok()) return decoded.status();
+          result.values_ = std::move(*decoded);
+        }
+        return result;
       },
       limiter);
 }
@@ -201,6 +215,49 @@ StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
           return absl::DataLossError("ordered page score bounds mismatch");
         return LoadedSortedSetPage{std::move(loaded), std::move(*entries)};
       });
+}
+
+Task<absl::StatusOr<PackedSortedSetValues>>
+StorageEngine::Impl::LoadPackedSortedSetPage(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, std::uint64_t page_id,
+    GroupReadLimiter* limiter) {
+  return LoadOrderedGroup<PackedSortedSetValues>(
+      store, partition, db_id, key, digest, std::move(object), page_id, false,
+      [](std::string_view payload, std::uint64_t,
+         const OrderedGroupEntry& route,
+         LoadedValue&&) -> absl::StatusOr<PackedSortedSetValues> {
+        auto entries = DecodeSortedSetGroupViews(
+            payload, SortedSetMemberValidation::kTrustStored);
+        if (!entries.ok()) return entries.status();
+        if (entries->front().score_ != route.min_score_ ||
+            entries->back().score_ != route.max_score_)
+          return absl::DataLossError("ordered page score bounds mismatch");
+        std::size_t bytes = 0;
+        for (const auto& entry : *entries) {
+          if (entry.value_.size() > SIZE_MAX - bytes)
+            return absl::ResourceExhaustedError(
+                "Sorted Set page size overflow");
+          bytes += entry.value_.size();
+        }
+        PackedSortedSetValues result;
+        result.members_.blocks_.emplace_back(bytes, '\0');
+        result.members_.values_.reserve(entries->size());
+        result.scores_.reserve(entries->size());
+        auto& block = result.members_.blocks_.front();
+        std::size_t offset = 0;
+        for (const auto& entry : *entries) {
+          result.members_.values_.push_back({0, offset, entry.value_.size()});
+          if (!entry.value_.empty())
+            std::memcpy(block.data() + offset, entry.value_.data(),
+                        entry.value_.size());
+          offset += entry.value_.size();
+          result.scores_.push_back(entry.score_);
+        }
+        return result;
+      },
+      limiter);
 }
 
 Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>

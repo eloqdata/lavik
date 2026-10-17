@@ -42,6 +42,7 @@
 #include "lavik/storage/collection_page.h"
 #include "lavik/storage/detail/record_location.h"
 #include "lavik/storage/format.h"
+#include "lavik/storage/packed_values.h"
 #include "lavik/storage/sorted_set.h"
 
 namespace bycorf {
@@ -768,6 +769,9 @@ struct ListOperation {
   // Multi-key callers leave this false even when they have no durable tx;
   // storage independently excludes transactions and native candidate/loading.
   bool prepare_unlocked_ = false;
+  // Only read-only range consumers may opt into immutable page blocks.
+  // Internal mutable consumers retain the owned-string representation.
+  bool packed_output_ = false;
 };
 
 struct ListResult {
@@ -780,6 +784,15 @@ struct ListResult {
   std::int64_t integer_ = 0;
   std::vector<std::string> values_;
   std::vector<std::int64_t> positions_;
+  std::unique_ptr<PackedValues> packed_values_;
+
+  std::size_t value_count() const noexcept {
+    return packed_values_ ? packed_values_->values_.size() : values_.size();
+  }
+  // Views borrow this result and are valid until it is moved or destroyed.
+  std::string_view value_view(std::size_t index) const {
+    return packed_values_ ? packed_values_->view(index) : values_[index];
+  }
 };
 
 enum class HashOperationKind : std::uint8_t {
@@ -829,28 +842,15 @@ struct HashOperation {
   std::string_view match_ = "*";
   bool count_provided_ = false;
   bool with_values_ = false;
+  // Full kKeys/kValues/kGetAll projections may own packed bytes instead of
+  // one string per component. Consumers must use HashResult's view accessors.
+  // Other operations keep their existing representation, including kReadPage.
+  bool packed_output_ = false;
 };
 
-// A command-time Hash/Set projection that survives page leases and key holds.
-// Offsets remain valid when blocks move, including small-string storage. Each
-// block packs only requested field/value bytes; no mutable HashEntry survives.
-struct HashReadSnapshot {
-  struct Slice {
-    std::size_t block_ = 0;
-    std::size_t offset_ = 0;
-    std::size_t size_ = 0;
-  };
-  std::vector<std::string> blocks_;
-  std::vector<Slice> values_;
-
-  // The returned view borrows this snapshot, which must remain immutable and
-  // alive until the caller has consumed the selected bytes.
-  std::string_view view(std::size_t index) const {
-    const auto& slice = values_[index];
-    return std::string_view(blocks_[slice.block_])
-        .substr(slice.offset_, slice.size_);
-  }
-};
+// Hash/Set snapshots retain only requested field/value bytes. Keep the name
+// for existing snapshot consumers while sharing the byte holder with ranges.
+using HashReadSnapshot = PackedValues;
 
 struct HashResult {
   // Page replies can cross worker/coroutine ownership boundaries. Keep this
@@ -866,9 +866,26 @@ struct HashResult {
   // HGET/HMGET use nullopt for a missing field. HGETALL returns alternating
   // field/value entries; HKEYS and HVALS return one entry per element.
   std::vector<std::optional<std::string>> values_;
-  // Used only by kReadSnapshot. retained_charge_ also owns its allocation,
-  // vector capacities and packed byte blocks across worker handoffs.
+  // Used by kReadSnapshot and full projections with packed_output_. The two
+  // output representations are mutually exclusive. retained_charge_ owns the
+  // snapshot allocation, vector capacities and blocks across worker handoffs.
   std::unique_ptr<HashReadSnapshot> snapshot_;
+
+  // Counts projected components, including missing-field slots. HGETALL has
+  // two components per field, regardless of the owned output representation.
+  std::size_t value_count() const noexcept {
+    return snapshot_ ? snapshot_->values_.size() : values_.size();
+  }
+
+  // index must be below value_count(). A missing field remains nullopt; an
+  // empty field/value is a present empty view. Views borrow this immutable
+  // result and must be consumed before it is moved, mutated or destroyed.
+  std::optional<std::string_view> value_view(std::size_t index) const {
+    assert(index < value_count());
+    if (snapshot_) return snapshot_->view(index);
+    if (!values_[index]) return std::nullopt;
+    return std::string_view(*values_[index]);
+  }
 };
 
 // A compact collection is persisted as one type-tagged value record. Sorted

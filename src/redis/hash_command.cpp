@@ -127,12 +127,15 @@ Task<CommandReply> ExecuteHashCommandImpl(
       break;
     case CommandKind::kHGetAll:
       operation.kind_ = storage::HashOperationKind::kGetAll;
+      operation.packed_output_ = true;
       break;
     case CommandKind::kHKeys:
       operation.kind_ = storage::HashOperationKind::kKeys;
+      operation.packed_output_ = true;
       break;
     case CommandKind::kHVals:
       operation.kind_ = storage::HashOperationKind::kValues;
+      operation.packed_output_ = true;
       break;
     case CommandKind::kHStrlen:
       operation.kind_ = storage::HashOperationKind::kStringLength;
@@ -265,8 +268,9 @@ Task<CommandReply> ExecuteHashCommandImpl(
     case CommandKind::kHMGet:
     case CommandKind::kHKeys:
     case CommandKind::kHVals:
-      reply_builder.AppendArrayHeader(result->values_.size());
-      for (const auto& value : result->values_) {
+      reply_builder.AppendArrayHeader(result->value_count());
+      for (std::size_t i = 0; i < result->value_count(); ++i) {
+        const auto value = result->value_view(i);
         if (value.has_value()) {
           reply_builder.AppendBulkString(*value);
         } else {
@@ -275,8 +279,9 @@ Task<CommandReply> ExecuteHashCommandImpl(
       }
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kHGetAll:
-      reply_builder.AppendMapHeader(result->values_.size() / 2);
-      for (const auto& value : result->values_) {
+      reply_builder.AppendMapHeader(result->value_count() / 2);
+      for (std::size_t i = 0; i < result->value_count(); ++i) {
+        const auto value = result->value_view(i);
         if (value.has_value()) {
           reply_builder.AppendBulkString(*value);
         } else {

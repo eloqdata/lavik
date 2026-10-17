@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "lavik/memory.h"
+#include "lavik/storage/packed_values.h"
 
 namespace lavik::storage {
 
@@ -109,12 +110,27 @@ struct SortedSetOperation {
   // publishing or returning a no-op.
   // Internal/multi-key operations and GEOADD leave this disabled.
   bool prepare_unlocked_ = false;
+  // Final range replies may keep immutable member bytes in page blocks.
+  // Internal aggregation/store/mutation consumers retain owned members by
+  // default. This hint applies only to kRange, never to selected removals.
+  bool packed_output_ = false;
 };
 
 struct SortedSetMember {
   RetainedMemoryCharge retained_charge_;
   std::string member_;
   double score_ = 0;
+};
+
+// Typed immutable range projection. Each score corresponds to one member
+// slice; the enclosing result or page admission owns all retained capacities.
+struct PackedSortedSetValues {
+  PackedValues members_;
+  std::vector<double> scores_;
+
+  ScoredMemberView view(std::size_t index) const {
+    return {members_.view(index), scores_[index]};
+  }
 };
 
 struct SortedSetResult {
@@ -134,6 +150,16 @@ struct SortedSetResult {
   // Each member owns its string admission; retained_charge_ above owns vector
   // metadata. Output survives awaits/worker hops without releasing its budget.
   std::vector<SortedSetMember> members_;
+  std::optional<PackedSortedSetValues> packed_members_;
+
+  std::size_t member_count() const {
+    return packed_members_ ? packed_members_->scores_.size() : members_.size();
+  }
+  // Views borrow this result and remain valid until it is changed/destroyed.
+  ScoredMemberView member_view(std::size_t index) const {
+    if (packed_members_) return packed_members_->view(index);
+    return {members_[index].member_, members_[index].score_};
+  }
 };
 
 }  // namespace lavik::storage

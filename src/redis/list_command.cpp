@@ -390,6 +390,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       break;
     case CommandKind::kLRange:
     case CommandKind::kLTrim:
+      op.packed_output_ = request.kind_ == CommandKind::kLRange;
       op.kind_ = request.kind_ == CommandKind::kLRange
                      ? storage::ListOperationKind::kRange
                      : storage::ListOperationKind::kTrim;
@@ -540,7 +541,9 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
               ? reply_builder.AppendNull()
               : reply_builder.AppendBulkString(result->values_.front()));
     case CommandKind::kLRange:
-      AppendBulkArray(reply_builder, result->values_);
+      reply_builder.AppendArrayHeader(result->value_count());
+      for (std::size_t i = 0; i < result->value_count(); ++i)
+        reply_builder.AppendBulkString(result->value_view(i));
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kLSet:
     case CommandKind::kLTrim:
