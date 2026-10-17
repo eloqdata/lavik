@@ -2596,6 +2596,15 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::span<const std::string_view> fields);
 
+  // Full read-only replies retain only projected output under bounded owner
+  // windows. Pages release their leases before joins, which recheck the view.
+  // kReadSnapshot uses packed blocks/offsets for ownership beyond key holds.
+  Task<absl::StatusOr<HashResult>> ReadGroupedHashResult(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, HashOperationKind kind,
+      bool with_values = false);
+
   Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4047,23 +4056,13 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
       GroupReadLimiter* limiter = nullptr);
-  // Owns field/value bytes after the physical lease is released. Published
-  // read-only pages trust writer uniqueness/routing and omit lookup digests.
-  // Mutation, import and callers needing process-local lookup digests use
-  // the strict snapshot.
-  Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupForRead(
-      WorkerStore& store, WorkerStore::PartitionStore& partition,
-      std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
-      GroupReadLimiter* limiter = nullptr);
-  // Callers admit the decoded image. Full read commands may additionally
-  // request per-owner windows; their optional admission can fall back to
-  // serial. These terminal full-read results omit process-local field digests;
-  // callers needing lookup digests must leave parallel disabled.
+  // Strict full materialization for mutation, import and legacy raw-value
+  // consumers. Callers admit the decoded image; query replies instead consume
+  // encoded pages through ReadGroupedHashResult or selected-entry helpers.
   Task<absl::StatusOr<HashValue>> LoadGroupedHashValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, bool pinned = false, bool parallel = false);
+      GroupedObject::Handle object, bool pinned = false);
   Task<absl::StatusOr<LoadedValue>> LoadGroupedValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

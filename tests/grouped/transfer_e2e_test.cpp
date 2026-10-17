@@ -388,10 +388,110 @@ TEST(GroupedTransferE2e, RandomFieldsAndSetPopDoNotMaterializeTheCollection) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
+TEST(GroupedTransferE2e, SetAggregationPagesPreserveErrorsAliasesAndLimits) {
+  for (const unsigned workers : {1U, 3U}) {
+    SCOPED_TRACE(workers);
+    PrivateDisk disk;
+    Server server(disk, workers);
+    Client client(server.port());
+    std::vector<std::string> large{"SADD", "aggregate-large"};
+    std::vector<std::string> small{"SADD", "aggregate-small"};
+    std::vector<std::string> disjoint{"SADD", "aggregate-disjoint"};
+    std::set<std::string> expected;
+    for (unsigned i = 0; i < 640; ++i) {
+      const auto member = std::to_string(i) + std::string(64, 'm');
+      large.push_back(member);
+      if (i % 8 == 0) {
+        small.push_back(member);
+        disjoint.push_back(std::to_string(i) + std::string(64, 'd'));
+        expected.insert(member);
+      }
+    }
+    ASSERT_EQ(client.Command(large).text_, "640");
+    ASSERT_EQ(client.Command(small).text_, "80");
+    ASSERT_EQ(client.Command(disjoint).text_, "80");
+    ASSERT_EQ(client.Command({"SET", "aggregate-wrong", "string"}).text_, "OK");
+    const auto intersection = client.Command(
+        {"SINTER", "aggregate-large", "aggregate-small", "aggregate-small"});
+    ASSERT_EQ(intersection.kind_, '*') << intersection.text_ << server.Log();
+    std::set<std::string> actual;
+    for (const auto& member : intersection.items_) actual.insert(member.text_);
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(client
+                  .Command({"SUNION", "aggregate-large", "aggregate-small",
+                            "aggregate-large"})
+                  .items_.size(),
+              640U);
+    EXPECT_EQ(client.Command({"SDIFF", "aggregate-large", "aggregate-small"})
+                  .items_.size(),
+              560U);
+    EXPECT_TRUE(client.Command({"SDIFF", "aggregate-large", "aggregate-large"})
+                    .items_.empty());
+    for (const auto& limit : {"0", "1", "999"}) {
+      EXPECT_EQ(client
+                    .Command({"SINTERCARD", "2", "aggregate-large",
+                              "aggregate-small", "LIMIT", limit})
+                    .text_,
+                std::string(limit) == "1" ? "1" : "80");
+    }
+    EXPECT_EQ(client
+                  .Command({"SINTERCARD", "2", "aggregate-large",
+                            "aggregate-disjoint", "LIMIT", "1"})
+                  .text_,
+              "0");
+    EXPECT_EQ(client
+                  .Command({"SINTERCARD", "2", "aggregate-small",
+                            "aggregate-small", "LIMIT", "1"})
+                  .text_,
+              "1");
+    for (const auto& command : std::vector<std::vector<std::string>>{
+             {"SINTER", "aggregate-missing", "aggregate-wrong"},
+             {"SDIFF", "aggregate-missing", "aggregate-wrong"},
+             {"SUNION", "aggregate-missing", "aggregate-wrong"},
+             {"SINTERCARD", "3", "aggregate-large", "aggregate-small",
+              "aggregate-wrong", "LIMIT", "1"}}) {
+      const auto wrong = client.Command(command);
+      EXPECT_EQ(wrong.kind_, '-');
+      EXPECT_NE(wrong.text_.find("WRONGTYPE"), std::string::npos);
+    }
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client
+                  .Command({"SINTERCARD", "2", "aggregate-large",
+                            "aggregate-small", "LIMIT", "1"})
+                  .text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"SINTER", "aggregate-missing", "aggregate-wrong"})
+                  .text_,
+              "QUEUED");
+    const auto exec = client.Command({"EXEC"});
+    ASSERT_EQ(exec.items_.size(), 2U);
+    EXPECT_EQ(exec.items_[0].text_, "1");
+    EXPECT_EQ(exec.items_[1].kind_, '-');
+    EXPECT_NE(exec.items_[1].text_.find("WRONGTYPE"), std::string::npos);
+    EXPECT_EQ(
+        client
+            .Command(
+                {"EVAL",
+                 "return redis.call('SINTERCARD',2,KEYS[1],KEYS[2],'LIMIT',1)",
+                 "2", "aggregate-large", "aggregate-small"})
+            .text_,
+        "1");
+    // Inputs remain locked until all probes finish, including when the
+    // destination is also the streamed source.
+    EXPECT_EQ(client
+                  .Command({"SINTERSTORE", "aggregate-large", "aggregate-large",
+                            "aggregate-small"})
+                  .text_,
+              "80");
+    EXPECT_EQ(client.Command({"SCARD", "aggregate-large"}).text_, "80");
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+}
+
 TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
   PrivateDisk disk;
   std::vector<std::string> members;
-  for (unsigned i = 0; i < 160; ++i) {
+  for (unsigned i = 0; i < 256; ++i) {
     members.push_back(std::to_string(i) + std::string(32 * 1024, 's'));
   }
   const std::string first = "{set-aggregate}:first";
@@ -403,7 +503,7 @@ TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
     for (const auto& key : {first, second}) {
       std::vector<std::string> add{"SADD", key};
       add.insert(add.end(), members.begin(), members.end());
-      ASSERT_EQ(client.Command(add).text_, "160") << server.Log();
+      ASSERT_EQ(client.Command(add).text_, "256") << server.Log();
     }
     ASSERT_EQ(client.Command({"SADD", destination, "sentinel"}).text_, "1");
     ASSERT_EQ(client.Command({"SET", "wrong-type", "original"}).text_, "OK");
@@ -413,9 +513,9 @@ TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
   {
     Server server(disk, 4, {}, {}, false, 2, "128M");
     Client client(server.port());
-    // Each source is readable independently. Their simultaneously retained
-    // inputs plus the legacy owning aggregation copies exceed an owner share.
-    // Repetition also catches a charge or transaction-hold leak on rejection.
+    // Each source is readable independently, but admitting the complete
+    // aggregate output and overlapping reply/STORE buffers exceeds an owner
+    // share. Repetition catches leaked charges or transaction holds.
     for (unsigned attempt = 0; attempt < 3; ++attempt) {
       for (const auto& command : std::vector<std::vector<std::string>>{
                {"SUNION", first, second},
@@ -427,8 +527,8 @@ TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
         EXPECT_EQ(client.Command({"SCARD", destination}).text_, "1");
         EXPECT_EQ(client.Command({"SISMEMBER", destination, "sentinel"}).text_,
                   "1");
-        EXPECT_EQ(client.Command({"SCARD", first}).text_, "160");
-        EXPECT_EQ(client.Command({"SCARD", second}).text_, "160");
+        EXPECT_EQ(client.Command({"SCARD", first}).text_, "256");
+        EXPECT_EQ(client.Command({"SCARD", second}).text_, "256");
       }
     }
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
@@ -480,8 +580,8 @@ TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
   }
   Server recovered(disk, 3);
   Client client(recovered.port());
-  EXPECT_EQ(client.Command({"SCARD", first}).text_, "158");
-  EXPECT_EQ(client.Command({"SCARD", second}).text_, "160");
+  EXPECT_EQ(client.Command({"SCARD", first}).text_, "254");
+  EXPECT_EQ(client.Command({"SCARD", second}).text_, "256");
   EXPECT_EQ(client.Command({"SCARD", destination}).text_, "3");
   EXPECT_EQ(client.Command({"SISMEMBER", destination, "sentinel"}).text_, "1");
   EXPECT_EQ(client.Command({"SISMEMBER", destination, members.front()}).text_,

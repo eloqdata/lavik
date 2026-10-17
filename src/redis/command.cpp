@@ -88,6 +88,7 @@
 #include "lavik/version.h"
 #include "list_command.h"
 #include "lua_eval.h"
+#include "set_aggregate.h"
 #include "set_command.h"
 #include "sort_command.h"
 #include "spdlog/spdlog.h"
@@ -3554,24 +3555,49 @@ struct RandomStreamPayloadState {
   std::size_t part_offset_ = 0;
   std::array<char, 32> header_{};
   std::size_t header_bytes_ = 0;
+
+  std::string_view value(std::size_t index) const {
+    return snapshot_.snapshot_ ? snapshot_.snapshot_->view(index)
+                               : std::string_view(*snapshot_.values_[index]);
+  }
 };
 
 absl::Status AdoptRandomStreamSnapshot(RandomStreamPayloadState& state,
                                        storage::HashResult snapshot) {
   const std::size_t width = state.options_.with_values_ ? 2 : 1;
+  const auto count = snapshot.snapshot_ ? snapshot.snapshot_->values_.size()
+                                        : snapshot.values_.size();
   if (snapshot.length_ > std::numeric_limits<std::size_t>::max() / width ||
-      snapshot.values_.size() != snapshot.length_ * width)
+      count != snapshot.length_ * width)
     return absl::InternalError(
         "random snapshot disagrees with collection length");
-  std::size_t retained = sizeof(snapshot) + snapshot.values_.capacity() *
-                                                sizeof(snapshot.values_[0]);
-  for (const auto& value : snapshot.values_) {
-    if (!value)
-      return absl::InternalError("random snapshot contains a missing value");
-    if (value->capacity() + 1 >
-        std::numeric_limits<std::size_t>::max() - retained)
+  std::size_t retained = sizeof(snapshot);
+  auto add_retained = [&](std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - retained)
+      return false;
+    retained += bytes;
+    return true;
+  };
+  if (snapshot.snapshot_) {
+    const auto& packed = *snapshot.snapshot_;
+    if (!add_retained(sizeof(packed)) ||
+        !add_retained(packed.blocks_.capacity() * sizeof(packed.blocks_[0])) ||
+        !add_retained(packed.values_.capacity() * sizeof(packed.values_[0])))
       return absl::ResourceExhaustedError("OOM random snapshot is too large");
-    retained += value->capacity() + 1;
+    for (const auto& block : packed.blocks_) {
+      if (!add_retained(block.capacity() + 1))
+        return absl::ResourceExhaustedError("OOM random snapshot is too large");
+    }
+  } else {
+    if (!add_retained(snapshot.values_.capacity() *
+                      sizeof(snapshot.values_[0])))
+      return absl::ResourceExhaustedError("OOM random snapshot is too large");
+    for (const auto& value : snapshot.values_) {
+      if (!value)
+        return absl::InternalError("random snapshot contains a missing value");
+      if (!add_retained(value->capacity() + 1))
+        return absl::ResourceExhaustedError("OOM random snapshot is too large");
+    }
   }
   // Modern producers transfer their output charge. The fallback also covers
   // older compact producers, without charging the same buffers twice.
@@ -3606,8 +3632,7 @@ absl::StatusOr<std::string> EncodeRandomStreamChunk(
   const std::size_t width = state.options_.with_values_ ? 2 : 1;
   auto begin_bulk = [&] {
     state.header_[0] = '$';
-    const auto size =
-        state.snapshot_.values_[state.selected_ + state.tuple_field_]->size();
+    const auto size = state.value(state.selected_ + state.tuple_field_).size();
     auto encoded = std::to_chars(state.header_.data() + 1,
                                  state.header_.data() + 29, size);
     assert(encoded.ec == std::errc{});
@@ -3631,7 +3656,7 @@ absl::StatusOr<std::string> EncodeRandomStreamChunk(
         piece = {state.header_.data(), state.header_bytes_};
         break;
       case RandomStreamPayloadState::Part::kValue:
-        piece = *state.snapshot_.values_[state.selected_ + state.tuple_field_];
+        piece = state.value(state.selected_ + state.tuple_field_);
         break;
       case RandomStreamPayloadState::Part::kTerminator:
         piece = "\r\n";
@@ -3697,9 +3722,8 @@ Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
         state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared,
         lavik::storage::RedisSlot(state->key_));
     storage::HashOperation operation;
-    operation.kind_ = state->options_.hash_ && state->options_.with_values_
-                          ? storage::HashOperationKind::kGetAll
-                          : storage::HashOperationKind::kKeys;
+    operation.kind_ = storage::HashOperationKind::kReadSnapshot;
+    operation.with_values_ = state->options_.with_values_;
     operation.now_ms_ = state->now_ms_;
     absl::StatusOr<storage::HashResult> snapshot;
     if (state->options_.zset_) {
@@ -3799,9 +3823,11 @@ Task<CommandReply> ExecuteNegativeRandomStream(
 
 // EXEC must preserve the view observed at the command's position in the
 // transaction, but it must not materialize a negative-count reply whose size
-// is controlled by the client. Capture the compact collection once while the
+// is controlled by the client. Capture the collection once while the
 // transaction owns its locks, then sample that immutable view in bounded
-// chunks after EXEC has released every DB/key guard.
+// chunks after EXEC has released every DB/key guard. Hash/Set snapshots pack
+// projected bytes once and index offsets; no read-buffer leases or per-entry
+// string allocations survive into socket backpressure.
 struct TransactionalRandomStreamState : RandomStreamPayloadState {};
 
 struct OwnedStreamReply {
@@ -3819,9 +3845,8 @@ PrepareTransactionalNegativeRandomStreamLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, NegativeRandomStreamOptions options) {
   storage::HashOperation operation;
-  operation.kind_ = options.hash_ && options.with_values_
-                        ? storage::HashOperationKind::kGetAll
-                        : storage::HashOperationKind::kKeys;
+  operation.kind_ = storage::HashOperationKind::kReadSnapshot;
+  operation.with_values_ = options.with_values_;
   operation.now_ms_ = RedisUnixTimeMillis();
 
   absl::StatusOr<storage::HashResult> snapshot;
@@ -6969,12 +6994,7 @@ Task<std::string> ExecuteExecSequentialSetMulti(
         include_second ? 2 : 1);
   };
   try {
-    // These outlive the materialized input/output strings, including owner
-    // hops. A failed command releases its scratch before attempting
-    // command-local undo.
-    std::vector<RetainedMemoryCharge> input_charges(command.args_.size());
-    std::vector<RetainedMemoryCharge> vector_charges(command.args_.size());
-    RetainedMemoryCharge aggregate_charge;
+    // The output and effects retain their admissions across owner hops.
     RetainedMemoryCharge effect_charge;
     const auto& args = command.args_;
     auto find_key = [&](std::size_t argument) -> const ExecKey* {
@@ -6991,22 +7011,8 @@ Task<std::string> ExecuteExecSequentialSetMulti(
             command.db_id_, args[key.arg_], key.digest_, operation,
             write ? &tx_writes[key.owner_] : nullptr);
         if (!result.ok()) co_return result.status();
-        // Full kKeys can still use an uncharged legacy result. Establish the
-        // retained owner before transferring its strings to the coordinator.
-        if (operation.kind_ == storage::HashOperationKind::kKeys &&
-            result->retained_charge_.bytes() == 0) {
-          std::size_t bytes = 0;
-          if (!add_bytes(&bytes, result->values_.capacity(),
-                         sizeof(std::optional<std::string>)))
-            co_return oom();
-          for (const auto& member : result->values_) {
-            if (member && !add_bytes(&bytes, member->capacity() + 1))
-              co_return oom();
-          }
-          auto admitted = TryReserveMemory(bytes);
-          if (!admitted) co_return oom();
-          result->retained_charge_.Adopt(&*admitted, bytes);
-        }
+        const auto admitted = AdmitSetReadResult(&*result);
+        if (!admitted.ok()) co_return admitted;
         co_return result;
       };
       if (key.owner_ == ThisWorker().id_) {
@@ -7014,29 +7020,6 @@ Task<std::string> ExecuteExecSequentialSetMulti(
       }
       co_return co_await SubmitTaskTo(key.owner_, execute);
     };
-    auto read_members = [&](std::size_t argument)
-        -> Task<absl::StatusOr<std::vector<std::string>>> {
-      const ExecKey* key = find_key(argument);
-      if (key == nullptr) co_return absl::InternalError("Set key is missing");
-      storage::HashOperation operation;
-      operation.kind_ = storage::HashOperationKind::kKeys;
-      auto result = co_await run_set(*key, std::move(operation), false);
-      if (!result.ok()) co_return result.status();
-      std::size_t bytes = 0;
-      if (!add_bytes(&bytes, result->values_.size(), sizeof(std::string)))
-        co_return oom();
-      auto admitted = TryReserveMemory(bytes);
-      if (!admitted) co_return oom();
-      input_charges[argument] = std::move(result->retained_charge_);
-      vector_charges[argument].Adopt(&*admitted, bytes);
-      std::vector<std::string> members;
-      members.reserve(result->values_.size());
-      for (auto& member : result->values_) {
-        members.push_back(std::move(*member));
-      }
-      co_return members;
-    };
-
     if (command.kind_ == CommandKind::kSMove) {
       MarkReplicationCommandHandled(command);
       const ExecKey* source_key = find_key(1);
@@ -7141,59 +7124,22 @@ Task<std::string> ExecuteExecSequentialSetMulti(
         cardinality_limit = static_cast<std::uint64_t>(parsed_limit);
       }
     }
-    std::vector<std::vector<std::string>> sources;
-    sources.reserve(last_source - first_source + 1);
-    for (std::size_t argument = first_source; argument <= last_source;
-         ++argument) {
-      auto members = co_await read_members(argument);
-      if (!members.ok()) co_return EncodeStorageError(members.status());
-      sources.push_back(std::move(*members));
-    }
-    std::size_t aggregate_bytes = 4096;
-    for (const auto& source : sources) {
-      if (!add_bytes(&aggregate_bytes, source.size(), 256))
-        co_return EncodeStorageError(oom());
-      for (const auto& member : source) {
-        // The encoded EXEC/Lua reply is an owning string, so it can overlap the
-        // hash table, ordered output and ReplyBuilder wire buffer.
-        if (!add_bytes(&aggregate_bytes, member.capacity() + 1, 4))
-          co_return EncodeStorageError(oom());
-      }
-    }
-    auto aggregate_admission = TryReserveMemory(aggregate_bytes);
-    if (!aggregate_admission) co_return EncodeStorageError(oom());
-    aggregate_charge.Adopt(&*aggregate_admission, aggregate_bytes);
-    absl::flat_hash_set<std::string> output;
-    for (const std::string& member : sources.front()) output.insert(member);
-    if (intersection) {
-      for (std::size_t i = 1; i < sources.size(); ++i) {
-        absl::flat_hash_set<std::string_view> current;
-        current.reserve(sources[i].size());
-        for (const std::string& member : sources[i]) current.insert(member);
-        for (auto it = output.begin(); it != output.end();) {
-          if (!current.contains(*it)) {
-            auto remove = it++;
-            output.erase(remove);
-          } else {
-            ++it;
-          }
-        }
-      }
-    } else if (difference) {
-      for (std::size_t i = 1; i < sources.size(); ++i) {
-        for (const std::string& member : sources[i]) output.erase(member);
-      }
-    } else {
-      for (std::size_t i = 1; i < sources.size(); ++i) {
-        for (const std::string& member : sources[i]) output.insert(member);
-      }
-    }
-
+    auto read = [&](std::size_t argument, storage::HashOperation operation)
+        -> Task<absl::StatusOr<storage::HashResult>> {
+      const ExecKey* key = find_key(argument);
+      if (key == nullptr) co_return absl::InternalError("Set key is missing");
+      co_return co_await run_set(*key, std::move(operation), false);
+    };
+    auto aggregated = co_await AggregateSetPages(
+        args, first_source, last_source,
+        intersection ? SetAggregate::kIntersection
+        : difference ? SetAggregate::kDifference
+                     : SetAggregate::kUnion,
+        command.kind_ == CommandKind::kSInterCard, cardinality_limit, read);
+    if (!aggregated.ok()) co_return EncodeStorageError(aggregated.status());
+    auto& output = aggregated->members_;
     if (command.kind_ == CommandKind::kSInterCard) {
-      const std::uint64_t cardinality = output.size();
-      co_return EncodeInteger(static_cast<long long>(
-          cardinality_limit == 0 ? cardinality
-                                 : std::min(cardinality, cardinality_limit)));
+      co_return EncodeInteger(static_cast<long long>(aggregated->cardinality_));
     }
 
     if (store) {
@@ -7226,11 +7172,7 @@ Task<std::string> ExecuteExecSequentialSetMulti(
       std::vector<std::string> remove_effect{"DEL", args[1]};
       std::vector<std::string> canonical{"SADD", args[1]};
       if (!output.empty()) {
-        std::vector<std::string> ordered(output.begin(), output.end());
-        std::sort(ordered.begin(), ordered.end());
-        canonical.insert(canonical.end(),
-                         std::make_move_iterator(ordered.begin()),
-                         std::make_move_iterator(ordered.end()));
+        canonical.insert(canonical.end(), output.begin(), output.end());
       }
       auto capture_ready = prepare_capture(!output.empty());
       if (!capture_ready.ok()) co_return EncodeStorageError(capture_ready);
@@ -7278,11 +7220,9 @@ Task<std::string> ExecuteExecSequentialSetMulti(
       co_return EncodeInteger(static_cast<long long>(output.size()));
     }
 
-    std::vector<std::string> ordered(output.begin(), output.end());
-    std::sort(ordered.begin(), ordered.end());
     ReplyBuilder builder(command.resp_version_);
-    builder.AppendSetHeader(ordered.size());
-    for (const std::string& member : ordered) builder.AppendBulkString(member);
+    builder.AppendSetHeader(output.size());
+    for (const std::string& member : output) builder.AppendBulkString(member);
     co_return std::string(builder.View());
   } catch (const std::length_error&) {
   }

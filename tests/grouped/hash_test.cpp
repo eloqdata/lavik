@@ -176,6 +176,112 @@ TEST(HashGroupPointProbe, BoundsOwnedCopyAndRejectsGrowingReplacement) {
   EXPECT_FALSE(*large);
 }
 
+TEST(CompactHashEdit, MatchesSequentialOwnedUpdates) {
+  std::mt19937 random(42);
+  for (unsigned trial = 0; trial < 300; ++trial) {
+    HashValue original = Value(1 + random() % 64, random() % 128);
+    original.entries_.push_back({.field_ = "", .value_ = ""});
+    original.entries_.push_back(
+        {.field_ = std::string("a\0b", 3), .value_ = std::string("x\0y", 3)});
+    auto encoded = EncodeHashValue(original);
+    ASSERT_TRUE(encoded.ok());
+    std::vector<std::string> field_storage, value_storage;
+    const auto n = 1 + random() % 24;
+    for (unsigned i = 0; i < n; ++i) {
+      field_storage.push_back(
+          i % 5 == 0 ? "" : "field-" + std::to_string(random() % 80));
+      value_storage.emplace_back(random() % 200,
+                                 static_cast<char>(random() % 256));
+    }
+    std::vector<std::string_view> fields(field_storage.begin(),
+                                         field_storage.end());
+    std::vector<std::string_view> values(value_storage.begin(),
+                                         value_storage.end());
+    auto expected = original;
+    bool changed = false;
+    std::size_t added = 0;
+    for (unsigned i = 0; i < n; ++i) {
+      auto it = std::find_if(
+          expected.entries_.begin(), expected.entries_.end(),
+          [&](const auto& entry) { return entry.field_ == fields[i]; });
+      if (it == expected.entries_.end()) {
+        expected.entries_.push_back({.field_ = std::string(fields[i]),
+                                     .value_ = std::string(values[i])});
+        ++added;
+        changed = true;
+      } else {
+        changed |= it->value_ != values[i];
+        it->value_ = values[i];
+      }
+    }
+    const auto expected_bytes = EncodeHashValue(expected);
+    ASSERT_TRUE(expected_bytes.ok());
+    auto result = EditCompactHash(*encoded, original.entries_.size(), fields,
+                                  values, SIZE_MAX);
+    ASSERT_TRUE(result.ok()) << result.status();
+    ASSERT_TRUE(result->has_value());
+    EXPECT_EQ((**result).changed_, changed);
+    EXPECT_EQ((**result).added_, added);
+    EXPECT_EQ((**result).count_, expected.entries_.size());
+    EXPECT_EQ((**result).payload_, changed ? *expected_bytes : "");
+    auto bounded = EditCompactHash(*encoded, original.entries_.size(), fields,
+                                   values, expected_bytes->size() - 1);
+    ASSERT_TRUE(bounded.ok());
+    EXPECT_FALSE(bounded->has_value());
+    auto exact = EditCompactHash(*encoded, original.entries_.size(), fields,
+                                 values, expected_bytes->size());
+    ASSERT_TRUE(exact.ok());
+    ASSERT_TRUE(exact->has_value());
+  }
+}
+
+TEST(CompactHashEdit, NoopTransientChangesBinaryAndBorrowedInputs) {
+  HashValue value{
+      .entries_ = {{.field_ = "", .value_ = ""},
+                   {.field_ = std::string("a\0b", 3), .value_ = "old"}}};
+  auto bytes = EncodeHashValue(value);
+  ASSERT_TRUE(bytes.ok());
+  std::vector<std::string_view> fields{"", ""}, values{"", ""};
+  auto result = EditCompactHash(*bytes, 2, fields, values, 16383);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result->has_value());
+  EXPECT_FALSE((**result).changed_);
+  EXPECT_TRUE((**result).payload_.empty());
+  values = {"temporary", ""};
+  result = EditCompactHash(*bytes, 2, fields, values, 16383);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result->has_value());
+  EXPECT_TRUE((**result).changed_);
+  EXPECT_EQ((**result).payload_, *bytes);
+  fields = {std::string_view("a\0b", 3)};
+  values = {std::string_view("x\0y", 3)};
+  result = EditCompactHash(*bytes, 2, fields, values, 16383);
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(result->has_value());
+  bytes->assign(bytes->size(), '!');
+  auto decoded = DecodeHashValue((**result).payload_);
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded->entries_[1].value_, std::string("x\0y", 3));
+}
+
+TEST(CompactHashEdit, ValidatesPastMatchesAndChecksCounts) {
+  auto value = Value(2, 32);
+  auto bytes = EncodeHashValue(value);
+  ASSERT_TRUE(bytes.ok());
+  const std::array<std::string_view, 1> fields{"field-0"},
+      values{value.entries_[0].value_};
+  EXPECT_FALSE(EditCompactHash(*bytes, 3, fields, values, 16383).ok());
+  EXPECT_FALSE(EditCompactHash(*bytes, 2, fields, {}, 16383).ok());
+  auto broken = *bytes;
+  const auto second = kHashValueHeaderBytes + 8 + 7 + 32;
+  broken[second] = static_cast<char>(255);
+  // A no-op on the first field must still reject a damaged later entry.
+  EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
+  broken = *bytes;
+  broken.replace(broken.find("field-1"), 7, "field-0");
+  EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
+}
+
 TEST(HashGroupEdits, OrderedDuplicatesOwnTheirBytesAndKeepWireFormat) {
   HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(8, 64)};
   auto payload = EncodeHashGroup(group);
@@ -742,59 +848,50 @@ TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
   EXPECT_EQ(visited, 3);
 }
 
-TEST(GroupedHashTest, PointLookupRejectsCorruptionAfterMatch) {
+TEST(GroupedHashTest, PointLookupStopsAtMatchAndChecksTraversedEncoding) {
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(2)});
   ASSERT_TRUE(encoded.ok());
-  // Preserve a valid outer envelope while corrupting the unchecked inner
-  // encoding, as a loader-success/lookup-failure boundary would see it.
-  auto check = [](const std::string& bytes) {
-    auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
-    EXPECT_TRUE(metadata.ok());
-    if (!metadata.ok()) return metadata.status();
-    const auto status =
-        FindHashGroupField(bytes, metadata->field_count_, "field-0").status();
-    const auto visited = VisitHashGroupFields(
-        bytes, metadata->field_count_, metadata->id_, Seed(),
-        [](const HashEntryView&) { return absl::OkStatus(); });
-    EXPECT_EQ(visited.code(), status.code());
-    return status;
-  };
-  auto broken = *encoded;
-  broken.replace(broken.find("field-1"), 7, "field-0");
-  auto status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "duplicate Hash field in group");
+  for (bool compact : {false, true}) {
+    SCOPED_TRACE(compact ? "compact" : "grouped");
+    auto find = [compact](std::string_view bytes, std::string_view field) {
+      return compact ? FindCompactHashField(bytes.substr(kHashGroupHeaderBytes),
+                                            2, field)
+                     : FindHashGroupField(bytes, 2, field);
+    };
+    auto broken = *encoded;
+    broken.replace(broken.find("field-1"), 7, "field-0");
+    auto found = find(broken, "field-0");
+    ASSERT_TRUE(found.ok());
+    ASSERT_TRUE(found->has_value());
+    EXPECT_EQ(**found, std::string(128, 'a'));
 
-  broken = *encoded;
-  // The first match is intact; the second entry claims an impossible length.
-  const auto second_header = broken.find("field-1") - 8;
-  broken.replace(second_header, 4, 4, '\xff');
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash entry is truncated");
+    broken = *encoded;
+    // A hit does not visit the damaged tail; a miss still checks its bounds.
+    broken.replace(broken.find("field-1") - 8, 4, 4, '\xff');
+    EXPECT_TRUE(find(broken, "field-0").ok());
+    EXPECT_EQ(find(broken, "absent").status().message(),
+              "Hash entry is truncated");
 
-  broken = *encoded;
-  broken[kHashGroupHeaderBytes] ^= 1;
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "invalid Hash value header");
+    broken = *encoded;
+    broken[kHashGroupHeaderBytes] ^= 1;
+    EXPECT_EQ(find(broken, "field-0").status().message(),
+              "invalid Hash value header");
+    broken = *encoded;
+    broken[kHashGroupHeaderBytes + 16] = 1;
+    EXPECT_EQ(find(broken, "field-0").status().message(),
+              "Hash element count does not match record metadata");
 
-  broken = *encoded;
-  broken[kHashGroupHeaderBytes + 16] = 1;
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash group inner count disagrees with envelope");
-
-  broken = *encoded + "x";
-  const auto compact_bytes = broken.size() - kHashGroupHeaderBytes;
-  for (std::size_t i = 0; i < 4; ++i)
-    broken[36 + i] = static_cast<char>(compact_bytes >> (8 * i));
-  for (std::size_t i = 0; i < 8; ++i)
-    broken[kHashGroupHeaderBytes + 24 + i] =
-        static_cast<char>(compact_bytes >> (8 * i));
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash value has trailing bytes");
+    broken = *encoded + "x";
+    const auto compact_bytes = broken.size() - kHashGroupHeaderBytes;
+    for (std::size_t i = 0; i < 4; ++i)
+      broken[36 + i] = static_cast<char>(compact_bytes >> (8 * i));
+    for (std::size_t i = 0; i < 8; ++i)
+      broken[kHashGroupHeaderBytes + 24 + i] =
+          static_cast<char>(compact_bytes >> (8 * i));
+    EXPECT_TRUE(find(broken, "field-0").ok());
+    EXPECT_EQ(find(broken, "absent").status().message(),
+              "Hash value has trailing bytes");
+  }
 }
 
 TEST(GroupedHashTest, PersistedVisitorBorrowsEmptyAndBinaryFields) {
@@ -953,43 +1050,88 @@ TEST(GroupedHashTest, BorrowedVisitorChecksUnrelatedRouteAndPropagatesFailure) {
 }
 
 TEST(GroupedHashTest,
-     MultiLookupMatchesRepeatedOperandsAndChecksUnselectedTail) {
+     MultiLookupPreservesRepeatedOperandsAndStopsAfterAllMatches) {
   auto value = Value(3);
   value.entries_[0].value_.clear();
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
   ASSERT_TRUE(encoded.ok());
-  std::array<HashFieldLookup, 4> requests{{
-      {.field_ = "absent", .result_index_ = 1},
-      {.field_ = "field-0", .result_index_ = 3},
-      {.field_ = "field-1", .result_index_ = 2},
-      {.field_ = "field-1", .result_index_ = 0},
-  }};
-  ASSERT_TRUE(FindHashGroupFields(*encoded, 3, requests).ok());
-  EXPECT_FALSE(requests[0].value_);
-  ASSERT_TRUE(requests[1].value_);
-  EXPECT_TRUE(requests[1].value_->empty());
-  ASSERT_TRUE(requests[2].value_);
-  EXPECT_EQ(*requests[2].value_, std::string(128, 'b'));
-  EXPECT_EQ(requests[2].value_, requests[3].value_);
+  for (bool compact : {false, true}) {
+    SCOPED_TRACE(compact ? "compact" : "grouped");
+    auto find = [compact](std::string_view bytes, std::uint32_t count,
+                          std::span<HashFieldLookup> requests) {
+      return compact ? FindCompactHashFields(
+                           bytes.substr(kHashGroupHeaderBytes), count, requests)
+                     : FindHashGroupFields(bytes, count, requests);
+    };
+    std::array<HashFieldLookup, 4> requests{{
+        {.field_ = "absent", .result_index_ = 1},
+        {.field_ = "field-0", .result_index_ = 3},
+        {.field_ = "field-1", .result_index_ = 2},
+        {.field_ = "field-1", .result_index_ = 0},
+    }};
+    ASSERT_TRUE(find(*encoded, 3, requests).ok());
+    EXPECT_FALSE(requests[0].value_);
+    ASSERT_TRUE(requests[1].value_);
+    EXPECT_TRUE(requests[1].value_->empty());
+    ASSERT_TRUE(requests[2].value_);
+    EXPECT_EQ(*requests[2].value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].value_, requests[3].value_);
 
-  auto broken = *encoded;
-  broken.replace(broken.find("field-2"), 7, "field-1");
-  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
-            "duplicate Hash field in group");
-  broken = *encoded;
-  broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
-  auto status = FindHashGroupFields(broken, 3, requests);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash entry is truncated");
-  broken = *encoded;
-  broken[kHashGroupHeaderBytes + 16] = 2;
-  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
-            "Hash group inner count disagrees with envelope");
+    auto broken = *encoded;
+    broken.replace(broken.find("field-2"), 7, "field-1");
+    ASSERT_TRUE(find(broken, 3, requests).ok());
+    EXPECT_FALSE(requests[0].value_);
+    EXPECT_EQ(requests[2].value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].value_, requests[3].value_);
 
-  auto empty = EncodeHashGroup({.incarnation_ = 17});
-  ASSERT_TRUE(empty.ok());
-  ASSERT_TRUE(FindHashGroupFields(*empty, 0, requests).ok());
-  for (const auto& request : requests) EXPECT_FALSE(request.value_);
+    broken = *encoded;
+    broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
+    EXPECT_EQ(find(broken, 3, requests).message(), "Hash entry is truncated");
+    ASSERT_TRUE(find(broken, 3, std::span(requests).subspan(1)).ok());
+    EXPECT_EQ(requests[2].value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].value_, requests[3].value_);
+    broken = *encoded;
+    broken[kHashGroupHeaderBytes + 16] = 2;
+    EXPECT_EQ(find(broken, 3, requests).message(),
+              "Hash element count does not match record metadata");
+
+    if (!compact) {
+      auto empty = EncodeHashGroup({.incarnation_ = 17});
+      ASSERT_TRUE(empty.ok());
+      ASSERT_TRUE(find(*empty, 0, requests).ok());
+      for (const auto& request : requests) EXPECT_FALSE(request.value_);
+    }
+  }
+}
+
+TEST(GroupedHashTest, RankLookupPreservesDrawPositionsAndSkipsUnusedTail) {
+  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(3)});
+  ASSERT_TRUE(encoded.ok());
+  encoded->replace(encoded->find("field-2") - 8, 4, 4, '\xff');
+  for (const bool compact : {false, true}) {
+    SCOPED_TRACE(compact ? "compact" : "grouped");
+    auto find = [&](std::span<HashRankLookup> requests) {
+      return compact
+                 ? FindCompactHashRanks(
+                       std::string_view(*encoded).substr(kHashGroupHeaderBytes),
+                       3, requests)
+                 : FindHashGroupRanks(*encoded, 3, requests);
+    };
+    std::array<HashRankLookup, 3> requests{{
+        {.rank_ = 0, .result_index_ = 2},
+        {.rank_ = 1, .result_index_ = 0},
+        {.rank_ = 1, .result_index_ = 1},
+    }};
+    ASSERT_TRUE(find(requests).ok());
+    EXPECT_EQ(requests[0].entry_.field_, "field-0");
+    EXPECT_EQ(requests[1].entry_.value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].entry_.value_, requests[1].entry_.value_);
+    EXPECT_EQ(requests[0].result_index_, 2);
+    requests.back().rank_ = 2;
+    EXPECT_EQ(find(requests).message(), "Hash entry is truncated");
+    requests.back().rank_ = 3;
+    EXPECT_EQ(find(requests).message(), "Hash sample rank exceeds page");
+  }
 }
 
 class HashLookupMemoryTest : public ::testing::Test {
@@ -1006,6 +1148,169 @@ class HashLookupMemoryTest : public ::testing::Test {
   }
   unsigned previous_shard_ = 0;
 };
+
+TEST_F(HashLookupMemoryTest, CompactMultiGetOwnsBytesAndPreservesOperandOrder) {
+  auto encoded = EncodeHashValue(Value(16, 128));
+  ASSERT_TRUE(encoded.ok());
+  CompactReadResult snapshot = std::optional<CompactValueView>{
+      CompactValueView{.encoded_ = *encoded, .logical_size_ = 16}};
+  HashOperation operation{
+      .kind_ = HashOperationKind::kGetMany,
+      .fields_ = {"field-15", "absent", "field-0", "field-15"}};
+  auto result = ReadCompactHash(snapshot, operation, ValueType::kHash);
+  ASSERT_TRUE(result.ok()) << result.status();
+  ASSERT_EQ(result->values_.size(), 4);
+  encoded->assign(encoded->size(), '!');
+  EXPECT_EQ(result->values_[0], std::string(128, 'p'));
+  EXPECT_EQ(result->values_[1], std::nullopt);
+  EXPECT_EQ(result->values_[2], std::string(128, 'a'));
+  EXPECT_EQ(result->values_[3], std::string(128, 'p'));
+}
+
+TEST_F(HashLookupMemoryTest, CompactSetMembershipSkipsUnvisitedTail) {
+  auto encoded = EncodeHashValue(Value(3, 0));
+  ASSERT_TRUE(encoded.ok());
+  encoded->replace(encoded->find("field-2") - 8, 4, 4, '\xff');
+  CompactReadResult snapshot = std::optional<CompactValueView>{
+      CompactValueView{.encoded_ = *encoded, .logical_size_ = 3}};
+  for (const auto kind :
+       {HashOperationKind::kExists, HashOperationKind::kGetMany}) {
+    SCOPED_TRACE(static_cast<int>(kind));
+    HashOperation operation{.kind_ = kind, .fields_ = {"field-0"}};
+    if (kind == HashOperationKind::kGetMany)
+      operation.fields_ = {"field-1", "field-0", "field-1"};
+    auto result = ReadCompactHash(snapshot, operation, ValueType::kSet);
+    ASSERT_TRUE(result.ok()) << result.status();
+    if (kind == HashOperationKind::kExists) {
+      EXPECT_EQ(result->integer_, 1);
+    } else {
+      ASSERT_EQ(result->values_.size(), 3);
+      for (const auto& value : result->values_) {
+        ASSERT_TRUE(value.has_value());
+        EXPECT_TRUE(value->empty());
+      }
+    }
+    operation.fields_.front() = "absent";
+    EXPECT_EQ(ReadCompactHash(snapshot, operation, ValueType::kSet)
+                  .status()
+                  .message(),
+              "Hash entry is truncated");
+  }
+}
+
+TEST_F(HashLookupMemoryTest, CompactScanRetainsCursorOrderAndOwnedMatches) {
+  const auto value = Value(16, 128);
+  auto encoded = EncodeHashValue(value);
+  ASSERT_TRUE(encoded.ok());
+  auto ordered = value.entries_;
+  std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+    return a.digest_ != b.digest_ ? a.digest_.value_ < b.digest_.value_
+                                  : a.field_ < b.field_;
+  });
+  for (const auto type : {ValueType::kHash, ValueType::kSet}) {
+    HashOperation operation{.kind_ = HashOperationKind::kScan,
+                            .scan_count_ = 3,
+                            .match_ = "field-1*"};
+    std::vector<std::string> expected;
+    for (const auto& entry : ordered) {
+      if (!entry.field_.starts_with("field-1")) continue;
+      expected.push_back(entry.field_);
+      if (type == ValueType::kHash) expected.push_back(entry.value_);
+    }
+    std::vector<std::string> observed;
+    do {
+      auto bytes = *encoded;
+      CompactReadResult input = std::optional<CompactValueView>{
+          CompactValueView{.encoded_ = bytes, .logical_size_ = 16}};
+      auto result = ReadCompactHash(input, operation, type);
+      ASSERT_TRUE(result.ok()) << result.status();
+      bytes.assign(bytes.size(), '!');
+      for (const auto& field : result->values_) observed.push_back(*field);
+      EXPECT_TRUE(result->cursor_ == 0 || result->cursor_ > operation.cursor_);
+      operation.cursor_ = result->cursor_;
+    } while (operation.cursor_ != 0);
+    EXPECT_EQ(observed, expected);
+  }
+}
+
+TEST_F(HashLookupMemoryTest, ProjectedReadsOwnBytesAcrossMoves) {
+  // Field-only projection fits SSO; WITHVALUES crosses into an allocated
+  // block. Both packed snapshots and page replies survive source reuse.
+  const HashValue value{
+      .entries_ = {{.field_ = "", .value_ = ""},
+                   {.field_ = "second", .value_ = std::string(128, 'v')}}};
+  const auto before = GetWorkerMemoryStats(0);
+  for (const auto kind :
+       {HashOperationKind::kReadSnapshot, HashOperationKind::kReadPage}) {
+    for (const bool with_values : {false, true}) {
+      auto encoded = EncodeHashValue(value);
+      ASSERT_TRUE(encoded.ok());
+      CompactReadResult input = std::optional<CompactValueView>{
+          CompactValueView{.encoded_ = *encoded, .logical_size_ = 2}};
+      HashOperation operation{.kind_ = kind, .with_values_ = with_values};
+      auto result = ReadCompactHash(input, operation, ValueType::kHash);
+      ASSERT_TRUE(result.ok()) << result.status();
+      if (kind == HashOperationKind::kReadSnapshot) {
+        ASSERT_TRUE(result->snapshot_);
+        ASSERT_EQ(result->snapshot_->blocks_.size(), 1);
+        ASSERT_EQ(result->snapshot_->values_.size(), with_values ? 4 : 2);
+        EXPECT_TRUE(result->values_.empty());
+      } else {
+        ASSERT_EQ(result->values_.size(), with_values ? 4 : 2);
+        EXPECT_EQ(result->cursor_, 0);
+        EXPECT_EQ(result->length_, 2);
+      }
+      auto moved = std::move(*result);
+      encoded->assign(encoded->size(), '!');
+      const auto output = [&](std::size_t index) -> std::string_view {
+        return moved.snapshot_ ? moved.snapshot_->view(index)
+                               : std::string_view(*moved.values_[index]);
+      };
+      EXPECT_EQ(output(0), "");
+      EXPECT_EQ(output(with_values ? 2 : 1), "second");
+      if (with_values) {
+        EXPECT_EQ(output(1), "");
+        EXPECT_EQ(output(3), std::string(128, 'v'));
+      }
+      EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                before.retained_bytes_ + moved.retained_charge_.bytes());
+      EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+                before.admission_pending_bytes_);
+    }
+  }
+  EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
+}
+
+TEST_F(HashLookupMemoryTest, CompactReadsChargeOutputAndRejectOom) {
+  auto payload = EncodeHashValue(Value(4, 128));
+  ASSERT_TRUE(payload.ok());
+  CompactReadResult snapshot = std::optional<CompactValueView>{
+      CompactValueView{.encoded_ = *payload, .logical_size_ = 4}};
+  const auto before = GetWorkerMemoryStats(0);
+  for (const auto kind :
+       {HashOperationKind::kGet, HashOperationKind::kGetMany,
+        HashOperationKind::kGetAll, HashOperationKind::kKeys,
+        HashOperationKind::kValues, HashOperationKind::kScan,
+        HashOperationKind::kRandomFields, HashOperationKind::kReadSnapshot,
+        HashOperationKind::kReadPage}) {
+    HashOperation op{.kind_ = kind, .fields_ = {"field-0"}};
+    if (kind == HashOperationKind::kGetMany) op.fields_.push_back("field-0");
+    {
+      auto result = ReadCompactHash(snapshot, op, ValueType::kHash);
+      ASSERT_TRUE(result.ok());
+      EXPECT_GT(result->retained_charge_.bytes(), 0);
+      EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                before.retained_bytes_ + result->retained_charge_.bytes());
+      EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+                before.admission_pending_bytes_);
+    }
+    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
+    ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+    auto rejected = ReadCompactHash(snapshot, op, ValueType::kHash);
+    EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
+    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  }
+}
 
 TEST_F(HashLookupMemoryTest, SmallRoutingMapsDoNotRetainAnOverlay) {
   for (unsigned count : {32, 256, 1023}) {

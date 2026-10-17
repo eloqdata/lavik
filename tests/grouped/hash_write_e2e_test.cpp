@@ -39,6 +39,39 @@ struct HashDiskLayout {
   bool empty_tail_ = false;
 };
 
+TEST(CompactHashWriteE2e, ColdUpdateKeepsCompactEncodingAndRecovers) {
+  PrivateDisk disk;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"HSET", "compact", "a", "old", "b", "keep"}).text_,
+        "2");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    // Update before any read warms the recovered payload; grow one value,
+    // preserve an untouched field, and append a new field in the same edit.
+    ASSERT_EQ(
+        client.Command({"HSET", "compact", "a", "replacement", "new", "added"})
+            .text_,
+        "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  EXPECT_TRUE(disk.Auxiliaries("compact").empty());
+  Server server(disk, 1);
+  Client client(server.port());
+  EXPECT_EQ(client.Command({"HLEN", "compact"}).text_, "3");
+  EXPECT_EQ(client.Command({"HGET", "compact", "a"}).text_, "replacement");
+  EXPECT_EQ(client.Command({"HGET", "compact", "b"}).text_, "keep");
+  EXPECT_EQ(client.Command({"HGET", "compact", "new"}).text_, "added");
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
 TEST(GroupedHashWriteE2e, ConcurrentLocalAndExecWritesRecover) {
   PrivateDisk disk;
   disk.PreserveOnFailure();

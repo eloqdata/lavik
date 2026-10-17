@@ -340,8 +340,10 @@ Sorted Set rank/score ranges, and continuous Stream reply ranges share bounded
 read windows for each physical owner of group records. The key owner retains
 the routing view, child tasks and output admission; only physical
 reads hop to another worker. Each request limits groups against their refreshed
-record owner, including after GC rerouting. Children validate and decode each page,
-then release its read lease before making that owner's capacity available.
+record owner, including after GC rerouting. Children consume each page into
+admitted output, then release its read lease before making that owner's
+capacity available. Hash/Set replies project encoded entries directly into
+the requested fields or values, without an intermediate logical collection.
 The parent joins every launched read before returning, including on error,
 and rechecks the population and view status after each join. Optional window
 admission covers scheduling metadata and task scratch; insufficient headroom
@@ -355,10 +357,13 @@ Hash/Set point operations load each affected prefix group once. Point reads
 scan encoded entries and retain only requested values. Multi-field reads group
 request positions by routing leaf, fill result slots in command order, and
 release each page before loading the next; repeated operands retain repeated results.
-Point reads validate entry framing and duplicate occurrences of requested
-fields. Full replies and read-only random selection consume published leaves
-without rebuilding field digests or a uniqueness set; the physical loader
-still validates record identity, framing and counts. Writers and strict
+Point reads trust published field uniqueness, validate the bounds of traversed
+entries, and stop once all requested fields are found. Unused trailing entries
+are not scanned. Storage checks payload checksums on records whose persisted
+flags enable CRC. Full replies and read-only random selection consume published
+leaves without rebuilding field digests or a uniqueness set; the physical loader
+still validates record identity, framing and counts. Compact reads use the same
+borrowed-entry projections. Writers and strict
 materialization/recovery decoders validate every field's uniqueness and route.
 Hash/Set field updates and removals validate complete affected
 leaves using borrowed entry views, then own only changed replacement pages.
@@ -367,14 +372,19 @@ oversized entries use owned fields and the bounded-state encoder. Other point
 writes decode affected groups. All paths replace only changed groups and any
 split-parent retirement records, without retaining user payloads in the index.
 HSCAN/SSCAN consume one routing leaf per call and use field digests under the
-persisted seed as cursors. COUNT is a hint; equal-digest fields remain in one
+persisted seed as cursors. Their temporary index borrows fields and values from
+the retained payload; only returned entries become owned strings.
+COUNT is a hint; equal-digest fields remain in one
 response, and empty routing leaves still advance the cursor. Deleting earlier
 fields does not shift later fields behind a rank-based cursor. Random field
 and member reads sample global ranks using directory counts and load only
-selected leaves, retaining draw order and duplicate draws. Random Set pops
+selected leaves, retaining draw order and duplicate draws. Only selected entries
+are copied. Large negative-count random replies release key intent before
+streaming and retain an admitted immutable snapshot of the requested projection
+as packed bytes and offsets. Random Set pops
 retain and replace only selected complete pages and replicate the chosen
-members as deterministic removals. Whole-value reads still assemble a logical
-value and admit its aggregate temporary peak.
+members as deterministic removals. Internal whole-value callbacks still assemble
+a logical value and admit its aggregate temporary peak.
 
 Foreground adapters reserve selected-page scratch before decoding. Scanning
 List operations and explicit full-image integrations admit their aggregate
@@ -384,9 +394,20 @@ are distinct from persistent side-index charges and from physical read-buffer
 ownership. A streamed page result retains its own output capacity charge across
 owner hops and reply construction.
 
-Set and Sorted Set multi-key aggregation retains admitted input and output
-owners across coordinator hops. These adapters still materialize their logical
-inputs and aggregate result and may reject the combined peak with OOM. STORE
+Set multi-key aggregation holds all source keys and one command-time expiration
+clock. Intersection and difference validate all input types and lengths before
+an empty-result decision. Intersection scans the smallest source and probes
+membership in the others; difference scans its first source.
+Internal page projections traverse immutable routing prefixes in stored order,
+without rebuilding public SCAN digest order. Only the current page, membership replies and surviving output remain owned
+across coordinator hops. Union validates types while consuming each distinct
+source and retains unique output members. SINTERCARD retains
+only its count and stops at LIMIT after validating all input types. SORT retains
+its source and comparison values, borrows them during selection, and owns only
+the requested output projection.
+Sorted Set multi-key aggregation still materializes admitted logical inputs and
+the aggregate result across coordinator hops. Both aggregation adapters can
+reject their admitted working set with OOM. STORE
 prepares operation vectors, encoding headroom and canonical replication effects
 before deleting its destination. Failure paths release no-longer-needed
 working state before compensation and propagate compensation failure rather

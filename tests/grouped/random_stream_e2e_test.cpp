@@ -114,6 +114,48 @@ TEST(GroupedRandomStreamE2e, FiniteRepliesAreByteExactAcrossBulkBoundaries) {
   ASSERT_EQ(server.Wait(true), 0) << server.Log();
 }
 
+TEST(GroupedRandomStreamE2e, GroupedSnapshotsKeepPairsAfterExecDeletesKey) {
+  PrivateDisk disk;
+  Server server(disk, 2);
+  Client client(server.port());
+  std::map<std::string, std::string> expected;
+  for (unsigned i = 0; i < 64; ++i) {
+    std::string field = i == 0 ? "" : std::to_string(i) + std::string(512, 'f');
+    expected.emplace(field, i == 1 ? "" : "value:" + field);
+  }
+  for (const auto* type : {"hash", "set"}) {
+    SCOPED_TRACE(type);
+    const bool hash = std::string_view(type) == "hash";
+    const std::string key = std::string(type) + "{snapshot}";
+    std::vector<std::string> seed{hash ? "HSET" : "SADD", key};
+    for (const auto& [field, value] : expected) {
+      seed.push_back(field);
+      if (hash) seed.push_back(value);
+    }
+    ASSERT_EQ(client.Command(seed).text_, "64");
+    // Both inputs exceed the compact threshold and span several leaves.
+    // EXEC releases their old graph before the continuation emits samples.
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command(Sample(type, key)).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"DEL", key}).text_, "QUEUED");
+    const auto reply = client.Command({"EXEC"});
+    ASSERT_EQ(reply.kind_, '*') << reply.text_;
+    ASSERT_EQ(reply.items_.size(), 2U);
+    ASSERT_EQ(reply.items_[1].text_, "1");
+    const auto& sampled = reply.items_[0];
+    ASSERT_EQ(sampled.kind_, '*') << sampled.text_;
+    const std::size_t width = hash ? 2 : 1;
+    ASSERT_EQ(sampled.items_.size(), 1001 * width);
+    for (std::size_t i = 0; i < sampled.items_.size(); i += width) {
+      const auto found = expected.find(sampled.items_[i].text_);
+      ASSERT_NE(found, expected.end());
+      if (hash) EXPECT_EQ(sampled.items_[i + 1].text_, found->second);
+    }
+    EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+  }
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
 TEST(GroupedRandomStreamE2e, DisconnectDuringLargeBulkReleasesStreamState) {
   PrivateDisk disk;
   Server server(disk, 2, {}, {}, false, 2, "128M", {}, "32M");

@@ -27,13 +27,14 @@
 namespace lavik::storage {
 
 struct HashResult;
+enum class HashOperationKind : std::uint8_t;
 
 // Scans a group whose envelope and physical identity the loader has verified;
 // field_count must be that envelope's count, and field must route to this
-// group. Validates all entry framing and rejects duplicate occurrences of
-// field, but leaves unrelated duplicate/route validation to full decodes. A
-// returned view borrows payload; nullopt means missing, including in an empty
-// routing leaf.
+// group. Checks the inner header/count and bounds of traversed entries,
+// stopping at the first match. Published field uniqueness is trusted; record
+// checksum validation belongs to the storage loader. A returned view borrows
+// payload; nullopt means missing, including in an empty routing leaf.
 absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
     std::string_view payload, std::uint32_t field_count,
     std::string_view field);
@@ -50,10 +51,57 @@ struct HashFieldLookup {
 
 // Same checked-envelope contract as FindHashGroupField. Requests must belong
 // to one group and be sorted by field; resets their values before scanning.
-// Validates the entire encoding, including duplicate requested fields on disk.
+// Stops when every request position has a value or the encoding is exhausted.
 absl::Status FindHashGroupFields(std::string_view payload,
                                  std::uint32_t field_count,
                                  std::span<HashFieldLookup> requests);
+
+// Compact equivalents: check the header/count and bounds of traversed entries,
+// trusting published field uniqueness. Return the first match for each field
+// without scanning unused trailing entries. Returned views borrow payload.
+// Batch requests must be sorted by field; repeated requested fields retain
+// distinct result positions. An empty batch checks only the header/count.
+absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
+    std::string_view payload, std::size_t field_count, std::string_view field);
+absl::Status FindCompactHashFields(std::string_view payload,
+                                   std::size_t field_count,
+                                   std::span<HashFieldLookup> requests);
+
+// A sampled rank and its original draw position. Requests are sorted by rank;
+// repeated ranks retain separate output slots. The populated entry borrows the
+// payload and must be consumed before its read lease is released.
+struct HashRankLookup {
+  std::uint64_t rank_ = 0;
+  std::size_t result_index_ = 0;
+  HashEntryView entry_{};
+};
+
+// Check the header/count and traversed bounds, stopping after the greatest
+// requested rank. The grouped variant requires a loader-validated envelope.
+// Requests must be sorted by rank, and every rank must be below field_count.
+absl::Status FindCompactHashRanks(std::string_view payload,
+                                  std::size_t field_count,
+                                  std::span<HashRankLookup> requests);
+absl::Status FindHashGroupRanks(std::string_view payload,
+                                std::uint32_t field_count,
+                                std::span<HashRankLookup> requests);
+
+// Copies sampled fields and optional values into empty, pre-sized result
+// slots, preserving draw order. Admits copies before allocation and grows the
+// existing result charge. Discard result on failure.
+absl::Status RetainHashRankValues(HashResult& result,
+                                  std::span<const HashRankLookup> requests,
+                                  bool with_values);
+
+// Forms a full reply directly from a nonempty compact encoding. Copies only
+// the requested component(s), validating traversal and admitting output first.
+// kind must be kGetAll, kKeys, kValues or kReadSnapshot. The snapshot retains
+// projected fields and optional values in a packed block with offsets; no
+// borrowed bytes escape the call.
+absl::StatusOr<HashResult> ReadHashPayloadResult(std::string_view payload,
+                                                 HashOperationKind kind,
+                                                 std::uint64_t count,
+                                                 bool with_values = false);
 
 // Copies this page's matches to their distinct, empty slots in a pre-sized,
 // charged result. Admits all copies (including repeated operands) before any

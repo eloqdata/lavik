@@ -17,6 +17,8 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -75,6 +77,27 @@ class HashValueReader {
 // and admit materialization memory independently of this logical codec.
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload);
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& value);
+
+// A bounded HSET after-image. No-op results have no payload; a changed result
+// owns its bytes independently of both the old payload and request operands.
+struct CompactHashEdit {
+  bool changed_ = false;
+  std::size_t added_ = 0;
+  std::size_t count_ = 0;
+  std::string payload_;
+};
+
+// Edits an existing compact Hash without materializing its fields. Validates
+// all framing and the expected count, including entries after a match. Input
+// views must stay alive until return. Repeated operands retain sequential HSET
+// semantics (last value wins, new fields counted once, transient changes count
+// as writes). A nullopt result requests the owned promotion path when the final
+// encoding exceeds max_bytes; it does not allocate that oversized after-image.
+// Callers admit O(fields.size()) planning space plus the bounded output first.
+absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
+    std::string_view payload, std::size_t expected_count,
+    std::span<const std::string_view> fields,
+    std::span<const std::string_view> values, std::size_t max_bytes);
 
 // Checked size accumulation without allocating the supplied field/value.
 // Used before serialization; failure leaves the caller's running size intact.

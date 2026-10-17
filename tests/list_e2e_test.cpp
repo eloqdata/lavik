@@ -3075,8 +3075,8 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
     // Startup needs enough memory to reconstruct the durable side index.
     // In the real-limit variant a 12 MiB request fits the separate 32 MiB
     // per-worker client budget, but its group-write scratch cannot fit the
-    // worker's storage headroom. Full reads of the nine 1 MiB values also
-    // exceed that headroom. The injected variant stays small.
+    // worker's storage headroom. Direct reads can fit their final projection
+    // without retaining a decoded HashValue. The injected variant stays small.
     const std::string replacement =
         injected_storage_failure ? "wrong" : std::string(12 * 1024 * 1024, 'w');
     EXPECT_TRUE(
@@ -3087,13 +3087,41 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
     EXPECT_TRUE(client.Command({"HSETNX", kKey, "new", replacement})
                     .starts_with("-OOM "));
     if (!injected_storage_failure) {
-      // Full reads also need admitted decoded/output ownership. Failure must
-      // keep the stored Hash intact, including when successful reads transfer
-      // strings instead of copying them into their reply result.
-      for (const auto command : {"HGETALL", "HKEYS", "HVALS"}) {
+      // The failed writes must leave every projected field and value intact.
+      // Compare unordered entries; Hash replies do not promise field order.
+      for (const std::string_view command : {"HGETALL", "HKEYS", "HVALS"}) {
+        SCOPED_TRACE(command);
         const auto reply = client.Command({command, kKey});
-        EXPECT_TRUE(reply.starts_with("-OOM "))
-            << command << ": " << reply.substr(0, 120);
+        ASSERT_TRUE(reply.starts_with("*")) << reply.substr(0, 120);
+        std::size_t offset = 0;
+        const auto parsed = ParseEncodedResp(reply, &offset);
+        ASSERT_EQ(offset, reply.size());
+        const bool has_fields = command != "HVALS";
+        const bool has_values = command != "HKEYS";
+        ASSERT_EQ(parsed.elements_.size(),
+                  (has_fields + has_values) * (fields_.size() + 1));
+        using Entry = std::pair<std::string_view, std::string_view>;
+        std::vector<Entry> expected;
+        const auto project = [&](std::string_view field,
+                                 std::string_view field_value) -> Entry {
+          return {has_fields ? field : std::string_view{},
+                  has_values ? field_value : std::string_view{}};
+        };
+        for (const auto& field : fields_)
+          expected.push_back(project(field, value));
+        expected.push_back(
+            project("version", std::string_view(value).substr(0, 1)));
+        std::vector<Entry> actual;
+        for (std::size_t i = 0; i < parsed.elements_.size();) {
+          const std::string_view field =
+              has_fields ? parsed.elements_[i++].scalar_ : std::string_view{};
+          const std::string_view field_value =
+              has_values ? parsed.elements_[i++].scalar_ : std::string_view{};
+          actual.emplace_back(field, field_value);
+        }
+        std::sort(actual.begin(), actual.end());
+        std::sort(expected.begin(), expected.end());
+        EXPECT_TRUE(actual == expected);
       }
     }
     if (injected_storage_failure) {

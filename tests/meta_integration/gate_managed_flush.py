@@ -40,6 +40,14 @@ def semantics(root, mode):
                 assert writer.call("SELECT", db) == "OK"
                 assert writer.call("SET", "{flush}old", f"db-{db}") == "OK"
             assert writer.call("SELECT", 0) == "OK"
+            # Meta readiness can precede the replica's local serving gate.
+            # Observe replicated data before asserting the online READONLY
+            # error; an incomplete population legitimately returns LOADING.
+            H.wait_until(
+                "replica readable before flush rejection checks",
+                30,
+                lambda: reader.call("GET", "{flush}old") == "db-0",
+            )
             for command in ("FLUSHDB", "FLUSHALL"):
                 rejects(writer, (command, "invalid"), "syntax error")
                 rejects(writer, (command, "SYNC", "ASYNC"), "wrong number")
