@@ -395,11 +395,13 @@ ownership. A streamed page result retains its own output capacity charge across
 owner hops and reply construction.
 
 Set multi-key aggregation holds all source keys and one command-time expiration
-clock while validating their types and lengths. Intersection scans the smallest
-source and probes membership in the others; difference scans its first source.
+clock. Intersection and difference validate all input types and lengths before
+an empty-result decision. Intersection scans the smallest source and probes
+membership in the others; difference scans its first source.
 Internal page projections traverse immutable routing prefixes in stored order,
 without rebuilding public SCAN digest order. Only the current page, membership replies and surviving output remain owned
-across coordinator hops. Union retains unique output members. SINTERCARD retains
+across coordinator hops. Union validates types while consuming each distinct
+source and retains unique output members. SINTERCARD retains
 only its count and stops at LIMIT after validating all input types. SORT retains
 its source and comparison values, borrows them during selection, and owns only
 the requested output projection.

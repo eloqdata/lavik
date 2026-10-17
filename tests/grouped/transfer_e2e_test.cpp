@@ -447,6 +447,7 @@ TEST(GroupedTransferE2e, SetAggregationPagesPreserveErrorsAliasesAndLimits) {
     for (const auto& command : std::vector<std::vector<std::string>>{
              {"SINTER", "aggregate-missing", "aggregate-wrong"},
              {"SDIFF", "aggregate-missing", "aggregate-wrong"},
+             {"SUNION", "aggregate-missing", "aggregate-wrong"},
              {"SINTERCARD", "3", "aggregate-large", "aggregate-small",
               "aggregate-wrong", "LIMIT", "1"}}) {
       const auto wrong = client.Command(command);

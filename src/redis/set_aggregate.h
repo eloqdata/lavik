@@ -94,26 +94,30 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
   std::size_t bytes = 4096;
   if (!AddSetWorkingBytes(
           &bytes, last_source - first_source + 1,
-          sizeof(std::uint64_t) + (kind == SetAggregate::kUnion ? 64 : 0))) {
+          kind == SetAggregate::kUnion ? 64 : sizeof(std::uint64_t))) {
     co_return SetAggregateOom();
   }
   auto admission = TryReserveMemory(bytes);
   if (!admission) co_return SetAggregateOom();
   result.charge_.Adopt(&*admission, bytes);
-  std::vector<std::uint64_t> lengths(last_source - first_source + 1);
+  std::vector<std::uint64_t> lengths(
+      kind == SetAggregate::kUnion ? 0 : last_source - first_source + 1);
   std::size_t source = first_source;
-  // Type errors take precedence over an empty intersection or LIMIT. Validate
-  // every source before making either early-return decision.
-  for (std::size_t i = first_source; i <= last_source; ++i) {
-    storage::HashOperation length;
-    length.kind_ = storage::HashOperationKind::kLength;
-    length.now_ms_ = now_ms;
-    auto checked = co_await read(i, std::move(length));
-    if (!checked.ok()) co_return checked.status();
-    lengths[i - first_source] = checked->length_;
-    if (kind == SetAggregate::kIntersection &&
-        checked->length_ < lengths[source - first_source]) {
-      source = i;
+  // Type errors take precedence over an empty intersection/difference or LIMIT.
+  // Union has no such early return: its page reads validate every distinct
+  // source, so it needs neither a length array nor separate metadata lookups.
+  if (kind != SetAggregate::kUnion) {
+    for (std::size_t i = first_source; i <= last_source; ++i) {
+      storage::HashOperation length;
+      length.kind_ = storage::HashOperationKind::kLength;
+      length.now_ms_ = now_ms;
+      auto checked = co_await read(i, std::move(length));
+      if (!checked.ok()) co_return checked.status();
+      lengths[i - first_source] = checked->length_;
+      if (kind == SetAggregate::kIntersection &&
+          checked->length_ < lengths[source - first_source]) {
+        source = i;
+      }
     }
   }
   if (kind != SetAggregate::kUnion && lengths[source - first_source] == 0) {
@@ -152,7 +156,8 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
   constexpr std::size_t kMinProbeBatch = 64;
   for (std::size_t current = source; current <= last_source; ++current) {
     if (kind != SetAggregate::kUnion && current != source) break;
-    if (lengths[current - first_source] == 0) continue;
+    if (kind != SetAggregate::kUnion && lengths[current - first_source] == 0)
+      continue;
     if (kind == SetAggregate::kUnion &&
         !scanned_sources.insert(arguments[current]).second) {
       continue;
