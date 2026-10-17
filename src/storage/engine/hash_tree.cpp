@@ -480,21 +480,16 @@ absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
     return absl::DataLossError(
         "Hash element count does not match record metadata");
 
-  std::optional<std::string_view> matched;
-  // Consume even the entries after a match: Next checks trailing bytes on the
-  // last entry, and a later occurrence of the requested field is corruption.
-  // Grouped callers have already checked the requested route. Unrelated
-  // fields need neither copying nor digest reconstruction.
+  // Published fields are unique by construction. The storage loader applies
+  // the record's checksum policy; a point lookup only parses through its match.
   for (std::size_t i = 0; i < reader->size(); ++i) {
     auto entry = reader->Next();
     if (!entry.ok()) [[unlikely]]
       return absl::DataLossError(entry.status().message());
-    if (entry->field_ != field) continue;
-    if (matched.has_value()) [[unlikely]]
-      return absl::DataLossError("duplicate Hash field in group");
-    matched = entry->value_;
+    if (entry->field_ == field)
+      return std::optional<std::string_view>{entry->value_};
   }
-  return matched;
+  return std::nullopt;
 }
 
 absl::Status FindCompactHashFields(std::string_view payload,
@@ -507,7 +502,10 @@ absl::Status FindCompactHashFields(std::string_view payload,
   if (reader->size() != field_count) [[unlikely]]
     return absl::DataLossError(
         "Hash element count does not match record metadata");
-  for (std::size_t i = 0; i < reader->size(); ++i) {
+  // Count request positions, including repeated operands, so a complete reply
+  // does not require parsing the unused tail of the stored Hash.
+  std::size_t remaining = requests.size();
+  for (std::size_t i = 0; i < reader->size() && remaining != 0; ++i) {
     auto entry = reader->Next();
     if (!entry.ok()) [[unlikely]]
       return absl::DataLossError(entry.status().message());
@@ -518,11 +516,13 @@ absl::Status FindCompactHashFields(std::string_view payload,
         [](const HashFieldLookup& request, std::string_view field) {
           return request.field_ < field;
         });
-    if (match == requests.end() || match->field_ != entry->field_) continue;
-    if (match->value_) [[unlikely]]
-      return absl::DataLossError("duplicate Hash field in group");
-    for (; match != requests.end() && match->field_ == entry->field_; ++match)
+    if (match == requests.end() || match->field_ != entry->field_ ||
+        match->value_)
+      continue;
+    for (; match != requests.end() && match->field_ == entry->field_; ++match) {
       match->value_ = entry->value_;
+      --remaining;
+    }
   }
   return absl::OkStatus();
 }

@@ -30,10 +30,10 @@ struct HashResult;
 
 // Scans a group whose envelope and physical identity the loader has verified;
 // field_count must be that envelope's count, and field must route to this
-// group. Validates all entry framing and rejects duplicate occurrences of
-// field, but leaves unrelated duplicate/route validation to full decodes. A
-// returned view borrows payload; nullopt means missing, including in an empty
-// routing leaf.
+// group. Checks the inner header/count and bounds of traversed entries,
+// stopping at the first match. Published field uniqueness is trusted; record
+// checksum validation belongs to the storage loader. A returned view borrows
+// payload; nullopt means missing, including in an empty routing leaf.
 absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
     std::string_view payload, std::uint32_t field_count,
     std::string_view field);
@@ -50,15 +50,16 @@ struct HashFieldLookup {
 
 // Same checked-envelope contract as FindHashGroupField. Requests must belong
 // to one group and be sorted by field; resets their values before scanning.
-// Validates the entire encoding, including duplicate requested fields on disk.
+// Stops when every request position has a value or the encoding is exhausted.
 absl::Status FindHashGroupFields(std::string_view payload,
                                  std::uint32_t field_count,
                                  std::span<HashFieldLookup> requests);
 
-// Compact equivalents: validate the complete payload and expected record
-// count. Returned views borrow payload. Batch requests must be sorted by field;
-// repeated requested fields retain distinct result positions. Reject duplicate
-// occurrences of requested fields on disk, as the grouped readers do.
+// Compact equivalents: check the header/count and bounds of traversed entries,
+// trusting published field uniqueness. Return the first match for each field
+// without scanning unused trailing entries. Returned views borrow payload.
+// Batch requests must be sorted by field; repeated requested fields retain
+// distinct result positions. An empty batch checks only the header/count.
 absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
     std::string_view payload, std::size_t field_count, std::string_view field);
 absl::Status FindCompactHashFields(std::string_view payload,

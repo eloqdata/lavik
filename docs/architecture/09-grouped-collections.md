@@ -355,9 +355,11 @@ Hash/Set point operations load each affected prefix group once. Point reads
 scan encoded entries and retain only requested values. Multi-field reads group
 request positions by routing leaf, fill result slots in command order, and
 release each page before loading the next; repeated operands retain repeated results.
-Point reads validate entry framing and duplicate occurrences of requested
-fields. Full replies and read-only random selection consume published leaves
-without rebuilding field digests or a uniqueness set; the physical loader
+Point reads trust published field uniqueness, validate the bounds of traversed
+entries, and stop once all requested fields are found. Unused trailing entries
+are not scanned. Storage checks payload checksums on records whose persisted
+flags enable CRC. Full replies and read-only random selection consume published
+leaves without rebuilding field digests or a uniqueness set; the physical loader
 still validates record identity, framing and counts. Writers and strict
 materialization/recovery decoders validate every field's uniqueness and route.
 Hash/Set field updates and removals validate complete affected

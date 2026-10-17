@@ -277,11 +277,9 @@ TEST(CompactHashEdit, ValidatesPastMatchesAndChecksCounts) {
   broken[second] = static_cast<char>(255);
   // A no-op on the first field must still reject a damaged later entry.
   EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
-  EXPECT_FALSE(FindCompactHashField(broken, 2, "field-0").ok());
   broken = *bytes;
   broken.replace(broken.find("field-1"), 7, "field-0");
   EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
-  EXPECT_FALSE(FindCompactHashField(broken, 2, "field-0").ok());
 }
 
 TEST(HashGroupEdits, OrderedDuplicatesOwnTheirBytesAndKeepWireFormat) {
@@ -850,60 +848,50 @@ TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
   EXPECT_EQ(visited, 3);
 }
 
-TEST(GroupedHashTest, PointLookupRejectsCorruptionAfterMatch) {
+TEST(GroupedHashTest, PointLookupStopsAtMatchAndChecksTraversedEncoding) {
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(2)});
   ASSERT_TRUE(encoded.ok());
-  // Preserve a valid outer envelope while corrupting the unchecked inner
-  // encoding, as a loader-success/lookup-failure boundary would see it.
-  auto check = [](const std::string& bytes) {
-    auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
-    EXPECT_TRUE(metadata.ok());
-    if (!metadata.ok()) return metadata.status();
-    const auto status =
-        FindHashGroupField(bytes, metadata->field_count_, "field-0").status();
-    const auto visited = VisitHashGroupFields(
-        bytes, metadata->field_count_, metadata->id_, Seed(),
-        [](const HashEntryView&) { return absl::OkStatus(); });
-    EXPECT_EQ(visited.code(), status.code());
-    return status;
-  };
-  auto broken = *encoded;
-  broken.replace(broken.find("field-1"), 7, "field-0");
-  auto status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "duplicate Hash field in group");
+  for (bool compact : {false, true}) {
+    SCOPED_TRACE(compact ? "compact" : "grouped");
+    auto find = [compact](std::string_view bytes, std::string_view field) {
+      return compact ? FindCompactHashField(bytes.substr(kHashGroupHeaderBytes),
+                                            2, field)
+                     : FindHashGroupField(bytes, 2, field);
+    };
+    auto broken = *encoded;
+    broken.replace(broken.find("field-1"), 7, "field-0");
+    auto found = find(broken, "field-0");
+    ASSERT_TRUE(found.ok());
+    ASSERT_TRUE(found->has_value());
+    EXPECT_EQ(**found, std::string(128, 'a'));
 
-  broken = *encoded;
-  // The first match is intact; the second entry claims an impossible length.
-  const auto second_header = broken.find("field-1") - 8;
-  broken.replace(second_header, 4, 4, '\xff');
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash entry is truncated");
+    broken = *encoded;
+    // A hit does not visit the damaged tail; a miss still checks its bounds.
+    broken.replace(broken.find("field-1") - 8, 4, 4, '\xff');
+    EXPECT_TRUE(find(broken, "field-0").ok());
+    EXPECT_EQ(find(broken, "absent").status().message(),
+              "Hash entry is truncated");
 
-  broken = *encoded;
-  broken[kHashGroupHeaderBytes] ^= 1;
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "invalid Hash value header");
+    broken = *encoded;
+    broken[kHashGroupHeaderBytes] ^= 1;
+    EXPECT_EQ(find(broken, "field-0").status().message(),
+              "invalid Hash value header");
+    broken = *encoded;
+    broken[kHashGroupHeaderBytes + 16] = 1;
+    EXPECT_EQ(find(broken, "field-0").status().message(),
+              "Hash element count does not match record metadata");
 
-  broken = *encoded;
-  broken[kHashGroupHeaderBytes + 16] = 1;
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(),
-            "Hash element count does not match record metadata");
-
-  broken = *encoded + "x";
-  const auto compact_bytes = broken.size() - kHashGroupHeaderBytes;
-  for (std::size_t i = 0; i < 4; ++i)
-    broken[36 + i] = static_cast<char>(compact_bytes >> (8 * i));
-  for (std::size_t i = 0; i < 8; ++i)
-    broken[kHashGroupHeaderBytes + 24 + i] =
-        static_cast<char>(compact_bytes >> (8 * i));
-  status = check(broken);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash value has trailing bytes");
+    broken = *encoded + "x";
+    const auto compact_bytes = broken.size() - kHashGroupHeaderBytes;
+    for (std::size_t i = 0; i < 4; ++i)
+      broken[36 + i] = static_cast<char>(compact_bytes >> (8 * i));
+    for (std::size_t i = 0; i < 8; ++i)
+      broken[kHashGroupHeaderBytes + 24 + i] =
+          static_cast<char>(compact_bytes >> (8 * i));
+    EXPECT_TRUE(find(broken, "field-0").ok());
+    EXPECT_EQ(find(broken, "absent").status().message(),
+              "Hash value has trailing bytes");
+  }
 }
 
 TEST(GroupedHashTest, PersistedVisitorBorrowsEmptyAndBinaryFields) {
@@ -1062,43 +1050,58 @@ TEST(GroupedHashTest, BorrowedVisitorChecksUnrelatedRouteAndPropagatesFailure) {
 }
 
 TEST(GroupedHashTest,
-     MultiLookupMatchesRepeatedOperandsAndChecksUnselectedTail) {
+     MultiLookupPreservesRepeatedOperandsAndStopsAfterAllMatches) {
   auto value = Value(3);
   value.entries_[0].value_.clear();
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
   ASSERT_TRUE(encoded.ok());
-  std::array<HashFieldLookup, 4> requests{{
-      {.field_ = "absent", .result_index_ = 1},
-      {.field_ = "field-0", .result_index_ = 3},
-      {.field_ = "field-1", .result_index_ = 2},
-      {.field_ = "field-1", .result_index_ = 0},
-  }};
-  ASSERT_TRUE(FindHashGroupFields(*encoded, 3, requests).ok());
-  EXPECT_FALSE(requests[0].value_);
-  ASSERT_TRUE(requests[1].value_);
-  EXPECT_TRUE(requests[1].value_->empty());
-  ASSERT_TRUE(requests[2].value_);
-  EXPECT_EQ(*requests[2].value_, std::string(128, 'b'));
-  EXPECT_EQ(requests[2].value_, requests[3].value_);
+  for (bool compact : {false, true}) {
+    SCOPED_TRACE(compact ? "compact" : "grouped");
+    auto find = [compact](std::string_view bytes, std::uint32_t count,
+                          std::span<HashFieldLookup> requests) {
+      return compact ? FindCompactHashFields(
+                           bytes.substr(kHashGroupHeaderBytes), count, requests)
+                     : FindHashGroupFields(bytes, count, requests);
+    };
+    std::array<HashFieldLookup, 4> requests{{
+        {.field_ = "absent", .result_index_ = 1},
+        {.field_ = "field-0", .result_index_ = 3},
+        {.field_ = "field-1", .result_index_ = 2},
+        {.field_ = "field-1", .result_index_ = 0},
+    }};
+    ASSERT_TRUE(find(*encoded, 3, requests).ok());
+    EXPECT_FALSE(requests[0].value_);
+    ASSERT_TRUE(requests[1].value_);
+    EXPECT_TRUE(requests[1].value_->empty());
+    ASSERT_TRUE(requests[2].value_);
+    EXPECT_EQ(*requests[2].value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].value_, requests[3].value_);
 
-  auto broken = *encoded;
-  broken.replace(broken.find("field-2"), 7, "field-1");
-  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
-            "duplicate Hash field in group");
-  broken = *encoded;
-  broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
-  auto status = FindHashGroupFields(broken, 3, requests);
-  EXPECT_EQ(status.code(), absl::StatusCode::kDataLoss);
-  EXPECT_EQ(status.message(), "Hash entry is truncated");
-  broken = *encoded;
-  broken[kHashGroupHeaderBytes + 16] = 2;
-  EXPECT_EQ(FindHashGroupFields(broken, 3, requests).message(),
-            "Hash element count does not match record metadata");
+    auto broken = *encoded;
+    broken.replace(broken.find("field-2"), 7, "field-1");
+    ASSERT_TRUE(find(broken, 3, requests).ok());
+    EXPECT_FALSE(requests[0].value_);
+    EXPECT_EQ(requests[2].value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].value_, requests[3].value_);
 
-  auto empty = EncodeHashGroup({.incarnation_ = 17});
-  ASSERT_TRUE(empty.ok());
-  ASSERT_TRUE(FindHashGroupFields(*empty, 0, requests).ok());
-  for (const auto& request : requests) EXPECT_FALSE(request.value_);
+    broken = *encoded;
+    broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
+    EXPECT_EQ(find(broken, 3, requests).message(), "Hash entry is truncated");
+    ASSERT_TRUE(find(broken, 3, std::span(requests).subspan(1)).ok());
+    EXPECT_EQ(requests[2].value_, std::string(128, 'b'));
+    EXPECT_EQ(requests[2].value_, requests[3].value_);
+    broken = *encoded;
+    broken[kHashGroupHeaderBytes + 16] = 2;
+    EXPECT_EQ(find(broken, 3, requests).message(),
+              "Hash element count does not match record metadata");
+
+    if (!compact) {
+      auto empty = EncodeHashGroup({.incarnation_ = 17});
+      ASSERT_TRUE(empty.ok());
+      ASSERT_TRUE(find(*empty, 0, requests).ok());
+      for (const auto& request : requests) EXPECT_FALSE(request.value_);
+    }
+  }
 }
 
 class HashLookupMemoryTest : public ::testing::Test {
