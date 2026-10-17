@@ -1348,7 +1348,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     plan.root_.field_count_ = edited_length;
   } else if (grouped != nullptr) {
     if (IsPointOperation(operation.kind_)) {
-      // Loading a requested leaf once is enough even when HMGET/HSET mentions
+      // Loading a requested leaf once is enough even when a mutation mentions
       // several fields routed to that same leaf. Unrelated large field values
       // never enter this command's scratch unless they share the affected
       // group.
