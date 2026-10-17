@@ -149,6 +149,7 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
     result.charge_.Resize(result.charge_.bytes() + extra);
     return absl::OkStatus();
   };
+  constexpr std::size_t kMinProbeBatch = 64;
   for (std::size_t current = source; current <= last_source; ++current) {
     if (kind != SetAggregate::kUnion && current != source) break;
     if (lengths[current - first_source] == 0) continue;
@@ -156,16 +157,24 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
         !scanned_sources.insert(arguments[current]).second) {
       continue;
     }
+    const bool limited = cardinality_only && limit != 0;
+    std::size_t probe_batch_hint = SIZE_MAX;
+    if (limited) {
+      probe_batch_hint = lengths[current - first_source] <= kMinProbeBatch
+                             ? kMinProbeBatch
+                             : static_cast<std::size_t>(std::min<std::uint64_t>(
+                                   limit - result.cardinality_, SIZE_MAX));
+    }
     std::uint64_t cursor = 0;
     do {
-      storage::HashOperation scan;
-      scan.kind_ = storage::HashOperationKind::kScan;
-      scan.now_ms_ = now_ms;
-      scan.cursor_ = cursor;
-      // SCAN returns at most one routing leaf (or one compact value). Reading
-      // it once avoids rebuilding its digest order for every candidate batch.
-      scan.scan_count_ = std::numeric_limits<std::uint64_t>::max();
-      auto page = co_await read(current, std::move(scan));
+      storage::HashOperation projection;
+      projection.kind_ = storage::HashOperationKind::kReadPage;
+      projection.now_ms_ = now_ms;
+      projection.cursor_ = cursor;
+      // Held key intent keeps the routing cursor stable. Consume each leaf in
+      // stored order without SCAN's digest index or sorting; owned strings can
+      // survive the membership reads below without retaining physical leases.
+      auto page = co_await read(current, std::move(projection));
       if (!page.ok()) co_return page.status();
       cursor = page->cursor_;
       std::size_t scratch_bytes = 0;
@@ -178,10 +187,10 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
       std::vector<std::size_t> positions;
       positions.reserve(page->values_.size());
       std::size_t batch_size = page->values_.size();
-      if (cardinality_only && limit != 0) {
-        batch_size =
-            std::min<std::uint64_t>(batch_size, limit - result.cardinality_);
-      }
+      // For a small source, one bounded batch of cheap comparisons costs less
+      // than another storage call after an unsuccessful initial LIMIT probe.
+      // Larger sources still start at LIMIT and grow only when needed.
+      if (limited) batch_size = std::min(batch_size, probe_batch_hint);
       for (std::size_t batch_begin = 0; batch_begin < page->values_.size();) {
         const auto batch_end = batch_begin + batch_size;
         if (kind != SetAggregate::kUnion) {
@@ -203,8 +212,19 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
               positions.push_back(i);
             }
             if (positions.empty()) break;
+            const bool single = positions.size() == 1;
+            // LIMIT 1 and a shrinking candidate batch need only one bit, not
+            // an admitted vector containing an owned empty Set value.
+            if (single) probe.kind_ = storage::HashOperationKind::kExists;
             auto present = co_await read(other, std::move(probe));
             if (!present.ok()) co_return present.status();
+            if (single) {
+              if ((present->integer_ != 0) !=
+                  (kind == SetAggregate::kIntersection)) {
+                page->values_[positions.front()].reset();
+              }
+              continue;
+            }
             if (present->values_.size() != positions.size()) {
               co_return absl::InternalError(
                   "Set membership result length mismatch");
@@ -252,11 +272,17 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
         batch_begin = batch_end;
         // A small LIMIT can stop after its first matches. Sparse/disjoint
         // inputs grow the next membership batch instead of doing a disk read
-        // per rejected candidate; all batches borrow this same source page.
-        batch_size = std::min(
-            page->values_.size() - batch_begin,
-            std::max<std::size_t>(
-                64, batch_size > SIZE_MAX / 2 ? SIZE_MAX : batch_size * 2));
+        // per rejected candidate. Keep that hint across leaves so each new
+        // page does not repeat an unsuccessful scalar probe.
+        if (limited) {
+          probe_batch_hint = std::max(
+              probe_batch_hint,
+              std::max<std::size_t>(kMinProbeBatch, batch_size > SIZE_MAX / 2
+                                                        ? SIZE_MAX
+                                                        : batch_size * 2));
+        }
+        batch_size = page->values_.size() - batch_begin;
+        if (limited) batch_size = std::min(batch_size, probe_batch_hint);
       }
     } while (cursor != 0);
     if (kind != SetAggregate::kUnion) break;

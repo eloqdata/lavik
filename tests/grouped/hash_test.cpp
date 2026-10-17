@@ -1233,38 +1233,50 @@ TEST_F(HashLookupMemoryTest, CompactScanRetainsCursorOrderAndOwnedMatches) {
   }
 }
 
-TEST_F(HashLookupMemoryTest, PackedSnapshotOwnsProjectedBytesAcrossMoves) {
+TEST_F(HashLookupMemoryTest, ProjectedReadsOwnBytesAcrossMoves) {
   // Field-only projection fits SSO; WITHVALUES crosses into an allocated
-  // block. Offsets must remain valid for both when the result is moved.
+  // block. Both packed snapshots and page replies survive source reuse.
   const HashValue value{
       .entries_ = {{.field_ = "", .value_ = ""},
                    {.field_ = "second", .value_ = std::string(128, 'v')}}};
   const auto before = GetWorkerMemoryStats(0);
-  for (const bool with_values : {false, true}) {
-    auto encoded = EncodeHashValue(value);
-    ASSERT_TRUE(encoded.ok());
-    CompactReadResult input = std::optional<CompactValueView>{
-        CompactValueView{.encoded_ = *encoded, .logical_size_ = 2}};
-    HashOperation operation{.kind_ = HashOperationKind::kReadSnapshot,
-                            .with_values_ = with_values};
-    auto result = ReadCompactHash(input, operation, ValueType::kHash);
-    ASSERT_TRUE(result.ok()) << result.status();
-    ASSERT_TRUE(result->snapshot_);
-    ASSERT_EQ(result->snapshot_->blocks_.size(), 1);
-    ASSERT_EQ(result->snapshot_->values_.size(), with_values ? 4 : 2);
-    EXPECT_TRUE(result->values_.empty());
-    auto moved = std::move(*result);
-    encoded->assign(encoded->size(), '!');
-    EXPECT_EQ(moved.snapshot_->view(0), "");
-    EXPECT_EQ(moved.snapshot_->view(with_values ? 2 : 1), "second");
-    if (with_values) {
-      EXPECT_EQ(moved.snapshot_->view(1), "");
-      EXPECT_EQ(moved.snapshot_->view(3), std::string(128, 'v'));
+  for (const auto kind :
+       {HashOperationKind::kReadSnapshot, HashOperationKind::kReadPage}) {
+    for (const bool with_values : {false, true}) {
+      auto encoded = EncodeHashValue(value);
+      ASSERT_TRUE(encoded.ok());
+      CompactReadResult input = std::optional<CompactValueView>{
+          CompactValueView{.encoded_ = *encoded, .logical_size_ = 2}};
+      HashOperation operation{.kind_ = kind, .with_values_ = with_values};
+      auto result = ReadCompactHash(input, operation, ValueType::kHash);
+      ASSERT_TRUE(result.ok()) << result.status();
+      if (kind == HashOperationKind::kReadSnapshot) {
+        ASSERT_TRUE(result->snapshot_);
+        ASSERT_EQ(result->snapshot_->blocks_.size(), 1);
+        ASSERT_EQ(result->snapshot_->values_.size(), with_values ? 4 : 2);
+        EXPECT_TRUE(result->values_.empty());
+      } else {
+        ASSERT_EQ(result->values_.size(), with_values ? 4 : 2);
+        EXPECT_EQ(result->cursor_, 0);
+        EXPECT_EQ(result->length_, 2);
+      }
+      auto moved = std::move(*result);
+      encoded->assign(encoded->size(), '!');
+      const auto output = [&](std::size_t index) -> std::string_view {
+        return moved.snapshot_ ? moved.snapshot_->view(index)
+                               : std::string_view(*moved.values_[index]);
+      };
+      EXPECT_EQ(output(0), "");
+      EXPECT_EQ(output(with_values ? 2 : 1), "second");
+      if (with_values) {
+        EXPECT_EQ(output(1), "");
+        EXPECT_EQ(output(3), std::string(128, 'v'));
+      }
+      EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                before.retained_bytes_ + moved.retained_charge_.bytes());
+      EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+                before.admission_pending_bytes_);
     }
-    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
-              before.retained_bytes_ + moved.retained_charge_.bytes());
-    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
-              before.admission_pending_bytes_);
   }
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
 }
@@ -1278,7 +1290,7 @@ TEST_F(HashLookupMemoryTest, CompactReadsChargeOutputAndRejectOom) {
   for (const auto kind :
        {HashOperationKind::kGet, HashOperationKind::kGetMany,
         HashOperationKind::kScan, HashOperationKind::kRandomFields,
-        HashOperationKind::kReadSnapshot}) {
+        HashOperationKind::kReadSnapshot, HashOperationKind::kReadPage}) {
     HashOperation op{.kind_ = kind, .fields_ = {"field-0"}};
     if (kind == HashOperationKind::kGetMany) op.fields_.push_back("field-0");
     {

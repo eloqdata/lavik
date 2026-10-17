@@ -439,6 +439,12 @@ absl::StatusOr<HashResult> ReadEncodedHash(std::string_view payload,
       operation.kind_ == HashOperationKind::kReadSnapshot)
     return ReadHashPayloadResult(payload, operation.kind_, count,
                                  operation.with_values_);
+  if (operation.kind_ == HashOperationKind::kReadPage)
+    return ReadHashPayloadResult(payload,
+                                 operation.with_values_
+                                     ? HashOperationKind::kGetAll
+                                     : HashOperationKind::kKeys,
+                                 count);
   if (IsCompactPointRead(operation.kind_))
     return ReadCompactHashFields(payload, count, operation);
   if (operation.kind_ == HashOperationKind::kScan)
@@ -1102,11 +1108,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         store, partition, db_id, key, digest, operation, std::move(grouped),
         value_type, tx, replication, mutation_precondition);
   }
-  if (grouped != nullptr && operation.kind_ == HashOperationKind::kScan) {
-    // Cursors are field digests under the persisted routing seed, not ranks.
-    // Deleting earlier fields or splitting a leaf cannot shift a later field
-    // behind the cursor. COUNT remains a hint: one leaf bounds scratch and a
-    // complete digest-collision cluster must be returned together.
+  if (grouped != nullptr && (operation.kind_ == HashOperationKind::kScan ||
+                             operation.kind_ == HashOperationKind::kReadPage)) {
+    // Public SCAN cursors are field digests under the persisted routing seed,
+    // so deletes and splits cannot shift a field behind its cursor. Internal
+    // page projections keep key intent for the entire traversal and need only
+    // the next immutable routing prefix, without rebuilding digest order.
     const auto& groups = grouped->directory().groups();
     const auto* route = groups.Floor(operation.cursor_);
     if (route == nullptr)
@@ -1125,6 +1132,22 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     const auto bytes = loaded->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                    bytes.size());
+    if (operation.kind_ == HashOperationKind::kReadPage) {
+      result.cursor_ = next != groups.end() ? next->first : 0;
+      if (loaded->field_count_ == 0) co_return result;
+      auto page = ReadHashPayloadResult(payload.substr(kHashGroupHeaderBytes),
+                                        operation.with_values_
+                                            ? HashOperationKind::kGetAll
+                                            : HashOperationKind::kKeys,
+                                        loaded->field_count_);
+      if (!page.ok() && absl::IsInternal(page.status()))
+        co_return absl::DataLossError(page.status().message());
+      if (page.ok()) {
+        page->length_ = result.length_;
+        page->cursor_ = result.cursor_;
+      }
+      co_return page;
+    }
     auto scanned = ReadHashScanResult(
         loaded->field_count_ == 0 ? std::string_view{}
                                   : payload.substr(kHashGroupHeaderBytes),

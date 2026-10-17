@@ -805,6 +805,12 @@ enum class HashOperationKind : std::uint8_t {
   // Capture immutable projected bytes for replies that outlive the key hold.
   // with_values_ includes values; the result uses snapshot_ instead of values_.
   kReadSnapshot,
+  // Project one encoded leaf (or the complete compact record) in stored order.
+  // with_values_ includes values. cursor_ starts at zero and returns the next
+  // leaf prefix, or zero when done. Callers must retain the same key hold and
+  // nonzero now_ms_ across the entire traversal; this is not a public SCAN
+  // cursor.
+  kReadPage,
 };
 
 // Views remain owned by the command request for the lifetime of the awaited
