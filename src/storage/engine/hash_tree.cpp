@@ -179,6 +179,8 @@ absl::StatusOr<HashResult> ReadCompactHashResult(std::string_view payload,
 }
 
 bool IsCompactPointRead(HashOperationKind kind) {
+  // Set members use Hash fields with empty values, so membership reads share
+  // the same borrowed lookup and early-completion rules.
   return kind == HashOperationKind::kGet ||
          kind == HashOperationKind::kGetMany ||
          kind == HashOperationKind::kExists ||
@@ -457,7 +459,7 @@ absl::StatusOr<HashResult> ReadCompactHash(const CompactReadResult& value,
         operation.kind_ == HashOperationKind::kValues)
       return ReadCompactHashResult(view.encoded_, operation.kind_,
                                    view.logical_size_);
-    if (type == ValueType::kHash && IsCompactPointRead(operation.kind_))
+    if (IsCompactPointRead(operation.kind_))
       return ReadCompactHashFields(view.encoded_, view.logical_size_,
                                    operation);
     auto decoded = DecodeHashValue(view.encoded_);
@@ -1244,7 +1246,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return ReadCompactHashResult(payload, operation.kind_,
                                       location.logical_size_);
     }
-    if (value_type == ValueType::kHash && IsCompactPointRead(operation.kind_))
+    if (IsCompactPointRead(operation.kind_))
       co_return ReadCompactHashFields(payload, location.logical_size_,
                                       operation);
     if (value_type == ValueType::kHash &&

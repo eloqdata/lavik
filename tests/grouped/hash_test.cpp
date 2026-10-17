@@ -1137,6 +1137,37 @@ TEST_F(HashLookupMemoryTest, CompactMultiGetOwnsBytesAndPreservesOperandOrder) {
   EXPECT_EQ(result->values_[3], std::string(128, 'p'));
 }
 
+TEST_F(HashLookupMemoryTest, CompactSetMembershipSkipsUnvisitedTail) {
+  auto encoded = EncodeHashValue(Value(3, 0));
+  ASSERT_TRUE(encoded.ok());
+  encoded->replace(encoded->find("field-2") - 8, 4, 4, '\xff');
+  CompactReadResult snapshot = std::optional<CompactValueView>{
+      CompactValueView{.encoded_ = *encoded, .logical_size_ = 3}};
+  for (const auto kind :
+       {HashOperationKind::kExists, HashOperationKind::kGetMany}) {
+    SCOPED_TRACE(static_cast<int>(kind));
+    HashOperation operation{.kind_ = kind, .fields_ = {"field-0"}};
+    if (kind == HashOperationKind::kGetMany)
+      operation.fields_ = {"field-1", "field-0", "field-1"};
+    auto result = ReadCompactHash(snapshot, operation, ValueType::kSet);
+    ASSERT_TRUE(result.ok()) << result.status();
+    if (kind == HashOperationKind::kExists) {
+      EXPECT_EQ(result->integer_, 1);
+    } else {
+      ASSERT_EQ(result->values_.size(), 3);
+      for (const auto& value : result->values_) {
+        ASSERT_TRUE(value.has_value());
+        EXPECT_TRUE(value->empty());
+      }
+    }
+    operation.fields_.front() = "absent";
+    EXPECT_EQ(ReadCompactHash(snapshot, operation, ValueType::kSet)
+                  .status()
+                  .message(),
+              "Hash entry is truncated");
+  }
+}
+
 TEST_F(HashLookupMemoryTest, CompactPointReadsChargeOutputAndRejectOom) {
   auto payload = EncodeHashValue(Value(4, 128));
   ASSERT_TRUE(payload.ok());
