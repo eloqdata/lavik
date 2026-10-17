@@ -95,13 +95,15 @@ absl::Status RetainHashRankValues(HashResult& result,
 
 // Forms a full reply directly from a nonempty compact encoding. Copies only
 // the requested component(s), validating traversal and admitting output first.
-// kind must be kGetAll, kKeys, kValues or kReadSnapshot. The snapshot retains
-// projected fields and optional values in a packed block with offsets; no
-// borrowed bytes escape the call.
+// kind must be kGetAll, kKeys, kValues or kReadSnapshot. kReadSnapshot and
+// packed_output retain only the selected fields/values in a packed block with
+// offsets; no borrowed bytes escape the call. with_values selects the snapshot
+// projection; the other kinds select their own components independently.
 absl::StatusOr<HashResult> ReadHashPayloadResult(std::string_view payload,
                                                  HashOperationKind kind,
                                                  std::uint64_t count,
-                                                 bool with_values = false);
+                                                 bool with_values = false,
+                                                 bool packed_output = false);
 
 // Copies this page's matches to their distinct, empty slots in a pre-sized,
 // charged result. Admits all copies (including repeated operands) before any

@@ -1165,6 +1165,11 @@ TEST_F(HashLookupMemoryTest, CompactMultiGetOwnsBytesAndPreservesOperandOrder) {
   EXPECT_EQ(result->values_[1], std::nullopt);
   EXPECT_EQ(result->values_[2], std::string(128, 'a'));
   EXPECT_EQ(result->values_[3], std::string(128, 'p'));
+  ASSERT_EQ(result->value_count(), 4);
+  EXPECT_EQ(result->value_view(0), std::string(128, 'p'));
+  EXPECT_EQ(result->value_view(1), std::nullopt);
+  EXPECT_EQ(result->value_view(2), std::string(128, 'a'));
+  EXPECT_EQ(result->value_view(3), std::string(128, 'p'));
 }
 
 TEST_F(HashLookupMemoryTest, CompactSetMembershipSkipsUnvisitedTail) {
@@ -1247,7 +1252,10 @@ TEST_F(HashLookupMemoryTest, ProjectedReadsOwnBytesAcrossMoves) {
       ASSERT_TRUE(encoded.ok());
       CompactReadResult input = std::optional<CompactValueView>{
           CompactValueView{.encoded_ = *encoded, .logical_size_ = 2}};
-      HashOperation operation{.kind_ = kind, .with_values_ = with_values};
+      // A packing hint must not change the owned kReadPage representation
+      // used by collection operations that move its individual strings.
+      HashOperation operation{
+          .kind_ = kind, .with_values_ = with_values, .packed_output_ = true};
       auto result = ReadCompactHash(input, operation, ValueType::kHash);
       ASSERT_TRUE(result.ok()) << result.status();
       if (kind == HashOperationKind::kReadSnapshot) {
@@ -1256,21 +1264,19 @@ TEST_F(HashLookupMemoryTest, ProjectedReadsOwnBytesAcrossMoves) {
         ASSERT_EQ(result->snapshot_->values_.size(), with_values ? 4 : 2);
         EXPECT_TRUE(result->values_.empty());
       } else {
+        EXPECT_FALSE(result->snapshot_);
         ASSERT_EQ(result->values_.size(), with_values ? 4 : 2);
         EXPECT_EQ(result->cursor_, 0);
         EXPECT_EQ(result->length_, 2);
       }
       auto moved = std::move(*result);
       encoded->assign(encoded->size(), '!');
-      const auto output = [&](std::size_t index) -> std::string_view {
-        return moved.snapshot_ ? moved.snapshot_->view(index)
-                               : std::string_view(*moved.values_[index]);
-      };
-      EXPECT_EQ(output(0), "");
-      EXPECT_EQ(output(with_values ? 2 : 1), "second");
+      EXPECT_EQ(moved.value_count(), with_values ? 4 : 2);
+      EXPECT_EQ(moved.value_view(0), "");
+      EXPECT_EQ(moved.value_view(with_values ? 2 : 1), "second");
       if (with_values) {
-        EXPECT_EQ(output(1), "");
-        EXPECT_EQ(output(3), std::string(128, 'v'));
+        EXPECT_EQ(moved.value_view(1), "");
+        EXPECT_EQ(moved.value_view(3), std::string(128, 'v'));
       }
       EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
                 before.retained_bytes_ + moved.retained_charge_.bytes());
@@ -1281,6 +1287,133 @@ TEST_F(HashLookupMemoryTest, ProjectedReadsOwnBytesAcrossMoves) {
   EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
 }
 
+TEST_F(HashLookupMemoryTest, FullProjectionsPackOnlySelectedBytes) {
+  // Exercise SSO-only blocks, non-SSO members, empty fields/values and embedded
+  // NULs. Packed and default output preserve the same component order.
+  for (const bool large : {false, true}) {
+    const HashValue value{
+        .entries_ = {{.field_ = "", .value_ = ""},
+                     {.field_ = std::string("f\0x", 3),
+                      .value_ = std::string("v\0y", 3)},
+                     {.field_ = std::string(large ? 32 : 1, 'f'),
+                      .value_ = std::string(large ? 128 : 1, 'v')}}};
+    for (const auto kind :
+         {HashOperationKind::kKeys, HashOperationKind::kValues,
+          HashOperationKind::kGetAll}) {
+      std::vector<std::string> expected;
+      std::string expected_block;
+      for (const auto& entry : value.entries_) {
+        if (kind != HashOperationKind::kValues)
+          expected.push_back(entry.field_);
+        if (kind != HashOperationKind::kKeys) expected.push_back(entry.value_);
+      }
+      for (const auto& component : expected) expected_block += component;
+      for (const bool packed : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "kind=" << static_cast<int>(kind) << " large=" << large
+                     << " packed=" << packed);
+        const auto before = GetWorkerMemoryStats(0);
+        {
+          auto encoded = EncodeHashValue(value);
+          ASSERT_TRUE(encoded.ok());
+          CompactReadResult input = std::optional<CompactValueView>{
+              CompactValueView{.encoded_ = *encoded, .logical_size_ = 3}};
+          // with_values only selects kReadSnapshot/kReadPage components. In
+          // particular it must not accidentally make HVALS include fields.
+          HashOperation operation{
+              .kind_ = kind, .with_values_ = true, .packed_output_ = packed};
+          auto result = ReadCompactHash(input, operation, ValueType::kHash);
+          ASSERT_TRUE(result.ok()) << result.status();
+          EXPECT_TRUE(result->key_exists_);
+          EXPECT_EQ(result->length_, 3);
+          if (packed) {
+            ASSERT_TRUE(result->snapshot_);
+            EXPECT_TRUE(result->values_.empty());
+            ASSERT_EQ(result->snapshot_->blocks_.size(), 1);
+            EXPECT_EQ(result->snapshot_->blocks_.front(), expected_block);
+          } else {
+            EXPECT_FALSE(result->snapshot_);
+            EXPECT_EQ(result->values_.size(), expected.size());
+          }
+          auto moved = std::move(*result);
+          encoded->assign(encoded->size(), '!');
+          ASSERT_EQ(moved.value_count(), expected.size());
+          for (std::size_t i = 0; i < expected.size(); ++i)
+            EXPECT_EQ(moved.value_view(i), expected[i]);
+          EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                    before.retained_bytes_ + moved.retained_charge_.bytes());
+          EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+                    before.admission_pending_bytes_);
+        }
+        EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                  before.retained_bytes_);
+      }
+    }
+  }
+}
+
+TEST_F(HashLookupMemoryTest, PackedReadsPreserveMissingAndEmptyComponents) {
+  CompactReadResult missing = std::optional<CompactValueView>{};
+  for (const auto kind : {HashOperationKind::kKeys, HashOperationKind::kValues,
+                          HashOperationKind::kGetAll}) {
+    auto result = ReadCompactHash(
+        missing, {.kind_ = kind, .packed_output_ = true}, ValueType::kHash);
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_FALSE(result->key_exists_);
+    EXPECT_EQ(result->value_count(), 0);
+  }
+  auto encoded = EncodeHashValue(Value(2, 0));
+  ASSERT_TRUE(encoded.ok());
+  CompactReadResult input = std::optional<CompactValueView>{
+      CompactValueView{.encoded_ = *encoded, .logical_size_ = 2}};
+  auto members = ReadCompactHash(
+      input, {.kind_ = HashOperationKind::kKeys, .packed_output_ = true},
+      ValueType::kSet);
+  ASSERT_TRUE(members.ok()) << members.status();
+  ASSERT_TRUE(members->snapshot_);
+  EXPECT_TRUE(members->values_.empty());
+  ASSERT_EQ(members->value_count(), 2);
+  EXPECT_EQ(members->value_view(0), "field-0");
+  EXPECT_EQ(members->value_view(1), "field-1");
+  auto empty_values = ReadCompactHash(
+      input, {.kind_ = HashOperationKind::kValues, .packed_output_ = true},
+      ValueType::kHash);
+  ASSERT_TRUE(empty_values.ok()) << empty_values.status();
+  ASSERT_TRUE(empty_values->snapshot_);
+  ASSERT_EQ(empty_values->snapshot_->blocks_.size(), 1);
+  EXPECT_TRUE(empty_values->snapshot_->blocks_.front().empty());
+  ASSERT_EQ(empty_values->value_count(), 2);
+  EXPECT_EQ(empty_values->value_view(0), "");
+  EXPECT_EQ(empty_values->value_view(1), "");
+  auto fields = ReadCompactHash(input,
+                                {.kind_ = HashOperationKind::kGetMany,
+                                 .fields_ = {"missing", "field-0", "field-1"},
+                                 .packed_output_ = true},
+                                ValueType::kHash);
+  ASSERT_TRUE(fields.ok()) << fields.status();
+  EXPECT_FALSE(fields->snapshot_);
+  ASSERT_EQ(fields->value_count(), 3);
+  EXPECT_EQ(fields->value_view(0), std::nullopt);
+  EXPECT_EQ(fields->value_view(1), "");
+  EXPECT_EQ(fields->value_view(2), "");
+}
+
+TEST_F(HashLookupMemoryTest, PackedFullReadsRejectInvalidPayloadWithoutCharge) {
+  auto payload = EncodeHashValue(Value(3, 32));
+  ASSERT_TRUE(payload.ok());
+  auto broken = *payload;
+  broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
+  const auto before = GetWorkerMemoryStats(0);
+  for (const auto kind : {HashOperationKind::kKeys, HashOperationKind::kValues,
+                          HashOperationKind::kGetAll}) {
+    EXPECT_FALSE(ReadHashPayloadResult(*payload, kind, 4, false, true).ok());
+    EXPECT_FALSE(ReadHashPayloadResult(broken, kind, 3, false, true).ok());
+    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
+    EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+              before.admission_pending_bytes_);
+  }
+}
+
 TEST_F(HashLookupMemoryTest, CompactReadsChargeOutputAndRejectOom) {
   auto payload = EncodeHashValue(Value(4, 128));
   ASSERT_TRUE(payload.ok());
@@ -1289,26 +1422,34 @@ TEST_F(HashLookupMemoryTest, CompactReadsChargeOutputAndRejectOom) {
   const auto before = GetWorkerMemoryStats(0);
   for (const auto kind :
        {HashOperationKind::kGet, HashOperationKind::kGetMany,
+        HashOperationKind::kScan, HashOperationKind::kRandomFields,
+        HashOperationKind::kReadSnapshot, HashOperationKind::kReadPage,
         HashOperationKind::kGetAll, HashOperationKind::kKeys,
-        HashOperationKind::kValues, HashOperationKind::kScan,
-        HashOperationKind::kRandomFields, HashOperationKind::kReadSnapshot,
-        HashOperationKind::kReadPage}) {
-    HashOperation op{.kind_ = kind, .fields_ = {"field-0"}};
-    if (kind == HashOperationKind::kGetMany) op.fields_.push_back("field-0");
-    {
-      auto result = ReadCompactHash(snapshot, op, ValueType::kHash);
-      ASSERT_TRUE(result.ok());
-      EXPECT_GT(result->retained_charge_.bytes(), 0);
+        HashOperationKind::kValues}) {
+    for (const bool packed : {false, true}) {
+      HashOperation op{.kind_ = kind, .fields_ = {"field-0"}};
+      op.packed_output_ = packed;
+      if (kind == HashOperationKind::kGetMany) op.fields_.push_back("field-0");
+      {
+        auto result = ReadCompactHash(snapshot, op, ValueType::kHash);
+        ASSERT_TRUE(result.ok());
+        EXPECT_GT(result->retained_charge_.bytes(), 0);
+        EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                  before.retained_bytes_ + result->retained_charge_.bytes());
+        EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
+                  before.admission_pending_bytes_);
+      }
       EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
-                before.retained_bytes_ + result->retained_charge_.bytes());
+                before.retained_bytes_);
+      ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
+      auto rejected = ReadCompactHash(snapshot, op, ValueType::kHash);
+      EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
+      EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_,
+                before.retained_bytes_);
       EXPECT_EQ(GetWorkerMemoryStats(0).admission_pending_bytes_,
                 before.admission_pending_bytes_);
+      ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
     }
-    EXPECT_EQ(GetWorkerMemoryStats(0).retained_bytes_, before.retained_bytes_);
-    ASSERT_TRUE(InitMemoryLimit(1, 1).ok());
-    auto rejected = ReadCompactHash(snapshot, op, ValueType::kHash);
-    EXPECT_EQ(rejected.status().code(), absl::StatusCode::kResourceExhausted);
-    ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   }
 }
 

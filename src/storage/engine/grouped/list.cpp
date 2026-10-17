@@ -310,15 +310,23 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     const auto added = page_budget.AddGroup(*entry, object->ExtentsFor(id));
     if (!added.ok()) co_return added;
   }
-  // Reads own each requested string once: page results move into the reply.
-  // The per-entry allowance covers both vectors' string headers; physical
+  // Reads own each requested value once: page blocks or strings move into
+  // the reply. The per-entry allowance covers slices/string headers; physical
   // read buffers have independent accounting, including oversized pages.
   // No mutation/encoding copies are needed, even with a wave in flight.
   auto page_scratch = page_budget.Reserve(read_only ? 1 : 4);
   if (!page_scratch.ok()) co_return page_scratch.status();
   auto retain_output = [&]() -> absl::Status {
     std::size_t bytes = result.values_.capacity() * sizeof(std::string);
-    for (const auto& value : result.values_) {
+    const auto* blocks = &result.values_;
+    if (result.packed_values_) {
+      const auto& packed = *result.packed_values_;
+      bytes = sizeof(PackedValues) +
+              packed.values_.capacity() * sizeof(PackedValues::Slice) +
+              packed.blocks_.capacity() * sizeof(std::string);
+      blocks = &packed.blocks_;
+    }
+    for (const auto& value : *blocks) {
       if (value.capacity() >= std::numeric_limits<std::size_t>::max() - bytes)
         return absl::ResourceExhaustedError("List reply size overflow");
       bytes += value.capacity() + 1;
@@ -332,7 +340,29 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     return absl::OkStatus();
   };
   if (read_only) {
-    using PageValues = std::vector<std::string>;
+    using PageValues = ListResult;
+    const bool packed_output = operation.kind_ == ListOperationKind::kRange &&
+                               operation.packed_output_;
+    if (packed_output) {
+      result.packed_values_ = std::make_unique<PackedValues>();
+      result.packed_values_->blocks_.resize(end_page - begin_page);
+      result.packed_values_->values_.resize(erase_count);
+    }
+    auto merge_packed = [&](std::size_t ordinal, std::size_t output,
+                            std::size_t count,
+                            ListResult& page) -> absl::Status {
+      if (!page.packed_values_ || page.value_count() != count ||
+          page.packed_values_->blocks_.size() != 1)
+        return absl::DataLossError("List packed range page count mismatch");
+      auto& packed = *result.packed_values_;
+      packed.blocks_[ordinal] = std::move(page.packed_values_->blocks_[0]);
+      for (std::size_t j = 0; j < count; ++j) {
+        auto slice = page.packed_values_->values_[j];
+        slice.block_ = ordinal;
+        packed.values_[output + j] = slice;
+      }
+      return absl::OkStatus();
+    };
     const auto groups = directory.groups();
     auto plan = GroupReadPlan::TryCreate(worker_count_, end_page - begin_page);
     if (plan) {
@@ -362,22 +392,28 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       // A single page, including LINDEX, needs no task window or reply copy.
       std::uint64_t remaining = erase_count;
       std::size_t offset = first->offset_;
-      if (end_page - begin_page > 1) result.values_.reserve(erase_count);
+      if (!packed_output && end_page - begin_page > 1)
+        result.values_.reserve(erase_count);
       for (std::size_t i = begin_page; i < end_page; ++i) {
         const auto take =
             std::min<std::uint64_t>(remaining, groups[i].item_count_ - offset);
-        auto values =
-            co_await LoadOrderedListRange(store, partition, db_id, key, digest,
-                                          object, groups[i].id_, offset, take);
+        auto values = co_await LoadOrderedListRange(
+            store, partition, db_id, key, digest, object, groups[i].id_, offset,
+            take, nullptr, packed_output);
         if (!values.ok()) {
           read_status = values.status();
           break;
         }
-        if (end_page - begin_page == 1)
-          result.values_ = std::move(*values);
-        else
-          for (auto& value : *values)
+        if (packed_output) {
+          read_status = merge_packed(i - begin_page, erase_count - remaining,
+                                     take, *values);
+          if (!read_status.ok()) break;
+        } else if (end_page - begin_page == 1) {
+          result.values_ = std::move(values->values_);
+        } else {
+          for (auto& value : values->values_)
             result.values_.push_back(std::move(value));
+        }
         remaining -= take;
         offset = 0;
       }
@@ -401,7 +437,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       // preassigned reply slots after each join without retaining another
       // complete vector of decoded pages. The window dies before the output,
       // routing view and admission borrowed by its children.
-      result.values_.resize(erase_count);
+      if (!packed_output) result.values_.resize(erase_count);
       GroupReadWindow<PageValues> window(store.worker_, worker_count_,
                                          plan->width());
       while (!plan->empty()) {
@@ -422,7 +458,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
             window.Add(LoadOrderedListRange(
                            store, partition, db_id, key, digest, object,
                            groups[begin_page + *ordinal].id_, range.first_,
-                           range.count_, window.limiter()),
+                           range.count_, window.limiter(), packed_output),
                        *ordinal);
           }
           if (!read_status.ok()) break;
@@ -437,10 +473,14 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         const auto completed = window.Collect(
             [&](std::size_t ordinal, PageValues&& values) -> absl::Status {
               const auto range = page_range(ordinal);
-              if (values.size() != range.count_)
+              if (packed_output)
+                return merge_packed(ordinal, range.output_, range.count_,
+                                    values);
+              if (values.values_.size() != range.count_)
                 return absl::DataLossError("List range page count mismatch");
-              for (std::size_t j = 0; j < values.size(); ++j)
-                result.values_[range.output_ + j] = std::move(values[j]);
+              for (std::size_t j = 0; j < values.values_.size(); ++j)
+                result.values_[range.output_ + j] =
+                    std::move(values.values_[j]);
               return absl::OkStatus();
             });
         if (read_status.ok()) read_status = completed;

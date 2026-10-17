@@ -336,18 +336,17 @@ absl::StatusOr<HashResult> ReadCompactHashRandom(
   return result;
 }
 
-absl::StatusOr<HashResult> ReadHashSnapshotResult(HashValueReader reader,
-                                                  std::size_t count,
-                                                  bool with_values) {
-  const std::size_t width = with_values ? 2 : 1;
+absl::StatusOr<HashResult> ReadPackedHashResult(HashValueReader reader,
+                                                std::size_t count, bool fields,
+                                                bool values) {
+  const std::size_t width = std::size_t{fields} + std::size_t{values};
   std::size_t payload_bytes = 0;
   auto inspect = reader;
   for (std::size_t i = 0; i < count; ++i) {
     auto entry = inspect.Next();
     if (!entry.ok()) return entry.status();
-    for (const auto bytes :
-         {entry->field_.size(),
-          with_values ? entry->value_.size() : std::size_t{0}}) {
+    for (const auto bytes : {fields ? entry->field_.size() : std::size_t{0},
+                             values ? entry->value_.size() : std::size_t{0}}) {
       if (bytes > SIZE_MAX - payload_bytes)
         return absl::ResourceExhaustedError("OOM Hash snapshot is too large");
       payload_bytes += bytes;
@@ -389,8 +388,8 @@ absl::StatusOr<HashResult> ReadHashSnapshotResult(HashValueReader reader,
   for (std::size_t i = 0; i < count; ++i) {
     auto entry = reader.Next();
     if (!entry.ok()) return entry.status();
-    append(entry->field_);
-    if (with_values) append(entry->value_);
+    if (fields) append(entry->field_);
+    if (values) append(entry->value_);
   }
   const auto retained =
       sizeof(HashResult) + sizeof(HashReadSnapshot) +
@@ -438,7 +437,8 @@ absl::StatusOr<HashResult> ReadEncodedHash(std::string_view payload,
       operation.kind_ == HashOperationKind::kValues ||
       operation.kind_ == HashOperationKind::kReadSnapshot)
     return ReadHashPayloadResult(payload, operation.kind_, count,
-                                 operation.with_values_);
+                                 operation.with_values_,
+                                 operation.packed_output_);
   if (operation.kind_ == HashOperationKind::kReadPage)
     return ReadHashPayloadResult(payload,
                                  operation.with_values_
@@ -459,17 +459,19 @@ absl::StatusOr<HashResult> ReadEncodedHash(std::string_view payload,
 absl::StatusOr<HashResult> ReadHashPayloadResult(std::string_view payload,
                                                  HashOperationKind kind,
                                                  std::uint64_t count,
-                                                 bool with_values) {
+                                                 bool with_values,
+                                                 bool packed_output) {
   auto reader = HashValueReader::Open(payload);
   if (!reader.ok()) return reader.status();
   if (reader->size() != count) {
     return absl::InternalError(
         "Hash element count does not match record metadata");
   }
-  if (kind == HashOperationKind::kReadSnapshot)
-    return ReadHashSnapshotResult(*reader, count, with_values);
+  const bool snapshot = kind == HashOperationKind::kReadSnapshot;
   const bool fields = kind != HashOperationKind::kValues;
-  const bool values = kind != HashOperationKind::kKeys;
+  const bool values = snapshot ? with_values : kind != HashOperationKind::kKeys;
+  if (snapshot || packed_output)
+    return ReadPackedHashResult(*reader, count, fields, values);
   const std::size_t width = kind == HashOperationKind::kGetAll ? 2 : 1;
   std::size_t retained = sizeof(HashResult);
   auto add_bytes = [&](std::size_t bytes) {
@@ -1166,7 +1168,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
        operation.kind_ == HashOperationKind::kReadSnapshot)) {
     auto values = co_await ReadGroupedHashResult(
         store, partition, db_id, key, digest, grouped, operation.kind_,
-        operation.with_values_);
+        operation.with_values_, operation.packed_output_);
     if (!values.ok() && read_epoch_changed()) co_return HashResult{};
     co_return values;
   }

@@ -34,6 +34,7 @@
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/format.h"
+#include "lavik/storage/packed_values.h"
 
 namespace lavik::storage {
 
@@ -251,6 +252,12 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
 // interval, but allocates/copies only [first, first + count). The interval must
 // fit the page. Returned strings own their bytes independently of the payload.
 absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
+    std::string_view bytes, std::size_t first, std::size_t count);
+
+// Same full-page validation, with one owned block for the selected interval
+// and offsets for its elements. No returned view borrows the source payload.
+// The caller admits output and temporary slice storage before decoding.
+absl::StatusOr<PackedValues> DecodePackedOrderedListRange(
     std::string_view bytes, std::size_t first, std::size_t count);
 
 // Validates a complete live Sorted Set page without copying members. Uniqueness

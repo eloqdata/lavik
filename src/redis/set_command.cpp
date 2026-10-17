@@ -117,6 +117,7 @@ Task<CommandReply> ExecuteSetCommandImpl(
       break;
     case CommandKind::kSMembers:
       operation.kind_ = storage::HashOperationKind::kKeys;
+      operation.packed_output_ = true;
       break;
     case CommandKind::kSMIsMember:
       operation.kind_ = storage::HashOperationKind::kGetMany;
@@ -218,9 +219,9 @@ Task<CommandReply> ExecuteSetCommandImpl(
     case CommandKind::kSCard:
       co_return BuiltReply(reply_builder.AppendInteger(result->length_));
     case CommandKind::kSMembers:
-      reply_builder.AppendSetHeader(result->values_.size());
-      for (const auto& value : result->values_) {
-        reply_builder.AppendBulkString(*value);
+      reply_builder.AppendSetHeader(result->value_count());
+      for (std::size_t i = 0; i < result->value_count(); ++i) {
+        reply_builder.AppendBulkString(*result->value_view(i));
       }
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kSMIsMember:

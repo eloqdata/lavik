@@ -521,6 +521,43 @@ absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
   return values;
 }
 
+absl::StatusOr<PackedValues> DecodePackedOrderedListRange(
+    std::string_view bytes, std::size_t first, std::size_t count) {
+  auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
+  if (!metadata.ok()) return metadata.status();
+  if (metadata->kind_ != OrderedCollectionKind::kList || metadata->retired_)
+    return absl::DataLossError("List range requires a live List page");
+  if (first > metadata->item_count_ || count > metadata->item_count_ - first)
+    return absl::OutOfRangeError("List range exceeds page");
+  PackedValues result;
+  result.values_.reserve(count);
+  std::size_t begin = 0, end = 0;
+  std::size_t offset = kOrderedGroupHeaderBytes;
+  for (std::size_t i = 0; i < metadata->item_count_; ++i) {
+    if (bytes.size() - offset < kEntryHeaderBytes)
+      return absl::DataLossError("truncated List entry header");
+    const auto length = Load(bytes, offset, 4);
+    // Lists require the exact +0 bit pattern, including in skipped entries.
+    if (Load(bytes, offset + 4, 8) != 0)
+      return absl::DataLossError("invalid List entry score");
+    offset += kEntryHeaderBytes;
+    if (length > kMaxStringBytes || length > bytes.size() - offset)
+      return absl::DataLossError("truncated List entry value");
+    if (i >= first && i - first < count) {
+      if (i == first) begin = offset;
+      end = offset + length;
+      result.values_.push_back({0, offset - begin, length});
+    }
+    offset += length;
+  }
+  if (offset != bytes.size())
+    return absl::DataLossError("List page has trailing bytes");
+  // The copied interval includes only intervening entry headers. Offsets
+  // remain valid after the page lease is returned, and after block moves.
+  if (count != 0) result.blocks_.emplace_back(bytes.substr(begin, end - begin));
+  return result;
+}
+
 absl::StatusOr<std::vector<OrderedCollectionEntryView>>
 DecodeSortedSetGroupViews(std::string_view bytes,
                           SortedSetMemberValidation validation) {

@@ -445,13 +445,15 @@ TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
     for (unsigned i = 0; i < count; ++i)
       fields["field" + std::to_string(i)] = std::string(128, 'a' + i % 26);
   }
-  auto check_reads = [&](Client& client) {
+  auto check_reads = [&](Client& client, bool resp3) {
+    ASSERT_EQ(client.Command({"HELLO", resp3 ? "3" : "2"}).kind_,
+              resp3 ? '%' : '*');
     for (const auto& [key, fields] : hashes) {
       // Alternating full reads must not consume persistent/staged data. The
       // returned strings survive destruction of each private decoded snapshot.
       for (unsigned repeat = 0; repeat < 3; ++repeat) {
         const auto all = client.Command({"HGETALL", key});
-        ASSERT_EQ(all.kind_, '*');
+        ASSERT_EQ(all.kind_, resp3 ? '%' : '*');
         ASSERT_EQ(all.items_.size(), fields.size() * 2);
         std::map<std::string, std::string> actual;
         for (std::size_t i = 0; i < all.items_.size(); i += 2)
@@ -459,6 +461,8 @@ TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
         EXPECT_EQ(actual, fields);
         const auto keys = client.Command({"HKEYS", key});
         const auto values = client.Command({"HVALS", key});
+        ASSERT_EQ(keys.kind_, '*');
+        ASSERT_EQ(values.kind_, '*');
         ASSERT_EQ(keys.items_.size(), fields.size());
         ASSERT_EQ(values.items_.size(), fields.size());
         std::set<std::string> actual_keys, expected_keys;
@@ -474,6 +478,28 @@ TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
       }
       EXPECT_EQ(client.Command({"HLEN", key}).text_,
                 std::to_string(fields.size()));
+      // HMGET still uses optional owned values: missing fields must remain
+      // null, while duplicate lookups and present empty strings stay distinct.
+      const auto some =
+          client.Command({"HMGET", key, std::string("binary\0field", 12),
+                          "missing", std::string("binary\0field", 12), ""});
+      ASSERT_EQ(some.kind_, '*');
+      ASSERT_EQ(some.items_.size(), 4U);
+      EXPECT_EQ(some.items_[0].text_, std::string("v\0x", 3));
+      EXPECT_EQ(some.items_[1].kind_, resp3 ? '_' : '$');
+      EXPECT_EQ(some.items_[1].text_, resp3 ? "" : "-1");
+      EXPECT_EQ(some.items_[2].text_, std::string("v\0x", 3));
+      EXPECT_EQ(some.items_[3].kind_, '$');
+      EXPECT_TRUE(some.items_[3].text_.empty());
+    }
+    for (const auto* command : {"HGETALL", "HKEYS", "HVALS"}) {
+      const auto missing = client.Command({command, "missing"});
+      EXPECT_EQ(missing.kind_,
+                resp3 && std::string_view(command) == "HGETALL" ? '%' : '*');
+      EXPECT_TRUE(missing.items_.empty());
+      const auto wrong_type = client.Command({command, "string"});
+      EXPECT_EQ(wrong_type.kind_, '-');
+      EXPECT_TRUE(wrong_type.text_.starts_with("WRONGTYPE"));
     }
   };
   {
@@ -489,7 +515,7 @@ TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
       ASSERT_EQ(client.Command(args).text_, std::to_string(fields.size()));
       ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
     }
-    check_reads(client);
+    for (const bool resp3 : {false, true}) check_reads(client, resp3);
     ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
     for (const auto& [key, fields] : hashes) {
       ASSERT_EQ(watcher.Command({"HGETALL", key}).text_, "QUEUED");
@@ -505,20 +531,124 @@ TEST(HashReadOwnershipE2e, FullReadsPreserveCompactAndGroupedValues) {
       EXPECT_EQ(replies.items_[position++].items_.size(), fields.size());
     }
     EXPECT_EQ(client.Command({"GET", "string"}).text_, "unchanged");
-    for (const auto* command : {"HGETALL", "HKEYS", "HVALS"}) {
-      EXPECT_TRUE(client.Command({command, "missing"}).items_.empty());
-      EXPECT_TRUE(
-          client.Command({command, "string"}).text_.starts_with("WRONGTYPE"));
-    }
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   // Cold recovery and a different worker layout exercise disk-backed reads,
   // not just the append buffers observed immediately after HSET.
+  EXPECT_EQ(disk.LatestRootGrouped("hash-10"), false);
+  EXPECT_EQ(disk.LatestRootGrouped("hash-256"), true);
   Server recovered(disk, 2);
   Client client(recovered.port());
-  check_reads(client);
+  for (const bool resp3 : {false, true}) check_reads(client, resp3);
   EXPECT_EQ(client.Command({"GET", "string"}).text_, "unchanged");
+}
+
+void ExpectFullCollectionReply(const Reply& reply, std::string_view command,
+                               const std::map<std::string, std::string>& fields,
+                               bool resp3) {
+  const bool pairs = command == "HGETALL";
+  char expected_kind = '*';
+  if (resp3 && pairs) expected_kind = '%';
+  if (resp3 && command == "SMEMBERS") expected_kind = '~';
+  ASSERT_EQ(reply.kind_, expected_kind) << reply.text_;
+  ASSERT_EQ(reply.items_.size(), fields.size() * (pairs ? 2 : 1));
+  for (const auto& item : reply.items_) EXPECT_EQ(item.kind_, '$');
+  if (pairs) {
+    std::map<std::string, std::string> actual;
+    for (std::size_t i = 0; i < reply.items_.size(); i += 2)
+      actual.emplace(reply.items_[i].text_, reply.items_[i + 1].text_);
+    EXPECT_EQ(actual, fields);
+  } else {
+    std::multiset<std::string> actual, expected;
+    for (const auto& item : reply.items_) actual.insert(item.text_);
+    for (const auto& [field, value] : fields)
+      expected.insert(command == "HVALS" ? value : field);
+    EXPECT_EQ(actual, expected);
+  }
+}
+
+TEST(CollectionReadOwnershipE2e,
+     FullRepliesSurviveExecAndLuaReplacingTheirSource) {
+  PrivateDisk disk;
+  Server server(disk, 3);
+  Client client(server.port());
+  ASSERT_EQ(client.Command({"SET", "wrong-type", "unchanged"}).text_, "OK");
+  for (const unsigned count : {10u, 256u}) {
+    // Long fields put both the Hash and Set above the grouped threshold in
+    // the large case. Empty/binary fields and repeated values catch projection
+    // mixups without assuming a stable iteration order.
+    std::map<std::string, std::string> fields{
+        {"", ""}, {std::string("f\0\r\n", 4), std::string("v\0\r\n", 4)}};
+    for (unsigned i = 0; i < count; ++i)
+      fields[std::string(128, 'f') + std::to_string(i)] =
+          std::string(128, 'a' + i % 3);
+    for (const bool resp3 : {false, true}) {
+      ASSERT_EQ(client.Command({"HELLO", resp3 ? "3" : "2"}).kind_,
+                resp3 ? '%' : '*');
+      for (const auto* command : {"HGETALL", "HKEYS", "HVALS", "SMEMBERS"}) {
+        SCOPED_TRACE(std::to_string(count) + " " + command +
+                     (resp3 ? " RESP3" : " RESP2"));
+        const bool set = std::string_view(command) == "SMEMBERS";
+        const std::string key =
+            std::string(set ? "set-" : "hash-") + std::to_string(count);
+        std::vector<std::string> seed{set ? "SADD" : "HSET", key};
+        for (const auto& [field, value] : fields) {
+          seed.push_back(field);
+          if (!set) seed.push_back(value);
+        }
+        auto seed_key = [&] {
+          ASSERT_EQ(client.Command({"DEL", key}).kind_, ':');
+          ASSERT_EQ(client.Command(seed).text_, std::to_string(fields.size()));
+        };
+        ASSERT_NO_FATAL_FAILURE(seed_key());
+        ExpectFullCollectionReply(client.Command({command, key}), command,
+                                  fields, resp3);
+        ExpectFullCollectionReply(client.Command({command, "missing"}), command,
+                                  {}, resp3);
+        const auto wrong_type = client.Command({command, "wrong-type"});
+        EXPECT_EQ(wrong_type.kind_, '-');
+        EXPECT_TRUE(wrong_type.text_.starts_with("WRONGTYPE"));
+
+        ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+        ASSERT_EQ(client.Command({command, key}).text_, "QUEUED");
+        ASSERT_EQ(client.Command({"DEL", key}).text_, "QUEUED");
+        ASSERT_EQ(client.Command({"SET", key, "after-exec"}).text_, "QUEUED");
+        const auto exec = client.Command({"EXEC"});
+        ASSERT_EQ(exec.kind_, '*');
+        ASSERT_EQ(exec.items_.size(), 3U);
+        // EXEC runs the replacement before draining its earlier read reply.
+        ExpectFullCollectionReply(exec.items_[0], command, fields, resp3);
+        EXPECT_EQ(exec.items_[1].text_, "1");
+        EXPECT_EQ(exec.items_[2].text_, "OK");
+        EXPECT_EQ(client.Command({"GET", key}).text_, "after-exec");
+
+        ASSERT_NO_FATAL_FAILURE(seed_key());
+        const auto lua = client.Command(
+            {"EVAL",
+             "redis.setresp(tonumber(ARGV[2])); "
+             "local reply=redis.call(ARGV[1],KEYS[1]); "
+             "redis.call('DEL',KEYS[1]); "
+             "redis.call('SET',KEYS[1],'after-lua'); return reply",
+             "1", key, command, resp3 ? "3" : "2"});
+        ExpectFullCollectionReply(lua, command, fields, resp3);
+        EXPECT_EQ(client.Command({"GET", key}).text_, "after-lua");
+
+        ASSERT_NO_FATAL_FAILURE(seed_key());
+        ASSERT_EQ(client.Command({"PEXPIRE", key, "-1"}).text_, "1");
+        ExpectFullCollectionReply(client.Command({command, key}), command, {},
+                                  resp3);
+        // Preserve one source of each size/type for on-disk layout assertions.
+        ASSERT_NO_FATAL_FAILURE(seed_key());
+      }
+    }
+  }
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  for (const auto* type : {"hash-", "set-"}) {
+    EXPECT_EQ(disk.LatestRootGrouped(std::string(type) + "10"), false);
+    EXPECT_EQ(disk.LatestRootGrouped(std::string(type) + "256"), true);
+  }
 }
 
 TEST(HashReplaceE2e, WatchExecAndLua) {

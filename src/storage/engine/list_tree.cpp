@@ -142,6 +142,78 @@ std::pair<std::uint64_t, std::uint64_t> NormalizeRange(std::int64_t start,
   return begin < end ? std::pair(begin, end) : std::pair(size, size);
 }
 
+// Compact LRANGE projects directly while the source read lease is live.
+// Validation covers skipped entries as well; only the selected interval is
+// copied and no member-sized allocation or borrowed view escapes the call.
+absl::StatusOr<ListResult> ReadPackedListRange(std::string_view encoded,
+                                               std::uint64_t expected_count,
+                                               const ListOperation& operation) {
+  if (expected_count > std::numeric_limits<std::uint32_t>::max() ||
+      encoded.size() < kListHeaderBytes ||
+      encoded.substr(0, kListMagic.size()) != kListMagic)
+    return absl::InternalError("invalid persisted List");
+  std::size_t offset = kListMagic.size();
+  std::uint32_t count = 0;
+  if (!ReadU32(encoded, &offset, &count) || count != expected_count)
+    return absl::InternalError("List count does not match record metadata");
+  if (count > (encoded.size() - offset) / sizeof(std::uint32_t))
+    return absl::InternalError("List count exceeds its payload");
+  const auto [first, last] =
+      NormalizeRange(operation.first_, operation.second_, count);
+  std::size_t begin = 0, end = 0;
+  for (std::uint32_t index = 0; index < count; ++index) {
+    std::uint32_t bytes = 0;
+    if (!ReadU32(encoded, &offset, &bytes) || offset > encoded.size() ||
+        bytes > kMaxStringBytes || bytes > encoded.size() - offset)
+      return absl::InternalError("persisted List is truncated");
+    if (index >= first && index < last) {
+      if (index == first) begin = offset;
+      end = offset + bytes;
+    }
+    offset += bytes;
+  }
+  if (offset != encoded.size())
+    return absl::InternalError("persisted List has trailing bytes");
+  ListResult result;
+  result.key_exists_ = true;
+  result.length_ = count;
+  if (first == last) return result;
+  const auto selected = static_cast<std::size_t>(last - first);
+  const auto fixed = sizeof(PackedValues) + sizeof(std::string) +
+                     std::max(end - begin, std::string{}.capacity()) + 1;
+  if (selected > (SIZE_MAX - fixed) / sizeof(PackedValues::Slice))
+    return absl::ResourceExhaustedError("List range output overflow");
+  auto reservation =
+      TryReserveMemory(fixed + selected * sizeof(PackedValues::Slice));
+  if (!reservation) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM List range output");
+  }
+  result.packed_values_ = std::make_unique<PackedValues>();
+  auto& packed = *result.packed_values_;
+  packed.values_.reserve(selected);
+  packed.blocks_.emplace_back(encoded.substr(begin, end - begin));
+  offset = begin - sizeof(std::uint32_t);
+  for (std::size_t i = 0; i < selected; ++i) {
+    std::uint32_t bytes = 0;
+    // The immutable payload was fully validated above.
+    const bool valid = ReadU32(encoded, &offset, &bytes);
+    assert(valid);
+    (void)valid;
+    packed.values_.push_back({0, offset - begin, bytes});
+    offset += bytes;
+  }
+  const auto retained =
+      sizeof(PackedValues) +
+      packed.values_.capacity() * sizeof(PackedValues::Slice) +
+      packed.blocks_.capacity() * sizeof(std::string) +
+      packed.blocks_[0].capacity() + 1;
+  if (retained > reservation->bytes())
+    return absl::ResourceExhaustedError("List range exceeds admission");
+  result.retained_charge_.Adopt(&*reservation, retained);
+  return result;
+}
+
 std::uint64_t UnsignedMagnitude(std::int64_t value) {
   return value < 0 ? static_cast<std::uint64_t>(-(value + 1)) + 1
                    : static_cast<std::uint64_t>(value);
@@ -273,6 +345,10 @@ absl::StatusOr<ListResult> ReadCompactList(const CompactReadResult& value,
   ListResult result;
   result.key_exists_ = value->has_value();
   result.length_ = *value ? (**value).logical_size_ : 0;
+  if (*value && operation.kind_ == ListOperationKind::kRange &&
+      operation.packed_output_)
+    return ReadPackedListRange((**value).encoded_, (**value).logical_size_,
+                               operation);
   std::vector<std::string> elements;
   if (*value && operation.kind_ != ListOperationKind::kLength) {
     auto decoded = DecodeList((**value).encoded_, (**value).logical_size_);
@@ -477,10 +553,12 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       co_return loaded.status();
     }
     const auto bytes = loaded->value();
-    auto decoded =
-        DecodeList(std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                    bytes.size()),
-                   location.logical_size_);
+    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                   bytes.size());
+    if (read_only && operation.kind_ == ListOperationKind::kRange &&
+        operation.packed_output_)
+      co_return ReadPackedListRange(payload, location.logical_size_, operation);
+    auto decoded = DecodeList(payload, location.logical_size_);
     if (!decoded.ok()) co_return decoded.status();
     elements = std::move(*decoded);
   }
