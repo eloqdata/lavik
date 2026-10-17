@@ -1512,7 +1512,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       // No suspension while transferring prepaid output to retained charges.
       // The enclosing reservation remains live until all owned pages are
       // destroyed, and is released before the next wave can admit anything.
-      for (auto& page : pages) {
+      // Index explicitly: Clang 18 crashes while resolving the range-for
+      // iterator comparison for this coroutine lambda's dependent page type.
+      for (std::size_t i = 0; i < pages.size(); ++i) {
+        auto& page = pages[i];
         const auto visited = [&] {
           if constexpr (packed)
             return consume_packed_page(page->page_, true);
