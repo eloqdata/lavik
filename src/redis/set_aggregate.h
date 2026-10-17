@@ -244,9 +244,12 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
         }
         std::size_t retained_bytes = 0;
         for (std::size_t i = batch_begin; i < batch_end; ++i) {
-          const auto& member = page->values_[i];
-          if (!member ||
-              (kind == SetAggregate::kUnion && unique.contains(*member))) {
+          auto& member = page->values_[i];
+          if (!member) continue;
+          if (kind == SetAggregate::kUnion && unique.contains(*member)) {
+            // Already-owned members need neither admission nor another hash
+            // lookup in the insertion pass below.
+            member.reset();
             continue;
           }
           if (cardinality_only) {
@@ -300,7 +303,8 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
     }
   }
   if (!cardinality_only) {
-    std::sort(result.members_.begin(), result.members_.end());
+    // Set replies are unordered. STORE and its captured SADD use this same
+    // member sequence, so replication needs no lexical ordering either.
     result.cardinality_ = result.members_.size();
   }
   co_return result;
