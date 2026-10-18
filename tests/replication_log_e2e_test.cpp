@@ -590,8 +590,8 @@ class ReplicationLogService final : public bycorf::Service {
     auto request = lavik::BuildCommandRequest(
         lavik::RespCommand{.args_ = std::move(args)}, connection.selected_db_);
     if (!request.ok()) co_return request.status();
-    lavik::ReplyBuilder builder;
-    auto reply = co_await lavik::DispatchCommand(connection, *request, builder);
+    connection.reply_builder_.Reset();
+    auto reply = co_await lavik::DispatchCommand(connection, *request);
     std::string actual(reply.encoded_);
     if (reply.disk_value_.valid()) {
       const auto bytes = reply.disk_value_.network_bytes();
@@ -744,23 +744,30 @@ class ReplicationLogService final : public bycorf::Service {
         "return {redis.call('GET', KEYS[1]), redis.call('STRLEN', KEYS[2])}";
     lavik::ConnectionContext connection;
     connection.selected_db_ = kDb;
+    // GCC 13 can ICE when a co_await argument uses an initializer list with
+    // nonliteral strings. Build the vectors before entering the await
+    // expression.
+    std::vector<std::string> seed_args{"MSET", first, "old", second, "old"};
     auto status = co_await DispatchClientCommand(
-        connection, {"MSET", first, "old", second, "old"}, "+OK\r\n");
+        connection, std::move(seed_args), "+OK\r\n");
     if (!status.ok()) co_return status;
     // Warm the Lua VM/bytecode while memory is unrestricted. Primary String
     // segment preparation remains subject to ordinary memory admission; leave
     // it enough scratch while the dynamically produced replication event must
     // still exceed this history's one-block reconnect quota.
-    status = co_await DispatchClientCommand(
-        connection, {"EVAL", script, "2", first, second, "warm"}, ":1\r\n");
+    std::vector<std::string> warm_args{"EVAL", script, "2",
+                                       first,  second, "warm"};
+    status = co_await DispatchClientCommand(connection, std::move(warm_args),
+                                            ":1\r\n");
     if (!status.ok()) co_return status;
     status = co_await storage_->EnableReplicationLog(kEpoch, 8 * kMiB);
     if (!status.ok()) co_return status;
     status = LimitRetainedHeadroom(24 * kMiB);
     if (!status.ok()) co_return status;
+    std::vector<std::string> run_args{"EVAL", script, "2",
+                                      first,  second, "run"};
     auto publication = co_await DispatchPinnedCommand(
-        connection, {"EVAL", script, "2", first, second, "run"},
-        "*2\r\n$4\r\nkept\r\n:9437184\r\n", 2);
+        connection, std::move(run_args), "*2\r\n$4\r\nkept\r\n:9437184\r\n", 2);
     const auto restored = lavik::InitMemoryLimit(512 * kMiB, 1);
     if (!restored.ok()) co_return restored;
     if (!publication.ok()) co_return publication.status();
@@ -780,15 +787,18 @@ class ReplicationLogService final : public bycorf::Service {
           "admitted Lua script lost its prefix or dynamically grown effect");
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(
-        connection, {"SET", first, "before-replay"}, "+OK\r\n");
+    std::vector<std::string> restore_args{"SET", first, "before-replay"};
+    status = co_await DispatchClientCommand(connection, std::move(restore_args),
+                                            "+OK\r\n");
     if (!status.ok()) co_return status;
     status = co_await lavik::ApplyReplicatedCommand(body);
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(connection, {"GET", first},
+    std::vector<std::string> get_args{"GET", first};
+    status = co_await DispatchClientCommand(connection, std::move(get_args),
                                             "$4\r\nkept\r\n");
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(connection, {"STRLEN", second},
+    std::vector<std::string> length_args{"STRLEN", second};
+    status = co_await DispatchClientCommand(connection, std::move(length_args),
                                             ":9437184\r\n");
     if (!status.ok()) co_return status;
     std::cout << "EVAL continuation exceeds backlog quota and replays PASS\n";
@@ -803,13 +813,17 @@ class ReplicationLogService final : public bycorf::Service {
     const std::string after = "capture-after-growth";
     lavik::ConnectionContext connection;
     connection.selected_db_ = kDb;
+    std::vector<std::string> hash_args{"HSET", hash, "f", "old"};
     auto status = co_await DispatchClientCommand(
-        connection, {"HSET", hash, "f", "old"}, ":1\r\n");
+        connection, std::move(hash_args), ":1\r\n");
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(
-        connection, {"SADD", source, std::string(9 * kMiB, 'S')}, ":1\r\n");
+    std::vector<std::string> set_args{"SADD", source,
+                                      std::string(9 * kMiB, 'S')};
+    status = co_await DispatchClientCommand(connection, std::move(set_args),
+                                            ":1\r\n");
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(connection, {"SET", after, "old"},
+    std::vector<std::string> after_args{"SET", after, "old"};
+    status = co_await DispatchClientCommand(connection, std::move(after_args),
                                             "+OK\r\n");
     if (!status.ok()) co_return status;
     status = co_await storage_->EnableReplicationLog(kEpoch, 8 * kMiB);
@@ -850,13 +864,16 @@ class ReplicationLogService final : public bycorf::Service {
               ReplicatedEffectAt(body, 2) ==
                   std::vector<std::string>({"SET", after, "kept"}),
           "EXEC lost an earlier or later effect around continuation growth");
-    status =
-        co_await DispatchClientCommand(connection, {"SCARD", source}, ":0\r\n");
+    std::vector<std::string> cardinality_args{"SCARD", source};
+    status = co_await DispatchClientCommand(
+        connection, std::move(cardinality_args), ":0\r\n");
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(connection, {"HGET", hash, "f"},
-                                            "$4\r\nkept\r\n");
+    std::vector<std::string> hash_read_args{"HGET", hash, "f"};
+    status = co_await DispatchClientCommand(
+        connection, std::move(hash_read_args), "$4\r\nkept\r\n");
     if (!status.ok()) co_return status;
-    status = co_await DispatchClientCommand(connection, {"GET", after},
+    std::vector<std::string> get_args{"GET", after};
+    status = co_await DispatchClientCommand(connection, std::move(get_args),
                                             "$4\r\nkept\r\n");
     if (!status.ok()) co_return status;
     std::cout << "EXEC continuation preserves fallback and later write PASS\n";
@@ -2467,8 +2484,9 @@ class ReplicationLogService final : public bycorf::Service {
     if (!status.ok()) co_return status;
     status = storage_->RetainReplicationLog(kPin, 1);
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(
-        0, {"SET", "replacement-old", std::string(9 * kMiB, 'O')}, "+OK\r\n");
+    std::vector<std::string> set_args{"SET", "replacement-old",
+                                      std::string(9 * kMiB, 'O')};
+    status = co_await ExecuteClientCommand(0, std::move(set_args), "+OK\r\n");
     if (!status.ok()) co_return status;
     status = co_await WaitForReplicationTail(1);
     if (!status.ok()) co_return status;
@@ -3706,7 +3724,9 @@ class ReplicationLogService final : public bycorf::Service {
     args.back() = "y";
     status = co_await ExecuteClientCommand(kDb, args, ":2\r\n");
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(kDb, {"SCARD", key}, ":2\r\n");
+    std::vector<std::string> cardinality_args{"SCARD", key};
+    status = co_await ExecuteClientCommand(kDb, std::move(cardinality_args),
+                                           ":2\r\n");
     if (!status.ok()) co_return status;
 
     auto fence = co_await storage_->FenceReplicationLog();
@@ -3740,9 +3760,12 @@ class ReplicationLogService final : public bycorf::Service {
     Check(*removed, "wide-argument SADD did not create its source key");
     status = co_await lavik::ApplyReplicatedCommand(*command);
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(kDb, {"SCARD", key}, ":2\r\n");
+    std::vector<std::string> replayed_cardinality_args{"SCARD", key};
+    status = co_await ExecuteClientCommand(
+        kDb, std::move(replayed_cardinality_args), ":2\r\n");
     if (!status.ok()) co_return status;
-    co_return co_await ExecuteClientCommand(kDb, {"SMISMEMBER", key, "x", "y"},
+    std::vector<std::string> membership_args{"SMISMEMBER", key, "x", "y"};
+    co_return co_await ExecuteClientCommand(kDb, std::move(membership_args),
                                             "*2\r\n:1\r\n:1\r\n");
   }
 

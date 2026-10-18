@@ -560,9 +560,10 @@ struct ConnectionContext;
 // `request` until the returned task completes. Redis sessions directly
 // co_await dispatch from the frame that owns the request, avoiding a second
 // 112-byte CommandRequest in this child coroutine frame.
+// Writes into ctx.reply_builder_. The caller must reset it before dispatch
+// and consume the reply before resetting or reusing the builder.
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest& request,
-                                   ReplyBuilder& reply_builder);
+                                   CommandRequest& request);
 
 // Revalidates an external data command after it obtains ordinary database
 // admission or drains a self-managed exclusive database cut.

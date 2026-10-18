@@ -204,8 +204,8 @@ std::string RunDispatch(lavik::ConnectionContext& context,
       lavik::RespCommand{.args_ = std::move(args)}, context.selected_db_);
   EXPECT_TRUE(request.ok()) << request.status();
   if (!request.ok()) return {};
-  lavik::ReplyBuilder builder(context.resp_version());
-  auto task = lavik::DispatchCommand(context, *request, builder);
+  context.reply_builder_.Reset();
+  auto task = lavik::DispatchCommand(context, *request);
   auto handle = std::move(task).ReleaseHandle();
   handle.resume();
   EXPECT_TRUE(handle.done());

@@ -12509,8 +12509,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
 }
 
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest& request,
-                                   ReplyBuilder& reply_builder) {
+                                   CommandRequest& request) {
   // FLUSH, KEYS, and RDB backup commands acquire or close database gates in
   // their handlers instead of using the ordinary shared-admission path. They
   // still need a dispatch-time token to reject an old-population request after
@@ -12530,7 +12529,7 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
   if (!request.replication_origin_ && SynchronousRdbSaveActive()) {
     auto waited = co_await WaitForSynchronousRdbSave();
     if (!waited.ok())
-      co_return BuiltReply(AppendStorageError(reply_builder, waited));
+      co_return BuiltReply(AppendStorageError(ctx.reply_builder_, waited));
   }
   const CommandKind kind = request.kind_;
   const bool may_advance_replication_watermark = [&] {
@@ -12566,7 +12565,7 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       request.spec_ != nullptr && (request.spec_->flags_ & kCmdMayBlock) != 0;
   const std::uint64_t started = bycorf::ReadCycleCounter();
   CommandReply reply =
-      co_await DispatchCommandImpl(ctx, request, reply_builder);
+      co_await DispatchCommandImpl(ctx, request, ctx.reply_builder_);
   if (cascade.has_value() && !cascade->empty()) {
     (void)co_await DrainBlockingWakeCascade(*cascade);
   }
