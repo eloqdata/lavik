@@ -26,6 +26,7 @@
 #include <optional>
 #include <span>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
 #include "bycorf/io/storage.h"
@@ -1100,19 +1101,18 @@ Task<absl::Status> RunCompact(
         ClusterMutationPrecondition(request);
     co_return co_await g_storage->ExecuteCompact(
         request.db_id_, key, storage::ValueType::kStream, read_only, callback,
-        0, replication, &mutation_precondition, access);
+        0, replication, &mutation_precondition, std::move(access));
   }
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kStream, read_only,
-      callback, tx, 0, replication, nullptr, access);
+      callback, tx, 0, replication, nullptr, std::move(access));
 }
 
 void AppendEntry(ReplyBuilder& builder, const Entry& entry) {
   builder.AppendArrayHeader(2);
   builder.AppendBulkString(FormatId(entry.id_));
   builder.AppendArrayHeader(entry.fields_.size());
-  for (const std::string& field : entry.fields_)
-    builder.AppendBulkString(field);
+  builder.AppendBulkStrings(entry.fields_);
 }
 
 struct StreamRangeReplyState {
@@ -1549,13 +1549,13 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     status = co_await g_storage->ExecuteCompact(
         db_id, key, storage::ValueType::kStream, !group_read, callback, 0,
         replication ? &*replication : nullptr, mutation_precondition_ptr,
-        access);
+        std::move(access));
   } else {
     status = co_await g_storage->ExecuteCompactLocked(
         db_id, key, *locked_digest, storage::ValueType::kStream, !group_read,
         callback, group_read ? tx : nullptr, 0,
         replication ? &*replication : nullptr, mutation_precondition_ptr,
-        access);
+        std::move(access));
   }
   if (!status.ok()) co_return status;
   if (request != nullptr && !captured_group_args.empty()) {
@@ -2367,6 +2367,8 @@ Task<CommandReply> ExecuteImpl(
           return NoChange();
         }
         Entry entry{.id_ = id, .fields_ = {}};
+        // The complete field/value count is known before copying owned strings.
+        entry.fields_.reserve(a.size() - i);
         for (; i < a.size(); ++i) entry.fields_.push_back(a[i]);
         AppendStreamEntry(&stream, std::move(entry));
         stream.last_id_ = id;
@@ -2441,7 +2443,7 @@ Task<CommandReply> ExecuteImpl(
         return publish_stream(std::move(stream));
       }
       case CommandKind::kXDel: {
-        std::vector<Id> ids;
+        absl::InlinedVector<Id, 1> ids;
         for (std::size_t i = 2; i < a.size(); ++i) {
           auto id = ParseId(a[i]);
           if (!id.ok()) return id.status();
@@ -2847,7 +2849,7 @@ Task<CommandReply> ExecuteImpl(
         std::optional<std::uint64_t> delivery_time;
         std::optional<std::uint64_t> retry_count;
         std::optional<Id> last_id;
-        std::vector<Id> ids;
+        absl::InlinedVector<Id, 1> ids;
         if (request.kind_ == CommandKind::kXClaim) {
           std::size_t i = 5;
           while (i < a.size() && !EqualCi(a[i], "idle") &&

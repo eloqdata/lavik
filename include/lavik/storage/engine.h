@@ -1013,14 +1013,16 @@ struct StreamRangeAccess {
 
 // A writable callback sees only the named messages and may remove them. Storage
 // maintains their logical node boundaries; consumer groups and PEL are omitted.
+// The selection owns its IDs across storage waits; a single ID needs no
+// separate descriptor allocation.
 struct StreamDeleteAccess {
-  std::vector<std::array<std::uint64_t, 2>> ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> ids_{};
 };
 
 // A writable callback may only remove the named pending IDs in this group.
 struct StreamAckAccess {
   std::string group_;
-  std::vector<std::array<std::uint64_t, 2>> ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> ids_{};
 };
 
 // PEL scans seek by ID and retain only matching rows. Pending-history reads
@@ -1039,8 +1041,8 @@ struct StreamPendingAccess {
 struct StreamGroupAccess {
   std::string group_;
   std::vector<std::string> consumers_{};
-  std::vector<std::array<std::uint64_t, 2>> pending_ids_{};
-  std::vector<std::array<std::uint64_t, 2>> entry_ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> pending_ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> entry_ids_{};
   std::optional<std::uint64_t> read_new_count_ = std::nullopt;
   std::optional<StreamPendingAccess> pending_scan_ = std::nullopt;
   // Delivery callbacks need IDs/counters, while replies read immutable fields
