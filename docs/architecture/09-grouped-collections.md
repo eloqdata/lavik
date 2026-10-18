@@ -342,8 +342,14 @@ the routing view, child tasks and output admission; only physical
 reads hop to another worker. Each request limits groups against their refreshed
 record owner, including after GC rerouting. Children consume each page into
 admitted output, then release its read lease before making that owner's
-capacity available. Hash/Set replies project encoded entries directly into
-the requested fields or values, without an intermediate logical collection.
+capacity available. `HGETALL`, `HKEYS`, `HVALS` and `SMEMBERS` project encoded
+entries into an admitted immutable snapshot of packed bytes and offsets,
+without an intermediate logical collection or a string allocation per entry.
+The result owns the snapshot across worker hops; reply construction borrows
+its selected field/value views only while that ownership remains alive.
+Compact full reads use the same result contract. Point reads and internal
+consumers retain their optional owned-value contract unless they explicitly
+request a snapshot.
 The parent joins every launched read before returning, including on error,
 and rechecks the population and view status after each join. Optional window
 admission covers scheduling metadata and task scratch; insufficient headroom
@@ -415,10 +421,14 @@ than disguising it as an ordinary admission rejection.
 
 List length uses root metadata. Indexed/range reads validate the corresponding
 rank pages completely and copy only requested values into owned replies.
-Multi-page ranges use the shared owner windows and assemble results in rank
-order. Admission covers one owned payload plus reply/page headers and the
-bounded task window, independently of read-buffer accounting. Indexed reads
-retain their direct single-page path.
+LRANGE opts into immutable byte blocks and element offsets: each selected
+page interval is copied once, and multi-page results keep rank order after
+out-of-order owner completion. Compact LRANGE uses the same result contract.
+The result owns its bytes after source leases and key holds end. Internal
+consumers that move individual strings keep the default owned-string output.
+Admission covers one owned payload plus reply/page headers and the bounded
+task window, independently of read-buffer accounting. Indexed reads retain
+their direct single-page path.
 Read-only operations retain shared
 key intent and an immutable routing view, release worker store state before
 page I/O, and validate population and physical record lifetime in the page
@@ -449,8 +459,14 @@ random selection borrow member bytes from one owned read lease. These reads
 validate complete page framing, ordering and identity before consumption.
 Ordinary read-only scans trust the writer's member uniqueness without building
 a temporary hash set; write preparation and strict decoders retain that check.
-Replies retain only admitted output members. Mutation source and boundary probes,
-and rewrite planning, use owned snapshots. Command-local probes retain admitted source
+Public range replies opt into packed member bytes with separate scores and
+offset-based views; they do not require one owned string per returned member.
+Rank/score page readers copy borrowed members into page blocks before releasing
+the read lease, then transfer selected slices and blocks into the result.
+Reverse order, bounds and LIMIT select the same logical members in either
+output representation. Replies retain their admitted buffers through encoding,
+including EXEC and Lua. Mutation source and boundary probes, and rewrite
+planning, keep the default owned-member snapshots. Command-local probes retain admitted source
 pages containing requested members within a fixed scratch bound and reuse
 them in planning. Unrelated or excess search pages are released immediately;
 large members retain the ordinary read fallback. Pop selection passes its owned pages

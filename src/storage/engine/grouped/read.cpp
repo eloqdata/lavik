@@ -262,17 +262,19 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, HashOperationKind kind, bool with_values) {
+    GroupedObject::Handle object, HashOperationKind kind, bool with_values,
+    bool packed_output) {
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
   const auto& directory = object->directory();
   const auto count = directory.root().field_count_;
   const bool snapshot = kind == HashOperationKind::kReadSnapshot;
+  const bool packed = snapshot || packed_output;
   const std::size_t width =
       kind == HashOperationKind::kGetAll || (snapshot && with_values) ? 2 : 1;
-  const std::size_t slot_bytes = snapshot ? sizeof(HashReadSnapshot::Slice)
-                                          : sizeof(std::optional<std::string>);
+  const std::size_t slot_bytes = packed ? sizeof(HashReadSnapshot::Slice)
+                                        : sizeof(std::optional<std::string>);
   std::size_t retained = sizeof(HashResult);
-  if (snapshot) {
+  if (packed) {
     if (directory.groups().size() >
         (SIZE_MAX - retained - sizeof(HashReadSnapshot)) / sizeof(std::string))
       co_return absl::ResourceExhaustedError("OOM Hash output is too large");
@@ -290,7 +292,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
   HashResult result;
   result.key_exists_ = true;
   result.length_ = count;
-  if (snapshot) {
+  if (packed) {
     result.snapshot_ = std::make_unique<HashReadSnapshot>();
     result.snapshot_->blocks_.reserve(directory.groups().size());
     result.snapshot_->values_.resize(count * width);
@@ -309,15 +311,15 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
   auto read = [&](GroupedRecordId id, GroupReadLimiter* limiter = nullptr) {
     return LoadHashGroup<HashResult>(
         store, partition, db_id, key, digest, object, id, false,
-        [kind, with_values](std::string_view payload, std::uint64_t,
-                            std::uint32_t field_count,
-                            LoadedValue&&) -> absl::StatusOr<HashResult> {
+        [kind, with_values, packed_output](
+            std::string_view payload, std::uint64_t, std::uint32_t field_count,
+            LoadedValue&&) -> absl::StatusOr<HashResult> {
           if (field_count == 0) return HashResult{};
           // Only final reply bytes survive this callback. In particular HKEYS
           // and SMEMBERS never copy values into an intermediate HashValue.
           auto result =
               ReadHashPayloadResult(payload.substr(kHashGroupHeaderBytes), kind,
-                                    field_count, with_values);
+                                    field_count, with_values, packed_output);
           if (!result.ok() && absl::IsInternal(result.status()))
             return absl::DataLossError(result.status().message());
           return result;
@@ -335,7 +337,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
       return absl::DataLossError("grouped Hash aggregate mismatch");
     if (selection.count_ == 0) return absl::OkStatus();
     std::size_t payload_bytes = 0;
-    if (snapshot) {
+    if (packed) {
       if (!page.snapshot_ || page.snapshot_->blocks_.size() != 1 ||
           page.snapshot_->values_.size() != selection.count_ * width)
         return absl::DataLossError("grouped Hash snapshot aggregate mismatch");

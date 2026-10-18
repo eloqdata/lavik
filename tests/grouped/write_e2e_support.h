@@ -321,8 +321,13 @@ class Client {
     if (reply.kind_ == '$' && reply.text_ != "-1") {
       reply.text_ = Bytes(std::stoull(reply.text_));
       Check(Bytes(2) == "\r\n", "malformed bulk reply");
-    } else if (reply.kind_ == '*' && reply.text_ != "-1") {
-      const auto count = std::stoull(reply.text_);
+    } else if ((reply.kind_ == '*' || reply.kind_ == '%' ||
+                reply.kind_ == '~') &&
+               reply.text_ != "-1") {
+      // Keep the wire kind while flattening map pairs, so command tests can
+      // distinguish RESP3 maps/sets from their RESP2 array encodings.
+      const auto count =
+          std::stoull(reply.text_) * (reply.kind_ == '%' ? 2 : 1);
       for (std::size_t i = 0; i < count; ++i) reply.items_.push_back(Read());
     }
     return reply;

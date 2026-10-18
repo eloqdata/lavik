@@ -1760,6 +1760,7 @@ if (BUILD_TESTING)
     tests/device_affinity_test.cpp
     tests/foreign_executor_test.cpp
     tests/grouped/hash_test.cpp
+    tests/packed_list_read_test.cpp
     tests/grouped/commit_decision_test.cpp
     tests/grouped/collection_test.cpp
     tests/grouped/list_directory_test.cpp
@@ -2219,6 +2220,25 @@ endforeach()
     set_tests_properties(lavik_grouped_recovery_e2e PROPERTIES
       TIMEOUT 600 RUN_SERIAL TRUE
     )
+
+    foreach(collection list zset)
+      add_executable(lavik_${collection}_read_packed_e2e_test
+        tests/grouped/${collection}_read_packed_e2e_test.cpp
+      )
+      target_link_libraries(lavik_${collection}_read_packed_e2e_test
+        PRIVATE lavik::module GTest::gtest
+      )
+      target_compile_definitions(lavik_${collection}_read_packed_e2e_test PRIVATE
+        LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
+      )
+      add_test(
+        NAME lavik_${collection}_read_packed_e2e
+        COMMAND lavik_${collection}_read_packed_e2e_test $<TARGET_FILE:lavik>
+      )
+      set_tests_properties(lavik_${collection}_read_packed_e2e PROPERTIES
+        TIMEOUT 600 RUN_SERIAL TRUE
+      )
+    endforeach()
 
     add_executable(lavik_grouped_hash_write_e2e_test
       tests/grouped/hash_write_e2e_test.cpp
