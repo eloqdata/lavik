@@ -34,6 +34,7 @@
 #include <ranges>
 #include <stdexcept>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
 #include "bycorf/runtime/cross_core.h"
@@ -1238,7 +1239,9 @@ Task<CommandReply> ExecuteImpl(
       RecordMemoryRejection();
       co_return Built(builder.AppendError("OOM Sorted Set input admission"));
     }
-    std::vector<storage::ScoredMemberView> inputs;
+    // Inline point-command descriptors while keeping input admission unchanged.
+    // Fill the owner before exposing its span; it survives the awaited call.
+    absl::InlinedVector<storage::ScoredMemberView, 1> inputs;
     inputs.reserve(input_count);
     for (; index < a.size(); index += tuple) {
       double score = 0;
@@ -1534,7 +1537,7 @@ Task<CommandReply> ExecuteImpl(
       RecordMemoryRejection();
       co_return Built(builder.AppendError("OOM Sorted Set input admission"));
     }
-    std::vector<std::string_view> members;
+    absl::InlinedVector<std::string_view, 1> members;
     members.reserve(member_end - 2);
     for (std::size_t i = 2; i < member_end; ++i) members.push_back(a[i]);
     storage::SortedSetOperation operation{
