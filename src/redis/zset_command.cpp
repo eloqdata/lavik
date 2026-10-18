@@ -91,8 +91,7 @@ bool ParseInt(std::string_view input, T* value) {
 // Scientific double conversion needs at most 17 significant digits; shortest
 // fixed conversion is no longer than that scientific representation. Redis's
 // notation rules can add at most seven zeroes to scientific digits. Including
-// signs and punctuation, 32 bytes covers either form without reserving the
-// full conversion scratch buffer per member in large WITHSCORES replies.
+// signs and punctuation, 32 bytes covers either form in the caller's buffer.
 constexpr std::size_t kMaximumFormattedDoubleBytes = 32;
 
 std::string_view FormatDoubleTo(
@@ -224,8 +223,9 @@ void AppendScore(ReplyBuilder& builder, double score) {
 }
 
 // The result accessor handles both owned members and immutable packed blocks.
-// Reserve the scored reply once, using a fixed upper bound for formatted scores
-// so they need only one conversion. Plain replies use exact batch sizing.
+// Plain replies use exact batch sizing. Scored replies grow with their actual
+// encoded bytes; reserving the maximum score width overallocates for short
+// scores in large ranges.
 void AppendRangeMembers(ReplyBuilder& builder,
                         const storage::SortedSetResult& result,
                         bool with_scores) {
@@ -235,32 +235,11 @@ void AppendRangeMembers(ReplyBuilder& builder,
     return;
   }
   const bool nested = with_scores && builder.version() == RespVersion::k3;
-  auto bytes = builder.View().size();
   const auto maximum = std::string{}.max_size();
-  auto add = [&](std::size_t count) {
-    if (count > maximum - bytes)
-      throw std::length_error("RESP reply is too large");
-    bytes += count;
-  };
-  if (with_scores) {
-    // Container count fits in size_t because each output owns at least one
-    // descriptor; guard the flattened count before multiplying regardless.
-    if (!nested && count > maximum / 2)
-      throw std::length_error("RESP reply is too large");
-    add(std::numeric_limits<std::size_t>::digits10 + 4);  // Array header.
-    for (std::size_t i = 0; i < count; ++i) {
-      const auto member = result.member_view(i);
-      std::size_t digits = 1;
-      for (auto length = member.member_.size(); length >= 10; length /= 10)
-        ++digits;
-      add(digits + 5);
-      add(member.member_.size());
-      // RESP3 has a nested pair plus a typed double. RESP2 has a bulk double
-      // with at most two length digits. Both fit this common bound.
-      add(kMaximumFormattedDoubleBytes + 7);
-    }
-    builder.Reserve(bytes);
-  }
+  // Container count fits in size_t because each output owns at least one
+  // descriptor; guard the flattened count before multiplying regardless.
+  if (with_scores && !nested && count > maximum / 2)
+    throw std::length_error("RESP reply is too large");
   builder.AppendArrayHeader(count * (with_scores && !nested ? 2 : 1));
   if (!with_scores) {
     builder.AppendBulkStrings(std::views::iota(std::size_t{0}, count),
