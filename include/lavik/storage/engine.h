@@ -32,6 +32,7 @@
 #include <string_view>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/lease_deadline.h"
@@ -753,7 +754,9 @@ enum class ListOperationKind : std::uint8_t {
 // the lifetime of the awaited call.
 struct ListOperation {
   ListOperationKind kind_ = ListOperationKind::kLength;
-  std::vector<std::string_view> values_;
+  // Single-element pushes need no separate operand allocation. Larger batches
+  // spill normally; the bytes remain owned by the awaited command request.
+  absl::InlinedVector<std::string_view, 1> values_;
   std::string_view value_;
   std::string_view pivot_;
   std::int64_t first_ = 0;
@@ -831,8 +834,10 @@ enum class HashOperationKind : std::uint8_t {
 // fields_/values_ arrays; field-only operations leave values_ empty.
 struct HashOperation {
   HashOperationKind kind_ = HashOperationKind::kLength;
-  std::vector<std::string_view> fields_;
-  std::vector<std::string_view> values_;
+  // Point commands dominate this interface. Inline the common operand pair
+  // without retaining a worker-wide scratch buffer across coroutine waits.
+  absl::InlinedVector<std::string_view, 1> fields_;
+  absl::InlinedVector<std::string_view, 1> values_;
   std::int64_t count_ = 0;
   std::uint64_t cursor_ = 0;
   std::uint64_t scan_count_ = 10;
@@ -1008,14 +1013,16 @@ struct StreamRangeAccess {
 
 // A writable callback sees only the named messages and may remove them. Storage
 // maintains their logical node boundaries; consumer groups and PEL are omitted.
+// The selection owns its IDs across storage waits; a single ID needs no
+// separate descriptor allocation.
 struct StreamDeleteAccess {
-  std::vector<std::array<std::uint64_t, 2>> ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> ids_{};
 };
 
 // A writable callback may only remove the named pending IDs in this group.
 struct StreamAckAccess {
   std::string group_;
-  std::vector<std::array<std::uint64_t, 2>> ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> ids_{};
 };
 
 // PEL scans seek by ID and retain only matching rows. Pending-history reads
@@ -1034,8 +1041,8 @@ struct StreamPendingAccess {
 struct StreamGroupAccess {
   std::string group_;
   std::vector<std::string> consumers_{};
-  std::vector<std::array<std::uint64_t, 2>> pending_ids_{};
-  std::vector<std::array<std::uint64_t, 2>> entry_ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> pending_ids_{};
+  absl::InlinedVector<std::array<std::uint64_t, 2>, 1> entry_ids_{};
   std::optional<std::uint64_t> read_new_count_ = std::nullopt;
   std::optional<StreamPendingAccess> pending_scan_ = std::nullopt;
   // Delivery callbacks need IDs/counters, while replies read immutable fields

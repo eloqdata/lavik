@@ -488,6 +488,124 @@ TEST(GroupedTransferE2e, SetAggregationPagesPreserveErrorsAliasesAndLimits) {
   }
 }
 
+TEST(GroupedTransferE2e,
+     SetAggregatesPreserveBinaryMembersThroughSourceReplacement) {
+  std::vector<std::string> members{"", "short"};
+  for (unsigned i = 2; i < 96; ++i) {
+    auto member = std::to_string(i) + std::string(256, 'm');
+    member[16] = '\0';
+    members.push_back(std::move(member));
+  }
+  members.back() = std::string(17000, 'z') + '\0';
+  const std::set<std::string> all(members.begin(), members.end());
+  const std::set<std::string> common(members.begin() + 32,
+                                     members.begin() + 64);
+  const std::set<std::string> left_only(members.begin(), members.begin() + 32);
+  auto expect_members = [](const Reply& reply,
+                           const std::set<std::string>& expected) {
+    ASSERT_EQ(reply.kind_, '*') << reply.text_;
+    std::set<std::string> actual;
+    for (const auto& member : reply.items_) {
+      EXPECT_EQ(member.kind_, '$');
+      EXPECT_TRUE(actual.insert(member.text_).second);
+    }
+    EXPECT_EQ(actual, expected);
+  };
+  for (const unsigned workers : {1U, 3U}) {
+    SCOPED_TRACE(workers);
+    PrivateDisk disk;
+    auto key_for_owner = [workers](std::string prefix, unsigned owner) {
+      for (unsigned i = 0;; ++i) {
+        const auto key = prefix + std::to_string(i);
+        if (RedisSlot(key) % workers == owner) return key;
+      }
+    };
+    const auto first = key_for_owner("aggregate-first-", 0);
+    const auto second = key_for_owner("aggregate-second-", workers - 1);
+    const auto destination = key_for_owner("aggregate-destination-", 0);
+    {
+      Server server(disk, workers);
+      Client client(server.port());
+      std::vector<std::string> add_first{"SADD", first};
+      add_first.insert(add_first.end(), members.begin(), members.begin() + 64);
+      ASSERT_EQ(client.Command(add_first).text_, "64");
+      std::vector<std::string> add_second{"SADD", second};
+      add_second.insert(add_second.end(), members.begin() + 32, members.end());
+      ASSERT_EQ(client.Command(add_second).text_, "64");
+      ASSERT_NO_FATAL_FAILURE(expect_members(
+          client.Command({"SUNION", first, second, first}), all));
+      ASSERT_NO_FATAL_FAILURE(expect_members(
+          client.Command({"SINTER", first, second, first}), common));
+      ASSERT_NO_FATAL_FAILURE(expect_members(
+          client.Command({"SDIFF", first, second, second}), left_only));
+      ASSERT_NO_FATAL_FAILURE(
+          expect_members(client.Command({"SDIFF", first, first}), {}));
+      EXPECT_EQ(client.Command({"SINTERCARD", "3", first, second, first}).text_,
+                "32");
+      EXPECT_EQ(client.Command({"SINTERCARD", "2", first, second, "LIMIT", "0"})
+                    .text_,
+                "32");
+      EXPECT_EQ(client.Command({"SINTERCARD", "2", first, second, "LIMIT", "1"})
+                    .text_,
+                "1");
+      EXPECT_EQ(client.Command({"SINTERCARD", "2", first, "absent"}).text_,
+                "0");
+      ASSERT_EQ(client.Command({"SET", "not-a-set", "value"}).text_, "OK");
+      const auto wrong = client.Command(
+          {"SINTERCARD", "3", first, first, "not-a-set", "LIMIT", "1"});
+      EXPECT_EQ(wrong.kind_, '-');
+      EXPECT_TRUE(wrong.text_.starts_with("WRONGTYPE"));
+      // STORE must own its result before deleting a source that is also the
+      // destination. Repeat sources and binary/SSO/oversized members exercise
+      // both duplicate elimination and the backing strings' lifetimes.
+      ASSERT_EQ(
+          client.Command({"SUNIONSTORE", first, first, second, first}).text_,
+          "96");
+      ASSERT_NO_FATAL_FAILURE(
+          expect_members(client.Command({"SMEMBERS", first}), all));
+      ASSERT_EQ(client.Command({"SDIFFSTORE", second, first, second}).text_,
+                "32");
+      ASSERT_NO_FATAL_FAILURE(
+          expect_members(client.Command({"SMEMBERS", second}), left_only));
+      ASSERT_EQ(
+          client.Command({"SINTERSTORE", destination, first, second}).text_,
+          "32");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+#if LAVIK_TEST_FAULTS_AVAILABLE
+    {
+      // Fail after DEL while building the replacement. Rollback releases the
+      // command's input/output owners and restores its independent predecessor.
+      Server server(disk, workers, {}, first, false, 1);
+      Client client(server.port());
+      for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        const auto failed =
+            client.Command({"SUNIONSTORE", first, first, second});
+        ASSERT_EQ(failed.kind_, '-') << failed.text_ << server.Log();
+        EXPECT_NE(failed.text_.find("injected grouped auxiliary"),
+                  std::string::npos);
+        ASSERT_NO_FATAL_FAILURE(
+            expect_members(client.Command({"SMEMBERS", first}), all));
+        ASSERT_NO_FATAL_FAILURE(
+            expect_members(client.Command({"SMEMBERS", second}), left_only));
+      }
+      EXPECT_EQ(client.Command({"SINTERCARD", "2", first, second}).text_, "32");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+#endif
+    Server recovered(disk, 2);
+    Client client(recovered.port());
+    ASSERT_NO_FATAL_FAILURE(
+        expect_members(client.Command({"SMEMBERS", first}), all));
+    ASSERT_NO_FATAL_FAILURE(
+        expect_members(client.Command({"SMEMBERS", second}), left_only));
+    ASSERT_NO_FATAL_FAILURE(
+        expect_members(client.Command({"SMEMBERS", destination}), left_only));
+  }
+}
+
 TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
   PrivateDisk disk;
   std::vector<std::string> members;

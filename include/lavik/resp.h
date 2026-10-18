@@ -16,11 +16,19 @@
 
 #pragma once
 
+#include <cassert>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <functional>
+#include <optional>
+#include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -146,6 +154,31 @@ class ReplyBuilder {
 
   std::string_view AppendSimpleString(std::string_view value);
   std::string_view AppendBulkString(std::string_view value);
+  // Appends bulk elements without a container header, preserving any existing
+  // prefix. Input bytes must remain valid independently of this builder. Checks
+  // the complete wire size before growing once; an unrepresentable size throws
+  // std::length_error without changing the reply. Missing optional elements use
+  // the protocol's semantic null, distinct from a present empty string.
+  std::string_view AppendBulkStrings(std::span<const std::string> values);
+  std::string_view AppendBulkStrings(std::span<const std::string_view> values);
+  std::string_view AppendBulkStrings(
+      std::span<const std::optional<std::string>> values);
+  // Projects elements to string_view or optional<string_view> without an
+  // intermediate container; nullopt uses the protocol's semantic null. Both
+  // passes must yield the same views. Iteration and projection must not throw,
+  // mutate the range, or refer to this builder's buffer.
+  template <typename Range, typename Projection>
+    requires std::ranges::forward_range<const Range> &&
+             std::is_nothrow_invocable_r_v<
+                 std::optional<std::string_view>, Projection&,
+                 std::ranges::range_reference_t<const Range>>
+  std::string_view AppendBulkStrings(const Range& values,
+                                     Projection projection) {
+    return AppendBulkStringsProjected(
+        values, [&](auto&& value) noexcept -> std::optional<std::string_view> {
+          return std::invoke(projection, std::forward<decltype(value)>(value));
+        });
+  }
   std::string_view AppendNullBulkString();
   std::string_view AppendNullArray();
   // A protocol-semantic null. RESP2 represents it as a null bulk string,
@@ -178,6 +211,63 @@ class ReplyBuilder {
   [[nodiscard]] std::string Release() && { return std::move(buffer_); }
 
  private:
+  template <typename Range, typename Projection>
+  std::string_view AppendBulkStringsProjected(const Range& values,
+                                              Projection projection) {
+    if (std::ranges::empty(values)) return buffer_;
+    const std::string_view null =
+        version_ == RespVersion::k3 ? "_\r\n" : "$-1\r\n";
+    const auto prefix = buffer_.size();
+    auto bytes = prefix;
+    auto add = [&](std::size_t count) {
+      if (count > buffer_.max_size() - bytes)
+        throw std::length_error("RESP reply is too large");
+      bytes += count;
+    };
+    for (auto&& entry : values) {
+      const auto value =
+          std::invoke(projection, std::forward<decltype(entry)>(entry));
+      if (!value) {
+        add(null.size());
+        continue;
+      }
+      std::size_t digits = 1;
+      for (auto length = value->size(); length >= 10; length /= 10) ++digits;
+      add(digits + 5);  // '$', decimal length, and two CRLF pairs.
+      add(value->size());
+    }
+
+    // Input owners survive destination growth. The checked pass makes the
+    // overwrite callback non-throwing without zero-filling a reply-sized tail.
+    buffer_.resize_and_overwrite(bytes, [&](char* data, std::size_t) noexcept {
+      auto* output = data + prefix;
+      for (auto&& entry : values) {
+        const auto value =
+            std::invoke(projection, std::forward<decltype(entry)>(entry));
+        if (!value) {
+          std::memcpy(output, null.data(), null.size());
+          output += null.size();
+          continue;
+        }
+        *output++ = '$';
+        const auto [end, error] =
+            std::to_chars(output, data + bytes, value->size());
+        assert(error == std::errc{});
+        output = end;
+        *output++ = '\r';
+        *output++ = '\n';
+        // A default-constructed empty view may have a null data pointer.
+        if (!value->empty()) std::memcpy(output, value->data(), value->size());
+        output += value->size();
+        *output++ = '\r';
+        *output++ = '\n';
+      }
+      assert(output == data + bytes);
+      return bytes;
+    });
+    return buffer_;
+  }
+
   std::string buffer_;
   RespVersion version_ = RespVersion::k2;
 };

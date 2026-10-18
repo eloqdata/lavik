@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -277,6 +278,93 @@ std::string Resp3Message(std::string_view channel, std::string_view payload) {
          "\r\n" + std::string(payload);
 }
 
+void ExpectSortedSetRangeProtocols(RespClient& resp2, RespClient& resp3) {
+  // Explicit text expectations preserve Redis's fixed/scientific cutovers and
+  // exponent spelling independently of the production formatter. Short members
+  // exercise compact fallback; long binary members force grouped page reads.
+  constexpr std::array<std::pair<std::string_view, std::string_view>, 17>
+      scores{{
+          {"-inf", "-inf"},
+          {"-1.7976931348623157e308", "-1.7976931348623157e+308"},
+          {"-1e20", "-1e+20"},
+          {"-1.5", "-1.5"},
+          {"-1e-7", "-1e-7"},
+          {"0", "0"},
+          {"5e-324", "5e-324"},
+          {"1e-7", "1e-7"},
+          {"1e-6", "0.000001"},
+          {"0.0001", "0.0001"},
+          {"0.001", "0.001"},
+          {"1.5", "1.5"},
+          {"1e7", "10000000"},
+          {"1e18", "1000000000000000000"},
+          {"1e20", "1e+20"},
+          {"1.7976931348623157e308", "1.7976931348623157e+308"},
+          {"inf", "inf"},
+      }};
+  auto bulk = [](std::string_view value) {
+    return "$" + std::to_string(value.size()) + "\r\n" + std::string(value);
+  };
+  for (const bool grouped : {false, true}) {
+    const std::string_view key =
+        grouped ? "protocol-grouped-zset" : "protocol-compact-zset";
+    std::vector<std::string> members;
+    members.reserve(scores.size());
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+      auto member = i == 5 ? std::string{} : "member-" + std::to_string(i);
+      if (grouped && !member.empty()) {
+        member.append("\0\xff", 2);
+        member.append(1024, static_cast<char>('a' + i));
+      }
+      members.push_back(std::move(member));
+    }
+    std::vector<std::string_view> seed{"ZADD", key};
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+      seed.push_back(scores[i].first);
+      seed.push_back(members[i]);
+    }
+    Expect(resp2.Command(seed), ":17", "seed protocol range scores");
+    for (const bool version3 : {false, true}) {
+      auto& client = version3 ? resp3 : resp2;
+      for (const bool reverse : {false, true}) {
+        for (const bool with_scores : {false, true}) {
+          for (const bool limited : {false, true}) {
+            const std::size_t count = limited ? 3 : scores.size();
+            std::vector<std::string_view> command{"ZRANGE", key};
+            if (limited) {
+              command.insert(command.end(), {reverse ? "+inf" : "-inf",
+                                             reverse ? "-inf" : "+inf",
+                                             "BYSCORE", "LIMIT", "2", "3"});
+            } else {
+              command.insert(command.end(), {"0", "-1"});
+            }
+            if (reverse) command.push_back("REV");
+            if (with_scores) command.push_back("WITHSCORES");
+            std::string expected =
+                "*" +
+                std::to_string(count * (with_scores && !version3 ? 2 : 1));
+            for (std::size_t i = 0; i < count; ++i) {
+              const auto position = i + (limited ? 2 : 0);
+              const auto index =
+                  reverse ? scores.size() - 1 - position : position;
+              if (with_scores && version3) expected += "\r\n*2";
+              expected += "\r\n" + bulk(members[index]);
+              if (with_scores)
+                expected +=
+                    "\r\n" + (version3 ? "," + std::string(scores[index].second)
+                                       : bulk(scores[index].second));
+            }
+            Expect(client.Command(command), expected,
+                   "range protocol, direction, bound and score spelling");
+          }
+        }
+      }
+      Expect(client.Command({"ZRANGE", key, "99", "100", "WITHSCORES"}), "*0",
+             "empty scored range protocol");
+    }
+  }
+}
+
 std::string PatternMessage(std::string_view pattern, std::string_view channel,
                            std::string_view payload) {
   return "*4\r\n$8\r\npmessage\r\n$" + std::to_string(pattern.size()) + "\r\n" +
@@ -440,6 +528,7 @@ int main(int argc, char** argv) {
     Expect(
         resp3_client.Command({"ZRANGE", "resp3-zset", "0", "-1", "WITHSCORES"}),
         "*1\r\n*2\r\n$1\r\nm\r\n,1.5", "RESP3 sorted-set scored pairs");
+    ExpectSortedSetRangeProtocols(source_client, resp3_client);
     ExpectContains(resp3_client.Command({"CONFIG", "GET", "repl-backlog-size"}),
                    "%1\r\n$17\r\nrepl-backlog-size", "RESP3 CONFIG map");
     Expect(resp3_client.Command({"SET", "lcs-a", "abc"}), "+OK", "seed LCS a");

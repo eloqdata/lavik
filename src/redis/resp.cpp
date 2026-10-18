@@ -575,6 +575,28 @@ std::string_view ReplyBuilder::AppendBulkString(std::string_view value) {
   return buffer_;
 }
 
+std::string_view ReplyBuilder::AppendBulkStrings(
+    std::span<const std::string> values) {
+  return AppendBulkStrings(values, [](const std::string& value) noexcept {
+    return std::string_view(value);
+  });
+}
+
+std::string_view ReplyBuilder::AppendBulkStrings(
+    std::span<const std::string_view> values) {
+  return AppendBulkStrings(values, std::identity{});
+}
+
+std::string_view ReplyBuilder::AppendBulkStrings(
+    std::span<const std::optional<std::string>> values) {
+  return AppendBulkStrings(
+      values,
+      [](const std::optional<std::string>& value) noexcept
+          -> std::optional<std::string_view> {
+        return value ? std::optional<std::string_view>(*value) : std::nullopt;
+      });
+}
+
 std::string_view ReplyBuilder::AppendNullBulkString() {
   buffer_.append("$-1\r\n");
   return buffer_;
