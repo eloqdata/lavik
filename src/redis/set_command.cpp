@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -86,9 +87,7 @@ bool ParseInteger(std::string_view text, Integer* output) {
 void AppendBulkArray(ReplyBuilder& builder,
                      const std::vector<std::optional<std::string>>& values) {
   builder.AppendArrayHeader(values.size());
-  for (const auto& value : values) {
-    builder.AppendBulkString(*value);
-  }
+  builder.AppendBulkStrings(values);
 }
 
 Task<CommandReply> ExecuteSetCommandImpl(
@@ -220,9 +219,9 @@ Task<CommandReply> ExecuteSetCommandImpl(
       co_return BuiltReply(reply_builder.AppendInteger(result->length_));
     case CommandKind::kSMembers:
       reply_builder.AppendSetHeader(result->value_count());
-      for (std::size_t i = 0; i < result->value_count(); ++i) {
-        reply_builder.AppendBulkString(*result->value_view(i));
-      }
+      reply_builder.AppendBulkStrings(
+          std::views::iota(std::size_t{0}, result->value_count()),
+          [&result](std::size_t i) noexcept { return result->value_view(i); });
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kSMIsMember:
       reply_builder.AppendArrayHeader(result->values_.size());
@@ -238,9 +237,7 @@ Task<CommandReply> ExecuteSetCommandImpl(
                 : reply_builder.AppendBulkString(*result->values_.front()));
       }
       reply_builder.AppendSetHeader(result->values_.size());
-      for (const auto& value : result->values_) {
-        reply_builder.AppendBulkString(*value);
-      }
+      reply_builder.AppendBulkStrings(result->values_);
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kSRandMember:
       if (!operation.count_provided_) {
@@ -835,9 +832,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   }
   try {
     reply_builder.AppendSetHeader(context.output_.size());
-    for (const std::string& member : context.output_) {
-      reply_builder.AppendBulkString(member);
-    }
+    reply_builder.AppendBulkStrings(context.output_);
     co_return BuiltReply(reply_builder.View());
   } catch (const std::length_error&) {
     co_return BuiltReply(AppendStorageError(reply_builder, SetMultiOom()));

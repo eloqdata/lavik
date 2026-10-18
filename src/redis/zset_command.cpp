@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -30,6 +31,8 @@
 #include <numbers>
 #include <numeric>
 #include <optional>
+#include <ranges>
+#include <stdexcept>
 
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
@@ -84,7 +87,15 @@ bool ParseInt(std::string_view input, T* value) {
   return parsed.ec == std::errc{} && parsed.ptr == input.data() + input.size();
 }
 
-std::string FormatDouble(double value) {
+// Scientific double conversion needs at most 17 significant digits; shortest
+// fixed conversion is no longer than that scientific representation. Redis's
+// notation rules can add at most seven zeroes to scientific digits. Including
+// signs and punctuation, 32 bytes covers either form without reserving the
+// full conversion scratch buffer per member in large WITHSCORES replies.
+constexpr std::size_t kMaximumFormattedDoubleBytes = 32;
+
+std::string_view FormatDoubleTo(
+    double value, std::span<char, kMaximumFormattedDoubleBytes> output) {
   if (value == 0) return std::signbit(value) ? "-0" : "0";
   if (std::isnan(value)) return "nan";
   if (std::isinf(value)) return value < 0 ? "-inf" : "inf";
@@ -93,10 +104,12 @@ std::string FormatDouble(double value) {
       static_cast<double>(std::numeric_limits<std::int64_t>::max() / 2);
   if (std::isfinite(value) && value >= -kSafeIntegerLimit &&
       value <= kSafeIntegerLimit && std::trunc(value) == value) {
-    const auto formatted = std::to_chars(buffer, buffer + sizeof(buffer),
-                                         static_cast<std::int64_t>(value));
-    return formatted.ec == std::errc{} ? std::string(buffer, formatted.ptr)
-                                       : std::string("0");
+    const auto formatted =
+        std::to_chars(output.data(), output.data() + output.size(),
+                      static_cast<std::int64_t>(value));
+    return formatted.ec == std::errc{}
+               ? std::string_view(output.data(), formatted.ptr)
+               : std::string_view("0");
   }
 
   // Redis 7.2's fpconv_dtoa and std::to_chars agree on the shortest
@@ -132,61 +145,135 @@ std::string FormatDouble(double value) {
   const std::size_t decimal_at = mantissa.find('.');
   const std::size_t decimal_position =
       decimal_at == std::string_view::npos ? mantissa.size() : decimal_at;
-  std::string digits;
-  digits.reserve(mantissa.size());
+  char significant[128];
+  auto* significant_end = significant;
   for (char digit : mantissa) {
-    if (digit != '.') digits.push_back(digit);
+    if (digit != '.') *significant_end++ = digit;
   }
+  std::string_view digits(significant, significant_end);
   const std::size_t leading = digits.find_first_not_of('0');
-  if (leading == std::string::npos) return negative ? "-0" : "0";
-  digits.erase(0, leading);
+  if (leading == std::string_view::npos) return negative ? "-0" : "0";
+  digits.remove_prefix(leading);
   const std::int64_t significant_decimal_position =
       static_cast<std::int64_t>(decimal_position) -
       static_cast<std::int64_t>(leading);
   int k = explicit_exponent + static_cast<int>(significant_decimal_position) -
           static_cast<int>(digits.size());
   while (digits.size() > 1 && digits.back() == '0') {
-    digits.pop_back();
+    digits.remove_suffix(1);
     ++k;
   }
 
   const int ndigits = static_cast<int>(digits.size());
   const int scientific_exponent = k + ndigits - 1;
   const int exponent_magnitude = std::abs(scientific_exponent);
-  std::string output;
-  output.reserve(32);
-  if (negative) output.push_back('-');
+  auto* end = output.data();
+  auto append = [&](std::string_view text) {
+    assert(text.size() <=
+           static_cast<std::size_t>(output.data() + output.size() - end));
+    if (!text.empty()) std::memcpy(end, text.data(), text.size());
+    end += text.size();
+  };
+  auto zeroes = [&](std::size_t count) {
+    assert(count <=
+           static_cast<std::size_t>(output.data() + output.size() - end));
+    std::memset(end, '0', count);
+    end += count;
+  };
+  if (negative) *end++ = '-';
   if (k >= 0 && exponent_magnitude < ndigits + 7) {
-    output.append(digits);
-    output.append(static_cast<std::size_t>(k), '0');
-    return output;
+    append(digits);
+    zeroes(static_cast<std::size_t>(k));
+    return std::string_view(output.data(), end);
   }
   if (k < 0 && (k > -7 || exponent_magnitude < 4)) {
     const int offset = ndigits - std::abs(k);
     if (offset <= 0) {
-      output.append("0.");
-      output.append(static_cast<std::size_t>(-offset), '0');
-      output.append(digits);
+      append("0.");
+      zeroes(static_cast<std::size_t>(-offset));
+      append(digits);
     } else {
-      output.append(digits.substr(0, static_cast<std::size_t>(offset)));
-      output.push_back('.');
-      output.append(digits.substr(static_cast<std::size_t>(offset)));
+      append(digits.substr(0, static_cast<std::size_t>(offset)));
+      *end++ = '.';
+      append(digits.substr(static_cast<std::size_t>(offset)));
     }
-    return output;
+    return std::string_view(output.data(), end);
   }
-  output.push_back(digits.front());
+  *end++ = digits.front();
   if (digits.size() > 1) {
-    output.push_back('.');
-    output.append(digits.substr(1));
+    *end++ = '.';
+    append(digits.substr(1));
   }
-  output.push_back('e');
-  output.push_back(scientific_exponent < 0 ? '-' : '+');
-  output.append(std::to_string(exponent_magnitude));
-  return output;
+  *end++ = 'e';
+  *end++ = scientific_exponent < 0 ? '-' : '+';
+  const auto exponent =
+      std::to_chars(end, output.data() + output.size(), exponent_magnitude);
+  assert(exponent.ec == std::errc{});
+  return std::string_view(output.data(), exponent.ptr);
+}
+
+std::string FormatDouble(double value) {
+  std::array<char, kMaximumFormattedDoubleBytes> buffer;
+  return std::string(FormatDoubleTo(value, buffer));
 }
 
 void AppendScore(ReplyBuilder& builder, double score) {
-  builder.AppendDoubleText(FormatDouble(score));
+  std::array<char, kMaximumFormattedDoubleBytes> buffer;
+  builder.AppendDoubleText(FormatDoubleTo(score, buffer));
+}
+
+// The result accessor handles both owned members and immutable packed blocks.
+// Reserve the scored reply once, using a fixed upper bound for formatted scores
+// so they need only one conversion. Plain replies use exact batch sizing.
+void AppendRangeMembers(ReplyBuilder& builder,
+                        const storage::SortedSetResult& result,
+                        bool with_scores) {
+  const auto count = result.member_count();
+  if (count == 0) {
+    builder.AppendArrayHeader(0);
+    return;
+  }
+  const bool nested = with_scores && builder.version() == RespVersion::k3;
+  auto bytes = builder.View().size();
+  const auto maximum = std::string{}.max_size();
+  auto add = [&](std::size_t count) {
+    if (count > maximum - bytes)
+      throw std::length_error("RESP reply is too large");
+    bytes += count;
+  };
+  if (with_scores) {
+    // Container count fits in size_t because each output owns at least one
+    // descriptor; guard the flattened count before multiplying regardless.
+    if (!nested && count > maximum / 2)
+      throw std::length_error("RESP reply is too large");
+    add(std::numeric_limits<std::size_t>::digits10 + 4);  // Array header.
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto member = result.member_view(i);
+      std::size_t digits = 1;
+      for (auto length = member.member_.size(); length >= 10; length /= 10)
+        ++digits;
+      add(digits + 5);
+      add(member.member_.size());
+      // RESP3 has a nested pair plus a typed double. RESP2 has a bulk double
+      // with at most two length digits. Both fit this common bound.
+      add(kMaximumFormattedDoubleBytes + 7);
+    }
+    builder.Reserve(bytes);
+  }
+  builder.AppendArrayHeader(count * (with_scores && !nested ? 2 : 1));
+  if (!with_scores) {
+    builder.AppendBulkStrings(std::views::iota(std::size_t{0}, count),
+                              [&result](std::size_t index) noexcept {
+                                return result.member_view(index).member_;
+                              });
+    return;
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    const auto member = result.member_view(i);
+    if (nested) builder.AppendArrayHeader(2);
+    builder.AppendBulkString(member.member_);
+    AppendScore(builder, member.score_);
+  }
 }
 
 void AppendMemberScore(ReplyBuilder& builder, std::string_view member,
@@ -1512,7 +1599,7 @@ Task<CommandReply> ExecuteImpl(
       builder.AppendArrayHeader(result->scores_.size());
     for (const auto score : result->scores_) {
       if (score)
-        builder.AppendDoubleText(FormatDouble(*score));
+        AppendScore(builder, *score);
       else
         builder.AppendNull();
     }
@@ -1632,15 +1719,7 @@ Task<CommandReply> ExecuteImpl(
       }
       co_return Built(builder.AppendInteger(*result->rank_));
     }
-    const bool nested = with_scores && builder.version() == RespVersion::k3;
-    builder.AppendArrayHeader(result->member_count() *
-                              (with_scores && !nested ? 2 : 1));
-    for (std::size_t i = 0; i < result->member_count(); ++i) {
-      const auto member = result->member_view(i);
-      if (nested) builder.AppendArrayHeader(2);
-      builder.AppendBulkString(member.member_);
-      if (with_scores) AppendScore(builder, member.score_);
-    }
+    AppendRangeMembers(builder, *result, with_scores);
     co_return Built(builder.View());
   }
 
@@ -1659,14 +1738,7 @@ Task<CommandReply> ExecuteImpl(
               ? builder.AppendNull()
               : builder.AppendBulkString(result->members_.front().member_));
     const bool with_scores = a.size() == 4;
-    const bool nested = with_scores && builder.version() == RespVersion::k3;
-    builder.AppendArrayHeader(result->members_.size() *
-                              (with_scores && !nested ? 2 : 1));
-    for (const auto& member : result->members_) {
-      if (nested) builder.AppendArrayHeader(2);
-      builder.AppendBulkString(member.member_);
-      if (with_scores) AppendScore(builder, member.score_);
-    }
+    AppendRangeMembers(builder, *result, with_scores);
     co_return Built(builder.View());
   }
   co_return Built(builder.AppendError("ERR unsupported Sorted Set operation"));

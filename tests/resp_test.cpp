@@ -18,8 +18,11 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstring>
+#include <forward_list>
 #include <limits>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -455,6 +458,172 @@ TEST(ReplyBuilderTest, ReusesBoundedCapacityAndReleasesOversizedBuffer) {
   builder.Reserve(128 * 1024);
   ASSERT_GT(builder.Capacity(), 64 * 1024);
   builder.Reset();
+  EXPECT_LE(builder.Capacity(), 64 * 1024);
+}
+
+TEST(ReplyBuilderTest, BulkElementsPreservePrefixAndBinaryPayloads) {
+  const std::vector<std::string> values{"", std::string("a\0b\r\n", 5), "tail"};
+  ReplyBuilder builder;
+  builder.AppendArrayHeader(values.size());
+  const char wire[] = "*3\r\n$0\r\n\r\n$5\r\na\0b\r\n\r\n$4\r\ntail\r\n";
+  const std::string expected(wire, sizeof(wire) - 1);
+  EXPECT_EQ(builder.AppendBulkStrings(values), expected);
+  builder.AppendInteger(7);
+  EXPECT_EQ(builder.View(), expected + ":7\r\n");
+  EXPECT_EQ(values[1], std::string("a\0b\r\n", 5));
+}
+
+TEST(ReplyBuilderTest, BulkElementsDistinguishNullFromEmptyInBothProtocols) {
+  const std::vector<std::optional<std::string>> values{
+      std::nullopt, std::string{}, "value", std::nullopt};
+  ReplyBuilder builder;
+  builder.AppendMapHeader(2);
+  EXPECT_EQ(builder.AppendBulkStrings(values),
+            "*4\r\n$-1\r\n$0\r\n\r\n$5\r\nvalue\r\n$-1\r\n");
+  builder.Reset();
+  builder.SetVersion(RespVersion::k3);
+  builder.AppendMapHeader(2);
+  EXPECT_EQ(builder.AppendBulkStrings(values),
+            "%2\r\n_\r\n$0\r\n\r\n$5\r\nvalue\r\n_\r\n");
+}
+
+TEST(ReplyBuilderTest, BulkViewsPreserveEmptyAndBorrowedBinaryValues) {
+  const std::string payload("a\0b\r\n", 5);
+  const std::array<std::string_view, 3> values{std::string_view{}, payload,
+                                               "tail"};
+  for (const auto version : {RespVersion::k2, RespVersion::k3}) {
+    ReplyBuilder expected(version);
+    ReplyBuilder builder(version);
+    expected.AppendArrayHeader(values.size());
+    builder.AppendArrayHeader(values.size());
+    for (const auto value : values) expected.AppendBulkString(value);
+    EXPECT_EQ(builder.AppendBulkStrings(values), expected.View());
+    EXPECT_EQ(builder.AppendBulkStrings(std::span<const std::string_view>{}),
+              expected.View());
+  }
+}
+
+TEST(ReplyBuilderTest, ProjectedBulkElementsAcceptOwnedAndBorrowedMembers) {
+  struct OwnedMember {
+    std::string member_;
+    OwnedMember(const OwnedMember&) = delete;
+    OwnedMember& operator=(const OwnedMember&) = delete;
+    explicit OwnedMember(std::string member) : member_(std::move(member)) {}
+  };
+  const std::array<OwnedMember, 3> members{OwnedMember(""),
+                                           OwnedMember(std::string("a\0b", 3)),
+                                           OwnedMember(std::string(4096, 'x'))};
+  ReplyBuilder expected;
+  ReplyBuilder builder;
+  expected.AppendArrayHeader(members.size());
+  builder.AppendArrayHeader(members.size());
+  for (const auto& member : members) expected.AppendBulkString(member.member_);
+  EXPECT_EQ(builder.AppendBulkStrings(members, &OwnedMember::member_),
+            expected.View());
+
+  // Non-contiguous forward ranges use the same encoder without materializing
+  // a span or taking ownership of their source bytes.
+  const std::forward_list<std::string_view> views{
+      members[0].member_, members[1].member_, members[2].member_};
+  builder.Reset();
+  builder.Reserve(expected.View().size());
+  builder.AppendArrayHeader(members.size());
+  const auto* data = builder.View().data();
+  std::size_t projections = 0;
+  EXPECT_EQ(builder.AppendBulkStrings(views,
+                                      [&](std::string_view value) noexcept {
+                                        ++projections;
+                                        return value;
+                                      }),
+            expected.View());
+  EXPECT_EQ(projections, 2 * members.size());
+  EXPECT_EQ(builder.View().data(), data);
+}
+
+TEST(ReplyBuilderTest, IndexedProjectionPreservesNullableBinaryViews) {
+  const std::string binary("a\0b\r\n", 5);
+  const std::array<std::optional<std::string_view>, 5> values{
+      std::nullopt, std::string_view{}, binary, "tail", std::nullopt};
+  const char resp2[] =
+      "*5\r\n$-1\r\n$0\r\n\r\n$5\r\na\0b\r\n\r\n$4\r\ntail\r\n$-1\r\n";
+  const char resp3[] =
+      "*5\r\n_\r\n$0\r\n\r\n$5\r\na\0b\r\n\r\n$4\r\ntail\r\n_\r\n";
+  for (const auto version : {RespVersion::k2, RespVersion::k3}) {
+    ReplyBuilder builder(version);
+    builder.AppendArrayHeader(values.size());
+    std::size_t projections = 0;
+    const auto project = [&](std::size_t index) noexcept {
+      ++projections;
+      return values[index];
+    };
+    const auto expected = version == RespVersion::k3
+                              ? std::string_view(resp3, sizeof(resp3) - 1)
+                              : std::string_view(resp2, sizeof(resp2) - 1);
+    EXPECT_EQ(builder.AppendBulkStrings(
+                  std::views::iota(std::size_t{0}, values.size()), project),
+              expected);
+    EXPECT_EQ(projections, 2 * values.size());
+    const auto* data = builder.View().data();
+    const auto capacity = builder.Capacity();
+    EXPECT_EQ(builder.AppendBulkStrings(
+                  std::views::iota(std::size_t{0}, std::size_t{0}), project),
+              expected);
+    EXPECT_EQ(projections, 2 * values.size());
+    EXPECT_EQ(builder.View().data(), data);
+    EXPECT_EQ(builder.Capacity(), capacity);
+  }
+}
+
+TEST(ReplyBuilderTest, EmptyBulkElementsLeaveReplyAndCapacityUnchanged) {
+  ReplyBuilder builder;
+  builder.Reserve(4096);
+  builder.AppendArrayHeader(0);
+  const auto* data = builder.View().data();
+  const auto capacity = builder.Capacity();
+  EXPECT_EQ(builder.AppendBulkStrings(std::span<const std::string>{}),
+            "*0\r\n");
+  EXPECT_EQ(
+      builder.AppendBulkStrings(std::span<const std::optional<std::string>>{}),
+      "*0\r\n");
+  EXPECT_EQ(builder.View().data(), data);
+  EXPECT_EQ(builder.Capacity(), capacity);
+}
+
+TEST(ReplyBuilderTest, BulkElementsHandleDecimalBoundariesAndRetainedCapacity) {
+  std::vector<std::string> values;
+  ReplyBuilder expected;
+  for (const std::size_t length : {0, 1, 9, 10, 99, 100, 999, 1000}) {
+    values.emplace_back(length, static_cast<char>('a' + values.size()));
+    expected.AppendBulkString(values.back());
+  }
+  ReplyBuilder builder;
+  builder.Reserve(expected.View().size() + 32);
+  builder.AppendArrayHeader(values.size());
+  const auto* data = builder.View().data();
+  const auto capacity = builder.Capacity();
+  EXPECT_EQ(builder.AppendBulkStrings(values),
+            std::string("*8\r\n") + std::string(expected.View()));
+  EXPECT_EQ(builder.View().data(), data);
+  EXPECT_EQ(builder.Capacity(), capacity);
+}
+
+TEST(ReplyBuilderTest, BulkElementsGrowForLargeRepliesAndAppendSeveralBatches) {
+  std::string binary(256, '\0');
+  for (std::size_t i = 0; i < binary.size(); ++i)
+    binary[i] = static_cast<char>(i);
+  const std::vector<std::string> values(4096, binary);
+  ReplyBuilder expected;
+  expected.AppendArrayHeader(values.size());
+  for (const auto& value : values) expected.AppendBulkString(value);
+  ReplyBuilder builder;
+  builder.AppendArrayHeader(values.size());
+  const auto split = std::span<const std::string>(values);
+  builder.AppendBulkStrings(split.first(17));
+  builder.AppendBulkStrings(split.subspan(17));
+  EXPECT_EQ(builder.View(), expected.View());
+  ASSERT_GT(builder.Capacity(), 64 * 1024);
+  builder.Reset();
+  EXPECT_TRUE(builder.View().empty());
   EXPECT_LE(builder.Capacity(), 64 * 1024);
 }
 

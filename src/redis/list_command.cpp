@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -128,38 +129,10 @@ std::string_view AppendStorageError(ReplyBuilder& reply_builder,
              : reply_builder.AppendError("ERR ", status.message());
 }
 
-void ReserveBulkArray(ReplyBuilder& builder,
-                      const std::vector<std::string>& values) {
-  if (values.size() < 2) return;
-  // Large reply buffers are released on Reset. Reserve the complete wire size
-  // once so each new array does not repeatedly grow and copy its prefix.
-  // Include any outer array/transaction prefix already in the builder.
-  std::size_t bytes = builder.View().size();
-  auto add = [&](std::size_t count) {
-    if (count > std::numeric_limits<std::size_t>::max() - bytes) return false;
-    bytes += count;
-    return true;
-  };
-  auto add_header = [&](std::size_t count, std::size_t framing) {
-    do {
-      ++framing;
-      count /= 10;
-    } while (count != 0);
-    return add(framing);
-  };
-  // An unrepresentable estimate falls back to ordinary append failure rather
-  // than wrapping the reservation. No wire bytes have been emitted here.
-  if (!add_header(values.size(), 3)) return;
-  for (const auto& value : values)
-    if (!add(value.size()) || !add_header(value.size(), 5)) return;
-  if (bytes > builder.Capacity()) builder.Reserve(bytes);
-}
-
 void AppendBulkArray(ReplyBuilder& builder,
                      const std::vector<std::string>& values) {
-  ReserveBulkArray(builder, values);
   builder.AppendArrayHeader(values.size());
-  for (const std::string& value : values) builder.AppendBulkString(value);
+  builder.AppendBulkStrings(values);
 }
 
 Task<absl::Status> ListLockHoldCallback(void*, const tx::ShardSlice&) {
@@ -542,8 +515,9 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
               : reply_builder.AppendBulkString(result->values_.front()));
     case CommandKind::kLRange:
       reply_builder.AppendArrayHeader(result->value_count());
-      for (std::size_t i = 0; i < result->value_count(); ++i)
-        reply_builder.AppendBulkString(result->value_view(i));
+      reply_builder.AppendBulkStrings(
+          std::views::iota(std::size_t{0}, result->value_count()),
+          [&result](std::size_t i) noexcept { return result->value_view(i); });
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kLSet:
     case CommandKind::kLTrim:

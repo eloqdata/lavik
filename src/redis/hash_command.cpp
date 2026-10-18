@@ -18,6 +18,7 @@
 
 #include <charconv>
 #include <limits>
+#include <ranges>
 
 #include "cluster_gate.h"
 #include "lavik/resp.h"
@@ -108,12 +109,14 @@ Task<CommandReply> ExecuteHashCommandImpl(
       break;
     case CommandKind::kHMGet:
       operation.kind_ = storage::HashOperationKind::kGetMany;
+      operation.fields_.reserve(args.size() - 2);
       for (std::size_t i = 2; i < args.size(); ++i) {
         operation.fields_.push_back(args[i]);
       }
       break;
     case CommandKind::kHDel:
       operation.kind_ = storage::HashOperationKind::kDelete;
+      operation.fields_.reserve(args.size() - 2);
       for (std::size_t i = 2; i < args.size(); ++i) {
         operation.fields_.push_back(args[i]);
       }
@@ -269,25 +272,15 @@ Task<CommandReply> ExecuteHashCommandImpl(
     case CommandKind::kHKeys:
     case CommandKind::kHVals:
       reply_builder.AppendArrayHeader(result->value_count());
-      for (std::size_t i = 0; i < result->value_count(); ++i) {
-        const auto value = result->value_view(i);
-        if (value.has_value()) {
-          reply_builder.AppendBulkString(*value);
-        } else {
-          reply_builder.AppendNull();
-        }
-      }
+      reply_builder.AppendBulkStrings(
+          std::views::iota(std::size_t{0}, result->value_count()),
+          [&result](std::size_t i) noexcept { return result->value_view(i); });
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kHGetAll:
       reply_builder.AppendMapHeader(result->value_count() / 2);
-      for (std::size_t i = 0; i < result->value_count(); ++i) {
-        const auto value = result->value_view(i);
-        if (value.has_value()) {
-          reply_builder.AppendBulkString(*value);
-        } else {
-          reply_builder.AppendNull();
-        }
-      }
+      reply_builder.AppendBulkStrings(
+          std::views::iota(std::size_t{0}, result->value_count()),
+          [&result](std::size_t i) noexcept { return result->value_view(i); });
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kHRandField:
       if (!operation.count_provided_) {
@@ -306,18 +299,14 @@ Task<CommandReply> ExecuteHashCommandImpl(
         }
       } else {
         reply_builder.AppendArrayHeader(result->values_.size());
-        for (const auto& value : result->values_) {
-          reply_builder.AppendBulkString(*value);
-        }
+        reply_builder.AppendBulkStrings(result->values_);
       }
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kHScan:
       reply_builder.AppendArrayHeader(2);
       reply_builder.AppendBulkString(std::to_string(result->cursor_));
       reply_builder.AppendArrayHeader(result->values_.size());
-      for (const auto& value : result->values_) {
-        reply_builder.AppendBulkString(*value);
-      }
+      reply_builder.AppendBulkStrings(result->values_);
       co_return BuiltReply(reply_builder.View());
     default:
       break;
