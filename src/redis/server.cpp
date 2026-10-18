@@ -1547,7 +1547,9 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     ~ReaderDone() { MarkPubSubReaderDone(session_); }
   } reader_done{session};
 
-  ReplyBuilder builder(ctx.resp_version());
+  // Serve waits for this reader to finish before reusing the connection's
+  // builder. The writer consumes owned queue entries, never this buffer.
+  ReplyBuilder& builder = ctx.reply_builder_;
   auto enqueue_command_reply = [&](CommandReply reply) -> Task<absl::Status> {
     if (reply.disk_value_.valid()) {
       const auto bytes = reply.disk_value_.network_bytes();
@@ -1621,7 +1623,6 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     CommandRequest request =
         BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     request.connection_tls_ = stream.IsTls();
-    builder.SetVersion(ctx.resp_version());
     builder.Reset();
     const CommandKind kind = request.kind_;
     if (HasMonitorSessions()) [[unlikely]] {
@@ -1630,7 +1631,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     if (kind == CommandKind::kQuit || kind == CommandKind::kReset) {
       const std::size_t queued_before = ctx.queued_.size();
-      CommandReply reply = co_await DispatchCommand(ctx, request, builder);
+      CommandReply reply = co_await DispatchCommand(ctx, request);
       if (ctx.queued_.size() > queued_before) {
         *multi_input_bytes += command_memory.Detach();
       } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1685,7 +1686,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
 
     const std::size_t queued_before = ctx.queued_.size();
-    CommandReply reply = co_await DispatchCommand(ctx, request, builder);
+    CommandReply reply = co_await DispatchCommand(ctx, request);
     if (ctx.queued_.size() > queued_before) {
       *multi_input_bytes += command_memory.Detach();
     } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1702,7 +1703,6 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     if (succeeded) {
       SetPubSubRespVersion(session, ctx.resp_version());
-      builder.SetVersion(ctx.resp_version());
     }
     if (PubSubSubscriptionCount(session) == 0) {
       ExitPubSubMode(session);
@@ -1931,7 +1931,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       // A worker may start connection cleanup while an earlier pipelined
       // reply is suspended. Do not dispatch another buffered command.
       if (ctx.closing_) co_return absl::OkStatus();
-      reply = co_await DispatchCommand(ctx, request, ctx.reply_builder_);
+      reply = co_await DispatchCommand(ctx, request);
     }
     if (ctx.queued_.size() > queued_before) {
       multi_input_bytes += command_memory.Detach();
