@@ -581,6 +581,226 @@ TEST(GroupedSortedSetWriteE2e,
   EXPECT_EQ(client.Command({"GET", "unrelated"}).text_, "after failure");
 }
 
+struct ZSetMemberLayout {
+  GroupedHashRoot root_;
+  std::map<GroupedRecordId, HashGroupSnapshot> leaves_;
+};
+
+ZSetMemberLayout InspectZSetMembers(const PrivateDisk& disk,
+                                    std::string_view key) {
+  ZSetMemberLayout result;
+  std::uint64_t root_sequence = 0;
+  std::vector<std::pair<RecordHeader, std::string>> records;
+  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+                        std::string_view name, std::string_view payload) {
+    if (name != key) return;
+    if (record.grouped_ && !record.auxiliary_group_ &&
+        record.mutation_sequence_ >= root_sequence) {
+      const auto root = DecodeOrderedCollectionRoot(payload);
+      Check(root.ok() && root->member_index_, "invalid fixture ZSet root");
+      result.root_ = *root->member_index_;
+      root_sequence = record.mutation_sequence_;
+    } else if (record.auxiliary_group_ &&
+               (record.group_prefix_bits_ != 0 || record.group_prefix_ == 0)) {
+      Check(!record.external_, "fixture member page must be inline");
+      records.emplace_back(record, payload);
+    }
+  });
+  Check(root_sequence != 0, "fixture has no grouped ZSet root");
+  std::map<GroupedRecordId, std::uint64_t> sequences;
+  for (const auto& [record, payload] : records) {
+    if (record.group_incarnation_ != result.root_.incarnation_ ||
+        record.mutation_sequence_ > result.root_.revision_)
+      continue;
+    const GroupedRecordId id{record.group_prefix_, record.group_prefix_bits_};
+    if (record.mutation_sequence_ < sequences[id]) continue;
+    sequences[id] = record.mutation_sequence_;
+    if (record.group_retired_) {
+      result.leaves_.erase(id);
+    } else {
+      auto leaf = DecodeHashGroup(payload);
+      Check(leaf.ok(), "invalid fixture member page");
+      result.leaves_[id] = std::move(*leaf);
+    }
+  }
+  Check(result.leaves_.size() == result.root_.group_count_,
+        "incomplete fixture member directory");
+  return result;
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     EncodedMemberInsertionsKeepFlagsBinaryOrderAndRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires member-index owned decode failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "encoded-member-insert";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Choose deletions from the actual persisted routing leaves. Every leaf
+  // then has room for all new operands, independently of the random seed.
+  // The remaining aggregate still exceeds one page and stays grouped.
+  const auto layout = InspectZSetMembers(disk, key);
+  std::vector<std::string> trim{"ZREM", key};
+  for (const auto& [id, leaf] : layout.leaves_) {
+    for (std::size_t i = 32; i < leaf.value_.entries_.size(); ++i) {
+      trim.push_back(leaf.value_.entries_[i].field_);
+      expected.erase(trim.back());
+    }
+  }
+  ASSERT_GT(trim.size(), 2);
+  {
+    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command(trim).text_, std::to_string(trim.size() - 2));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(InspectZSetMembers(disk, key).root_.group_count_,
+            layout.root_.group_count_);
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY", key.c_str());
+    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    const std::string binary("\0member\xff\0", 9);
+    const std::string long_member(1024, '\xff');
+    ASSERT_EQ(client.Command({"ZADD", key, "XX", "512", "missing"}).text_, "0");
+    ASSERT_EQ(client.Command({"ZADD", key, "XX", "INCR", "1", "missing"}).text_,
+              "-1");
+    ASSERT_EQ(client.Command({"ZADD", key, "NX", "512", ""}).text_, "1");
+    expected[""] = 512;
+    ASSERT_EQ(client.Command({"ZADD", key, "NX", "999", ""}).text_, "0");
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "512", binary}).text_, "1");
+    expected[binary] = 512;
+    ASSERT_EQ(client.Command({"ZADD", key, "LT", "512", long_member}).text_,
+              "1");
+    expected[long_member] = 512;
+    ASSERT_EQ(client.Command({"ZADD", key, "GT", "512", "gt-new"}).text_, "1");
+    expected["gt-new"] = 512;
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "INCR", "2.5", "increment-new"}).text_,
+        "2.5");
+    expected["increment-new"] = 2.5;
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "-2.5", "zincr-new"}).text_,
+              "-2.5");
+    expected["zincr-new"] = -2.5;
+    // Repeated operands are a batch even when they name one absent member.
+    // The failure must not publish the first operand's private insertion.
+    const auto repeated =
+        client.Command({"ZADD", key, "NX", "1", "repeat", "2", "repeat"});
+    EXPECT_EQ(repeated.kind_, '-');
+    EXPECT_NE(repeated.text_.find("owned decode failure"), std::string::npos);
+    EXPECT_EQ(client.Command({"ZSCORE", key, "repeat"}).text_, "-1");
+    const auto batch =
+        client.Command({"ZADD", key, "1", "batch-a", "2", "batch-b"});
+    EXPECT_EQ(batch.kind_, '-');
+    EXPECT_NE(batch.text_.find("owned decode failure"), std::string::npos);
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     EncodedMemberInsertionOverflowUsesDecodedSplitAndRecovers) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires member-index owned decode failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "encoded-member-overflow";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto layout = InspectZSetMembers(disk, key);
+  const auto& [id, leaf] = *std::min_element(
+      layout.leaves_.begin(), layout.leaves_.end(),
+      [](const auto& a, const auto& b) {
+        return a.second.field_count() < b.second.field_count();
+      });
+  const auto encoded = EncodeHashGroup(leaf);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  const auto old_bytes = encoded->size() - kHashGroupHeaderBytes;
+  ASSERT_LE(old_bytes + 16 + 32, kCollectionGroupTargetBytes);
+  auto routed_member = [&](std::size_t size, std::string prefix) {
+    for (unsigned i = 0; i < 100000; ++i) {
+      auto member = prefix + std::to_string(i);
+      Check(member.size() <= size, "fixture routed member too short");
+      member.resize(size, '\0');
+      if (id.ContainsHash(ComputeDigest(member, layout.root_.seed_).value_) &&
+          !expected.contains(member))
+        return member;
+    }
+    throw std::runtime_error("cannot find fixture member in selected prefix");
+  };
+  const auto filler =
+      routed_member(kCollectionGroupTargetBytes - old_bytes - 16, "fill-");
+  const auto overflow = routed_member(32, "overflow-");
+  const std::string oversized(16384, 'z');
+  {
+    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"ZADD", key, "511", filler}).text_, "1");
+    expected[filler] = 511;
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto full = InspectZSetMembers(disk, key);
+  ASSERT_EQ(full.root_.group_count_, layout.root_.group_count_);
+  const auto full_payload = EncodeHashGroup(full.leaves_.at(id));
+  ASSERT_TRUE(full_payload.ok()) << full_payload.status();
+  ASSERT_EQ(full_payload->size() - kHashGroupHeaderBytes,
+            kCollectionGroupTargetBytes);
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY", key.c_str());
+    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    for (const auto& member : {overflow, oversized}) {
+      const auto failed = client.Command({"ZADD", key, "511", member});
+      EXPECT_EQ(failed.kind_, '-');
+      EXPECT_NE(failed.text_.find("owned decode failure"), std::string::npos);
+      EXPECT_EQ(client.Command({"ZSCORE", key, member}).text_, "-1");
+    }
+    // A full leaf still supports an equal-width existing-member update.
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "512", filler}).text_, "1");
+    expected[filler] = 512;
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    for (const auto& member : {overflow, oversized}) {
+      ASSERT_EQ(client.Command({"ZADD", key, "511", member}).text_, "1");
+      expected[member] = 511;
+    }
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // The short insertion splits an ordinary full prefix; the oversized entry
+  // also retains its existing bounded owned-encoder path.
+  ASSERT_GT(InspectZSetMembers(disk, key).root_.group_count_,
+            layout.root_.group_count_);
+  Server recovered(disk, 1, {}, {}, false, 2, "128M");
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
 TEST(GroupedSortedSetWriteE2e, DuplicateMemberInputsKeepSequentialConditions) {
   PrivateDisk disk;
   const std::string key = "duplicate-zadd";

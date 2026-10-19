@@ -23,6 +23,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -90,6 +91,34 @@ struct OrderedCollectionEntryView {
   double score_ = 0;
 };
 
+struct OrderedGroupSnapshot;
+struct OrderedGroupSplit;
+
+// An owned, immutable member sequence certified by the checked Sorted Set
+// splitter. Moving the original vector preserves its allocations. Only const
+// access escapes: changing an after-image requires a new mutable snapshot and
+// full validation, not a flag that can outlive edits to public entries_.
+class CheckedSortedSetEntries {
+ public:
+  CheckedSortedSetEntries(const CheckedSortedSetEntries&) = default;
+  CheckedSortedSetEntries& operator=(const CheckedSortedSetEntries&) = default;
+  CheckedSortedSetEntries(CheckedSortedSetEntries&&) noexcept = default;
+  CheckedSortedSetEntries& operator=(CheckedSortedSetEntries&&) noexcept =
+      default;
+  std::span<const OrderedCollectionEntry> entries() const noexcept {
+    return entries_;
+  }
+
+ private:
+  friend absl::StatusOr<OrderedGroupSplit> SplitCheckedSortedSetGroup(
+      OrderedGroupSnapshot group, std::uint64_t next_group_id,
+      std::size_t target_bytes);
+  explicit CheckedSortedSetEntries(std::vector<OrderedCollectionEntry> entries)
+      : entries_(std::move(entries)) {}
+
+  std::vector<OrderedCollectionEntry> entries_;
+};
+
 struct OrderedCollectionRoot {
   OrderedCollectionKind kind_ = OrderedCollectionKind::kList;
   std::uint64_t incarnation_ = 0;
@@ -133,7 +162,19 @@ struct OrderedGroupSnapshot {
   // page writes, including suspension; decoding always produces owned entries.
   // Routing directories and asynchronous commit receipts never retain it.
   std::optional<std::string_view> borrowed_string_ = std::nullopt;
+  // Final Sorted Set after-images may own checked immutable entries instead
+  // of entries_. Link/identity changes still undergo ordinary encoder checks;
+  // member edits and rebalance must finish before this representation exists.
+  std::optional<CheckedSortedSetEntries> checked_sorted_set_ = std::nullopt;
 };
+
+// Read either mutable-plan entries or a final checked Sorted Set after-image.
+// The returned span borrows the snapshot and cannot modify its members.
+inline std::span<const OrderedCollectionEntry> OrderedGroupEntries(
+    const OrderedGroupSnapshot& group) noexcept {
+  return group.checked_sorted_set_ ? group.checked_sorted_set_->entries()
+                                   : std::span(group.entries_);
+}
 
 // Returns a String segment's raw bytes from its owned or borrowed form. The
 // caller must keep that form's owner alive and unchanged while using the view.
@@ -151,7 +192,7 @@ inline std::size_t OrderedGroupSize(
     const OrderedGroupSnapshot& group) noexcept {
   return group.kind_ == OrderedCollectionKind::kString
              ? OrderedStringBytes(group).size()
-             : group.entries_.size();
+             : OrderedGroupEntries(group).size();
 }
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
@@ -596,6 +637,16 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(
 // the ordinary extent layer stores it. The caller must update the following
 // neighbour's previous link if this returns more than one page.
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(
+    OrderedGroupSnapshot group, std::uint64_t next_group_id,
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
+
+// Fully validates a mutable Sorted Set after-image before partitioning, then
+// freezes each resulting member sequence. Subsequent encoders can reuse that
+// uniqueness proof without another member hash set; identity, framing, score
+// and ordering checks remain. No member edits or rebalance may follow, though
+// callers may finish page links before publication. Other kinds, already
+// frozen pages and all default codec entry points keep their ordinary paths.
+absl::StatusOr<OrderedGroupSplit> SplitCheckedSortedSetGroup(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
     std::size_t target_bytes = kCollectionGroupTargetBytes);
 

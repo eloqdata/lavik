@@ -143,19 +143,30 @@ absl::StatusOr<std::size_t> ValidateGroup(
     SortedSetMemberValidation validation =
         SortedSetMemberValidation::kVerifyUnique) {
   const bool borrowed_string = group.borrowed_string_.has_value();
+  if (group.checked_sorted_set_ &&
+      (group.kind_ != OrderedCollectionKind::kSortedSet ||
+       !group.entries_.empty() || borrowed_string))
+    return absl::InvalidArgumentError("invalid checked Sorted Set entries");
+  const auto entries = OrderedGroupEntries(group);
   if (borrowed_string && (group.kind_ != OrderedCollectionKind::kString ||
                           !group.entries_.empty()))
     return absl::InvalidArgumentError("invalid borrowed String segment");
   if (group.incarnation_ == 0 || group.id_ == 0 ||
       group.previous_ == group.id_ || group.next_ == group.id_ ||
       (group.previous_ != 0 && group.previous_ == group.next_) ||
-      group.entries_.size() > std::numeric_limits<std::uint32_t>::max() ||
-      (group.retired_ ? (!group.entries_.empty() || borrowed_string ||
+      entries.size() > std::numeric_limits<std::uint32_t>::max() ||
+      (group.retired_ ? (!entries.empty() || borrowed_string ||
                          group.previous_ != 0 || group.next_ != 0)
-                      : (group.entries_.empty() && !borrowed_string))) {
+                      : (entries.empty() && !borrowed_string))) {
     return absl::InvalidArgumentError("invalid ordered page identity or state");
   }
-  auto status = ValidateEntries(group.kind_, group.entries_, validation);
+  // Only the checked splitter can create this immutable owner, after full
+  // after-image validation. It cannot become stale through a member edit.
+  // All structural and order checks still run after callers finish links.
+  auto status = ValidateEntries(group.kind_, entries,
+                                group.checked_sorted_set_
+                                    ? SortedSetMemberValidation::kTrustStored
+                                    : validation);
   if (!status.ok()) return status;
   if (group.kind_ == OrderedCollectionKind::kString) {
     const auto size = OrderedGroupSize(group);
@@ -168,7 +179,7 @@ absl::StatusOr<std::size_t> ValidateGroup(
     return kOrderedGroupHeaderBytes + size;
   }
   std::size_t bytes = kOrderedGroupHeaderBytes;
-  for (const auto& entry : group.entries_) {
+  for (const auto& entry : entries) {
     if (bytes > kMaxRecordPayloadBytes - kEntryHeaderBytes ||
         entry.value_.size() >
             kMaxRecordPayloadBytes - kEntryHeaderBytes - bytes) {
@@ -417,8 +428,9 @@ std::optional<std::string_view> OrderedGroupEncoder::Next() noexcept {
     ++entry_;
     return OrderedStringBytes(*group_);
   }
-  if (entry_ == group_->entries_.size()) return std::nullopt;
-  const auto& entry = group_->entries_[entry_];
+  const auto entries = OrderedGroupEntries(*group_);
+  if (entry_ == entries.size()) return std::nullopt;
+  const auto& entry = entries[entry_];
   if (phase_ == 1) {
     phase_ = 2;
     Store(entry_header_, 0, entry.value_.size(), 4);
@@ -726,8 +738,9 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
     return absl::DataLossError("inconsistent ordered page neighbours");
   }
   if (left.kind_ == OrderedCollectionKind::kString) return absl::OkStatus();
-  return ValidateOrderedEntryBoundary(left.kind_, left.entries_.back(),
-                                      right.entries_.front());
+  return ValidateOrderedEntryBoundary(left.kind_,
+                                      OrderedGroupEntries(left).back(),
+                                      OrderedGroupEntries(right).front());
 }
 
 absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Recover(
@@ -1631,6 +1644,7 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(OrderedGroupSnapshot& left,
                                                  std::size_t target_bytes) {
   if (left.kind_ != OrderedCollectionKind::kSortedSet ||
       right.kind_ != left.kind_ || left.incarnation_ == 0 ||
+      left.checked_sorted_set_ || right.checked_sorted_set_ ||
       left.incarnation_ != right.incarnation_ || left.id_ == 0 ||
       right.id_ == 0 || left.id_ == right.id_ || left.retired_ ||
       right.retired_ || left.next_ != right.id_ ||
@@ -1720,7 +1734,7 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
   if (target_bytes <= kOrderedGroupHeaderBytes ||
       target_bytes > kMaxRecordPayloadBytes ||
       next_group_id <= std::max({group.id_, group.previous_, group.next_}) ||
-      group.retired_ || group.entries_.empty()) {
+      group.retired_ || group.checked_sorted_set_ || group.entries_.empty()) {
     return absl::InvalidArgumentError("invalid ordered split input");
   }
   // A promotion can exceed one record's aggregate limit. Validate individual
@@ -1816,6 +1830,26 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
                                false);
 }
 
+absl::StatusOr<OrderedGroupSplit> SplitCheckedSortedSetGroup(
+    OrderedGroupSnapshot group, std::uint64_t next_group_id,
+    std::size_t target_bytes) {
+  if (group.kind_ != OrderedCollectionKind::kSortedSet ||
+      group.borrowed_string_)
+    return absl::InvalidArgumentError("checked split requires a Sorted Set");
+  auto split = SplitOrderedGroupImpl(std::move(group), next_group_id,
+                                     target_bytes, false);
+  if (!split.ok()) return split.status();
+  for (auto& page : split->groups_) {
+    // Splitting only partitions the fully validated input. Freezing the
+    // ownership here also covers duplicates that would land in separate
+    // outputs: validation happened before choosing page boundaries.
+    page.checked_sorted_set_ =
+        CheckedSortedSetEntries(std::move(page.entries_));
+    page.entries_.clear();
+  }
+  return split;
+}
+
 absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     const OrderedGroupDirectory& directory,
     std::vector<LoadedOrderedGroup> loaded_groups, std::uint64_t rank,
@@ -1854,8 +1888,8 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
     const auto* found = directory.Find(page.id_);
     if (found == nullptr || candidate.sequence_ != found->sequence_ ||
         page.incarnation_ != root.incarnation_ || page.kind_ != root.kind_ ||
-        page.retired_ || page.previous_ != found->previous_ ||
-        page.next_ != found->next_ ||
+        page.retired_ || page.checked_sorted_set_ ||
+        page.previous_ != found->previous_ || page.next_ != found->next_ ||
         page.entries_.size() != found->item_count_) {
       return absl::AbortedError("ordered splice loaded a stale page");
     }

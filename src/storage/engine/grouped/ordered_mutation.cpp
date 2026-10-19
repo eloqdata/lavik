@@ -298,9 +298,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             if (page.kind_ == OrderedCollectionKind::kString)
               compact.push_back(
                   {.value_ = std::string(OrderedStringBytes(page))});
-            else
-              compact.insert(compact.end(), page.entries_.begin(),
-                             page.entries_.end());
+            else {
+              const auto entries = OrderedGroupEntries(page);
+              compact.insert(compact.end(), entries.begin(), entries.end());
+            }
             id = page.next_;
           } else {
             const auto* route = previous->ordered_directory().Find(id);
@@ -450,6 +451,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       continue;
     }
     const auto& page = plan.writes_[i];
+    const auto entries = OrderedGroupEntries(page);
     RecoveredOrderedGroup candidate{
         {.incarnation_ = plan.root_.incarnation_,
          .id_ = page.id_,
@@ -461,8 +463,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
          .encoded_bytes_ = ordered_sizes[i],
          .record_token_ = page.id_,
          .retired_ = group.retired_,
-         .min_score_ = page.entries_.empty() ? 0 : page.entries_.front().score_,
-         .max_score_ = page.entries_.empty() ? 0 : page.entries_.back().score_},
+         .min_score_ = entries.empty() ? 0 : entries.front().score_,
+         .max_score_ = entries.empty() ? 0 : entries.back().score_},
         tx->txid_,
         command_batch};
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {

@@ -2506,6 +2506,15 @@ class StorageEngine::Impl {
     std::optional<double> before_;
     std::optional<double> after_;
   };
+  // A bounded absent-member probe can splice its checked after-image while
+  // the original read lease is live. The request member outlives preparation;
+  // its score and identity must match the eventual typed delta before use.
+  struct SortedSetMemberInsertion {
+    MemoryReservation admission_;
+    std::string_view member_;
+    double score_;
+    HashGroupSnapshot replacement_;
+  };
   // A single-member writer may hand its checked lookup leaf to index
   // preparation. Ownership is command-local, and the original admission
   // follows its bounded checked bytes or decoded fallback until the prepared
@@ -2515,6 +2524,7 @@ class StorageEngine::Impl {
     GroupedObject::Handle source_;
     HashGroupSnapshot snapshot_;
     std::optional<HashGroupPointProbe> encoded_;
+    std::optional<SortedSetMemberInsertion> insertion_ = std::nullopt;
   };
   // Full-image writers derive changes from complete ordered before/after
   // pages. Typed writers may supply exact changes after checking old members

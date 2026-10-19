@@ -21,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -1048,6 +1049,148 @@ TEST(GroupedCollectionTest, UnsplitPagePreservesStorageAndIdentity) {
       EXPECT_EQ(split->next_group_id_, 20);
     }
   }
+}
+
+TEST(GroupedCollectionTest, CheckedSortedSetSplitOwnsImmutableEntries) {
+  static_assert(!std::is_constructible_v<CheckedSortedSetEntries,
+                                         std::vector<OrderedCollectionEntry>>);
+  static_assert(
+      std::is_same_v<
+          decltype(std::declval<const CheckedSortedSetEntries&>().entries()),
+          std::span<const OrderedCollectionEntry>>);
+  auto page = Page(7, 184, OrderedCollectionKind::kSortedSet);
+  page.previous_ = 3;
+  page.next_ = 9;
+  for (auto& entry : page.entries_) entry.value_.resize(32, 'x');
+  const auto expected = page.entries_;
+  const auto* entries_storage = page.entries_.data();
+  const auto* member_storage = page.entries_.front().value_.data();
+  auto before = EncodeOrderedGroup(page);
+  ASSERT_TRUE(before.ok()) << before.status();
+
+  auto split = SplitCheckedSortedSetGroup(std::move(page), 20);
+  ASSERT_TRUE(split.ok()) << split.status();
+  ASSERT_EQ(split->groups_.size(), 1);
+  auto kept = std::move(split->groups_.front());
+  ASSERT_TRUE(kept.checked_sorted_set_.has_value());
+  EXPECT_TRUE(kept.entries_.empty());
+  const auto entries = OrderedGroupEntries(kept);
+  ASSERT_EQ(entries.size(), expected.size());
+  EXPECT_EQ(entries.data(), entries_storage);
+  EXPECT_EQ(entries.front().value_.data(), member_storage);
+  EXPECT_TRUE(std::equal(entries.begin(), entries.end(), expected.begin()));
+  EXPECT_EQ(OrderedGroupSize(kept), expected.size());
+  auto encoded = EncodeOrderedGroup(kept);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_EQ(*encoded, *before);
+  // Link publication follows the split, but the immutable member sequence
+  // and its proof survive ownership moves without another payload copy.
+  kept.previous_ = 2;
+  kept.next_ = 12;
+  encoded = EncodeOrderedGroup(kept);
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  auto decoded = DecodeOrderedGroup(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_FALSE(decoded->checked_sorted_set_.has_value());
+  EXPECT_EQ(decoded->entries_, expected);
+  EXPECT_EQ(decoded->previous_, 2);
+  EXPECT_EQ(decoded->next_, 12);
+}
+
+TEST(GroupedCollectionTest, CheckedSortedSetSplitMatchesOrdinarySplit) {
+  auto page = Page(7, 30, OrderedCollectionKind::kSortedSet);
+  page.previous_ = 3;
+  page.next_ = 9;
+  for (auto& entry : page.entries_) entry.value_.resize(32, 'x');
+  // Include an indivisible oversized member between ordinary pages.
+  page.entries_[15].value_.resize(4096, 'x');
+  auto ordinary = SplitOrderedGroup(page, 20, 256);
+  auto checked = SplitCheckedSortedSetGroup(std::move(page), 20, 256);
+  ASSERT_TRUE(ordinary.ok()) << ordinary.status();
+  ASSERT_TRUE(checked.ok()) << checked.status();
+  ASSERT_EQ(checked->groups_.size(), ordinary->groups_.size());
+  EXPECT_EQ(checked->next_group_id_, ordinary->next_group_id_);
+  for (std::size_t i = 0; i < ordinary->groups_.size(); ++i) {
+    ASSERT_TRUE(checked->groups_[i].checked_sorted_set_.has_value());
+    auto expected = EncodeOrderedGroup(ordinary->groups_[i]);
+    auto encoded = EncodeOrderedGroup(checked->groups_[i]);
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    EXPECT_EQ(*encoded, *expected) << i;
+    if (i != 0) {
+      EXPECT_TRUE(ValidateOrderedGroupBoundary(checked->groups_[i - 1],
+                                               checked->groups_[i])
+                      .ok());
+      EXPECT_TRUE(ValidateOrderedGroupBoundary(ordinary->groups_[i - 1],
+                                               checked->groups_[i])
+                      .ok());
+      EXPECT_TRUE(ValidateOrderedGroupBoundary(checked->groups_[i - 1],
+                                               ordinary->groups_[i])
+                      .ok());
+    }
+  }
+}
+
+TEST(GroupedCollectionTest, CheckedSortedSetBoundariesRejectOverlap) {
+  auto left = SplitCheckedSortedSetGroup(
+      Page(7, 3, OrderedCollectionKind::kSortedSet), 20);
+  auto right = SplitCheckedSortedSetGroup(
+      Page(8, 3, OrderedCollectionKind::kSortedSet), 20);
+  ASSERT_TRUE(left.ok()) << left.status();
+  ASSERT_TRUE(right.ok()) << right.status();
+  left->groups_.front().next_ = right->groups_.front().id_;
+  right->groups_.front().previous_ = left->groups_.front().id_;
+  EXPECT_FALSE(ValidateOrderedGroupBoundary(left->groups_.front(),
+                                            right->groups_.front())
+                   .ok());
+}
+
+TEST(GroupedCollectionTest, CheckedSortedSetSplitRejectsUnverifiedAfterimages) {
+  const auto valid = Page(7, 20, OrderedCollectionKind::kSortedSet);
+  const auto rejected = [&](auto change) {
+    auto page = valid;
+    change(page);
+    EXPECT_FALSE(SplitCheckedSortedSetGroup(std::move(page), 20, 128).ok());
+  };
+  // These duplicate names would fall in different output pages. Checking
+  // only each final encoder would miss the invalid input sequence.
+  rejected([](auto& page) {
+    page.entries_.back().value_ = page.entries_.front().value_;
+  });
+  rejected([](auto& page) {
+    page.entries_.front().score_ = std::numeric_limits<double>::quiet_NaN();
+  });
+  rejected([](auto& page) { std::swap(page.entries_[0], page.entries_[1]); });
+  rejected([](auto& page) { page.incarnation_ = 0; });
+  rejected([](auto& page) { page.previous_ = page.id_; });
+  rejected([](auto& page) { page.borrowed_string_ = "invalid"; });
+  EXPECT_FALSE(SplitCheckedSortedSetGroup(Page(), 20).ok());
+}
+
+TEST(GroupedCollectionTest, CheckedSortedSetEntriesKeepEncoderGuards) {
+  auto split = SplitCheckedSortedSetGroup(
+      Page(7, 3, OrderedCollectionKind::kSortedSet), 20);
+  ASSERT_TRUE(split.ok()) << split.status();
+  const auto& valid = split->groups_.front();
+  const auto rejected = [&](auto change) {
+    auto page = valid;
+    change(page);
+    EXPECT_FALSE(OrderedGroupEncoder::Create(page).ok());
+  };
+  rejected([](auto& page) { page.entries_.push_back({"new", 3}); });
+  rejected([](auto& page) { page.kind_ = OrderedCollectionKind::kList; });
+  rejected([](auto& page) { page.retired_ = true; });
+  rejected([](auto& page) { page.id_ = 0; });
+  rejected([](auto& page) { page.next_ = page.id_; });
+  rejected([](auto& page) { page.borrowed_string_ = "invalid"; });
+  EXPECT_FALSE(SplitOrderedGroup(valid, 20).ok());
+  EXPECT_FALSE(SplitCheckedSortedSetGroup(valid, 20).ok());
+  auto left = valid;
+  auto right = Page(8, 3, OrderedCollectionKind::kSortedSet);
+  left.next_ = right.id_;
+  right.previous_ = left.id_;
+  for (auto& entry : right.entries_) entry.score_ += 3;
+  EXPECT_FALSE(RebalanceSortedSetGroupPair(left, right).ok());
 }
 
 TEST(GroupedCollectionTest, UnsplitOversizedMemberPreservesStorageAndIdentity) {
