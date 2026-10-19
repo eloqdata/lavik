@@ -17,8 +17,10 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -119,6 +121,34 @@ class CheckedSortedSetEntries {
   std::vector<OrderedCollectionEntry> entries_;
 };
 
+// A fully checked page held in one immutable byte block. Views share that
+// block across snapshot copies/moves, so no physical read lease survives
+// decoding and no member acquires its own string allocation. Only the checked
+// decoder and topology-preserving point editor can construct this owner.
+class EncodedSortedSetEntries {
+ public:
+  std::span<const OrderedCollectionEntryView> entries() const noexcept {
+    return entries_;
+  }
+  std::string_view bytes() const noexcept { return *bytes_; }
+
+ private:
+  friend absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
+      std::string_view bytes);
+  friend absl::StatusOr<std::optional<OrderedGroupSnapshot>>
+  EditEncodedSortedSetGroup(const OrderedGroupSnapshot& page,
+                            std::string_view member,
+                            std::optional<double> before,
+                            std::optional<double> after,
+                            std::size_t target_bytes);
+  EncodedSortedSetEntries(std::shared_ptr<const std::string> bytes,
+                          std::vector<OrderedCollectionEntryView> entries)
+      : bytes_(std::move(bytes)), entries_(std::move(entries)) {}
+  // Declare the owner first so every borrowing view dies before its bytes.
+  std::shared_ptr<const std::string> bytes_;
+  std::vector<OrderedCollectionEntryView> entries_;
+};
+
 struct OrderedCollectionRoot {
   OrderedCollectionKind kind_ = OrderedCollectionKind::kList;
   std::uint64_t incarnation_ = 0;
@@ -166,12 +196,18 @@ struct OrderedGroupSnapshot {
   // of entries_. Link/identity changes still undergo ordinary encoder checks;
   // member edits and rebalance must finish before this representation exists.
   std::optional<CheckedSortedSetEntries> checked_sorted_set_ = std::nullopt;
+  // Ordinary point edits keep the complete, checked entry framing in one
+  // owned block. Topology changes materialize mutable entries before planning.
+  std::optional<EncodedSortedSetEntries> encoded_sorted_set_ = std::nullopt;
 };
 
 // Read either mutable-plan entries or a final checked Sorted Set after-image.
 // The returned span borrows the snapshot and cannot modify its members.
+// Encoded pages expose views through encoded_sorted_set_->entries() instead;
+// a mutable planner must materialize them before using this owned-entry API.
 inline std::span<const OrderedCollectionEntry> OrderedGroupEntries(
     const OrderedGroupSnapshot& group) noexcept {
+  assert(!group.encoded_sorted_set_);
   return group.checked_sorted_set_ ? group.checked_sorted_set_->entries()
                                    : std::span(group.entries_);
 }
@@ -192,6 +228,8 @@ inline std::size_t OrderedGroupSize(
     const OrderedGroupSnapshot& group) noexcept {
   return group.kind_ == OrderedCollectionKind::kString
              ? OrderedStringBytes(group).size()
+         : group.encoded_sorted_set_
+             ? group.encoded_sorted_set_->entries().size()
              : OrderedGroupEntries(group).size();
 }
 
@@ -288,6 +326,26 @@ enum class SortedSetMemberValidation { kVerifyUnique, kTrustStored };
 absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
     std::string_view bytes, SortedSetMemberValidation validation =
                                 SortedSetMemberValidation::kVerifyUnique);
+
+// Fully validates a live Sorted Set page, including member uniqueness, and
+// retains its encoded entries in one owned block after the physical lease ends.
+absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
+    std::string_view bytes);
+
+// Edits one member in an encoded page without changing its ID or links. before
+// and after describe this page only (a cross-page move calls it twice). Returns
+// nullopt for an empty/oversized after-image, leaving topology changes to the
+// ordinary planner. The input is immutable even on failure; score mismatches,
+// duplicate additions and invalid inputs are errors, never silent fallbacks.
+absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
+    const OrderedGroupSnapshot& page, std::string_view member,
+    std::optional<double> before, std::optional<double> after,
+    std::size_t target_bytes = kCollectionGroupTargetBytes);
+
+// Converts a private checked/encoded page into mutable, independently owned
+// entries before split/rebalance planning. Existing mutable pages are
+// unchanged.
+void MaterializeOrderedGroupEntries(OrderedGroupSnapshot& page);
 
 // Validates a complete live List page, including entries outside the requested
 // interval, but allocates/copies only [first, first + count). The interval must
