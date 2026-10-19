@@ -1028,6 +1028,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   };
   // A serial scan retains one physical read lease and borrowed member views.
   // Keep scratch admitted until both disappear; replies own separate copies.
+  const bool point_write =
+      ordered_probe == nullptr &&
+      ((operation.kind_ == SortedSetOperationKind::kAdd &&
+        operation.entries_.size() == 1) ||
+       (operation.kind_ == SortedSetOperationKind::kRemove &&
+        operation.members_.size() == 1));
   SortedSetOrderedProbe local_probe{.source_ = object, .pages_ = {}};
   if (ordered_probe == nullptr) ordered_probe = &local_probe;
   if (ordered_probe->source_.get() != object.get())
@@ -1035,6 +1041,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto& probed_pages = ordered_probe->pages_;
   using OwnedScanPage = SortedSetOrderedProbe::Page;
   auto retain_probe = [&](std::size_t i, OwnedScanPage page) {
+    if (point_write &&
+        metadata[i].encoded_bytes_ <= kCollectionGroupTargetBytes) {
+      // A point writer needs at most its source and destination boundary.
+      // Dense ordinary pages can carry much more admission than encoded
+      // bytes: decoder headroom is charged per member and twice per read.
+      // Keep that full protection, but do not mistake it for page size.
+      if (probed_pages.size() < 2) probed_pages.emplace(i, std::move(page));
+      return;
+    }
     // Reuse is optional, not a batch-sized payload cache. Bound admitted
     // retention (including decoded entry overhead), so large members and
     // wide pops keep the ordinary one-page scan/fallback under maxmemory.
@@ -1046,6 +1061,37 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       bytes += retained.admission_.bytes();
     }
     probed_pages.emplace(i, std::move(page));
+  };
+#if LAVIK_FAULTS_ENABLED
+  bool probe_reservation_failure_injected = false;
+#endif
+  auto reserve_work =
+      [&](const GroupedScratchBudget& budget,
+          std::size_t copies) -> absl::StatusOr<MemoryReservation> {
+    if (point_write && !probed_pages.empty()) {
+      if (copies == 0 ||
+          budget.bytes() > std::numeric_limits<std::size_t>::max() / copies)
+        return absl::ResourceExhaustedError(
+            "grouped scratch peak size overflow");
+      bool retain_pages = true;
+      LAVIK_FAULT_INJECT(
+          if (!probe_reservation_failure_injected &&
+              LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_PROBE_RETAIN_RESERVE_KEY",
+                                  key)) {
+            probe_reservation_failure_injected = true;
+            retain_pages = false;
+          });
+      auto reservation = retain_pages
+                             ? TryReserveMemory(budget.bytes() * copies)
+                             : std::nullopt;
+      if (reservation) return std::move(*reservation);
+      // Retention must not turn a formerly admissible point edit into OOM.
+      // Drop the optional owned pages and their credits together, then use
+      // the ordinary read/plan path. Only that final attempt records a
+      // rejection; a failed cache-preserving attempt is not a failed command.
+      probed_pages.clear();
+    }
+    return budget.Reserve(copies);
   };
   SortedSetPageWorkBudget page_work;
   auto read_page_impl = [&]<typename Page>(std::size_t i,
@@ -1092,7 +1138,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // A parallel wave admits all owned pages before launching children. Its
     // reservation outlives the returned pages; serial probes own theirs here.
     if (limiter == nullptr) {
-      auto reserved = budget.Reserve(2);
+      auto reserved = reserve_work(budget, 2);
       if (!reserved.ok()) co_return reserved.status();
       admission = std::move(*reserved);
     }
@@ -1878,7 +1924,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     status = budget.AddBytes(member.size() + 256);
     if (!status.ok()) co_return status;
   }
-  auto admission = budget.Reserve(4);
+  auto admission = reserve_work(budget, 4);
   if (!admission.ok()) co_return admission.status();
   working_admission.emplace(std::move(*admission));
   auto check_plan_read = [&]([[maybe_unused]] std::size_t i) -> absl::Status {

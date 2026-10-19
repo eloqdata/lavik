@@ -172,6 +172,253 @@ TEST(GroupedSortedSetWriteE2e, SourceAndPopPagesAvoidSecondPlanRead) {
   EXPECT_EQ(client.Command({"ZRANK", key, member(12)}).text_, "10");
 }
 
+std::string DenseZSetMember(unsigned index) {
+  auto member = std::to_string(index);
+  member.insert(0, 31 - member.size(), '0');
+  // One later-score member sorts before the first page's upper boundary.
+  // Moving it onto that score requires the destination boundary probe.
+  member.insert(member.begin(), index == 500 ? 'a' : 'm');
+  return member;
+}
+
+std::vector<std::string> DenseZSetSeed(
+    std::string_view key, std::map<std::string, double>* expected) {
+  std::vector<std::string> command{"ZADD", std::string(key)};
+  for (unsigned index = 0; index < 1024; ++index) {
+    const auto member = DenseZSetMember(index);
+    command.insert(command.end(), {std::to_string(index), member});
+    expected->emplace(member, index);
+  }
+  return command;
+}
+
+void ExpectDenseZSet(Client& client, std::string_view key,
+                     const std::map<std::string, double>& expected) {
+  EXPECT_EQ(client.Command({"ZCARD", std::string(key)}).text_,
+            std::to_string(expected.size()));
+  std::vector<std::string> lookup{"ZMSCORE", std::string(key)};
+  std::vector<std::pair<double, std::string>> ordered;
+  for (const auto& [member, score] : expected) {
+    lookup.push_back(member);
+    ordered.emplace_back(score, member);
+  }
+  const auto scores = client.Command(lookup);
+  ASSERT_EQ(scores.items_.size(), expected.size());
+  std::size_t index = 0;
+  for (const auto& [member, score] : expected) {
+    ASSERT_EQ(scores.items_[index].kind_, '$') << member;
+    EXPECT_EQ(std::stod(scores.items_[index++].text_), score) << member;
+  }
+  std::sort(ordered.begin(), ordered.end());
+  const auto range =
+      client.Command({"ZRANGE", std::string(key), "0", "-1", "WITHSCORES"});
+  ASSERT_EQ(range.items_.size(), ordered.size() * 2);
+  for (index = 0; index < ordered.size(); ++index) {
+    EXPECT_EQ(range.items_[2 * index].text_, ordered[index].second);
+    EXPECT_EQ(std::stod(range.items_[2 * index + 1].text_),
+              ordered[index].first);
+  }
+}
+
+std::optional<OrderedGroupSnapshot> FirstDenseOrderedPage(
+    const PrivateDisk& disk, std::string_view key) {
+  std::optional<OrderedGroupSnapshot> first;
+  std::uint64_t sequence = 0;
+  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+                        std::string_view name, std::string_view payload) {
+    if (name != key || !record.auxiliary_group_ || record.external_ ||
+        record.group_prefix_bits_ != 0)
+      return;
+    const auto page = DecodeOrderedGroup(payload);
+    if (!page.ok() || page->previous_ != 0 || page->retired_ ||
+        record.mutation_sequence_ < sequence)
+      return;
+    first = *page;
+    sequence = record.mutation_sequence_;
+  });
+  return first;
+}
+
+TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires ordered plan read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "dense-source-probe";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped(key), true);
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
+    ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
+    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("maxmemory:134217728\r\n"),
+              std::string::npos);
+    // Dense 32-byte members have small encoded pages but substantial decoder
+    // admission. A recovered source page must survive into the mutation plan
+    // with its full charge, both for in-page edits and moves to another page.
+    ASSERT_EQ(
+        client.Command({"ZINCRBY", key, "0.5", DenseZSetMember(10)}).text_,
+        "10.5");
+    expected[DenseZSetMember(10)] = 10.5;
+    ASSERT_EQ(
+        client.Command({"ZINCRBY", key, "2000", DenseZSetMember(11)}).text_,
+        "2011");
+    expected[DenseZSetMember(11)] = 2011;
+    ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(12)}).text_, "1");
+    expected.erase(DenseZSetMember(12));
+    // The fault is live: an insertion with no source/boundary probe must
+    // still perform and fail its first planner read, without changing either
+    // graph or hiding the failure behind the cache.
+    const auto failed = client.Command({"ZADD", key, "-1", "unprobed"});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
+    ExpectDenseZSet(client, key, expected);
+    EXPECT_EQ(client.Command({"ZSCORE", key, "unprobed"}).text_, "-1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     DensePointDestinationBoundaryAvoidsSecondPlanRead) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires ordered plan read failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "dense-boundary-probe";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    // Make room without changing the first page's upper score. The point
+    // move then tests source+boundary reuse, independently of split policy.
+    ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(20)}).text_, "1");
+    expected.erase(DenseZSetMember(20));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto first = FirstDenseOrderedPage(disk, key);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_GT(first->entries_.size(), 128U);
+  const auto boundary_score = first->entries_.back().score_;
+  ASSERT_GT(500, boundary_score);
+  ASSERT_LT(DenseZSetMember(500), first->entries_.back().value_);
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
+    ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
+    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("maxmemory:134217728\r\n"),
+              std::string::npos);
+    const auto changed =
+        client.Command({"ZINCRBY", key, std::to_string(boundary_score - 500),
+                        DenseZSetMember(500)});
+    ASSERT_EQ(changed.kind_, '$') << changed.text_;
+    EXPECT_EQ(std::stod(changed.text_), boundary_score);
+    expected[DenseZSetMember(500)] = boundary_score;
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires probe-retention reservation failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "dense-probe-fallback";
+  std::map<std::string, double> expected;
+  auto rejections = [](Client& client) {
+    const auto info = client.Command({"INFO", "MEMORY"}).text_;
+    const std::string_view field = "oom_rejected_commands:";
+    const auto offset = info.find(field);
+    Check(offset != std::string::npos, "missing OOM rejection counter");
+    return std::stoull(info.substr(offset + field.size()));
+  };
+  {
+    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(20)}).text_, "1");
+    expected.erase(DenseZSetMember(20));
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  const auto first = FirstDenseOrderedPage(disk, key);
+  ASSERT_TRUE(first.has_value());
+  ASSERT_GT(first->entries_.size(), 128U);
+  const auto boundary_score = first->entries_.back().score_;
+  ASSERT_GT(500, boundary_score);
+  ASSERT_LT(DenseZSetMember(500), first->entries_.back().value_);
+  ScopedEnvironment reservation_failure(
+      "LAVIK_FAIL_ZSET_PROBE_RETAIN_RESERVE_KEY", key.c_str());
+  {
+    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    ASSERT_NE(client.Command({"INFO", "MEMORY"})
+                  .text_.find("maxmemory:134217728\r\n"),
+              std::string::npos);
+    const auto rejected_before = rejections(client);
+    // Only the optional cache-preserving reservation fails. The ordinary
+    // retry still uses the real nonzero memory limit. Same-page edits reach
+    // final-plan admission; a tied destination first needs another probe.
+    ASSERT_EQ(
+        client.Command({"ZINCRBY", key, "0.5", DenseZSetMember(10)}).text_,
+        "10.5");
+    expected[DenseZSetMember(10)] = 10.5;
+    const auto moved =
+        client.Command({"ZINCRBY", key, std::to_string(boundary_score - 500),
+                        DenseZSetMember(500)});
+    ASSERT_EQ(moved.kind_, '$') << moved.text_;
+    EXPECT_EQ(std::stod(moved.text_), boundary_score);
+    expected[DenseZSetMember(500)] = boundary_score;
+    ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(12)}).text_, "1");
+    expected.erase(DenseZSetMember(12));
+    ExpectDenseZSet(client, key, expected);
+    EXPECT_EQ(rejections(client), rejected_before);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Prove the rejection really discards the optional source: its fallback
+    // planner read now fails. Both indexes must retain the previous value.
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
+    ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
+    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Client client(server.port());
+    const auto rejected_before = rejections(client);
+    const auto failed =
+        client.Command({"ZINCRBY", key, "0.5", DenseZSetMember(10)});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
+    EXPECT_EQ(rejections(client), rejected_before);
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
 TEST(GroupedSortedSetWriteE2e,
      PointWritesReuseMemberLeafAndKeepBatchFailureAtomic) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
