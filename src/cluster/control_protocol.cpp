@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
 #include <climits>
 #include <cstddef>
@@ -152,6 +153,19 @@ class Writer {
   std::size_t size_ = 0;
 };
 
+// Callers validate the field length before loading. Wire fields may be
+// unaligned, so memcpy preserves alignment and aliasing safety.
+template <typename T>
+T LoadBigEndian(const char* input) noexcept {
+  static_assert(std::is_unsigned_v<T>);
+  T value = 0;
+  std::memcpy(&value, input, sizeof(value));
+  if constexpr (std::endian::native == std::endian::little) {
+    value = std::byteswap(value);
+  }
+  return value;
+}
+
 class Reader {
  public:
   explicit Reader(std::string_view bytes) : bytes_(bytes) {}
@@ -172,27 +186,19 @@ class Reader {
   absl::StatusOr<std::uint16_t> U16() {
     auto raw = Raw(2);
     if (!raw.ok()) return raw.status();
-    const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
-                                      p[1]);
+    return LoadBigEndian<std::uint16_t>(raw->data());
   }
 
   absl::StatusOr<std::uint32_t> U32() {
     auto raw = Raw(4);
     if (!raw.ok()) return raw.status();
-    const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < 4; ++i) value = (value << 8) | p[i];
-    return value;
+    return LoadBigEndian<std::uint32_t>(raw->data());
   }
 
   absl::StatusOr<std::uint64_t> U64() {
     auto raw = Raw(8);
     if (!raw.ok()) return raw.status();
-    const auto* p = reinterpret_cast<const unsigned char*>(raw->data());
-    std::uint64_t value = 0;
-    for (unsigned i = 0; i < 8; ++i) value = (value << 8) | p[i];
-    return value;
+    return LoadBigEndian<std::uint64_t>(raw->data());
   }
 
   absl::StatusOr<bool> Bool() {
@@ -236,23 +242,15 @@ class Reader {
 };
 
 std::uint16_t ReadBe16(std::string_view bytes, std::size_t offset) {
-  const auto* p = reinterpret_cast<const unsigned char*>(bytes.data() + offset);
-  return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
-                                    p[1]);
+  return LoadBigEndian<std::uint16_t>(bytes.data() + offset);
 }
 
 std::uint32_t ReadBe32(std::string_view bytes, std::size_t offset) {
-  const auto* p = reinterpret_cast<const unsigned char*>(bytes.data() + offset);
-  std::uint32_t value = 0;
-  for (unsigned i = 0; i < 4; ++i) value = (value << 8) | p[i];
-  return value;
+  return LoadBigEndian<std::uint32_t>(bytes.data() + offset);
 }
 
 std::uint64_t ReadBe64(std::string_view bytes, std::size_t offset) {
-  const auto* p = reinterpret_cast<const unsigned char*>(bytes.data() + offset);
-  std::uint64_t value = 0;
-  for (unsigned i = 0; i < 8; ++i) value = (value << 8) | p[i];
-  return value;
+  return LoadBigEndian<std::uint64_t>(bytes.data() + offset);
 }
 
 void StoreBe32(std::string* bytes, std::size_t offset, std::uint32_t value) {
