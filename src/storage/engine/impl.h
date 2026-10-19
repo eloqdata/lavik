@@ -4440,16 +4440,22 @@ class StorageEngine::Impl {
   // caller-owned limiter accounts against the refreshed physical owner until
   // decoding finishes; it must outlive this task, including cancellation.
   // Only read-only consumers may trust stored Sorted Set member uniqueness.
-  // Point writers may retain a checked encoded block instead of member strings;
-  // that representation always checks uniqueness and also releases the lease.
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned = false,
       GroupReadLimiter* limiter = nullptr,
       SortedSetMemberValidation validation =
-          SortedSetMemberValidation::kVerifyUnique,
-      bool encoded_sorted_set = false);
+          SortedSetMemberValidation::kVerifyUnique);
+  // Returns a fully validated encoded_sorted_set_ with entries_ empty, after
+  // releasing the physical lease. The snapshot and any copies remain on the
+  // key owner worker; a supplied limiter must outlive the task, including
+  // cancellation.
+  Task<absl::StatusOr<LoadedOrderedGroup>> LoadEncodedSortedSetGroupSnapshot(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, std::uint64_t id,
+      GroupReadLimiter* limiter = nullptr);
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
