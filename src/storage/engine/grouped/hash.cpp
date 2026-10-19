@@ -371,9 +371,10 @@ absl::StatusOr<std::optional<HashGroupPointProbe>> HashGroupPointProbe::Create(
   if (payload.size() - kGroupHeaderBytes > kCollectionGroupTargetBytes ||
       metadata->field_count_ == 0)
     return std::nullopt;
-  // An absent member takes the checked decoded fallback. Locate first without
-  // hashing or allocating a duplicate set, so insertion does not validate the
-  // same leaf twice. A hit still checks every field before certifying bytes.
+  // An absent member leaves uniqueness validation to the caller's checked
+  // splice or decoded fallback. Locate first without hashing or allocating a
+  // duplicate set, so insertion does not repeat that validation. A hit still
+  // checks every field before certifying bytes.
   auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
   if (!reader.ok()) return absl::DataLossError(reader.status().message());
   if (reader->size() != metadata->field_count_)

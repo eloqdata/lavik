@@ -1805,6 +1805,45 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                                HashGroupSnapshot{}, std::move(*point));
           continue;
         }
+        if (operation.kind_ == SortedSetOperationKind::kAdd &&
+            operation.entries_.size() == 1) {
+          const auto& entry = operation.entries_.front();
+          const auto old_bytes = payload.size() - kHashGroupHeaderBytes;
+          const auto base_bytes = std::max(old_bytes, kHashValueHeaderBytes);
+          // A missing field does not invalidate the checked byte-splice
+          // editor. Keep the ordinary decoder for a split or large member,
+          // and never turn repeated request operands into a point insertion.
+          constexpr std::size_t kEntryFrameAndScoreBytes = 8 + sizeof(double);
+          if (entry.member_.size() <=
+                  kCollectionGroupTargetBytes - kEntryFrameAndScoreBytes &&
+              base_bytes <= kCollectionGroupTargetBytes -
+                                kEntryFrameAndScoreBytes -
+                                entry.member_.size()) {
+            GroupedScratchBudget incoming;
+            status = incoming.AddBytes(entry.member_.size() + 256);
+            if (!status.ok()) co_return status;
+            auto incoming_admission = incoming.Reserve(1);
+            if (!incoming_admission.ok()) co_return incoming_admission.status();
+            const auto score = EncodeSortedSetMemberScore(entry.score_);
+            const HashEntryView edit{entry.member_, score};
+            auto inserted = ApplyHashGroupEdits(
+                payload, object->directory().root().seed_,
+                HashGroupEditKind::kSetIfAbsent, {&edit, 1});
+            if (!inserted.ok()) co_return inserted.status();
+            if (!inserted->changed_ || inserted->added_ != 1 ||
+                inserted->removed_ != 0 || inserted->leaves_.size() != 1 ||
+                !inserted->leaves_.front().prepared_)
+              co_return absl::DataLossError(
+                  "invalid member-index insertion probe");
+            member_probe.emplace(
+                std::move(*admission), object, HashGroupSnapshot{},
+                std::nullopt,
+                SortedSetMemberInsertion{std::move(*incoming_admission),
+                                         entry.member_, entry.score_,
+                                         std::move(inserted->leaves_.front())});
+            continue;
+          }
+        }
         LAVIK_FAULT_INJECT(
             if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY",
                                     key)) co_return absl::
@@ -2095,6 +2134,17 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           destination.begin(), destination.end(), moved, OrderedEntryLess);
       destination.insert(position, std::move(moved));
     }
+  } else if (operation.kind_ == SortedSetOperationKind::kAdd &&
+             operation.entries_.size() == 1 && pending.size() == 1) {
+    // The untouched destination is already ordered. Insert a new member at
+    // its exact score/member position instead of sorting all existing entries.
+    // The member-index lookup and ordinary page validation remain mandatory.
+    const auto& [member, state] = pending.front();
+    auto& destination = loaded.at(state->destination_).entries_;
+    OrderedCollectionEntry entry{std::string(member), *state->after_};
+    const auto position = std::lower_bound(
+        destination.begin(), destination.end(), entry, OrderedEntryLess);
+    destination.insert(position, std::move(entry));
   } else {
     for (const auto i : modified) {
       auto& entries = loaded.at(i).entries_;
@@ -2212,7 +2262,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         plan.writes_.push_back(std::move(page));
         continue;
       }
-      auto split = SplitOrderedGroup(std::move(page), next_id);
+      auto split = SplitCheckedSortedSetGroup(std::move(page), next_id);
       if (!split.ok()) co_return split.status();
       next_id = split->next_group_id_;
       for (auto& part : split->groups_) {

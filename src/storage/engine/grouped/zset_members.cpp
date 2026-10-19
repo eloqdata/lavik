@@ -232,9 +232,11 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     status = incoming.AddBytes(member.size() + 256);
     if (!status.ok()) co_return status;
   }
-  auto scratch = incoming.Reserve(1);
-  if (!scratch.ok()) co_return scratch.status();
-  result.scratch_ = std::move(*scratch);
+  if (probe == nullptr || !probe->insertion_) {
+    auto scratch = incoming.Reserve(1);
+    if (!scratch.ok()) co_return scratch.status();
+    result.scratch_ = std::move(*scratch);
+  }
   auto& plan = result.plan_;
   plan.root_ = previous->directory().root();
   if (changes.empty()) co_return result;
@@ -248,10 +250,38 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   if (probe != nullptr &&
       (!checked_changes || probe->source_.get() != previous.get() ||
        leaves.size() != 1 ||
-       leaves.begin()->first !=
-           (probe->encoded_ ? probe->encoded_->id() : probe->snapshot_.id_) ||
+       leaves.begin()->first != (probe->encoded_ ? probe->encoded_->id()
+                                 : probe->insertion_
+                                     ? probe->insertion_->replacement_.id_
+                                     : probe->snapshot_.id_) ||
        probe->snapshot_.retired_))
     co_return absl::DataLossError("invalid Sorted Set member probe");
+  if (probe != nullptr && probe->insertion_) {
+    auto& insertion = *probe->insertion_;
+    const auto& replacement = insertion.replacement_;
+    if (probe->encoded_ || changes.size() != 1 ||
+        changes.begin()->first != insertion.member_ ||
+        changes.begin()->second.before_ || !changes.begin()->second.after_ ||
+        std::bit_cast<std::uint64_t>(*changes.begin()->second.after_) !=
+            std::bit_cast<std::uint64_t>(insertion.score_) ||
+        replacement.retired_ || !replacement.prepared_ ||
+        !replacement.value_.entries_.empty() ||
+        replacement.incarnation_ != plan.root_.incarnation_)
+      co_return absl::DataLossError(
+          "invalid encoded Sorted Set member insertion");
+    // The lookup certified absence plus complete Hash framing, uniqueness
+    // and routing. The typed delta now certifies the same new member/score
+    // in the ordered graph; consume the prepared bytes without re-decoding.
+    // Transfer incoming admission with its after-image only after validation,
+    // so rejection cannot release credit while the probe still owns bytes.
+    result.scratch_ = std::move(insertion.admission_);
+    result.leaves_ = std::move(probe->admission_);
+    plan.root_.revision_ = ordered.root_.revision_;
+    plan.root_.field_count_ = ordered.root_.item_count_;
+    plan.changed_ = true;
+    plan.writes_.push_back(std::move(insertion.replacement_));
+    co_return result;
+  }
   if (probe != nullptr && probe->encoded_) {
     // The point lookup validated every field and retained exactly this old
     // value. Reconcile the semantic delta before consuming its private bytes;
