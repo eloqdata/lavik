@@ -47,6 +47,41 @@ std::uint64_t Get(std::string_view input, std::size_t offset, unsigned width) {
 
 }  // namespace
 
+absl::StatusOr<OrderedCompactReader> OrderedCompactReader::Open(
+    OrderedCollectionKind kind, std::string_view encoded,
+    std::uint64_t expected_count) {
+  const bool sorted = kind == OrderedCollectionKind::kSortedSet;
+  const std::size_t framing = sorted ? 12 : 4;
+  if (!ValidKind(kind) || expected_count == 0 || expected_count > UINT32_MAX ||
+      encoded.size() < 8 || !encoded.starts_with(sorted ? "LZS1" : "LVL1") ||
+      Get(encoded, 4, 4) != expected_count ||
+      expected_count > (encoded.size() - 8) / framing)
+    return absl::DataLossError("invalid ordered full-image framing");
+  return OrderedCompactReader(encoded, expected_count, sorted);
+}
+
+absl::StatusOr<OrderedCompactEntryView> OrderedCompactReader::Next() {
+  const std::size_t framing = sorted_ ? 12 : 4;
+  if (remaining_ == 0 || framing > bytes_.size() - offset_)
+    return absl::DataLossError("truncated ordered full-image entry");
+  const auto score =
+      sorted_ ? std::bit_cast<double>(Get(bytes_, offset_, 8)) : 0;
+  const auto size = Get(bytes_, offset_ + (sorted_ ? 8 : 0), 4);
+  if (std::isnan(score) || size > kMaxStringBytes ||
+      size > bytes_.size() - offset_ - framing)
+    return absl::DataLossError("invalid ordered full-image entry");
+  const auto end = offset_ + framing + size;
+  if (remaining_ == 1 && end != bytes_.size())
+    return absl::DataLossError("trailing ordered full-image bytes");
+  OrderedCompactEntryView result{
+      .value_ = bytes_.substr(offset_ + framing, size),
+      .score_ = score,
+      .encoded_ = bytes_.substr(offset_, framing + size)};
+  offset_ = end;
+  --remaining_;
+  return result;
+}
+
 absl::StatusOr<std::size_t> AppendOrderedEntrySize(OrderedCollectionKind kind,
                                                    std::size_t encoded_bytes,
                                                    std::size_t item_bytes,

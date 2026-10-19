@@ -366,6 +366,30 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
 
   auto update = callback(view);
   if (!update.ok()) co_return update.status();
+  if (update->inline_payload_ &&
+      (grouped || !exists || !loaded || !update->changed_ || update->erase_ ||
+       update->reuse_encoded_ || !update->encoded_.empty() ||
+       value_type != ValueType::kSortedSet ||
+       update->inline_payload_->encoded_bytes() >= kCollectionPromotionBytes))
+    co_return absl::InternalError("invalid compact callback encoder");
+  if (update->inline_payload_ && loaded->lease_.buffer_id() != 0 &&
+      (loaded->lease_.owner_worker() != store.worker_->id() ||
+       store.buffers_.available_read_buffers() == 0)) {
+    // A queued writer must not pin the last read slot needed by a state-lock
+    // owner ahead of it. Materialize under the callback's existing admission
+    // before reacquiring state; remote pools cannot be queried on this worker.
+    update->encoded_.resize(update->inline_payload_->encoded_bytes());
+    auto encoded = update->inline_payload_->WriteTo(
+        std::as_writable_bytes(std::span(update->encoded_)));
+    if (!encoded.ok()) co_return encoded;
+    update->inline_payload_ = nullptr;
+  }
+  if (!grouped && !update->inline_payload_ && !update->reuse_encoded_) {
+    // Owned callback output (or a no-op) no longer needs the read slot while
+    // waiting for publication state. Grouped/reuse paths still borrow it.
+    loaded.reset();
+    view.reset();
+  }
   // A missing key may be created directly as a large graph. Keep both
   // indexes private/admitted until absence and population are revalidated;
   // the commit adapter stamps their placeholder incarnations together.
@@ -541,7 +565,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       store, partition, db_id, key, digest,
       update->erase_ ? std::string_view{} : encoded, kind, published_type,
       expire_at_ms, tx, update->erase_ ? 0 : logical_size, nullptr, nullptr,
-      replication, true, nullptr, mutation_precondition);
+      replication, true, nullptr, mutation_precondition, nullptr,
+      update->inline_payload_);
   co_return status;
 }
 

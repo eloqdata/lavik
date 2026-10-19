@@ -240,7 +240,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
       true, nullptr, mutation_precondition
 #if LAVIK_ENABLE_TRACE
       ,
-      /*grouped=*/nullptr, trace
+      /*grouped=*/nullptr, /*inline_payload=*/nullptr, trace
 #endif
   );
   if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
@@ -1977,7 +1977,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
     bool capture_fullsync, TxUndoLog* replacement_undo,
     const MutationPrecondition* mutation_precondition,
-    GroupMutationWrite* grouped
+    GroupMutationWrite* grouped, const InlineRecordPayload* inline_payload
 #if LAVIK_ENABLE_TRACE
     ,
     SetLatencyTrace* trace
@@ -1987,8 +1987,16 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     co_return absl::FailedPreconditionError(
         "storage writer is stopped after an IO failure");
   }
+  const auto value_bytes =
+      inline_payload ? inline_payload->encoded_bytes() : value.size();
+  // Compact editors borrow read leases through allocation waits. Oversized
+  // results must use the existing promotion/extent path before reaching here.
+  if (inline_payload &&
+      (!value.empty() || grouped || replacement_undo ||
+       kind != RecordKind::kValue || value_bytes >= kCollectionPromotionBytes))
+    co_return absl::InvalidArgumentError("invalid compact encoder write");
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
-    logical_size = value.size();
+    logical_size = value_bytes;
   }
   if (!ValidRecordKeySize(key.size())) {
     co_return absl::OutOfRangeError("record key exceeds storage limit");
@@ -2081,7 +2089,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   absl::Status status = absl::OkStatus();
   const bool key_indirect = key.size() > kInlineKeyMaxBytes;
   const std::uint64_t logical_payload_bytes =
-      static_cast<std::uint64_t>(value.size());
+      static_cast<std::uint64_t>(value_bytes);
   const std::size_t inline_bytes =
       AlignRecord(RecordHeaderBytes(key.size(), key_indirect, tx != nullptr,
                                     expire_at_ms != 0) +
@@ -2131,6 +2139,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     const RecordWriteRequest record_write{
         .key_ = key,
         .value_ = value,
+        .inline_payload_ = inline_payload,
         .digest_ = digest,
         .expire_at_ms_ = expire_at_ms,
         .mutation_sequence_ = mutation_sequence,
@@ -2677,8 +2686,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   const bool grouped_root =
       request.group_ != nullptr && !request.group_->auxiliary_;
   if (request.inline_payload_ != nullptr &&
-      (!auxiliary || request.external_ || !request.value_.empty()))
-    co_return absl::InvalidArgumentError("invalid inline group encoder write");
+      (request.external_ || !request.value_.empty() ||
+       (!auxiliary &&
+        (request.group_ != nullptr || request.kind_ != RecordKind::kValue ||
+         payload_bytes >= kCollectionPromotionBytes))))
+    co_return absl::InvalidArgumentError(
+        "invalid inline payload encoder write");
   struct FailIncompleteGroupedRoot {
     WorkerStore& store_;
     TxShardWrites* tx_;
@@ -2740,7 +2753,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     }
   } else if (request.kind_ == RecordKind::kValue &&
              request.value_type_ == ValueType::kString && !request.group_ &&
-             request.value_.size() != logical_size) {
+             payload_bytes != logical_size) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "inline string length mismatch");
   }
@@ -3418,13 +3431,17 @@ acquire_active_stream:
     // tail, and neither an index identity nor an indirect-key reference exists.
     auto encoded = request.inline_payload_->WriteTo(std::span<std::byte>(
         staging.data_ + record_offset + record_header_bytes, payload_bytes));
-    LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES(
-                               "LAVIK_FAIL_INLINE_GROUP_ENCODE_KEY",
-                               request.key_)) {
-      static std::atomic<bool> injected{false};
-      if (!injected.exchange(true, std::memory_order_relaxed))
-        encoded = absl::DataLossError("injected inline group encoding fault");
-    });
+    LAVIK_FAULT_INJECT(
+        if (LAVIK_FAULT_MATCHES(auxiliary
+                                    ? "LAVIK_FAIL_INLINE_GROUP_ENCODE_KEY"
+                                    : "LAVIK_FAIL_INLINE_COMPACT_ENCODE_KEY",
+                                request.key_)) {
+          static std::atomic<bool> injected{false};
+          if (!injected.exchange(true, std::memory_order_relaxed))
+            encoded = absl::DataLossError(
+                auxiliary ? "injected inline group encoding fault"
+                          : "injected inline compact encoding fault");
+        });
     if (!encoded.ok()) co_return encoded;
   }
   // Admit exceptional reference-directory allocations before publishing any

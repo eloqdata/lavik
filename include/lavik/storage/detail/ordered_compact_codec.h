@@ -20,6 +20,33 @@
 
 namespace lavik::storage {
 
+struct OrderedCompactEntryView {
+  std::string_view value_;
+  double score_ = 0;
+  std::string_view encoded_;
+};
+
+// Checked traversal without per-element ownership. Consume exactly size()
+// entries to validate the tail. Returned views borrow the immutable payload;
+// copying a reader preserves its position for a second planning pass.
+class OrderedCompactReader {
+ public:
+  static absl::StatusOr<OrderedCompactReader> Open(
+      OrderedCollectionKind kind, std::string_view encoded,
+      std::uint64_t expected_count);
+  std::size_t size() const noexcept { return size_; }
+  absl::StatusOr<OrderedCompactEntryView> Next();
+
+ private:
+  OrderedCompactReader(std::string_view bytes, std::size_t count, bool sorted)
+      : bytes_(bytes), size_(count), remaining_(count), sorted_(sorted) {}
+  std::string_view bytes_;
+  std::size_t size_;
+  std::size_t remaining_;
+  std::size_t offset_ = 8;
+  bool sorted_;
+};
+
 // Logical full-image bridge used by existing callback/RDB integrations.
 // A collection can span many physical pages, so aggregate bytes have no
 // String or record-payload limit here. Each item remains limited to 512 MiB

@@ -634,10 +634,96 @@ absl::StatusOr<MemoryReservation> ReserveInputs(
   return budget.Reserve(1);
 }
 
+absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
+    std::optional<CompactValueView> value, const SortedSetOperation& operation,
+    Members& members, SortedSetResult& result, CompactPayload& output) {
+  const bool add = operation.kind_ == SortedSetOperationKind::kAdd;
+  if (!value || (add ? operation.entries_.size() != 1
+                     : operation.kind_ != SortedSetOperationKind::kRemove ||
+                           operation.members_.size() != 1))
+    return std::nullopt;
+  const auto member =
+      add ? operation.entries_.front().member_ : operation.members_.front();
+  // Conservatively leave near-threshold additions to the owned promotion
+  // path, before applying input semantics or populating the reply.
+  if (value->encoded_.size() >= kCollectionPromotionBytes ||
+      (add && member.size() + 12 >=
+                  kCollectionPromotionBytes - value->encoded_.size()))
+    return std::nullopt;
+  auto reader = OrderedCompactReader::Open(
+      OrderedCollectionKind::kSortedSet, value->encoded_, value->logical_size_);
+  if (!reader.ok()) return reader.status();
+  auto scan = *reader;
+  auto& state = members.at(member);
+  std::optional<OrderedCompactEntryView> previous;
+  for (std::size_t i = 0; i < scan.size(); ++i) {
+    auto entry = scan.Next();
+    if (!entry.ok()) return entry.status();
+    if (previous && (previous->score_ > entry->score_ ||
+                     (previous->score_ == entry->score_ &&
+                      previous->value_ > entry->value_)))
+      return absl::DataLossError("unsorted compact Sorted Set");
+    previous = *entry;
+    if (entry->value_ == member) {
+      if (state.before_)
+        return absl::DataLossError("duplicate persisted Sorted Set member");
+      state.before_ = state.after_ = entry->score_;
+    }
+  }
+  result.key_exists_ = true;
+  result.length_ = value->logical_size_;
+  auto applied = ApplyInputs(operation, &members, &result);
+  if (!applied.ok()) return applied;
+  CompactValueUpdate update;
+  if (result.changed_ == 0) return update;
+  update.changed_ = true;
+  update.logical_size_ = result.length_;
+  if (result.length_ == 0) {
+    update.erase_ = true;
+    return update;
+  }
+  output.AppendBytes("LZS1");
+  output.AppendUnsigned(result.length_, 4);
+  auto append = [&] {
+    output.AppendUnsigned(std::bit_cast<std::uint64_t>(*state.after_), 8);
+    output.AppendUnsigned(member.size(), 4);
+    output.AppendBytes(member);
+  };
+  bool inserted = !state.after_.has_value();
+  // Only the removed and inserted positions split the borrowed old image.
+  // Keep whole intervals rather than one descriptor per unchanged member.
+  std::size_t kept_begin = 8;
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return entry.status();
+    const auto entry_begin = static_cast<std::size_t>(entry->encoded_.data() -
+                                                      value->encoded_.data());
+    if (entry->value_ == member) {
+      output.AppendBytes(
+          value->encoded_.substr(kept_begin, entry_begin - kept_begin));
+      kept_begin = entry_begin + entry->encoded_.size();
+      continue;
+    }
+    if (!inserted &&
+        (*state.after_ < entry->score_ ||
+         (*state.after_ == entry->score_ && member < entry->value_))) {
+      output.AppendBytes(
+          value->encoded_.substr(kept_begin, entry_begin - kept_begin));
+      append();
+      kept_begin = entry_begin;
+      inserted = true;
+    }
+  }
+  output.AppendBytes(value->encoded_.substr(kept_begin));
+  if (!inserted) append();
+  return update;
+}
+
 absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     std::optional<CompactValueView> value, const SortedSetOperation& operation,
     Members& members, SortedSetResult& result,
-    std::optional<MemoryReservation>& compact_admission) {
+    std::optional<MemoryReservation>& compact_admission,
+    CompactPayload* point_payload = nullptr) {
   // ExecuteCompactLocked owns decode/re-encode admission, including the
   // bounded inline workspace that lets shrinking commands run at
   // maxmemory. Range removal adds no input members or retained reply;
@@ -660,6 +746,12 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     auto admission = budget.Reserve(4);
     if (!admission.ok()) return admission.status();
     compact_admission.emplace(std::move(*admission));
+  }
+  if (point_payload) {
+    auto point = PlanCompactSortedSetPoint(value, operation, members, result,
+                                           *point_payload);
+    if (!point.ok()) return point.status();
+    if (*point) return std::move(**point);
   }
   std::vector<OrderedCollectionEntry> entries;
   if (value) {
@@ -951,10 +1043,17 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   // The encoded callback result survives until the compact writer returns.
   // Keep its admission outside the synchronous callback's stack frame.
   std::optional<MemoryReservation> compact_admission;
+  CompactPayload point_payload;
+  std::optional<InlineRecordPayload> inline_payload;
   auto callback = [&](std::optional<CompactValueView> value)
       -> absl::StatusOr<CompactValueUpdate> {
-    return ApplyCompactSortedSet(value, operation, members, result,
-                                 compact_admission);
+    auto update = ApplyCompactSortedSet(value, operation, members, result,
+                                        compact_admission, &point_payload);
+    if (update.ok() && !point_payload.empty()) {
+      inline_payload.emplace(point_payload);
+      update->inline_payload_ = &*inline_payload;
+    }
+    return update;
   };
   // kAdd also implements ZINCRBY and GEOADD, so the operation kind alone is
   // insufficient: only explicit single-key command admission opts in.

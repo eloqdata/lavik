@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "lavik/storage/detail/compact_payload.h"
 #include "lavik/storage/format.h"
 
 namespace lavik::storage {
@@ -77,6 +78,27 @@ class HashValueReader {
 // and admit materialization memory independently of this logical codec.
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload);
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& value);
+
+enum class CompactHashEditKind { kSet, kDelete };
+
+struct CompactHashEditPlan {
+  bool changed_ = false;
+  std::size_t added_ = 0;
+  std::size_t removed_ = 0;
+  std::size_t count_ = 0;
+  CompactPayload payload_;
+};
+
+// Validates the complete old image and builds a bounded splice plan. Sources
+// must remain immutable through encoding, including append allocation waits.
+// Duplicate operands retain sequential command semantics. Delete accepts no
+// values. Nullopt selects promotion without allocating an oversized image.
+// Callers admit O(fields.size()) planning space before entering this helper.
+absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
+    std::string_view payload, std::size_t expected_count,
+    std::span<const std::string_view> fields,
+    std::span<const std::string_view> values, std::size_t max_bytes,
+    CompactHashEditKind kind = CompactHashEditKind::kSet);
 
 // A bounded HSET after-image. No-op results have no payload; a changed result
 // owns its bytes independently of both the old payload and request operands.

@@ -282,6 +282,77 @@ TEST(CompactHashEdit, ValidatesPastMatchesAndChecksCounts) {
   EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
 }
 
+TEST(CompactHashEdit, DeletePlanMatchesSequentialSetRemoval) {
+  std::mt19937 random(91);
+  for (unsigned trial = 0; trial < 200; ++trial) {
+    auto original = Value(1 + random() % 256, 0);
+    original.entries_.push_back({.field_ = "", .value_ = ""});
+    original.entries_.push_back(
+        {.field_ = std::string("a\0b", 3), .value_ = ""});
+    auto bytes = EncodeHashValue(original);
+    ASSERT_TRUE(bytes.ok());
+    std::vector<std::string> storage;
+    for (unsigned i = 0; i < 32; ++i)
+      storage.push_back("field-" + std::to_string(random() % 256));
+    std::vector<std::string_view> fields(storage.begin(), storage.end());
+    fields.insert(fields.end(), {"", "", std::string_view("a\0b", 3)});
+    auto expected = original;
+    std::size_t removed = 0;
+    for (auto field : fields) {
+      auto it = std::find_if(
+          expected.entries_.begin(), expected.entries_.end(),
+          [&](const auto& entry) { return entry.field_ == field; });
+      if (it != expected.entries_.end()) {
+        expected.entries_.erase(it);
+        ++removed;
+      }
+    }
+    auto planned = PlanCompactHashEdit(*bytes, original.entries_.size(), fields,
+                                       {}, 16383, CompactHashEditKind::kDelete);
+    ASSERT_TRUE(planned.ok()) << planned.status();
+    ASSERT_TRUE(planned->has_value());
+    // Moving a plan must retain its framing even when its parts spill inline
+    // capacity; the old image and request storage remain the byte owners.
+    auto plan = std::move(**planned);
+    EXPECT_EQ(plan.removed_, removed);
+    EXPECT_EQ(plan.count_, expected.entries_.size());
+    auto encoded = EncodeInlineRecordPayload(plan.payload_);
+    ASSERT_TRUE(encoded.ok());
+    if (expected.entries_.empty()) {
+      EXPECT_TRUE(encoded->empty());
+    } else {
+      auto reference = EncodeHashValue(expected);
+      ASSERT_TRUE(reference.ok());
+      EXPECT_EQ(*encoded, *reference);
+    }
+  }
+}
+
+TEST(CompactHashEdit, DeleteValidatesNoopTailAndLastMember) {
+  HashValue value{.entries_ = {{.field_ = "a", .value_ = ""},
+                               {.field_ = "b", .value_ = ""}}};
+  auto bytes = EncodeHashValue(value);
+  ASSERT_TRUE(bytes.ok());
+  const std::array<std::string_view, 1> missing{"absent"};
+  auto no_op = PlanCompactHashEdit(*bytes, 2, missing, {}, 16383,
+                                   CompactHashEditKind::kDelete);
+  ASSERT_TRUE(no_op.ok());
+  ASSERT_TRUE(no_op->has_value());
+  EXPECT_FALSE((**no_op).changed_);
+  EXPECT_TRUE((**no_op).payload_.empty());
+  EXPECT_FALSE(PlanCompactHashEdit(*bytes + "x", 2, missing, {}, 16383,
+                                   CompactHashEditKind::kDelete)
+                   .ok());
+  const std::array<std::string_view, 3> all{"b", "a", "a"};
+  auto empty = PlanCompactHashEdit(*bytes, 2, all, {}, 16383,
+                                   CompactHashEditKind::kDelete);
+  ASSERT_TRUE(empty.ok());
+  ASSERT_TRUE(empty->has_value());
+  EXPECT_EQ((**empty).removed_, 2);
+  EXPECT_EQ((**empty).count_, 0);
+  EXPECT_TRUE((**empty).payload_.empty());
+}
+
 TEST(HashGroupEdits, OrderedDuplicatesOwnTheirBytesAndKeepWireFormat) {
   HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(8, 64)};
   auto payload = EncodeHashGroup(group);

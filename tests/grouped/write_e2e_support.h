@@ -36,6 +36,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -342,7 +343,8 @@ class Server {
          bool pause_handoff = false, unsigned fail_aux_nth = 2,
          std::string_view max_memory = "1G", std::string_view load_rdb = {},
          std::string_view max_memory_clients = {}, unsigned flush_pause_ms = 0,
-         unsigned flush_max_ms = 20) {
+         unsigned flush_max_ms = 20,
+         std::span<const std::string_view> extra_args = {}) {
     const int socket = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     Check(socket >= 0, "port socket failed");
     sockaddr_in address{.sin_family = AF_INET,
@@ -415,6 +417,7 @@ class Server {
         args.emplace_back("--maxmemory-clients");
         args.emplace_back(max_memory_clients);
       }
+      for (const auto arg : extra_args) args.emplace_back(arg);
       std::vector<char*> argv;
       for (auto& arg : args) argv.push_back(arg.data());
       argv.push_back(nullptr);

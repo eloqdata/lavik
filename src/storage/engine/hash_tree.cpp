@@ -1297,7 +1297,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   }
   HashValue compact;
   std::optional<MemoryReservation> compact_edit_scratch;
-  std::optional<CompactHashEdit> compact_edit;
+  std::optional<CompactHashEditPlan> compact_edit;
+  std::optional<LoadedValue> compact_source;
   std::optional<HashGroupMutationPlan> grouped_plan;
   std::uint64_t edited_length = location.logical_size_;
   if (edit_leaves) {
@@ -1388,11 +1389,22 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (read_only)
       co_return ReadEncodedHash(payload, location.logical_size_, operation,
                                 value_type);
-    if (value_type == ValueType::kHash &&
-        operation.kind_ == HashOperationKind::kSet) {
-      // Only operand views and a bounded after-image survive preparation; the
-      // old fields remain borrowed from this read lease. Publication still
-      // uses the existing key intent, snapshot validation and append boundary.
+    // A prepared write may wait behind a state-lock owner that needs a read
+    // slot. Do not retain the pool's last slot across that wait. Remote pool
+    // availability cannot be inspected here, so those leases use owned edits.
+    const bool borrow_source =
+        loaded->lease_.buffer_id() == 0 ||
+        (loaded->lease_.owner_worker() == store.worker_->id() &&
+         store.buffers_.available_read_buffers() != 0);
+    if (borrow_source && ((value_type == ValueType::kHash &&
+                           operation.kind_ == HashOperationKind::kSet) ||
+                          (value_type == ValueType::kSet &&
+                           (operation.kind_ == HashOperationKind::kSet ||
+                            operation.kind_ == HashOperationKind::kDelete)))) {
+      // Only operand views and framing survive preparation; unchanged bytes
+      // remain borrowed from compact_source through the awaited append.
+      // Publication still uses the existing key intent, snapshot validation and
+      // append boundary.
       GroupedScratchBudget budget;
       if (operation.fields_.size() > SIZE_MAX / 256)
         co_return absl::ResourceExhaustedError(
@@ -1402,20 +1414,31 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       added = budget.AddBytes(kCollectionPromotionBytes * 2);
       if (!added.ok()) co_return added;
       auto admitted = budget.Reserve(1);
-      if (!admitted.ok()) co_return admitted.status();
-      compact_edit_scratch.emplace(std::move(*admitted));
-      auto edited =
-          EditCompactHash(payload, location.logical_size_, operation.fields_,
-                          operation.values_, kCollectionPromotionBytes - 1);
-      if (!edited.ok()) co_return edited.status();
-      compact_edit = std::move(*edited);
-      if (compact_edit) {
-        result.changed_ = compact_edit->changed_;
-        result.integer_ = compact_edit->added_;
-      } else {
-        // Promotion keeps the existing owned builder and its admission. No
-        // oversized output was allocated by the bounded editor.
-        compact_edit_scratch.reset();
+      // Preserve the bounded legacy workspace for shrinking at maxmemory.
+      // A denied splice plan falls back before it borrows or changes data.
+      if (!admitted.ok() && operation.kind_ != HashOperationKind::kDelete)
+        co_return admitted.status();
+      if (admitted.ok()) {
+        compact_edit_scratch.emplace(std::move(*admitted));
+        auto edited = PlanCompactHashEdit(
+            payload, location.logical_size_, operation.fields_,
+            operation.values_, kCollectionPromotionBytes - 1,
+            operation.kind_ == HashOperationKind::kDelete
+                ? CompactHashEditKind::kDelete
+                : CompactHashEditKind::kSet);
+        if (!edited.ok()) co_return edited.status();
+        compact_edit = std::move(*edited);
+        if (compact_edit) {
+          result.changed_ = compact_edit->changed_;
+          result.integer_ = operation.kind_ == HashOperationKind::kDelete
+                                ? compact_edit->removed_
+                                : compact_edit->added_;
+          compact_source.emplace(std::move(*loaded));
+        } else {
+          // Promotion keeps the existing owned builder and its admission. No
+          // oversized output was allocated by the bounded editor.
+          compact_edit_scratch.reset();
+        }
       }
     }
     if (!compact_edit) {
@@ -1631,7 +1654,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       break;
     }
     case HashOperationKind::kDelete:
-      if (edit_leaves) break;
+      if (edit_leaves || compact_edit) break;
       for (std::string_view field : operation.fields_) {
         auto entry = find_entry(field);
         if (entry != compact.entries_.end()) {
@@ -1712,18 +1735,16 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!valid.ok()) co_return valid;
   }
   std::optional<std::string> prepared_compact_payload;
-  if (compact_edit && compact_edit->changed_)
-    prepared_compact_payload.emplace(std::move(compact_edit->payload_));
   bool compact_write_promotes = false;
   if (unlocked_compact_write || unlocked_create) {
     if (result.changed_ && result.key_exists_) {
-      compact_write_promotes = NeedsGroupedHash(compact);
+      compact_write_promotes = !compact_edit && NeedsGroupedHash(compact);
       if (unlocked_create && compact_write_promotes) {
         auto prepared = PrepareGroupedHashMutation(nullptr, std::move(compact),
                                                    {}, result.length_, 1);
         if (!prepared.ok()) co_return prepared.status();
         grouped_plan.emplace(std::move(*prepared));
-      } else if (!compact_write_promotes && !prepared_compact_payload) {
+      } else if (!compact_write_promotes && !compact_edit) {
         auto encoded = EncodeHashValue(compact);
         if (!encoded.ok()) co_return encoded.status();
         prepared_compact_payload.emplace(std::move(*encoded));
@@ -1810,6 +1831,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   if (!result.key_exists_) {
     kind = RecordKind::kTombstone;
     published_type = ValueType::kNone;
+  } else if (compact_edit) {
+    // The borrowed plan is consumed directly into the unpublished record.
   } else if (prepared_compact_payload.has_value()) {
     payload = std::move(*prepared_compact_payload);
   } else {
@@ -1817,11 +1840,15 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!encoded.ok()) co_return encoded.status();
     payload = std::move(*encoded);
   }
+  std::optional<InlineRecordPayload> inline_payload;
+  if (compact_edit && result.key_exists_)
+    inline_payload.emplace(compact_edit->payload_);
   absl::Status written = co_await AppendLocked(
       store, partition, db_id, key, digest, payload, kind, published_type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? result.length_ : 0, nullptr, nullptr,
-      replication, true, nullptr, mutation_precondition);
+      replication, true, nullptr, mutation_precondition, nullptr,
+      inline_payload ? &*inline_payload : nullptr);
   if (!written.ok()) co_return written;
   co_return result;
 }

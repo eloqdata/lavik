@@ -158,11 +158,13 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
   return value;
 }
 
-absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
+absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
     std::string_view payload, std::size_t expected_count,
     std::span<const std::string_view> fields,
-    std::span<const std::string_view> values, std::size_t max_bytes) {
-  if (fields.size() != values.size())
+    std::span<const std::string_view> values, std::size_t max_bytes,
+    CompactHashEditKind kind) {
+  const bool erase = kind == CompactHashEditKind::kDelete;
+  if ((!erase && fields.size() != values.size()) || (erase && !values.empty()))
     return absl::InvalidArgumentError("Hash field/value mismatch");
   auto reader = HashValueReader::Open(payload);
   if (!reader.ok()) return reader.status();
@@ -190,21 +192,22 @@ absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
   edits.reserve(fields.size());
   if (fields.size() > 1) positions.reserve(fields.size());
   for (std::size_t i = 0; i < fields.size(); ++i) {
+    const auto value = erase ? std::string_view{} : values[i];
     auto size = AppendHashEntrySize(kHashValueHeaderBytes, fields[i].size(),
-                                    values[i].size(), std::string{}.max_size());
+                                    value.size(), std::string{}.max_size());
     if (!size.ok()) return size.status();
     if (fields.size() > 1) {
       const auto [it, inserted] = positions.emplace(fields[i], edits.size());
       if (!inserted) {
         auto& edit = edits[it->second];
-        edit.varied |= edit.value != values[i];
-        edit.value = values[i];
+        edit.varied |= edit.value != value;
+        edit.value = value;
         continue;
       }
     }
-    edits.push_back({fields[i], values[i]});
+    edits.push_back({fields[i], value});
   }
-  CompactHashEdit result{.count_ = expected_count, .payload_ = {}};
+  CompactHashEditPlan result{.count_ = expected_count, .payload_ = {}};
   std::size_t bytes = payload.size();
   for (std::size_t i = 0; i < reader->size(); ++i) {
     auto entry = reader->Next();
@@ -221,20 +224,25 @@ absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
     if (edit.found)
       return absl::DataLossError("duplicate requested Hash field");
     edit.found = true;
-    result.changed_ |= edit.varied || edit.value != entry->value_;
-    if (edit.value == entry->value_) continue;
+    result.changed_ |= erase || edit.varied || edit.value != entry->value_;
+    if (!erase && edit.value == entry->value_) continue;
     const auto begin =
         static_cast<std::size_t>(entry->field_.data() - payload.data()) - 8;
     const auto end = begin + 8 + entry->field_.size() + entry->value_.size();
-    auto size =
-        AppendHashEntrySize(bytes - (end - begin), edit.field.size(),
-                            edit.value.size(), std::string{}.max_size());
-    if (!size.ok()) return size.status();
-    bytes = *size;
+    bytes -= end - begin;
+    if (erase) {
+      ++result.removed_;
+    } else {
+      auto size =
+          AppendHashEntrySize(bytes, edit.field.size(), edit.value.size(),
+                              std::string{}.max_size());
+      if (!size.ok()) return size.status();
+      bytes = *size;
+    }
     splices.push_back({begin, end, index});
   }
   for (const auto& edit : edits) {
-    if (edit.found) continue;
+    if (erase || edit.found) continue;
     auto size = AppendHashEntrySize(bytes, edit.field.size(), edit.value.size(),
                                     std::string{}.max_size());
     if (!size.ok()) return size.status();
@@ -244,34 +252,51 @@ absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
   if (result.added_ > UINT32_MAX - result.count_)
     return absl::OutOfRangeError("Hash element count overflow");
   result.count_ += result.added_;
+  result.count_ -= result.removed_;
   result.changed_ |= result.added_ != 0;
   if (bytes > max_bytes) return std::nullopt;
-  if (!result.changed_) return result;
+  if (!result.changed_ || result.count_ == 0) return result;
 
   auto& output = result.payload_;
-  output.reserve(bytes);
-  AppendU64(&output, kHashValueMagic);
-  AppendU32(&output, kStorageFormatVersion);
-  AppendU32(&output, kHashValueHeaderBytes);
-  AppendU32(&output, result.count_);
-  AppendU32(&output, 0);
-  AppendU64(&output, bytes);
+  output.AppendUnsigned(kHashValueMagic, 8);
+  output.AppendUnsigned(kStorageFormatVersion, 4);
+  output.AppendUnsigned(kHashValueHeaderBytes, 4);
+  output.AppendUnsigned(result.count_, 4);
+  output.AppendUnsigned(0, 4);
+  output.AppendUnsigned(bytes, 8);
   auto append = [&](const Edit& edit) {
-    AppendU32(&output, edit.field.size());
-    AppendU32(&output, edit.value.size());
-    output.append(edit.field);
-    output.append(edit.value);
+    output.AppendUnsigned(edit.field.size(), 4);
+    output.AppendUnsigned(edit.value.size(), 4);
+    output.AppendBytes(edit.field);
+    output.AppendBytes(edit.value);
   };
   std::size_t offset = kHashValueHeaderBytes;
   for (const auto& splice : splices) {
-    output.append(payload.substr(offset, splice.begin - offset));
-    append(edits[splice.edit]);
+    output.AppendBytes(payload.substr(offset, splice.begin - offset));
+    if (!erase) append(edits[splice.edit]);
     offset = splice.end;
   }
-  output.append(payload.substr(offset));
+  output.AppendBytes(payload.substr(offset));
   for (const auto& edit : edits)
-    if (!edit.found) append(edit);
+    if (!erase && !edit.found) append(edit);
   return result;
+}
+
+absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
+    std::string_view payload, std::size_t expected_count,
+    std::span<const std::string_view> fields,
+    std::span<const std::string_view> values, std::size_t max_bytes) {
+  auto plan =
+      PlanCompactHashEdit(payload, expected_count, fields, values, max_bytes);
+  if (!plan.ok()) return plan.status();
+  if (!*plan) return std::nullopt;
+  auto& edit = **plan;
+  auto encoded = EncodeInlineRecordPayload(edit.payload_);
+  if (!encoded.ok()) return encoded.status();
+  return CompactHashEdit{.changed_ = edit.changed_,
+                         .added_ = edit.added_,
+                         .count_ = edit.count_,
+                         .payload_ = std::move(*encoded)};
 }
 
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {
