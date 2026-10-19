@@ -480,10 +480,12 @@ Rank/score page readers copy borrowed members into page blocks before releasing
 the read lease, then transfer selected slices and blocks into the result.
 Reverse order, bounds and LIMIT select the same logical members in either
 output representation. Replies retain their admitted buffers through encoding,
-including EXEC and Lua. Mutation source and boundary probes, and rewrite
-planning, keep the default owned-member snapshots. Command-local probes retain admitted source
-pages containing requested members within a fixed scratch bound and reuse
-them in planning. Unrelated or excess search pages are released immediately;
+including EXEC and Lua. Single-member mutation probes and after-images may
+retain validated encoded pages, owning their bytes after the physical read
+lease ends. Plans that change page topology materialize mutable entries;
+batch and pop planning use owned-member snapshots. Command-local probes retain
+admitted source pages containing requested members within a fixed scratch bound
+and reuse them in planning. Unrelated or excess search pages are released immediately;
 large members retain the ordinary read fallback. Pop selection passes its owned pages
 into deletion under the same exclusive key intent. Reuse checks the logical
 population and preserves member-index/ordered-index agreement; physical GC
