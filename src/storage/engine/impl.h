@@ -2572,7 +2572,7 @@ class StorageEngine::Impl {
       const MutationPrecondition* mutation_precondition = nullptr,
       PreparedOrderedMutation* prepared = nullptr);
   // Command-local checked ordered pages. Retain only pages containing requested
-  // members (or a destination boundary), with admission beside owned strings.
+  // members (or a destination boundary), with admission beside owned payloads.
   // Pop selection passes this cache into deletion under the same key intent;
   // it is never stored in the resident object or reused by another command.
   struct SortedSetOrderedProbe {
@@ -4440,13 +4440,16 @@ class StorageEngine::Impl {
   // caller-owned limiter accounts against the refreshed physical owner until
   // decoding finishes; it must outlive this task, including cancellation.
   // Only read-only consumers may trust stored Sorted Set member uniqueness.
+  // Point writers may retain a checked encoded block instead of member strings;
+  // that representation always checks uniqueness and also releases the lease.
   Task<absl::StatusOr<LoadedOrderedGroup>> LoadOrderedGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned = false,
       GroupReadLimiter* limiter = nullptr,
       SortedSetMemberValidation validation =
-          SortedSetMemberValidation::kVerifyUnique);
+          SortedSetMemberValidation::kVerifyUnique,
+      bool encoded_sorted_set = false);
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

@@ -239,6 +239,58 @@ std::optional<OrderedGroupSnapshot> FirstDenseOrderedPage(
   return first;
 }
 
+TEST(GroupedSortedSetWriteE2e, EncodedPointEditsPreserveExpiryAndDemote) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires mutable point-plan failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "encoded-point-demotion";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    ASSERT_EQ(client.Command({"PEXPIRE", key, "3600000"}).text_, "1");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped(key), true);
+  {
+    ScopedEnvironment fault("LAVIK_FAIL_ZSET_MUTABLE_PLAN_KEY", key.c_str());
+    Server server(disk, 3);
+    Client client(server.port());
+    const auto low = DenseZSetMember(10);
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "0.25", low}).text_, "10.25");
+    expected[low] = 10.25;
+    // The last page has spare space: this move edits two encoded pages while
+    // retaining every page ID/link, and must not enter the mutable planner.
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "2000", low}).text_, "1");
+    expected[low] = 2000;
+    const auto erased = DenseZSetMember(12);
+    ASSERT_EQ(client.Command({"ZREM", key, erased}).text_, "1");
+    expected.erase(erased);
+    ASSERT_EQ(client.Command({"ZADD", key, "12", erased}).text_, "1");
+    expected[erased] = 12;
+    // Walk a coprime permutation so no ordered page becomes empty. The final
+    // point deletion crosses the aggregate demotion threshold with encoded
+    // after-images, exercising the publication path's compact materialization.
+    for (unsigned i = 0; i < 854; ++i) {
+      const auto member = DenseZSetMember((i * 17) % 1024);
+      ASSERT_EQ(client.Command({"ZREM", key, member}).text_, "1") << i;
+      expected.erase(member);
+    }
+    ExpectDenseZSet(client, key, expected);
+    EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped(key), false);
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+  EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+}
+
 TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires ordered plan read failure injection";

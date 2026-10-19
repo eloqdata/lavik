@@ -1254,7 +1254,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       else
         return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
                                         object, metadata[i].id_, false, limiter,
-                                        validation);
+                                        validation, point_write);
     };
     auto page = co_await load();
     if (!page.ok()) co_return page.status();
@@ -1263,7 +1263,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto read_page = [&](std::size_t i) {
     return read_page_impl.template operator()<LoadedSortedSetPage>(i);
   };
-  // Mutation probes own their entries, releasing physical leases before
+  // Mutation probes own their payloads, releasing physical leases before
   // routing. Both wrappers return the loader task without another coroutine.
   auto read_owned_page = [&](std::size_t i) {
     return read_page_impl.template operator()<LoadedOrderedGroup>(i);
@@ -1938,7 +1938,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     GroupedScratchBudget budget;
     status = add_page_budget(&budget, i);
     if (!status.ok()) co_return status;
-    auto located = locate_sources(i, page.page_.snapshot_.entries_);
+    const auto& snapshot = page.page_.snapshot_;
+    auto located =
+        snapshot.encoded_sorted_set_
+            ? locate_sources(i, snapshot.encoded_sorted_set_->entries())
+            : locate_sources(i, snapshot.entries_);
     if (!located.ok()) co_return located.status();
   }
   // The two resident doubles bound old-score candidates without reading
@@ -1963,7 +1967,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (probed_pages.contains(i)) continue;
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
-      auto located = locate_sources(i, page->page_.snapshot_.entries_);
+      const auto& snapshot = page->page_.snapshot_;
+      auto located =
+          snapshot.encoded_sorted_set_
+              ? locate_sources(i, snapshot.encoded_sorted_set_->entries())
+              : locate_sources(i, snapshot.entries_);
       if (!located.ok()) co_return located.status();
       // Equal-score scans may touch unrelated pages. Retain only pages with
       // requested members, so a point update never caches the whole set.
@@ -2029,7 +2037,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
             if (!page.ok()) co_return page.status();
             boundary.emplace(std::move(*page));
           }
-          if (member > boundary->page_.snapshot_.entries_.back().value_) break;
+          const auto& snapshot = boundary->page_.snapshot_;
+          const std::string_view last_member =
+              snapshot.encoded_sorted_set_
+                  ? snapshot.encoded_sorted_set_->entries().back().value_
+                  : std::string_view(snapshot.entries_.back().value_);
+          if (member > last_member) break;
         }
       }
       state->destination_ = i;
@@ -2083,7 +2096,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
       loaded.emplace(i, std::move(page->page_.snapshot_));
-      // working_admission now covers the transferred strings.
+      // working_admission now covers the transferred owned payload.
     } else {
       status = check_plan_read(i);
       if (!status.ok()) co_return status;
@@ -2095,220 +2108,257 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
               "Sorted Set plan cancelled by shutdown");
       }
       auto page = co_await LoadOrderedGroupSnapshot(
-          store, partition, db_id, key, digest, object, metadata[i].id_);
+          store, partition, db_id, key, digest, object, metadata[i].id_, false,
+          nullptr, SortedSetMemberValidation::kVerifyUnique, point_write);
       if (!page.ok()) co_return page.status();
       loaded.emplace(i, std::move(page->snapshot_));
     }
   }
-  if (operation.kind_ == SortedSetOperationKind::kAdd &&
-      operation.entries_.size() == 1 && pending.size() == 1 &&
-      pending.front().second->before_) {
-    // A point score update owns the existing member already. Keep that
-    // allocation and the page's ordered subsequences instead of deleting the
-    // member, copying the request, and sorting the entire destination. Batch
-    // inputs retain the general path because repeated members apply in order.
-    const auto& [member, state] = pending.front();
-    auto& source = loaded.at(state->source_).entries_;
-    const auto entry =
-        std::find_if(source.begin(), source.end(),
-                     [&](const auto& at) { return at.value_ == member; });
-    if (entry == source.end())
-      co_return absl::DataLossError("missing Sorted Set point-update source");
-    entry->score_ = *state->after_;
-    if (state->source_ == state->destination_) {
-      if (entry != source.begin() && OrderedEntryLess(*entry, *(entry - 1))) {
-        const auto position =
-            std::lower_bound(source.begin(), entry, *entry, OrderedEntryLess);
-        std::rotate(position, entry, entry + 1);
-      } else if (entry + 1 != source.end() &&
-                 OrderedEntryLess(*(entry + 1), *entry)) {
-        const auto position =
-            std::lower_bound(entry + 1, source.end(), *entry, OrderedEntryLess);
-        std::rotate(entry, entry + 1, position);
-      }
-    } else {
-      auto moved = std::move(*entry);
-      source.erase(entry);
-      auto& destination = loaded.at(state->destination_).entries_;
-      const auto position = std::lower_bound(
-          destination.begin(), destination.end(), moved, OrderedEntryLess);
-      destination.insert(position, std::move(moved));
-    }
-  } else if (operation.kind_ == SortedSetOperationKind::kAdd &&
-             operation.entries_.size() == 1 && pending.size() == 1) {
-    // The untouched destination is already ordered. Insert a new member at
-    // its exact score/member position instead of sorting all existing entries.
-    // The member-index lookup and ordinary page validation remain mandatory.
-    const auto& [member, state] = pending.front();
-    auto& destination = loaded.at(state->destination_).entries_;
-    OrderedCollectionEntry entry{std::string(member), *state->after_};
-    const auto position = std::lower_bound(
-        destination.begin(), destination.end(), entry, OrderedEntryLess);
-    destination.insert(position, std::move(entry));
-  } else {
+  bool encoded_point = point_write;
+  if (encoded_point) {
+    const auto& [member, state] = *members.begin();
     for (const auto i : modified) {
-      auto& entries = loaded.at(i).entries_;
-      std::erase_if(entries, [&](const auto& entry) {
-        const auto member = members.find(entry.value_);
-        return member != members.end() && member->second.touched_;
-      });
+      auto edited = EditEncodedSortedSetGroup(
+          loaded.at(i), member,
+          i == state.source_ ? state.before_ : std::nullopt,
+          i == state.destination_ ? state.after_ : std::nullopt);
+      if (!edited.ok()) co_return edited.status();
+      if (!*edited) {
+        encoded_point = false;
+        plan.writes_.clear();
+        break;
+      }
+      plan.writes_.push_back(std::move(**edited));
     }
-    for (const auto& [member, state] : pending)
-      loaded.at(state->destination_)
-          .entries_.push_back({std::string(member), *state->after_});
-
-    // Removal preserves the order of every surviving entry.
-    if (!pending.empty()) {
+  }
+  if (!encoded_point) {
+    LAVIK_FAULT_INJECT(
+        if (point_write &&
+            LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MUTABLE_PLAN_KEY",
+                                key)) co_return absl::
+            UnavailableError(
+                "injected mutable Sorted Set point plan failure"););
+    // Empty/overflowing pages need the ordinary retirement, redistribution and
+    // split planner. Materialize only on this uncommon path; no encoded page
+    // or physical lease escapes into the mutable topology machinery.
+    for (auto& [index, page] : loaded) MaterializeOrderedGroupEntries(page);
+    if (operation.kind_ == SortedSetOperationKind::kAdd &&
+        operation.entries_.size() == 1 && pending.size() == 1 &&
+        pending.front().second->before_) {
+      // A point score update owns the existing member already. Keep that
+      // allocation and the page's ordered subsequences instead of deleting the
+      // member, copying the request, and sorting the entire destination. Batch
+      // inputs retain the general path because repeated members apply in order.
+      const auto& [member, state] = pending.front();
+      auto& source = loaded.at(state->source_).entries_;
+      const auto entry =
+          std::find_if(source.begin(), source.end(),
+                       [&](const auto& at) { return at.value_ == member; });
+      if (entry == source.end())
+        co_return absl::DataLossError("missing Sorted Set point-update source");
+      entry->score_ = *state->after_;
+      if (state->source_ == state->destination_) {
+        if (entry != source.begin() && OrderedEntryLess(*entry, *(entry - 1))) {
+          const auto position =
+              std::lower_bound(source.begin(), entry, *entry, OrderedEntryLess);
+          std::rotate(position, entry, entry + 1);
+        } else if (entry + 1 != source.end() &&
+                   OrderedEntryLess(*(entry + 1), *entry)) {
+          const auto position = std::lower_bound(entry + 1, source.end(),
+                                                 *entry, OrderedEntryLess);
+          std::rotate(entry, entry + 1, position);
+        }
+      } else {
+        auto moved = std::move(*entry);
+        source.erase(entry);
+        auto& destination = loaded.at(state->destination_).entries_;
+        const auto position = std::lower_bound(
+            destination.begin(), destination.end(), moved, OrderedEntryLess);
+        destination.insert(position, std::move(moved));
+      }
+    } else if (operation.kind_ == SortedSetOperationKind::kAdd &&
+               operation.entries_.size() == 1 && pending.size() == 1) {
+      // The untouched destination is already ordered. Insert a new member at
+      // its exact score/member position instead of sorting all existing
+      // entries. The member-index lookup and ordinary page validation remain
+      // mandatory.
+      const auto& [member, state] = pending.front();
+      auto& destination = loaded.at(state->destination_).entries_;
+      OrderedCollectionEntry entry{std::string(member), *state->after_};
+      const auto position = std::lower_bound(
+          destination.begin(), destination.end(), entry, OrderedEntryLess);
+      destination.insert(position, std::move(entry));
+    } else {
       for (const auto i : modified) {
         auto& entries = loaded.at(i).entries_;
-        std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+        std::erase_if(entries, [&](const auto& entry) {
+          const auto member = members.find(entry.value_);
+          return member != members.end() && member->second.touched_;
+        });
       }
-    }
-  }
-  // A score move can overflow its destination while freeing the adjacent
-  // source. Reuse both already admitted pages when they still fit together;
-  // allocating an extra id would force full-directory reconstruction.
-  for (const auto i : modified) {
-    if (!modified.contains(i + 1)) continue;
-    auto balanced = RebalanceSortedSetGroupPair(loaded.at(i), loaded.at(i + 1));
-    if (!balanced.ok()) co_return balanced.status();
-  }
+      for (const auto& [member, state] : pending)
+        loaded.at(state->destination_)
+            .entries_.push_back({std::string(member), *state->after_});
 
-  // Repeated inserts before a full page otherwise split off one tiny successor
-  // per command. Reuse at most one unchanged neighbour before allocating an
-  // identity, using resident sizes to avoid speculative reads of full pages.
-  // selected already admits both immediate neighbours. A successful pair keeps
-  // its links and IDs, so it needs neither a wider interval nor more admission.
-  constexpr auto kPagePayloadBytes =
-      kCollectionGroupTargetBytes - kOrderedGroupHeaderBytes;
-  constexpr auto kPairPayloadBytes = 2 * kPagePayloadBytes;
-  auto bounded_payload_bytes = [](const OrderedGroupSnapshot& page) {
-    std::size_t bytes = 0;
-    for (const auto& entry : page.entries_) {
-      const auto entry_bytes = kOrderedEntryHeaderBytes + entry.value_.size();
-      if (entry_bytes > kPairPayloadBytes - bytes) return kPairPayloadBytes + 1;
-      bytes += entry_bytes;
-    }
-    return bytes;
-  };
-  absl::InlinedVector<std::pair<std::size_t, std::size_t>, 4> overflowing;
-  for (const auto i : modified) {
-    const auto bytes = bounded_payload_bytes(loaded.at(i));
-    if (bytes > kPagePayloadBytes && bytes <= kPairPayloadBytes)
-      overflowing.emplace_back(i, bytes);
-  }
-  // Iterate only original overflows: adopted neighbours must fit the target
-  // after redistribution and cannot start an outward chain of extra reads.
-  for (const auto& [i, bytes] : overflowing) {
-    std::size_t neighbor = kNoPage;
-    for (const auto candidate : {i == 0 ? kNoPage : i - 1,
-                                 i + 1 == metadata.size() ? kNoPage : i + 1}) {
-      if (candidate == kNoPage || modified.contains(candidate)) continue;
-      const auto encoded = metadata[candidate].encoded_bytes_;
-      if (encoded < kOrderedGroupHeaderBytes ||
-          encoded - kOrderedGroupHeaderBytes > kPairPayloadBytes - bytes)
-        continue;
-      if (neighbor == kNoPage || encoded < metadata[neighbor].encoded_bytes_)
-        neighbor = candidate;
-    }
-    if (neighbor == kNoPage) continue;
-    if (!loaded.contains(neighbor)) {
-      status = check_plan_read(neighbor);
-      if (!status.ok()) co_return status;
-      auto page = co_await LoadOrderedGroupSnapshot(
-          store, partition, db_id, key, digest, object, metadata[neighbor].id_);
-      if (!page.ok()) co_return page.status();
-      loaded.emplace(neighbor, std::move(page->snapshot_));
-    }
-    auto balanced =
-        neighbor < i
-            ? RebalanceSortedSetGroupPair(loaded.at(neighbor), loaded.at(i))
-            : RebalanceSortedSetGroupPair(loaded.at(i), loaded.at(neighbor));
-    if (!balanced.ok()) co_return balanced.status();
-    // Indivisible variable-sized entries can still prevent a legal cut. Keep
-    // that unchanged snapshot for a possible link rewrite after the split.
-    if (*balanced) modified.insert(neighbor);
-  }
-
-  struct Route {
-    std::uint64_t id_;
-    std::size_t source_;
-    std::size_t write_;
-  };
-  std::vector<Route> route;
-  route.reserve(selected.size());
-  auto next_id = directory.root().next_group_id_;
-  std::uint64_t page_count = metadata.size();
-  // Original modified pages have their immediate neighbours in selected;
-  // redistributed neighbours retain their outer links. Process contiguous
-  // intervals independently: gaps need neither routing nor payload rebuilds.
-  for (auto selected_it = selected.begin(); selected_it != selected.end();) {
-    const auto begin = *selected_it++;
-    auto end = begin + 1;
-    while (selected_it != selected.end() && *selected_it == end) {
-      ++selected_it;
-      ++end;
-    }
-    route.clear();
-    for (std::size_t i = begin; i < end; ++i) {
-      if (!modified.contains(i)) {
-        route.push_back({metadata[i].id_, i, kNoPage});
-        continue;
-      }
-      auto page = std::move(loaded.at(i));
-      if (page.entries_.empty()) {
-        page.retired_ = true;
-        page.previous_ = page.next_ = 0;
-        plan.writes_.push_back(std::move(page));
-        continue;
-      }
-      auto split = SplitCheckedSortedSetGroup(std::move(page), next_id);
-      if (!split.ok()) co_return split.status();
-      next_id = split->next_group_id_;
-      for (auto& part : split->groups_) {
-        route.push_back({part.id_, i, plan.writes_.size()});
-        plan.writes_.push_back(std::move(part));
-      }
-    }
-    // A non-global interval includes an unchanged boundary neighbour. The
-    // global empty result was handled above by deleting the complete key.
-    if (route.empty())
-      co_return absl::DataLossError("empty Sorted Set selected interval");
-    page_count = page_count - (end - begin) + route.size();
-    for (std::size_t i = 0; i < route.size(); ++i) {
-      auto& at = route[i];
-      const auto previous =
-          i == 0 ? metadata[begin].previous_ : route[i - 1].id_;
-      const auto following =
-          i + 1 == route.size() ? metadata[end - 1].next_ : route[i + 1].id_;
-      if (at.write_ == kNoPage) {
-        const auto& old = metadata[at.source_];
-        if (old.previous_ == previous && old.next_ == following) continue;
-        at.write_ = plan.writes_.size();
-        if (const auto cached = loaded.find(at.source_);
-            cached != loaded.end()) {
-          plan.writes_.push_back(std::move(cached->second));
-        } else {
-          status = check_plan_read(at.source_);
-          if (!status.ok()) co_return status;
-          // Revalidate the captured logical view and current physical
-          // location through the ordinary loader, including GC retry checks.
-          auto neighbor = co_await LoadOrderedGroupSnapshot(
-              store, partition, db_id, key, digest, object, old.id_);
-          if (!neighbor.ok()) co_return neighbor.status();
-          plan.writes_.push_back(std::move(neighbor->snapshot_));
+      // Removal preserves the order of every surviving entry.
+      if (!pending.empty()) {
+        for (const auto i : modified) {
+          auto& entries = loaded.at(i).entries_;
+          std::sort(entries.begin(), entries.end(), OrderedEntryLess);
         }
       }
-      plan.writes_[at.write_].previous_ = previous;
-      plan.writes_[at.write_].next_ = following;
     }
-    if (begin == 0) plan.root_.first_group_ = route.front().id_;
-    if (end == metadata.size()) plan.root_.last_group_ = route.back().id_;
+    // A score move can overflow its destination while freeing the adjacent
+    // source. Reuse both already admitted pages when they still fit together;
+    // allocating an extra id would force full-directory reconstruction.
+    for (const auto i : modified) {
+      if (!modified.contains(i + 1)) continue;
+      auto balanced =
+          RebalanceSortedSetGroupPair(loaded.at(i), loaded.at(i + 1));
+      if (!balanced.ok()) co_return balanced.status();
+    }
+
+    // Repeated inserts before a full page otherwise split off one tiny
+    // successor per command. Reuse at most one unchanged neighbour before
+    // allocating an identity, using resident sizes to avoid speculative reads
+    // of full pages. selected already admits both immediate neighbours. A
+    // successful pair keeps its links and IDs, so it needs neither a wider
+    // interval nor more admission.
+    constexpr auto kPagePayloadBytes =
+        kCollectionGroupTargetBytes - kOrderedGroupHeaderBytes;
+    constexpr auto kPairPayloadBytes = 2 * kPagePayloadBytes;
+    auto bounded_payload_bytes = [](const OrderedGroupSnapshot& page) {
+      std::size_t bytes = 0;
+      for (const auto& entry : page.entries_) {
+        const auto entry_bytes = kOrderedEntryHeaderBytes + entry.value_.size();
+        if (entry_bytes > kPairPayloadBytes - bytes)
+          return kPairPayloadBytes + 1;
+        bytes += entry_bytes;
+      }
+      return bytes;
+    };
+    absl::InlinedVector<std::pair<std::size_t, std::size_t>, 4> overflowing;
+    for (const auto i : modified) {
+      const auto bytes = bounded_payload_bytes(loaded.at(i));
+      if (bytes > kPagePayloadBytes && bytes <= kPairPayloadBytes)
+        overflowing.emplace_back(i, bytes);
+    }
+    // Iterate only original overflows: adopted neighbours must fit the target
+    // after redistribution and cannot start an outward chain of extra reads.
+    for (const auto& [i, bytes] : overflowing) {
+      std::size_t neighbor = kNoPage;
+      for (const auto candidate :
+           {i == 0 ? kNoPage : i - 1,
+            i + 1 == metadata.size() ? kNoPage : i + 1}) {
+        if (candidate == kNoPage || modified.contains(candidate)) continue;
+        const auto encoded = metadata[candidate].encoded_bytes_;
+        if (encoded < kOrderedGroupHeaderBytes ||
+            encoded - kOrderedGroupHeaderBytes > kPairPayloadBytes - bytes)
+          continue;
+        if (neighbor == kNoPage || encoded < metadata[neighbor].encoded_bytes_)
+          neighbor = candidate;
+      }
+      if (neighbor == kNoPage) continue;
+      if (!loaded.contains(neighbor)) {
+        status = check_plan_read(neighbor);
+        if (!status.ok()) co_return status;
+        auto page = co_await LoadOrderedGroupSnapshot(store, partition, db_id,
+                                                      key, digest, object,
+                                                      metadata[neighbor].id_);
+        if (!page.ok()) co_return page.status();
+        loaded.emplace(neighbor, std::move(page->snapshot_));
+      }
+      auto balanced =
+          neighbor < i
+              ? RebalanceSortedSetGroupPair(loaded.at(neighbor), loaded.at(i))
+              : RebalanceSortedSetGroupPair(loaded.at(i), loaded.at(neighbor));
+      if (!balanced.ok()) co_return balanced.status();
+      // Indivisible variable-sized entries can still prevent a legal cut. Keep
+      // that unchanged snapshot for a possible link rewrite after the split.
+      if (*balanced) modified.insert(neighbor);
+    }
+
+    struct Route {
+      std::uint64_t id_;
+      std::size_t source_;
+      std::size_t write_;
+    };
+    std::vector<Route> route;
+    route.reserve(selected.size());
+    auto next_id = directory.root().next_group_id_;
+    std::uint64_t page_count = metadata.size();
+    // Original modified pages have their immediate neighbours in selected;
+    // redistributed neighbours retain their outer links. Process contiguous
+    // intervals independently: gaps need neither routing nor payload rebuilds.
+    for (auto selected_it = selected.begin(); selected_it != selected.end();) {
+      const auto begin = *selected_it++;
+      auto end = begin + 1;
+      while (selected_it != selected.end() && *selected_it == end) {
+        ++selected_it;
+        ++end;
+      }
+      route.clear();
+      for (std::size_t i = begin; i < end; ++i) {
+        if (!modified.contains(i)) {
+          route.push_back({metadata[i].id_, i, kNoPage});
+          continue;
+        }
+        auto page = std::move(loaded.at(i));
+        if (page.entries_.empty()) {
+          page.retired_ = true;
+          page.previous_ = page.next_ = 0;
+          plan.writes_.push_back(std::move(page));
+          continue;
+        }
+        auto split = SplitCheckedSortedSetGroup(std::move(page), next_id);
+        if (!split.ok()) co_return split.status();
+        next_id = split->next_group_id_;
+        for (auto& part : split->groups_) {
+          route.push_back({part.id_, i, plan.writes_.size()});
+          plan.writes_.push_back(std::move(part));
+        }
+      }
+      // A non-global interval includes an unchanged boundary neighbour. The
+      // global empty result was handled above by deleting the complete key.
+      if (route.empty())
+        co_return absl::DataLossError("empty Sorted Set selected interval");
+      page_count = page_count - (end - begin) + route.size();
+      for (std::size_t i = 0; i < route.size(); ++i) {
+        auto& at = route[i];
+        const auto previous =
+            i == 0 ? metadata[begin].previous_ : route[i - 1].id_;
+        const auto following =
+            i + 1 == route.size() ? metadata[end - 1].next_ : route[i + 1].id_;
+        if (at.write_ == kNoPage) {
+          const auto& old = metadata[at.source_];
+          if (old.previous_ == previous && old.next_ == following) continue;
+          at.write_ = plan.writes_.size();
+          if (const auto cached = loaded.find(at.source_);
+              cached != loaded.end()) {
+            plan.writes_.push_back(std::move(cached->second));
+          } else {
+            status = check_plan_read(at.source_);
+            if (!status.ok()) co_return status;
+            // Revalidate the captured logical view and current physical
+            // location through the ordinary loader, including GC retry checks.
+            auto neighbor = co_await LoadOrderedGroupSnapshot(
+                store, partition, db_id, key, digest, object, old.id_);
+            if (!neighbor.ok()) co_return neighbor.status();
+            plan.writes_.push_back(std::move(neighbor->snapshot_));
+          }
+        }
+        plan.writes_[at.write_].previous_ = previous;
+        plan.writes_[at.write_].next_ = following;
+      }
+      if (begin == 0) plan.root_.first_group_ = route.front().id_;
+      if (end == metadata.size()) plan.root_.last_group_ = route.back().id_;
+    }
+    if (page_count == 0 ||
+        page_count > std::numeric_limits<std::uint32_t>::max())
+      co_return absl::DataLossError("invalid Sorted Set resulting page count");
+    plan.root_.group_count_ = page_count;
+    plan.root_.next_group_id_ = next_id;
   }
-  if (page_count == 0 || page_count > std::numeric_limits<std::uint32_t>::max())
-    co_return absl::DataLossError("invalid Sorted Set resulting page count");
-  plan.root_.group_count_ = page_count;
-  plan.root_.next_group_id_ = next_id;
   // A failed redistribution may have inspected a neighbour whose link stayed
   // unchanged. Keep only the owned after-images through member preparation and
   // publication; no later phase needs those speculative decoded bytes.

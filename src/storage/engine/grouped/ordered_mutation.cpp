@@ -298,7 +298,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             if (page.kind_ == OrderedCollectionKind::kString)
               compact.push_back(
                   {.value_ = std::string(OrderedStringBytes(page))});
-            else {
+            else if (page.encoded_sorted_set_) {
+              for (const auto& entry : page.encoded_sorted_set_->entries())
+                compact.push_back({std::string(entry.value_), entry.score_});
+            } else {
               const auto entries = OrderedGroupEntries(page);
               compact.insert(compact.end(), entries.begin(), entries.end());
             }
@@ -451,7 +454,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       continue;
     }
     const auto& page = plan.writes_[i];
-    const auto entries = OrderedGroupEntries(page);
+    const auto entries = page.encoded_sorted_set_
+                             ? std::span<const OrderedCollectionEntry>{}
+                             : OrderedGroupEntries(page);
     RecoveredOrderedGroup candidate{
         {.incarnation_ = plan.root_.incarnation_,
          .id_ = page.id_,
@@ -463,8 +468,14 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
          .encoded_bytes_ = ordered_sizes[i],
          .record_token_ = page.id_,
          .retired_ = group.retired_,
-         .min_score_ = entries.empty() ? 0 : entries.front().score_,
-         .max_score_ = entries.empty() ? 0 : entries.back().score_},
+         .min_score_ = page.encoded_sorted_set_
+                           ? page.encoded_sorted_set_->entries().front().score_
+                       : entries.empty() ? 0
+                                         : entries.front().score_,
+         .max_score_ = page.encoded_sorted_set_
+                           ? page.encoded_sorted_set_->entries().back().score_
+                       : entries.empty() ? 0
+                                         : entries.back().score_},
         tx->txid_,
         command_batch};
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {
