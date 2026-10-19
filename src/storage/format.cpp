@@ -43,21 +43,21 @@ std::uint64_t LoadLittleEndian(const std::uint8_t* input) noexcept {
 }
 
 std::uint32_t LoadLittleEndian32(const std::byte* input) noexcept {
-  return std::to_integer<std::uint8_t>(input[0]) |
-         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(input[1]))
-          << 8) |
-         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(input[2]))
-          << 16) |
-         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(input[3]))
-          << 24);
+  // Serialized fields need not be aligned; memcpy also avoids aliasing a byte
+  // buffer as an integer while allowing a single fixed-width load.
+  std::uint32_t value = 0;
+  std::memcpy(&value, input, sizeof(value));
+  if constexpr (std::endian::native == std::endian::big) {
+    value = std::byteswap(value);
+  }
+  return value;
 }
 
 std::uint64_t LoadLittleEndian64(const std::byte* input) noexcept {
   std::uint64_t value = 0;
-  for (unsigned byte = 0; byte < 8; ++byte) {
-    value |=
-        static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(input[byte]))
-        << (byte * 8);
+  std::memcpy(&value, input, sizeof(value));
+  if constexpr (std::endian::native == std::endian::big) {
+    value = std::byteswap(value);
   }
   return value;
 }
