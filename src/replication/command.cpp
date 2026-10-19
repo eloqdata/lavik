@@ -222,8 +222,7 @@ DecodeReplicationTransactionEnvelope(std::string_view encoded) {
 }
 
 bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept {
-  return encoded.size() >= kTransactionMagic.size() &&
-         encoded.substr(0, kTransactionMagic.size()) == kTransactionMagic;
+  return encoded.starts_with(kTransactionMagic);
 }
 
 // The source owns and accounts its header and view table. Protocol/container
