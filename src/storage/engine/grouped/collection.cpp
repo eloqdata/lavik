@@ -527,7 +527,7 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
   if (!entries.ok()) return entries.status();
   auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
   if (!metadata.ok()) return metadata.status();
-  auto owned = std::make_shared<const std::string>(
+  auto owned = MakeLocalShared<const std::string>(
       bytes.substr(kOrderedGroupHeaderBytes));
   for (auto& entry : *entries) {
     const auto offset =
@@ -577,7 +577,7 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
        frame_bytes > target_bytes - kOrderedGroupHeaderBytes - retained_bytes))
     return std::nullopt;
   const auto size = retained_bytes + (after ? frame_bytes : 0);
-  auto output = std::make_shared<std::string>();
+  auto output = MakeLocalShared<std::string>();
   output->reserve(size);
   auto append_member = [&] {
     std::array<char, kEntryHeaderBytes> header{};

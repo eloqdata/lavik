@@ -20,7 +20,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -34,6 +33,7 @@
 #include "lavik/containers/cow_array.h"
 #include "lavik/containers/cow_map.h"
 #include "lavik/containers/fenwick_tree.h"
+#include "lavik/local_shared_ptr.h"
 #include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/format.h"
@@ -123,8 +123,10 @@ class CheckedSortedSetEntries {
 
 // A fully checked page held in one immutable byte block. Views share that
 // block across snapshot copies/moves, so no physical read lease survives
-// decoding and no member acquires its own string allocation. Only the checked
-// decoder and topology-preserving point editor can construct this owner.
+// decoding and no member acquires its own string allocation. The owner and
+// all snapshots stay on the key owner worker, including across suspension and
+// destruction; only the checked decoder and topology-preserving point editor
+// can construct this owner.
 class EncodedSortedSetEntries {
  public:
   std::span<const OrderedCollectionEntryView> entries() const noexcept {
@@ -141,11 +143,11 @@ class EncodedSortedSetEntries {
                             std::optional<double> before,
                             std::optional<double> after,
                             std::size_t target_bytes);
-  EncodedSortedSetEntries(std::shared_ptr<const std::string> bytes,
+  EncodedSortedSetEntries(LocalSharedPtr<const std::string> bytes,
                           std::vector<OrderedCollectionEntryView> entries)
       : bytes_(std::move(bytes)), entries_(std::move(entries)) {}
   // Declare the owner first so every borrowing view dies before its bytes.
-  std::shared_ptr<const std::string> bytes_;
+  LocalSharedPtr<const std::string> bytes_;
   std::vector<OrderedCollectionEntryView> entries_;
 };
 
