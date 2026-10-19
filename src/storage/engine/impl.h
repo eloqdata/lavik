@@ -4221,7 +4221,8 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       bool capture_fullsync = true, TxUndoLog* replacement_undo = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
-      GroupMutationWrite* grouped = nullptr
+      GroupMutationWrite* grouped = nullptr,
+      const InlineRecordPayload* inline_payload = nullptr
 #if LAVIK_ENABLE_TRACE
       ,
       SetLatencyTrace* trace = nullptr
@@ -4478,7 +4479,7 @@ class StorageEngine::Impl {
   struct RecordWriteRequest {
     std::string_view key_{};
     std::string_view value_{};
-    // Optional preflighted inline auxiliary encoder, mutually exclusive with
+    // Optional preflighted compact/auxiliary encoder, mutually exclusive with
     // value_ and external_. Borrowed through allocation waits, then consumed
     // synchronously into the unpublished staging tail after final validation.
     const InlineRecordPayload* inline_payload_ = nullptr;

@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <deque>
 #include <optional>
 #include <tuple>
 
@@ -236,6 +238,259 @@ void ExpectWatchOutcome(Client& watcher, Collection type,
     EXPECT_EQ(result.items_.size(), 1);
 }
 
+TEST(CompactStringWriteE2e, ColdRangeWriteYieldsStateAndRetainsKey) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires compact write pause hook";
+#endif
+  PrivateDisk disk(kPrivateDiskBytes);
+  std::string expected(8192, 'a');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", "target", expected, "EX", "600"}).text_,
+              "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ScopedFault pause_key("LAVIK_COMPACT_WRITE_PAUSE_KEY", "target");
+    WritePauseGate gate(disk, "LAVIK_COMPACT_WRITE_HOLD_FILE");
+    Server server(disk, 1);
+    Client client(server.port());
+    PendingWrite first(server.port()), second(server.port());
+    gate.Arm();
+    first.Send({"SETRANGE", "target", "2048", std::string(256, 'b')});
+    ASSERT_TRUE(AwaitMarker(server, gate.marker())) << server.Log();
+    second.Send({"SETRANGE", "target", "4096", std::string(256, 'c')});
+    EXPECT_EQ(client.Command({"SET", "unrelated", "progress"}).text_, "OK");
+    EXPECT_EQ(client.Command({"HSET", "hash", "f", "progress"}).text_, "1");
+    EXPECT_FALSE(first.HasReply());
+    EXPECT_FALSE(second.HasReply());
+    gate.Release();
+    EXPECT_EQ(first.Read().text_, "8192");
+    EXPECT_EQ(second.Read().text_, "8192");
+    expected.replace(2048, 256, 256, 'b');
+    expected.replace(4096, 256, 256, 'c');
+    EXPECT_EQ(client.Command({"GET", "target"}).text_, expected);
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "target"}).text_), 0);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", "target"}).text_, expected);
+  EXPECT_GT(std::stoll(client.Command({"PTTL", "target"}).text_), 0);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
+  PrivateDisk disk;
+  std::deque<std::string> list;
+  std::set<std::string> set;
+  std::map<std::string, double> zset;
+  std::string value(8192, 's');
+  auto member = [](unsigned i) {
+    auto text = std::to_string(i);
+    text.resize(32, static_cast<char>(i));
+    return text;
+  };
+  auto verify = [&](Client& client) {
+    const auto actual_list = client.Command({"LRANGE", "list", "0", "-1"});
+    ASSERT_EQ(actual_list.items_.size(), list.size());
+    for (std::size_t i = 0; i < list.size(); ++i)
+      EXPECT_EQ(actual_list.items_[i].text_, list[i]);
+    const auto actual_set = client.Command({"SMEMBERS", "set"});
+    std::set<std::string> members;
+    for (const auto& item : actual_set.items_) members.insert(item.text_);
+    EXPECT_EQ(members, set);
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& [name, score] : zset) ordered.emplace_back(score, name);
+    std::sort(ordered.begin(), ordered.end());
+    const auto actual_zset =
+        client.Command({"ZRANGE", "zset", "0", "-1", "WITHSCORES"});
+    ASSERT_EQ(actual_zset.items_.size(), ordered.size() * 2);
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+      EXPECT_EQ(actual_zset.items_[2 * i].text_, ordered[i].second);
+      EXPECT_EQ(std::stod(actual_zset.items_[2 * i + 1].text_),
+                ordered[i].first);
+    }
+    EXPECT_EQ(client.Command({"GET", "string"}).text_, value);
+  };
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> push{"RPUSH", "list"};
+    for (unsigned i = 0; i < 32; ++i) {
+      list.emplace_back(256, static_cast<char>(i));
+      push.push_back(list.back());
+    }
+    ASSERT_EQ(client.Command(push).text_, "32");
+    std::vector<std::string> sadd{"SADD", "set"}, zadd{"ZADD", "zset"};
+    for (unsigned i = 0; i < 256; ++i) {
+      const auto name = member(i);
+      set.insert(name);
+      zset[name] = i % 8;
+      sadd.push_back(name);
+      zadd.push_back(std::to_string(i % 8));
+      zadd.push_back(name);
+    }
+    ASSERT_EQ(client.Command(sadd).text_, "256");
+    ASSERT_EQ(client.Command(zadd).text_, "256");
+    ASSERT_EQ(client.Command({"SET", "string", value}).text_, "OK");
+    for (unsigned i = 0; i < 128; ++i) {
+      const std::string a(256, static_cast<char>(i)),
+          b(256, static_cast<char>(i + 1));
+      const bool left = i % 2 == 0;
+      ASSERT_EQ(client.Command({left ? "LPUSH" : "RPUSH", "list", a, b}).text_,
+                "34");
+      if (left) {
+        list.push_front(a);
+        list.push_front(b);
+      } else {
+        list.push_back(a);
+        list.push_back(b);
+      }
+      const auto popped = client.Command({left ? "RPOP" : "LPOP", "list", "2"});
+      ASSERT_EQ(popped.items_.size(), 2);
+      for (unsigned j = 0; j < 2; ++j) {
+        EXPECT_EQ(popped.items_[j].text_, left ? list.back() : list.front());
+        if (left)
+          list.pop_back();
+        else
+          list.pop_front();
+      }
+      const auto name = member((i * 37) % 256);
+      const int delta = i % 2 == 0 ? 32768 : -32768;
+      const auto incremented =
+          client.Command({"ZINCRBY", "zset", std::to_string(delta), name});
+      ASSERT_EQ(incremented.kind_, '$');
+      zset[name] += delta;
+      EXPECT_EQ(std::stod(incremented.text_), zset[name]);
+      if (i % 7 == 0) {
+        ASSERT_EQ(client.Command({"ZREM", "zset", name}).text_, "1");
+        ASSERT_EQ(client.Command({"ZADD", "zset", "3", name}).text_, "1");
+        zset[name] = 3;
+      }
+      ASSERT_EQ(client.Command({"SREM", "set", name, name}).text_, "1");
+      ASSERT_EQ(client.Command({"SADD", "set", name, name}).text_, "1");
+      const auto offset = (i * 317) % 8192;
+      value.resize(std::max(value.size(), offset + a.size()), '\0');
+      value.replace(offset, a.size(), a);
+      EXPECT_EQ(
+          client.Command({"SETRANGE", "string", std::to_string(offset), a})
+              .text_,
+          std::to_string(value.size()));
+    }
+    verify(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  verify(client);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(CompactPointWriteE2e, FailedInlineEncodingKeepsValueAndWatch) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires inline encoder fault hook";
+#endif
+  const std::vector<
+      std::pair<std::vector<std::string>, std::vector<std::string>>>
+      cases{{{"SET", "target", std::string(8192, 'a')},
+             {"SETRANGE", "target", "3", "changed"}},
+            {{"HSET", "target", "a", "before", "b", "keep"},
+             {"HSET", "target", "a", "after"}},
+            {{"SADD", "target", "a", "b"}, {"SREM", "target", "a"}},
+            {{"RPUSH", "target", "a", "b"}, {"LPUSH", "target", "after"}},
+            {{"ZADD", "target", "1", "a", "2", "b"},
+             {"ZINCRBY", "target", "9", "a"}}};
+  for (const auto& [seed, mutation] : cases) {
+    for (const bool in_exec : {false, true}) {
+      SCOPED_TRACE(seed.front());
+      SCOPED_TRACE(in_exec);
+      PrivateDisk disk(kPrivateDiskBytes);
+      std::string after;
+      {
+        ScopedFault fault("LAVIK_FAIL_INLINE_COMPACT_ENCODE_KEY", "target");
+        Server server(disk, 1);
+        Client client(server.port()), watcher(server.port());
+        ASSERT_NE(client.Command(seed).kind_, '-');
+        const auto before = client.Command({"DUMP", "target"});
+        ASSERT_EQ(before.kind_, '$');
+        ASSERT_EQ(watcher.Command({"WATCH", "target"}).text_, "OK");
+        Reply failed;
+        if (in_exec) {
+          ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+          ASSERT_EQ(client.Command(mutation).text_, "QUEUED");
+          ASSERT_EQ(
+              client.Command({"SET", "exec-successor", "committed"}).text_,
+              "QUEUED");
+          auto executed = client.Command({"EXEC"});
+          ASSERT_EQ(executed.items_.size(), 2);
+          failed = std::move(executed.items_[0]);
+          EXPECT_EQ(executed.items_[1].text_, "OK");
+        } else {
+          failed = client.Command(mutation);
+        }
+        ASSERT_EQ(failed.kind_, '-') << failed.text_;
+        EXPECT_EQ(client.Command({"DUMP", "target"}).text_, before.text_);
+        ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+        ASSERT_EQ(watcher.Command({"EXISTS", "target"}).text_, "QUEUED");
+        ASSERT_EQ(watcher.Command({"EXEC"}).items_.size(), 1);
+        ASSERT_NE(client.Command(mutation).kind_, '-');
+        after = client.Command({"DUMP", "target"}).text_;
+        EXPECT_NE(after, before.text_);
+        client.Durable();
+        ASSERT_EQ(server.Wait(true), 0) << server.Log();
+      }
+      Server recovered(disk, 2);
+      Client client(recovered.port());
+      EXPECT_EQ(client.Command({"DUMP", "target"}).text_, after);
+      if (in_exec)
+        EXPECT_EQ(client.Command({"GET", "exec-successor"}).text_, "committed");
+      ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+    }
+  }
+}
+
+TEST(CompactPointWriteE2e, SingleReadSlotUsesOwnedFallback) {
+  PrivateDisk disk(kPrivateDiskBytes);
+  const std::array<std::string_view, 4> options{
+      "--registered-buffer-mb-per-worker", "33", "--storage-read-buffer-kb",
+      "1024"};
+  // Four default write slots leave exactly one read slot. Indirect-key
+  // publication needs to read its key while the old value is being replaced.
+  Server server(disk, 1, {}, {}, false, 2, "1G", {}, {}, 0, 20, options);
+  Client client(server.port());
+  for (const auto& key : {std::string("target"), std::string(3072, 'k')}) {
+    ASSERT_EQ(client.Command({"SET", key, std::string(8192, 'a')}).text_, "OK");
+    EXPECT_EQ(client.Command({"SETRANGE", key, "0", "b"}).text_, "8192");
+    EXPECT_EQ(client.Command({"GETRANGE", key, "0", "1"}).text_, "ba");
+    ASSERT_EQ(client.Command({"DEL", key}).text_, "1");
+    ASSERT_EQ(client.Command({"HSET", key, "a", "old", "b", "keep"}).text_,
+              "2");
+    EXPECT_EQ(client.Command({"HSET", key, "a", "new"}).text_, "0");
+    EXPECT_EQ(client.Command({"HGET", key, "a"}).text_, "new");
+    ASSERT_EQ(client.Command({"DEL", key}).text_, "1");
+    ASSERT_EQ(client.Command({"SADD", key, "a", "b"}).text_, "2");
+    EXPECT_EQ(client.Command({"SREM", key, "a"}).text_, "1");
+    EXPECT_EQ(client.Command({"SADD", key, "c"}).text_, "1");
+    EXPECT_EQ(client.Command({"SCARD", key}).text_, "2");
+    ASSERT_EQ(client.Command({"DEL", key}).text_, "1");
+    ASSERT_EQ(client.Command({"RPUSH", key, "a", "b"}).text_, "2");
+    EXPECT_EQ(client.Command({"LPUSH", key, "c"}).text_, "3");
+    EXPECT_EQ(client.Command({"RPOP", key}).text_, "b");
+    ASSERT_EQ(client.Command({"DEL", key}).text_, "1");
+    ASSERT_EQ(client.Command({"ZADD", key, "1", "a", "2", "b"}).text_, "2");
+    EXPECT_EQ(client.Command({"ZINCRBY", key, "3", "a"}).text_, "4");
+    EXPECT_EQ(client.Command({"ZREM", key, "b"}).text_, "1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, "a"}).text_, "4");
+  }
+  client.Durable();
+  ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
 class CompactCollectionWriteE2e : public testing::TestWithParam<Collection> {};
 
 TEST_P(CompactCollectionWriteE2e, ColdPauseReleasesStateButSerializesSameKey) {
@@ -367,7 +622,10 @@ TEST_P(CompactCollectionWriteE2e, ConditionsErrorsTtlWatchAndDeleteRecover) {
       EXPECT_EQ(client.Command({"LPOP", key}).text_, "left");
       EXPECT_EQ(client.Command({"RPOP", key}).text_, "right");
       EXPECT_EQ(client.Command({"LSET", key, "-1", "B"}).text_, "OK");
-      EXPECT_EQ(client.Command({"LPOP", "last"}).text_, "a");
+      const auto last = client.Command({"LPOP", "last", "99"});
+      ASSERT_EQ(last.kind_, '*');
+      ASSERT_EQ(last.items_.size(), 1);
+      EXPECT_EQ(last.items_[0].text_, "a");
       EXPECT_EQ(client.Command({"LSET", "last", "0", "missing"}).kind_, '-');
     } else {
       EXPECT_EQ(client.Command({"ZADD", key, "NX", "9", "a"}).text_, "0");

@@ -82,6 +82,52 @@ TEST(OrderedCompactCodecTest, BoundsAndFramingFailClosed) {
           .ok());
 }
 
+TEST(OrderedCompactCodecTest, BorrowedReaderChecksEveryTruncatedBoundary) {
+  const std::vector<OrderedCollectionEntry> entries{
+      {.value_ = "", .score_ = 0},
+      {.value_ = std::string("a\0b", 3), .score_ = 0},
+      {.value_ = std::string(32, 'm'), .score_ = 0}};
+  for (auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    auto bytes = EncodeOrderedCompactValue(kind, entries);
+    ASSERT_TRUE(bytes.ok());
+    for (std::size_t length = 0; length <= bytes->size(); ++length) {
+      auto reader = OrderedCompactReader::Open(
+          kind, std::string_view(*bytes).substr(0, length), entries.size());
+      bool valid = reader.ok();
+      if (valid) {
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+          auto entry = reader->Next();
+          if (!entry.ok()) {
+            valid = false;
+            break;
+          }
+          EXPECT_EQ(entry->value_, entries[i].value_);
+          EXPECT_EQ(entry->score_, entries[i].score_);
+        }
+      }
+      EXPECT_EQ(valid, length == bytes->size());
+    }
+    auto reader = OrderedCompactReader::Open(kind, *bytes, entries.size());
+    ASSERT_TRUE(reader.ok());
+    auto copied = *reader;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      auto a = reader->Next();
+      auto b = copied.Next();
+      ASSERT_TRUE(a.ok());
+      ASSERT_TRUE(b.ok());
+      EXPECT_EQ(a->encoded_, b->encoded_);
+    }
+    EXPECT_FALSE(reader->Next().ok());
+    const auto trailing = *bytes + "x";
+    auto broken = OrderedCompactReader::Open(kind, trailing, entries.size());
+    ASSERT_TRUE(broken.ok());
+    ASSERT_TRUE(broken->Next().ok());
+    ASSERT_TRUE(broken->Next().ok());
+    EXPECT_FALSE(broken->Next().ok());
+  }
+}
+
 TEST(OrderedCompactCodecTest, LargeItemAndInvalidScore) {
   std::vector<OrderedCollectionEntry> entries{
       {.value_ = std::string(9 * 1024 * 1024, 'x')}};

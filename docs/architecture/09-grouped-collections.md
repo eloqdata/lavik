@@ -327,6 +327,21 @@ cleaner disabling or the allocator's authoritative capacity checks.
 
 ## Command access paths
 
+Compact Hash/Set point edits, List end edits, single-member Sorted Set writes
+and bounded String range edits can prepare borrowed after-images. Their read
+leases and command operands remain immutable through append allocation waits;
+only framing and changed command data need separate ownership. The append
+funnel consumes each encoder after its final suspension, then publishes the
+same complete checked record format. Published records and commit receipts
+retain no borrowed payload.
+Remote read leases and local read-pool exhaustion use owned output so a queued
+writer does not retain the last read slot needed by an earlier state-lock owner.
+Ordinary existing compact String writes retain key intent and database
+admission while releasing worker store state for the old-value read and private
+preparation; reacquisition validates logical identity and population, allowing
+physical GC relocation. Transactional and external-value preparation retain
+their existing locked paths. Promotion uses the owned collection builders.
+
 Whole-Hash replacement (`LAVIK.HREPLACE`) checks existing key/type/expiry and
 the preceding grouped decision, but does not load old field payloads. Its
 after-image comes entirely from admitted request data. A large replacement

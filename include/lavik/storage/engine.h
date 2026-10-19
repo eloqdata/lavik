@@ -56,6 +56,8 @@ class ReplicationHistory;
 
 namespace lavik::storage {
 
+class InlineRecordPayload;
+
 struct StorageEngineOptions {
   // Runtime databases [0, database_count_). Cluster servers use only DB0;
   // durable and replication epoch metadata retain all 16 database slots.
@@ -995,6 +997,11 @@ struct CompactValueUpdate {
   // DELCONSUMER receives its removed PEL cardinality after storage has scanned
   // and planned the selected consumer's removals, before publishing the root.
   std::function<void(std::uint64_t)> stream_pending_removed_;
+  // Optional after-image for an existing compact Sorted Set write, exclusive
+  // with encoded_/reuse_encoded_. The callback owner retains the encoder and
+  // its borrowed sources until the awaited ExecuteCompact call returns. It
+  // must stay below promotion size.
+  const InlineRecordPayload* inline_payload_ = nullptr;
 };
 
 // Inclusive/exclusive 128-bit ID bounds for a read-only Stream callback. The

@@ -234,25 +234,70 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     }
   };
   if (!grouped) {
-    std::string bytes;
-    if (exists) {
-      auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                       location, ExtentsFor(store, found));
-      if (!loaded.ok()) co_return loaded.status();
-      auto data = loaded->value();
-      bytes.assign(reinterpret_cast<const char*>(data.data()), data.size());
+    const auto extents = exists ? ExtentsFor(store, found) : ExtentManifest{};
+    const bool prepare_unlocked =
+        !read_only && exists &&
+        CanPrepareCompactWriteUnlocked(store, partition, found, location, tx);
+    const auto snapshot = CaptureCompactWriteSnapshot(store, partition, db_id);
+    if (prepare_unlocked) {
+      // Key intent and DB admission survive this interval. Owned read leases
+      // protect borrowed bytes; logical identity, not GC coordinates, is
+      // revalidated before publication, just like compact Hash/List writes.
+      found = nullptr;
+      unlock.Unlock();
+      LAVIK_FAULT_INJECT({
+        auto paused = co_await PauseCompactWriteForTest(*store.worker_, key);
+        if (!paused.ok()) co_return paused;
+      });
     }
-    if (!read_only) bytes.resize(new_size, '\0');
-    apply(bytes, 0);
+    std::optional<LoadedValue> loaded;
+    std::string_view before;
+    if (exists) {
+      auto value = co_await LoadValue(store, partition, db_id, key, digest,
+                                      location, extents);
+      if (!value.ok()) co_return value.status();
+      loaded.emplace(std::move(*value));
+      const auto data = loaded->value();
+      before = {reinterpret_cast<const char*>(data.data()), data.size()};
+    }
+    std::string bytes;
+    CompactPayload plan;
+    std::optional<InlineRecordPayload> inline_payload;
+    // Waiting for state while holding the last read slot could block an
+    // earlier lock owner. Remote pool state is likewise not ours to inspect.
+    const bool borrow_source =
+        !loaded || loaded->lease_.buffer_id() == 0 ||
+        (loaded->lease_.owner_worker() == store.worker_->id() &&
+         store.buffers_.available_read_buffers() != 0);
+    if (!read_only && !bit && start <= before.size() &&
+        new_size < kCollectionPromotionBytes && borrow_source) {
+      plan.AppendBytes(before.substr(0, start));
+      plan.AppendBytes(operation.value_);
+      plan.AppendBytes(
+          before.substr(std::min<std::uint64_t>(start + count, before.size())));
+      inline_payload.emplace(plan);
+    } else {
+      bytes.assign(before);
+      if (!read_only) bytes.resize(new_size, '\0');
+      apply(bytes, 0);
+      loaded.reset();
+    }
+    if (prepare_unlocked) {
+      co_await store.store_state_mutex_.Lock();
+      unlock.Adopt();
+      const auto valid = ValidateCompactWriteSnapshot(
+          store, partition, db_id, key, digest, location, snapshot);
+      if (!valid.ok()) co_return valid;
+    }
     if (operation.kind_ == Kind::kSetBit && start < old_size &&
         result.bit_ == operation.bit_)
       co_return result;
     if (!read_only) {
       const auto status = co_await AppendLocked(
           store, partition, db_id, key, digest, bytes, RecordKind::kValue,
-          ValueType::kString, exists ? location.expire_at_ms_ : 0, tx,
-          bytes.size(), nullptr, nullptr, replication, true, nullptr,
-          mutation_precondition);
+          ValueType::kString, exists ? location.expire_at_ms_ : 0, tx, new_size,
+          nullptr, nullptr, replication, true, nullptr, mutation_precondition,
+          nullptr, inline_payload ? &*inline_payload : nullptr);
       if (!status.ok()) co_return status;
     }
   } else {

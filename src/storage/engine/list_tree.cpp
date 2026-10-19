@@ -102,6 +102,88 @@ absl::StatusOr<std::string> EncodeList(std::span<const std::string> elements) {
   return output;
 }
 
+struct CompactListEdit {
+  std::optional<MemoryReservation> admission_;
+  CompactPayload payload_;
+};
+
+// Only end edits need this borrowed plan. General List operations and
+// promotion keep their owned builder. Pop owns just the returned elements.
+absl::StatusOr<std::optional<CompactListEdit>> PlanCompactListEdit(
+    std::string_view payload, std::uint64_t count,
+    const ListOperation& operation, ListResult& result) {
+  using Kind = ListOperationKind;
+  const bool push = operation.kind_ == Kind::kPushLeft ||
+                    operation.kind_ == Kind::kPushRight ||
+                    operation.kind_ == Kind::kPushLeftIfExists ||
+                    operation.kind_ == Kind::kPushRightIfExists;
+  const bool pop =
+      operation.kind_ == Kind::kPopLeft || operation.kind_ == Kind::kPopRight;
+  if ((!push && !pop) || payload.size() >= kCollectionPromotionBytes)
+    return std::nullopt;
+  const bool left = operation.kind_ == Kind::kPushLeft ||
+                    operation.kind_ == Kind::kPushLeftIfExists ||
+                    operation.kind_ == Kind::kPopLeft;
+  auto reader =
+      OrderedCompactReader::Open(OrderedCollectionKind::kList, payload, count);
+  if (!reader.ok()) return reader.status();
+  std::size_t size = payload.size();
+  if (push) {
+    if (operation.values_.size() > UINT32_MAX - count)
+      return absl::OutOfRangeError("invalid List element count");
+    for (const auto value : operation.values_) {
+      auto next =
+          AppendOrderedEntrySize(OrderedCollectionKind::kList, size,
+                                 value.size(), std::string{}.max_size());
+      if (!next.ok()) return next.status();
+      size = *next;
+    }
+    if (size >= kCollectionPromotionBytes) return std::nullopt;
+  }
+  const auto removed = pop ? std::min(operation.count_, count) : 0;
+  const auto length = push ? count + operation.values_.size() : count - removed;
+  CompactListEdit edit;
+  if (push && operation.values_.size() > 1) {
+    edit.admission_ = TryReserveMemory(operation.values_.size() * 256);
+    if (!edit.admission_) return std::nullopt;
+  }
+  auto& output = edit.payload_;
+  if (length != 0) {
+    output.AppendBytes(kListMagic);
+    output.AppendUnsigned(length, 4);
+  }
+  auto append_inputs = [&] {
+    for (std::size_t i = 0; i < operation.values_.size(); ++i) {
+      const auto value =
+          operation.values_[left ? operation.values_.size() - 1 - i : i];
+      output.AppendUnsigned(value.size(), 4);
+      output.AppendBytes(value);
+    }
+  };
+  if (push && left) append_inputs();
+  std::size_t kept_begin = 0;
+  std::size_t kept_bytes = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return entry.status();
+    if (pop && (left ? i < removed : i >= count - removed)) {
+      result.values_.emplace_back(entry->value_);
+    } else {
+      if (kept_bytes == 0) kept_begin = entry->encoded_.data() - payload.data();
+      kept_bytes += entry->encoded_.size();
+    }
+  }
+  // End edits retain one contiguous interval, regardless of cardinality.
+  output.AppendBytes(payload.substr(kept_begin, kept_bytes));
+  if (push && !left) append_inputs();
+  if (pop && !left) std::reverse(result.values_.begin(), result.values_.end());
+  result.changed_ = push ? !operation.values_.empty() : removed != 0;
+  result.length_ = length;
+  // key_exists_ describes the input for POP's nil-vs-array reply, including
+  // a counted pop that consumes the last element and publishes a tombstone.
+  return edit;
+}
+
 std::optional<std::uint64_t> NormalizeIndex(std::int64_t index,
                                             std::uint64_t size) {
   if (index < 0) {
@@ -545,6 +627,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     create_admission.emplace(std::move(*admitted));
   }
   std::vector<std::string> elements;
+  std::optional<CompactListEdit> compact_edit;
+  std::optional<LoadedValue> compact_source;
   if (exists) {
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      location, extents);
@@ -558,149 +642,173 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (read_only && operation.kind_ == ListOperationKind::kRange &&
         operation.packed_output_)
       co_return ReadPackedListRange(payload, location.logical_size_, operation);
-    auto decoded = DecodeList(payload, location.logical_size_);
-    if (!decoded.ok()) co_return decoded.status();
-    elements = std::move(*decoded);
+    // Leave a local read slot for operations ahead of this writer in the
+    // state-lock queue. Remote leases and pool pressure use the owned path.
+    const bool borrow_source =
+        loaded->lease_.buffer_id() == 0 ||
+        (loaded->lease_.owner_worker() == store.worker_->id() &&
+         store.buffers_.available_read_buffers() != 0);
+    if (!read_only && borrow_source) {
+      auto planned = PlanCompactListEdit(payload, location.logical_size_,
+                                         operation, result);
+      if (!planned.ok()) co_return planned.status();
+      compact_edit = std::move(*planned);
+    }
+    if (compact_edit) {
+      compact_source.emplace(std::move(*loaded));
+    } else {
+      auto decoded = DecodeList(payload, location.logical_size_);
+      if (!decoded.ok()) co_return decoded.status();
+      elements = std::move(*decoded);
+    }
   }
 
   if (read_only)
     co_return ReadListSnapshot(elements, std::move(result), operation);
 
-  switch (operation.kind_) {
-    case ListOperationKind::kPushLeft:
-    case ListOperationKind::kPushRight:
-    case ListOperationKind::kPushLeftIfExists:
-    case ListOperationKind::kPushRightIfExists: {
-      const bool only_if_exists =
-          operation.kind_ == ListOperationKind::kPushLeftIfExists ||
-          operation.kind_ == ListOperationKind::kPushRightIfExists;
-      if (!exists && only_if_exists) co_return result;
-      const bool left = operation.kind_ == ListOperationKind::kPushLeft ||
-                        operation.kind_ == ListOperationKind::kPushLeftIfExists;
-      for (std::string_view value : operation.values_) {
-        if (unlocked_create && !elements.empty() && elements.size() % 256 == 0)
-          co_await bycorf::Yield(*store.worker_);
-        if (value.size() > kMaxStringBytes) {
-          co_return absl::OutOfRangeError(
-              "List element exceeds Redis-compatible 512 MiB limit");
+  if (!compact_edit) {
+    switch (operation.kind_) {
+      case ListOperationKind::kPushLeft:
+      case ListOperationKind::kPushRight:
+      case ListOperationKind::kPushLeftIfExists:
+      case ListOperationKind::kPushRightIfExists: {
+        const bool only_if_exists =
+            operation.kind_ == ListOperationKind::kPushLeftIfExists ||
+            operation.kind_ == ListOperationKind::kPushRightIfExists;
+        if (!exists && only_if_exists) co_return result;
+        const bool left =
+            operation.kind_ == ListOperationKind::kPushLeft ||
+            operation.kind_ == ListOperationKind::kPushLeftIfExists;
+        for (std::string_view value : operation.values_) {
+          if (unlocked_create && !elements.empty() &&
+              elements.size() % 256 == 0)
+            co_await bycorf::Yield(*store.worker_);
+          if (value.size() > kMaxStringBytes) {
+            co_return absl::OutOfRangeError(
+                "List element exceeds Redis-compatible 512 MiB limit");
+          }
+          if (left)
+            elements.insert(elements.begin(), std::string(value));
+          else
+            elements.emplace_back(value);
         }
-        if (left)
-          elements.insert(elements.begin(), std::string(value));
-        else
-          elements.emplace_back(value);
-      }
-      result.changed_ = !operation.values_.empty();
-      result.key_exists_ = true;
-      break;
-    }
-    case ListOperationKind::kPopLeft:
-    case ListOperationKind::kPopRight: {
-      const std::size_t count = static_cast<std::size_t>(
-          std::min<std::uint64_t>(operation.count_, elements.size()));
-      const bool left = operation.kind_ == ListOperationKind::kPopLeft;
-      for (std::size_t i = 0; i < count; ++i) {
-        if (left) {
-          result.values_.push_back(std::move(elements.front()));
-          elements.erase(elements.begin());
-        } else {
-          result.values_.push_back(std::move(elements.back()));
-          elements.pop_back();
-        }
-      }
-      result.changed_ = count != 0;
-      break;
-    }
-    case ListOperationKind::kSet: {
-      if (!exists) co_return absl::NotFoundError("no such key");
-      if (operation.value_.size() > kMaxStringBytes)
-        co_return absl::OutOfRangeError("List element exceeds storage limits");
-      auto position = NormalizeIndex(operation.first_, elements.size());
-      if (!position) co_return absl::OutOfRangeError("index out of range");
-      elements[*position] = operation.value_;
-      result.changed_ = true;
-      break;
-    }
-    case ListOperationKind::kInsertBefore:
-    case ListOperationKind::kInsertAfter: {
-      if (!exists) co_return result;
-      if (operation.value_.size() > kMaxStringBytes)
-        co_return absl::OutOfRangeError("List element exceeds storage limits");
-      auto it = std::find(elements.begin(), elements.end(), operation.pivot_);
-      if (it == elements.end()) {
-        result.integer_ = -1;
-        // A successful no-op still has to validate the captured population
-        // after an unlocked read, just like a replacement or final-element
-        // pop.
+        result.changed_ = !operation.values_.empty();
+        result.key_exists_ = true;
         break;
       }
-      if (operation.kind_ == ListOperationKind::kInsertAfter) ++it;
-      elements.insert(it, std::string(operation.value_));
-      result.changed_ = true;
-      result.integer_ = elements.size();
-      break;
-    }
-    case ListOperationKind::kRemove: {
-      const ListRemovePlan plan = NormalizeListRemoveLimit(operation.first_);
-      std::uint64_t removed = 0;
-      if (plan.forward_) {
-        for (auto it = elements.begin();
-             it != elements.end() && removed < plan.limit_;) {
-          if (*it == operation.value_) {
-            it = elements.erase(it);
-            ++removed;
+      case ListOperationKind::kPopLeft:
+      case ListOperationKind::kPopRight: {
+        const std::size_t count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(operation.count_, elements.size()));
+        const bool left = operation.kind_ == ListOperationKind::kPopLeft;
+        for (std::size_t i = 0; i < count; ++i) {
+          if (left) {
+            result.values_.push_back(std::move(elements.front()));
+            elements.erase(elements.begin());
           } else {
-            ++it;
+            result.values_.push_back(std::move(elements.back()));
+            elements.pop_back();
           }
         }
-      } else {
-        for (std::size_t i = elements.size(); i > 0 && removed < plan.limit_;) {
-          --i;
-          if (elements[i] == operation.value_) {
-            elements.erase(elements.begin() + i);
-            ++removed;
-          }
-        }
+        result.changed_ = count != 0;
+        break;
       }
-      result.integer_ = removed;
-      result.changed_ = removed != 0;
-      break;
+      case ListOperationKind::kSet: {
+        if (!exists) co_return absl::NotFoundError("no such key");
+        if (operation.value_.size() > kMaxStringBytes)
+          co_return absl::OutOfRangeError(
+              "List element exceeds storage limits");
+        auto position = NormalizeIndex(operation.first_, elements.size());
+        if (!position) co_return absl::OutOfRangeError("index out of range");
+        elements[*position] = operation.value_;
+        result.changed_ = true;
+        break;
+      }
+      case ListOperationKind::kInsertBefore:
+      case ListOperationKind::kInsertAfter: {
+        if (!exists) co_return result;
+        if (operation.value_.size() > kMaxStringBytes)
+          co_return absl::OutOfRangeError(
+              "List element exceeds storage limits");
+        auto it = std::find(elements.begin(), elements.end(), operation.pivot_);
+        if (it == elements.end()) {
+          result.integer_ = -1;
+          // A successful no-op still has to validate the captured population
+          // after an unlocked read, just like a replacement or final-element
+          // pop.
+          break;
+        }
+        if (operation.kind_ == ListOperationKind::kInsertAfter) ++it;
+        elements.insert(it, std::string(operation.value_));
+        result.changed_ = true;
+        result.integer_ = elements.size();
+        break;
+      }
+      case ListOperationKind::kRemove: {
+        const ListRemovePlan plan = NormalizeListRemoveLimit(operation.first_);
+        std::uint64_t removed = 0;
+        if (plan.forward_) {
+          for (auto it = elements.begin();
+               it != elements.end() && removed < plan.limit_;) {
+            if (*it == operation.value_) {
+              it = elements.erase(it);
+              ++removed;
+            } else {
+              ++it;
+            }
+          }
+        } else {
+          for (std::size_t i = elements.size();
+               i > 0 && removed < plan.limit_;) {
+            --i;
+            if (elements[i] == operation.value_) {
+              elements.erase(elements.begin() + i);
+              ++removed;
+            }
+          }
+        }
+        result.integer_ = removed;
+        result.changed_ = removed != 0;
+        break;
+      }
+      case ListOperationKind::kTrim: {
+        const auto [begin, end] = NormalizeRange(
+            operation.first_, operation.second_, elements.size());
+        std::vector<std::string> kept;
+        kept.reserve(end - begin);
+        for (std::uint64_t i = begin; i < end; ++i)
+          kept.push_back(std::move(elements[i]));
+        result.changed_ = kept.size() != elements.size();
+        elements = std::move(kept);
+        break;
+      }
+      case ListOperationKind::kMoveWithin: {
+        if (elements.empty()) co_return result;
+        const bool source_left = operation.first_ != 0;
+        const bool destination_left = operation.second_ != 0;
+        std::string moved = source_left ? std::move(elements.front())
+                                        : std::move(elements.back());
+        if (source_left)
+          elements.erase(elements.begin());
+        else
+          elements.pop_back();
+        if (destination_left)
+          elements.insert(elements.begin(), moved);
+        else
+          elements.push_back(moved);
+        result.values_.push_back(std::move(moved));
+        result.changed_ =
+            source_left != destination_left && elements.size() > 1;
+        break;
+      }
+      case ListOperationKind::kLength:
+        co_return result;
+      default:
+        co_return absl::InternalError("read operation reached List mutation");
     }
-    case ListOperationKind::kTrim: {
-      const auto [begin, end] =
-          NormalizeRange(operation.first_, operation.second_, elements.size());
-      std::vector<std::string> kept;
-      kept.reserve(end - begin);
-      for (std::uint64_t i = begin; i < end; ++i)
-        kept.push_back(std::move(elements[i]));
-      result.changed_ = kept.size() != elements.size();
-      elements = std::move(kept);
-      break;
-    }
-    case ListOperationKind::kMoveWithin: {
-      if (elements.empty()) co_return result;
-      const bool source_left = operation.first_ != 0;
-      const bool destination_left = operation.second_ != 0;
-      std::string moved = source_left ? std::move(elements.front())
-                                      : std::move(elements.back());
-      if (source_left)
-        elements.erase(elements.begin());
-      else
-        elements.pop_back();
-      if (destination_left)
-        elements.insert(elements.begin(), moved);
-      else
-        elements.push_back(moved);
-      result.values_.push_back(std::move(moved));
-      result.changed_ = source_left != destination_left && elements.size() > 1;
-      break;
-    }
-    case ListOperationKind::kLength:
-      co_return result;
-    default:
-      co_return absl::InternalError("read operation reached List mutation");
-  }
 
-  result.length_ = elements.size();
+    result.length_ = elements.size();
+  }
   std::optional<std::string> prepared_compact_payload;
   std::optional<OrderedCollectionMutationPlan> prepared_groups;
   bool compact_write_promotes = false;
@@ -765,9 +873,11 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   RecordKind kind = RecordKind::kValue;
   ValueType type = ValueType::kList;
   std::string payload;
-  if (elements.empty()) {
+  if (result.length_ == 0) {
     kind = RecordKind::kTombstone;
     type = ValueType::kNone;
+  } else if (compact_edit) {
+    // Encoding waits until the append tail is exclusively owned.
   } else if (prepared_compact_payload.has_value()) {
     payload = std::move(*prepared_compact_payload);
   } else {
@@ -775,11 +885,15 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (!encoded.ok()) co_return encoded.status();
     payload = std::move(*encoded);
   }
+  std::optional<InlineRecordPayload> inline_payload;
+  if (compact_edit && result.length_ != 0)
+    inline_payload.emplace(compact_edit->payload_);
   absl::Status written = co_await AppendLocked(
       store, partition, db_id, key, digest, payload, kind, type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
-      kind == RecordKind::kValue ? elements.size() : 0, nullptr, nullptr,
-      replication, true, nullptr, mutation_precondition);
+      kind == RecordKind::kValue ? result.length_ : 0, nullptr, nullptr,
+      replication, true, nullptr, mutation_precondition, nullptr,
+      inline_payload ? &*inline_payload : nullptr);
   if (!written.ok()) co_return written;
   co_return result;
 }
