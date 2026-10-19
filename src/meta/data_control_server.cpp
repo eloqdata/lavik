@@ -2987,9 +2987,8 @@ class MetaDataControlServer::SessionConnectionBorrow {
   }
 
   SessionConnectionBorrow(SessionConnectionBorrow&& other) noexcept
-      : core_(std::move(other.core_)), connection_(other.connection_) {
-    other.connection_ = nullptr;
-  }
+      : core_(std::move(other.core_)),
+        connection_(std::exchange(other.connection_, nullptr)) {}
   SessionConnectionBorrow(const SessionConnectionBorrow&) = delete;
   SessionConnectionBorrow& operator=(const SessionConnectionBorrow&) = delete;
   SessionConnectionBorrow& operator=(SessionConnectionBorrow&&) = delete;
