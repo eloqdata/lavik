@@ -1251,10 +1251,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       else if constexpr (std::is_same_v<Page, PackedSortedSetValues>)
         return LoadPackedSortedSetPage(store, partition, db_id, key, digest,
                                        object, metadata[i].id_, limiter);
-      else
+      else {
+        if (point_write)
+          return LoadEncodedSortedSetGroupSnapshot(store, partition, db_id, key,
+                                                   digest, object,
+                                                   metadata[i].id_, limiter);
         return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
                                         object, metadata[i].id_, false, limiter,
-                                        validation, point_write);
+                                        validation);
+      }
     };
     auto page = co_await load();
     if (!page.ok()) co_return page.status();
@@ -2107,9 +2112,12 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           co_return absl::CancelledError(
               "Sorted Set plan cancelled by shutdown");
       }
-      auto page = co_await LoadOrderedGroupSnapshot(
-          store, partition, db_id, key, digest, object, metadata[i].id_, false,
-          nullptr, SortedSetMemberValidation::kVerifyUnique, point_write);
+      auto page = co_await (point_write ? LoadEncodedSortedSetGroupSnapshot(
+                                              store, partition, db_id, key,
+                                              digest, object, metadata[i].id_)
+                                        : LoadOrderedGroupSnapshot(
+                                              store, partition, db_id, key,
+                                              digest, object, metadata[i].id_));
       if (!page.ok()) co_return page.status();
       loaded.emplace(i, std::move(page->snapshot_));
     }

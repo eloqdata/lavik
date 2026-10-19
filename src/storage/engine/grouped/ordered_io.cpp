@@ -147,30 +147,42 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
-    GroupReadLimiter* limiter, SortedSetMemberValidation validation,
-    bool encoded_sorted_set) {
+    GroupReadLimiter* limiter, SortedSetMemberValidation validation) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
-      [validation, encoded_sorted_set](
-          std::string_view payload, std::uint64_t sequence,
-          const OrderedGroupEntry& route,
-          LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
-        auto decoded = encoded_sorted_set
-                           ? DecodeEncodedSortedSetGroup(payload)
-                           : DecodeOrderedGroup(payload, validation);
+      [validation](std::string_view payload, std::uint64_t sequence,
+                   const OrderedGroupEntry& route,
+                   LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
+        auto decoded = DecodeOrderedGroup(payload, validation);
         if (!decoded.ok()) return decoded.status();
         if (decoded->kind_ == OrderedCollectionKind::kSortedSet) {
-          const auto min_score =
-              decoded->encoded_sorted_set_
-                  ? decoded->encoded_sorted_set_->entries().front().score_
-                  : decoded->entries_.front().score_;
-          const auto max_score =
-              decoded->encoded_sorted_set_
-                  ? decoded->encoded_sorted_set_->entries().back().score_
-                  : decoded->entries_.back().score_;
-          if (min_score != route.min_score_ || max_score != route.max_score_)
+          if (decoded->entries_.front().score_ != route.min_score_ ||
+              decoded->entries_.back().score_ != route.max_score_)
             return absl::DataLossError("ordered page score bounds mismatch");
         }
+        return LoadedOrderedGroup{.sequence_ = sequence,
+                                  .snapshot_ = std::move(*decoded)};
+      },
+      limiter);
+}
+
+Task<absl::StatusOr<LoadedOrderedGroup>>
+StorageEngine::Impl::LoadEncodedSortedSetGroupSnapshot(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, std::uint64_t page_id,
+    GroupReadLimiter* limiter) {
+  return LoadOrderedGroup<LoadedOrderedGroup>(
+      store, partition, db_id, key, digest, std::move(object), page_id, false,
+      [](std::string_view payload, std::uint64_t sequence,
+         const OrderedGroupEntry& route,
+         LoadedValue&&) -> absl::StatusOr<LoadedOrderedGroup> {
+        auto decoded = DecodeEncodedSortedSetGroup(payload);
+        if (!decoded.ok()) return decoded.status();
+        const auto entries = decoded->encoded_sorted_set_->entries();
+        if (entries.front().score_ != route.min_score_ ||
+            entries.back().score_ != route.max_score_)
+          return absl::DataLossError("ordered page score bounds mismatch");
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
       },
