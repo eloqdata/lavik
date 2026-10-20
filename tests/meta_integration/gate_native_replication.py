@@ -1365,7 +1365,14 @@ def handoff_order(root):
             < log.index("acknowledged async partition handoff 1")
             < log.index("acknowledged async partition handoff 0")
         )
-        assert C.readonly_get(target, "{native}seed") == "baseline"
+        # Meta readiness can precede the switch from initialization to Follow
+        # Owner. Probe with fresh clients while that reconnect closes read
+        # admission, as the handoff tail check below does for live replay.
+        H.wait_until(
+            "handoff seed readable",
+            30,
+            lambda: C.readonly_get(target, "{native}seed") == "baseline",
+        )
         writer.call("INCR", "{native}tail")
         H.wait_until(
             "handoff tail", 20, lambda: C.readonly_get(target, "{native}tail") == "1"
