@@ -32,7 +32,10 @@
 
 namespace lavik {
 
-inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
+// Purge eligible pages immediately online so deferred reclamation does not
+// accumulate on later allocations. Large frees can still pay synchronous purge
+// costs. Recovery keeps mimalloc's native delay until all workers finish.
+inline constexpr long kDefaultMimallocPurgeDelayMs = 0;
 inline constexpr std::uint64_t kDefaultMaxClients = 10'000;
 
 // One Redis `save <seconds> <changes>` policy. A background RDB save becomes

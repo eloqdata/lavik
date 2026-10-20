@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
       ->check(CLI::NonNegativeNumber);
   app.add_option("--mimalloc-purge-delay-ms", options.mimalloc_purge_delay_ms_,
                  "Online mimalloc purge delay in ms, applied after recovery "
-                 "(-1 disables purging)")
+                 "(0 purges immediately, -1 disables purging)")
       ->capture_default_str()
       ->check(CLI::Range(-1L, std::numeric_limits<long>::max()));
   app.add_option("--registered-buffer-mb-per-worker", registered_buffer_mb,
