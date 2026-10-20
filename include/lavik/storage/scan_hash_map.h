@@ -546,7 +546,7 @@ ScanHashMapEntryArena::AllocateSmallSpan() {
   span->storage_ = TryAllocateRetainedBytes(
       allocation_domain_, kSpanBytes - kPageBytes, kPageBytes);
   if (span->storage_ == nullptr) return nullptr;
-  if (mi_expand(span->storage_, kSpanBytes) == nullptr) {
+  if (mi_expand(span->storage_, kSpanBytes) == nullptr) [[unlikely]] {
     // Release the smaller allocation and its retained charge before admitting
     // the fallback. A rejected fallback leaves no partially published span.
     DeallocateRetainedBytes(allocation_domain_, span->storage_, kPageBytes);
