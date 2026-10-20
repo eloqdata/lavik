@@ -109,7 +109,16 @@ class PolicyBarrier(H.Proxy):
                     for frame in pending:
                         send(frame)
                     pending.clear()
-                if not select.select([src], [], [], 0.01)[0]:
+                try:
+                    readable = select.select([src], [], [], 0.01)[0]
+                except ValueError:
+                    # The opposite pump can close both sockets before select
+                    # reads their descriptors. Treat only that teardown race
+                    # as EOF; other ValueErrors remain proxy failures.
+                    if src.fileno() < 0:
+                        break
+                    raise
+                if not readable:
                     continue
                 header = exact(28)
                 magic, version, kind = struct.unpack_from(">IHH", header)
