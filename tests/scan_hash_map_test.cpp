@@ -19,7 +19,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -789,27 +791,168 @@ TEST(ScanHashMapTest, AccountsForOverflowPoolVectorGrowth) {
             8ULL * 1024);
 }
 
+TEST(ScanHashMapTest, SmallSpanUsesCompactAllocationWhenExpandable) {
+  constexpr std::size_t kSpanBytes = ScanHashMapEntryArena::kSpanBytes;
+  constexpr std::size_t kPageBytes = ScanHashMapEntryArena::kPageBytes;
+  using Allocation = std::unique_ptr<void, decltype(&mi_free)>;
+  Allocation compact(mi_malloc_aligned(kSpanBytes - kPageBytes, kPageBytes),
+                     &mi_free);
+  Allocation full(mi_malloc_aligned(kSpanBytes, kPageBytes), &mi_free);
+  ASSERT_NE(compact, nullptr);
+  ASSERT_NE(full, nullptr);
+  // Compare arena retention with the allocator's actual capabilities. This
+  // exercises expansion with release mimalloc and fallback with Debug padding
+  // or MIMALLOC_DISALLOW_ARENA_ALLOC=1, without assuming a portable size class.
+  const bool can_expand = mi_expand(compact.get(), kSpanBytes) != nullptr;
+  const std::size_t expected_bytes =
+      mi_usable_size(can_expand ? compact.get() : full.get());
+  ASSERT_GE(expected_bytes, kSpanBytes);
+
+  ASSERT_TRUE(lavik::InitMemoryLimit(64 * 1024 * 1024, 1).ok());
+  lavik::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+    }
+  } restore;
+  const auto before = lavik::WorkerMemoryAccountingBytes(0);
+  {
+    ScanHashMapEntryArena arena(16);
+    ASSERT_TRUE(arena.PreallocateDirectory());
+    const auto directory_bytes = lavik::WorkerMemoryAccountingBytes(0);
+    const auto allocation = arena.Allocate(32);
+    ASSERT_NE(allocation.pointer_, nullptr);
+    // The first page starts at the allocation base; later logical pages must
+    // never be passed to allocator introspection or free.
+    void* span = reinterpret_cast<void*>(
+        reinterpret_cast<std::uintptr_t>(allocation.pointer_) &
+        ~(kPageBytes - 1));
+    EXPECT_EQ(mi_usable_size(span), expected_bytes);
+    const auto retained =
+        lavik::WorkerMemoryAccountingBytes(0) - directory_bytes;
+    EXPECT_GE(retained, static_cast<std::int64_t>(expected_bytes));
+    EXPECT_LT(retained, static_cast<std::int64_t>(expected_bytes + kPageBytes));
+    arena.Deallocate(allocation.handle_);
+    EXPECT_EQ(arena.allocated_spans(), 0);
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), directory_bytes);
+  }
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), before);
+}
+
+TEST(ScanHashMapTest, SmallSpanRejectionReleasesTemporaryStorageAndPageId) {
+  constexpr std::size_t kSpanBytes = ScanHashMapEntryArena::kSpanBytes;
+  constexpr std::size_t kPageBytes = ScanHashMapEntryArena::kPageBytes;
+  std::unique_ptr<void, decltype(&mi_free)> probe(
+      mi_malloc_aligned(kSpanBytes - kPageBytes, kPageBytes), &mi_free);
+  ASSERT_NE(probe, nullptr);
+  const bool can_expand = mi_expand(probe.get(), kSpanBytes) != nullptr;
+
+  ASSERT_TRUE(lavik::InitMemoryLimit(4 * 1024 * 1024, 1).ok());
+  lavik::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+    }
+  } restore;
+  ScanHashMapEntryArena arena(1);
+  ASSERT_TRUE(arena.PreallocateDirectory());
+  const auto memory = lavik::GetWorkerMemoryStats(0);
+  constexpr std::size_t kMetadataHeadroom = 4096;
+  constexpr auto kMaximumBytes = std::numeric_limits<std::size_t>::max();
+  const auto compact_usable =
+      lavik::AllocatorUsableSizeForRequest(kSpanBytes - kPageBytes);
+  const auto full_usable = lavik::AllocatorUsableSizeForRequest(kSpanBytes);
+  ASSERT_LE(compact_usable, kMaximumBytes - kPageBytes - kMetadataHeadroom);
+  ASSERT_LE(full_usable, kMaximumBytes - kPageBytes);
+  const auto compact_admission = compact_usable + kPageBytes;
+  const auto full_admission = full_usable + kPageBytes;
+  const auto headroom = compact_admission + kMetadataHeadroom;
+  ASSERT_GT(full_admission, headroom);
+  ASSERT_GE(memory.retained_limit_bytes_, memory.retained_bytes_);
+  const auto available = memory.retained_limit_bytes_ - memory.retained_bytes_;
+  ASSERT_GT(available, headroom);
+  // Mirror allocator admission, including its alignment allowance. The
+  // compact request and span metadata fit, while the full-size fallback must
+  // be rejected. Neither a temporary charge nor a page ID may survive that
+  // rejection; restoring headroom must allow a retry in the same arena.
+  auto blocker = lavik::TryReserveMemory(available - headroom);
+  ASSERT_TRUE(blocker.has_value());
+  const auto allocation = arena.Allocate(32);
+  if (can_expand) {
+    ASSERT_NE(allocation.pointer_, nullptr);
+    arena.Deallocate(allocation.handle_);
+  } else {
+    EXPECT_EQ(allocation.pointer_, nullptr);
+    EXPECT_EQ(allocation.handle_, 0);
+  }
+  EXPECT_EQ(arena.allocated_pages(), 0);
+  EXPECT_EQ(arena.allocated_spans(), 0);
+  EXPECT_EQ(lavik::GetWorkerMemoryStats(0).retained_bytes_,
+            memory.retained_bytes_);
+  EXPECT_EQ(lavik::GetWorkerMemoryStats(0).admission_pending_bytes_,
+            blocker->bytes());
+  blocker.reset();
+
+  const auto retry = arena.Allocate(32);
+  ASSERT_NE(retry.pointer_, nullptr);
+  EXPECT_EQ(arena.Resolve(retry.handle_), retry.pointer_);
+  arena.Deallocate(retry.handle_);
+}
+
 TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
   ScanHashMapEntryArena arena;
   std::vector<ScanHashMapEntryArena::Handle> handles;
+  // This class fills every byte after the page header, including the final
+  // byte of the sixteenth page. A smaller request without successful expansion
+  // would overwrite Debug padding or run past a direct OS allocation.
+  constexpr std::size_t kSlotBytes = 32;
   constexpr std::size_t kSlotsPerPage =
-      (ScanHashMapEntryArena::kPageBytes - 64) / 4096;
+      (ScanHashMapEntryArena::kPageBytes - 64) / kSlotBytes;
   handles.reserve(ScanHashMapEntryArena::kPagesPerSpan * kSlotsPerPage);
 
   for (std::size_t page = 0; page < ScanHashMapEntryArena::kPagesPerSpan;
        ++page) {
     for (std::size_t slot = 0; slot < kSlotsPerPage; ++slot) {
-      handles.push_back(arena.Allocate(4096).handle_);
+      const auto allocation = arena.Allocate(kSlotBytes);
+      ASSERT_NE(allocation.pointer_, nullptr);
+      ASSERT_EQ(arena.HandleOf(allocation.pointer_), allocation.handle_);
+      std::memset(allocation.pointer_, static_cast<int>(page + 1), kSlotBytes);
+      handles.push_back(allocation.handle_);
     }
     EXPECT_EQ(arena.allocated_spans(), 1);
     if (page + 1 < ScanHashMapEntryArena::kPagesPerSpan) {
-      EXPECT_LT(arena.AllocationBytesIfNewPage(4096),
+      EXPECT_LT(arena.AllocationBytesIfNewPage(kSlotBytes),
                 ScanHashMapEntryArena::kSpanBytes);
     }
   }
-  EXPECT_GE(arena.AllocationBytesIfNewPage(4096),
+  EXPECT_GE(arena.AllocationBytesIfNewPage(kSlotBytes),
             ScanHashMapEntryArena::kSpanBytes);
   EXPECT_EQ(arena.allocated_pages(), ScanHashMapEntryArena::kPagesPerSpan);
+  EXPECT_EQ(arena.allocated_spans(), 1);
+
+  for (std::size_t index = 0; index < handles.size(); ++index) {
+    const auto* data =
+        static_cast<const unsigned char*>(arena.Resolve(handles[index]));
+    for (std::size_t byte = 0; byte < kSlotBytes; ++byte) {
+      ASSERT_EQ(data[byte], index / kSlotsPerPage + 1);
+    }
+  }
+
+  // Recycle the final page while the other pages keep the span alive.
+  for (std::size_t slot = 0; slot < kSlotsPerPage; ++slot) {
+    arena.Deallocate(handles.back());
+    handles.pop_back();
+  }
+  EXPECT_EQ(arena.allocated_pages(), ScanHashMapEntryArena::kPagesPerSpan - 1);
+  EXPECT_EQ(arena.allocated_spans(), 1);
+  for (std::size_t slot = 0; slot < kSlotsPerPage; ++slot) {
+    const auto allocation = arena.Allocate(kSlotBytes);
+    ASSERT_NE(allocation.pointer_, nullptr);
+    std::memset(allocation.pointer_, 0xa5, kSlotBytes);
+    handles.push_back(allocation.handle_);
+  }
   EXPECT_EQ(arena.allocated_spans(), 1);
 
   for (auto handle = handles.rbegin(); handle != handles.rend(); ++handle) {
