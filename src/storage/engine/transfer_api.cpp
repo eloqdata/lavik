@@ -610,6 +610,34 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                 : std::min<std::uint64_t>(range.count_,
                                           range.selected_ids_.size());
       }
+      // Boundary probes can suspend long enough for GC to relocate and free
+      // the captured blocks. Key intent preserves the logical ranks, not those
+      // physical coordinates. Refresh the matching graph before materializing
+      // its pin list, with no suspension between lookup and capture.
+      co_await store.store_state_mutex_.Lock();
+      unlock.Adopt();
+      auto resolved = co_await FindVerifiedEntry(
+          store, partition.indexes_[db_id], digest, key, location);
+      if (!resolved.ok()) co_return resolved.status();
+      if (!source->Valid(*this))
+        co_return absl::CancelledError(
+            "collection transfer population changed during boundary reads");
+      if (*resolved == nullptr || !(*resolved)->value_.grouped() ||
+          (*resolved)->value_.mutation_sequence_ != location.mutation_sequence_)
+        co_return absl::NotFoundError(
+            "Stream root changed during boundary reads");
+      auto version = source->saved_.grouped_->version();
+      version.root_ = MaterializeIndexLocation(**resolved);
+      auto current =
+          partition.grouped_objects_[db_id].Lookup(digest, key, version);
+      if (!current.ok()) co_return current.status();
+      if (*current == nullptr ||
+          !source->saved_.grouped_->SameLogicalRoot(**current))
+        co_return absl::NotFoundError(
+            "Stream logical version changed during boundary reads");
+      source->saved_.location_ = version.root_;
+      source->saved_.extents_ = ExtentsFor(store, *resolved);
+      source->saved_.grouped_ = std::move(*current);
     }
     auto prepared = source->range_
                         ? PrepareOrderedRangeSnapshotPins(
