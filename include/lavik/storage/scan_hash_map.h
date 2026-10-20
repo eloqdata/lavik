@@ -49,14 +49,15 @@
 namespace lavik::storage {
 
 // Single-owner backing store for compact hash-table entry handles. Small pages
-// are carved from 1 MiB spans so mimalloc pays the 64 KiB alignment overhead
-// once per 16 logical pages instead of once per page. Large entries still own
-// dedicated 64 KiB-aligned allocations. Mimalloc remains responsible for OS
-// memory, accounting, and purge behavior; only slots and span pages are managed
-// here. A page belongs to one size class, and freed slots carry their own
-// intrusive free-list link. Empty logical pages are reusable immediately, but
-// their backing memory is returned only when all sixteen pages in the span are
-// empty; this is the reclaim-granularity cost of amortizing alignment waste.
+// are carved from 1 MiB spans. A smaller aligned request can supply the whole
+// span from allocator slack; configurations that cannot expand it in place use
+// a full-size request. Large entries still own dedicated 64 KiB-aligned
+// allocations. Mimalloc remains responsible for OS memory, accounting, and
+// purge behavior; only slots and span pages are managed here. A page belongs
+// to one size class, and freed slots carry their own intrusive free-list link.
+// Empty logical pages are reusable immediately, but their backing memory is
+// returned only when all sixteen pages in the span are empty; this is the
+// reclaim-granularity cost of sharing span storage.
 //
 // Handles are runtime-only. Zero is invalid; the high 21 bits select a page
 // directory entry and the low 11 bits select a slot in that page. Page IDs may
@@ -77,9 +78,9 @@ class ScanHashMapEntryArena {
   static constexpr std::size_t kPageBytes = 64 * 1024;
   static constexpr std::size_t kPagesPerSpan = 16;
   static constexpr std::size_t kSpanBytes = kPagesPerSpan * kPageBytes;
-  // A 64 KiB-aligned allocation may consume one extra alignment unit in the
-  // allocator size class. External admission users must cover this whole
-  // first-span cost because the arena deliberately skips its own reservation.
+  // Admission must cover the full-size fallback and its alignment allowance,
+  // even when the smaller request normally supplies the entire span.
+  // Externally admitted arenas deliberately skip their own reservation.
   static constexpr std::size_t kSmallSpanAdmissionBytes =
       kSpanBytes + kPageBytes;
   static constexpr unsigned kSlotBits = 11;
@@ -536,8 +537,22 @@ ScanHashMapEntryArena::AllocateSmallSpan() {
   auto span_owner = TryMakeRetainedUnique<SmallSpan>(allocation_domain_);
   if (span_owner == nullptr) return nullptr;
   auto* span = span_owner.get();
-  span->storage_ =
-      TryAllocateRetainedBytes(allocation_domain_, kSpanBytes, kPageBytes);
+  // The pinned mimalloc's aligned path adds alignment - 1 before rounding.
+  // Requesting 960 KiB normally yields a full 1 MiB instead of 1088 KiB.
+  // mi_expand neither moves nor initializes storage; its result is the only
+  // capacity check needed. Debug padding disables expansion, and direct OS
+  // allocations can lose usable bytes to alignment, so neither may publish
+  // the sixteenth page without a successful expansion or a full-size request.
+  span->storage_ = TryAllocateRetainedBytes(
+      allocation_domain_, kSpanBytes - kPageBytes, kPageBytes);
+  if (span->storage_ == nullptr) return nullptr;
+  if (mi_expand(span->storage_, kSpanBytes) == nullptr) {
+    // Release the smaller allocation and its retained charge before admitting
+    // the fallback. A rejected fallback leaves no partially published span.
+    DeallocateRetainedBytes(allocation_domain_, span->storage_, kPageBytes);
+    span->storage_ =
+        TryAllocateRetainedBytes(allocation_domain_, kSpanBytes, kPageBytes);
+  }
   if (span->storage_ == nullptr) return nullptr;
   span->all_previous_ = nullptr;
   span->all_next_ = small_spans_head_;
