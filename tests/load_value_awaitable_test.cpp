@@ -170,9 +170,12 @@ class LoadValueAwaitableTestPeer : public testing::Test {
         Store(), Store().partitions_[0], 0, key_, digest_, operation, grouped_,
         nullptr, nullptr);
   }
-  auto ReadGroupedStream(std::uint64_t count = UINT64_MAX) {
+  auto ReadGroupedStream(std::uint64_t count = UINT64_MAX,
+                         std::uint64_t last = UINT64_MAX) {
     return storage_.impl_->ReadValueForTransferLocked(
-        0, key_, digest_, StreamRangeAccess{.first_ = {1, 0}, .count_ = count});
+        0, key_, digest_,
+        StreamRangeAccess{
+            .first_ = {1, 0}, .last_ = {last, UINT64_MAX}, .count_ = count});
   }
   void CloseTransfer(TransferValue& source) {
     source.reader_ = {};
@@ -2203,6 +2206,57 @@ INSTANTIATE_TEST_SUITE_P(OwnedAndPacked, GroupedZsetPackedReadTest,
                          testing::Bool());
 INSTANTIATE_TEST_SUITE_P(OwnedAndPacked, GroupedZsetSingleSlotReadTest,
                          testing::Bool());
+
+TEST_F(GroupedCollectionTwoOwnerReadTest,
+       StreamRangeRefreshesPhysicalGraphAfterBoundaryReads) {
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedStream());
+  ASSERT_NO_FATAL_FAILURE(InstallGroupedDiskImage());
+  auto open = ReadGroupedStream(UINT64_MAX, 4);
+  Start(open);
+  ASSERT_FALSE(open.done());
+  ASSERT_EQ(block_.pin_count(), 1);
+  // Finish the local lower-bound probe, but leave the remote upper-bound
+  // probe queued. Its suspension permits GC to move the captured graph.
+  const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (block_.pin_count() != 0 && std::chrono::steady_clock::now() < until)
+    worker_.RunOnce(false);
+  ASSERT_EQ(block_.pin_count(), 0);
+  ASSERT_FALSE(open.done());
+  ASSERT_NO_FATAL_FAILURE(RelocateGroupedPagesToRemoteOwner());
+  auto version = grouped_->version();
+  location_ = RecordLocation(
+      2, location_.mutation_sequence_, 7, 0, location_.logical_size_,
+      RecordLocation::PackedMetadata::Encode(
+          location_.record_offset(), location_.total_disk_bytes(), 1, false,
+          false, false, false, false, false, RecordKind::kValue,
+          ValueType::kStream, false, true));
+  version.root_ = location_;
+  auto moved = GroupedObject::RelocateRoot(grouped_, version);
+  ASSERT_TRUE(moved.ok()) << moved.status();
+  ASSERT_NO_FATAL_FAILURE(PublishGroupedCollection(std::move(*moved)));
+  // No reader pins remain on the source allocation. Retiring it makes an
+  // attempt to materialize the old compact coordinates fail deterministically.
+  block_.Reset(kUnownedBlock);
+  ASSERT_NO_FATAL_FAILURE(Drain(open));
+  auto result = std::move(open).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  auto source = std::move(*result);
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(blocks_[1].pin_count(), 1);
+  std::vector<std::string> actual;
+  for (bool done = false; !done;) {
+    auto read = source.reader_();
+    Start(read);
+    ASSERT_NO_FATAL_FAILURE(Drain(read));
+    auto page = std::move(read).TakeResult();
+    ASSERT_TRUE(page.ok()) << page.status();
+    actual.insert(actual.end(), page->elements_.begin(), page->elements_.end());
+    done = page->done_;
+  }
+  EXPECT_EQ(actual, (std::vector<std::string>{stream_messages_.begin(),
+                                              stream_messages_.begin() + 4}));
+  ASSERT_NO_FATAL_FAILURE(CloseTransfer(source));
+}
 
 TEST_F(GroupedCollectionTwoOwnerReadTest,
        StreamInteriorWindowReadsSixteenPagesOnEachOwner) {
