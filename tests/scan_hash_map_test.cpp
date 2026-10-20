@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -809,6 +810,12 @@ TEST(ScanHashMapTest, SmallSpanUsesCompactAllocationWhenExpandable) {
 
   ASSERT_TRUE(lavik::InitMemoryLimit(64 * 1024 * 1024, 1).ok());
   lavik::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+    }
+  } restore;
   const auto before = lavik::WorkerMemoryAccountingBytes(0);
   {
     ScanHashMapEntryArena arena(16);
@@ -831,7 +838,6 @@ TEST(ScanHashMapTest, SmallSpanUsesCompactAllocationWhenExpandable) {
     EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), directory_bytes);
   }
   EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), before);
-  lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
 }
 
 TEST(ScanHashMapTest, SmallSpanRejectionReleasesTemporaryStorageAndPageId) {
@@ -853,12 +859,25 @@ TEST(ScanHashMapTest, SmallSpanRejectionReleasesTemporaryStorageAndPageId) {
   ScanHashMapEntryArena arena(1);
   ASSERT_TRUE(arena.PreallocateDirectory());
   const auto memory = lavik::GetWorkerMemoryStats(0);
-  // Leave enough admission for the compact request and span metadata, but not
-  // for the full-size fallback. No temporary charge or page ID may survive a
-  // rejected fallback; the same arena must succeed after headroom is restored.
-  auto blocker =
-      lavik::TryReserveMemory(memory.retained_limit_bytes_ -
-                              memory.retained_bytes_ - kSpanBytes - 4096);
+  constexpr std::size_t kMetadataHeadroom = 4096;
+  constexpr auto kMaximumBytes = std::numeric_limits<std::size_t>::max();
+  const auto compact_usable =
+      lavik::AllocatorUsableSizeForRequest(kSpanBytes - kPageBytes);
+  const auto full_usable = lavik::AllocatorUsableSizeForRequest(kSpanBytes);
+  ASSERT_LE(compact_usable, kMaximumBytes - kPageBytes - kMetadataHeadroom);
+  ASSERT_LE(full_usable, kMaximumBytes - kPageBytes);
+  const auto compact_admission = compact_usable + kPageBytes;
+  const auto full_admission = full_usable + kPageBytes;
+  const auto headroom = compact_admission + kMetadataHeadroom;
+  ASSERT_GT(full_admission, headroom);
+  ASSERT_GE(memory.retained_limit_bytes_, memory.retained_bytes_);
+  const auto available = memory.retained_limit_bytes_ - memory.retained_bytes_;
+  ASSERT_GT(available, headroom);
+  // Mirror allocator admission, including its alignment allowance. The
+  // compact request and span metadata fit, while the full-size fallback must
+  // be rejected. Neither a temporary charge nor a page ID may survive that
+  // rejection; restoring headroom must allow a retry in the same arena.
+  auto blocker = lavik::TryReserveMemory(available - headroom);
   ASSERT_TRUE(blocker.has_value());
   const auto allocation = arena.Allocate(32);
   if (can_expand) {
