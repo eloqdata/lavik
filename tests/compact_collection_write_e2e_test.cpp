@@ -963,6 +963,7 @@ TEST_P(GroupedStreamWriteConcurrencyE2e,
   disk.PreserveOnFailure();
   {
     Server server(disk, 1);
+    server.PreserveOnFailure();
     Client client(server.port());
     for (const auto* id : {"1-0", "2-0", "3-0"})
       ASSERT_EQ(client.Command({"XADD", key, id, "f", initial}).text_, id);
@@ -1017,6 +1018,8 @@ TEST_P(GroupedStreamWriteConcurrencyE2e,
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   Server recovered(disk, 3);
+  // A reply exception unwinds before Wait() can report the recovery log.
+  recovered.PreserveOnFailure();
   Client client(recovered.port());
   check_stream(client);
   EXPECT_EQ(client.Command({"GET", "other-string"}).text_, "progress");
