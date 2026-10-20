@@ -133,6 +133,39 @@ TEST(IndexReadersTest, LastReaderNotifiesOnceAndIntentSurvivesResizeScope) {
   EXPECT_EQ(notifications, 1);
 }
 
+TEST(IndexReadersTest, LazyResizeKeepsReadersClosedUntilEveryBlockIsReady) {
+  ConcurrentIndex map(ConcurrentArena());
+  ASSERT_TRUE(map.PreallocateForExpectedSize(9 * 8192));
+  const Digest keep{7168};
+  auto* kept = map.InsertNew(keep, "external", 1, false);
+  auto* removed = map.InsertNew(Digest{5120}, "external", 2, false);
+  ASSERT_NE(kept, nullptr);
+  ASSERT_NE(removed, nullptr);
+  map.EnableConcurrentReads();
+  {
+    auto reader = map.TryRead(keep);
+    ASSERT_TRUE(reader);
+    EXPECT_EQ(std::as_const(map).Find(keep, "external"), kept);
+  }
+  ASSERT_TRUE(map.Erase(removed));
+  ASSERT_EQ(map.uninitialized_bucket_count(), 4096);
+  EXPECT_FALSE(map.TryRead(keep));
+  for (std::size_t step = 0; step < 8192 && map.rehashing(); ++step) {
+    EXPECT_FALSE(map.TryRead(Digest{step}));
+    ASSERT_TRUE(map.Maintain());
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+  std::thread remote([&] {
+    auto reader = map.TryRead(keep);
+    EXPECT_TRUE(reader);
+    if (!reader) return;
+    EXPECT_EQ(std::as_const(map).Find(keep, "external"), kept);
+    EXPECT_EQ(std::as_const(map).Find(Digest{1024}, "external"), nullptr);
+  });
+  remote.join();
+}
+
 TEST(IndexReadersTest,
      StripeClosureAndNestedGlobalClosureDrainExistingReaders) {
   ConcurrentIndex map(ConcurrentArena());

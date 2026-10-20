@@ -1378,7 +1378,8 @@ class ScanHashMap {
         tables_[0].exponent_ < MaxBucketExponent)
       return true;
     const Table& table = tables_[0];
-    const Bucket* bucket = &table.buckets_[Hash(digest) & BucketMask(table)];
+    const Bucket* bucket =
+        table.template ReadBucket<false>(Hash(digest) & BucketMask(table));
     while (bucket != nullptr) {
       for (auto handle : bucket->entries_)
         if (handle == 0) return false;
@@ -1452,13 +1453,22 @@ class ScanHashMap {
           std::numeric_limits<std::size_t>::max() / sizeof(Bucket)) {
         return std::numeric_limits<std::size_t>::max();
       }
-      return add(required, add(next_buckets * sizeof(Bucket),
-                               kSlowPathBookkeepingAllowance));
+      std::size_t buckets_bytes = next_buckets * sizeof(Bucket);
+      if (next_buckets > kBucketsPerInitializationBlock) {
+        const std::size_t words =
+            (next_buckets / kBucketsPerInitializationBlock + 63) / 64;
+        buckets_bytes = add(buckets_bytes, sizeof(OverflowBuckets));
+        buckets_bytes =
+            add(buckets_bytes,
+                AllocatorUsableSizeForRequest(words * sizeof(std::uint64_t)));
+      }
+      return add(required, add(buckets_bytes, kSlowPathBookkeepingAllowance));
     }
 
     const Table& target = Rehashing() ? tables_[1] : tables_[0];
     const std::uint64_t hash = Hash(digest);
-    const Bucket* bucket = &target.buckets_[hash & BucketMask(target)];
+    const Bucket* bucket = target.ReadBucket(hash & BucketMask(target));
+    if (bucket == nullptr) return required;
     while (bucket != nullptr) {
       if (std::any_of(bucket->entries_.begin(), bucket->entries_.end(),
                       [](EntryHandle handle) { return handle == 0; })) {
@@ -1535,6 +1545,19 @@ class ScanHashMap {
   // Exposes incremental-rehash state for capacity diagnostics and tests.
   bool rehashing() const noexcept { return Rehashing(); }
 
+  // Direct buckets reserved by a resize but not yet initialized. Read-only
+  // access treats these as empty; useful for capacity and resize diagnostics.
+  std::size_t uninitialized_bucket_count() const noexcept {
+    std::size_t count = 0;
+    for (const Table& table : tables_) {
+      if (table.lazy_buckets_) {
+        count += table.overflow_->uninitialized_blocks_ *
+                 kBucketsPerInitializationBlock;
+      }
+    }
+    return count;
+  }
+
   // Returns the low bucket-address bits callers must retain with an Entry
   // address across suspension. It is computed while the Entry is known live;
   // FindAddress can then validate membership without dereferencing stale
@@ -1546,12 +1569,14 @@ class ScanHashMap {
     return static_cast<std::uint32_t>(EntryHash(entry));
   }
 
-  Entry* Find(const Digest& digest, std::string_view key) {
+  [[gnu::always_inline]] Entry* Find(const Digest& digest,
+                                     std::string_view key) {
     AdvanceRehashIfNeeded();
     return FindWithoutStep(digest, key);
   }
 
-  const Entry* Find(const Digest& digest, std::string_view key) const {
+  [[gnu::always_inline]] const Entry* Find(const Digest& digest,
+                                           std::string_view key) const {
     return FindWithoutStep(digest, key);
   }
 
@@ -1584,9 +1609,9 @@ class ScanHashMap {
             FindCandidateInTable(tables_[0], digest, key, hash, accept)) {
       return found;
     }
-    return Rehashing()
-               ? FindCandidateInTable(tables_[1], digest, key, hash, accept)
-               : nullptr;
+    return Rehashing() ? FindCandidateInTable<true>(tables_[1], digest, key,
+                                                    hash, accept)
+                       : nullptr;
   }
 
   bool Contains(const Entry* entry, std::uint32_t hash) const noexcept {
@@ -1619,7 +1644,7 @@ class ScanHashMap {
     for (int t = 0, count = Rehashing() ? 2 : 1; t < count; ++t) {
       const Table& table = tables_[t];
       if (table.buckets_)
-        __builtin_prefetch(&table.buckets_[hash & BucketMask(table)], 0, 3);
+        __builtin_prefetch(table.ReadBucket(hash & BucketMask(table)), 0, 3);
     }
   }
 
@@ -1671,7 +1696,7 @@ class ScanHashMap {
       if (!table.buckets_) {
         continue;
       }
-      Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+      Bucket* bucket = table.ReadBucket(hash & BucketMask(table));
       while (bucket != nullptr) {
         for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
           if (Occupied(*bucket, slot) &&
@@ -1765,7 +1790,7 @@ class ScanHashMap {
       if (!table.buckets_) {
         continue;
       }
-      Bucket* top = &table.buckets_[hash & BucketMask(table)];
+      Bucket* top = table.ReadBucket(hash & BucketMask(table));
       for (Bucket* bucket = top; bucket != nullptr;
            bucket = Chained(*bucket) ? Child(table, bucket) : nullptr) {
         for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
@@ -1803,7 +1828,7 @@ class ScanHashMap {
       if (!table.buckets_) {
         continue;
       }
-      Bucket* top = &table.buckets_[hash & BucketMask(table)];
+      Bucket* top = table.ReadBucket(hash & BucketMask(table));
       for (Bucket* bucket = top; bucket != nullptr;
            bucket = Chained(*bucket) ? Child(table, bucket) : nullptr) {
         for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
@@ -1873,7 +1898,12 @@ class ScanHashMap {
         continue;
       }
 
-      const Bucket* bucket = &table.buckets_[cursor->bucket_];
+      const Bucket* bucket = table.ReadBucket(cursor->bucket_);
+      if (bucket == nullptr) {
+        assert(cursor->chain_ == 0 && cursor->slot_ == 0);
+        ++cursor->bucket_;
+        continue;
+      }
       for (std::size_t chain = 0; chain < cursor->chain_; ++chain) {
         assert(Chained(*bucket));
         bucket = Child(table, bucket);
@@ -2026,6 +2056,12 @@ class ScanHashMap {
 
   static_assert(sizeof(Bucket) == 64);
 
+  // Bound each first-write initialization independently of the table size.
+  // Small tables and offline recovery remain eager. Only a resize target can
+  // contain uninitialized blocks, while existing resize exclusion keeps remote
+  // readers out; no atomics or worker-blocking synchronization is needed.
+  static constexpr std::size_t kBucketsPerInitializationBlock = 1024;
+
   using BucketOwner = std::unique_ptr<Bucket, RetainedObjectDeleter<Bucket>>;
   using BucketOwnerVector =
       std::vector<BucketOwner, RetainedAllocator<BucketOwner>>;
@@ -2043,10 +2079,16 @@ class ScanHashMap {
   struct OverflowBuckets {
     explicit OverflowBuckets(RetainedAllocationDomain domain)
         : buckets_(RetainedAllocator<BucketOwner>(domain)),
-          free_ids_(RetainedAllocator<std::uint32_t>(domain)) {}
+          free_ids_(RetainedAllocator<std::uint32_t>(domain)),
+          initialized_blocks_(RetainedAllocator<std::uint64_t>(domain)) {}
 
     BucketOwnerVector buckets_;
     OverflowFreeIds free_ids_;
+    // Resize-only state shares the optional overflow allocation so the many
+    // empty partition/DB maps do not each acquire another pointer or vector.
+    std::vector<std::uint64_t, RetainedAllocator<std::uint64_t>>
+        initialized_blocks_;
+    std::size_t uninitialized_blocks_ = 0;
   };
 
   using OverflowOwner =
@@ -2062,22 +2104,103 @@ class ScanHashMap {
     // Direct tables never grow in place. An explicit array allocation gives
     // optional shrinking a rejection channel without changing vector's fatal
     // allocation contract or bypassing admission for later overflow growth.
-    bool AllocateBuckets(std::size_t count,
-                         bool independent_admission = false) {
+    bool AllocateBuckets(std::size_t count, bool independent_admission = false,
+                         bool defer_initialization = false) {
       assert(!buckets_);
       auto domain = buckets_.get_deleter().domain_;
       if (independent_admission) domain.externally_admitted_ = false;
+      const bool lazy =
+          defer_initialization && count > kBucketsPerInitializationBlock;
+      OverflowOwner prepared(nullptr, overflow_.get_deleter());
+      if (lazy) {
+        prepared = TryMakeRetainedUnique<OverflowBuckets>(
+            domain, buckets_.get_deleter().domain_);
+        if (prepared == nullptr) return false;
+        const std::size_t blocks = count / kBucketsPerInitializationBlock;
+        const std::size_t words = (blocks + 63) / 64;
+        if (!TryReserveOverflowVector(&prepared->initialized_blocks_, words,
+                                      domain)) {
+          return false;
+        }
+        prepared->initialized_blocks_.resize(words, 0);
+        prepared->uninitialized_blocks_ = blocks;
+      }
       auto* data = static_cast<Bucket*>(TryAllocateRetainedBytes(
           domain, count * sizeof(Bucket), alignof(Bucket)));
       if (data == nullptr) return false;
-      std::uninitialized_value_construct_n(data, count);
+      if (!lazy) std::uninitialized_value_construct_n(data, count);
       buckets_.reset(data);
+      overflow_ = std::move(prepared);
+      lazy_buckets_ = lazy;
       return true;
+    }
+
+    // Never form a readable Bucket in storage whose lifetime has not started.
+    // All observers, including scans, address checks, and admission estimates,
+    // must interpret an uninitialized block as empty without touching it.
+    template <bool CheckInitialization = true>
+    const Bucket* ReadBucket(std::size_t index) const noexcept {
+      if (!buckets_) return nullptr;
+      if constexpr (CheckInitialization) {
+        if (lazy_buckets_) {
+          const std::size_t block = index / kBucketsPerInitializationBlock;
+          if ((overflow_->initialized_blocks_[block / 64] &
+               (std::uint64_t{1} << (block % 64))) == 0) {
+            return nullptr;
+          }
+        }
+      } else {
+        // Primary-table lookup keeps its original path: table zero is always
+        // fully constructed, including throughout the next resize.
+        assert(!lazy_buckets_);
+      }
+      return buckets_.get() + index;
+    }
+
+    template <bool CheckInitialization = true>
+    Bucket* ReadBucket(std::size_t index) noexcept {
+      return const_cast<Bucket*>(
+          std::as_const(*this).template ReadBucket<CheckInitialization>(index));
+    }
+
+    Bucket* WriteBucket(std::size_t index) {
+      assert(buckets_);
+      if (lazy_buckets_) {
+        const std::size_t block = index / kBucketsPerInitializationBlock;
+        auto& word = overflow_->initialized_blocks_[block / 64];
+        const std::uint64_t bit = std::uint64_t{1} << (block % 64);
+        if ((word & bit) == 0) {
+          std::uninitialized_value_construct_n(
+              buckets_.get() + block * kBucketsPerInitializationBlock,
+              kBucketsPerInitializationBlock);
+          // A foreground insert may initialize a block before migration gets
+          // there. Publish only after construction and never clear it again.
+          word |= bit;
+          --overflow_->uninitialized_blocks_;
+        }
+      }
+      return buckets_.get() + index;
+    }
+
+    void FinishBucketInitialization() {
+      if (!lazy_buckets_) return;
+      // Each source bucket prepares its destination(s), including empty ones,
+      // so completing migration leaves no deferred work on the settled table.
+      assert(overflow_->uninitialized_blocks_ == 0);
+      lazy_buckets_ = false;
+      if (overflow_->buckets_.empty()) {
+        overflow_.reset();
+      } else {
+        decltype(overflow_->initialized_blocks_) empty(
+            overflow_->initialized_blocks_.get_allocator());
+        overflow_->initialized_blocks_.swap(empty);
+      }
     }
 
     DirectBuckets buckets_{nullptr, BucketArrayDeleter{}};
     OverflowOwner overflow_;
     std::uint8_t exponent_ = 0;
+    bool lazy_buckets_ = false;
     std::size_t used_ = 0;
   };
 
@@ -2482,7 +2605,9 @@ class ScanHashMap {
     assert(arena_ != nullptr);
     tables_[1] = Table(arena_->allocation_domain());
     tables_[1].exponent_ = tables_[0].exponent_ + 1;
-    if (!tables_[1].AllocateBuckets(std::size_t{1} << tables_[1].exponent_)) {
+    if (!tables_[1].AllocateBuckets(std::size_t{1} << tables_[1].exponent_,
+                                    /*independent_admission=*/false,
+                                    /*defer_initialization=*/true)) {
       std::terminate();
     }
     tables_[1].used_ = 0;
@@ -2513,7 +2638,9 @@ class ScanHashMap {
     // Deletion has no enclosing growth permit, even for a primary index.
     // Reserve the temporary old+new footprint before publishing the target;
     // rejection must never turn a successful Erase into a failed command.
-    if (!prepared.AllocateBuckets(buckets / 2, true)) {
+    if (!prepared.AllocateBuckets(buckets / 2,
+                                  /*independent_admission=*/true,
+                                  /*defer_initialization=*/true)) {
       EndResize();
       return false;
     }
@@ -2543,6 +2670,7 @@ class ScanHashMap {
     ++rehash_index_;
     if (rehash_index_ == BucketCount(tables_[0])) {
       assert(tables_[0].used_ == 0);
+      tables_[1].FinishBucketInitialization();
       tables_[0] = std::move(tables_[1]);
       tables_[1] = Table(arena_->allocation_domain());
       rehash_index_ = kNotRehashing;
@@ -2553,7 +2681,8 @@ class ScanHashMap {
 
   static std::size_t FreeSlots(const Table& table,
                                std::size_t bucket_index) noexcept {
-    const Bucket* bucket = &table.buckets_[bucket_index];
+    const Bucket* bucket = table.ReadBucket(bucket_index);
+    if (bucket == nullptr) return kEntriesPerBucket;
     std::size_t free = 0;
     while (bucket != nullptr) {
       free += static_cast<std::size_t>(std::count(
@@ -2574,7 +2703,7 @@ class ScanHashMap {
 
   static bool AppendEmptyBuckets(Table* table, std::size_t bucket_index,
                                  std::size_t count) {
-    Bucket* tail = &table->buckets_[bucket_index];
+    Bucket* tail = table->WriteBucket(bucket_index);
     while (Chained(*tail)) tail = Child(*table, tail);
     while (count-- != 0) {
       const ChildAllocation child = AllocateChild(table);
@@ -2593,8 +2722,8 @@ class ScanHashMap {
       std::size_t slot_ = 0;
     };
     std::array<Cursor, 2> cursors = {
-        Cursor{.bucket_ = &target->buckets_[target_indexes[0]]},
-        Cursor{.bucket_ = &target->buckets_[target_indexes[1]]}};
+        Cursor{.bucket_ = target->ReadBucket(target_indexes[0])},
+        Cursor{.bucket_ = target->ReadBucket(target_indexes[1])}};
     for (RehashMove& move : *plan) {
       Cursor& cursor = cursors[move.split_];
       while (cursor.bucket_ != nullptr) {
@@ -2718,10 +2847,13 @@ class ScanHashMap {
     return nullptr;
   }
 
+  template <bool CheckInitialization = false>
   Entry* FindInTable(Table& table, const Digest& digest, std::string_view key,
                      std::uint64_t hash) {
     if (!table.buckets_) return nullptr;
-    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    Bucket* bucket = table.template ReadBucket<CheckInitialization>(
+        hash & BucketMask(table));
+    if (bucket == nullptr) return nullptr;
     const std::uint8_t tag = HashTag(hash);
     if (Entry* found = FindInBucket(*bucket, digest, key, tag)) return found;
     return Chained(*bucket)
@@ -2757,10 +2889,13 @@ class ScanHashMap {
     return nullptr;
   }
 
+  template <bool CheckInitialization = false>
   const Entry* FindInTable(const Table& table, const Digest& digest,
                            std::string_view key, std::uint64_t hash) const {
     if (!table.buckets_) return nullptr;
-    const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    const Bucket* bucket = table.template ReadBucket<CheckInitialization>(
+        hash & BucketMask(table));
+    if (bucket == nullptr) return nullptr;
     const std::uint8_t tag = HashTag(hash);
     if (const Entry* found = FindInBucket(*bucket, digest, key, tag))
       return found;
@@ -2781,7 +2916,7 @@ class ScanHashMap {
       if (!table.buckets_) {
         continue;
       }
-      const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+      const Bucket* bucket = table.ReadBucket(hash & BucketMask(table));
       while (bucket != nullptr) {
         if constexpr (FilterTag) {
           // Flush receipts already retain the key's tag. Use the same SIMD
@@ -2815,7 +2950,7 @@ class ScanHashMap {
     if (!table.buckets_) {
       return;
     }
-    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    Bucket* bucket = table.ReadBucket(hash & BucketMask(table));
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
       for (std::uint32_t matches = MatchingTags(*bucket, tag); matches != 0;
@@ -2864,13 +2999,15 @@ class ScanHashMap {
     return nullptr;
   }
 
-  template <typename Predicate>
+  template <bool CheckInitialization = false, typename Predicate>
   Entry* FindCandidateInTable(Table& table, const Digest& digest,
                               std::string_view key, std::uint64_t hash,
                               Predicate& accept) {
     if (!table.buckets_) return nullptr;
-    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    Bucket* bucket = table.template ReadBucket<CheckInitialization>(
+        hash & BucketMask(table));
     const std::uint8_t tag = HashTag(hash);
+    if (bucket == nullptr) return nullptr;
     if (Entry* found = FindCandidateInBucket(*bucket, digest, key, tag, accept))
       return found;
     return Chained(*bucket)
@@ -2879,7 +3016,11 @@ class ScanHashMap {
                : nullptr;
   }
 
-  Entry* FindWithoutStep(const Digest& digest, std::string_view key) {
+  // Resize preparation is much larger than lookup. Keep it from changing the
+  // compiler's inlining decision for the primary-table read path at callers
+  // that also insert; only overflow and second-table lookup stay out of line.
+  [[gnu::always_inline]] Entry* FindWithoutStep(const Digest& digest,
+                                                std::string_view key) {
     const std::uint64_t hash = Hash(digest);
     if (Entry* found = FindInTable(tables_[0], digest, key, hash);
         found != nullptr) {
@@ -2891,8 +3032,8 @@ class ScanHashMap {
     return nullptr;
   }
 
-  const Entry* FindWithoutStep(const Digest& digest,
-                               std::string_view key) const {
+  [[gnu::always_inline]] const Entry* FindWithoutStep(
+      const Digest& digest, std::string_view key) const {
     const std::uint64_t hash = Hash(digest);
     if (const Entry* found = FindInTable(tables_[0], digest, key, hash);
         found != nullptr) {
@@ -2911,18 +3052,18 @@ class ScanHashMap {
   [[gnu::noinline]] Entry* FindInRehashTable(const Digest& digest,
                                              std::string_view key,
                                              std::uint64_t hash) {
-    return FindInTable(tables_[1], digest, key, hash);
+    return FindInTable<true>(tables_[1], digest, key, hash);
   }
 
   [[gnu::noinline]] const Entry* FindInRehashTable(const Digest& digest,
                                                    std::string_view key,
                                                    std::uint64_t hash) const {
-    return FindInTable(tables_[1], digest, key, hash);
+    return FindInTable<true>(tables_[1], digest, key, hash);
   }
 
   bool AddToTable(Table& table, EntryHandle entry, std::uint64_t hash) {
     const std::uint8_t tag = HashTag(hash);
-    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    Bucket* bucket = table.WriteBucket(hash & BucketMask(table));
     while (true) {
       for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
         if (!Occupied(*bucket, slot)) {
@@ -3017,7 +3158,7 @@ class ScanHashMap {
     if (!table.buckets_) {
       return;
     }
-    const Bucket* bucket = &table.buckets_[index];
+    const Bucket* bucket = table.ReadBucket(index);
     while (bucket != nullptr) {
       for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
         if (Occupied(*bucket, slot)) {
@@ -3039,7 +3180,7 @@ class ScanHashMap {
   template <typename Fn>
   bool EmitBucketWhile(const Table& table, std::uint64_t index, Fn& fn) const {
     if (!table.buckets_) return true;
-    const Bucket* bucket = &table.buckets_[index];
+    const Bucket* bucket = table.ReadBucket(index);
     while (bucket != nullptr) {
       for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
         if (Occupied(*bucket, slot) &&
@@ -3064,7 +3205,7 @@ class ScanHashMap {
   void DestroyTable(Table& table, bool destroy_entries) noexcept {
     const std::size_t count = BucketCount(table);
     for (std::size_t index = 0; index < count; ++index) {
-      Bucket* top = &table.buckets_[index];
+      Bucket* top = table.ReadBucket(index);
       Bucket* bucket = top;
       while (bucket != nullptr) {
         const bool chained = Chained(*bucket);

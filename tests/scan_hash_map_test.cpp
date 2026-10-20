@@ -744,6 +744,258 @@ TEST(ScanHashMapTest, PreallocatesSettledTableForKnownPopulation) {
   EXPECT_EQ(map.size(), 91);
 }
 
+TEST(ScanHashMapTest, LazyGrowthSkipsUntouchedBlocksAndPreservesEarlyWrites) {
+  using Map = ScanHashMap<std::uint64_t>;
+  constexpr std::size_t kOldBuckets = 2048;
+  constexpr std::size_t kOldEntries = 9 * kOldBuckets;
+  Map map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(kOldEntries));
+  EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+  for (std::size_t i = 0; i < kOldEntries; ++i) {
+    ASSERT_NE(map.InsertNew(Digest{i}, "external", i, false), nullptr);
+  }
+  // This insertion lands in the last of four target blocks, long before
+  // sequential migration reaches that block. Only that block is constructed.
+  const Digest early{(1ULL << 32) | 3072};
+  auto* entry = map.InsertNew(early, "external", kOldEntries, false);
+  ASSERT_NE(entry, nullptr);
+  ASSERT_TRUE(map.rehashing());
+  EXPECT_EQ(map.uninitialized_bucket_count(), 3072);
+  const auto& reader = std::as_const(map);
+  const Digest missing{(1ULL << 40) | 1024};
+  EXPECT_EQ(reader.Find(missing, "external"), nullptr);
+  EXPECT_EQ(reader.Find(early, "external"), entry);
+  const auto address = reinterpret_cast<std::uintptr_t>(entry);
+  EXPECT_EQ(reader.FindAddress(address, Map::AddressHash(missing)), nullptr);
+  EXPECT_EQ(reader.FindAddress(address, Map::AddressHash(missing),
+                               Map::AddressTag(missing)),
+            nullptr);
+  reader.PrefetchAddress(Map::AddressHash(missing));
+  EXPECT_EQ(
+      map.RequiredAllocationBytes(missing, "external", false, false, true),
+      map.RequiredAllocationBytes(Digest{3073}, "external", false, false,
+                                  true));
+
+  auto check_scan = [&] {
+    std::vector<unsigned> seen(map.size(), 0);
+    std::uint64_t cursor = 0;
+    do {
+      cursor = map.Scan(cursor, [&](auto& value) { ++seen.at(value.value()); });
+    } while (cursor != 0);
+    for (unsigned count : seen) EXPECT_EQ(count, 1);
+    Map::StableScanCursor stable;
+    std::size_t visited = 0;
+    while (!map.ScanStableWhile(&stable, [&](const auto&) {
+      ++visited;
+      return visited % 37 != 0;
+    })) {
+    }
+    EXPECT_EQ(visited, map.size());
+    visited = 0;
+    map.ForEach([&](const auto&) { ++visited; });
+    EXPECT_EQ(visited, map.size());
+    visited = 0;
+    EXPECT_TRUE(map.ForEachWhile([&](const auto&) {
+      ++visited;
+      return true;
+    }));
+    EXPECT_EQ(visited, map.size());
+  };
+  check_scan();
+  EXPECT_EQ(map.uninitialized_bucket_count(), 3072);
+
+  // These owner queries advance migration near bucket zero, initializing
+  // target blocks zero and two. The missing key's block one stays untouched.
+  EXPECT_EQ(map.Find(missing, "external"), nullptr);
+  EXPECT_TRUE(map.FindCandidates(missing, "external").empty());
+  EXPECT_EQ(map.FindCandidateIf(missing, "external",
+                                [](const auto&) { return true; }),
+            nullptr);
+  EXPECT_FALSE(map.Erase(missing, "external"));
+  EXPECT_EQ(map.uninitialized_bucket_count(), 1024);
+  check_scan();
+  EXPECT_EQ(map.uninitialized_bucket_count(), 1024);
+
+  // An early write into the last untouched block must not be erased when
+  // migration later visits another bucket in the same block.
+  auto* second = map.InsertNew(missing, "external", kOldEntries + 1, false);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+  // Keep an overflow chain in the target: finishing initialization must free
+  // the bitmap without freeing the shared overflow metadata or its entries.
+  for (std::uint64_t i = 0; i < 13; ++i) {
+    const Digest collision{((i + 2) << 40) | 1024};
+    ASSERT_NE(map.InsertNew(collision, "external", kOldEntries + 2 + i, false),
+              nullptr);
+  }
+  for (std::size_t step = 0; step < kOldBuckets && map.rehashing(); ++step) {
+    ASSERT_TRUE(map.Maintain());
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_EQ(map.allocated_bucket_count(), 2 * kOldBuckets);
+  EXPECT_EQ(reader.Find(early, "external"), entry);
+  EXPECT_EQ(reader.Find(missing, "external"), second);
+  for (std::uint64_t i = 0; i < 13; ++i) {
+    const Digest collision{((i + 2) << 40) | 1024};
+    auto* found = reader.Find(collision, "external");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->value(), kOldEntries + 2 + i);
+  }
+  for (std::size_t i = 0; i < kOldEntries; ++i) {
+    auto* found = reader.Find(Digest{i}, "external");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->value(), i);
+  }
+  check_scan();
+}
+
+TEST(ScanHashMapTest, LazyShrinkInitializesEmptyDestinationsBeforeSettling) {
+  ScanHashMap<std::uint64_t> map;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(9 * 8192));
+  const Digest keep{7168};
+  auto* kept = map.InsertNew(keep, "external", 1, false);
+  auto* removed = map.InsertNew(Digest{5120}, "external", 2, false);
+  ASSERT_NE(kept, nullptr);
+  ASSERT_NE(removed, nullptr);
+  ASSERT_TRUE(map.Erase(removed));
+  ASSERT_TRUE(map.rehashing());
+  EXPECT_EQ(map.uninitialized_bucket_count(), 4096);
+  EXPECT_EQ(std::as_const(map).Find(keep, "external"), kept);
+  std::size_t seen = 0;
+  std::uint64_t cursor = 0;
+  do {
+    cursor = map.Scan(cursor, [&](const auto& entry) {
+      EXPECT_EQ(entry.value(), 1);
+      ++seen;
+    });
+  } while (cursor != 0);
+  EXPECT_EQ(seen, 1);
+  EXPECT_EQ(map.uninitialized_bucket_count(), 4096);
+  for (std::size_t step = 0; step < 8192 && map.rehashing(); ++step) {
+    ASSERT_TRUE(map.Maintain());
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_EQ(map.allocated_bucket_count(), 4096);
+  EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+  EXPECT_EQ(std::as_const(map).Find(keep, "external"), kept);
+  // Even destinations of empty source buckets are now safe to inspect after
+  // the bitmap has been discarded.
+  for (std::uint64_t i = 0; i < 4096; ++i) {
+    EXPECT_EQ(std::as_const(map).Find(Digest{i}, "external"), nullptr);
+  }
+}
+
+TEST(ScanHashMapTest, LazyResizeBitmapSpansWordsAndScanSurvivesMigration) {
+  ScanHashMap<std::uint64_t> map;
+  constexpr std::size_t kOldBuckets = 1 << 18;
+  ASSERT_TRUE(map.PreallocateForExpectedSize(9 * kOldBuckets));
+  ASSERT_NE(map.InsertNew(Digest{0}, "external", 0, false), nullptr);
+  auto* removed = map.InsertNew(Digest{1}, "external", 1, false);
+  ASSERT_NE(removed, nullptr);
+  ASSERT_TRUE(map.Erase(removed));
+  ASSERT_EQ(map.uninitialized_bucket_count(), kOldBuckets / 2);
+  constexpr std::array<std::uint64_t, 4> blocks{0, 63, 64, 127};
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const Digest digest{(1ULL << 32) | (blocks[i] * 1024)};
+    ASSERT_NE(map.InsertNew(digest, "external", i + 1, false), nullptr);
+    EXPECT_EQ(map.uninitialized_bucket_count(),
+              kOldBuckets / 2 - (i + 1) * 1024);
+  }
+  std::array<unsigned, 5> seen{};
+  std::uint64_t cursor = 0;
+  do {
+    cursor =
+        map.Scan(cursor, [&](const auto& entry) { ++seen.at(entry.value()); });
+    ASSERT_TRUE(map.Maintain());
+  } while (cursor != 0);
+  for (unsigned count : seen) EXPECT_GE(count, 1);
+  for (std::size_t step = 0; step < kOldBuckets && map.rehashing(); ++step) {
+    ASSERT_TRUE(map.Maintain());
+  }
+  ASSERT_FALSE(map.rehashing());
+  EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+  for (std::size_t i = 0; i < blocks.size(); ++i) {
+    const Digest digest{(1ULL << 32) | (blocks[i] * 1024)};
+    auto* found = std::as_const(map).Find(digest, "external");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->value(), i + 1);
+  }
+}
+
+TEST(ScanHashMapTest, LazyResizeMoveDetachAndClearReleaseAllAccounting) {
+  ASSERT_TRUE(lavik::InitMemoryLimit(64 * 1024 * 1024, 1).ok());
+  lavik::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+    }
+  } restore;
+  const auto before = lavik::WorkerMemoryAccountingBytes(0);
+  for (bool initialize_one_block : {false, true}) {
+    {
+      ScanHashMap<std::uint64_t> map;
+      ASSERT_TRUE(map.PreallocateForExpectedSize(9 * 8192));
+      ASSERT_NE(map.InsertNew(Digest{7168}, "external", 1, false), nullptr);
+      auto* removed = map.InsertNew(Digest{5120}, "external", 2, false);
+      ASSERT_NE(removed, nullptr);
+      ASSERT_TRUE(map.Erase(removed));
+      if (initialize_one_block) ASSERT_TRUE(map.Maintain());
+      const std::size_t remaining = map.uninitialized_bucket_count();
+      EXPECT_EQ(remaining, initialize_one_block ? 3072 : 4096);
+      auto detached = map.Detach();
+      EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+      ScanHashMap<std::uint64_t> moved(std::move(detached));
+      EXPECT_EQ(moved.uninitialized_bucket_count(), remaining);
+      EXPECT_NE(std::as_const(moved).Find(Digest{7168}, "external"), nullptr);
+      detached = std::move(moved);
+      EXPECT_EQ(detached.uninitialized_bucket_count(), remaining);
+      detached.Clear();
+      EXPECT_EQ(detached.uninitialized_bucket_count(), 0);
+      EXPECT_FALSE(detached.has_allocated_storage());
+    }
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), before);
+  }
+}
+
+TEST(ScanHashMapTest, LazyShrinkRollsBackMetadataWhenBucketAdmissionFails) {
+  ASSERT_TRUE(lavik::InitMemoryLimit(4 * 1024 * 1024, 1).ok());
+  lavik::BindMemoryAccountingShard(0);
+  struct RestoreLimit {
+    ~RestoreLimit() {
+      (void)lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
+      lavik::BindMemoryAccountingShard(lavik::kMaxMemoryWorkers);
+    }
+  } restore;
+  for (bool externally_admitted : {false, true}) {
+    auto arena = std::make_shared<ScanHashMapEntryArena>(
+        ScanHashMapEntryArena::kMaximumPageId, externally_admitted);
+    ScanHashMap<std::uint64_t> map(arena);
+    ASSERT_TRUE(map.PreallocateForExpectedSize(9 * 8192));
+    ASSERT_NE(map.InsertNew(Digest{7168}, "external", 1, false), nullptr);
+    auto* removed = map.InsertNew(Digest{5120}, "external", 2, false);
+    ASSERT_NE(removed, nullptr);
+    const auto memory = lavik::GetWorkerMemoryStats(0);
+    // Leave room for the optional metadata and bitmap, but not the target
+    // bucket array. Their temporary accounting must unwind on rejection.
+    auto blocker = lavik::TryReserveMemory(memory.retained_limit_bytes_ -
+                                           memory.retained_bytes_ - 512);
+    ASSERT_TRUE(blocker.has_value());
+    EXPECT_TRUE(map.Erase(removed));
+    EXPECT_EQ(map.size(), 1);
+    EXPECT_FALSE(map.rehashing());
+    EXPECT_EQ(map.allocated_bucket_count(), 8192);
+    EXPECT_EQ(map.uninitialized_bucket_count(), 0);
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), memory.retained_bytes_);
+    EXPECT_FALSE(map.Maintain());
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), memory.retained_bytes_);
+    blocker.reset();
+    ASSERT_TRUE(map.Maintain());
+    EXPECT_TRUE(map.rehashing());
+    EXPECT_EQ(map.uninitialized_bucket_count(), 4096);
+  }
+}
+
 TEST(ScanHashMapTest, KnownEmptyPopulationAllocatesNothing) {
   ScanHashMap<std::uint64_t> map;
   EXPECT_TRUE(map.PreallocateForExpectedSize(0));
