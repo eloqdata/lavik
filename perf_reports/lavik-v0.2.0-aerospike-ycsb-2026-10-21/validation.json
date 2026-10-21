@@ -1,0 +1,13 @@
+{
+  "passed": true,
+  "formal_windows": 16,
+  "warmup_windows": 16,
+  "fresh_loads": 2,
+  "errors": 0,
+  "log_hashes_and_metrics_recomputed": true,
+  "recovery_samples_equal": true,
+  "complete_matrix": true,
+  "server_counters_reconciled": true,
+  "irq_deltas_checked": true,
+  "host_policy_restoration_checked": true
+}
