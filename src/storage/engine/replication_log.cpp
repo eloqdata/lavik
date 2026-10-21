@@ -1136,6 +1136,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog(
 Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     WorkerStore* store) {
   auto& log = store->replication_log_;
+  // Scratch belongs to this publisher invocation, not the log epoch: a
+  // suspended old publisher must never share buffers with a replacement.
+  ReplicationCommandPayloadSource command_scratch;
   while (!log.publish_queue_.empty()) {
     struct ReclaimPublicationDebt {
       Impl* impl;
@@ -1146,8 +1149,9 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
           impl->ReclaimReplicationLogDebt(*store);
       }
     } reclaim{this, store, log.publish_queue_.front().log_epoch_};
-    // Release codec buffers and canonical payload references before reclaiming
-    // debt and waking admissions. An old publisher cannot reclaim a new epoch.
+    // Drop codec views and canonical payload references before reclaiming debt
+    // and waking admissions. Retained scratch capacity stays charged. An old
+    // publisher cannot reclaim a new epoch.
     auto pending = std::move(log.publish_queue_.front());
     log.publish_queue_.pop_front();
     if (pending.fence_ != nullptr) {
@@ -1268,16 +1272,31 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       continue;
     }
 
-    auto command_source =
-        pending.transaction_ != nullptr
-            ? BuildReplicationTransactionEnvelope(*pending.transaction_,
-                                                  bycorf::ThisWorker().id_)
-            : ReplicationCommandPayloadSource::Create(pending.append_.db_id_,
-                                                      pending.append_.args_);
-    if (!command_source.ok()) {
+    // Clear views only after AppendReplicationLog has finished reading them,
+    // and before pending's strings and the publication debt are released.
+    struct ClearEncodingScratch {
+      ReplicationCommandPayloadSource* source;
+      ~ClearEncodingScratch() { source->ClearForReuse(); }
+    } clear_scratch{&command_scratch};
+    std::optional<ReplicationCommandPayloadSource> transaction_source;
+    ReplicationCommandPayloadSource* command_source = &command_scratch;
+    absl::Status encoded;
+    if (pending.transaction_ != nullptr) {
+      auto source = BuildReplicationTransactionEnvelope(
+          *pending.transaction_, bycorf::ThisWorker().id_);
+      encoded = source.status();
+      if (source.ok()) {
+        transaction_source.emplace(std::move(*source));
+        command_source = &*transaction_source;
+      }
+    } else {
+      encoded =
+          command_scratch.Reset(pending.append_.db_id_, pending.append_.args_);
+    }
+    if (!encoded.ok()) {
       log.state_ = ReplicationLogState::kInvalid;
       spdlog::warn("replication command encoding failed: {}",
-                   command_source.status().message());
+                   encoded.message());
       break;
     }
     auto appended = co_await AppendReplicationLog(
@@ -1286,7 +1305,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
             .partition_id_ = pending.append_.partition_id_,
             .partition_sequence_ = pending.append_.partition_sequence_,
             .payload_ = {},
-            .payload_source_ = &*command_source,
+            .payload_source_ = command_source,
         },
         /*already_admitted=*/true);
     if (!appended.ok()) {

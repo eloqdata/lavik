@@ -225,66 +225,110 @@ bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept {
   return encoded.starts_with(kTransactionMagic);
 }
 
-// The source owns and accounts its header and view table. Protocol/container
-// bounds return errors; physical allocation failure remains process-fatal.
-absl::StatusOr<ReplicationCommandPayloadSource>
-ReplicationCommandPayloadSource::Create(
-    std::uint8_t db_id, std::span<const std::string_view> args) try {
-  if (db_id >= storage::kLogicalDatabaseCount) {
-    return Malformed("replication command database is out of range");
+std::size_t ReplicationCommandPayloadSource::RetainedMetadataBytes()
+    const noexcept {
+  std::size_t bytes = args_.capacity() == 0
+                          ? 0
+                          : AllocatorUsableSizeForRequest(
+                                args_.capacity() * sizeof(std::string_view));
+  if (header_.capacity() > std::string{}.capacity())
+    bytes += AllocatorUsableSizeForRequest(header_.capacity() + 1);
+  return bytes;
+}
+
+void ReplicationCommandPayloadSource::RefreshMetadataCharge() noexcept {
+  const std::size_t bytes = RetainedMetadataBytes();
+  if (metadata_charge_.bytes() == 0)
+    metadata_charge_.Account(CurrentMemoryAccountingShard(), bytes);
+  else
+    metadata_charge_.Resize(bytes);
+}
+
+void ReplicationCommandPayloadSource::ClearForReuse(
+    std::size_t max_retained_bytes) noexcept {
+  args_.clear();
+  header_.clear();
+  size_ = 0;
+  if (RetainedMetadataBytes() > max_retained_bytes) {
+    std::vector<std::string_view>{}.swap(args_);
+    std::string{}.swap(header_);
   }
+  // Empty containers still own their capacity. Keep that capacity charged
+  // until trimming or destruction actually releases it.
+  RefreshMetadataCharge();
+}
+
+// Both input representations fill the final table directly. A temporary
+// vector<string_view> here would allocate and release a second table per SET.
+template <typename Argument>
+absl::Status ReplicationCommandPayloadSource::ResetImpl(
+    std::uint8_t db_id, std::span<const Argument> args) try {
+  ClearForReuse(std::numeric_limits<std::size_t>::max());
+  if (db_id >= storage::kLogicalDatabaseCount)
+    return Malformed("replication command database is out of range");
   const auto header_bytes = CommandHeaderBytes(args.size());
   if (!header_bytes.ok()) return header_bytes.status();
 
-  ReplicationCommandPayloadSource source;
-  source.header_.reserve(*header_bytes);
-  source.header_.append(kMagic);
-  const bool legacy = args.size() <= kLegacyMaxArgumentCount;
-  source.header_.push_back(
-      static_cast<char>(legacy ? kLegacyVersion : kWideArgumentCountVersion));
-  source.header_.push_back(static_cast<char>(db_id));
-  if (legacy)
-    PutU16(&source.header_, static_cast<std::uint16_t>(args.size()));
-  else
-    PutU32(&source.header_, static_cast<std::uint32_t>(args.size()));
-  source.size_ = *header_bytes;
-  source.args_.reserve(args.size());
-  std::size_t retained = AllocatorUsableSizeForRequest(
-      source.args_.capacity() * sizeof(std::string_view));
-  if (source.header_.capacity() > std::string{}.capacity())
-    retained += AllocatorUsableSizeForRequest(source.header_.capacity() + 1);
-  source.metadata_charge_.Account(CurrentMemoryAccountingShard(), retained);
+  std::uint64_t total = *header_bytes;
   for (std::string_view arg : args) {
     if (arg.size() > kMaxArgumentBytes ||
-        arg.size() > std::numeric_limits<std::uint32_t>::max()) {
+        arg.size() > std::numeric_limits<std::uint32_t>::max())
       return Malformed("replication command argument is too large");
-    }
-    if (source.size_ > std::numeric_limits<std::uint64_t>::max() - arg.size() ||
-        source.size_ > std::numeric_limits<std::size_t>::max() - arg.size()) {
+    if (arg.size() > std::numeric_limits<std::uint64_t>::max() - total ||
+        arg.size() > std::numeric_limits<std::size_t>::max() - total)
       return absl::ResourceExhaustedError("replication command size overflow");
-    }
-    PutU32(&source.header_, static_cast<std::uint32_t>(arg.size()));
-    source.args_.push_back(arg);
-    source.size_ += arg.size();
+    total += arg.size();
   }
-  return source;
+
+  header_.reserve(*header_bytes);
+  args_.reserve(args.size());
+  RefreshMetadataCharge();
+  header_.append(kMagic);
+  const bool legacy = args.size() <= kLegacyMaxArgumentCount;
+  header_.push_back(
+      static_cast<char>(legacy ? kLegacyVersion : kWideArgumentCountVersion));
+  header_.push_back(static_cast<char>(db_id));
+  if (legacy)
+    PutU16(&header_, static_cast<std::uint16_t>(args.size()));
+  else
+    PutU32(&header_, static_cast<std::uint32_t>(args.size()));
+  for (std::string_view arg : args) {
+    PutU32(&header_, static_cast<std::uint32_t>(arg.size()));
+    args_.push_back(arg);
+  }
+  size_ = total;
+  return absl::OkStatus();
 } catch (const std::length_error&) {
+  ClearForReuse(std::numeric_limits<std::size_t>::max());
   return absl::ResourceExhaustedError("replication command is too large");
+}
+
+absl::Status ReplicationCommandPayloadSource::Reset(
+    std::uint8_t db_id, std::span<const std::string_view> args) {
+  return ResetImpl(db_id, args);
+}
+
+absl::Status ReplicationCommandPayloadSource::Reset(
+    std::uint8_t db_id, std::span<const std::string> args) {
+  return ResetImpl(db_id, args);
+}
+
+absl::StatusOr<ReplicationCommandPayloadSource>
+ReplicationCommandPayloadSource::Create(
+    std::uint8_t db_id, std::span<const std::string_view> args) {
+  ReplicationCommandPayloadSource source;
+  absl::Status status = source.Reset(db_id, args);
+  if (!status.ok()) return status;
+  return source;
 }
 
 absl::StatusOr<ReplicationCommandPayloadSource>
 ReplicationCommandPayloadSource::Create(std::uint8_t db_id,
-                                        std::span<const std::string> args) try {
-  const auto header_bytes = CommandHeaderBytes(args.size());
-  if (!header_bytes.ok()) return header_bytes.status();
-  std::vector<std::string_view, RetainedAllocator<std::string_view>> views{
-      RetainedAllocator<std::string_view>(
-          RetainedAllocationDomain{.externally_admitted_ = true})};
-  views.reserve(args.size());
-  for (const std::string& arg : args) views.push_back(arg);
-  return Create(db_id, views);
-} catch (const std::length_error&) {
-  return absl::ResourceExhaustedError("replication command is too large");
+                                        std::span<const std::string> args) {
+  ReplicationCommandPayloadSource source;
+  absl::Status status = source.Reset(db_id, args);
+  if (!status.ok()) return status;
+  return source;
 }
 
 bycorf::Task<absl::Status> ReplicationCommandPayloadSource::Read(

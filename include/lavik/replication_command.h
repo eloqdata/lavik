@@ -82,12 +82,28 @@ bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept;
 class ReplicationCommandPayloadSource final
     : public storage::ReplicationLogPayloadSource {
  public:
+  ReplicationCommandPayloadSource() = default;
+
   static absl::StatusOr<ReplicationCommandPayloadSource> Create(
       std::uint8_t db_id, std::span<const std::string_view> args);
   // Convenience ownership boundary for queued vector<string> payloads. The
   // returned source keeps only views, so args must outlive the source.
   static absl::StatusOr<ReplicationCommandPayloadSource> Create(
       std::uint8_t db_id, std::span<const std::string> args);
+
+  // Refill worker-local encoding scratch without copying argument bodies.
+  // Arguments must outlive all Read calls. Reset/ClearForReuse require the
+  // previous append (including any suspended Read) to have completed. Failure
+  // leaves an empty source; retained capacity remains accounted.
+  absl::Status Reset(std::uint8_t db_id,
+                     std::span<const std::string_view> args);
+  absl::Status Reset(std::uint8_t db_id, std::span<const std::string> args);
+
+  // Drop borrowed views after append, retaining only bounded codec capacity.
+  // Oversized commands must not permanently enlarge each publisher's scratch.
+  static constexpr std::size_t kMaxRetainedMetadataBytes = 64 * 1024;
+  void ClearForReuse(
+      std::size_t max_retained_bytes = kMaxRetainedMetadataBytes) noexcept;
 
   ReplicationCommandPayloadSource(ReplicationCommandPayloadSource&&) noexcept =
       default;
@@ -99,10 +115,13 @@ class ReplicationCommandPayloadSource final
                                   std::span<std::byte> output) override;
 
  private:
-  ReplicationCommandPayloadSource() = default;
+  template <typename Argument>
+  absl::Status ResetImpl(std::uint8_t db_id, std::span<const Argument> args);
+  std::size_t RetainedMetadataBytes() const noexcept;
+  void RefreshMetadataCharge() noexcept;
 
-  // Codec buffers remain charged until the source is destroyed. Accepted
-  // replication may allocate them beyond the soft memory budget.
+  // Codec capacity stays charged until trimmed or destroyed, including while
+  // empty between commands. Accepted replication may exceed the soft budget.
   RetainedMemoryCharge metadata_charge_;
   std::string header_;
   std::vector<std::string_view> args_;
