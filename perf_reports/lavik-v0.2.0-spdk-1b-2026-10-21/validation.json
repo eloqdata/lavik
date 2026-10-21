@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "formal_points": 8,
+  "fresh_fill_requests": 1000000000,
+  "client_threads": 32,
+  "client_cpus": "0-31",
+  "connections": [
+    160,
+    320,
+    640,
+    1280
+  ],
+  "zero_connection_errors": true,
+  "zero_get_misses": true,
+  "full_matrix": true,
+  "raw_percentiles_match": true,
+  "exact_dbsize_before_after": 1000000000,
+  "defrag_enabled": true,
+  "drivers_and_hugepages_restored": true
+}
