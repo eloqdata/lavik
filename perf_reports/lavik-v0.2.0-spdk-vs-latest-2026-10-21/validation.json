@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "formal_points": 120,
+  "zero_connection_errors": true,
+  "zero_get_misses": true,
+  "full_matrix": true,
+  "raw_percentiles_match_tables": true,
+  "fixed_configuration_selection": {
+    "GET:lavik-10m": 16,
+    "GET:lavik-1b": 16,
+    "GET:redis": 16,
+    "GET:valkey": 16,
+    "SET:lavik-10m": 16,
+    "SET:lavik-1b": 16,
+    "SET:redis": 16,
+    "SET:valkey": 8
+  }
+}

@@ -70,7 +70,7 @@ Ranges use post-point snapshots. INFO memory follows each product’s accounting
 
 | Item | Configuration |
 | --- | --- |
-| Server | Standard_L2aos_v5; 2 vCPU / 16 GiB nominal RAM; AMD EPYC 9V45 96-Core Processor |
+| Server | Standard_L2aos_v5; 2 vCPU (1 physical core) / 16 GiB nominal RAM; AMD EPYC 9V45 96-Core Processor |
 | Client | Standard_F16as_v7; separate VM; CPUs 0–15 |
 | Region | East US, zone 3 |
 | OS | Ubuntu 24.04; Linux 6.17.0-1022-azure on both hosts |
