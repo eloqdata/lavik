@@ -489,7 +489,7 @@ const CommandSpec* FindCommand(std::string_view name) {
   return nullptr;
 }
 
-const CommandSpec* FindCommand(std::span<const std::string> args) {
+const CommandSpec* FindCommand(CommandArgsView args) {
   if (args.empty()) return nullptr;
   const CommandSpec* spec = FindCommand(std::string_view(args.front()));
   if (spec == nullptr || spec->kind_ != CommandKind::kFunction ||
@@ -544,7 +544,7 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
 }
 
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
-                                           std::span<const std::string> args) {
+                                           CommandArgsView args) {
   if ((spec.flags_ & kCmdMovableKeys) == 0) {
     return DetermineKeys(spec, args.size());
   }

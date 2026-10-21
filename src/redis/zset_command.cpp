@@ -798,7 +798,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
   transaction.SetShardValidator(nullptr, nullptr);
 
   for (std::size_t argument : shape.key_args_) {
-    const std::string& key = request.args_[argument];
+    const std::string_view key = request.args_[argument];
     const storage::Digest digest = storage::ComputeDigest(key);
     auto popped = co_await bycorf::SubmitTaskTo(
         g_storage->OwnerForKey(key),
@@ -914,8 +914,8 @@ struct RangeOptions {
   std::int64_t count_ = -1;
 };
 
-absl::Status ParseRangeLimit(const std::vector<std::string>& args,
-                             std::size_t option, RangeOptions* output) {
+absl::Status ParseRangeLimit(CommandArgsView args, std::size_t option,
+                             RangeOptions* output) {
   if (option + 2 >= args.size()) {
     return absl::InvalidArgumentError("syntax error");
   }
@@ -2138,7 +2138,7 @@ CapturedReplicationCommands BuildZSetReplacement(const CommandRequest& request,
   effects.push_back(CapturedReplicationCommand{
       request.db_id_, {"DEL", request.args_[destination_arg]}});
   if (!output.empty()) {
-    std::vector<std::string> add{"ZADD", request.args_[destination_arg]};
+    auto add = CopyCommandArgs({"ZADD", request.args_[destination_arg]});
     add.reserve(2 + output.size() * 2);
     for (const Element& element : output) {
       add.push_back(FormatDouble(element.score_));
@@ -2272,7 +2272,8 @@ absl::Status ComputeMulti(MultiContext* context) {
   } cleanup{context};
   auto computed = ComputeMultiUnchecked(context);
   if (!computed.ok()) return computed;
-  if (context->store_) {
+  if (context->store_ && (!context->borrowed_tx_ ||
+                          context->request_->replication_capture_ != nullptr)) {
     auto effects = BuildZSetReplacement(*context->request_,
                                         context->store_shape_->destination_arg_,
                                         context->output_);
@@ -2312,7 +2313,7 @@ Task<absl::Status> ReplaceMultiDestination(
   const auto& request = *context->request_;
   const std::size_t destination_arg =
       context->store_shape_ ? context->store_shape_->destination_arg_ : 1;
-  const std::string& destination = request.args_[destination_arg];
+  const std::string_view destination = request.args_[destination_arg];
   if (writes == nullptr) writes = LocalWrites(*context);
   const auto bytes = ZSetRetainedBytes(context->output_);
   if (!bytes.ok()) co_return bytes.status();
@@ -3113,10 +3114,12 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       co_return std::string(StorageError(builder, popped.status()));
     }
     if (!popped->members_.empty()) {
-      CaptureReplicationCommand(
-          request,
-          CanonicalSelectedZSetPop(request.args_[argument], shape.maximum_,
-                                   popped->members_.size()));
+      if (request.replication_capture_ != nullptr) {
+        CaptureReplicationCommand(
+            request,
+            CanonicalSelectedZSetPop(request.args_[argument], shape.maximum_,
+                                     popped->members_.size()));
+      }
       AppendMultiPopReply(builder, request.args_[argument], *popped,
                           shape.flat_reply_);
       co_return std::string(builder.View());
@@ -3144,14 +3147,14 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   specs.reserve(shape->key_args_.size());
   for (std::size_t argument : shape->key_args_) {
     specs.push_back(BlockingWaitSpec{
-        .key_ = args[argument],
+        .key_ = std::string(args[argument]),
         .lane_ = {},
         .value_type_ = BlockingValueType::kSortedSet,
         .policy_ = BlockingQueuePolicy::kFifo,
         .stream_after_ = std::nullopt,
     });
   }
-  CommandRequest nonblocking = request;
+  CommandRequest nonblocking = request.Clone();
   auto attempt =
       [&](BlockingWakeCascade* cascade) -> Task<BlockingAttemptResult> {
     // The wait loop re-admits the original request for every attempt. Keep

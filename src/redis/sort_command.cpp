@@ -693,7 +693,8 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     // SORT STORE's mutation runs inside ReplaceDestinationLocked's owner hop.
     // The early authority check avoids wasted work; each storage publication
     // performs the final check carried by the transaction writes below.
-    const std::string& destination_name = request.args_[*options->store_arg_];
+    const std::string_view destination_name =
+        request.args_[*options->store_arg_];
     const LockedKey* destination = FindLockedKey(keys, destination_name);
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> writes(g_storage->worker_count());
@@ -815,7 +816,7 @@ Task<std::string> ExecuteSortCommandLocked(
     co_return std::string(builder.View());
   }
 
-  const std::string& destination_name = request.args_[*options->store_arg_];
+  const std::string_view destination_name = request.args_[*options->store_arg_];
   const LockedKey* destination = FindLockedKey(keys, destination_name);
   if (destination == nullptr) {
     co_return EncodeError("ERR SORT destination is missing");
@@ -859,12 +860,15 @@ Task<std::string> ExecuteSortCommandLocked(
     co_return EncodeSortError(restored.ok() ? replaced.status() : restored);
   }
   if (*replaced) {
-    CaptureReplicationCommand(request, {"DEL", destination_name});
+    if (request.replication_capture_ != nullptr)
+      CaptureReplicationCommand(request, {"DEL", destination_name});
     if (!product->stored_values_.empty()) {
-      std::vector<std::string> push{"RPUSH", destination_name};
-      push.insert(push.end(), product->stored_values_.begin(),
-                  product->stored_values_.end());
-      CaptureReplicationCommand(request, std::move(push));
+      if (request.replication_capture_ != nullptr) {
+        auto push = CopyCommandArgs({"RPUSH", destination_name});
+        push.insert(push.end(), product->stored_values_.begin(),
+                    product->stored_values_.end());
+        CaptureReplicationCommand(request, std::move(push));
+      }
       NotifyListBlockingKey(request, destination_name);
     }
   }

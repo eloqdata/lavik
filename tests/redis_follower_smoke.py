@@ -411,6 +411,23 @@ def exercise(lavik, redis, root):
             assert target.call("EXISTS", "old-db15") == 0
             assert target.call("PTTL", "ttl") > 0
             assert target.call("FCALL_RO", "follow_value", 0) == "function-value"
+            # Exercise parser-owned arguments across awaited apply, including
+            # overflow bytes and reuse by the next ordinary command.
+            large_value = "x" * (1024 * 1024) + "\0tail"
+            assert source.call("SET", "large-online", large_value) == "OK"
+            assert source.call("SET", "after-large-online", "small") == "OK"
+            H.wait_until(
+                "ordinary large Redis command followed by small command",
+                10,
+                lambda: target.call("GET", "after-large-online") == "small",
+            )
+            assert target.call("GET", "large-online") == large_value
+            assert source.call("SET", "large-online", "reused") == "OK"
+            H.wait_until(
+                "ordinary Redis argument storage reuse",
+                10,
+                lambda: target.call("GET", "large-online") == "reused",
+            )
             reaped_before = int(tomb_stats(target)["tomb_raider_reaped"])
             assert source.call("SET", "reaped-delete", "buried", "PX", 5000) == "OK"
             H.wait_until(

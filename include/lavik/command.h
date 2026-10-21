@@ -34,6 +34,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/cluster/topology.h"
+#include "lavik/command_args.h"
 #include "lavik/read_trace.h"
 #include "lavik/resp_version.h"
 #include "lavik/retained_allocator.h"
@@ -63,6 +64,9 @@ using bycorf::Task;
 struct CapturedReplicationCommand {
   CapturedReplicationCommand() = default;
   CapturedReplicationCommand(std::uint8_t db_id, std::vector<std::string> args);
+  CapturedReplicationCommand(std::uint8_t db_id,
+                             std::initializer_list<std::string_view> args)
+      : CapturedReplicationCommand(db_id, CopyCommandArgs(args)) {}
   CapturedReplicationCommand(const CapturedReplicationCommand& other)
       : CapturedReplicationCommand(other.db_id_, other.args_) {}
   CapturedReplicationCommand& operator=(
@@ -391,9 +395,9 @@ struct CommandSpec;
 
 // CommandRequest is stored directly in Bycorf coroutine frames. Their allocator
 // guarantees max_align_t, so stronger type alignment would let GCC emit aligned
-// SIMD stores that the frame cannot honor. The compact extent still keeps
-// vectors densely strided; do not over-align the type without extending the
-// coroutine allocation contract and measuring its cost on ordinary commands.
+// SIMD stores that the frame cannot honor. Do not over-align the type without
+// extending the coroutine allocation contract and measuring its cost on
+// ordinary commands.
 struct alignas(std::max_align_t) CommandRequest {
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
@@ -480,20 +484,47 @@ struct alignas(std::max_align_t) CommandRequest {
   // refreshing this proof does not change the request's logical contents.
   mutable std::shared_ptr<const cluster::AuthorityAdmission>
       cluster_authority_admission_;
-  std::vector<std::string> args_;
+  CommandArgsHandle args_;
   std::shared_ptr<ReplicationCommandCapture> replication_capture_;
   std::shared_ptr<BlockingNotificationCapture> blocking_notification_capture_;
   // Non-owning: the dispatch coroutine keeps the cascade alive until every
   // waiter transitively woken by this command has finished its ready attempt.
   BlockingWakeCascade* blocking_wake_cascade_ = nullptr;
+
+  // Copies execution metadata with independently owned arguments. Rewriters
+  // can start with an empty handle instead of copying arguments they replace.
+  [[nodiscard]] CommandRequest WithArgs(CommandArgsHandle args) const {
+    return CommandRequest{
+        .kind_ = kind_,
+        .db_id_ = db_id_,
+        .resp_version_ = resp_version_,
+        .replication_origin_ = replication_origin_,
+        .connection_tls_ = connection_tls_,
+        .cluster_slot_sample_count_ = cluster_slot_sample_count_,
+        .write_admission_role_epoch_valid_ = write_admission_role_epoch_valid_,
+        .serving_generation_valid_ = serving_generation_valid_,
+        .defer_pubsub_delivery_ = defer_pubsub_delivery_,
+        .exclusive_db_access_ = exclusive_db_access_,
+        .write_admission_role_epoch_ = write_admission_role_epoch_,
+        .serving_generation_ = serving_generation_,
+        .spec_ = spec_,
+        .cluster_slot_samples_ = cluster_slot_samples_,
+        .routed_key_argument_ = routed_key_argument_,
+        .cluster_authority_admission_ = cluster_authority_admission_,
+        .args_ = std::move(args),
+        .replication_capture_ = replication_capture_,
+        .blocking_notification_capture_ = blocking_notification_capture_,
+        .blocking_wake_cascade_ = blocking_wake_cascade_};
+  }
+  // Explicit deep copy for a nested execution that needs independent arguments.
+  [[nodiscard]] CommandRequest Clone() const { return WithArgs(args_.Clone()); }
 };
 
-// Command dispatch moves this object through coroutine frames and MULTI
-// vectors. The two independent 64-bit role and dataset fences added by the
-// rebuild protocol require the second cache line; keep the extent fixed so
-// unrelated fields cannot silently add a third line.
+// Requests move through coroutine frames and MULTI vectors; their arguments
+// stay at a fixed address behind a single owning pointer. Preserve the original
+// two-cache-line budget so unrelated fields cannot silently add a third line.
 static_assert(alignof(CommandRequest) == alignof(std::max_align_t));
-static_assert(sizeof(CommandRequest) == 128);
+static_assert(sizeof(CommandRequest) <= 128);
 
 struct ReplicaOfRequest {
   // Empty for REPLICAOF NO ONE; otherwise identifies the requested upstream.
@@ -503,8 +534,7 @@ struct ReplicaOfRequest {
 
 // Parses REPLICAOF <host> <port> and REPLICAOF NO ONE without changing role.
 // Command dispatch passes the validated request to ReplicationManager.
-absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(
-    std::span<const std::string> args);
+absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(CommandArgsView args);
 
 // Pulls the next chunk of a streamed reply; an empty chunk ends the stream.
 // Lets unbounded replies (KEYS) reach the socket in bounded memory.
@@ -599,11 +629,30 @@ std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
     const CommandRequest& request,
     std::vector<std::string> canonical_args = {});
 
+// Transfers owned deterministic effects into an EXEC/Lua capture, if present.
+// Check replication_capture_ before constructing capture-only arguments: this
+// function's null check runs after by-value arguments have already been built.
 void CaptureReplicationCommand(const CommandRequest& request,
                                std::vector<std::string> canonical_args);
 void CaptureReplicationCommand(const CommandRequest& request,
                                std::uint8_t db_id,
                                std::vector<std::string> canonical_args);
+// Borrowed canonical literals/views are copied only when a capture is active.
+inline void CaptureReplicationCommand(
+    const CommandRequest& request,
+    std::initializer_list<std::string_view> canonical_args) {
+  if (request.replication_capture_ != nullptr)
+    CaptureReplicationCommand(request, CopyCommandArgs(canonical_args));
+}
+inline void CaptureReplicationCommand(
+    const CommandRequest& request, std::uint8_t db_id,
+    std::initializer_list<std::string_view> canonical_args) {
+  if (request.replication_capture_ != nullptr)
+    CaptureReplicationCommand(request, db_id, CopyCommandArgs(canonical_args));
+}
+std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
+    const CommandRequest& request,
+    std::initializer_list<std::string_view> canonical_args);
 void MarkReplicationCommandHandled(const CommandRequest& request);
 
 // Encodes several deterministic write effects as one replication command.
@@ -770,8 +819,9 @@ Task<absl::Status> ApplyFullSyncCommand(const ReplicatedCommand& command,
 // Replays Redis's ordinary single-connection replication stream. Redis emits
 // raw FLUSH commands and groups MULTI/EXEC commands without Lavik's native
 // epoch/envelope metadata, so these need a distinct trusted apply path.
-Task<absl::Status> ApplyRedisReplicatedCommand(
-    const ReplicatedCommand& command);
+// The single-command caller builds metadata once and retains the request and
+// its argument owner until this await completes, including cross-worker work.
+Task<absl::Status> ApplyRedisReplicatedCommand(CommandRequest& request);
 Task<absl::Status> ApplyRedisReplicatedTransaction(
     std::span<const ReplicatedCommand> commands);
 

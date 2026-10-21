@@ -270,8 +270,8 @@ bool HasMonitorSessions() noexcept {
 }
 
 std::shared_ptr<const std::string> PrepareMonitorMessage(
-    std::uint8_t db_id, std::string_view endpoint,
-    std::span<const std::string> args, const CommandRequest* request) {
+    std::uint8_t db_id, std::string_view endpoint, CommandArgsView args,
+    const CommandRequest* request) {
   if (args.empty() || (request != nullptr && !ValidMonitorCommand(*request))) {
     return nullptr;
   }

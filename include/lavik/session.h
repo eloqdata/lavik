@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "lavik/command.h"
+#include "lavik/command_args.h"
 #include "lavik/replication.h"
 #include "lavik/resp.h"
 #include "lavik/storage/format.h"
@@ -37,9 +38,11 @@ class PubSubSession;
 // Everything here must be cleaned up through the single cleanup point at the
 // end of RedisService::Serve.
 struct ConnectionContext {
+  // One fixed object for sequential commands. Declare it before queued_ so a
+  // MULTI command borrowing it is destroyed first, including on disconnect.
+  CommandArgsStorage command_args_storage_;
   using HelloHandler = std::string_view (*)(const void*, void*,
-                                            ConnectionContext&,
-                                            std::span<const std::string>,
+                                            ConnectionContext&, CommandArgsView,
                                             ReplyBuilder&);
   // Worker-local shutdown marker: buffered commands stop once cleanup starts.
   bool closing_ = false;

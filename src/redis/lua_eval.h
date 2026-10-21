@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "lavik/command_args.h"
 #include "lavik/resp_version.h"
 
 namespace lavik {
@@ -58,7 +59,9 @@ std::optional<std::string> LuaFunctionLibraryNameFromCode(
 
 struct LuaRedisCall {
   bool protected_call_ = false;
-  std::vector<std::string> args_;
+  // Own bytes copied from the Lua stack across suspension. Dispatch transfers
+  // this handle without repacking arguments or moving their inline storage.
+  CommandArgsHandle args_;
 };
 
 struct LuaExecutionStep {
@@ -85,16 +88,13 @@ struct LuaRunningInvocation {
 class LuaExecution {
  public:
   static absl::StatusOr<std::unique_ptr<LuaExecution>> Create(
-      std::string_view script, std::span<const std::string> keys,
-      std::span<const std::string> argv,
+      std::string_view script, CommandArgsView keys, CommandArgsView argv,
       RespVersion client_resp_version = RespVersion::k2);
   static absl::StatusOr<std::unique_ptr<LuaExecution>> CreateCached(
-      std::string_view sha, std::span<const std::string> keys,
-      std::span<const std::string> argv,
+      std::string_view sha, CommandArgsView keys, CommandArgsView argv,
       RespVersion client_resp_version = RespVersion::k2);
   static absl::StatusOr<std::unique_ptr<LuaExecution>> CreateFunction(
-      std::string_view name, std::span<const std::string> keys,
-      std::span<const std::string> argv,
+      std::string_view name, CommandArgsView keys, CommandArgsView argv,
       RespVersion client_resp_version = RespVersion::k2);
 
   LuaExecution(const LuaExecution&) = delete;
@@ -106,7 +106,7 @@ class LuaExecution {
   std::string_view bytecode() const;
   LuaExecutionStep Start(bool replication_origin,
                          std::string_view script_name = "user_script",
-                         std::span<const std::string> invocation_command = {});
+                         CommandArgsView invocation_command = {});
   LuaExecutionStep Resume(std::string_view command_reply);
   LuaExecutionStep ResumeAfterSchedulerYield();
   // Returns false if SCRIPT KILL won the race before this write started.

@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -103,7 +104,7 @@ CommandRequest BuildParsedCommandRequest(RespCommand command,
   // parser invariant in the hottest coroutine frame.
   assert(!command.args_.empty());
   CommandRequest request;
-  request.spec_ = FindCommand(std::span<const std::string>(command.args_));
+  request.spec_ = FindCommand(CommandArgsView(command.args_));
   request.kind_ =
       request.spec_ != nullptr ? request.spec_->kind_ : CommandKind::kUnknown;
   request.db_id_ = db_id;
@@ -218,8 +219,7 @@ bool ValidClientName(std::string_view name) {
 
 std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
                               ReplicationManager* replication,
-                              ConnectionContext& ctx,
-                              std::span<const std::string> args,
+                              ConnectionContext& ctx, CommandArgsView args,
                               ReplyBuilder& reply) {
   RespVersion requested = ctx.resp_version();
   std::optional<std::pair<std::string_view, std::string_view>> credentials;
@@ -305,7 +305,7 @@ std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
 std::string_view ExecuteHelloFromContext(const void* authenticator,
                                          void* replication,
                                          ConnectionContext& ctx,
-                                         std::span<const std::string> args,
+                                         CommandArgsView args,
                                          ReplyBuilder& reply) {
   return ExecuteHello(*static_cast<const PasswordAuthenticator*>(authenticator),
                       static_cast<ReplicationManager*>(replication), ctx, args,
@@ -350,8 +350,7 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
 }
 
 std::string_view ExecuteAuth(const PasswordAuthenticator& authenticator,
-                             ConnectionContext& ctx,
-                             std::span<const std::string> args) {
+                             ConnectionContext& ctx, CommandArgsView args) {
   std::shared_ptr<const std::string> monitor_message;
   if (HasMonitorSessions()) [[unlikely]] {
     if (args.size() == 2 || args.size() == 3) {
@@ -396,8 +395,7 @@ enum class ReplicationHandshake {
 // These transport commands deliberately remain outside CommandSpecs(), which
 // also defines the ordinary execution and Redis COMMAND surface. Only a miss
 // in that table needs this second classification.
-ReplicationHandshake ClassifyReplicationHandshake(
-    std::span<const std::string> args) {
+ReplicationHandshake ClassifyReplicationHandshake(CommandArgsView args) {
   if (args.empty()) return ReplicationHandshake::kNone;
   if (absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
     return ReplicationHandshake::kRedisConfig;
@@ -414,8 +412,7 @@ ReplicationHandshake ClassifyReplicationHandshake(
 // recognized handshake is ready for transport handoff. Native handshakes keep
 // their existing admission rules in the replication manager.
 std::optional<std::string_view> PrepareReplicationHandshake(
-    ReplicationHandshake kind, ConnectionContext& ctx,
-    std::span<const std::string> args) {
+    ReplicationHandshake kind, ConnectionContext& ctx, CommandArgsView args) {
   assert(kind != ReplicationHandshake::kNone);
   if (kind != ReplicationHandshake::kNative && ctx.in_multi_) {
     // Redis handshakes cannot overtake queued transaction commands. Mark the
@@ -496,7 +493,7 @@ class RedisService final : public TcpService, public ClientLimit {
   Task<absl::Status> Serve(TcpStream& stream, ConnectionContext& ctx);
   // Terminal handoff: the caller's parser/buffers must outlive this await.
   Task<absl::Status> HandoffReplicationConnection(
-      TcpStream& stream, ConnectionContext& ctx, std::vector<std::string>& args,
+      TcpStream& stream, ConnectionContext& ctx, CommandArgsHandle& args,
       ReplicationHandshake kind, bool isolated, PendingReplyBatch& pending,
       CommandBufferGuard& command_memory);
   Task<absl::Status> ReadSubscribedCommands(
@@ -1003,15 +1000,17 @@ class CommandBatch {
     assert(!empty());
     BufferedCommand command = std::move(commands_[next_++]);
     if (next_ == commands_.size()) {
-      commands_.clear();
+      // Keep the bounded handle-array allocation for the next batch. clear()
+      // on InlinedVector would free it and make every large pipeline allocate.
+      commands_.resize(0);
       next_ = 0;
     }
     return command;
   }
 
  private:
-  // Most clients send one command at a time. Keep short pipelines allocation
-  // free while retaining contiguous storage for larger batches.
+  // Batch growth moves handles only; every command keeps its fixed-address
+  // argument storage. Short batches need no separate handle-array allocation.
   absl::InlinedVector<BufferedCommand, 4> commands_;
   std::size_t next_ = 0;
 };
@@ -1669,10 +1668,10 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
         kind != CommandKind::kPSubscribe &&
         kind != CommandKind::kPUnsubscribe) {
       if (kind == CommandKind::kUnknown) {
-        EnqueuePubSubReply(
-            session,
-            std::string(builder.AppendError("ERR unknown command '" +
-                                            request.args_.front() + "'")));
+        EnqueuePubSubReply(session,
+                           std::string(builder.AppendError(
+                               "ERR unknown command '" +
+                               std::string(request.args_.front()) + "'")));
       } else {
         std::string name(CommandCanonicalName(kind));
         EnqueuePubSubReply(
@@ -1742,7 +1741,7 @@ Task<absl::Status> RedisService::ServeSubscribed(
 }
 
 Task<absl::Status> RedisService::HandoffReplicationConnection(
-    TcpStream& stream, ConnectionContext& ctx, std::vector<std::string>& args,
+    TcpStream& stream, ConnectionContext& ctx, CommandArgsHandle& args,
     ReplicationHandshake kind, bool isolated, PendingReplyBatch& pending,
     CommandBufferGuard& command_memory) {
   assert(kind == ReplicationHandshake::kRedisSync ||
@@ -1769,19 +1768,24 @@ Task<absl::Status> RedisService::HandoffReplicationConnection(
   const bool tls = stream.IsTls();
   if (!native) UnregisterClientConnection(ctx.conn_id_);
   command_memory.Release();
+  // The replication connection outlives ordinary request dispatch and owns
+  // its handshake arguments through the existing replication API.
+  std::vector<std::string> owned_args(std::make_move_iterator(args.begin()),
+                                      std::make_move_iterator(args.end()));
   if (native) {
     co_return co_await replication_->ServeNativeConnection(
-        stream, std::move(args), ctx.conn_id_, address, tls);
+        stream, std::move(owned_args), ctx.conn_id_, address, tls);
   }
   co_return co_await replication_->ServeRedisExportConnection(
-      stream, std::move(args), ctx.conn_id_, address, tls,
+      stream, std::move(owned_args), ctx.conn_id_, address, tls,
       ctx.redis_replica_eof_);
 }
 
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
   RequestInputBuffer input;
-  RespCommandParser parser(client_query_buffer_limit());
+  RespCommandParser parser(client_query_buffer_limit(),
+                           &ctx.command_args_storage_);
   CommandBatch ready;
   ClientBufferReservation client_buffers;
   std::size_t unassigned_input_bytes = 0;

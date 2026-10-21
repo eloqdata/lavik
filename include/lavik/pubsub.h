@@ -29,6 +29,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/command_args.h"
 #include "lavik/resp.h"
 
 namespace bycorf {
@@ -57,20 +58,19 @@ std::size_t PubSubPatternSubscriptionCount(
 // These return one or more complete push-style frames in the session's
 // negotiated RESP version.
 std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
-                              std::span<const std::string> channels);
+                              CommandArgsView channels);
 std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,
-                                std::span<const std::string> channels);
+                                CommandArgsView channels);
 std::string PSubscribePatterns(const std::shared_ptr<PubSubSession>& session,
-                               std::span<const std::string> patterns);
+                               CommandArgsView patterns);
 std::string PUnsubscribePatterns(const std::shared_ptr<PubSubSession>& session,
-                                 std::span<const std::string> patterns);
+                                 CommandArgsView patterns);
 void ResetPubSubSubscriptions(const std::shared_ptr<PubSubSession>& session);
 
 // PUBSUB introspection reports this node's aggregate worker-local state.
 bycorf::Task<std::vector<std::string>> PubSubChannels(
     std::optional<std::string> pattern);
-bycorf::Task<std::vector<std::uint64_t>> PubSubNumSub(
-    std::span<const std::string> channels);
+bycorf::Task<std::vector<std::uint64_t>> PubSubNumSub(CommandArgsView channels);
 bycorf::Task<std::uint64_t> PubSubNumPat();
 
 // Delivers to every worker-local registry and returns the number of matching

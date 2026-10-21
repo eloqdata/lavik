@@ -499,7 +499,9 @@ bycorf::Task<std::string> RunBitmapLocked(
         db, key, digest, operation, tx, replication ? &*replication : nullptr,
         mutation_precondition);
     if (!result.ok()) co_return StorageError(result.status());
-    if (result->changed_) CaptureReplicationCommand(request, args);
+    if (result->changed_ && request.replication_capture_ != nullptr)
+      CaptureReplicationCommand(
+          request, std::vector<std::string>(args.begin(), args.end()));
     co_return EncodeInteger(result->bit_ ? 1 : 0);
   }
   if (request.kind_ == CommandKind::kBitPos) {
@@ -677,14 +679,14 @@ bycorf::Task<std::string> RunStringLocked(
   switch (request.kind_) {
     case CommandKind::kSetEx:
     case CommandKind::kPSetEx:
-      canonical_args = {"SET", args[1], args[3]};
+      canonical_args = CopyCommandArgs({"SET", args[1], args[3]});
       break;
     case CommandKind::kSetNx:
     case CommandKind::kGetSet:
-      canonical_args = {"SET", args[1], args[2]};
+      canonical_args = CopyCommandArgs({"SET", args[1], args[2]});
       break;
     case CommandKind::kGetDel:
-      canonical_args = {"DEL", args[1]};
+      canonical_args = CopyCommandArgs({"DEL", args[1]});
       break;
     default:
       break;
@@ -708,7 +710,8 @@ bycorf::Task<std::string> RunStringLocked(
     auto result = co_await g_storage->SetLocked(
         db, key, digest, args[3], options, tx,
         replication ? &*replication : nullptr, nullptr, mutation_precondition);
-    if (result.ok() && result->applied_) {
+    if (result.ok() && result->applied_ &&
+        request.replication_capture_ != nullptr) {
       CaptureReplicationCommand(request, {"SET", args[1], args[3], "PXAT",
                                           std::to_string(*expire_at)});
     }
@@ -722,7 +725,8 @@ bycorf::Task<std::string> RunStringLocked(
     auto result = co_await g_storage->SetLocked(
         db, key, digest, args[2], options, tx,
         replication ? &*replication : nullptr, nullptr, mutation_precondition);
-    if (result.ok() && result->applied_) {
+    if (result.ok() && result->applied_ &&
+        request.replication_capture_ != nullptr) {
       CaptureReplicationCommand(request, {"SET", args[1], args[2]});
     }
     co_return result.ok() ? EncodeInteger(result->applied_ ? 1 : 0)
@@ -736,7 +740,8 @@ bycorf::Task<std::string> RunStringLocked(
         db, key, digest, args[2], options, tx,
         replication ? &*replication : nullptr, nullptr, mutation_precondition);
     if (!result.ok()) co_return StorageError(result.status());
-    CaptureReplicationCommand(request, {"SET", args[1], args[2]});
+    if (request.replication_capture_ != nullptr)
+      CaptureReplicationCommand(request, {"SET", args[1], args[2]});
     if (!result->old_value_)
       co_return EncodeSemanticNull(request.resp_version_);
     const auto bytes = result->old_value_->network_bytes();
@@ -766,7 +771,9 @@ bycorf::Task<std::string> RunStringLocked(
         db, key, digest, operation, tx, replication ? &*replication : nullptr,
         mutation_precondition);
     if (!result.ok()) co_return StorageError(result.status());
-    if (result->changed_) CaptureReplicationCommand(request, args);
+    if (result->changed_ && request.replication_capture_ != nullptr)
+      CaptureReplicationCommand(
+          request, std::vector<std::string>(args.begin(), args.end()));
     co_return EncodeInteger(result->length_);
   }
   if (request.kind_ == CommandKind::kGetEx) {
@@ -818,7 +825,8 @@ bycorf::Task<std::string> RunStringLocked(
       reply = exists ? EncodeBulkString(old)
                      : EncodeSemanticNull(request.resp_version_);
       if (!exists) return storage::CompactValueUpdate{};
-      captured_args = {"DEL", args[1]};
+      if (request.replication_capture_ != nullptr)
+        captured_args = CopyCommandArgs({"DEL", args[1]});
       return storage::CompactValueUpdate{
           .changed_ = true,
           .erase_ = true,
@@ -840,7 +848,8 @@ bycorf::Task<std::string> RunStringLocked(
       if (args.size() == 2) return storage::CompactValueUpdate{};
       if (args.size() == 3) {
         if (ttl == 0) return storage::CompactValueUpdate{};
-        captured_args = {"PERSIST", args[1]};
+        if (request.replication_capture_ != nullptr)
+          captured_args = CopyCommandArgs({"PERSIST", args[1]});
         return storage::CompactValueUpdate{
             .changed_ = true,
             .reuse_encoded_ = true,
@@ -860,8 +869,13 @@ bycorf::Task<std::string> RunStringLocked(
         return parsed.status();
       }
       getex_deadline = *parsed;
-      captured_args = {"PEXPIREAT", args[1], std::to_string(*getex_deadline)};
-      if (replication.has_value()) replication->args_ = captured_args;
+      // Standalone journaling also needs the absolute deadline, even without
+      // an EXEC/Lua capture.
+      if (replication || request.replication_capture_ != nullptr) {
+        captured_args = CopyCommandArgs(
+            {"PEXPIREAT", args[1], std::to_string(*getex_deadline)});
+        if (replication.has_value()) replication->args_ = captured_args;
+      }
       if (*getex_deadline <= RedisUnixTimeMillis()) {
         return storage::CompactValueUpdate{
             .changed_ = true,
@@ -913,7 +927,9 @@ bycorf::Task<std::string> RunStringLocked(
       if (replication.has_value()) {
         replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
       }
-      captured_args = {"SET", std::string(key), formatted, "KEEPTTL"};
+      if (request.replication_capture_ != nullptr)
+        captured_args =
+            CopyCommandArgs({"SET", std::string(key), formatted, "KEEPTTL"});
       return changed(std::move(formatted));
     }
 
@@ -952,7 +968,9 @@ bycorf::Task<std::string> RunStringLocked(
     if (replication.has_value()) {
       replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
     }
-    captured_args = {"SET", std::string(key), formatted, "KEEPTTL"};
+    if (request.replication_capture_ != nullptr)
+      captured_args =
+          CopyCommandArgs({"SET", std::string(key), formatted, "KEEPTTL"});
     return changed(std::move(formatted));
   };
 
@@ -972,8 +990,7 @@ struct LcsOptions {
   std::uint32_t minimum_match_length_ = 0;
 };
 
-absl::StatusOr<LcsOptions> ParseLcsOptions(
-    const std::vector<std::string>& args) {
+absl::StatusOr<LcsOptions> ParseLcsOptions(CommandArgsView args) {
   LcsOptions options;
   for (std::size_t i = 3; i < args.size(); ++i) {
     if (RedisEqualsIgnoreCase(args[i], "len")) {
@@ -1560,11 +1577,13 @@ bycorf::Task<std::string> ExecuteBitOpLocked(
     status = co_await bycorf::SubmitTaskTo(destination->owner_, write);
   }
   if (!status.ok()) co_return StorageError(status);
-  CaptureReplicationCommand(
-      request,
-      context.output_.empty()
-          ? std::vector<std::string>{"DEL", request.args_[2]}
-          : std::vector<std::string>{"SET", request.args_[2], context.output_});
+  if (request.replication_capture_ != nullptr) {
+    CaptureReplicationCommand(
+        request,
+        context.output_.empty()
+            ? CopyCommandArgs({"DEL", request.args_[2]})
+            : CopyCommandArgs({"SET", request.args_[2], context.output_}));
+  }
   co_return EncodeInteger(context.output_.size());
 }
 

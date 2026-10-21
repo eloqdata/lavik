@@ -201,8 +201,9 @@ Task<CommandReply> ExecuteSetCommandImpl(
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
   }
-  if (request.kind_ == CommandKind::kSPop && !result->values_.empty()) {
-    std::vector<std::string> canonical{"SREM", args[1]};
+  if (request.replication_capture_ != nullptr &&
+      request.kind_ == CommandKind::kSPop && !result->values_.empty()) {
+    auto canonical = CopyCommandArgs({"SREM", args[1]});
     canonical.reserve(result->values_.size() + 2);
     for (const auto& member : result->values_) {
       if (member.has_value()) canonical.push_back(*member);
@@ -378,7 +379,7 @@ std::vector<std::string> EncodeSetReplacement(
   effects.push_back(
       CapturedReplicationCommand{request.db_id_, {"DEL", request.args_[1]}});
   if (!members.empty()) {
-    std::vector<std::string> add{"SADD", request.args_[1]};
+    auto add = CopyCommandArgs({"SADD", request.args_[1]});
     add.insert(add.end(), members.begin(), members.end());
     effects.push_back(
         CapturedReplicationCommand{request.db_id_, std::move(add)});
@@ -430,7 +431,7 @@ Task<absl::Status> PrepareSetEffects(SetMultiContext* context) {
 Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
   try {
     const auto& request = *context->request_;
-    const std::string& destination = request.args_[1];
+    const std::string_view destination = request.args_[1];
     const storage::Digest digest = storage::ComputeDigest(destination);
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, destination, digest, LocalWrites(*context));

@@ -84,7 +84,7 @@ Task<CommandReply> ExecuteHashCommandImpl(
       if ((args.size() - 2) % 2 != 0) {
         co_return BuiltReply(
             reply_builder.AppendError("ERR wrong number of arguments for '" +
-                                      args.front() + "' command"));
+                                      std::string(args.front()) + "' command"));
       }
       operation.kind_ = request.kind_ == CommandKind::kHReplace
                             ? storage::HashOperationKind::kReplaceOnly
@@ -236,11 +236,13 @@ Task<CommandReply> ExecuteHashCommandImpl(
     MarkReplicationCommandHandled(request);
     co_return BuiltReply(reply_builder.AppendNull());
   }
-  if (request.kind_ == CommandKind::kHIncrBy) {
+  if (request.replication_capture_ != nullptr &&
+      request.kind_ == CommandKind::kHIncrBy) {
     CaptureReplicationCommand(
         request,
         {"HSET", args[1], args[2], std::to_string(result->signed_integer_)});
-  } else if (request.kind_ == CommandKind::kHIncrByFloat) {
+  } else if (request.replication_capture_ != nullptr &&
+             request.kind_ == CommandKind::kHIncrByFloat) {
     CaptureReplicationCommand(request,
                               {"HSET", args[1], args[2], result->scalar_});
   }

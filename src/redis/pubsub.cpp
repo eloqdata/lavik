@@ -214,7 +214,7 @@ WorkerPubSubRegistry& LocalRegistry() {
 }
 
 void AppendSubscriptionFrame(ReplyBuilder* builder, std::string_view kind,
-                             const std::string* channel,
+                             const std::string_view* channel,
                              std::size_t subscription_count) {
   builder->AppendPushHeader(3);
   builder->AppendBulkString(kind);
@@ -798,7 +798,7 @@ bool PubSubSession::Unsubscribe(std::string_view channel) {
 void PubSubSession::UnsubscribeAll() {
   if (channels_.empty()) return;
   // Clear the order vector once; retain set capacity for later subscriptions.
-  for (const std::string& channel : channel_order_) {
+  for (const std::string_view channel : channel_order_) {
     RemoveFromChannel(channel);
     channels_.erase(channel);
   }
@@ -840,7 +840,7 @@ bool PubSubSession::PUnsubscribe(std::string_view pattern) {
 void PubSubSession::PUnsubscribeAll() {
   if (patterns_.empty()) return;
   // Clear the order vector once; retain set capacity for later subscriptions.
-  for (const std::string& pattern : pattern_order_) {
+  for (const std::string_view pattern : pattern_order_) {
     RemoveFromPattern(pattern);
     patterns_.erase(pattern);
   }
@@ -957,9 +957,9 @@ std::size_t PubSubPatternSubscriptionCount(
 }
 
 std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
-                              std::span<const std::string> channels) {
+                              CommandArgsView channels) {
   ReplyBuilder builder(session->version());
-  for (const std::string& channel : channels) {
+  for (const std::string_view channel : channels) {
     (void)session->Subscribe(channel);
     AppendSubscriptionFrame(&builder, "subscribe", &channel,
                             session->subscription_count());
@@ -968,7 +968,7 @@ std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
 }
 
 std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,
-                                std::span<const std::string> channels) {
+                                CommandArgsView channels) {
   ReplyBuilder builder(session->version());
   if (channels.empty()) {
     const std::vector<std::string> current = session->channel_order();
@@ -977,14 +977,14 @@ std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,
                               session->subscription_count());
       return std::move(builder).Release();
     }
-    for (const std::string& channel : current) {
+    for (const std::string_view channel : current) {
       (void)session->Unsubscribe(channel);
       AppendSubscriptionFrame(&builder, "unsubscribe", &channel,
                               session->subscription_count());
     }
     return std::move(builder).Release();
   }
-  for (const std::string& channel : channels) {
+  for (const std::string_view channel : channels) {
     (void)session->Unsubscribe(channel);
     AppendSubscriptionFrame(&builder, "unsubscribe", &channel,
                             session->subscription_count());
@@ -993,9 +993,9 @@ std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,
 }
 
 std::string PSubscribePatterns(const std::shared_ptr<PubSubSession>& session,
-                               std::span<const std::string> patterns) {
+                               CommandArgsView patterns) {
   ReplyBuilder builder(session->version());
-  for (const std::string& pattern : patterns) {
+  for (const std::string_view pattern : patterns) {
     (void)session->PSubscribe(pattern);
     AppendSubscriptionFrame(&builder, "psubscribe", &pattern,
                             session->subscription_count());
@@ -1004,7 +1004,7 @@ std::string PSubscribePatterns(const std::shared_ptr<PubSubSession>& session,
 }
 
 std::string PUnsubscribePatterns(const std::shared_ptr<PubSubSession>& session,
-                                 std::span<const std::string> patterns) {
+                                 CommandArgsView patterns) {
   ReplyBuilder builder(session->version());
   if (patterns.empty()) {
     const std::vector<std::string> current = session->pattern_order();
@@ -1013,14 +1013,14 @@ std::string PUnsubscribePatterns(const std::shared_ptr<PubSubSession>& session,
                               session->subscription_count());
       return std::move(builder).Release();
     }
-    for (const std::string& pattern : current) {
+    for (const std::string_view pattern : current) {
       (void)session->PUnsubscribe(pattern);
       AppendSubscriptionFrame(&builder, "punsubscribe", &pattern,
                               session->subscription_count());
     }
     return std::move(builder).Release();
   }
-  for (const std::string& pattern : patterns) {
+  for (const std::string_view pattern : patterns) {
     (void)session->PUnsubscribe(pattern);
     AppendSubscriptionFrame(&builder, "punsubscribe", &pattern,
                             session->subscription_count());
@@ -1062,8 +1062,7 @@ Task<std::vector<std::string>> PubSubChannels(
   co_return channels;
 }
 
-Task<std::vector<std::uint64_t>> PubSubNumSub(
-    std::span<const std::string> channels) {
+Task<std::vector<std::uint64_t>> PubSubNumSub(CommandArgsView channels) {
   std::vector<std::string> owned(channels.begin(), channels.end());
   std::vector<std::uint64_t> counts(owned.size(), 0);
   for (unsigned worker = 0; worker < g_worker_count; ++worker) {

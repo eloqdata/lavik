@@ -143,13 +143,26 @@ racing closure is either rejected or remains visible to the drain.
    Independently, `client-query-buffer-limit` bounds the wire bytes retained
    while one connection incrementally assembles a command. It defaults to 1
    GiB and, like Redis, accepts an absolute value from 1 MiB through
-   `LONG_MAX`. Both receive paths assemble argument strings without requiring
-   a second contiguous command buffer. Completed pipelined and
-   `MULTI` commands remain governed by `maxmemory-clients` after parser
-   ownership ends. `CONFIG SET client-query-buffer-limit` updates a process-wide
+   `LONG_MAX`. Both receive paths assemble arguments into shared command byte
+   storage; offset/length entries identify individual arguments. Readers borrow
+   views of completed arguments without materializing another argument array.
+   Completed pipelined and `MULTI` commands remain governed by
+   `maxmemory-clients` after parser ownership ends.
+   `CONFIG SET client-query-buffer-limit` updates a process-wide
    atomic. Existing connections refresh it once per socket-read parsing round
    and before committing a direct read, so a partially read command is checked
    against the new limit when more bytes arrive.
+   The connection embeds one fixed-address argument storage object. Parsing
+   borrows it when free; commands retained concurrently by a pipeline or MULTI
+   own additional independent objects. Queueing and request handoff transfer
+   handles without relocating arguments. Completion or abandonment clears the
+   embedded object's buffers and releases their overflow heaps, or deletes an
+   additional object outright; connections keep no cache of extra objects.
+   The connection outlives every handle borrowing its embedded storage,
+   including queued MULTI commands. Cross-worker execution borrows the request
+   until the originating worker's await completes, so releasing arguments needs
+   no cross-worker return queue. Without externally supplied storage, parser
+   results own their storage independently and may outlive the parser.
 2. `BuildCommandRequest` resolves case-insensitive static metadata from the
    command table and copies the connection's current database ID into the
    request.
@@ -380,9 +393,11 @@ key set from `numkeys`. The command layer acquires those declared keys through
 one transaction before starting Lua. The `_RO` command variants use shared
 holds; ordinary `EVAL`, `EVALSHA`, and `FCALL` use exclusive holds regardless
 of the Function's runtime flags. Calls made through `redis.call` or
-`redis.pcall` re-enter command metadata and keyed execution inside those
-retained holds. Undeclared keys and global, administrative, nested scripting,
-or otherwise unsafe commands are rejected. Blocking list and sorted-set pops
+`redis.pcall` own arguments extracted from the Lua stack and transfer that
+owner into the command request for keyed execution inside those retained holds.
+Argument ownership survives VM suspension and cross-worker execution.
+Undeclared keys and global, administrative, nested scripting, or otherwise
+unsafe commands are rejected. Blocking list and sorted-set pops
 and moves reuse the transaction's locked EXEC helpers for one immediate
 attempt; they never register a waiter. `XREAD` and `XREADGROUP` similarly use
 one locked read when `BLOCK` is absent and reject an explicit `BLOCK` option.
@@ -543,6 +558,7 @@ real server executable.
 | Bycorf service integration, pre-TLS connection admission, connection setup/cleanup, parsing loop, batching, reply paths, and handshake transfer | `bycorf/include/bycorf/net/tcp_service.h`, `bycorf/src/net/tcp_service.cpp`, `src/redis/server.cpp` |
 | Per-connection database, authentication, reply version, MULTI, WATCH, monitor, Pub/Sub, and client identity state | `include/lavik/session.h`, `include/lavik/resp_version.h` |
 | Incremental RESP parser and version-aware reusable reply builder | `include/lavik/resp.h`, `src/redis/resp.cpp` |
+| Fixed argument storage, exclusive handoff, and embedded/independent ownership | `include/lavik/command_args.h`, `include/lavik/session.h`, `src/redis/server.cpp` |
 | Command request/reply contracts, dispatch, replay, and gate interfaces | `include/lavik/command.h` |
 | Static command classification and key extraction | `include/lavik/command_table.h`, `src/redis/command_table.cpp` |
 | Admission, controlled-failover pause, role checks, database/replication gates, transaction integration, PUBLISH fencing, routing, and replay | `src/redis/command.cpp`, `src/redis/blocking_wait.cpp` |

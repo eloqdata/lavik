@@ -210,7 +210,7 @@ target_include_directories(lavik_resp_protocol PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(lavik_resp_protocol PUBLIC
-  absl::status absl::statusor absl::strings OpenSSL::Crypto
+  absl::inlined_vector absl::status absl::statusor absl::strings OpenSSL::Crypto
 )
 
 add_library(lavik_sync_transport STATIC src/net/sync_stream.cpp)

@@ -613,6 +613,10 @@ std::optional<std::size_t> ReplicationCommandStagingBytes(
     std::span<const std::string> args) noexcept;
 std::optional<std::size_t> ReplicationCommandStagingBytes(
     std::span<const std::string_view> args) noexcept;
+// Equivalent estimate for packed arguments, without materializing a view array.
+// argument_bytes is the sum of payload lengths, excluding wire framing.
+std::optional<std::size_t> ReplicationCommandStagingBytes(
+    std::size_t argument_count, std::size_t argument_bytes) noexcept;
 
 struct FullSyncPublishItem {
   std::uint64_t id_ = 0;

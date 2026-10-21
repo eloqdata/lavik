@@ -258,7 +258,8 @@ std::string SubcommandSyntaxError(const CommandRequest& request) {
   const std::string command =
       request.kind_ == CommandKind::kXGroup ? "XGROUP" : "XINFO";
   return "ERR unknown subcommand or wrong number of arguments for '" +
-         request.args_[1].substr(0, 128) + "'. Try " + command + " HELP.";
+         std::string(request.args_[1].substr(0, 128)) + "'. Try " + command +
+         " HELP.";
 }
 
 template <class T>
@@ -903,7 +904,7 @@ Task<absl::Status> RunCompact(
   if (request.kind_ == CommandKind::kXPending && request.args_.size() == 3)
     access.stream_inspect_ = storage::StreamInspectAccess{
         .kind_ = storage::StreamInspectAccess::Kind::kPending,
-        .group_ = request.args_[2]};
+        .group_ = std::string(request.args_[2])};
   if (request.kind_ == CommandKind::kXInfo) {
     using Kind = storage::StreamInspectAccess::Kind;
     storage::StreamInspectAccess inspect;
@@ -912,7 +913,7 @@ Task<absl::Status> RunCompact(
       inspect.kind_ = Kind::kGroups;
     else if (EqualCi(a[1], "consumers")) {
       inspect.kind_ = Kind::kConsumers;
-      inspect.group_ = a[3];
+      inspect.group_ = std::string(a[3]);
     } else if (a.size() >= 4 && EqualCi(a[3], "full")) {
       inspect.kind_ = Kind::kFull;
       if (a.size() == 6) {
@@ -961,7 +962,7 @@ Task<absl::Status> RunCompact(
     access.stream_delete_ = std::move(selected);
   }
   if (request.kind_ == CommandKind::kXAck) {
-    storage::StreamAckAccess ack{.group_ = request.args_[2]};
+    storage::StreamAckAccess ack{.group_ = std::string(request.args_[2])};
     bool valid = true;
     for (std::size_t i = 3; i < request.args_.size(); ++i) {
       auto id = ParseId(request.args_[i]);
@@ -979,7 +980,7 @@ Task<absl::Status> RunCompact(
       request.args_[4] == "2") {
     auto delta = DecodeGroupDelta(request.args_[5]);
     if (!delta.ok()) co_return delta.status();
-    storage::StreamGroupAccess group{.group_ = request.args_[3]};
+    storage::StreamGroupAccess group{.group_ = std::string(request.args_[3])};
     group.consumers_ = delta->removed_consumers_;
     for (const auto& consumer : delta->upserts_.consumers_)
       group.consumers_.push_back(consumer.name_);
@@ -995,10 +996,10 @@ Task<absl::Status> RunCompact(
        EqualCi(request.args_[1], "create") ||
        EqualCi(request.args_[1], "destroy") ||
        EqualCi(request.args_[1], "delconsumer"))) {
-    storage::StreamGroupAccess group{.group_ = request.args_[3]};
+    storage::StreamGroupAccess group{.group_ = std::string(request.args_[3])};
     if (EqualCi(request.args_[1], "createconsumer") ||
         EqualCi(request.args_[1], "delconsumer"))
-      group.consumers_.push_back(request.args_[4]);
+      group.consumers_.emplace_back(request.args_[4]);
     if (EqualCi(request.args_[1], "delconsumer"))
       group.remove_consumer_ = request.args_[4];
     group.create_ = EqualCi(request.args_[1], "create");
@@ -1009,7 +1010,7 @@ Task<absl::Status> RunCompact(
       EqualCi(request.args_[1], kRestoreGroupSubcommand) &&
       request.args_[4] == "0") {
     access.stream_group_ = storage::StreamGroupAccess{
-        .group_ = request.args_[3], .destroy_ = true};
+        .group_ = std::string(request.args_[3]), .destroy_ = true};
   }
   if (request.kind_ == CommandKind::kXPending && request.args_.size() > 3) {
     const auto& a = request.args_;
@@ -1039,9 +1040,10 @@ Task<absl::Status> RunCompact(
     scan.range_.first_ = {first->ms_, first->seq_};
     scan.range_.last_ = {last->ms_, last->seq_};
     scan.range_.count_ = count <= 0 ? 0 : count;
-    if (a.size() - at == 4 && !a[at + 3].empty()) scan.consumer_ = a[at + 3];
+    if (a.size() - at == 4 && !a[at + 3].empty())
+      scan.consumer_ = std::string(a[at + 3]);
     access.stream_group_ = storage::StreamGroupAccess{
-        .group_ = a[2], .pending_scan_ = std::move(scan)};
+        .group_ = std::string(a[2]), .pending_scan_ = std::move(scan)};
   }
   if (request.kind_ == CommandKind::kXAutoClaim) {
     const auto& a = request.args_;
@@ -1066,8 +1068,8 @@ Task<absl::Status> RunCompact(
     const auto scans =
         count > (UINT64_MAX - 1) / 10 ? UINT64_MAX : count * 10 + 1;
     access.stream_group_ = storage::StreamGroupAccess{
-        .group_ = a[2],
-        .consumers_ = {a[3]},
+        .group_ = std::string(a[2]),
+        .consumers_ = {std::string(a[3])},
         .pending_scan_ = storage::StreamPendingAccess{
             .range_ = {.first_ = {first->ms_, first->seq_},
                        .count_ = scans,
@@ -1075,8 +1077,9 @@ Task<absl::Status> RunCompact(
             .load_entries_ = true}};
   }
   if (request.kind_ == CommandKind::kXClaim) {
-    storage::StreamGroupAccess group{.group_ = request.args_[2],
-                                     .consumers_ = {request.args_[3]}};
+    storage::StreamGroupAccess group{
+        .group_ = std::string(request.args_[2]),
+        .consumers_ = {std::string(request.args_[3])}};
     bool valid = true;
     for (std::size_t i = 5; i < request.args_.size(); ++i) {
       const auto& arg = request.args_[i];
@@ -1430,6 +1433,9 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
   if (group_read && tx == nullptr && request != nullptr) {
     replication = PrepareReplicationCommand(*request);
   }
+  const bool needs_replication_args =
+      replication.has_value() ||
+      (request != nullptr && request->replication_capture_ != nullptr);
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
     auto decoded = Decode(value);
@@ -1453,7 +1459,8 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     }
     Group* group = FindGroup(&stream, group_name);
     if (!group) return absl::NotFoundError("NOGROUP No such consumer group");
-    const Group before_group = *group;
+    std::optional<Group> before_group;
+    if (needs_replication_args) before_group = *group;
     bool changed = false;
     bool successful_delivery = false;
     Consumer* consumer = FindConsumer(group, consumer_name);
@@ -1514,10 +1521,12 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     if (successful_delivery && consumer->active_ms_ != now) changed = true;
     if (successful_delivery) consumer->active_ms_ = now;
     if (!changed) return NoChange();
-    auto canonical = RestoreGroupArgs(key, group_name, group, &before_group);
-    if (!canonical.ok()) return canonical.status();
-    if (replication.has_value()) replication->args_ = *canonical;
-    captured_group_args = std::move(*canonical);
+    if (needs_replication_args) {
+      auto canonical = RestoreGroupArgs(key, group_name, group, &*before_group);
+      if (!canonical.ok()) return canonical.status();
+      if (replication.has_value()) replication->args_ = *canonical;
+      captured_group_args = std::move(*canonical);
+    }
     return Changed(std::move(stream));
   };
   storage::CompactAccessOptions access;
@@ -1686,7 +1695,7 @@ Task<CommandReply> ExecuteRead(
           ? std::optional(started + std::chrono::milliseconds(block_ms))
           : std::nullopt;
   std::unique_ptr<BlockingWaitHandle> wait_handle;
-  CommandRequest attempt_request = request;
+  CommandRequest attempt_request = request.Clone();
   bool initialized_dollars = false;
   struct AttemptDbGuard {
     explicit AttemptDbGuard(std::uint8_t db, bool active)
@@ -1772,7 +1781,7 @@ Task<CommandReply> ExecuteRead(
         });
       }
       for (std::size_t k = 0; k < key_count; ++k) {
-        std::string key = a[first_key + k];
+        std::string key(a[first_key + k]);
         const StreamExecKey* locked_key = nullptr;
         if (!locked_keys.empty()) {
           for (const StreamExecKey& candidate : locked_keys) {
@@ -1940,7 +1949,7 @@ Task<CommandReply> ExecuteRead(
       for (std::size_t k = 0; k < key_count; ++k) {
         if (group_read && !new_messages[k]) continue;
         BlockingWaitSpec spec{
-            .key_ = a[first_key + k],
+            .key_ = std::string(a[first_key + k]),
             .lane_ = lane,
             .value_type_ = BlockingValueType::kStream,
             .policy_ = group_read ? BlockingQueuePolicy::kFifo
@@ -2143,6 +2152,10 @@ Task<CommandReply> ExecuteImpl(
   auto replication = tx == nullptr && directly_replayable_write
                          ? PrepareReplicationCommand(request)
                          : std::nullopt;
+  // These canonical arguments serve both standalone journaling and EXEC/Lua
+  // capture. Skip their construction only when neither consumer needs them.
+  const bool needs_replication_args =
+      replication.has_value() || request.replication_capture_ != nullptr;
 
   if (request.kind_ == CommandKind::kXInfo) {
     if (EqualCi(a[1], "stream")) {
@@ -2203,32 +2216,28 @@ Task<CommandReply> ExecuteImpl(
             ? (request.kind_ == CommandKind::kXGroup ? a[3] : a[2])
             : std::string_view{};
     std::optional<Group> before_group;
-    if (group_state_write) {
+    if (group_state_write && needs_replication_args) {
       if (const auto* group = FindGroup(&stream, group_name))
         before_group = *group;
     }
     auto publish_stream =
         [&](Stream after) -> absl::StatusOr<storage::CompactValueUpdate> {
+      if (!needs_replication_args) return Changed(std::move(after));
       if (request.kind_ == CommandKind::kXAck ||
           (request.kind_ == CommandKind::kXGroup &&
            EqualCi(a[1], "delconsumer"))) {
         // ACK and consumer removal are deterministic and has no clock-dependent
         // after-state. Replay the ID removals directly so both peers can use
         // the sparse PEL path.
-        captured_group_args = request.args_;
+        captured_group_args.assign(request.args_.begin(), request.args_.end());
         if (replication) replication->args_ = captured_group_args;
       } else if (request.kind_ == CommandKind::kXGroup &&
                  EqualCi(a[1], "create")) {
         const auto* group = FindGroup(&after, group_name);
         if (!group) return absl::InternalError("missing created Stream group");
-        captured_group_args = {"XGROUP",
-                               "CREATE",
-                               a[2],
-                               a[3],
-                               FormatId(group->last_id_),
-                               "MKSTREAM",
-                               "ENTRIESREAD",
-                               std::to_string(group->entries_read_)};
+        captured_group_args = CopyCommandArgs(
+            {"XGROUP", "CREATE", a[2], a[3], FormatId(group->last_id_),
+             "MKSTREAM", "ENTRIESREAD", std::to_string(group->entries_read_)});
         if (replication) replication->args_ = captured_group_args;
       } else if (group_state_write) {
         auto canonical =
@@ -2369,14 +2378,16 @@ Task<CommandReply> ExecuteImpl(
         Entry entry{.id_ = id, .fields_ = {}};
         // The complete field/value count is known before copying owned strings.
         entry.fields_.reserve(a.size() - i);
-        for (; i < a.size(); ++i) entry.fields_.push_back(a[i]);
+        for (; i < a.size(); ++i) entry.fields_.emplace_back(a[i]);
         AppendStreamEntry(&stream, std::move(entry));
         stream.last_id_ = id;
         ++stream.entries_added_;
         simple = FormatId(id);
         appended_id = id;
-        captured_xadd = request.args_;
-        captured_xadd[id_arg] = FormatId(id);
+        if (needs_replication_args) {
+          captured_xadd.assign(request.args_.begin(), request.args_.end());
+          captured_xadd[id_arg] = FormatId(id);
+        }
         const std::uint64_t effective_limit =
             trim_approximate
                 ? trim_limit.value_or(DefaultApproximateTrimLimit())
@@ -2394,6 +2405,7 @@ Task<CommandReply> ExecuteImpl(
             update->stream_trim_complete_ =
                 [&, trim, trim_approximate, trim_specifier_arg,
                  trim_threshold_arg](const storage::StreamTrimResult& result) {
+                  if (!needs_replication_args) return;
                   if (trim_approximate) {
                     captured_xadd[*trim_specifier_arg] = "=";
                     captured_xadd[*trim_threshold_arg] =
@@ -2425,7 +2437,7 @@ Task<CommandReply> ExecuteImpl(
         // Approximate trimming depends on the local macro-node boundaries.
         // Propagate the exact resulting boundary so replicas and AOF replay do
         // not depend on their stream-node-max-entries setting.
-        if (trim_approximate) {
+        if (trim_approximate && needs_replication_args) {
           captured_xadd[*trim_specifier_arg] = "=";
           captured_xadd[*trim_threshold_arg] =
               trim == Trim::kMaxLen
@@ -2578,8 +2590,10 @@ Task<CommandReply> ExecuteImpl(
               [&, approximate, maxlen_mode, trim_specifier_arg,
                trim_threshold_arg](const storage::StreamTrimResult& result) {
                 integer = result.removed_;
-                if (approximate && result.removed_ != 0) {
-                  captured_xtrim = request.args_;
+                if (approximate && result.removed_ != 0 &&
+                    needs_replication_args) {
+                  captured_xtrim.assign(request.args_.begin(),
+                                        request.args_.end());
                   captured_xtrim[*trim_specifier_arg] = "=";
                   captured_xtrim[trim_threshold_arg] =
                       maxlen_mode ? std::to_string(result.length_)
@@ -2601,8 +2615,8 @@ Task<CommandReply> ExecuteImpl(
           removed = TrimStreamMinId(&stream, minid, approximate, limit);
         }
         integer = removed;
-        if (approximate && removed != 0) {
-          captured_xtrim = request.args_;
+        if (approximate && removed != 0 && needs_replication_args) {
+          captured_xtrim.assign(request.args_.begin(), request.args_.end());
           captured_xtrim[*trim_specifier_arg] = "=";
           captured_xtrim[trim_threshold_arg] =
               maxlen_mode
@@ -2696,7 +2710,7 @@ Task<CommandReply> ExecuteImpl(
             if (!parsed.ok()) return parsed.status();
             id = *parsed;
           }
-          stream.groups_.push_back(Group{.name_ = a[3],
+          stream.groups_.push_back(Group{.name_ = std::string(a[3]),
                                          .last_id_ = id,
                                          .entries_read_ = entries_read,
                                          .consumers_ = {},
@@ -2746,7 +2760,7 @@ Task<CommandReply> ExecuteImpl(
             integer = 0;
             return NoChange();
           }
-          group->consumers_.push_back(Consumer{a[4], now, 0});
+          group->consumers_.push_back(Consumer{std::string(a[4]), now, 0});
           integer = 1;
           return publish_stream(std::move(stream));
         }
@@ -3420,7 +3434,7 @@ Task<std::string> ExecuteStreamReadLocked(
 // a concurrent mutation may already have changed that live state. Redis can
 // apply PEL ownership/count/time with XCLAIM and group position with SETID.
 absl::StatusOr<std::vector<std::vector<std::string>>> RedisExportStreamGroup(
-    std::span<const std::string> args) {
+    CommandArgsView args) {
   using Commands = std::vector<std::vector<std::string>>;
   if (args.size() < 2 || !EqualCi(args[0], "xgroup") ||
       !EqualCi(args[1], kRestoreGroupSubcommand)) {
@@ -3431,7 +3445,7 @@ absl::StatusOr<std::vector<std::vector<std::string>>> RedisExportStreamGroup(
   const auto& key = args[2];
   const auto& name = args[3];
   if (args[4] == "0" && args.size() == 5)
-    return Commands{{"XGROUP", "DESTROY", key, name}};
+    return Commands{CopyCommandArgs({"XGROUP", "DESTROY", key, name})};
   if (args.size() != 6)
     return absl::InvalidArgumentError("invalid export Stream group payload");
   GroupDelta delta;
@@ -3444,28 +3458,31 @@ absl::StatusOr<std::vector<std::vector<std::string>>> RedisExportStreamGroup(
     auto decoded = DecodeGroupState(args[5]);
     if (!decoded.ok()) return decoded.status();
     delta.upserts_ = std::move(*decoded);
-    result.push_back({"XGROUP", "DESTROY", key, name});
-    result.push_back({"XGROUP", "CREATE", key, name,
-                      FormatId(delta.upserts_.last_id_), "MKSTREAM"});
+    result.push_back(CopyCommandArgs({"XGROUP", "DESTROY", key, name}));
+    result.push_back(
+        CopyCommandArgs({"XGROUP", "CREATE", key, name,
+                         FormatId(delta.upserts_.last_id_), "MKSTREAM"}));
   } else {
     return absl::InvalidArgumentError("invalid export Stream group operation");
   }
   if (delta.upserts_.name_ != name)
     return absl::InvalidArgumentError("export Stream group identity mismatch");
   for (const auto& consumer : delta.removed_consumers_)
-    result.push_back({"XGROUP", "DELCONSUMER", key, name, consumer});
+    result.push_back(
+        CopyCommandArgs({"XGROUP", "DELCONSUMER", key, name, consumer}));
   for (const auto id : delta.removed_pending_)
-    result.push_back({"XACK", key, name, FormatId(id)});
+    result.push_back(CopyCommandArgs({"XACK", key, name, FormatId(id)}));
   for (const auto& consumer : delta.upserts_.consumers_)
-    result.push_back({"XGROUP", "CREATECONSUMER", key, name, consumer.name_});
+    result.push_back(CopyCommandArgs(
+        {"XGROUP", "CREATECONSUMER", key, name, consumer.name_}));
   for (const auto& pending : delta.upserts_.pending_)
-    result.push_back({"XCLAIM", key, name, pending.consumer_, "0",
-                      FormatId(pending.id_), "TIME",
-                      std::to_string(pending.delivery_ms_), "RETRYCOUNT",
-                      std::to_string(pending.deliveries_), "FORCE", "JUSTID"});
-  result.push_back({"XGROUP", "SETID", key, name,
-                    FormatId(delta.upserts_.last_id_), "ENTRIESREAD",
-                    std::to_string(delta.upserts_.entries_read_)});
+    result.push_back(CopyCommandArgs(
+        {"XCLAIM", key, name, pending.consumer_, "0", FormatId(pending.id_),
+         "TIME", std::to_string(pending.delivery_ms_), "RETRYCOUNT",
+         std::to_string(pending.deliveries_), "FORCE", "JUSTID"}));
+  result.push_back(CopyCommandArgs(
+      {"XGROUP", "SETID", key, name, FormatId(delta.upserts_.last_id_),
+       "ENTRIESREAD", std::to_string(delta.upserts_.entries_read_)}));
   return result;
 }
 

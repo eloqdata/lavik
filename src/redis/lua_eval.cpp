@@ -535,7 +535,7 @@ void SetTableFunction(lua_State* state, int table, const char* name,
 }
 
 void SetStringArray(lua_State* state, const char* name,
-                    std::span<const std::string> values) {
+                    CommandArgsView values) {
   lua_createtable(state, static_cast<int>(values.size()), 0);
   for (std::size_t i = 0; i < values.size(); ++i) {
     lua_pushlstring(state, values[i].data(), values[i].size());
@@ -553,7 +553,7 @@ void SetGlobalNil(lua_State* state, const char* name) {
   lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 1);
 }
 
-void PushStringArray(lua_State* state, std::span<const std::string> values) {
+void PushStringArray(lua_State* state, CommandArgsView values) {
   lua_createtable(state, static_cast<int>(values.size()), 0);
   for (std::size_t i = 0; i < values.size(); ++i) {
     lua_pushlstring(state, values[i].data(), values[i].size());
@@ -1499,7 +1499,7 @@ struct LuaExecution::Impl {
               valid = false;
               break;
             }
-            call.args_.emplace_back(buffer, formatted.ptr);
+            call.args_.push_back(std::string_view(buffer, formatted.ptr));
           } else {
             std::size_t size = 0;
             const char* value = lua_tolstring(state_, i, &size);
@@ -1507,7 +1507,7 @@ struct LuaExecution::Impl {
               valid = false;
               break;
             }
-            call.args_.emplace_back(value, size);
+            call.args_.push_back(std::string_view(value, size));
           }
         }
       }
@@ -1535,8 +1535,8 @@ LuaExecution::LuaExecution(std::unique_ptr<Impl> impl)
 LuaExecution::~LuaExecution() = default;
 
 absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::Create(
-    std::string_view script, std::span<const std::string> keys,
-    std::span<const std::string> argv, RespVersion client_resp_version) {
+    std::string_view script, CommandArgsView keys, CommandArgsView argv,
+    RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
   if (!runtime.ok()) return runtime.status();
   auto impl = std::make_unique<Impl>();
@@ -1558,8 +1558,8 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::Create(
 }
 
 absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
-    std::string_view sha, std::span<const std::string> keys,
-    std::span<const std::string> argv, RespVersion client_resp_version) {
+    std::string_view sha, CommandArgsView keys, CommandArgsView argv,
+    RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
   if (!runtime.ok()) return runtime.status();
   auto impl = std::make_unique<Impl>();
@@ -1577,8 +1577,8 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
 }
 
 absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFunction(
-    std::string_view name, std::span<const std::string> keys,
-    std::span<const std::string> argv, RespVersion client_resp_version) {
+    std::string_view name, CommandArgsView keys, CommandArgsView argv,
+    RespVersion client_resp_version) {
   auto runtime = WorkerLuaRuntime();
   if (!runtime.ok()) return runtime.status();
   auto impl = std::make_unique<Impl>();
@@ -1601,9 +1601,9 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFunction(
 
 std::string_view LuaExecution::bytecode() const { return impl_->bytecode_; }
 
-LuaExecutionStep LuaExecution::Start(
-    bool replication_origin, std::string_view script_name,
-    std::span<const std::string> invocation_command) {
+LuaExecutionStep LuaExecution::Start(bool replication_origin,
+                                     std::string_view script_name,
+                                     CommandArgsView invocation_command) {
   const auto now = std::chrono::steady_clock::now();
   const std::uint64_t threshold =
       g_script_busy_threshold_ms.load(std::memory_order_acquire);

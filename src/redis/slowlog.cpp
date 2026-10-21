@@ -140,8 +140,7 @@ SlowLogShard* LocalShard() noexcept {
   return &g_slowlog_shards[worker];
 }
 
-bool ShouldRedactArgument(std::span<const std::string> args,
-                          std::size_t index) {
+bool ShouldRedactArgument(CommandArgsView args, std::size_t index) {
   if (args.empty() || index == 0) return false;
   if (absl::EqualsIgnoreCase(args.front(), "AUTH")) return true;
   if (absl::EqualsIgnoreCase(args.front(), "HELLO")) {
@@ -170,7 +169,7 @@ std::string TruncateArgument(std::string_view argument) {
   return absl::StrCat(argument.substr(0, prefix), suffix);
 }
 
-std::vector<std::string> CopyArguments(std::span<const std::string> args) {
+std::vector<std::string> CopyArguments(CommandArgsView args) {
   std::vector<std::string> result;
   const bool truncated = args.size() > kMaximumArgumentCount;
   const std::size_t copied =
@@ -199,7 +198,7 @@ void InitSlowLog(unsigned worker_count, std::int64_t threshold_micros,
   }
 }
 
-void MaybeRecordSlowCommand(std::span<const std::string> args,
+void MaybeRecordSlowCommand(CommandArgsView args,
                             std::string_view client_address,
                             std::string_view client_name,
                             std::uint64_t elapsed_ticks, bool may_block) {

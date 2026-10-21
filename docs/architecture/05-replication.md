@@ -1316,7 +1316,9 @@ Function opcode is rejected because it is not safely skippable.
 The online stream handles `SELECT`, `PING`, `REPLCONF GETACK`, `PUBLISH`,
 Function mutations, keyed writes, and strict `MULTI`/`EXEC`. `PUBLISH` is
 delivered locally without being forwarded again. The offset advances only
-after successful apply.
+after successful apply. Ordinary commands transfer the parser's argument
+owner into one request retained through source-slot validation and awaited
+execution. Transaction buffering owns its commands independently until `EXEC`.
 In standalone Redis PSYNC compatibility mode, one Lavik process can follow
 multiple masters of one Redis Cluster; these are sources for one imported
 dataset, not multiple cluster-managed replication groups. Each source must be

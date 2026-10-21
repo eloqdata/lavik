@@ -540,7 +540,10 @@ class ReplicationLogService final : public bycorf::Service {
       std::uint8_t db_id, std::vector<std::string> args,
       std::string_view expected_reply) {
     auto request = lavik::BuildCommandRequest(
-        lavik::RespCommand{.args_ = std::move(args)}, db_id);
+        lavik::RespCommand{.args_ = lavik::CommandArgsHandle(
+                               std::make_move_iterator(args.begin()),
+                               std::make_move_iterator(args.end()))},
+        db_id);
     if (!request.ok()) co_return request.status();
     lavik::ReplyBuilder reply_builder;
     lavik::CommandReply reply =
@@ -588,7 +591,10 @@ class ReplicationLogService final : public bycorf::Service {
       lavik::ConnectionContext& connection, std::vector<std::string> args,
       std::string_view expected_reply) {
     auto request = lavik::BuildCommandRequest(
-        lavik::RespCommand{.args_ = std::move(args)}, connection.selected_db_);
+        lavik::RespCommand{.args_ = lavik::CommandArgsHandle(
+                               std::make_move_iterator(args.begin()),
+                               std::make_move_iterator(args.end()))},
+        connection.selected_db_);
     if (!request.ok()) co_return request.status();
     connection.reply_builder_.Reset();
     auto reply = co_await lavik::DispatchCommand(connection, *request);
@@ -621,9 +627,9 @@ class ReplicationLogService final : public bycorf::Service {
     co_return absl::OkStatus();
   }
 
-  bycorf::Task<absl::Status> ReportStorageFailure(
-      std::string_view context, std::uint8_t db_id,
-      std::span<const std::string> args) {
+  bycorf::Task<absl::Status> ReportStorageFailure(std::string_view context,
+                                                  std::uint8_t db_id,
+                                                  lavik::CommandArgsView args) {
     // Capture owner-local counters before collecting asynchronous snapshots.
     // Only failures take this path; bounded argument prefixes identify the
     // command/key without dumping its multi-megabyte value or binary body.
@@ -634,7 +640,7 @@ class ReplicationLogService final : public bycorf::Service {
               << " db=" << static_cast<unsigned>(db_id)
               << " argc=" << args.size();
     for (std::size_t i = 0; i < std::min<std::size_t>(args.size(), 6); ++i) {
-      std::string prefix = args[i].substr(0, 48);
+      std::string prefix(args[i].substr(0, 48));
       for (char& c : prefix) {
         if (static_cast<unsigned char>(c) < 32 ||
             static_cast<unsigned char>(c) > 126)
@@ -2724,7 +2730,7 @@ class ReplicationLogService final : public bycorf::Service {
     // and view-incomplete kinds stay conservative. Multi-shard outcomes are
     // covered by CommandTableTest.RequestSpansMultipleShardsDecision and the
     // multikey e2e gate regression.
-    auto admission_request = [](std::vector<std::string> args) {
+    auto admission_request = [](lavik::CommandArgs args) {
       lavik::CommandRequest built;
       built.spec_ = lavik::FindCommand(args.front());
       built.kind_ = built.spec_ != nullptr ? built.spec_->kind_
@@ -3344,6 +3350,62 @@ class ReplicationLogService final : public bycorf::Service {
     status = co_await ExerciseReplicationContinuationDebt();
     if (!status.ok()) co_return status;
     co_return absl::OkStatus();
+  }
+
+  bycorf::Task<absl::Status> ExerciseCanonicalArgumentsWithoutCapture() {
+    auto status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    constexpr std::uint64_t kExpireAt = 4'102'444'800'000ULL;
+    const std::string deadline = std::to_string(kExpireAt);
+    for (const bool journal : {false, true}) {
+      const std::string key = journal ? "canonical-on" : "canonical-off";
+      const std::string stream = key + "-stream";
+      status =
+          co_await ExecuteClientCommand(0, {"SET", key, "value"}, "+OK\r\n");
+      if (!status.ok()) co_return status;
+      if (journal) {
+        status = co_await storage_->EnableReplicationLog(37, 4 * 8 * kMiB);
+        if (!status.ok()) co_return status;
+      }
+
+      // These standalone requests have no EXEC/Lua capture. Their canonical
+      // arguments must still reach an active journal, while the same writes
+      // must also work when neither journal nor capture consumes arguments.
+      status = co_await ExecuteClientCommand(
+          0, {"GETEX", key, "PXAT", deadline}, "$5\r\nvalue\r\n");
+      if (!status.ok()) co_return status;
+      status = co_await ExecuteClientCommand(0, {"PEXPIRETIME", key},
+                                             ":" + deadline + "\r\n");
+      if (!status.ok()) co_return status;
+      status = co_await ExecuteClientCommand(
+          0, {"XADD", stream, "1-*", "field", "value"}, "$3\r\n1-0\r\n");
+      if (!status.ok()) co_return status;
+      status = co_await ExecuteClientCommand(0, {"XLEN", stream}, ":1\r\n");
+      if (!status.ok()) co_return status;
+      if (journal) {
+        status = co_await WaitForReplicationTail(2);
+        if (!status.ok()) co_return status;
+        const std::vector<std::vector<std::string>> expected{
+            {"PEXPIREAT", key, deadline},
+            {"XADD", stream, "1-0", "field", "value"}};
+        ReplicationLogCursor cursor;
+        for (const auto& effect : expected) {
+          auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+          if (!batch.ok()) co_return batch.status();
+          Check(batch->frames_.size() == 1,
+                "standalone canonical command was not published");
+          auto decoded =
+              lavik::DecodeReplicationCommand(batch->frames_.front().payload_);
+          if (!decoded.ok()) co_return decoded.status();
+          Check(
+              ReplicatedEffectAt(
+                  ReplicationTransactionBody(std::move(*decoded)), 0) == effect,
+              "standalone journal lost canonical arguments without capture");
+          cursor = batch->next_;
+        }
+      }
+    }
+    co_return co_await storage_->DisableReplicationLog();
   }
 
   bycorf::Task<absl::Status> ExercisePublishedStringCommands() {
@@ -4420,6 +4482,10 @@ class ReplicationLogService final : public bycorf::Service {
 
     current_stage_ = "backlog storage";
     status = co_await ExerciseBacklogStorage();
+    if (!status.ok()) co_return status;
+
+    current_stage_ = "canonical arguments without capture";
+    status = co_await ExerciseCanonicalArgumentsWithoutCapture();
     if (!status.ok()) co_return status;
 
     current_stage_ = "published String commands";

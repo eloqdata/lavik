@@ -280,6 +280,15 @@ TEST(ReplicationCommandTest, StagingBudgetIncludesShortArgumentOwners) {
   EXPECT_GE(*bytes, args.size() * sizeof(std::string));
 }
 
+TEST(ReplicationCommandTest, PackedStagingBudgetMatchesOwnedArguments) {
+  const std::vector<std::string> args{"SET", "key", std::string(1024, 'v')};
+  EXPECT_EQ(lavik::storage::ReplicationCommandStagingBytes(args),
+            lavik::storage::ReplicationCommandStagingBytes(3, 1030));
+  const auto maximum = std::numeric_limits<std::size_t>::max();
+  EXPECT_FALSE(lavik::storage::ReplicationCommandStagingBytes(maximum, 0));
+  EXPECT_FALSE(lavik::storage::ReplicationCommandStagingBytes(3, maximum));
+}
+
 TEST(ReplicationCommandTest, TransactionEnvelopeRoundTripsCanonicalBitmap) {
   auto encoded = lavik::EncodeReplicationTransactionEnvelope(
       lavik::ReplicationTransactionEnvelope{

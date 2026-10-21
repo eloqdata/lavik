@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "lavik/command_args.h"
 #include "lavik/expiration.h"
 #include "lavik/memory.h"
 #include "lavik/storage/engine.h"
@@ -84,7 +85,7 @@ inline absl::Status AdmitSetReadResult(storage::HashResult* result) {
 // no complete input collection is retained alongside another input collection.
 template <typename Reader>
 bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
-    std::span<const std::string> arguments, std::size_t first_source,
+    CommandArgsView arguments, std::size_t first_source,
     std::size_t last_source, SetAggregate kind, bool cardinality_only,
     std::uint64_t limit, Reader& read) {
   SetAggregateResult result;

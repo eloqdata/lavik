@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <forward_list>
 #include <limits>
@@ -31,6 +32,246 @@
 
 namespace lavik {
 namespace {
+
+bool ArgumentsAreInline(const CommandArgsHandle& handle) {
+  const auto& args = handle.Get();
+  const auto storage = reinterpret_cast<std::uintptr_t>(&args);
+  const auto data = reinterpret_cast<std::uintptr_t>(args.args.data());
+  return data >= storage && data < storage + sizeof(args);
+}
+
+bool ArgumentBytesAreInline(const CommandArgsHandle& handle) {
+  const auto& args = handle.Get();
+  const auto storage = reinterpret_cast<std::uintptr_t>(&args);
+  const auto data = reinterpret_cast<std::uintptr_t>(args.bytes.data());
+  return data >= storage && data < storage + sizeof(args);
+}
+
+TEST(RespParserTest, PackedArgumentsShareInlineBytesBeyondStringSso) {
+  const std::string key(24, 'k');
+  const std::string value(40, 'v');
+  const std::string wire =
+      "*7\r\n$4\r\nMSET\r\n"
+      "$24\r\n" +
+      key + "\r\n$40\r\n" + value + "\r\n" + "$24\r\n" + key + "\r\n$40\r\n" +
+      value + "\r\n" + "$24\r\n" + key + "\r\n$40\r\n" + value + "\r\n";
+  auto parsed = ParseRespCommand(wire);
+  ASSERT_EQ(parsed.state_, RespParseState::kOk);
+  const auto& args = parsed.command_.args_;
+  ASSERT_EQ(args.size(), 7);
+  EXPECT_TRUE(ArgumentsAreInline(args));
+  EXPECT_TRUE(ArgumentBytesAreInline(args));
+  const auto& storage = args.Get();
+  std::size_t offset = 0;
+  for (std::size_t i = 0; i != args.size(); ++i) {
+    EXPECT_EQ(storage.args[i].offset, offset);
+    EXPECT_EQ(args[i].data(), storage.bytes.data() + offset);
+    EXPECT_EQ(storage.args[i].length, args[i].size());
+    if (i != 0) EXPECT_EQ(args[i], i % 2 == 0 ? value : key);
+    offset += args[i].size();
+  }
+  EXPECT_EQ(storage.bytes.size(), offset);
+}
+
+TEST(RespParserTest, PackedBytesSpillAtInlineBoundaryAndReleaseOnReturn) {
+  CommandArgsStorage storage;
+  RespCommandParser parser(kDefaultClientQueryBufferLimit, &storage);
+  for (const std::size_t length : {255, 256, 257, 1024}) {
+    std::string value(length, '\0');
+    for (std::size_t i = 0; i != length; ++i) value[i] = i % 251;
+    const auto wire =
+        "*1\r\n$" + std::to_string(length) + "\r\n" + value + "\r\n";
+    auto parsed = parser.Parse(wire);
+    ASSERT_EQ(parsed.state_, RespParseState::kOk);
+    EXPECT_EQ(parsed.command_.args_[0], value);
+    EXPECT_TRUE(ArgumentsAreInline(parsed.command_.args_));
+    EXPECT_EQ(ArgumentBytesAreInline(parsed.command_.args_), length <= 256);
+    const auto* slot = &parsed.command_.args_.Get();
+    parsed.command_.args_.Reset();
+    auto empty = CommandArgsHandle::TryBorrow(storage);
+    EXPECT_EQ(&empty.Get(), slot);
+    EXPECT_TRUE(empty.empty());
+    EXPECT_TRUE(empty.Get().bytes.empty());
+    EXPECT_TRUE(ArgumentsAreInline(empty));
+    EXPECT_TRUE(ArgumentBytesAreInline(empty));
+  }
+}
+
+TEST(RespParserTest, PackedGrowthPreservesEarlierEmptyBinaryAndVerbatimArgs) {
+  const std::string payload(2048, 'x');
+  const std::string binary("a\0b\r\nc", 6);
+  const std::string wire = "*5\r\n$4\r\nECHO\r\n$0\r\n\r\n$6\r\n" + binary +
+                           "\r\n=7\r\ntxt:one\r\n$2048\r\n" + payload + "\r\n";
+  RespCommandParser parser;
+  RespParseResult parsed;
+  // Small fragments force repeated byte-buffer growth after earlier offsets
+  // have been recorded; a dangling cached view would corrupt those arguments.
+  std::size_t pos = 0;
+  while (pos < wire.size()) {
+    const auto available = std::min<std::size_t>(17, wire.size() - pos);
+    parsed = parser.Parse(std::string_view(wire).substr(pos, available));
+    ASSERT_NE(parsed.state_, RespParseState::kError) << parsed.status_;
+    ASSERT_GT(parsed.consumed_, 0);
+    pos += parsed.consumed_;
+  }
+  ASSERT_EQ(parsed.state_, RespParseState::kOk);
+  EXPECT_EQ(parsed.command_.args_,
+            (CommandArgs{"ECHO", "", binary, "one", payload}));
+}
+
+TEST(RespParserTest, KeepsSmallArgumentArraysInline) {
+  for (const std::string_view wire :
+       {"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n",
+        "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
+        "MGET a b c d e f g\r\n"}) {
+    auto parsed = ParseRespCommand(wire);
+    ASSERT_EQ(parsed.state_, RespParseState::kOk);
+    EXPECT_EQ(parsed.consumed_, wire.size());
+    EXPECT_TRUE(ArgumentsAreInline(parsed.command_.args_));
+    EXPECT_TRUE(ArgumentBytesAreInline(parsed.command_.args_));
+  }
+}
+
+TEST(RespParserTest, ReleasesOverflowArrayOnClearAndReusesParser) {
+  RespCommandParser parser;
+  auto large = parser.Parse("MGET a b c d e f g h\r\n");
+  ASSERT_EQ(large.state_, RespParseState::kOk);
+  ASSERT_EQ(large.command_.args_.size(), 9);
+  EXPECT_FALSE(ArgumentsAreInline(large.command_.args_));
+
+  large.command_.args_.clear();
+  EXPECT_TRUE(large.command_.args_.empty());
+  EXPECT_TRUE(ArgumentsAreInline(large.command_.args_));
+
+  // Reset an incomplete array that has already spilled, then parse a new
+  // command. Abandoned elements must not leak into the next result.
+  auto partial = parser.Parse(
+      "*10\r\n+a\r\n+b\r\n+c\r\n+d\r\n+e\r\n+f\r\n+g\r\n+h\r\n+i\r\n");
+  ASSERT_EQ(partial.state_, RespParseState::kNeedMoreData);
+  parser.Reset();
+  auto small = parser.Parse("GET key\r\n");
+  ASSERT_EQ(small.state_, RespParseState::kOk);
+  EXPECT_EQ(small.command_.args_, (CommandArgs{"GET", "key"}));
+  EXPECT_TRUE(ArgumentsAreInline(small.command_.args_));
+}
+
+TEST(RespParserTest, ParsesIntoEmbeddedStorageAndClearsItAfterRelease) {
+  CommandArgsStorage storage;
+  const auto* arguments = &storage;
+  RespCommandParser parser(kDefaultClientQueryBufferLimit, &storage);
+  for (unsigned round = 0; round != 3; ++round) {
+    auto partial = parser.Parse("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nva");
+    ASSERT_EQ(partial.state_, RespParseState::kNeedMoreData);
+    ASSERT_EQ(arguments->size(), 3);
+    EXPECT_EQ(arguments->back(), "va");
+    const auto* array = arguments->args.data();
+    const auto* value = arguments->back().data();
+    auto parsed = parser.Parse("lue\r\n");
+    ASSERT_EQ(parsed.state_, RespParseState::kOk);
+    EXPECT_EQ(&parsed.command_.args_.Get(), arguments);
+    EXPECT_EQ(parsed.command_.args_.Get().args.data(), array);
+    EXPECT_EQ(parsed.command_.args_.back().data(), value);
+    EXPECT_EQ(parsed.command_.args_.back(), "value");
+    // The result releases its slot at the end of each iteration. Subsequent
+    // parsing must reuse that exact slot, including its inline byte storage.
+  }
+  EXPECT_TRUE(arguments->empty());
+}
+
+TEST(RespParserTest, LiveResultsKeepEmbeddedStorageOccupiedAcrossHandoffs) {
+  CommandArgsStorage storage;
+  RespCommand first;
+  RespCommand second;
+  {
+    RespCommandParser parser(kDefaultClientQueryBufferLimit, &storage);
+    auto parsed = parser.Parse("GET first\r\n");
+    ASSERT_EQ(parsed.state_, RespParseState::kOk);
+    EXPECT_EQ(&parsed.command_.args_.Get(), &storage);
+    first = std::move(parsed.command_);
+    EXPECT_FALSE(CommandArgsHandle::TryBorrow(storage).HasStorage());
+
+    parsed = parser.Parse("GET second\r\n");
+    ASSERT_EQ(parsed.state_, RespParseState::kOk);
+    second = std::move(parsed.command_);
+    EXPECT_NE(&second.args_.Get(), &storage);
+    // Resetting a partial independent command must not clear either completed
+    // result, particularly the embedded object still held by the first handle.
+    parsed = parser.Parse("*20\r\n$10000\r\npartial");
+    ASSERT_EQ(parsed.state_, RespParseState::kNeedMoreData);
+    parser.Reset();
+    EXPECT_FALSE(CommandArgsHandle::TryBorrow(storage).HasStorage());
+  }
+  EXPECT_EQ(first.args_, (CommandArgs{"GET", "first"}));
+  EXPECT_EQ(second.args_, (CommandArgs{"GET", "second"}));
+  first.args_.Reset();
+  auto available = CommandArgsHandle::TryBorrow(storage);
+  ASSERT_TRUE(available.HasStorage());
+  EXPECT_TRUE(available.empty());
+  EXPECT_EQ(&available.Get(), &storage);
+  EXPECT_EQ(second.args_, (CommandArgs{"GET", "second"}));
+}
+
+TEST(RespParserTest, ResetClearsPartialEmbeddedStorageIncludingOverflowHeaps) {
+  CommandArgsStorage storage;
+  RespCommandParser parser(kDefaultClientQueryBufferLimit, &storage);
+  auto parsed = parser.Parse("*20\r\n$10000\r\n" + std::string(1024, 'x'));
+  ASSERT_EQ(parsed.state_, RespParseState::kNeedMoreData);
+  ASSERT_GT(storage.args.capacity(), 8);
+  ASSERT_GT(storage.bytes.capacity(), 256);
+  parser.Reset();
+  auto available = CommandArgsHandle::TryBorrow(storage);
+  ASSERT_TRUE(available.HasStorage());
+  EXPECT_TRUE(available.empty());
+  EXPECT_TRUE(available.Get().bytes.empty());
+  EXPECT_TRUE(ArgumentsAreInline(available));
+  EXPECT_TRUE(ArgumentBytesAreInline(available));
+}
+
+TEST(RespParserTest, AdditionalCommandOwnsStorageBeyondConnectionLifetime) {
+  RespCommand independent;
+  {
+    CommandArgsStorage storage;
+    RespCommandParser parser(kDefaultClientQueryBufferLimit, &storage);
+    auto first = parser.Parse("GET first\r\n");
+    auto second = parser.Parse("GET second\r\n");
+    ASSERT_EQ(first.state_, RespParseState::kOk);
+    ASSERT_EQ(second.state_, RespParseState::kOk);
+    EXPECT_EQ(&first.command_.args_.Get(), &storage);
+    EXPECT_NE(&second.command_.args_.Get(), &storage);
+    independent = std::move(second.command_);
+    first.command_.args_.Reset();
+    // Later commands reuse the now-free embedded object without affecting the
+    // independent command, even before that command has completed.
+    auto third = parser.Parse("GET third\r\n");
+    ASSERT_EQ(third.state_, RespParseState::kOk);
+    EXPECT_EQ(&third.command_.args_.Get(), &storage);
+    EXPECT_EQ(independent.args_[1], "second");
+  }
+  EXPECT_EQ(independent.args_, (CommandArgs{"GET", "second"}));
+}
+
+TEST(RespParserTest, PartialPipelineCommandKeepsItsStorageAfterFirstCompletes) {
+  CommandArgsStorage storage;
+  RespCommandParser parser(kDefaultClientQueryBufferLimit, &storage);
+  auto first = parser.Parse("GET first\r\n");
+  ASSERT_EQ(first.state_, RespParseState::kOk);
+  EXPECT_EQ(&first.command_.args_.Get(), &storage);
+  auto partial = parser.Parse("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nva");
+  ASSERT_EQ(partial.state_, RespParseState::kNeedMoreData);
+
+  // A read batch can return the first complete command while retaining the
+  // second command's prefix. Finishing the first must not change where that
+  // prefix lives when the next socket read resumes parsing.
+  first.command_.args_.Reset();
+  auto second = parser.Parse("lue\r\n");
+  ASSERT_EQ(second.state_, RespParseState::kOk);
+  EXPECT_NE(&second.command_.args_.Get(), &storage);
+  EXPECT_EQ(second.command_.args_, (CommandArgs{"SET", "key", "value"}));
+  auto third = parser.Parse("GET third\r\n");
+  ASSERT_EQ(third.state_, RespParseState::kOk);
+  EXPECT_EQ(&third.command_.args_.Get(), &storage);
+  EXPECT_EQ(second.command_.args_[2], "value");
+}
 
 TEST(RespParserTest, AcceptsMoreThan1024ArrayElements) {
   constexpr std::size_t kArgumentCount = 1025;
@@ -108,7 +349,7 @@ TEST(RespParserTest, AcceptsCommandExactlyAtConfiguredQueryBufferLimit) {
   RespParseResult parsed = parser.Parse(request);
 
   ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_.message();
-  EXPECT_EQ(parsed.command_.args_, (std::vector<std::string>{"PING"}));
+  EXPECT_EQ(parsed.command_.args_, (CommandArgs{"PING"}));
 }
 
 TEST(RespParserTest, AppliesLowerRuntimeLimitToIncompleteCommand) {
@@ -242,11 +483,10 @@ TEST(RespParserTest, DirectBulkReadsPreserveMultipleArgumentsAndPipelining) {
   auto parsed = parser.Parse(pipeline);
   ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_;
   EXPECT_EQ(parsed.consumed_, 1);
-  EXPECT_EQ(parsed.command_.args_,
-            (std::vector<std::string>{first, second.substr(4)}));
+  EXPECT_EQ(parsed.command_.args_, (CommandArgs{first, second.substr(4)}));
   auto next = parser.Parse(std::string_view(pipeline).substr(parsed.consumed_));
   ASSERT_EQ(next.state_, RespParseState::kOk);
-  EXPECT_EQ(next.command_.args_, (std::vector<std::string>{"PING"}));
+  EXPECT_EQ(next.command_.args_, (CommandArgs{"PING"}));
 }
 
 TEST(RespParserTest, DirectBulkReadsHonorQueryLimitsAtPreparationAndCommit) {
@@ -291,7 +531,7 @@ TEST(RespParserTest, DirectBulkResetDiscardsUnwrittenBody) {
             absl::StatusCode::kInvalidArgument);
   auto parsed = parser.Parse("*1\r\n$4\r\nPING\r\n");
   ASSERT_EQ(parsed.state_, RespParseState::kOk);
-  EXPECT_EQ(parsed.command_.args_, (std::vector<std::string>{"PING"}));
+  EXPECT_EQ(parsed.command_.args_, (CommandArgs{"PING"}));
 }
 
 TEST(RespParserTest, DirectBulkReadsRetainTerminatorAndVerbatimValidation) {
@@ -362,7 +602,7 @@ TEST(RespParserTest, IncrementallyParsesEveryByteExactlyOnce) {
   EXPECT_LE(largest_pending, 1);
   EXPECT_EQ(completed.state_, RespParseState::kOk);
   EXPECT_EQ(completed.command_.args_,
-            (std::vector<std::string>{"SET", "key", "hello world", "NX"}));
+            (CommandArgs{"SET", "key", "hello world", "NX"}));
 }
 
 TEST(RespParserTest, ReturnsPipelinedCommandsInWireOrder) {
@@ -372,12 +612,12 @@ TEST(RespParserTest, ReturnsPipelinedCommandsInWireOrder) {
 
   RespParseResult one = parser.Parse(first + second);
   ASSERT_EQ(one.state_, RespParseState::kOk);
-  EXPECT_EQ(one.command_.args_, (std::vector<std::string>{"PING"}));
+  EXPECT_EQ(one.command_.args_, (CommandArgs{"PING"}));
 
   RespParseResult two =
       parser.Parse(std::string_view(first + second).substr(one.consumed_));
   ASSERT_EQ(two.state_, RespParseState::kOk);
-  EXPECT_EQ(two.command_.args_, (std::vector<std::string>{"GET", "key"}));
+  EXPECT_EQ(two.command_.args_, (CommandArgs{"GET", "key"}));
   EXPECT_TRUE(parser.idle());
 }
 
@@ -389,7 +629,7 @@ TEST(RespParserTest, ConsumesFillerAndEmptyArraysAcrossFragments) {
 
   RespParseResult parsed = parser.Parse("\r\n*1\r\n$4\r\nPING\r\n");
   ASSERT_EQ(parsed.state_, RespParseState::kOk);
-  EXPECT_EQ(parsed.command_.args_, (std::vector<std::string>{"PING"}));
+  EXPECT_EQ(parsed.command_.args_, (CommandArgs{"PING"}));
 }
 
 TEST(RespParserTest, RejectsSplitMalformedBulkTerminator) {
@@ -410,7 +650,7 @@ TEST(RespParserTest, AcceptsInlineCommandsQuotesAndEscapesIncrementally) {
   RespParseResult second = parser.Parse("world\" NX\r\n");
   ASSERT_EQ(second.state_, RespParseState::kOk) << second.status_.message();
   EXPECT_EQ(second.command_.args_,
-            (std::vector<std::string>{"SET", "inline", "hello world", "NX"}));
+            (CommandArgs{"SET", "inline", "hello world", "NX"}));
 }
 
 TEST(RespParserTest, AcceptsResp3ScalarAndVerbatimArguments) {
@@ -419,9 +659,8 @@ TEST(RespParserTest, AcceptsResp3ScalarAndVerbatimArguments) {
       ",1.5\r\n#t\r\n";
   RespParseResult parsed = ParseRespCommand(request);
   ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_.message();
-  EXPECT_EQ(
-      parsed.command_.args_,
-      (std::vector<std::string>{"SET", "key", "value", "42", "1.5", "1"}));
+  EXPECT_EQ(parsed.command_.args_,
+            (CommandArgs{"SET", "key", "value", "42", "1.5", "1"}));
 }
 
 TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {

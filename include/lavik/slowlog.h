@@ -25,6 +25,7 @@
 
 #include "absl/status/status.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/command_args.h"
 
 namespace lavik {
 
@@ -48,7 +49,7 @@ void InitSlowLog(unsigned worker_count, std::int64_t threshold_micros,
 
 // Fast command-completion hook. It returns before reading command arguments
 // unless the local threshold is enabled and exceeded.
-void MaybeRecordSlowCommand(std::span<const std::string> args,
+void MaybeRecordSlowCommand(CommandArgsView args,
                             std::string_view client_address,
                             std::string_view client_name,
                             std::uint64_t elapsed_ticks, bool may_block);

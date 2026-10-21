@@ -32,6 +32,7 @@
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/runtime/task.h"
 #include "lavik/client_mode.h"
+#include "lavik/command_args.h"
 #include "lavik/lease_deadline.h"
 #include "lavik/replication_group.h"
 
@@ -842,7 +843,7 @@ class ReplicationManager {
 
   // Native control, flow, recovery and parent-export handshakes arrive as
   // isolated RESP commands on the ordinary Redis port.
-  static bool IsNativeHandshake(std::span<const std::string> args) noexcept;
+  static bool IsNativeHandshake(CommandArgsView args) noexcept;
   bycorf::Task<absl::Status> ServeNativeConnection(
       bycorf::TcpStream& stream, std::vector<std::string> args,
       std::uint64_t client_id, std::string client_address, bool tls);
