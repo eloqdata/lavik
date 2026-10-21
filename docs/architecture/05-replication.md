@@ -795,6 +795,13 @@ admitted, allocations needed to complete its replication may exceed the
 worker's soft memory budget. Payload, encoding metadata, and backlog allocations
 are charged until freed, so subsequent admissions observe the excess. Fixed
 queue staging allowances remain separate from these actual allocation charges.
+Worker-local publication retains bounded encoding scratch across queued
+ordinary commands.
+Argument bodies remain owned by the queued command until append completes;
+only then may the publisher clear its borrowed views and reuse codec capacity.
+Retained scratch stays charged, and oversized metadata is released after use.
+Each publisher invocation owns its scratch, so an old suspended publisher and
+a replacement log epoch cannot alias the same encoding buffers.
 
 One command larger than its publisher-staging waterline may proceed only as the
 sole queued item so the queue cannot deadlock on an item that no consumer can

@@ -316,6 +316,82 @@ TEST(ReplicationCommandTest, SmallCommandsKeepLegacyWireEncoding) {
   EXPECT_EQ(decoded->args_, (std::vector<std::string>{"SET", "key", "value"}));
 }
 
+TEST(ReplicationCommandTest, ReusesCodecCapacityAndKeepsItCharged) {
+  CaptureMemoryScope memory;
+  const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
+  {
+    lavik::ReplicationCommandPayloadSource source;
+    std::vector<std::string> first{"SET", "first", std::string(1024, 'a')};
+    ASSERT_TRUE(source.Reset(1, first).ok());
+    const auto warmed = lavik::WorkerMemoryAccountingBytes(0);
+    ASSERT_GT(warmed, baseline);
+    auto decoded = lavik::DecodeReplicationCommand(ReadCommandSource(source));
+    ASSERT_TRUE(decoded.ok());
+    EXPECT_EQ(decoded->args_, first);
+    source.ClearForReuse();
+    EXPECT_EQ(source.size(), 0U);
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), warmed);
+    first.clear();  // No borrowed view survives the completed append.
+
+    const std::vector<std::string_view> second{"SET", "second", ""};
+    for (unsigned i = 0; i < 100; ++i) {
+      ASSERT_TRUE(source.Reset(2, second).ok());
+      decoded = lavik::DecodeReplicationCommand(ReadCommandSource(source));
+      ASSERT_TRUE(decoded.ok());
+      EXPECT_EQ(decoded->db_id_, 2);
+      EXPECT_EQ(decoded->args_,
+                (std::vector<std::string>{"SET", "second", ""}));
+      source.ClearForReuse();
+      EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), warmed);
+    }
+    auto moved = std::move(source);
+    moved.ClearForReuse(0);
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
+  }
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST(ReplicationCommandTest, ReleasesOversizedCodecCapacityAfterUse) {
+  CaptureMemoryScope memory;
+  const auto baseline = lavik::WorkerMemoryAccountingBytes(0);
+  lavik::ReplicationCommandPayloadSource source;
+  const std::vector<std::string_view> wide(65536, "x");
+  ASSERT_TRUE(source.Reset(15, wide).ok());
+  EXPECT_GT(lavik::WorkerMemoryAccountingBytes(0) - baseline,
+            lavik::ReplicationCommandPayloadSource::kMaxRetainedMetadataBytes);
+  auto decoded = lavik::DecodeReplicationCommand(ReadCommandSource(source));
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded->args_.size(), wide.size());
+  source.ClearForReuse();
+  EXPECT_EQ(source.size(), 0U);
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), baseline);
+
+  const std::vector<std::string> small{"GET", "key"};
+  ASSERT_TRUE(source.Reset(0, small).ok());
+  decoded = lavik::DecodeReplicationCommand(ReadCommandSource(source));
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded->args_, small);
+}
+
+TEST(ReplicationCommandTest, FailedResetLeavesEmptyAccountedScratch) {
+  CaptureMemoryScope memory;
+  lavik::ReplicationCommandPayloadSource source;
+  const std::vector<std::string> args{"SET", "key", "value"};
+  ASSERT_TRUE(source.Reset(0, args).ok());
+  const auto warmed = lavik::WorkerMemoryAccountingBytes(0);
+  EXPECT_FALSE(source.Reset(16, args).ok());
+  EXPECT_EQ(source.size(), 0U);
+  EXPECT_TRUE(ReadCommandSource(source).empty());
+  EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), warmed);
+  const std::vector<std::string_view> empty;
+  EXPECT_FALSE(source.Reset(0, empty).ok());
+  EXPECT_EQ(source.size(), 0U);
+  ASSERT_TRUE(source.Reset(0, args).ok());
+  auto decoded = lavik::DecodeReplicationCommand(ReadCommandSource(source));
+  ASSERT_TRUE(decoded.ok());
+  EXPECT_EQ(decoded->args_, args);
+}
+
 TEST(ReplicationCommandTest, LegacyArgumentBoundaryKeepsLegacyWireEncoding) {
   constexpr auto count = std::numeric_limits<std::uint16_t>::max();
   std::vector<std::string_view> args(count, "x");
