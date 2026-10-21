@@ -2,6 +2,8 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+> **1B rerun pending:** The displayed 1B results used 16 memtier threads. They will be replaced with a fresh 32-thread run on client CPUs 0–31 at 160/320/640/1280 total connections; the 80-connection point is removed. The 10M baseline remains at 16 client threads.
+
 Test dates: 2026-10-21 (UTC). All **120 formal points** were freshly measured on newly provisioned Azure hosts. Lavik’s 1B-key dataset contains **953.67 GiB of logical value payload**, 100 times the 10M dataset.
 
 At 1B keys, peak GET / SET throughput is **1,085,805 / 858,557 ops/s**, retaining **93.9% / 90.8%** of the smaller dataset’s peaks. Peaks may occur at different connection counts; matched-concurrency results follow below. In the 10M baseline, the highest GET peak is Lavik 0.2.0 / 10M (1,156,956 ops/s), while the highest SET peak is Lavik 0.2.0 / 10M (945,384 ops/s).
