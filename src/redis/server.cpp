@@ -491,9 +491,10 @@ class RedisService final : public TcpService, public ClientLimit {
 
  private:
   Task<absl::Status> Serve(TcpStream& stream, ConnectionContext& ctx);
-  // Terminal handoff: the caller's parser/buffers must outlive this await.
+  // Terminal handoff takes the argument handle. The caller's connection,
+  // parser and buffers must outlive this await.
   Task<absl::Status> HandoffReplicationConnection(
-      TcpStream& stream, ConnectionContext& ctx, CommandArgsHandle& args,
+      TcpStream& stream, ConnectionContext& ctx, CommandArgsHandle args,
       ReplicationHandshake kind, bool isolated, PendingReplyBatch& pending,
       CommandBufferGuard& command_memory);
   Task<absl::Status> ReadSubscribedCommands(
@@ -1741,7 +1742,7 @@ Task<absl::Status> RedisService::ServeSubscribed(
 }
 
 Task<absl::Status> RedisService::HandoffReplicationConnection(
-    TcpStream& stream, ConnectionContext& ctx, CommandArgsHandle& args,
+    TcpStream& stream, ConnectionContext& ctx, CommandArgsHandle args,
     ReplicationHandshake kind, bool isolated, PendingReplyBatch& pending,
     CommandBufferGuard& command_memory) {
   assert(kind == ReplicationHandshake::kRedisSync ||
@@ -1872,8 +1873,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         const bool isolated =
             ready.empty() && input.View().empty() && parser.idle();
         co_return co_await HandoffReplicationConnection(
-            stream, ctx, request.args_, handshake, isolated, pending_replies,
-            command_memory);
+            stream, ctx, std::move(request.args_), handshake, isolated,
+            pending_replies, command_memory);
       }
     }
 
