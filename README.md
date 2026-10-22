@@ -102,11 +102,12 @@ With **1 billion keys (1TB)**, Lavik reached **1,129,597 GET QPS** and
 The [1TB storage comparison](perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md) tests
 Lavik, Dragonfly, Garnet, Apache Kvrocks, Pika and Tendis on an Azure
 Standard_L16aos_v4 VM with **1 billion keys and 1 KiB values**.
-All products use **32 client threads** and **160/320/640/1280 connections**,
-with a 60-second window per point. The chart shows GET/SET throughput and p99.9
-latency across the full connection sweep.
+Results below use **320 connections** and **32 client threads**, with a 60-second
+window per point, sorted by QPS for each command. QPS bars grow from left to right;
+p99.9 latency bars grow from right to left on the same row. The full
+**160/320/640/1280-connection** sweep is available in the linked report.
 
-<img src="perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/combined.svg" alt="1B keys: GET and SET throughput and p99.9 latency for Lavik, Dragonfly, Garnet, Kvrocks, Pika and Tendis across 160 to 1280 connections" width="900">
+<img src="perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/ranked-320.svg" alt="320 connections: paired horizontal QPS and p99.9 latency bars for each database, sorted by QPS within GET and SET" width="900">
 
 See also the [100-million-record YCSB comparison with Aerospike](perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.md),
 covering workloads A/B/C/D and their tail latencies.
