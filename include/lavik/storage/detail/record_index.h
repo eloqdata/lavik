@@ -306,9 +306,4 @@ static_assert(alignof(RecordLocation) == 8);
 static_assert(sizeof(RecordIndex::Entry) == 20);
 static_assert(sizeof(RecordIndex::ExtendedEntry) == 28);
 
-inline bool IsNewer(const RecordLocation& candidate,
-                    const RecordLocation& current) noexcept {
-  return candidate.mutation_sequence_ > current.mutation_sequence_;
-}
-
 }  // namespace lavik::storage
