@@ -24,7 +24,7 @@
 
 namespace lavik::storage {
 
-class RecordIndexValue;
+class RecordIndexPrefix;
 
 struct RecordLocationCore {
   // Runtime block identities need only the 27-bit local block id plus the
@@ -171,7 +171,7 @@ struct RecordLocationCore {
     }
 
    private:
-    friend class RecordIndexValue;
+    friend class RecordIndexPrefix;
 
     explicit constexpr PackedMetadata(std::uint64_t bits) noexcept
         : bits_(bits) {}

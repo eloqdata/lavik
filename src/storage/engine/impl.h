@@ -206,9 +206,9 @@ inline bool IsExpired(const RecordLocation& location,
 }
 
 inline std::uint64_t ExpireAt(const RecordIndex::Entry& entry) noexcept {
-  const std::uint64_t* expiry = entry.optional_extra();
+  const auto* expiry = entry.optional_extra();
   assert(entry.value_.has_expiry() == (expiry != nullptr));
-  return expiry == nullptr ? 0 : *expiry;
+  return expiry == nullptr ? 0 : static_cast<std::uint64_t>(*expiry);
 }
 
 inline bool IsExpired(const RecordIndex::Entry& entry,
@@ -423,8 +423,8 @@ static_assert(alignof(BlockState) == 32);
 // byte accounting prevents either field from changing while the entry is
 // current.
 inline RecordLocation MaterializePublishedIndexLocation(
-    const RecordIndexValue& value, const BlockState& state,
-    const std::uint64_t* expiry = nullptr) noexcept {
+    const RecordIndexPrefix& value, const BlockState& state,
+    const RecordIndexExpiry* expiry = nullptr) noexcept {
   const std::uint16_t owner = state.owner_.load(std::memory_order_acquire);
   const std::uint64_t allocation_epoch = state.allocation_epoch_;
   assert(owner < kMaxMemoryWorkers);
@@ -3928,8 +3928,8 @@ class StorageEngine::Impl {
   // it. The returned value then owns the epoch snapshot and is safe to carry
   // across suspension even if a later relocation replaces the index entry.
   RecordLocation MaterializeIndexLocation(
-      const RecordIndexValue& value,
-      const std::uint64_t* expiry = nullptr) const noexcept {
+      const RecordIndexPrefix& value,
+      const RecordIndexExpiry* expiry = nullptr) const noexcept {
     const std::uint64_t block_id = value.block_id();
     const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
     RecordLocation location =

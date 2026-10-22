@@ -528,6 +528,14 @@ use, preserving block-reuse and ABA protection. These index representations
 are runtime-only; durable block and record headers retain the fields needed for
 restart validation.
 
+Primary and auxiliary group indexes share the same compact field layout.
+Primary entries store logical sizes in a variable-width tail; auxiliary arrays
+own fixed-width values with their logical-size tail included. An update keeps
+its entry identity while its existing representation has room. Width growth
+or an expiry subtype change replaces the entry. The append path admits
+replacement memory and handle capacity before publishing the write;
+pointer-keyed side state follows the replacement.
+
 Runtime key digests use one operating-system-seeded SipHash key shared by all
 workers and do not affect Redis-slot routing. A cold recovery chooses a fresh
 seed; a successful shutdown-checkpoint recovery restores the checkpoint seed
