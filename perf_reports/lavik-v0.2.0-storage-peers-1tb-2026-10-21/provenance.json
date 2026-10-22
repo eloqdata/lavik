@@ -1,0 +1,123 @@
+{
+  "lavik": {
+    "kind": "large",
+    "release": "v0.2.0",
+    "revision": "2908f86f2770e9c6e8acc6585b3bedb4b44d1cd5",
+    "server_private": "10.96.1.4",
+    "client_private": "10.96.0.5",
+    "server_cpus": "0-15",
+    "workers": 16,
+    "io_threads": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "huge_mib": 8192,
+    "nvmes": [
+      {
+        "serial": "7906831e17220f400006",
+        "bdf": "9816:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme5n1"
+      },
+      {
+        "serial": "7906831e17220f400005",
+        "bdf": "fa44:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme3n1"
+      },
+      {
+        "serial": "7906831e17220f400004",
+        "bdf": "ef09:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme1n1"
+      },
+      {
+        "serial": "7906831e17220f400001",
+        "bdf": "7133:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme6n1"
+      },
+      {
+        "serial": "7906831e17220f400003",
+        "bdf": "9c4a:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme4n1"
+      },
+      {
+        "serial": "7906831e17220f400002",
+        "bdf": "10fc:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme2n1"
+      }
+    ],
+    "versions": {
+      "redis": {
+        "version": "8.10.2"
+      },
+      "valkey": {
+        "version": "9.1.2"
+      }
+    },
+    "lavik_binary_sha256": "21f796318bafa736d69ab1897840031bdb737a9f362d9d72635cf4236f4193eb",
+    "storage_client_threads": 32,
+    "storage_client_cpus": "0-31",
+    "storage_connections": [
+      160,
+      320,
+      640,
+      1280
+    ]
+  },
+  "filesystem": {
+    "time": 1792602272.3658388,
+    "md": "/dev/md127",
+    "member_serials": [
+      "7906831e17220f400001",
+      "7906831e17220f400002",
+      "7906831e17220f400003",
+      "7906831e17220f400004",
+      "7906831e17220f400005",
+      "7906831e17220f400006"
+    ],
+    "mount": "{\n   \"filesystems\": [\n      {\n         \"target\": \"/mnt/bench020\",\n         \"source\": \"/dev/md127\",\n         \"fstype\": \"xfs\",\n         \"options\": \"rw,noatime,attr2,inode64,logbufs=8,logbsize=32k,sunit=1024,swidth=6144,noquota\"\n      }\n   ]\n}",
+    "after": "32-thread Lavik 1B rerun"
+  },
+  "peer_binaries": {
+    "dragonfly": {
+      "path": "/opt/bench020/peers/downloads/dragonfly/dragonfly-x86_64",
+      "sha256": "2cf7bea7e142b0360421ed5083e54ee49e0effc41f7ced5ebdcaf88f8ff2e116"
+    },
+    "garnet": {
+      "path": "/opt/bench020/peers/downloads/garnet/net10.0/GarnetServer",
+      "sha256": "0cf7131316379f912807b1c70177b6fb48615f7a6f1dd324ebd93a8937da80fe"
+    },
+    "kvrocks": {
+      "path": "/opt/bench020/peers/sources/kvrocks/build/kvrocks",
+      "sha256": "8c34439d41153ffe9dcfa02e7c8026cc21107b51afc66dd5fb7db46de02f5b9e"
+    },
+    "pika": {
+      "path": "/opt/bench020/peers/downloads/pika/bin/pika",
+      "sha256": "4c5d15054efaa57f3e92de6d1a5463d4f875931e4cfe48fe44c4b256dfc2de78"
+    },
+    "tendis": {
+      "path": "/opt/bench020/peers/downloads/tendis/tendisplus-2.8.4-rocksdb-v8.5.3/bin/tendisplus",
+      "sha256": "b1646168115e19ed8c1f92099183bdfa422786e3978541d3c45f57047af9d302"
+    }
+  },
+  "formal_points": 48,
+  "raw_source": "raw-results.tar.gz; full experiment archive evidence-large-all.tar.gz",
+  "report_evidence": {
+    "file": "raw-results.tar.gz",
+    "sha256": "d9f9acae55a1f3c1b4b95f3dd16dd025c922f772e369cba02bc2d505e20d04b4",
+    "files": 522
+  }
+}
