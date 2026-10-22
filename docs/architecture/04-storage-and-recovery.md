@@ -528,12 +528,13 @@ use, preserving block-reuse and ABA protection. These index representations
 are runtime-only; durable block and record headers retain the fields needed for
 restart validation.
 
-The primary index stores logical sizes in a variable-width tail, independently
-of the fixed-width auxiliary group locations. An update keeps its entry
-identity while its existing representation has room. Width growth or an expiry
-subtype change replaces the entry. The append path admits replacement memory
-and handle capacity before publishing the write; pointer-keyed side state
-follows the replacement.
+Primary and auxiliary group indexes share the same compact field layout.
+Primary entries store logical sizes in a variable-width tail; auxiliary arrays
+own fixed-width values with their logical-size tail included. An update keeps
+its entry identity while its existing representation has room. Width growth
+or an expiry subtype change replaces the entry. The append path admits
+replacement memory and handle capacity before publishing the write;
+pointer-keyed side state follows the replacement.
 
 Runtime key digests use one operating-system-seeded SipHash key shared by all
 workers and do not affect Redis-slot routing. A cold recovery chooses a fresh
@@ -1279,7 +1280,7 @@ current source code are authoritative for present storage behavior.
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
 | Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/lavik/storage/scan_hash_map.h`, `include/lavik/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/init.cpp`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Compact and grouped Hash/Set serving, group identity and object side index | `src/storage/engine/hash_tree.cpp`, `src/storage/engine/hash_codec.cpp`, `src/storage/engine/grouped/hash.cpp`, `src/storage/engine/grouped/object_index.cpp`, [Grouped collections](09-grouped-collections.md) |
-| Runtime location representations for primary keys and auxiliary groups | `include/lavik/storage/detail/record_location.h`, `include/lavik/storage/detail/record_index.h` |
+| Compact physical index representation shared by user-key and group-location indexes | `include/lavik/storage/detail/record_location.h`, `include/lavik/storage/detail/record_index.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | System-state manifest, catalog COW extents, full-sync fence, population token, promotion base, and one-use shutdown certificate | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |
