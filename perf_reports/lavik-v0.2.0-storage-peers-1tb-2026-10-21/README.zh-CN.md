@@ -69,7 +69,7 @@ UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 
 Lavik defrag 全程启用；Garnet 使用 Lookup compaction，RocksDB 自动压缩保持启用。配置内存预算不同：Dragonfly 96 GiB；Garnet 64 GiB log、32 GiB read cache、16 GiB index；Kvrocks 80 GiB block cache；Pika 24 GiB block cache 与 32 GiB 应用缓存；Tendis 72 GiB 共享缓存。这些是预算，不是实测总 RSS。
 
-持久化路径不同：Lavik 使用 SPDK 存储；Dragonfly 使用分层文件，不做周期快照；Garnet 使用 storage log，不启用 AOF；Kvrocks、Tendis 关闭 WAL，Pika 关闭 binlog。成功响应不代表相同同步持久性。每点只测一次，不给置信区间。历史 1B 测试使用 16 个客户端线程并包含 80 连接；本次使用 32 线程、四档连接数，Dragonfly/Garnet 额外预热也改为 32 线程、160 连接；本次在 Japan East、旧测试在 Japan West；区域、物理放置和运行时段也会影响历史对比。
+持久化路径不同：Lavik 使用 SPDK 存储；Dragonfly 使用分层文件，不做周期快照；Garnet 使用 storage log，不启用 AOF；Kvrocks、Tendis 关闭 WAL，Pika 关闭 binlog。成功响应不代表相同同步持久性。每点只测一次，不给置信区间。历史 1B 测试使用 16 个客户端线程并包含 80 连接；本次使用 32 线程、四档连接数，Dragonfly/Garnet 额外预热也改为 32 线程、160 连接；本次在 Japan East、旧测试在 Japan West。
 
 对比产品版本与 0.1.0 报告一致：Dragonfly 2.0.2、Garnet 2.2.1（.NET 10.0.12）、Kvrocks 2.17.0、Pika 3.5.7、Tendis 2.8.4-rocksdb-v8.5.3。Pika 官方包内嵌版本显示 3.5.6，revision 为 `62a57f85534198e0d1033c32f1215c958bef8a5e`。
 

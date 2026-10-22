@@ -8,7 +8,7 @@ Measured unlimited total-throughput differences relative to Aerospike: A **+9.06
 
 Throughput and tail latency trade off: Lavik has **higher p99.9 in 4 of seven unlimited operation cells**. The largest relative difference is **A / READ: 4.399 ms versus 2.225 ms (1.98×)**. These are single-window observations.
 
-CPU allocation and host policy differ: Aerospike retains the original host policy, while Lavik uses 12 workers and 4 CPUs for system-task and benchmark-NIC IRQ policy. This is not a single-variable comparison. Operation cells show **operation QPS; p99 / p99.9 (ms)**.
+CPU allocation and host policy differ: Aerospike retains the original host policy, while Lavik uses 12 workers and 4 CPUs for system-task and benchmark-NIC IRQ policy. Operation cells show **operation QPS; p99 / p99.9 (ms)**.
 
 ## 100K target
 

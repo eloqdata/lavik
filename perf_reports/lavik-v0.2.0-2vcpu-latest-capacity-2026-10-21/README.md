@@ -91,7 +91,7 @@ Ranges use post-point snapshots. INFO memory follows each product’s accounting
 
 [Complete point data](results.csv) · [Version, hardware and validation provenance](provenance.json)
 
-Each point has one measured run; no confidence interval is claimed. Successful responses do not imply equal synchronous durability guarantees. New hosts can differ from the historical run in physical placement, network latency and timing; historical differences cannot be attributed solely to release code. [Raw logs and receipts](raw-results.tar.gz) includes a per-file SHA-256 manifest; its archive hash is recorded in provenance.
+Each point has one measured run; no confidence interval is claimed. Successful responses do not imply equal synchronous durability guarantees. New hosts can differ from the historical run in physical placement, network latency and timing. [Raw logs and receipts](raw-results.tar.gz) includes a per-file SHA-256 manifest; its archive hash is recorded in provenance.
 
 ## Reproduction commands
 

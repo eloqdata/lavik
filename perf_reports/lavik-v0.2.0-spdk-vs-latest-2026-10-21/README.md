@@ -88,9 +88,9 @@ Some points approach the client CPU budget; observed peaks do not establish a se
 
 [Complete point data](results.csv) · [Version, hardware and validation provenance](provenance.json)
 
-Each point has one measured run; no confidence interval is claimed. Successful responses do not imply equal synchronous durability guarantees. New hosts can differ from the historical run in physical placement, network latency and timing; historical differences cannot be attributed solely to release code. [Raw logs and receipts](raw-results.tar.gz) includes a per-file SHA-256 manifest; its archive hash is recorded in provenance.
+Each point has one measured run; no confidence interval is claimed. Successful responses do not imply equal synchronous durability guarantees. New hosts can differ from the historical run in physical placement, network latency and timing. [Raw logs and receipts](raw-results.tar.gz) includes a per-file SHA-256 manifest; its archive hash is recorded in provenance.
 
-This large-host rerun uses Japan East; the historical v0.1.0 run used Japan West. Region and network placement can particularly affect low-concurrency results.
+This large-host rerun uses Japan East; the historical v0.1.0 run used Japan West.
 
 [Validation](validation.json)
 

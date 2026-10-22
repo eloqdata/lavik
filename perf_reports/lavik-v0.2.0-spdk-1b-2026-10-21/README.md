@@ -36,7 +36,7 @@ UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-21T17:03:39.576000+00:00.
 - Fresh sequential fill: exactly 1B SETs, 32 threads and 640 total connections. Formal sweeps use independent client seeds, uniform random GET or overwriting SET, pipeline 1, and 60 seconds per point. GET precedes SET; concurrency increases within each sweep. No additional GET warmup.
 - Lavik uses 16 server workers, SPDK, shutdown checkpointing, tomb-raider interval 0 and SPDK completion cap 16. Other tested defaults are inherited. Defrag stays enabled and is checked around every measured point. Exact DBSIZE and five value lengths are verified before and after the sweep.
 - Each cell has one run; no confidence intervals. Throughput and percentiles come from the complete measurement window. These eight points are reused in the storage-peer report, not counted as independent repeats.
-- The historical report used 16 client threads and included 80 connections. This run uses 32 threads and omits that point. Region also changed from Japan West to Japan East; historical differences cannot be attributed solely to release code.
+- The historical report used 16 client threads and included 80 connections. This run uses 32 threads and omits that point. Region also changed from Japan West to Japan East.
 
 Load invocation wall time: **21.6 minutes**; reported fill throughput: **940,654 ops/s**. Across formal points, maximum average client CPU use is **17.971 cores**, maximum individual thread average is **0.579 cores**, and maximum server steal in enclosing sampled windows is **0.0000%**.
 
