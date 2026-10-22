@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <iterator>
+
 #include "replication_internal.h"
 
 namespace lavik {
@@ -1490,25 +1492,33 @@ auto ReplicationManager::ReplicationGroup::ValidateRedisSourceCommand(
     const ReplicatedCommand& command,
     const std::shared_ptr<RedisSource>& source) -> absl::Status {
   if (!redis_cluster_) return absl::OkStatus();
-  RespCommand wire{.args_ = command.args_};
+  RespCommand wire{
+      .args_ = CommandArgsHandle(command.args_.begin(), command.args_.end())};
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
   if (!request.ok()) return request.status();
-  if (request->kind_ == CommandKind::kFlushDb ||
-      request->kind_ == CommandKind::kFlushAll ||
-      request->kind_ == CommandKind::kFunction) {
+  return ValidateRedisSourceCommand(*request, source);
+}
+
+auto ReplicationManager::ReplicationGroup::ValidateRedisSourceCommand(
+    const CommandRequest& request, const std::shared_ptr<RedisSource>& source)
+    -> absl::Status {
+  if (!redis_cluster_) return absl::OkStatus();
+  if (request.kind_ == CommandKind::kFlushDb ||
+      request.kind_ == CommandKind::kFlushAll ||
+      request.kind_ == CommandKind::kFunction) {
     return absl::OkStatus();
   }
-  if (request->spec_ == nullptr) {
+  if (request.spec_ == nullptr) {
     return absl::InvalidArgumentError("unknown Redis replication command");
   }
-  auto keys = DetermineKeys(*request->spec_, request->args_);
+  auto keys = DetermineKeys(*request.spec_, request.args_);
   if (!keys.ok() || keys->count() == 0) {
     return absl::InvalidArgumentError(
         "Redis replication command has no routable key");
   }
   for (std::uint16_t index = keys->first_; index <= keys->last_;
        index = static_cast<std::uint16_t>(index + keys->step_)) {
-    const std::uint16_t slot = storage::RedisSlot(request->args_[index]);
+    const std::uint16_t slot = storage::RedisSlot(request.args_[index]);
     if (!source->slots_.test(slot)) {
       return absl::FailedPreconditionError(
           absl::StrCat("Redis command key belongs to slot ", slot,
@@ -1565,7 +1575,7 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
       co_return absl::InvalidArgumentError(
           "empty command in Redis replication stream");
     }
-    const std::string name = wire->command_.args_.front();
+    const std::string_view name = wire->command_.args_.front();
     if (EqualCaseInsensitive(name, "SELECT")) {
       unsigned selected = 0;
       if (wire->command_.args_.size() != 2 ||
@@ -1634,21 +1644,24 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
       in_multi = false;
       continue;
     }
-    ReplicatedCommand command{.db_id_ = db_id,
-                              .args_ = std::move(wire->command_.args_)};
     if (in_multi) {
+      // The transaction representation owns strings until EXEC consumes it.
+      // Ordinary commands instead hand the parser's owner directly to apply.
       transaction_bytes += wire->bytes_;
-      transaction.push_back(std::move(command));
+      transaction.push_back(ReplicatedCommand{
+          .db_id_ = db_id, .args_ = CopyCommandArgs(wire->command_.args_)});
       continue;
     }
-    absl::Status valid = ValidateRedisSourceCommand(command, source);
+    auto request = BuildCommandRequest(std::move(wire->command_), db_id);
+    if (!request.ok()) co_return request.status();
+    absl::Status valid = ValidateRedisSourceCommand(*request, source);
     if (!valid.ok()) co_return valid;
     if (redis_cluster_ && (EqualCaseInsensitive(name, "FLUSHDB") ||
                            EqualCaseInsensitive(name, "FLUSHALL"))) {
-      if (command.args_.size() > 2 ||
-          (command.args_.size() == 2 &&
-           !EqualCaseInsensitive(command.args_[1], "ASYNC") &&
-           !EqualCaseInsensitive(command.args_[1], "SYNC"))) {
+      if (request->args_.size() > 2 ||
+          (request->args_.size() == 2 &&
+           !EqualCaseInsensitive(request->args_[1], "ASYNC") &&
+           !EqualCaseInsensitive(request->args_[1], "SYNC"))) {
         co_return absl::InvalidArgumentError(
             "invalid Redis replicated flush command");
       }
@@ -1657,7 +1670,9 @@ auto ReplicationManager::ReplicationGroup::ConsumeRedisCommandStream(
       source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
       continue;
     }
-    absl::Status applied = co_await ApplyRedisReplicatedCommand(command);
+    // Keep the owner here through apply and error formatting: name borrows
+    // its bytes, and the stream's embedded storage cannot be reused yet.
+    absl::Status applied = co_await ApplyRedisReplicatedCommand(*request);
     if (!applied.ok()) {
       co_return absl::Status(
           applied.code(), absl::StrCat("failed to apply Redis command '", name,

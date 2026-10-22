@@ -19,7 +19,11 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "lavik/command.h"
+#include "lavik/resp.h"
 
 namespace {
 
@@ -51,7 +55,8 @@ TEST(LuaEvalTest, CatalogSwapKeepsSuspendedExecutionRuntimeAlive) {
   ASSERT_TRUE(old_execution.ok());
   lavik::LuaExecutionStep old_step = (*old_execution)->Start(false);
   ASSERT_TRUE(old_step.call_.has_value());
-  EXPECT_EQ(old_step.call_->args_, (std::vector<std::string>{"PING"}));
+  ASSERT_EQ(old_step.call_->args_.size(), 1);
+  EXPECT_EQ(old_step.call_->args_.front(), "PING");
 
   const std::vector<std::string> replacement_catalog{
       "#!lua name=runtime_owner\n"
@@ -72,6 +77,42 @@ TEST(LuaEvalTest, CatalogSwapKeepsSuspendedExecutionRuntimeAlive) {
   const lavik::LuaExecutionStep new_step = (*new_execution)->Start(false);
   EXPECT_FALSE(new_step.call_.has_value());
   EXPECT_EQ(new_step.reply_, "$3\r\nnew\r\n");
+}
+
+TEST(LuaEvalTest, RedisCallOwnsPackedArgumentsAcrossVmTeardownAndHandoff) {
+  const std::vector<std::string> keys{std::string("key\0suffix", 10)};
+  for (std::size_t size : {64, 4096}) {
+    std::string value(size, 'v');
+    value[size / 2] = '\0';
+    const std::vector<std::string> argv{value};
+    auto execution = lavik::LuaExecution::Create(
+        "return redis.pcall('SET', KEYS[1], ARGV[1], 'PX', 9007199254740991)",
+        keys, argv);
+    ASSERT_TRUE(execution.ok());
+    auto step = (*execution)->Start(false);
+    ASSERT_TRUE(step.call_.has_value());
+    EXPECT_TRUE(step.call_->protected_call_);
+    auto* owner = &step.call_->args_.Get();
+    auto* index = owner->args.data();
+    auto* bytes = owner->bytes.data();
+
+    // Subcommand bytes belong to the yielded handle, not the suspended VM.
+    execution->reset();
+    auto call = std::move(*step.call_);
+    auto request = lavik::BuildCommandRequest(
+        lavik::RespCommand{.args_ = std::move(call.args_)}, 0);
+    ASSERT_TRUE(request.ok());
+    EXPECT_FALSE(call.args_.HasStorage());
+    EXPECT_EQ(&request->args_.Get(), owner);
+    EXPECT_EQ(request->args_.Get().args.data(), index);
+    EXPECT_EQ(request->args_.Get().bytes.data(), bytes);
+    ASSERT_EQ(request->args_.size(), 5);
+    EXPECT_EQ(request->args_[0], "SET");
+    EXPECT_EQ(request->args_[1], keys.front());
+    EXPECT_EQ(request->args_[2], value);
+    EXPECT_EQ(request->args_[3], "PX");
+    EXPECT_EQ(request->args_[4], "9007199254740991");
+  }
 }
 
 }  // namespace

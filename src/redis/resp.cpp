@@ -41,20 +41,16 @@ constexpr std::size_t kDirectBulkThreshold = 32 * 1024;
 constexpr std::size_t kDirectBulkReservation = 1024 * 1024;
 constexpr std::size_t kDirectBulkReadBytes = 256 * 1024;
 constexpr std::size_t kMaxLengthTextBytes = 32;
-absl::Status AppendArgument(std::string* output, std::string_view value) {
-  if (value.size() > std::numeric_limits<std::size_t>::max() - output->size()) {
-    return absl::ResourceExhaustedError("client argument is too large");
-  }
+absl::Status AppendArgument(CommandArgs* output, std::string_view value) {
   try {
-    output->append(value);
+    output->AppendLast(value);
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError("client argument is too large");
   }
   return absl::OkStatus();
 }
 
-absl::Status ReserveArguments(std::vector<std::string>* output,
-                              std::size_t desired) {
+absl::Status ReserveArguments(CommandArgs* output, std::size_t desired) {
   if (desired <= output->capacity()) return absl::OkStatus();
   std::size_t allocation_capacity = desired;
   if (output->capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
@@ -63,7 +59,7 @@ absl::Status ReserveArguments(std::vector<std::string>* output,
     return absl::ResourceExhaustedError("too many client arguments");
   }
   if (allocation_capacity >
-      std::numeric_limits<std::size_t>::max() / sizeof(std::string)) {
+      std::numeric_limits<std::size_t>::max() / sizeof(OffsetAndLength)) {
     return absl::ResourceExhaustedError("too many client arguments");
   }
   try {
@@ -76,22 +72,18 @@ absl::Status ReserveArguments(std::vector<std::string>* output,
   return absl::OkStatus();
 }
 
-absl::Status PushArgument(std::vector<std::string>* output,
-                          std::string argument) {
-  absl::Status reserved = ReserveArguments(output, output->size() + 1);
-  if (!reserved.ok()) return reserved;
-  output->push_back(std::move(argument));
-  return absl::OkStatus();
-}
-
-absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
-    std::string_view line) {
-  std::vector<std::string> args;
+absl::Status ParseInlineArguments(CommandArgs& args) {
+  const std::string_view line(args.bytes.data(), args.bytes.size());
+  std::size_t output = 0;
   std::size_t pos = 0;
   while (pos < line.size()) {
     while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
     if (pos == line.size()) break;
-    std::string argument;
+    if (args.size() == args.capacity()) [[unlikely]] {
+      absl::Status reserved = ReserveArguments(&args, args.size() + 1);
+      if (!reserved.ok()) return reserved;
+    }
+    args.args.push_back({output, 0});
     char quote = 0;
     if (line[pos] == '\'' || line[pos] == '"') quote = line[pos++];
     bool closed = quote == 0;
@@ -103,9 +95,8 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
       }
       if (quote == 0 && (value == ' ' || value == '\t')) break;
       if (value != '\\') {
-        absl::Status appended =
-            AppendArgument(&argument, std::string_view(&value, 1));
-        if (!appended.ok()) return appended;
+        args.bytes[output++] = value;
+        ++args.args.back().length;
         continue;
       }
       if (pos == line.size())
@@ -143,18 +134,18 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
           value = escaped;
           break;
       }
-      absl::Status appended =
-          AppendArgument(&argument, std::string_view(&value, 1));
-      if (!appended.ok()) return appended;
+      args.bytes[output++] = value;
+      ++args.args.back().length;
     }
     if (!closed) return absl::InvalidArgumentError("unterminated inline quote");
     if (quote != 0 && pos < line.size() && line[pos] != ' ' &&
         line[pos] != '\t')
       return absl::InvalidArgumentError("characters after inline quote");
-    absl::Status pushed = PushArgument(&args, std::move(argument));
-    if (!pushed.ok()) return pushed;
   }
-  return args;
+  // Decoding only removes framing/escapes, so output never overtakes input.
+  // No byte-buffer growth or argument string allocation occurs while decoding.
+  args.bytes.resize(output);
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -162,10 +153,9 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
 void RespCommandParser::ResetCommand() {
   state_ = State::kArrayStart;
   length_text_.clear();
-  // A reset abandons an incomplete request. Release its payload instead of
-  // retaining an attacker-selected bulk capacity on the connection.
-  current_argument_ = std::string{};
-  command_ = RespCommand{};
+  // A completed command has already transferred its handle. An abandoned
+  // command releases its storage and both packed buffers' overflow heaps.
+  command_.args_.Reset();
   arguments_remaining_ = 0;
   bulk_remaining_ = 0;
   bulk_prepared_ = 0;
@@ -175,10 +165,19 @@ void RespCommandParser::ResetCommand() {
 
 void RespCommandParser::Reset() { ResetCommand(); }
 
+// Keep the storage-selection wrapper inline even when its allocation fallback
+// exceeds the compiler's automatic inlining budget. Existing-capacity parsing
+// should not pay an out-of-line call just to obtain the argument owner.
+[[gnu::always_inline]] inline CommandArgs& RespCommandParser::Arguments() {
+  if (!command_.args_.HasStorage() && args_storage_ != nullptr)
+    command_.args_ = CommandArgsHandle::TryBorrow(*args_storage_);
+  return command_.args_.Get();
+}
+
 std::size_t RespCommandParser::BulkReadReservationSize() const noexcept {
-  if (state_ != State::kBulkData || current_argument_.empty() ||
+  if (state_ != State::kBulkData || command_.args_.back().empty() ||
       bulk_prepared_ != 0 ||
-      current_argument_.size() + bulk_remaining_ < kDirectBulkThreshold ||
+      command_.args_.back().size() + bulk_remaining_ < kDirectBulkThreshold ||
       command_bytes_ >= query_buffer_limit_)
     return 0;
   return std::min({bulk_remaining_, kDirectBulkReservation,
@@ -188,10 +187,10 @@ std::size_t RespCommandParser::BulkReadReservationSize() const noexcept {
 absl::Status RespCommandParser::PrepareBulkRead(std::size_t bytes) {
   if (bytes == 0 || bytes > BulkReadReservationSize())
     return absl::InvalidArgumentError("invalid RESP bulk read reservation");
-  // Resize makes the whole writable range valid string storage. Tracking its
+  // Resize makes the whole writable range valid byte storage. Tracking its
   // unread tail prevents initialized but unreceived bytes becoming payload.
   // Allocation failure follows Parse's process-fatal allocation policy.
-  current_argument_.resize(current_argument_.size() + bytes);
+  command_.args_.Get().ResizeLast(command_.args_.back().size() + bytes);
   bulk_prepared_ = bytes;
   return absl::OkStatus();
 }
@@ -199,7 +198,8 @@ absl::Status RespCommandParser::PrepareBulkRead(std::size_t bytes) {
 std::span<char> RespCommandParser::BulkReadBuffer() noexcept {
   if (state_ != State::kBulkData) return {};
   const auto bytes = std::min(bulk_prepared_, kDirectBulkReadBytes);
-  return {current_argument_.data() + current_argument_.size() - bulk_prepared_,
+  return {command_.args_.Get().MutableLast().data() +
+              command_.args_.back().size() - bulk_prepared_,
           bytes};
 }
 
@@ -258,7 +258,6 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         if (pos == input.size()) break;
         if (input[pos] != '*') {
           command_bytes_ = 0;
-          current_argument_.clear();
           state_ = State::kInline;
           break;
         }
@@ -272,27 +271,30 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         const std::size_t newline = input.find('\n', pos);
         const std::size_t end =
             newline == std::string_view::npos ? input.size() : newline + 1;
-        absl::Status appended =
-            AppendArgument(&current_argument_, input.substr(pos, end - pos));
-        if (!appended.ok()) return Error(appended, pos);
+        auto& bytes = Arguments().bytes;
+        const auto part = input.substr(pos, end - pos);
+        if (part.size() > bytes.max_size() - bytes.size())
+          return Error(
+              absl::ResourceExhaustedError("client argument is too large"),
+              pos);
+        bytes.insert(bytes.end(), part.begin(), part.end());
         if (!consume(end - pos)) {
           return Error(absl::ResourceExhaustedError(
                            "client request exceeds the query buffer limit"),
                        pos);
         }
         if (newline == std::string_view::npos) break;
-        current_argument_.pop_back();
-        if (!current_argument_.empty() && current_argument_.back() == '\r')
-          current_argument_.pop_back();
-        auto parsed = ParseInlineArguments(current_argument_);
-        if (!parsed.ok()) return Error(parsed.status(), pos);
-        if (parsed->empty()) {
+        bytes.pop_back();
+        if (!bytes.empty() && bytes.back() == '\r') bytes.pop_back();
+        auto parsed = ParseInlineArguments(command_.args_.Get());
+        if (!parsed.ok()) return Error(parsed, pos);
+        if (command_.args_.empty()) {
           ResetCommand();
           break;
         }
         result.state_ = RespParseState::kOk;
         result.consumed_ = pos;
-        result.command_.args_ = std::move(*parsed);
+        result.command_ = std::move(command_);
         ResetCommand();
         return result;
       }
@@ -346,21 +348,24 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                 break;
               }
               arguments_remaining_ = static_cast<std::size_t>(parsed);
-              absl::Status reserved = ReserveArguments(
-                  &command_.args_,
-                  std::min(arguments_remaining_, kInitialArgCapacity));
-              if (!reserved.ok()) return Error(reserved, pos);
+              auto& args = Arguments();
+              const auto desired =
+                  std::min(arguments_remaining_, kInitialArgCapacity);
+              if (desired > args.capacity()) [[unlikely]] {
+                absl::Status reserved = ReserveArguments(&args, desired);
+                if (!reserved.ok()) return Error(reserved, pos);
+              }
               state_ = State::kArgumentStart;
             } else {
               if (parsed > static_cast<long long>(kMaxBulkLen) ||
                   static_cast<unsigned long long>(parsed) >
-                      current_argument_.max_size()) {
+                      command_.args_.Get().bytes.max_size()) {
                 return Error(
                     absl::OutOfRangeError("RESP bulk string too large"), pos);
               }
               bulk_remaining_ = static_cast<std::size_t>(parsed);
               assert(bulk_prepared_ == 0);
-              current_argument_.clear();
+              command_.args_.Get().ResizeLast(0);
               state_ = State::kBulkData;
             }
             break;
@@ -381,7 +386,7 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         break;
       }
 
-      case State::kArgumentStart:
+      case State::kArgumentStart: {
         argument_type_ = input[pos];
         if (argument_type_ != '$' && argument_type_ != '=' &&
             argument_type_ != '+' && argument_type_ != ':' &&
@@ -396,18 +401,26 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                            "client request exceeds the query buffer limit"),
                        pos);
         }
-        current_argument_.clear();
+        // The nonempty array header already acquired storage. Only invoke the
+        // growth helper after exhausting its index capacity, not per argument.
+        auto& args = command_.args_.Get();
+        if (args.size() == args.capacity()) [[unlikely]] {
+          absl::Status reserved = ReserveArguments(&args, args.size() + 1);
+          if (!reserved.ok()) return Error(reserved, pos);
+        }
+        args.StartArgument();
         state_ = argument_type_ == '$' || argument_type_ == '='
                      ? State::kBulkLength
                      : State::kLineArgument;
         break;
+      }
 
       case State::kLineArgument: {
         const std::size_t newline = input.find('\n', pos);
         const std::size_t end =
             newline == std::string_view::npos ? input.size() : newline + 1;
         absl::Status appended =
-            AppendArgument(&current_argument_, input.substr(pos, end - pos));
+            AppendArgument(&command_.args_.Get(), input.substr(pos, end - pos));
         if (!appended.ok()) return Error(appended, pos);
         if (!consume(end - pos)) {
           return Error(absl::ResourceExhaustedError(
@@ -415,26 +428,21 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                        pos);
         }
         if (newline == std::string_view::npos) break;
-        if (current_argument_.size() < 2 ||
-            current_argument_[current_argument_.size() - 2] != '\r') {
+        if (command_.args_.back().size() < 2 ||
+            command_.args_.back()[command_.args_.back().size() - 2] != '\r') {
           return Error(
               absl::InvalidArgumentError("malformed RESP scalar terminator"),
               pos);
         }
-        current_argument_.resize(current_argument_.size() - 2);
+        command_.args_.Get().ResizeLast(command_.args_.back().size() - 2);
         if (argument_type_ == '#') {
-          if (current_argument_ == "t")
-            current_argument_ = "1";
-          else if (current_argument_ == "f")
-            current_argument_ = "0";
-          else
+          const auto value = command_.args_.back();
+          if (value != "t" && value != "f")
             return Error(absl::InvalidArgumentError("invalid RESP boolean"),
                          pos);
+          const char digit = value == "t" ? '1' : '0';
+          command_.args_.Get().MutableLast()[0] = digit;
         }
-        absl::Status pushed =
-            PushArgument(&command_.args_, std::move(current_argument_));
-        if (!pushed.ok()) return Error(pushed, pos);
-        current_argument_.clear();
         --arguments_remaining_;
         if (arguments_remaining_ != 0) {
           state_ = State::kArgumentStart;
@@ -451,22 +459,20 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         const std::size_t available = input.size() - pos;
         const std::size_t take = std::min(available, bulk_remaining_);
         if (take != 0) {
-          // Bulk length was checked against both the protocol limit and the
-          // string's max_size before this state was entered. bulk_remaining_
-          // bounds the cumulative append, so repeating overflow checks and a
-          // length_error handler on every ordinary RESP argument is redundant.
+          // bulk_remaining_ bounds this argument; AppendLast also checks the
+          // total packed size because earlier arguments share the same buffer.
           // Allocation failure remains process-fatal through the coroutine's
           // unhandled-exception policy.
           if (bulk_prepared_ == 0) [[likely]] {
-            current_argument_.append(input.substr(pos, take));
+            command_.args_.Get().AppendLast(input.substr(pos, take));
           } else {
             const auto prepared = std::min(take, bulk_prepared_);
-            std::memcpy(current_argument_.data() + current_argument_.size() -
-                            bulk_prepared_,
+            std::memcpy(command_.args_.Get().MutableLast().data() +
+                            command_.args_.back().size() - bulk_prepared_,
                         input.data() + pos, prepared);
             bulk_prepared_ -= prepared;
             if (take > prepared)
-              current_argument_.append(
+              command_.args_.Get().AppendLast(
                   input.substr(pos + prepared, take - prepared));
           }
           bulk_remaining_ -= take;
@@ -501,18 +507,15 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         if (terminator_bytes_ != 2) break;
 
         if (argument_type_ == '=') {
-          if (current_argument_.size() < 4 || current_argument_[3] != ':') {
+          if (command_.args_.back().size() < 4 ||
+              command_.args_.back()[3] != ':') {
             return Error(
                 absl::InvalidArgumentError("invalid RESP verbatim string"),
                 pos);
           }
-          current_argument_.erase(0, 4);
+          command_.args_.Get().RemoveLastPrefix(4);
         }
 
-        absl::Status pushed =
-            PushArgument(&command_.args_, std::move(current_argument_));
-        if (!pushed.ok()) return Error(pushed, pos);
-        current_argument_.clear();
         --arguments_remaining_;
         if (arguments_remaining_ != 0) {
           state_ = State::kArgumentStart;

@@ -622,7 +622,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   keys.reserve(key_args.size());
   for (std::size_t arg : key_args) {
     single_shard &= ShardForKey(args[arg]) == first_owner;
-    keys.push_back(args[arg]);
+    keys.emplace_back(args[arg]);
   }
   struct SnapshotAttemptGuard {
     bool snapshot_active_ = false;
@@ -926,7 +926,7 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendError("ERR timeout is negative"));
   }
 
-  CommandRequest nonblocking = request;
+  CommandRequest nonblocking = request.WithArgs({});
   if (request.kind_ == CommandKind::kBLPop ||
       request.kind_ == CommandKind::kBRPop) {
     nonblocking.kind_ = CommandKind::kLMPop;
@@ -946,12 +946,14 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
                              args.end());
   } else if (request.kind_ == CommandKind::kBLMove) {
     nonblocking.kind_ = CommandKind::kLMove;
-    nonblocking.args_.assign(args.begin(), args.begin() + 5);
-    nonblocking.args_[0] = "LMOVE";
+    nonblocking.args_.push_back("LMOVE");
+    nonblocking.args_.insert(nonblocking.args_.end(), args.begin() + 1,
+                             args.begin() + 5);
   } else {
     nonblocking.kind_ = CommandKind::kRPopLPush;
-    nonblocking.args_.assign(args.begin(), args.begin() + 3);
-    nonblocking.args_[0] = "RPOPLPUSH";
+    nonblocking.args_.push_back("RPOPLPUSH");
+    nonblocking.args_.insert(nonblocking.args_.end(), args.begin() + 1,
+                             args.begin() + 3);
   }
 
   auto wait_deadline = BlockingDeadlineFromSeconds(timeout_seconds);

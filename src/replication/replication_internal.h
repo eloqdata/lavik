@@ -486,6 +486,8 @@ class RedisCommandStream {
  public:
   explicit RedisCommandStream(TcpStream* stream) : stream_(stream) {}
 
+  // Results own their slot handles, but must be destroyed before this stream's
+  // storage. The consumer retains each result until its awaited apply finishes.
   Task<absl::StatusOr<RedisWireCommand>> Next() {
     constexpr std::size_t kMaxPendingBytes = 1ULL * 1024 * 1024 * 1024;
     std::uint64_t prefix_bytes = 0;
@@ -523,7 +525,8 @@ class RedisCommandStream {
 
  private:
   TcpStream* stream_;
-  RespCommandParser parser_;
+  CommandArgsStorage args_storage_;
+  RespCommandParser parser_{kDefaultClientQueryBufferLimit, &args_storage_};
   std::string pending_;
 };
 
@@ -2445,6 +2448,9 @@ class ReplicationManager::ReplicationGroup {
 
   absl::Status ValidateRedisSourceCommand(
       const ReplicatedCommand& command,
+      const std::shared_ptr<RedisSource>& source);
+  absl::Status ValidateRedisSourceCommand(
+      const CommandRequest& request,
       const std::shared_ptr<RedisSource>& source);
 
   Task<absl::Status> ResetRedisSourceSlots(

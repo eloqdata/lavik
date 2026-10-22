@@ -12839,8 +12839,7 @@ unsigned ReplicationManager::replica_priority() const noexcept {
   return group_->replica_priority();
 }
 
-bool ReplicationManager::IsNativeHandshake(
-    std::span<const std::string> args) noexcept {
+bool ReplicationManager::IsNativeHandshake(CommandArgsView args) noexcept {
   return !args.empty() && (EqualCaseInsensitive(args.front(), "LVPSYNC") ||
                            EqualCaseInsensitive(args.front(), "LVFLOW") ||
                            EqualCaseInsensitive(args.front(), "LVRECOVER") ||

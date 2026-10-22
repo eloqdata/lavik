@@ -242,7 +242,7 @@ bool OptionIs(std::string_view token, std::string_view expected) {
 }
 
 void ExecuteHello(const PasswordAuthenticator& authenticator,
-                  SentinelSession& session, std::span<const std::string> args) {
+                  SentinelSession& session, CommandArgsView args) {
   auto& reply = session.reply_;
   auto version = reply.version();
   std::optional<std::pair<std::string_view, std::string_view>> credentials;
@@ -328,7 +328,7 @@ void ExecuteHello(const PasswordAuthenticator& authenticator,
 // refusal is a deterministic answer, not a topology claim.
 SessionAction ExecuteSentinelCommand(DiscoverySource& source,
                                      SentinelSession& session,
-                                     std::span<const std::string> args) {
+                                     CommandArgsView args) {
   auto& reply = session.reply_;
   if (args.size() < 2) {
     reply.AppendError("ERR wrong number of arguments for 'sentinel' command");
@@ -383,7 +383,7 @@ SessionAction ExecuteSentinelCommand(DiscoverySource& source,
 
 SessionAction ExecuteConnectionCommand(
     const PasswordAuthenticator& authenticator, DiscoverySource& discovery,
-    SentinelSession& session, std::span<const std::string> args,
+    SentinelSession& session, CommandArgsView args,
     const MetaSentinelServerOptions& limits) {
   auto& reply = session.reply_;
   reply.Reset();
@@ -1079,7 +1079,8 @@ bycorf::Task<absl::Status> MetaSentinelServer::SessionLoop(
   session.connection_ = connection;
   core->live_.emplace(connection, &session);
   core->worker_->Spawn(core->WriteSession(&stream, &session));
-  RespCommandParser parser(core->options_.query_limit_);
+  CommandArgsStorage args_storage;
+  RespCommandParser parser(core->options_.query_limit_, &args_storage);
   std::array<std::byte, 4096> buffer;
   std::string pending;
   unsigned commands = 0;

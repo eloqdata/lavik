@@ -76,23 +76,13 @@ bool AddCommandArgumentAllocationBytes(std::span<const String> args,
 template <typename String>
 std::optional<std::size_t> CommandStagingBytes(
     std::span<const String> args) noexcept {
-  // This allowance covers the ring item, vector control object, shared-owner
-  // control block, and event metadata without coupling the hot path to a
-  // particular allocator's size classes. Keep it deliberately conservative;
-  // the configured waterline is a fixed staging budget, not used_memory.
-  std::size_t total = kReplicationPublisherItemMetadataBytes;
-  if (args.size() >
-      (std::numeric_limits<std::size_t>::max() - total) / sizeof(std::string)) {
-    return std::nullopt;
-  }
-  total += args.size() * sizeof(std::string);
+  std::size_t bytes = 0;
   for (const auto& arg : args) {
-    if (arg.size() > std::numeric_limits<std::size_t>::max() - total) {
+    if (arg.size() > std::numeric_limits<std::size_t>::max() - bytes)
       return std::nullopt;
-    }
-    total += arg.size();
+    bytes += arg.size();
   }
-  return total;
+  return ReplicationCommandStagingBytes(args.size(), bytes);
 }
 
 bool CursorBefore(const ReplicationLogCursor& left,
@@ -177,6 +167,23 @@ void AccountReplicationCommand(ReplicationCommandAppend* command) {
   auto charge = std::make_shared<RetainedMemoryCharge>();
   charge->Account(CurrentMemoryAccountingShard(), bytes);
   command->retained_owner_ = std::move(charge);
+}
+
+std::optional<std::size_t> ReplicationCommandStagingBytes(
+    std::size_t argument_count, std::size_t argument_bytes) noexcept {
+  // The published journal still owns strings. Estimate that representation,
+  // independently of whether the source request owns strings or packed bytes.
+  // The fixed allowance covers the ring item, vector control object, shared
+  // owner control block, and event metadata without allocator size classes:
+  // this conservative staging waterline is separate from used_memory.
+  std::size_t total = kReplicationPublisherItemMetadataBytes;
+  if (argument_count >
+      (std::numeric_limits<std::size_t>::max() - total) / sizeof(std::string))
+    return std::nullopt;
+  total += argument_count * sizeof(std::string);
+  if (argument_bytes > std::numeric_limits<std::size_t>::max() - total)
+    return std::nullopt;
+  return total + argument_bytes;
 }
 
 std::optional<std::size_t> ReplicationCommandStagingBytes(

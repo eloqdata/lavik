@@ -168,7 +168,7 @@ class ClusterRuntimeGuard {
   }
 };
 
-lavik::CommandRequest MakeRequest(std::vector<std::string> args,
+lavik::CommandRequest MakeRequest(lavik::CommandArgs args,
                                   bool connection_tls = false) {
   lavik::CommandRequest request;
   request.kind_ = lavik::CommandKind::kCluster;
@@ -199,7 +199,7 @@ std::string RunClusterCommand(
 }
 
 std::string RunDispatch(lavik::ConnectionContext& context,
-                        std::vector<std::string> args) {
+                        lavik::CommandArgs args) {
   auto request = lavik::BuildCommandRequest(
       lavik::RespCommand{.args_ = std::move(args)}, context.selected_db_);
   EXPECT_TRUE(request.ok()) << request.status();
@@ -300,7 +300,7 @@ TEST(ClusterCommandTest, PublishUsesItsChannelSlotAndHonorsControlledPause) {
 TEST(ClusterCommandTest, SubcommandErrorsMatchRedis) {
   cluster::SetClientMode(lavik::ClientMode::kSingle);
   cluster::InstallClusterRuntime(nullptr);
-  const auto expect_error = [](std::vector<std::string> args,
+  const auto expect_error = [](lavik::CommandArgs args,
                                std::string_view subcommand) {
     EXPECT_EQ(RunClusterCommand(MakeRequest(std::move(args))),
               lavik::EncodeError(absl::StrCat(

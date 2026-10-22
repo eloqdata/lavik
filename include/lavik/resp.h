@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "lavik/command_args.h"
 #include "lavik/resp_version.h"
 
 namespace lavik {
@@ -43,7 +44,7 @@ inline constexpr std::size_t kMinimumClientQueryBufferLimit =
     1ULL * 1024 * 1024;
 
 struct RespCommand {
-  std::vector<std::string> args_;
+  CommandArgsHandle args_;
 };
 
 enum class RespParseState {
@@ -66,10 +67,14 @@ class RespCommandParser {
  public:
   // The limit applies to the wire bytes retained while assembling one command.
   // Completed commands transfer ownership to the caller and no longer count
-  // toward this parser-local guard.
+  // toward this parser-local guard. A supplied args_storage is borrowed when
+  // free and must outlive this parser and any command borrowing it. While it is
+  // occupied (or absent), commands own independent storage that is deleted when
+  // released. Returned commands can outlive the parser.
   explicit RespCommandParser(
-      std::size_t query_buffer_limit = kDefaultClientQueryBufferLimit) noexcept
-      : query_buffer_limit_(query_buffer_limit) {}
+      std::size_t query_buffer_limit = kDefaultClientQueryBufferLimit,
+      CommandArgsStorage* args_storage = nullptr) noexcept
+      : args_storage_(args_storage), query_buffer_limit_(query_buffer_limit) {}
 
   RespParseResult Parse(std::string_view input);
 
@@ -94,6 +99,7 @@ class RespCommandParser {
   // returns completed commands. It can also fill a partially used window.
   absl::Status CommitBulkRead(std::size_t bytes);
 
+  // Abandons the current command and releases overflow argument-array storage.
   void Reset();
   // Changes the guard without disturbing partially parsed state. If the new
   // limit is already below the retained command size, the next input byte is
@@ -120,15 +126,17 @@ class RespCommandParser {
   RespParseResult Error(absl::Status status, std::size_t consumed);
   bool Account(std::size_t bytes);
   void ResetCommand();
+  CommandArgs& Arguments();
 
   State state_ = State::kArrayStart;
   std::string length_text_;
+  CommandArgsStorage* args_storage_ = nullptr;
   RespCommand command_;
-  std::string current_argument_;
   std::size_t arguments_remaining_ = 0;
   std::size_t bulk_remaining_ = 0;
-  // String size includes this prepared but unwritten tail. Received payload
-  // ends before it; bulk_remaining_ includes it. Parse-only callers keep zero.
+  // The last argument includes this prepared but unwritten tail. Received
+  // payload ends before it; bulk_remaining_ includes it. Parse-only callers
+  // keep zero.
   std::size_t bulk_prepared_ = 0;
   std::size_t terminator_bytes_ = 0;
   std::size_t command_bytes_ = 0;

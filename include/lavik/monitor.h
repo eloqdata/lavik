@@ -24,6 +24,7 @@
 
 #include "absl/status/status.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/command_args.h"
 
 namespace bycorf {
 class TcpStream;
@@ -44,8 +45,8 @@ bool HasMonitorSessions() noexcept;
 // Returns null for commands that Valkey excludes from MONITOR (ADMIN,
 // SKIP_MONITOR, unknown commands, and invalid arity).
 std::shared_ptr<const std::string> PrepareMonitorMessage(
-    std::uint8_t db_id, std::string_view endpoint,
-    std::span<const std::string> args, const CommandRequest* request = nullptr);
+    std::uint8_t db_id, std::string_view endpoint, CommandArgsView args,
+    const CommandRequest* request = nullptr);
 
 // One-way fanout. The caller never waits for monitor consumers.
 void PublishMonitorMessage(std::shared_ptr<const std::string> message);

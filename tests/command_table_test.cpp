@@ -32,6 +32,8 @@
 
 #include "lavik/command.h"
 #include "lavik/glob.h"
+#include "lavik/resp.h"
+#include "lavik/session.h"
 #include "lavik/storage/engine.h"
 #include "support/test_data_path.h"
 
@@ -43,6 +45,110 @@ using lavik::CommandSpec;
 using lavik::DetermineKeys;
 using lavik::FindCommand;
 using lavik::KeyIndexView;
+
+TEST(CommandTableTest, RequestHandoffPreservesHeapOwnedArgumentPayloads) {
+  const std::string value(1024, '\0');
+  for (const std::size_t pairs : {1, 4}) {
+    lavik::RespCommand command;
+    command.args_.push_back(pairs == 1 ? "SET" : "MSET");
+    for (std::size_t i = 0; i < pairs; ++i) {
+      command.args_.push_back("key" + std::to_string(i));
+      command.args_.push_back(value);
+    }
+    std::vector<const char*> payloads;
+    for (std::size_t i = 0; i < pairs; ++i)
+      payloads.push_back(command.args_[2 * i + 2].data());
+
+    auto request = lavik::BuildCommandRequest(std::move(command), 0);
+    ASSERT_TRUE(request.ok()) << request.status();
+    ASSERT_EQ(request->args_.size(), 1 + 2 * pairs);
+    for (std::size_t i = 0; i < pairs; ++i) {
+      EXPECT_EQ(request->args_[2 * i + 2], value);
+      // Handoff transfers the owning pointer, preserving all payload addresses
+      // inside the packed buffer without copying its bytes again.
+      EXPECT_EQ(request->args_[2 * i + 2].data(), payloads[i]);
+    }
+  }
+}
+
+TEST(CommandTableTest, QueuedRequestsKeepArgumentAndInlineByteAddresses) {
+  lavik::ConnectionContext connection;
+  lavik::RespCommandParser parser(lavik::kDefaultClientQueryBufferLimit,
+                                  &connection.command_args_storage_);
+  struct Addresses {
+    const lavik::OffsetAndLength* arguments;
+    const char* key;
+    const char* value;
+  };
+  std::vector<Addresses> addresses;
+  // Exceed a network batch and grow the MULTI vector several times. Alternate
+  // inline and heap indexes; both must retain offsets and payload addresses.
+  for (unsigned i = 0; i != 140; ++i) {
+    auto parsed = parser.Parse(i % 2 == 0 ? "SET key value\r\n"
+                                          : "MSET key value a b c d e f\r\n");
+    ASSERT_EQ(parsed.state_, lavik::RespParseState::kOk);
+    addresses.push_back({parsed.command_.args_.Get().args.data(),
+                         parsed.command_.args_[1].data(),
+                         parsed.command_.args_[2].data()});
+    auto request = lavik::BuildCommandRequest(std::move(parsed.command_), 2);
+    ASSERT_TRUE(request.ok()) << request.status();
+    EXPECT_FALSE(parsed.command_.args_.HasStorage());
+    connection.queued_.push_back(std::move(*request));
+    EXPECT_FALSE(request->args_.HasStorage());
+  }
+  auto executing = std::move(connection.queued_);
+  connection.ResetMulti();
+  for (std::size_t i = 0; i != executing.size(); ++i) {
+    EXPECT_EQ(executing[i].args_.Get().args.data(), addresses[i].arguments);
+    EXPECT_EQ(executing[i].args_[1].data(), addresses[i].key);
+    EXPECT_EQ(executing[i].args_[2].data(), addresses[i].value);
+    EXPECT_EQ(executing[i].args_[1], "key");
+    EXPECT_EQ(executing[i].args_[2], "value");
+    EXPECT_EQ(executing[i].db_id_, 2);
+  }
+  executing.clear();
+  auto reused = parser.Parse("GET next\r\n");
+  ASSERT_EQ(reused.state_, lavik::RespParseState::kOk);
+  EXPECT_EQ(reused.command_.args_[1], "next");
+  // Leave a live queued handle for the connection destructor, as on a client
+  // disconnect during MULTI. The embedded storage must outlive this queue.
+  auto request = lavik::BuildCommandRequest(std::move(reused.command_), 0);
+  ASSERT_TRUE(request.ok());
+  connection.queued_.push_back(std::move(*request));
+}
+
+TEST(CommandTableTest, ExplicitCloneOwnsIndependentArgumentsAndMetadata) {
+  lavik::CommandRequest clone;
+  {
+    lavik::CommandArgsStorage storage;
+    lavik::RespCommandParser parser(lavik::kDefaultClientQueryBufferLimit,
+                                    &storage);
+    auto parsed = parser.Parse("SET key value\r\n");
+    auto request = lavik::BuildCommandRequest(std::move(parsed.command_), 3);
+    ASSERT_TRUE(request.ok());
+    request->resp_version_ = lavik::RespVersion::k3;
+    request->write_admission_role_epoch_valid_ = true;
+    request->write_admission_role_epoch_ = 123;
+    request->serving_generation_valid_ = true;
+    request->serving_generation_ = 456;
+    request->SetRoutedPartition(77, 1);
+    clone = request->Clone();
+    ASSERT_NE(clone.args_.Get().bytes.data(),
+              request->args_.Get().bytes.data());
+    clone.args_.Get().MutableLast().front() = 'V';
+    EXPECT_EQ(request->args_[2], "value");
+  }
+  EXPECT_EQ(clone.args_[2], "Value");
+  EXPECT_EQ(clone.kind_, CommandKind::kSet);
+  EXPECT_EQ(clone.db_id_, 3);
+  EXPECT_EQ(clone.resp_version_, lavik::RespVersion::k3);
+  EXPECT_TRUE(clone.write_admission_role_epoch_valid_);
+  EXPECT_EQ(clone.write_admission_role_epoch_, 123);
+  EXPECT_TRUE(clone.serving_generation_valid_);
+  EXPECT_EQ(clone.serving_generation_, 456);
+  EXPECT_TRUE(clone.HasRoutedPartitionFor(1));
+  EXPECT_EQ(clone.RoutedPartitionId(), 77);
+}
 
 // Test-only transliteration of Valkey's stringmatchlen_impl (nocase=false).
 // Keeping the oracle independent of the iterative production matcher catches
@@ -1034,7 +1140,7 @@ TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
   }
   ASSERT_FALSE(cross.empty()) << "no cross-shard probe key found";
 
-  auto request = [](std::vector<std::string> args) {
+  auto request = [](lavik::CommandArgs args) {
     lavik::CommandRequest built;
     built.spec_ = FindCommand(args.front());
     built.kind_ =
@@ -1042,7 +1148,7 @@ TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
     built.args_ = std::move(args);
     return built;
   };
-  auto spans = [&request](std::vector<std::string> args) {
+  auto spans = [&request](lavik::CommandArgs args) {
     return lavik::RequestSpansMultipleShards(request(std::move(args)));
   };
 

@@ -21,6 +21,7 @@
 
 #include "absl/status/status.h"
 #include "lavik/command.h"
+#include "lavik/command_args.h"
 
 namespace lavik {
 
@@ -53,6 +54,6 @@ Task<std::string> ExecuteStreamReadLocked(
 // Expand a native Stream group replacement/delta into ordinary Redis commands.
 // Non-private commands pass through; malformed private payloads fail closed.
 absl::StatusOr<std::vector<std::vector<std::string>>> RedisExportStreamGroup(
-    std::span<const std::string> args);
+    CommandArgsView args);
 
 }  // namespace lavik

@@ -23,6 +23,7 @@
 #include <string_view>
 
 #include "lavik/command.h"
+#include "lavik/command_args.h"
 
 namespace lavik {
 
@@ -86,7 +87,7 @@ struct CommandSpec {
 const CommandSpec* FindCommand(std::string_view name);
 // Resolve execution metadata for a concrete request. FUNCTION inspection and
 // run controls do not inherit the catalog mutation's write/publisher flags.
-const CommandSpec* FindCommand(std::span<const std::string> args);
+const CommandSpec* FindCommand(CommandArgsView args);
 
 // Complete canonical command metadata, used by Redis-compatible COMMAND.
 std::span<const CommandSpec> CommandSpecs() noexcept;
@@ -119,6 +120,6 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
 // Resolves argument-dependent key ranges such as LMPOP/BLMPOP in addition to
 // the static Redis key spec above.
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
-                                           std::span<const std::string> args);
+                                           CommandArgsView args);
 
 }  // namespace lavik
