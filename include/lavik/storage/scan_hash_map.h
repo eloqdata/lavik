@@ -830,11 +830,23 @@ inline ScanHashMapEntryArena::Handle ScanHashMapEntryArena::HandleOf(
 
 // The default policy stores every value directly in Entry. Specialized maps
 // may split a value into a common hot-path prefix and an optional derived
-// payload while retaining the same hash-table implementation.
+// payload and a variable byte tail before the key metadata. TailBytesFor
+// sizes a new allocation; TailBytes describes the retained representation.
+// CanAssign must reject a value that needs a wider representation.
+// InitializeTail runs before the key tail is populated.
 template <typename Value>
 struct ScanHashMapInlineEntryPolicy {
   using StoredValue = Value;
   struct Extra {};
+  static constexpr std::size_t kMaxTailBytes = 0;
+  static constexpr std::size_t TailBytesFor(const Value&) noexcept { return 0; }
+  static constexpr std::size_t TailBytes(const StoredValue&) noexcept {
+    return 0;
+  }
+  static constexpr bool CanAssign(const StoredValue&, const Value&) noexcept {
+    return true;
+  }
+  static void InitializeTail(StoredValue*, const Value&, std::byte*) noexcept {}
 
   static constexpr bool HasExtraValue(const Value&) noexcept { return false; }
   static constexpr bool HasExtraStored(const StoredValue&) noexcept {
@@ -843,7 +855,8 @@ struct ScanHashMapInlineEntryPolicy {
   static StoredValue Store(const Value& value) { return value; }
   static Extra StoreExtra(const Value&) noexcept { return {}; }
   static Value Load(const StoredValue& value, const Extra*) { return value; }
-  static void Assign(StoredValue* stored, Extra*, const Value& value) {
+  static void Assign(StoredValue* stored, Extra*, const Value& value,
+                     std::byte*) {
     *stored = value;
   }
 };
@@ -1151,12 +1164,13 @@ class ScanHashMap {
     Value value() const { return EntryPolicy::Load(value_, optional_extra()); }
 
     bool can_assign(const Value& value) const noexcept {
-      return has_extra() == EntryPolicy::HasExtraValue(value);
+      return has_extra() == EntryPolicy::HasExtraValue(value) &&
+             EntryPolicy::CanAssign(value_, value);
     }
 
     void assign(const Value& value) {
       assert(can_assign(value));
-      EntryPolicy::Assign(&value_, optional_extra(), value);
+      EntryPolicy::Assign(&value_, optional_extra(), value, value_tail());
     }
 
     bool key_complete() const noexcept {
@@ -1267,6 +1281,8 @@ class ScanHashMap {
 
     EntryExtra* extra() noexcept;
     const EntryExtra* extra() const noexcept;
+    std::byte* value_tail() noexcept;
+    const std::byte* value_tail() const noexcept;
     std::byte* tail() noexcept;
     const std::byte* tail() const noexcept;
   };
@@ -1417,14 +1433,18 @@ class ScanHashMap {
   }
 
   // After the caller validates key length, a false result is the explicit
-  // 32-bit page-ID capacity boundary. Callers that publish other state before
+  // 32-bit page-ID capacity boundary. value_tail_bytes defaults to the policy
+  // maximum; pass TailBytesFor(value) for exact variable-tail admission.
+  // Callers that publish other state before
   // insertion must check this while mutation remains owner-serialized and
   // report ResourceExhausted instead of allowing the handle namespace to wrap.
-  bool CanAllocateEntry(std::string_view key, bool key_complete,
-                        bool has_extra) const noexcept {
+  bool CanAllocateEntry(std::string_view key, bool key_complete, bool has_extra,
+                        std::size_t value_tail_bytes =
+                            EntryPolicy::kMaxTailBytes) const noexcept {
     if (key.size() > Entry::kMaxLogicalKeySize) return false;
-    const std::size_t bytes = EntryAllocationBytes(
-        static_cast<std::uint32_t>(key.size()), key_complete, has_extra);
+    const std::size_t bytes =
+        EntryAllocationBytes(static_cast<std::uint32_t>(key.size()),
+                             key_complete, has_extra, value_tail_bytes);
     return arena_ == nullptr || arena_->CanAllocate(bytes);
   }
 
@@ -1433,18 +1453,20 @@ class ScanHashMap {
   // and bucket storage suffice. Callers hold the returned process-memory
   // reservation across the non-suspending mutation, closing the admission to
   // allocator-accounting race without adding work to ordinary page reuse.
-  std::size_t RequiredAllocationBytes(const Digest& digest,
-                                      std::string_view key, bool key_complete,
-                                      bool has_extra,
-                                      bool inserting) const noexcept {
+  std::size_t RequiredAllocationBytes(
+      const Digest& digest, std::string_view key, bool key_complete,
+      bool has_extra, bool inserting,
+      std::size_t value_tail_bytes =
+          EntryPolicy::kMaxTailBytes) const noexcept {
     auto add = [](std::size_t left, std::size_t right) noexcept {
       return right > std::numeric_limits<std::size_t>::max() - left
                  ? std::numeric_limits<std::size_t>::max()
                  : left + right;
     };
 
-    const std::size_t entry_bytes = EntryAllocationBytes(
-        static_cast<std::uint32_t>(key.size()), key_complete, has_extra);
+    const std::size_t entry_bytes =
+        EntryAllocationBytes(static_cast<std::uint32_t>(key.size()),
+                             key_complete, has_extra, value_tail_bytes);
     std::size_t required = arena_ == nullptr
                                ? ScanHashMapEntryArena::kPageBytes
                                : arena_->AllocationBytesIfNewPage(entry_bytes);
@@ -1659,8 +1681,8 @@ class ScanHashMap {
   }
 
   // Updates an entry without changing its address when the policy-selected
-  // concrete type stays the same. If the representation changes, swaps a new
-  // object into the existing bucket slot and returns the detached old object
+  // representation can hold the new value. Otherwise, swaps a new object
+  // into the existing bucket slot and returns the detached old object
   // through `replaced`. Before destroying it, the caller must migrate caches
   // that assume a live object; asynchronous address-only caches can instead
   // use FindAddress to validate membership before dereferencing.
@@ -1710,7 +1732,7 @@ class ScanHashMap {
     RequireDrained(write);
     if (Entry* existing = Find(digest, key); existing != nullptr) {
       // The inline policy never changes representation. Specialized policies
-      // use ReplaceValue when a new value changes the concrete entry type.
+      // use ReplaceValue when a new value needs a different representation.
       assert(existing->can_assign(value));
       existing->assign(value);
       return {existing, false, false};
@@ -2334,14 +2356,14 @@ class ScanHashMap {
     return static_cast<const Entry*>(arena_->Resolve(handle));
   }
 
-  static std::size_t EntryAllocationBytes(std::uint32_t logical_size,
-                                          bool key_complete,
-                                          bool has_extra) noexcept {
+  static std::size_t EntryAllocationBytes(
+      std::uint32_t logical_size, bool key_complete, bool has_extra,
+      std::size_t value_tail_bytes) noexcept {
     const std::size_t metadata =
         Entry::KeyMetadataBytesFor(logical_size, key_complete);
     const std::size_t payload = key_complete ? logical_size : sizeof(Digest);
-    return (has_extra ? sizeof(ExtendedEntry) : sizeof(Entry)) + metadata +
-           payload;
+    return (has_extra ? sizeof(ExtendedEntry) : sizeof(Entry)) +
+           value_tail_bytes + metadata + payload;
   }
 
   void DestroyEntry(Entry* entry, EntryHandle handle) noexcept {
@@ -3217,7 +3239,8 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
   const std::size_t tail_bytes = metadata_bytes + payload_bytes;
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
-      extended ? sizeof(ExtendedEntry) : sizeof(Entry);
+      (extended ? sizeof(ExtendedEntry) : sizeof(Entry)) +
+      EntryPolicy::TailBytesFor(value);
   if (tail_bytes > std::numeric_limits<std::size_t>::max() - header_bytes) {
     return {};
   }
@@ -3239,6 +3262,7 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
     arena.Deallocate(allocation.handle_);
     throw;
   }
+  EntryPolicy::InitializeTail(&entry->value_, value, entry->value_tail());
   const std::uint8_t written_metadata =
       EncodeKeyMetadata(entry->tail(), logical_size, key_complete);
   assert(written_metadata == metadata_bytes);
@@ -3261,7 +3285,8 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy, ReadStripeCount>::Entry::
   const std::size_t tail_bytes = source.tail_bytes();
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
-      extended ? sizeof(ExtendedEntry) : sizeof(Entry);
+      (extended ? sizeof(ExtendedEntry) : sizeof(Entry)) +
+      EntryPolicy::TailBytesFor(value);
   if (tail_bytes > std::numeric_limits<std::size_t>::max() - header_bytes) {
     return {};
   }
@@ -3281,6 +3306,7 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy, ReadStripeCount>::Entry::
     arena.Deallocate(allocation.handle_);
     throw;
   }
+  EntryPolicy::InitializeTail(&entry->value_, value, entry->value_tail());
   if (tail_bytes != 0) {
     std::memcpy(entry->tail(), source.tail(), tail_bytes);
   }
@@ -3305,10 +3331,13 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
   return &static_cast<const ExtendedEntry*>(this)->extra_;
 }
 
+// Start from the complete arena entry, not its fixed value subobject. This
+// preserves the allocation's bounds for fortified stores into the variable
+// tail, which belongs to the arena allocation rather than to StoredValue.
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
           std::size_t ReadStripeCount>
 std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
-                       ReadStripeCount>::Entry::tail() noexcept {
+                       ReadStripeCount>::Entry::value_tail() noexcept {
   return reinterpret_cast<std::byte*>(this) +
          (has_extra() ? sizeof(ExtendedEntry) : sizeof(Entry));
 }
@@ -3316,9 +3345,24 @@ std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
           std::size_t ReadStripeCount>
 const std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
-                             ReadStripeCount>::Entry::tail() const noexcept {
+                             ReadStripeCount>::Entry::value_tail()
+    const noexcept {
   return reinterpret_cast<const std::byte*>(this) +
          (has_extra() ? sizeof(ExtendedEntry) : sizeof(Entry));
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                       ReadStripeCount>::Entry::tail() noexcept {
+  return value_tail() + EntryPolicy::TailBytes(value_);
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
+          std::size_t ReadStripeCount>
+const std::byte* ScanHashMap<Value, MaxBucketExponent, EntryPolicy,
+                             ReadStripeCount>::Entry::tail() const noexcept {
+  return value_tail() + EntryPolicy::TailBytes(value_);
 }
 
 }  // namespace lavik::storage

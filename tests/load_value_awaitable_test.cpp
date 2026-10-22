@@ -783,12 +783,17 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     }
   }
   void IndexLocation() {
-    ASSERT_NE(Store()
-                  .partitions_[0]
-                  .indexes_[0]
-                  .InsertOrAssign(digest_, key_, location_)
-                  .entry_,
-              nullptr);
+    auto& index = Store().partitions_[0].indexes_[0];
+    if (auto* existing = index.Find(digest_, key_); existing != nullptr) {
+      // The fixture changes logical-size widths as it builds larger grouped
+      // values. Use the same representation replacement as the append funnel.
+      RecordIndex::Entry* replaced = nullptr;
+      ASSERT_NE(index.ReplaceValue(existing, location_, digest_, &replaced),
+                nullptr);
+      index.DestroyDetached(replaced);
+    } else {
+      ASSERT_NE(index.InsertNew(digest_, key_, location_), nullptr);
+    }
   }
   void Invalidate(bool database) {
     if (database)

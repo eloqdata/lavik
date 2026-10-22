@@ -172,6 +172,7 @@ struct RecordLocationCore {
 
    private:
     friend class RecordIndexValue;
+    friend class RecordIndexPrefix;
 
     explicit constexpr PackedMetadata(std::uint64_t bits) noexcept
         : bits_(bits) {}

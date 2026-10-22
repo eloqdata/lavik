@@ -506,8 +506,8 @@ static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
 static_assert(sizeof(RecordIndexValue) == 24);
 static_assert(RecordIndexValue::kReservedBits == 4);
-static_assert(sizeof(RecordIndex::Entry) == 24);
-static_assert(sizeof(RecordIndex::ExtendedEntry) == 32);
+static_assert(sizeof(RecordIndex::Entry) == 20);
+static_assert(sizeof(RecordIndex::ExtendedEntry) == 28);
 
 RecordLocation MaterializeForTest(const RecordIndex::Entry& entry,
                                   std::uint64_t allocation_epoch,
@@ -768,6 +768,132 @@ TEST(RecordLocationTest, IndexKeyMatchingPreservesTailAndCollisionSemantics) {
       }
     }
   }
+}
+
+TEST(RecordLocationTest, VariableLogicalSizePreservesMetadataAndKeyTail) {
+  constexpr std::array<std::uint32_t, 8> sizes = {
+      0,        255,
+      256,      65535,
+      65536,    16777215,
+      16777216, static_cast<std::uint32_t>(RecordIndexValue::kLogicalSizeMask)};
+  constexpr std::array<std::size_t, 8> key_sizes = {0,  1,  10,  16,
+                                                    63, 64, 128, 2048};
+  for (const auto size : sizes) {
+    for (const auto key_size : key_sizes) {
+      for (unsigned flags = 0; flags < 128; ++flags) {
+        const auto type = static_cast<ValueType>(1 + flags % 6);
+        const std::uint64_t expiry = (flags & 64) ? UINT64_MAX : 0;
+        const bool indirect = key_size != 0 && (flags & 32);
+        const auto metadata = RecordLocation::PackedMetadata::Encode(
+            kStorageBlockBytes - kRecordAlignment,
+            kStorageBlockBytes - kBlockHeaderBytes, 1023, flags & 1, flags & 2,
+            indirect, flags & 4, flags & 8, flags & 16, RecordKind::kValue,
+            type, expiry != 0, flags & 32);
+        const RecordLocation expected(RecordLocation::kBlockIdMask, UINT64_MAX,
+                                      123456, expiry, size, metadata);
+        const std::string key(key_size, '\xa5');
+        const Digest digest = ComputeDigest(key);
+        RecordIndex index;
+        const auto* entry = index.InsertNew(digest, key, expected, !indirect);
+        ASSERT_NE(entry, nullptr);
+        const auto actual = MaterializeForTest(*entry, 123456, 1023);
+        EXPECT_EQ(actual.block_id(), expected.block_id());
+        EXPECT_EQ(actual.mutation_sequence_, expected.mutation_sequence_);
+        EXPECT_EQ(actual.logical_size_, size);
+        EXPECT_EQ(actual.record_offset(), expected.record_offset());
+        EXPECT_EQ(actual.total_disk_bytes(), expected.total_disk_bytes());
+        EXPECT_EQ(actual.expire_at_ms_, expiry);
+        EXPECT_EQ(actual.in_memory(), expected.in_memory());
+        EXPECT_EQ(actual.external(), expected.external());
+        EXPECT_EQ(actual.key_indirect(), expected.key_indirect());
+        EXPECT_EQ(actual.shielding(), expected.shielding());
+        EXPECT_EQ(actual.unclaimed(), expected.unclaimed());
+        EXPECT_EQ(actual.tx_tagged(), expected.tx_tagged());
+        EXPECT_EQ(actual.grouped(), expected.grouped());
+        EXPECT_EQ(actual.value_type(), type);
+        EXPECT_EQ(entry->logical_key_size(), key_size);
+        EXPECT_EQ(entry->key_complete(), !indirect);
+        if (indirect) {
+          EXPECT_EQ(entry->external_key_digest(), digest);
+        } else {
+          EXPECT_EQ(entry->key(), key);
+        }
+        EXPECT_TRUE(entry->MatchesKey(digest, key));
+      }
+    }
+  }
+}
+
+TEST(RecordLocationTest, VariableLogicalSizeGrowthAndShrinkPreserveKey) {
+  const std::string key = "logical-size-key";
+  const auto digest = ComputeDigest(key);
+  const auto metadata = RecordLocation::PackedMetadata::Encode(
+      kBlockHeaderBytes, kRecordAlignment, 0, false, false, false, false, false,
+      false, RecordKind::kValue, ValueType::kString);
+  for (const std::uint64_t expiry : {0ULL, 4102444800123ULL}) {
+    RecordIndex index;
+    auto* entry = index.InsertNew(digest, key,
+                                  RecordLocation(1, 2, 3, expiry, 0, metadata));
+    ASSERT_NE(entry, nullptr);
+    for (const std::uint32_t size :
+         {255U, 256U, 65535U, 65536U, 16777215U, 16777216U, 0U}) {
+      const unsigned old_width = entry->value_.logical_bytes();
+      const auto old_address = reinterpret_cast<std::uintptr_t>(entry);
+      RecordIndex::Entry* replaced = nullptr;
+      auto* next = index.ReplaceValue(
+          entry, RecordLocation(1, 4, 3, expiry, size, metadata), digest,
+          &replaced);
+      ASSERT_NE(next, nullptr);
+      if (RecordIndexPrefix::LogicalBytesFor(size) > old_width) {
+        EXPECT_EQ(replaced, entry);
+        EXPECT_NE(next, entry);
+        index.DestroyDetached(replaced);
+        EXPECT_EQ(
+            index.FindAddress(old_address, RecordIndex::AddressHash(digest)),
+            nullptr);
+      } else {
+        EXPECT_EQ(replaced, nullptr);
+        EXPECT_EQ(next, entry);
+        EXPECT_EQ(next->value_.logical_bytes(), old_width);
+      }
+      entry = next;
+      EXPECT_EQ(MaterializeForTest(*entry, 3).logical_size_, size);
+      EXPECT_EQ(entry->key(), key);
+      EXPECT_EQ(index.Find(digest, key), entry);
+    }
+  }
+}
+
+TEST(RecordLocationTest, LogicalWidthAdmissionFailureLeavesOldEntryUsable) {
+  // 20 + 1 logical byte + 1 key-metadata byte + 10 key bytes fits the
+  // 32-byte class. A second logical byte needs the 40-byte class, whose
+  // first page cannot be allocated in this one-page arena.
+  auto arena = std::make_shared<ScanHashMapEntryArena>(1);
+  RecordIndex index(arena);
+  const std::string key = "0123456789";
+  const auto digest = ComputeDigest(key);
+  const auto metadata = RecordLocation::PackedMetadata::Encode(
+      kBlockHeaderBytes, kRecordAlignment, 0, false, false, false, false, false,
+      false, RecordKind::kValue, ValueType::kString);
+  auto* entry =
+      index.InsertNew(digest, key, RecordLocation(1, 2, 3, 0, 255, metadata));
+  ASSERT_NE(entry, nullptr);
+  EXPECT_TRUE(index.CanAllocateEntry(key, true, false, 1));
+  EXPECT_FALSE(index.CanAllocateEntry(key, true, false, 2));
+
+  RecordIndex::Entry* replaced = nullptr;
+  EXPECT_EQ(index.ReplaceValue(entry, RecordLocation(1, 4, 3, 0, 256, metadata),
+                               digest, &replaced),
+            nullptr);
+  EXPECT_EQ(replaced, nullptr);
+  EXPECT_EQ(index.Find(digest, key), entry);
+  EXPECT_EQ(entry->value_.logical_size(), 255);
+  EXPECT_EQ(entry->value_.mutation_sequence_, 2);
+  EXPECT_EQ(index.ReplaceValue(entry, RecordLocation(1, 4, 3, 0, 254, metadata),
+                               digest, &replaced),
+            entry);
+  EXPECT_EQ(entry->key(), key);
+  EXPECT_EQ(entry->value_.logical_size(), 254);
 }
 
 }  // namespace

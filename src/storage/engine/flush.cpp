@@ -566,7 +566,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (current_entry == nullptr) {
         continue;
       }
-      RecordIndexValue& current = current_entry->value_;
+      auto& current = current_entry->value_;
       // The entry may no longer hold the version this identity was staged
       // for. Matching on block and epoch alone was enough when a block
       // flushed once: an overwrite necessarily landed in a different block.

@@ -54,8 +54,9 @@ class GroupedScratchBudget {
   // or epoch from a possibly retired block after another page's IO/Yield.
   // The page loader separately refreshes and verifies the logical version
   // before reading. GC relocation does not change the decoded page size.
+  template <typename IndexValue>
   absl::Status AddGroup(
-      const RecordIndexValue& value,
+      const IndexValue& value,
       const std::shared_ptr<const std::vector<ExtentRef>>& extents) {
     return AddLayout(
         value.total_disk_bytes(),

@@ -47,7 +47,7 @@ absl::StatusOr<RecordIndex::Entry*> StorageEngine::Impl::ReplaceIndexLocation(
   // handle: its exclusive key lock prevents any other transaction or
   // foreground writer from observing the transition. Updating the handle's
   // one current-pointer slot avoids scanning every prior write in a large
-  // transaction when many keys change TTL representation.
+  // transaction when many keys change expiry subtype or logical-size width.
   if (tx_undo != nullptr) {
     tx_undo->Replace(replaced, current);
   }
@@ -3216,16 +3216,21 @@ acquire_active_stream:
     }
   }
   const bool has_index_extra = request.expire_at_ms_ != 0;
+  const unsigned index_logical_bytes = RecordIndexPrefix::LogicalBytesFor(
+      static_cast<std::uint32_t>(logical_size));
   const bool needs_index_allocation =
-      index_ptr != nullptr && (previous_entry == nullptr ||
-                               previous_entry->has_extra() != has_index_extra);
+      index_ptr != nullptr &&
+      (previous_entry == nullptr ||
+       previous_entry->has_extra() != has_index_extra ||
+       previous_entry->value_.logical_bytes() < index_logical_bytes);
   if (needs_index_allocation &&
       !index_ptr->CanAllocateEntry(request.key_, !request.key_indirect_,
-                                   has_index_extra)) {
+                                   has_index_extra, index_logical_bytes)) {
     // The handle's 21-bit page ID is a hard per-worker capacity boundary.
     // Check it after every suspension and before mutating the staging buffer,
     // so exhaustion is reported without leaving a durable record whose index
-    // entry cannot be published. Page IDs are never allowed to wrap.
+    // entry cannot be published. Logical-size width growth needs the same
+    // reservation as expiry subtype changes. Page IDs never wrap.
     co_return absl::ResourceExhaustedError(
         "record index entry page capacity exhausted");
   }
@@ -3244,7 +3249,7 @@ acquire_active_stream:
   if (needs_index_allocation) {
     const std::size_t allocation_bytes = index_ptr->RequiredAllocationBytes(
         request.digest_, request.key_, !request.key_indirect_, has_index_extra,
-        previous_entry == nullptr);
+        previous_entry == nullptr, index_logical_bytes);
     if (allocation_bytes != 0) {
       index_memory_reservation = TryReserveMemory(allocation_bytes);
       if (!index_memory_reservation.has_value()) {
