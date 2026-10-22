@@ -774,7 +774,7 @@ class ReplicationLogService final : public bycorf::Service {
                                       first,  second, "run"};
     auto publication = co_await DispatchPinnedCommand(
         connection, std::move(run_args), "*2\r\n$4\r\nkept\r\n:9437184\r\n", 2);
-    const auto restored = lavik::InitMemoryLimit(512 * kMiB, 1);
+    const auto restored = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!restored.ok()) co_return restored;
     if (!publication.ok()) co_return publication.status();
     status = co_await DispatchClientCommand(connection, {"PING"}, "+PONG\r\n");
@@ -853,7 +853,7 @@ class ReplicationLogService final : public bycorf::Service {
                           std::string(9 * kMiB, 'S') + "\r\n+OK\r\n";
     auto publication =
         co_await DispatchPinnedCommand(connection, {"EXEC"}, expected, 2);
-    const auto restored = lavik::InitMemoryLimit(512 * kMiB, 1);
+    const auto restored = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!restored.ok()) co_return restored;
     if (!publication.ok()) co_return publication.status();
     status = co_await DispatchClientCommand(connection, {"PING"}, "+PONG\r\n");
@@ -925,7 +925,7 @@ class ReplicationLogService final : public bycorf::Service {
     lavik::RefreshMemoryStats();
     Check(lavik::GetMemoryStats().used_bytes_ == before,
           "destroyed transaction retained its canonical payload charge");
-    const absl::Status restored = lavik::InitMemoryLimit(512 * kMiB, 1);
+    const absl::Status restored = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!restored.ok()) co_return restored;
     co_return absl::OkStatus();
   }
@@ -964,7 +964,7 @@ class ReplicationLogService final : public bycorf::Service {
     lavik::ReplyBuilder builder;
     lavik::CommandReply reply =
         co_await lavik::ExecuteBitOpCommand(*request, builder);
-    const absl::Status restored = lavik::InitMemoryLimit(512 * kMiB, 1);
+    const absl::Status restored = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!restored.ok()) co_return restored;
     // Grouped input materialization has its own admitted scratch, so it can
     // reject before the output payload reservation. Both must report OOM and
@@ -1352,7 +1352,7 @@ class ReplicationLogService final : public bycorf::Service {
     auto under_reserved = storage_->BeginFullSyncSession(100);
     Check(!under_reserved.ok(),
           "full-sync session bypassed first-span admission");
-    absl::Status restored_limit = lavik::InitMemoryLimit(512 * kMiB, 1);
+    absl::Status restored_limit = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!restored_limit.ok()) co_return restored_limit;
 
     lavik::RefreshMemoryStats();
@@ -2802,7 +2802,7 @@ class ReplicationLogService final : public bycorf::Service {
     if (!status.ok()) co_return status;
     Check(!co_await storage_->Exists(0, "new-write-oom"),
           "rejected new write still mutated storage");
-    status = lavik::InitMemoryLimit(512 * kMiB, 1);
+    status = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!status.ok()) co_return status;
     co_return absl::OkStatus();
   }
@@ -2925,7 +2925,7 @@ class ReplicationLogService final : public bycorf::Service {
 
   bycorf::Task<absl::Status> ExerciseReplicationContinuationDebt() {
     struct RestoreMemoryLimit {
-      ~RestoreMemoryLimit() { (void)lavik::InitMemoryLimit(512 * kMiB, 1); }
+      ~RestoreMemoryLimit() { (void)lavik::InitMemoryLimit(1024 * kMiB, 1); }
     } restore;
     for (bool cancel_consumer : {false, true}) {
       const std::uint64_t epoch = cancel_consumer ? 905 : 904;
@@ -3019,7 +3019,7 @@ class ReplicationLogService final : public bycorf::Service {
       storage_->ReleaseReplicationLogRetention(epoch);
       status = co_await storage_->DisableReplicationLog();
       if (!status.ok()) co_return status;
-      status = lavik::InitMemoryLimit(512 * kMiB, 1);
+      status = lavik::InitMemoryLimit(1024 * kMiB, 1);
       if (!status.ok()) co_return status;
     }
     std::cout
@@ -3059,7 +3059,7 @@ class ReplicationLogService final : public bycorf::Service {
               lavik::GetMemoryStats().used_bytes_ == before_large,
           "large raw append bypassed admission or changed history/accounting");
     }
-    status = lavik::InitMemoryLimit(512 * kMiB, 1);
+    status = lavik::InitMemoryLimit(1024 * kMiB, 1);
     if (!status.ok()) co_return status;
     const auto before_oversized = storage_->LocalReplicationLogInfo();
     RepeatedByteSource too_large(9 * kMiB, 'x');
@@ -4531,7 +4531,7 @@ int RunOnce(const std::string& path, bool exercise) {
   options.replication_publish_queue_bytes_ = 16 * kMiB;
   StorageEngine storage(std::move(options));
   lavik::InitWorkerMetrics(1);
-  const absl::Status memory = lavik::InitMemoryLimit(512 * kMiB, 1);
+  const absl::Status memory = lavik::InitMemoryLimit(1024 * kMiB, 1);
   if (!memory.ok()) {
     std::cerr << memory << '\n';
     return 1;

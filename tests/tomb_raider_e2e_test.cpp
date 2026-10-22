@@ -1002,7 +1002,7 @@ void VerifyTombRaiderController(
   options.tomb_raider_sleep_ms_ = 60'000;
   lavik::storage::StorageEngine storage(std::move(options));
   lavik::InitWorkerMetrics(1);
-  const absl::Status memory = lavik::InitMemoryLimit(512 * kMiB, 1);
+  const absl::Status memory = lavik::InitMemoryLimit(1024 * kMiB, 1);
   if (!memory.ok()) Fail(std::string(memory.message()));
   const absl::Status prepared = storage.Prepare(1);
   if (!prepared.ok()) Fail(std::string(prepared.message()));

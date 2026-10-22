@@ -139,13 +139,18 @@ class BufferPoolWaitService final : public bycorf::Service {
       worker.RequestStop();
       co_return result_;
     }
-    std::byte* overflow_data = overflow->bytes().data();
     overflow->Reset();
+    if (pool_.overflow_read_buffer_count() != 0) {
+      result_ = absl::FailedPreconditionError(
+          "released overflow read buffer still owns storage");
+      worker.RequestStop();
+      co_return result_;
+    }
     auto reused = co_await pool_.AcquireReadBuffer(2 * kMiB);
-    if (!reused.ok() || reused->bytes().data() != overflow_data ||
+    if (!reused.ok() || reused->buffer_id() != 0 ||
         pool_.overflow_read_buffer_count() != 1) {
       result_ = absl::FailedPreconditionError(
-          "released overflow read buffer was not reusable");
+          "released overflow read slot was not reusable");
     }
     worker.RequestStop();
     co_return result_;
@@ -381,6 +386,87 @@ class BufferPoolMemlockTest : public ::testing::Test {
   int wake_fd_ = -1;
   char path_[64] = "/tmp/lavik-buffer-memlock-XXXXXX";
 };
+
+TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  const auto other_baseline = WorkerMemoryAccountingBytes(1);
+  ASSERT_NO_FATAL_FAILURE(Init(0, 2));
+  const auto fixed_bytes =
+      pool_->write_buffer_count() * options_.write_buffer_bytes_ +
+      pool_->read_buffer_count() * options_.read_slot_bytes_;
+  const auto fixed_total = baseline + fixed_bytes;
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
+
+  std::uint16_t write_id = 0;
+  ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&write_id));
+  auto read = pool_->AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(read.ok());
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
+  read->Reset();
+  pool_->ReleaseWriteBuffer(write_id);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
+
+  // I/O needed for reads or reclamation remains available when retained
+  // admission is closed. Its capacity must still appear in the counters.
+  ASSERT_TRUE(InitMemoryLimit(1, 2).ok());
+  struct RestoreLimit {
+    ~RestoreLimit() { (void)InitMemoryLimit(1024 * kMiB, 2); }
+  } restore_limit;
+  std::byte* heap_write = nullptr;
+  ASSERT_TRUE(pool_->TryAcquireHeapWriteBuffer(&heap_write));
+  const auto cached_total = fixed_total + options_.write_buffer_bytes_;
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
+  pool_->ReleaseHeapWriteBuffer(heap_write);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
+  std::byte* reused_write = nullptr;
+  ASSERT_TRUE(pool_->TryAcquireHeapWriteBuffer(&reused_write));
+  EXPECT_EQ(reused_write, heap_write);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
+  pool_->ReleaseHeapWriteBuffer(reused_write);
+
+  auto first = pool_->AcquireReadBuffer(kMiB).await_resume();
+  auto second = pool_->AcquireReadBuffer(2 * kMiB).await_resume();
+  ASSERT_TRUE(first.ok());
+  ASSERT_TRUE(second.ok());
+  const auto second_bytes = second->bytes().size();
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 2);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+            cached_total + first->bytes().size() + second_bytes);
+  first->Reset();
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total + second_bytes);
+
+  // A remote return only queues the release. Keep its storage and charge until
+  // the owner consumes that message, even if an earlier slot is reused.
+  bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+  second->Reset();
+  bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total + second_bytes);
+  auto reused_read = pool_->AcquireReadBuffer(3 * kMiB).await_resume();
+  ASSERT_TRUE(reused_read.ok());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool_->overflow_read_buffer_count() != 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    worker_->RunOnce(false);
+  }
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+            cached_total + reused_read->bytes().size());
+  reused_read->Reset();
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
+
+  worker_->Shutdown();
+  worker_.reset();
+  bycorf::MutableThisWorker() = saved_context_;
+  pool_.reset();
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
+}
 
 TEST_F(BufferPoolMemlockTest, FullRegistrationPreservesConfiguredPool) {
   ASSERT_NO_FATAL_FAILURE(Init(12 * kMiB));

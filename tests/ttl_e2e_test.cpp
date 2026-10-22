@@ -550,7 +550,7 @@ void VerifyDeferredExpirationAuthority(const std::string& data_path) {
     }
   }
   lavik::InitWorkerMetrics(1);
-  absl::Status status = lavik::InitMemoryLimit(512ULL * 1024 * 1024, 1);
+  absl::Status status = lavik::InitMemoryLimit(1024ULL * 1024 * 1024, 1);
   if (!status.ok()) Fail(std::string(status.message()));
   status = storage.Prepare(1);
   if (!status.ok()) Fail(std::string(status.message()));

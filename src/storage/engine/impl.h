@@ -1643,6 +1643,10 @@ class StorageEngine::Impl {
  public:
   struct FullSyncCollection;
   struct WorkerStore {
+    explicit WorkerStore(unsigned memory_owner = CurrentMemoryAccountingShard())
+        : partition_indexes_(RetainedAllocator<RecordIndex>(
+              {.owner_shard_ = memory_owner, .externally_admitted_ = true})) {}
+
     Impl* engine_ = nullptr;
     bycorf::AsyncNotification block_pin_progress_;
     // Only genuinely exhausted foreground allocations wait here. Notification
@@ -1977,7 +1981,10 @@ class StorageEngine::Impl {
     // Declaring the arena before partitions and detached populations makes it
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
-    std::vector<RecordIndex> partition_indexes_;
+    // Constructed before workers start, but charged to the eventual owner.
+    // Startup recovery includes this fixed footprint in its budget checks;
+    // allocator ownership also survives main-thread teardown.
+    std::vector<RecordIndex, RetainedAllocator<RecordIndex>> partition_indexes_;
     std::vector<GroupedObjectIndex> partition_grouped_objects_;
     std::vector<PartitionStore> partitions_;
     // Present only while a shutdown checkpoint is being restored. Keeping the

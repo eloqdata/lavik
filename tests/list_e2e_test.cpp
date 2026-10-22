@@ -46,6 +46,7 @@
 #include "lavik/command_table.h"
 #include "lavik/rdb.h"
 #include "lavik/storage/format.h"
+#include "support/storage_memory.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -3061,8 +3062,10 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
     const std::vector<std::string> arguments =
         injected_storage_failure
             ? std::vector<std::string>{}
-            : std::vector<std::string>{"--max-memory", "64M",
-                                       "--maxmemory-clients", "64M"};
+            : std::vector<std::string>{
+                  "--max-memory",
+                  lavik::test::WithStorageBaseline(64ULL * 1024 * 1024, 2),
+                  "--maxmemory-clients", "64M"};
     const std::vector<std::pair<std::string, std::string>> environment =
         injected_storage_failure
             ? std::vector<std::pair<

@@ -28,6 +28,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/sync.h"
+#include "lavik/memory.h"
 
 namespace bycorf {
 class CrossCore;
@@ -46,7 +47,7 @@ struct RegisteredBufferPoolOptions {
   std::size_t write_buffer_bytes_ = 8 * kMiB;
   // Cover ordinary compact records and grouped pages, including record headers
   // and direct-I/O alignment, without reserving a large slot for every small
-  // read. Oversized records and whole-value assembly use reusable overflow
+  // read. Oversized records and whole-value assembly use on-demand overflow
   // buffers; the group target is not a hard allocation limit.
   // Total slot size includes both framing margins.
   std::size_t read_slot_bytes_ = 32 * kKiB;
@@ -171,8 +172,9 @@ class RegisteredBufferPool {
   std::size_t available_read_buffers() const noexcept {
     return free_read_buffers_.size();
   }
+  // Number of live oversized-read allocations; idle release IDs own no memory.
   std::size_t overflow_read_buffer_count() const noexcept {
-    return overflow_read_buffers_.size();
+    return overflow_read_buffers_.size() - free_overflow_read_buffers_.size();
   }
   std::size_t write_buffer_count() const noexcept {
     return options_.storage_write_buffer_count_;
@@ -258,6 +260,9 @@ class RegisteredBufferPool {
   std::size_t registered_read_count_ = 0;
   std::size_t registered_write_count_ = 0;
   RegisteredBufferPoolOptions options_{};
+  // Charge owned capacity for both aligned and SPDK DMA allocations. Pool
+  // borrowing does not change ownership; teardown may run off the owner worker.
+  RetainedMemoryCharge buffer_memory_;
   std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;
@@ -271,9 +276,9 @@ class RegisteredBufferPool {
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;
   std::deque<AcquireReadAwaiter*> read_waiters_;
-  // SPDK and io_uring overflow reads grow this cache to the observed
-  // concurrency high-water mark. Released DMA/aligned buffers are reused,
-  // avoiding allocation and huge-page faults on every pool miss.
+  // Oversized reads retain DMA/aligned storage only while leased. Reuse empty
+  // release IDs so repeated large reads do not grow the bookkeeping forever;
+  // live IDs stay stable across cross-worker lease returns.
   std::vector<bycorf::FixedBuffer> overflow_read_buffers_;
   std::vector<std::size_t> free_overflow_read_buffers_;
   std::vector<bool> overflow_read_buffer_in_use_;

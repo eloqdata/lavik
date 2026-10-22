@@ -908,7 +908,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
                               std::memory_order_relaxed);
   stores_.reserve(worker_count);
   for (unsigned i = 0; i < worker_count; ++i) {
-    stores_.push_back(std::make_unique<WorkerStore>());
+    stores_.push_back(std::make_unique<WorkerStore>(i + 1));
     WorkerStore& store = *stores_.back();
     // Record and UUID insertion reserve a new page together with any bucket
     // growth before mutating durable staging. The arena must not reserve the

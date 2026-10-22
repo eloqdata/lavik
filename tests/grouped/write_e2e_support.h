@@ -42,12 +42,14 @@
 #include <thread>
 #include <vector>
 
+#include "../support/storage_memory.h"
 #include "../support/test_data_path.h"
 #include "gtest/gtest.h"
 #include "lavik/storage/format.h"
 
 namespace grouped_e2e {
 using namespace lavik::storage;
+using lavik::test::WithStorageBaseline;
 using namespace std::chrono_literals;
 inline std::string server_binary;
 

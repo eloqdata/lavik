@@ -201,10 +201,11 @@ TEST(GroupedRdbStreamE2e,
   }
   ASSERT_FALSE(disk.Auxiliaries("hash").empty());
   // Recovery admits only the routing envelope. The 32 MiB decoded page cannot
-  // fit a four-worker share of 128 MiB (28.8 MiB retained allowance), although
+  // fit a four-worker working budget of 128 MiB (28.8 MiB per worker
+  // after fixed map objects and I/O pools), although
   // its root/token/graph metadata fits. This uses the real admission gate,
   // with neither an injected OOM response nor a runtime maxmemory override.
-  Server server(disk, 4, {}, {}, false, 2, "128M");
+  Server server(disk, 4, {}, {}, false, 2, WithStorageBaseline(128 * kMiB, 4));
   Client client(server.port());
   ASSERT_EQ(client.Command({"HLEN", "hash"}).text_, "1");
   const std::string path = disk.path() + ".rdb";
@@ -437,9 +438,10 @@ TEST(GroupedRdbStreamE2e, RestoreStreamsFourTypesInsideAndOutsideExec) {
 }
 
 TEST(GroupedRdbStreamE2e, ZsetRestoreBatchesPreserveOrderAndRollback) {
-  // At two workers and 128 MiB, the ingest planner cannot admit all these
-  // entries in one batch. Cover head/tail splices, overlapping score ranges and
-  // equal-score ties through the real memory gate, including cold recovery.
+  // At two workers and a 176 MiB working budget, the ingest planner cannot
+  // admit all these entries in one batch. Cover head/tail splices, overlapping
+  // score ranges and equal-score ties through the real memory gate, including
+  // cold recovery.
   constexpr unsigned count = 49152;
   auto member = [](unsigned i) {
     auto value = std::to_string(i);
@@ -504,7 +506,8 @@ TEST(GroupedRdbStreamE2e, ZsetRestoreBatchesPreserveOrderAndRollback) {
   PrivateDisk disk;
   {
     // Include the fixed 16 MiB arena directory per worker in the budget.
-    Server server(disk, 2, {}, {}, false, 2, "176M");
+    Server server(disk, 2, {}, {}, false, 2,
+                  WithStorageBaseline(176 * kMiB, 2));
     Client client(server.port());
     for (unsigned mode = 0; mode < 4; ++mode) {
       SCOPED_TRACE(mode);
@@ -714,9 +717,9 @@ TEST(GroupedRdbStreamE2e,
   static_assert(count * member_bytes > 1024ULL * 1024 * 1024);
   // One worker owns this entire key. Its admission share must cover old and
   // new undo receipts while they are merged during atomic import. Leave room
-  // for that transient peak while keeping the process budget below the value
-  // size; fixed I/O buffers have a separate budget.
-  constexpr std::string_view max_memory = "640M";
+  // for that transient peak while keeping the working budget below the value
+  // size. The process limit additionally covers fixed map objects and I/O.
+  constexpr std::uint64_t working_limit = 640 * kMiB;
   PrivateDisk disk(4ULL * 1024 * 1024 * 1024);
   // A failed multi-minute run must retain its only recovery/timeout evidence.
   // Successful runs still remove all private artifacts.
@@ -760,7 +763,8 @@ TEST(GroupedRdbStreamE2e,
     ASSERT_TRUE(writer->Finish().ok());
   }
   {
-    Server imported(disk, 2, {}, {}, false, 2, max_memory, input);
+    Server imported(disk, 2, {}, {}, false, 2,
+                    WithStorageBaseline(working_limit, 2), input);
     imported.PreserveOnFailure();
     const auto deadline = std::chrono::steady_clock::now() + 10min;
     while (imported.Log().find("loaded RDB file") == std::string::npos &&
@@ -811,7 +815,8 @@ TEST(GroupedRdbStreamE2e,
     } import_log{imported, disk.path()};
     ASSERT_EQ(imported.Wait(true, 120s), 0) << imported.Log();
   }
-  Server recovered(disk, 3, {}, {}, false, 2, max_memory);
+  Server recovered(disk, 3, {}, {}, false, 2,
+                   WithStorageBaseline(working_limit, 3));
   recovered.PreserveOnFailure();
   // Rebuilding hundreds of thousands of physical records can outlast the
   // generic client's 20-second connection deadline. Observe actual recovery

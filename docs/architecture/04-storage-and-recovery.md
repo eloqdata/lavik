@@ -555,8 +555,10 @@ allocation when the caller protects the resolved entry and arena lifetimes;
 it does not pin entries or make the hash tables safe for concurrent access.
 Allocator mutation remains owner-local. Private auxiliary arenas retain
 incremental directory allocation and owner-only access.
-Each primary key index reserves 32 cache-line-isolated atomic read-admission
-states, including while empty. Its bucket arrays remain demand-allocated,
+The primary-index object arrays are allocated once for the worker's partitions
+and enabled logical databases and charged to that worker, including while
+empty. Each primary key index reserves 32 cache-line-isolated atomic
+read-admission states within those objects. Its bucket arrays remain demand-allocated,
 start at 32 buckets, and never shrink below 32 while nonempty; checkpoint
 recovery applies the same floor. Reader admission is explicitly enabled only
 for a published map with a fixed arena directory and an externally protected
@@ -617,6 +619,17 @@ headroom. After all storage recovery coroutines have returned and their heaps
 have been collected, every worker's remaining footprint must fit its normal
 90-percent share before the server permits startup import and serving. A
 failed transition stops startup. Recovery does not change the disk scan count.
+
+Storage buffer capacity also participates in retained accounting: fixed read
+and write pools are charged at initialization, and extra maintenance write
+buffers remain charged while cached for reuse. Oversized reads allocate
+aligned or SPDK DMA overflow storage only while leased; returning a lease
+frees that storage and removes its charge on the owner worker. Fixed-pool
+exhaustion suspends ordinary reads rather than allocating overflow. These I/O
+allocations are accounted without a separate admission gate so reads and
+reclamation can still progress at the memory waterline; subsequent retained
+growth observes their charges. Pool charges cover allocated slot capacity,
+not allocator overhead or SPDK's entire hugepage reservation.
 
 Accounting ownership remains bound to the allocation's origin,
 so destruction credits the same worker even when it occurs elsewhere. INFO and

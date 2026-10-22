@@ -24,6 +24,7 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "bycorf/io/spdk_storage.h"
@@ -435,6 +436,11 @@ absl::Status RegisteredBufferPool::Init(
   for (std::size_t i = read_count; i > 0; --i) {
     free_read_buffers_.push_back(static_cast<std::uint16_t>(read_base + i - 1));
   }
+  // Charge actual slot capacity, excluding any unused tail of the configured
+  // budget. Registration fallback owns the same memory. Startup's recovery
+  // budget checks include this fixed footprint before serving begins.
+  buffer_memory_.Account(worker.id() + 1,
+                         registered_write_bytes + read_count * read_slot_bytes);
   return absl::OkStatus();
 }
 
@@ -547,25 +553,10 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
                         "overflow read buffer exceeds the 32-bit lease "
                         "representation");
   }
-  std::size_t best_free = free_overflow_read_buffers_.size();
-  std::size_t best_bytes = std::numeric_limits<std::size_t>::max();
-  for (std::size_t i = 0; i < free_overflow_read_buffers_.size(); ++i) {
-    const std::size_t overflow_id = free_overflow_read_buffers_[i];
-    const std::size_t candidate_bytes =
-        overflow_read_buffers_[overflow_id - 1].size_;
-    if (candidate_bytes >= bytes && candidate_bytes < best_bytes) {
-      best_free = i;
-      best_bytes = candidate_bytes;
-    }
-  }
-  if (best_free != free_overflow_read_buffers_.size()) {
-    const std::size_t overflow_id = free_overflow_read_buffers_[best_free];
-    free_overflow_read_buffers_[best_free] = free_overflow_read_buffers_.back();
-    free_overflow_read_buffers_.pop_back();
-    overflow_read_buffer_in_use_[overflow_id - 1] = true;
-    return ReadBufferLease(this, overflow_read_buffers_[overflow_id - 1],
-                           options_.read_headroom_bytes_,
-                           options_.read_tailroom_bytes_, overflow_id);
+  if (free_overflow_read_buffers_.empty() &&
+      overflow_read_buffers_.size() >= ReadBufferLease::kReleaseTokenMask) {
+    return absl::ResourceExhaustedError(
+        "overflow read buffer id space exhausted");
   }
   auto* data = static_cast<std::byte*>(
       bycorf::AllocateStorageBuffer(bytes, options_.alignment_));
@@ -573,17 +564,23 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned heap read buffer allocation failed");
   }
-  if (overflow_read_buffers_.size() >= ReadBufferLease::kReleaseTokenMask) {
-    bycorf::FreeStorageBuffer(data, options_.alignment_);
-    return absl::Status(absl::StatusCode::kResourceExhausted,
-                        "overflow read buffer id space exhausted");
+  std::size_t overflow_id;
+  const bycorf::FixedBuffer buffer{.data_ = data, .size_ = bytes, .index_ = 0};
+  if (free_overflow_read_buffers_.empty()) {
+    overflow_read_buffers_.push_back(buffer);
+    overflow_read_buffer_in_use_.push_back(true);
+    overflow_id = overflow_read_buffers_.size();
+  } else {
+    overflow_id = free_overflow_read_buffers_.back();
+    free_overflow_read_buffers_.pop_back();
+    overflow_read_buffers_[overflow_id - 1] = buffer;
+    overflow_read_buffer_in_use_[overflow_id - 1] = true;
   }
-  overflow_read_buffers_.push_back(
-      bycorf::FixedBuffer{.data_ = data, .size_ = bytes, .index_ = 0});
-  overflow_read_buffer_in_use_.push_back(true);
-  const std::size_t overflow_id = overflow_read_buffers_.size();
-  return ReadBufferLease(this, overflow_read_buffers_.back(),
-                         options_.read_headroom_bytes_,
+  // Reads and maintenance I/O must still make progress at the retained limit.
+  // Account their live storage without a new admission gate; subsequent
+  // retained growth observes it, and returning this lease releases the charge.
+  buffer_memory_.Resize(buffer_memory_.bytes() + bytes);
+  return ReadBufferLease(this, buffer, options_.read_headroom_bytes_,
                          options_.read_tailroom_bytes_, overflow_id);
 }
 
@@ -632,6 +629,9 @@ bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
     return false;
   }
   heap_write_buffers_.push_back(data);
+  // Maintenance may need this buffer to reclaim space while admission is
+  // closed. Charge its retained capacity without blocking that progress.
+  buffer_memory_.Resize(buffer_memory_.bytes() + options_.write_buffer_bytes_);
   *buffer = data;
   return true;
 }
@@ -702,6 +702,9 @@ void RegisteredBufferPool::ReleaseOverflowLocal(
   if (!overflow_read_buffer_in_use_[offset]) {
     return;
   }
+  const auto buffer = std::exchange(overflow_read_buffers_[offset], {});
+  bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
+  buffer_memory_.Resize(buffer_memory_.bytes() - buffer.size_);
   overflow_read_buffer_in_use_[offset] = false;
   free_overflow_read_buffers_.push_back(overflow_id);
 }
