@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-在新建 Azure Standard_L16aos_v4 上重新测量 Lavik、Dragonfly、Garnet、Kvrocks、Pika、Tendis。每种产品独立装载 **10 亿条 key × 1 KiB value（953.67 GiB 逻辑 value 净载荷）**，完成 **48 个正式测量点**。Lavik 的八个点与同批 SPDK 报告共用，其余五种数据库重新独立装载、测量。
+在新建 Azure Standard_L16aos_v4 上重新测量 Lavik、Dragonfly、Garnet、Kvrocks、Pika、Tendis。每种产品独立装载 **10 亿条 key × 1 KiB value（953.67 GiB 逻辑 value 净载荷）**，完成 **48 个正式测量点**。Lavik 的八个点与同批[内存数据库对比报告](../lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md)共用，其余五种数据库重新独立装载、测量。
 
 UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 

@@ -24,10 +24,8 @@ Each report provides an English `README.md` and a Simplified Chinese
 
 | Report | Test date | English | 简体中文 |
 |---|---|---|---|
+| v0.2.0 versus in-memory databases: 2 / 16 vCPUs, up to 1B keys | 2026-10-21 | [English](lavik-v0.2.0-vs-memory-databases-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md) |
 | v0.2.0: 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | 2026-10-21–2026-10-22 | [English](lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.zh-CN.md) |
-| v0.2.0 on 16 vCPUs: 10M-key Redis / Valkey comparison | 2026-10-21 | [English](lavik-v0.2.0-spdk-vs-latest-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-spdk-vs-latest-2026-10-21/README.zh-CN.md) |
-| v0.2.0 on 2 vCPUs: Redis / Valkey + Lavik 100M-key capacity | 2026-10-21 | [English](lavik-v0.2.0-2vcpu-latest-capacity-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-2vcpu-latest-capacity-2026-10-21/README.zh-CN.md) |
-| v0.2.0: Lavik 1B-key SPDK with 32 client threads | 2026-10-21 | [English](lavik-v0.2.0-spdk-1b-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-spdk-1b-2026-10-21/README.zh-CN.md) |
 | v0.2.0: Aerospike YCSB A/B/C/D throughput and tail latency | 2026-10-21 | [English](lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.zh-CN.md) |
 | v0.1.0: 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | 2026-10-13–14 | [English](lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.md) | [简体中文](lavik-v0.1.0-storage-peers-1tb-2026-10-14/README.zh-CN.md) |
 | v0.1.0 on 2 vCPUs: latest Redis / Valkey + Lavik 100M-key capacity | 2026-10-13 | [English](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.md) | [简体中文](lavik-v0.1.0-2vcpu-latest-capacity-2026-10-13/README.zh-CN.md) |

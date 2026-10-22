@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "formal_points": 180,
+  "suite_points": {
+    "2vcpu": 84,
+    "16vcpu-10m": 88,
+    "16vcpu-1b": 8
+  },
+  "original_measurements_preserved": true,
+  "source_manifests_verified": true,
+  "zero_connection_errors": true,
+  "zero_get_misses": true,
+  "full_matrix": true,
+  "lavik_1b_shared_with_storage_peer_report": true
+}

@@ -7,5 +7,5 @@
   "fresh_fills": 6,
   "fill_requests_each": 1000000000,
   "raw_percentiles_match": true,
-  "lavik_reused_from_spdk_report": true
+  "lavik_reused_from_memory_database_report": true
 }

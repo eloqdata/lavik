@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Lavik, Dragonfly, Garnet, Kvrocks, Pika and Tendis were freshly measured on a new Azure Standard_L16aos_v4. Each independently loads **1B keys × 1 KiB values (953.67 GiB logical value payload)**. All **48 formal points** are complete. The eight Lavik points are shared with this batch’s SPDK report; the five peers each have a separate fresh load and measurement.
+Lavik, Dragonfly, Garnet, Kvrocks, Pika and Tendis were freshly measured on a new Azure Standard_L16aos_v4. Each independently loads **1B keys × 1 KiB values (953.67 GiB logical value payload)**. All **48 formal points** are complete. The eight Lavik points are shared with this batch’s [in-memory database comparison report](../lavik-v0.2.0-vs-memory-databases-2026-10-21/README.md); the five peers each have a separate fresh load and measurement.
 
 UTC: 2026-10-21T16:55:31.378000+00:00 – 2026-10-22T01:26:24.735000+00:00.
 
