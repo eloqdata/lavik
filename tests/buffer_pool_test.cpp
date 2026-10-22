@@ -34,12 +34,16 @@
 #include "bycorf/runtime/task.h"
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
+#include "support/read_buffer_fault.h"
 
 namespace lavik::storage {
 namespace {
 
 class BufferPoolWaitService final : public bycorf::Service {
  public:
+  explicit BufferPoolWaitService(bool allocation_failure = false)
+      : allocation_failure_(allocation_failure) {}
+
   void Prepare(unsigned thread_count) override {
     prepared_ = thread_count == 1;
   }
@@ -104,26 +108,57 @@ class BufferPoolWaitService final : public bycorf::Service {
       }
       held_reads.push_back(std::move(*acquired));
     }
-    read_waiter_started_ = false;
-    read_waiter_acquired_ = false;
-    worker.Spawn(AcquireReadAfterRelease());
-    co_await bycorf::Yield(worker);
-    if (!read_waiter_started_ || read_waiter_acquired_ ||
-        pool_.overflow_read_buffer_count() != 0) {
-      result_ = absl::FailedPreconditionError(
-          "read-buffer exhaustion allocated overflow instead of waiting");
+    if (allocation_failure_) {
+      read_waiter_started_ = false;
+      read_waiter_acquired_ = false;
+      worker.Spawn(AcquireReadAfterRelease());
+      co_await bycorf::Yield(worker);
+      if (!read_waiter_started_ || read_waiter_acquired_ ||
+          pool_.overflow_read_buffer_count() != 0) {
+        result_ = absl::FailedPreconditionError(
+            "read-buffer exhaustion allocated overflow instead of waiting");
+        worker.RequestStop();
+        co_return result_;
+      }
+      held_reads.back().Reset();
+      held_reads.pop_back();
+      for (unsigned attempt = 0; attempt < 100 && !read_waiter_acquired_;
+           ++attempt) {
+        co_await bycorf::Yield(worker);
+      }
+      if (!read_waiter_acquired_ || pool_.overflow_read_buffer_count() != 0) {
+        result_ = absl::DeadlineExceededError(
+            "fixed-read-buffer release did not wake its waiter");
+        worker.RequestStop();
+        co_return result_;
+      }
+
+      auto oversized = co_await pool_.AcquireReadBuffer(2 * kMiB);
+      if (!absl::IsResourceExhausted(oversized.status())) {
+        result_ = absl::FailedPreconditionError(
+            "oversized allocation failure waited for an unusable fixed slot");
+      }
       worker.RequestStop();
       co_return result_;
     }
-    held_reads.back().Reset();
-    held_reads.pop_back();
-    for (unsigned attempt = 0; attempt < 100 && !read_waiter_acquired_;
-         ++attempt) {
-      co_await bycorf::Yield(worker);
+
+    const auto retained = WorkerMemoryAccountingBytes(worker.id());
+    auto temporary = co_await pool_.AcquireReadBuffer();
+    if (!temporary.ok() || temporary->buffer_id() != 0 ||
+        temporary->registered() || pool_.overflow_read_buffer_count() != 1 ||
+        pool_.available_read_buffers() != 0 ||
+        WorkerMemoryAccountingBytes(worker.id()) !=
+            retained + temporary->bytes().size()) {
+      result_ = absl::FailedPreconditionError(
+          "exhausted fixed pool did not acquire an accounted temporary lease");
+      worker.RequestStop();
+      co_return result_;
     }
-    if (!read_waiter_acquired_ || pool_.overflow_read_buffer_count() != 0) {
-      result_ = absl::DeadlineExceededError(
-          "fixed-read-buffer release did not wake its waiter");
+    temporary->Reset();
+    if (pool_.overflow_read_buffer_count() != 0 ||
+        WorkerMemoryAccountingBytes(worker.id()) != retained) {
+      result_ = absl::FailedPreconditionError(
+          "temporary read buffer was not released after pool exhaustion");
       worker.RequestStop();
       co_return result_;
     }
@@ -186,6 +221,7 @@ class BufferPoolWaitService final : public bycorf::Service {
   }
 
   RegisteredBufferPool pool_;
+  bool allocation_failure_ = false;
   bool prepared_ = false;
   bool storage_waiter_started_ = false;
   bool storage_waiter_acquired_ = false;
@@ -196,7 +232,25 @@ class BufferPoolWaitService final : public bycorf::Service {
 };
 
 TEST(BufferPoolTest, StorageWriteBufferWaiterIsReusable) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
   BufferPoolWaitService service;
+  bycorf::Server server;
+  server.AddService(&service);
+  bycorf::ServerOptions options;
+  options.thread_count_ = 1;
+  options.pin_workers_ = false;
+  options.recv_buffer_count_ = 0;
+  ASSERT_TRUE(server.Start(options).ok());
+  server.WaitUntilStopped();
+  EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(BufferPoolTest, ReadAllocationFailureWaitsForFixedSlot) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  BufferPoolWaitService service(true);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions options;
@@ -466,6 +520,57 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   pool_.reset();
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
+}
+
+TEST_F(BufferPoolMemlockTest, RepeatedReadinessOwnsOneTemporaryLease) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  std::vector<ReadBufferLease> held;
+  while (pool_->available_read_buffers() != 0) {
+    auto read = pool_->AcquireReadBuffer().await_resume();
+    ASSERT_TRUE(read.ok());
+    held.push_back(std::move(*read));
+  }
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    auto acquire = pool_->AcquireReadBuffer();
+    ASSERT_TRUE(acquire.await_ready());
+    ASSERT_TRUE(acquire.await_ready());
+    EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+              baseline + options_.read_slot_bytes_);
+    // Destroying an unconsumed ready awaiter must release its temporary lease.
+  }
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  auto acquire = pool_->AcquireReadBuffer();
+  ASSERT_TRUE(acquire.await_ready());
+  auto lease = acquire.await_resume();
+  ASSERT_TRUE(lease.ok());
+  EXPECT_EQ(lease->buffer_id(), 0);
+  EXPECT_FALSE(lease->registered());
+  held.clear();
+  lease->Reset();
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST_F(BufferPoolMemlockTest, NoFixedReadSlotsNeverWaitForAllocationFailure) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  options_.registered_bytes_ = 2 * options_.write_buffer_bytes_;
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  auto acquire = pool_->AcquireReadBuffer();
+  ASSERT_TRUE(acquire.await_ready());
+  auto lease = acquire.await_resume();
+  ASSERT_TRUE(lease.ok());
+  EXPECT_EQ(lease->buffer_id(), 0);
+  lease->Reset();
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  auto failed = pool_->AcquireReadBuffer();
+  ASSERT_TRUE(failed.await_ready());
+  EXPECT_TRUE(absl::IsResourceExhausted(failed.await_resume().status()));
 }
 
 TEST_F(BufferPoolMemlockTest, FullRegistrationPreservesConfiguredPool) {

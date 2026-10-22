@@ -622,14 +622,16 @@ failed transition stops startup. Recovery does not change the disk scan count.
 
 Storage buffer capacity also participates in retained accounting: fixed read
 and write pools are charged at initialization, and extra maintenance write
-buffers remain charged while cached for reuse. Oversized reads allocate
-aligned or SPDK DMA overflow storage only while leased; returning a lease
-frees that storage and removes its charge on the owner worker. Fixed-pool
-exhaustion suspends ordinary reads rather than allocating overflow. These I/O
-allocations are accounted without a separate admission gate so reads and
-reclamation can still progress at the memory waterline; subsequent retained
-growth observes their charges. Pool charges cover allocated slot capacity,
-not allocator overhead or SPDK's entire hugepage reservation.
+buffers remain charged while cached for reuse. Oversized reads and reads that
+find the fixed pool exhausted allocate aligned or SPDK DMA overflow storage
+only while leased; returning a lease frees that storage and removes its charge
+on the owner worker. If temporary allocation fails, ordinary reads wait for a
+fixed slot in FIFO order. Oversized reads report allocation failure because
+fixed slots cannot satisfy them. These I/O allocations are accounted without
+a separate admission gate so reads and reclamation can still progress at the
+memory waterline; subsequent retained growth observes their charges. Pool
+charges cover allocated slot capacity, not allocator overhead or SPDK's
+entire hugepage reservation.
 
 Accounting ownership remains bound to the allocation's origin,
 so destruction credits the same worker even when it occurs elsewhere. INFO and
@@ -717,9 +719,9 @@ owner qualify, and the connection worker must have device I/O access. Length
 commands can answer from the same protected index metadata without a block pin
 or payload buffer. Closed admission, unsupported representations, expired
 entries, concurrent admission contention, and an exhausted connection-worker
-read-buffer pool return to the normal owner route. Stream and Sorted Set
-whole-value callbacks exceeding the bounded inline workspace also retain the
-owner's scratch-admission path. Index misses use the same transaction and
+read-buffer pool whose temporary allocation also fails return to the normal
+owner route. Stream and Sorted Set whole-value callbacks exceeding the bounded
+inline workspace also retain the owner's scratch-admission path. Index misses use the same transaction and
 population admission checks.
 
 An admitted payload read submits I/O directly from an awaitable in the

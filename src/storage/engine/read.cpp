@@ -342,8 +342,8 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
                         direct_io_alignment_ - 1) &
                        ~mask;
 
-  // Admission is only an optimization. If the local bounded pool is busy,
-  // let the owner path wait for its buffer rather than adding a child task or
+  // Admission is only an optimization. If neither a local fixed slot nor a
+  // temporary allocation is available, let the owner path wait rather than
   // retaining a remote pin in a second asynchronous state machine.
 #if LAVIK_ENABLE_TRACE
   if (result.trace_) {
@@ -1686,7 +1686,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
     if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
     auto acquire = store_.buffers_.AcquireReadBuffer(read_bytes_);
     if (!acquire.await_ready()) {
-      buffer_wait_.emplace(&store_.buffers_, read_bytes_);
+      buffer_wait_.emplace(std::move(acquire));
       return;
     }
     auto acquired = acquire.await_resume();

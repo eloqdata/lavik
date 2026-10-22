@@ -14,6 +14,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
 #include "lavik/storage/detail/stream_records.h"
+#include "support/read_buffer_fault.h"
 
 namespace lavik::storage {
 
@@ -995,7 +996,29 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   std::vector<std::string> stream_messages_;
 };
 
+TEST_F(LoadValueAwaitableTestPeer, ExhaustedPoolReadsThroughTemporaryBuffer) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  {
+    auto read = Read();
+    EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
+    auto task = AwaitExisting(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectValue(std::move(task).TakeResult());
+    EXPECT_FALSE(HasHelper(read));
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
+  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
+}
+
 TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
@@ -1023,6 +1046,10 @@ TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
 }
 
 TEST_F(LoadValueAwaitableTestPeer, PopulationChangeDuringBufferWaitSkipsIo) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
   auto read = Read();
@@ -1038,6 +1065,10 @@ TEST_F(LoadValueAwaitableTestPeer, PopulationChangeDuringBufferWaitSkipsIo) {
 }
 
 TEST_F(LoadValueAwaitableTestPeer, RelocationDuringBufferWaitUsesNewLocation) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
   auto read = Read();
@@ -1060,6 +1091,10 @@ TEST_F(LoadValueAwaitableTestPeer, RelocationDuringBufferWaitUsesNewLocation) {
 }
 
 TEST_F(LoadValueAwaitableTestPeer, ExtentWaitRetainsPinAndReturnsSlice) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   ASSERT_NO_FATAL_FAILURE(InstallExtent());
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
@@ -1341,6 +1376,13 @@ TEST_F(LoadValueAwaitableTestPeer,
 
 TEST_F(LoadValueAwaitableTestPeer,
        GroupedStringAssemblyRechecksPopulationAfterPageBufferWait) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  // The output assembly must succeed; fail only the temporary ordinary page
+  // read so the population change races with a real fixed-slot wait.
+  lavik::test::ScopedReadBufferAllocationFailure failure(
+      /*ordinary_only=*/true);
   ASSERT_NO_FATAL_FAILURE(InstallGroupedString(2 * kStringGroupBytes + 17));
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());

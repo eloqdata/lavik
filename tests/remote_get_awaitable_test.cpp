@@ -7,6 +7,7 @@
 
 #include "../src/storage/engine/impl.h"
 #include "gtest/gtest.h"
+#include "support/read_buffer_fault.h"
 
 namespace lavik::storage {
 
@@ -272,7 +273,12 @@ TEST_F(RemoteGetTestPeer, UnawaitedReadReleasesPinAndBuffer) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(RemoteGetTestPeer, ExhaustedPoolFallsBackWithoutEnqueuingWaiter) {
+TEST_F(RemoteGetTestPeer,
+       ExhaustedPoolAllocationFailureFallsBackWithoutWaiting) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   {
     auto held = Pool().AcquireReadBuffer().await_resume();
     ASSERT_TRUE(held.ok());
@@ -282,6 +288,26 @@ TEST_F(RemoteGetTestPeer, ExhaustedPoolFallsBackWithoutEnqueuingWaiter) {
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(RemoteGetTestPeer, ExhaustedPoolUsesAndReleasesTemporaryReplyLease) {
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  Awaitable::Result result;
+  {
+    auto read = Read();
+    ASSERT_FALSE(read.await_ready());
+    EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
+    ASSERT_NO_FATAL_FAILURE(Complete(read));
+    result = read.await_resume();
+    ASSERT_TRUE(result && result->ok());
+    EXPECT_EQ(result->value().view().encoded_, value_);
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
+  EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
+  result.reset();
+  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
 }
 
 TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {

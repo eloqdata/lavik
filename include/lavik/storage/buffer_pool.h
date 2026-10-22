@@ -172,7 +172,7 @@ class RegisteredBufferPool {
   std::size_t available_read_buffers() const noexcept {
     return free_read_buffers_.size();
   }
-  // Number of live oversized-read allocations; idle release IDs own no memory.
+  // Number of live overflow allocations; idle release IDs own no buffer.
   std::size_t overflow_read_buffer_count() const noexcept {
     return overflow_read_buffers_.size() - free_overflow_read_buffers_.size();
   }
@@ -207,7 +207,7 @@ class RegisteredBufferPool {
                        std::size_t minimum_payload_bytes)
         : pool_(pool), minimum_payload_bytes_(minimum_payload_bytes) {}
 
-    bool await_ready() const noexcept;
+    bool await_ready();
     bool await_suspend(std::coroutine_handle<> awaiting);
     absl::StatusOr<ReadBufferLease> await_resume();
 
@@ -226,9 +226,15 @@ class RegisteredBufferPool {
     std::coroutine_handle<> awaiting_{};
     bycorf::RemoteWork* continuation_ = nullptr;
     std::uint16_t assigned_buffer_id_ = 0;
+    // Keep a successful speculative allocation until await_resume consumes it.
+    // Readiness may be checked again by either suspension API.
+    ReadBufferLease overflow_;
+    bool overflow_attempted_ = false;
   };
 
-  // Requests larger than a registered read slot use an aligned heap lease.
+  // Prefer a fixed slot. On exhaustion, try a temporary aligned/DMA lease,
+  // then wait for a fixed slot if allocation fails. Oversized requests always
+  // use overflow and report allocation failure because no fixed slot fits.
   AcquireReadAwaiter AcquireReadBuffer(
       std::size_t minimum_payload_bytes = 0) noexcept {
     return AcquireReadAwaiter(this, minimum_payload_bytes);
@@ -276,7 +282,7 @@ class RegisteredBufferPool {
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;
   std::deque<AcquireReadAwaiter*> read_waiters_;
-  // Oversized reads retain DMA/aligned storage only while leased. Reuse empty
+  // Overflow reads retain DMA/aligned storage only while leased. Reuse empty
   // release IDs so repeated large reads do not grow the bookkeeping forever;
   // live IDs stay stable across cross-worker lease returns.
   std::vector<bycorf::FixedBuffer> overflow_read_buffers_;

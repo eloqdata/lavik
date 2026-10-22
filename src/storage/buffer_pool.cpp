@@ -30,6 +30,7 @@
 #include "bycorf/io/spdk_storage.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/fault_injection.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::storage {
@@ -461,15 +462,26 @@ bool RegisteredBufferPool::IsReadBufferId(
   return index >= read_base && index < read_base + read_buffers_.size();
 }
 
-bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() const noexcept {
-  if (pool_ == nullptr || !pool_->initialized()) {
+bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() {
+  if (pool_ == nullptr || !pool_->initialized() || assigned_buffer_id_ != 0 ||
+      overflow_.valid()) {
     return true;
   }
-  // Oversized reads cannot use a fixed slot and retain the aligned overflow
-  // path. Ordinary reads wait for their worker's bounded fixed pool instead
-  // of turning a transient hand-back delay into unbounded DMA allocation.
-  return minimum_payload_bytes_ > pool_->options_.read_payload_bytes() ||
-         !pool_->free_read_buffers_.empty();
+  // Oversized reads (and pools with no fixed read slots) cannot wait for a
+  // usable slot. Allocate in await_resume so failure is returned to the caller.
+  if (minimum_payload_bytes_ > pool_->options_.read_payload_bytes() ||
+      pool_->read_buffers_.empty() || !pool_->free_read_buffers_.empty()) {
+    return true;
+  }
+  // A temporary lease can absorb a delayed hand-back without stalling I/O.
+  // Attempt once per awaiter; if allocation fails, both suspension APIs use
+  // the existing FIFO fixed-slot handoff instead of retrying or spinning.
+  if (!overflow_attempted_) {
+    overflow_attempted_ = true;
+    auto acquired = pool_->AllocateHeapReadBuffer(minimum_payload_bytes_);
+    if (acquired.ok()) overflow_ = std::move(*acquired);
+  }
+  return overflow_.valid();
 }
 
 bool RegisteredBufferPool::AcquireReadAwaiter::await_suspend(
@@ -496,6 +508,7 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is not initialized");
   }
+  if (overflow_.valid()) return std::move(overflow_);
   if (assigned_buffer_id_ != 0) {
     return pool_->LeaseReadBuffer(assigned_buffer_id_);
   }
@@ -503,7 +516,8 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
       !pool_->free_read_buffers_.empty()) {
     return pool_->TakeReadBuffer();
   }
-  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes()) {
+  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes() &&
+      !pool_->read_buffers_.empty()) {
     return absl::Status(absl::StatusCode::kInternal,
                         "read buffer waiter resumed without a buffer");
   }
@@ -558,6 +572,14 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
     return absl::ResourceExhaustedError(
         "overflow read buffer id space exhausted");
   }
+  LAVIK_FAULT_INJECT(
+      if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1") ||
+          (minimum_payload_bytes <= options_.read_payload_bytes() &&
+           LAVIK_FAULT_MATCHES("LAVIK_FAIL_READ_BUFFER_ALLOCATION",
+                               "ordinary"))) {
+        return absl::ResourceExhaustedError(
+            "injected read buffer allocation failure");
+      });
   auto* data = static_cast<std::byte*>(
       bycorf::AllocateStorageBuffer(bytes, options_.alignment_));
   if (data == nullptr) {
