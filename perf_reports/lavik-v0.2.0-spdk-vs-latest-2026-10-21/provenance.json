@@ -1,0 +1,152 @@
+{
+  "release": "v0.2.0",
+  "commit": "2908f86f2770e9c6e8acc6585b3bedb4b44d1cd5",
+  "binary_sha256": "21f796318bafa736d69ab1897840031bdb737a9f362d9d72635cf4236f4193eb",
+  "config": {
+    "kind": "large",
+    "release": "v0.2.0",
+    "revision": "2908f86f2770e9c6e8acc6585b3bedb4b44d1cd5",
+    "server_private": "10.96.1.4",
+    "client_private": "10.96.0.5",
+    "server_cpus": "0-15",
+    "workers": 16,
+    "io_threads": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "huge_mib": 8192,
+    "nvmes": [
+      {
+        "serial": "7906831e17220f400006",
+        "bdf": "9816:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme5n1"
+      },
+      {
+        "serial": "7906831e17220f400005",
+        "bdf": "fa44:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme3n1"
+      },
+      {
+        "serial": "7906831e17220f400004",
+        "bdf": "ef09:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme1n1"
+      },
+      {
+        "serial": "7906831e17220f400001",
+        "bdf": "7133:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme6n1"
+      },
+      {
+        "serial": "7906831e17220f400003",
+        "bdf": "9c4a:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme4n1"
+      },
+      {
+        "serial": "7906831e17220f400002",
+        "bdf": "10fc:00:00.0",
+        "nsid": 1,
+        "bytes": 1919850381312,
+        "device": "/dev/nvme2n1"
+      }
+    ],
+    "versions": {
+      "redis": {
+        "version": "8.10.2"
+      },
+      "valkey": {
+        "version": "9.1.2"
+      }
+    },
+    "lavik_binary_sha256": "21f796318bafa736d69ab1897840031bdb737a9f362d9d72635cf4236f4193eb"
+  },
+  "client_provenance": {
+    "utc": "2026-10-21T13:34:12Z",
+    "cpu": {
+      "argv": [
+        "lscpu",
+        "-J"
+      ],
+      "returncode": 0,
+      "stdout": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"48 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"32\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"AuthenticAMD\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"AMD EPYC 9V74 80-Core Processor\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"25\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"17\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"32\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"5192.29\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves user_shstk avx512_bf16 clzero xsaveerptr rdpru arat npt nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"AMD-V\"\n      },{\n         \"field\": \"Hypervisor vendor:\",\n         \"data\": \"Microsoft\"\n      },{\n         \"field\": \"Virtualization type:\",\n         \"data\": \"full\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"1 MiB (32 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"1 MiB (32 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"32 MiB (32 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"128 MiB (4 instances)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-31\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Ghostwrite:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Old microcode:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Vulnerable: Safe RET, no microcode\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Vulnerable\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Retpolines; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Vulnerable: No microcode\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Not affected\"\n      }\n   ]\n}\n",
+      "stderr": ""
+    },
+    "kernel": {
+      "argv": [
+        "uname",
+        "-a"
+      ],
+      "returncode": 0,
+      "stdout": "Linux client 6.17.0-1022-azure #22-Ubuntu SMP Mon Jul 27 17:24:03 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux\n",
+      "stderr": ""
+    },
+    "memtier": {
+      "argv": [
+        "memtier_benchmark",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "memtier_benchmark v=2.5.1 sha=00000000:0 bits=64 libevent=2.1.12-stable openssl=OpenSSL 3.0.13 30 Jan 2024 prometheus=yes\nCopyright (C) 2011-2026 Redis Ltd.\nThis is free software.  You may redistribute copies of it under the terms of\nthe GNU General Public License <http://www.gnu.org/licenses/gpl.html>.\nThere is NO WARRANTY, to the extent permitted by law.\n",
+      "stderr": ""
+    },
+    "redis": {
+      "argv": [
+        "/opt/bench020/downloads/redis/src/redis-server",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=8a69ba54b05c43b2\n",
+      "stderr": ""
+    },
+    "valkey": {
+      "argv": [
+        "/opt/bench020/downloads/valkey/src/valkey-server",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "Valkey server v=9.1.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=802bdf485a4c98a1\n",
+      "stderr": ""
+    },
+    "files": {
+      "ycsb-redis-jars.sha256": "9b47fbae444feaac4b7e04f0ea294569e4bc282bc69d8c2ce2ac3f23577281e2  ycsb-redis-dist/lib/HdrHistogram-2.1.12.jar\nea0505ee7515e58b1ac0e686e4d1a5d9f7d808e251a61bc371aa0595b9963f83  ycsb-redis-dist/lib/commons-pool2-2.11.1.jar\n55630496d3cdf4184084922a9e795bd51cb11f53933149f31a3a6c3f21aebd7c  ycsb-redis-dist/lib/core-0.18.0-SNAPSHOT.jar\n5d45b7904857c3e4ad36b3bcc57be2d2c5f308c69b5f6a58bd86aa7d48a25ef6  ycsb-redis-dist/lib/htrace-core4-4.1.0-incubating.jar\n6129e1b91d7850ba250b1375094c8ca215a0f7cf234b6f60a2f4a88d5b1272c9  ycsb-redis-dist/lib/jackson-core-asl-1.9.4.jar\nf013389c3eb92aa997df801e4a352464925af634a4af3e5bd77c6c0763dc9c99  ycsb-redis-dist/lib/jackson-mapper-asl-1.9.4.jar\n6e2d300c31fccd2be59dbf21d3308348413ba6e2b3b1f21a1c08bb635f1ad14a  ycsb-redis-dist/lib/jedis-3.9.0.jar\n3a38868b79038872c52813cc51db6a10b4abc4b3d9e094f2f7e29d106a0550ff  ycsb-redis-dist/lib/redis-binding-0.18.0-SNAPSHOT.jar\n18c4a0095d5c1da6b817592e767bb23d29dd2f560ad74df75ff3961dbde25b79  ycsb-redis-dist/lib/slf4j-api-1.7.25.jar\n",
+      "ycsb-aerospike-jars.sha256": "9b47fbae444feaac4b7e04f0ea294569e4bc282bc69d8c2ce2ac3f23577281e2  ycsb-aerospike-dist/lib/HdrHistogram-2.1.12.jar\nf4b83b24a8315caa3e6c36ff107970456695ad8362d64895dffe4f3dd1cd7b88  ycsb-aerospike-dist/lib/aerospike-binding-0.18.0-SNAPSHOT.jar\n5a01832a8c415d2430bc1d0cba6d5e7c3601537b8b7370e161195b916e2b4206  ycsb-aerospike-dist/lib/aerospike-client-3.1.2.jar\n55630496d3cdf4184084922a9e795bd51cb11f53933149f31a3a6c3f21aebd7c  ycsb-aerospike-dist/lib/core-0.18.0-SNAPSHOT.jar\nb041b53fc4da294947ef081e5faff79a4c76ef8556f3a2d3e43104706caff3c0  ycsb-aerospike-dist/lib/gnu-crypto-2.0.1.jar\n5d45b7904857c3e4ad36b3bcc57be2d2c5f308c69b5f6a58bd86aa7d48a25ef6  ycsb-aerospike-dist/lib/htrace-core4-4.1.0-incubating.jar\n6129e1b91d7850ba250b1375094c8ca215a0f7cf234b6f60a2f4a88d5b1272c9  ycsb-aerospike-dist/lib/jackson-core-asl-1.9.4.jar\nf013389c3eb92aa997df801e4a352464925af634a4af3e5bd77c6c0763dc9c99  ycsb-aerospike-dist/lib/jackson-mapper-asl-1.9.4.jar\nc0717079f4fe18f72f36ad1ab15a2afa63c6544fee4b9ac2128851330b5e1031  ycsb-aerospike-dist/lib/jbcrypt-0.3m.jar\n4f0fb3e5c7f1e184b4533ab20f831523440c0f95db0fb47e495aaab4d16f6610  ycsb-aerospike-dist/lib/luaj-jse-3.0.jar\n",
+      "ycsb-source.sha256": "6daf789b45604a17ed814db07c8594cb4e3fa2046bb7088c18904f77fda60cb3  ycsb-source.tar.gz\n"
+    },
+    "binaries": {
+      "/usr/local/bin/memtier_benchmark": "bc07f192bcbe199acb7426906299126ab5966b4e3236c718f1a887d34cdffac3",
+      "/opt/bench020/downloads/redis/src/redis-server": "100dc87d011ccc593257c448e6e9ec37a353401e5683d162e043752f3450c3a9",
+      "/opt/bench020/downloads/valkey/src/valkey-server": "db4a81e796f15624d1c729155d15fbde753af843d59ff3453cb54638631496e8"
+    },
+    "source_build_sha256": "5c710d5b0167a97df57a85254d833eb6968e757926dec714a9f3196c59991383  redis-source.tar.gz\nc34214a05899f52771ec0441ff0557d87e6fa73ae0c16204cbecc59ca30798bb  valkey-source.tar.gz\n9b34e17a0d1d7e70b152eb442c6362161b5b764ce2ea98e97b7c74815bdd90b7  memtier-source.tar.gz\n100dc87d011ccc593257c448e6e9ec37a353401e5683d162e043752f3450c3a9  redis/src/redis-server\ndb4a81e796f15624d1c729155d15fbde753af843d59ff3453cb54638631496e8  valkey/src/valkey-server\nbc07f192bcbe199acb7426906299126ab5966b4e3236c718f1a887d34cdffac3  /usr/local/bin/memtier_benchmark\n"
+  },
+  "formal_points": 88,
+  "client_threads": 16,
+  "connections": [
+    160,
+    320,
+    640,
+    1280
+  ],
+  "first_formal_utc": "2026-10-21T13:01:41.211000+00:00",
+  "last_formal_utc": "2026-10-21T14:41:58.874000+00:00",
+  "source_archive": "evidence-large.tar.gz",
+  "source_archive_sha256": "7e9aaa5d32c42dfb44925262ef0224970150e37eedabf265f81dc420b7eb74d8",
+  "scope": "Previously measured 10M results; formal 80-connection points excluded. No new benchmark execution. Original sweep included 80 connections.",
+  "report_evidence": {
+    "file": "raw-results.tar.gz",
+    "sha256": "7cef19ed31218c46ed04585b55f557cbc6d9403c10a2a9f16ee6d8391fecf22b",
+    "files": 895
+  }
+}
