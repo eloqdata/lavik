@@ -58,7 +58,7 @@ measured on October 21–22, 2026 (UTC).
 
 <a id="in-memory-redis-and-valkey"></a>
 
-### In-memory Redis and Valkey: more data, higher throughput
+### Comparison with in-memory Redis and Valkey
 
 <a id="performance-at-a-glance"></a>
 
