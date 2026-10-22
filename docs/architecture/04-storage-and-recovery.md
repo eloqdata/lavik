@@ -627,7 +627,11 @@ find the fixed pool exhausted allocate aligned or SPDK DMA overflow storage
 only while leased; returning a lease frees that storage and removes its charge
 on the owner worker. If temporary allocation fails, ordinary reads wait for a
 fixed slot in FIFO order. Oversized reads report allocation failure because
-fixed slots cannot satisfy them. These I/O allocations are accounted without
+fixed slots cannot satisfy them. Whole-value assembly uses ordinary heap
+memory, including on SPDK: page and extent reads copy into an output that
+neither consumes a fixed slot nor needs DMA addressability. Outputs retain
+reply framing space and follow the same owner-bound lease accounting and
+release lifecycle. These allocations are accounted without
 a separate admission gate so reads and reclamation can still progress at the
 memory waterline; subsequent retained growth observes their charges. Pool
 charges cover allocated slot capacity, not allocator overhead or SPDK's

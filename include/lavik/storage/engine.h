@@ -490,9 +490,9 @@ struct ReplicationLogInfo {
   bool capacity_backpressured_ = false;
 };
 
-// A value read directly into a registered storage buffer. network_bytes()
-// contains a complete RESP bulk-string frame and remains valid until this
-// move-only object is destroyed after the network send CQE.
+// A value backed by a storage read buffer or a heap assembly output.
+// network_bytes() contains a complete RESP bulk-string frame and remains valid
+// until this move-only object is destroyed after the network send CQE.
 class DiskValue {
  public:
   DiskValue() = default;

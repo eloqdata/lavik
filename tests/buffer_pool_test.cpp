@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -551,6 +552,86 @@ TEST_F(BufferPoolMemlockTest, RepeatedReadinessOwnsOneTemporaryLease) {
   EXPECT_FALSE(lease->registered());
   held.clear();
   lease->Reset();
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST_F(BufferPoolMemlockTest, AssemblyOutputBypassesStorageAllocationAndSlots) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  const auto available = pool_->available_read_buffers();
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  EXPECT_TRUE(absl::IsResourceExhausted(
+      pool_->AcquireReadBuffer(kMiB).await_resume().status()));
+  for (const auto payload : {std::size_t{1}, kMiB}) {
+    auto output = pool_->AllocateReadOutputBuffer(payload);
+    ASSERT_TRUE(output.ok()) << output.status();
+    EXPECT_EQ(output->buffer_id(), 0);
+    EXPECT_FALSE(output->registered());
+    EXPECT_GE(output->io_buffer().size_, payload);
+    EXPECT_GE(output->headroom_bytes(), 32);
+    EXPECT_GE(output->tailroom_bytes(), 2);
+    EXPECT_EQ(pool_->available_read_buffers(), available);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+              baseline + output->bytes().size());
+    auto moved = std::move(*output);
+    EXPECT_FALSE(output->valid());
+    moved.Reset();
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+    EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  }
+}
+
+TEST_F(BufferPoolMemlockTest, AssemblyOutputRemoteReleaseAndMixedIdReuse) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0, 2));
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  const auto other_baseline = WorkerMemoryAccountingBytes(1);
+  // Reuse one dynamic ID across both allocators. Its current allocation must
+  // determine the free operation, not the allocation that created the ID.
+  auto disk = pool_->AcquireReadBuffer(kMiB).await_resume();
+  ASSERT_TRUE(disk.ok());
+  disk->Reset();
+  auto output = pool_->AllocateReadOutputBuffer(2 * kMiB);
+  ASSERT_TRUE(output.ok());
+  const auto output_bytes = output->bytes().size();
+  bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+  output->Reset();
+  bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline + output_bytes);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool_->overflow_read_buffer_count() != 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    worker_->RunOnce(false);
+  }
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  auto reused = pool_->AcquireReadBuffer(kMiB).await_resume();
+  ASSERT_TRUE(reused.ok());
+  reused->Reset();
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
+}
+
+TEST_F(BufferPoolMemlockTest,
+       AssemblyOutputRejectsInvalidSizesWithoutCharging) {
+  RegisteredBufferPool uninitialized;
+  EXPECT_TRUE(absl::IsFailedPrecondition(
+      uninitialized.AllocateReadOutputBuffer(1).status()));
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  for (const auto bytes :
+       {std::numeric_limits<std::size_t>::max(),
+        std::size_t{std::numeric_limits<std::uint32_t>::max()}}) {
+    EXPECT_TRUE(
+        absl::IsOutOfRange(pool_->AllocateReadOutputBuffer(bytes).status()));
+  }
   EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
 }

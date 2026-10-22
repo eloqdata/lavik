@@ -47,8 +47,8 @@ struct RegisteredBufferPoolOptions {
   std::size_t write_buffer_bytes_ = 8 * kMiB;
   // Cover ordinary compact records and grouped pages, including record headers
   // and direct-I/O alignment, without reserving a large slot for every small
-  // read. Oversized records and whole-value assembly use on-demand overflow
-  // buffers; the group target is not a hard allocation limit.
+  // read. Oversized disk reads use on-demand overflow buffers; whole-value
+  // assembly uses ordinary heap memory. The group target is not a hard limit.
   // Total slot size includes both framing margins.
   std::size_t read_slot_bytes_ = 32 * kKiB;
   std::size_t read_headroom_bytes_ = 4 * kKiB;
@@ -67,9 +67,9 @@ struct RegisteredBufferPoolOptions {
 
 class RegisteredBufferPool;
 
-// A read slot remains owned by its storage worker. Moving this lease to a
-// connection worker only loans the memory; Reset()/destruction returns the slot
-// to the owner through a one-way cross-core notification.
+// A read or assembly buffer remains owned by its storage worker. Moving it to a
+// connection worker only loans the memory; Reset()/destruction returns
+// ownership to the owner through a one-way cross-core notification.
 class ReadBufferLease {
  public:
   ReadBufferLease() = default;
@@ -172,7 +172,8 @@ class RegisteredBufferPool {
   std::size_t available_read_buffers() const noexcept {
     return free_read_buffers_.size();
   }
-  // Number of live overflow allocations; idle release IDs own no buffer.
+  // Live dynamic allocations, including heap assembly outputs; idle release
+  // IDs own no buffer.
   std::size_t overflow_read_buffer_count() const noexcept {
     return overflow_read_buffers_.size() - free_overflow_read_buffers_.size();
   }
@@ -240,13 +241,20 @@ class RegisteredBufferPool {
     return AcquireReadAwaiter(this, minimum_payload_bytes);
   }
 
+  // Allocate ordinary heap memory for assembling a value, even on SPDK.
+  // Never consumes a fixed read slot and must not be submitted to storage I/O.
+  // Preserves reply framing space, retained accounting and owner-local release
+  // through the same lease type as disk reads. Allocation failure is returned.
+  absl::StatusOr<ReadBufferLease> AllocateReadOutputBuffer(
+      std::size_t minimum_payload_bytes);
+
  private:
   friend class ReadBufferLease;
 
   ReadBufferLease TakeReadBuffer();
   ReadBufferLease LeaseReadBuffer(std::uint16_t buffer_id);
-  absl::StatusOr<ReadBufferLease> AllocateHeapReadBuffer(
-      std::size_t minimum_payload_bytes);
+  absl::StatusOr<ReadBufferLease> AllocateOverflowBuffer(
+      std::size_t minimum_payload_bytes, bool storage_io);
   void ReleaseOverflow(std::size_t overflow_id) noexcept;
   void ReleaseOverflowLocal(std::size_t overflow_id) noexcept;
   std::optional<std::uint16_t> TakeWriteBuffer();
@@ -282,10 +290,17 @@ class RegisteredBufferPool {
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;
   std::deque<AcquireReadAwaiter*> read_waiters_;
-  // Overflow reads retain DMA/aligned storage only while leased. Reuse empty
+  struct OverflowBuffer {
+    bycorf::FixedBuffer buffer_{};
+    // Assembly outputs bypass the backend allocator. Keep its matching free
+    // operation with the owner, including across remote returns and ID reuse.
+    bool storage_io_ = false;
+    void Free(std::size_t alignment) const noexcept;
+  };
+  // Dynamic buffers retain DMA/aligned storage only while leased. Reuse empty
   // release IDs so repeated large reads do not grow the bookkeeping forever;
   // live IDs stay stable across cross-worker lease returns.
-  std::vector<bycorf::FixedBuffer> overflow_read_buffers_;
+  std::vector<OverflowBuffer> overflow_read_buffers_;
   std::vector<std::size_t> free_overflow_read_buffers_;
   std::vector<bool> overflow_read_buffer_in_use_;
 };

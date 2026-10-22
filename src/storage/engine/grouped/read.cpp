@@ -523,7 +523,7 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     encoded = EncodeHashValue(*value);
   }
   if (!encoded.ok()) co_return encoded.status();
-  auto buffer = co_await store.buffers_.AcquireReadBuffer(encoded->size());
+  auto buffer = store.buffers_.AllocateReadOutputBuffer(encoded->size());
   if (!buffer.ok()) co_return buffer.status();
   const auto output = buffer->io_buffer();
   if (output.size_ < encoded->size()) {

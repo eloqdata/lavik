@@ -29,9 +29,9 @@ namespace lavik::test {
 // synchronously. Restore the environment after every assertion exit.
 class ScopedReadBufferAllocationFailure {
  public:
-  explicit ScopedReadBufferAllocationFailure(bool ordinary_only = false) {
+  ScopedReadBufferAllocationFailure() {
     if (const auto* previous = std::getenv(kVariable)) previous_ = previous;
-    if (::setenv(kVariable, ordinary_only ? "ordinary" : "1", 1) != 0)
+    if (::setenv(kVariable, "1", 1) != 0)
       throw std::runtime_error("cannot inject read buffer allocation failure");
   }
   ScopedReadBufferAllocationFailure(const ScopedReadBufferAllocationFailure&) =

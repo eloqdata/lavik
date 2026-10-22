@@ -63,8 +63,9 @@ Whole String writes borrow immutable input segments until every changed page
 has been encoded into staging. Published directories and queued commit receipts
 retain no borrowed input. Whole String reads validate each segment against the
 retained graph and assemble it directly into the returned read lease through
-the shared group-read windows described below. The output lease uses overflow
-storage so its lifetime cannot exhaust the fixed slots needed for page reads.
+the shared group-read windows described below. The output lease uses ordinary
+heap memory, including on SPDK, so its lifetime neither consumes DMA memory nor
+exhausts the fixed slots needed for page reads.
 Admission covers the output and active page/task scratch.
 For grouped Strings, GETRANGE/GETBIT retain an immutable routing view and read
 only intersecting segments outside worker store state. The page loader checks
@@ -371,8 +372,8 @@ admission covers scheduling metadata and task scratch; insufficient headroom
 falls back to serial reads without weakening output admission.
 Oversized groups retain sequential reads of their payload extents, each routed
 to its own owner; the group window does not impose a separate extent-owner limit.
-External group assembly keeps its output in overflow storage so waiting for
-extent buffers cannot exhaust the fixed pool.
+External group assembly also keeps its output in ordinary heap memory so
+waiting for extent buffers cannot exhaust the fixed pool.
 
 Hash/Set point operations load each affected prefix group once. Point reads
 scan encoded entries and retain only requested values. Multi-field reads group

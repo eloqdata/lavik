@@ -1137,6 +1137,29 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
 }
 
 TEST_F(LoadValueAwaitableTestPeer,
+       ExternalAssemblyDoesNotRequireDynamicStorageMemory) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  value_.assign(4097, 'x');
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  auto task = ReadExternalGrouped();
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok()) << result.status();
+  ExpectValue(result);
+  EXPECT_EQ(result->lease_.buffer_id(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+            baseline + result->lease_.bytes().size());
+  result->lease_.Reset();
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
        ConcurrentExternalGroupedReadsProgressWithOnePageSlot) {
   value_.resize(4097);
   for (std::size_t i = 0; i < value_.size(); ++i)
@@ -1379,10 +1402,9 @@ TEST_F(LoadValueAwaitableTestPeer,
 #if !LAVIK_FAULTS_ENABLED
   GTEST_SKIP() << "requires read buffer allocation failure injection";
 #endif
-  // The output assembly must succeed; fail only the temporary ordinary page
-  // read so the population change races with a real fixed-slot wait.
-  lavik::test::ScopedReadBufferAllocationFailure failure(
-      /*ordinary_only=*/true);
+  // Heap output assembly succeeds even when all dynamic storage allocations
+  // fail. The population change races with a real fixed-slot page wait.
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   ASSERT_NO_FATAL_FAILURE(InstallGroupedString(2 * kStringGroupBytes + 17));
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());

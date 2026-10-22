@@ -137,11 +137,11 @@ RegisteredBufferPool::~RegisteredBufferPool() {
       bycorf::FreeStorageBuffer(buffer, options_.alignment_);
     }
   }
-  for (const bycorf::FixedBuffer& buffer : overflow_read_buffers_) {
-    if (buffer.data_ != nullptr &&
-        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
+  for (const auto& buffer : overflow_read_buffers_) {
+    if (buffer.buffer_.data_ != nullptr &&
+        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.buffer_.data_),
                   options_.alignment_)) {
-      bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
+      buffer.Free(options_.alignment_);
     }
   }
 }
@@ -478,7 +478,7 @@ bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() {
   // the existing FIFO fixed-slot handoff instead of retrying or spinning.
   if (!overflow_attempted_) {
     overflow_attempted_ = true;
-    auto acquired = pool_->AllocateHeapReadBuffer(minimum_payload_bytes_);
+    auto acquired = pool_->AllocateOverflowBuffer(minimum_payload_bytes_, true);
     if (acquired.ok()) overflow_ = std::move(*acquired);
   }
   return overflow_.valid();
@@ -521,7 +521,7 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
     return absl::Status(absl::StatusCode::kInternal,
                         "read buffer waiter resumed without a buffer");
   }
-  return pool_->AllocateHeapReadBuffer(minimum_payload_bytes_);
+  return pool_->AllocateOverflowBuffer(minimum_payload_bytes_, true);
 }
 
 ReadBufferLease RegisteredBufferPool::TakeReadBuffer() {
@@ -541,8 +541,26 @@ ReadBufferLease RegisteredBufferPool::LeaseReadBuffer(std::uint16_t buffer_id) {
                          options_.read_tailroom_bytes_, buffer_id);
 }
 
-absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
+absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateReadOutputBuffer(
     std::size_t minimum_payload_bytes) {
+  if (!initialized()) {
+    return absl::FailedPreconditionError(
+        "registered buffer pool is not initialized");
+  }
+  return AllocateOverflowBuffer(minimum_payload_bytes, false);
+}
+
+void RegisteredBufferPool::OverflowBuffer::Free(
+    std::size_t alignment) const noexcept {
+  if (storage_io_) {
+    bycorf::FreeStorageBuffer(buffer_.data_, alignment);
+  } else {
+    ::operator delete[](buffer_.data_, std::align_val_t(alignment));
+  }
+}
+
+absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateOverflowBuffer(
+    std::size_t minimum_payload_bytes, bool storage_io) {
   std::size_t payload_bytes =
       std::max(options_.read_payload_bytes(), minimum_payload_bytes);
   if (payload_bytes >
@@ -573,15 +591,18 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
         "overflow read buffer id space exhausted");
   }
   LAVIK_FAULT_INJECT(
-      if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1") ||
-          (minimum_payload_bytes <= options_.read_payload_bytes() &&
-           LAVIK_FAULT_MATCHES("LAVIK_FAIL_READ_BUFFER_ALLOCATION",
-                               "ordinary"))) {
+      if (storage_io &&
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1")) {
         return absl::ResourceExhaustedError(
             "injected read buffer allocation failure");
       });
+  // Assembly destinations are only written by memcpy, never storage DMA.
+  // Keep their framing/alignment layout without consuming SPDK hugepages.
   auto* data = static_cast<std::byte*>(
-      bycorf::AllocateStorageBuffer(bytes, options_.alignment_));
+      storage_io
+          ? bycorf::AllocateStorageBuffer(bytes, options_.alignment_)
+          : ::operator new[](bytes, std::align_val_t(options_.alignment_),
+                             std::nothrow));
   if (data == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned heap read buffer allocation failed");
@@ -589,13 +610,13 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
   std::size_t overflow_id;
   const bycorf::FixedBuffer buffer{.data_ = data, .size_ = bytes, .index_ = 0};
   if (free_overflow_read_buffers_.empty()) {
-    overflow_read_buffers_.push_back(buffer);
+    overflow_read_buffers_.push_back({buffer, storage_io});
     overflow_read_buffer_in_use_.push_back(true);
     overflow_id = overflow_read_buffers_.size();
   } else {
     overflow_id = free_overflow_read_buffers_.back();
     free_overflow_read_buffers_.pop_back();
-    overflow_read_buffers_[overflow_id - 1] = buffer;
+    overflow_read_buffers_[overflow_id - 1] = {buffer, storage_io};
     overflow_read_buffer_in_use_[overflow_id - 1] = true;
   }
   // Reads and maintenance I/O must still make progress at the retained limit.
@@ -725,8 +746,8 @@ void RegisteredBufferPool::ReleaseOverflowLocal(
     return;
   }
   const auto buffer = std::exchange(overflow_read_buffers_[offset], {});
-  bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
-  buffer_memory_.Resize(buffer_memory_.bytes() - buffer.size_);
+  buffer.Free(options_.alignment_);
+  buffer_memory_.Resize(buffer_memory_.bytes() - buffer.buffer_.size_);
   overflow_read_buffer_in_use_[offset] = false;
   free_overflow_read_buffers_.push_back(overflow_id);
 }
