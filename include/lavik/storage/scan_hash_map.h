@@ -3147,16 +3147,18 @@ std::uint8_t ScanHashMap<
   assert(logical_size <= kMaxLogicalKeySize);
   std::uint32_t encoded =
       (logical_size << 1) | static_cast<std::uint32_t>(!key_complete);
-  const std::uint8_t bytes = EncodedKeyMetadataBytes(encoded);
-  for (std::uint8_t index = 0; index < bytes; ++index) {
+  // Create() already sized the allocation; count bytes as they are written.
+  // Zero metadata still occupies one byte.
+  std::uint8_t index = 0;
+  do {
     std::uint8_t byte = static_cast<std::uint8_t>(encoded & 0x7f);
     encoded >>= 7;
     if (encoded != 0) {
       byte |= 0x80;
     }
-    output[index] = static_cast<std::byte>(byte);
-  }
-  return bytes;
+    output[index++] = static_cast<std::byte>(byte);
+  } while (encoded != 0);
+  return index;
 }
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy,
