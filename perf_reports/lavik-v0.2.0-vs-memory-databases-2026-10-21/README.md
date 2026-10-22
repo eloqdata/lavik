@@ -110,7 +110,7 @@ The 10M results retain saved measurements with the original 80-connection points
 | SET | 640 | 834,508 / 3.871 | 861,911 / 1.727 | 732,342 / 3.423 | 749,664 / 3.759 |
 | SET | 1280 | 945,384 / 10.175 | 910,356 / 4.319 | 863,860 / 7.391 | 793,809 / 7.743 |
 
-### Complete I/O-thread sweep
+### Redis / Valkey I/O-thread sweep (10M)
 
 ![All tested configurations](16vcpu-all-configurations.svg)
 
