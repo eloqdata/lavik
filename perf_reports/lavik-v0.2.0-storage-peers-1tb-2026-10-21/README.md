@@ -40,8 +40,6 @@ Peaks may occur at different connection counts. The matched-concurrency table sh
 | SET | 640 | 861,911 / 1.727 | 550,147 / 30.335 | 832,135 / 7.263 | 111,034 / 29.055 | 89,450 / 65.023 | 138,691 / 12.351 |
 | SET | 1280 | 910,356 / 4.319 | 549,937 / 60.671 | 822,427 / 7.071 | 109,065 / 36.095 | 86,950 / 64.511 | 132,374 / 28.287 |
 
-![160 connections](ranked-160.svg)
-
 ## Client and memory diagnostics
 
 | Product | Max average client CPU / cores | Max thread average / cores | Post-point RSS / MiB | Max server steal / % |
