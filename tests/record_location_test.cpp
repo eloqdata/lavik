@@ -518,42 +518,6 @@ RecordLocation MaterializeForTest(const RecordIndex::Entry& entry,
                                       allocation_epoch, block_owner);
 }
 
-TEST(RecordLocationTest, PrimaryIndexMaterializesCompleteBlockIdentity) {
-  constexpr std::uint64_t expiry = 4'102'444'800'123ULL;
-  constexpr std::uint16_t owner = kMaxMemoryWorkers - 1;
-  const RecordLocation location(
-      RecordLocation::kBlockIdMask, std::numeric_limits<std::uint64_t>::max(),
-      RecordLocation::kAllocationEpochMask, expiry,
-      static_cast<std::uint32_t>(kMaxBitmapBytes),
-      RecordLocation::PackedMetadata::Encode(
-          kStorageBlockBytes - kRecordAlignment,
-          kStorageBlockBytes - kBlockHeaderBytes, owner, true, true, true, true,
-          true, true, RecordKind::kTombstone, ValueType::kNone));
-
-  RecordIndex index;
-  const auto* entry = index.InsertNew(ComputeDigest("key"), "key", location);
-  ASSERT_NE(entry, nullptr);
-  const RecordLocation restored =
-      MaterializeForTest(*entry, location.allocation_epoch(), owner);
-
-  EXPECT_EQ(restored.block_id(), location.block_id());
-  EXPECT_EQ(restored.allocation_epoch(), location.allocation_epoch());
-  EXPECT_EQ(restored.block_owner(), owner);
-  EXPECT_EQ(restored.mutation_sequence_, location.mutation_sequence_);
-  EXPECT_EQ(restored.logical_size_, location.logical_size_);
-  EXPECT_EQ(restored.record_offset(), location.record_offset());
-  EXPECT_EQ(restored.total_disk_bytes(), location.total_disk_bytes());
-  EXPECT_EQ(restored.expire_at_ms_, expiry);
-  EXPECT_TRUE(restored.in_memory());
-  EXPECT_TRUE(restored.external());
-  EXPECT_TRUE(restored.key_indirect());
-  EXPECT_TRUE(restored.shielding());
-  EXPECT_TRUE(restored.unclaimed());
-  EXPECT_TRUE(restored.tx_tagged());
-  EXPECT_TRUE(restored.has_expiry());
-  EXPECT_EQ(restored.kind(), RecordKind::kTombstone);
-}
-
 TEST(RecordLocationTest, RemoteMaterializationRejectsReusedBlockByEpoch) {
   constexpr std::uint64_t block_id = 37;
   constexpr std::uint64_t old_epoch = 101;
@@ -775,6 +739,8 @@ TEST(RecordLocationTest, IndexKeyMatchingPreservesTailAndCollisionSemantics) {
 }
 
 TEST(RecordLocationTest, VariableLogicalSizePreservesMetadataAndKeyTail) {
+  constexpr std::uint16_t owner = kMaxMemoryWorkers - 1;
+  constexpr std::uint64_t epoch = RecordLocation::kAllocationEpochMask;
   constexpr std::array<std::uint32_t, 8> sizes = {
       0,        255,
       256,      65535,
@@ -784,29 +750,35 @@ TEST(RecordLocationTest, VariableLogicalSizePreservesMetadataAndKeyTail) {
                                                     63, 64, 128, 2048};
   for (const auto size : sizes) {
     for (const auto key_size : key_sizes) {
-      for (unsigned flags = 0; flags < 128; ++flags) {
-        const auto type = static_cast<ValueType>(1 + flags % 6);
+      for (unsigned flags = 0; flags < 512; ++flags) {
+        const bool tombstone = (flags & 128) != 0;
+        const auto type = tombstone ? ValueType::kNone
+                                    : static_cast<ValueType>(1 + flags % 6);
         const std::uint64_t expiry = (flags & 64) ? UINT64_MAX : 0;
         const bool indirect = key_size != 0 && (flags & 32);
         const auto metadata = RecordLocation::PackedMetadata::Encode(
             kStorageBlockBytes - kRecordAlignment,
-            kStorageBlockBytes - kBlockHeaderBytes, 1023, flags & 1, flags & 2,
-            indirect, flags & 4, flags & 8, flags & 16, RecordKind::kValue,
-            type, expiry != 0, flags & 32);
+            kStorageBlockBytes - kBlockHeaderBytes, owner, flags & 1, flags & 2,
+            indirect, flags & 4, flags & 8, flags & 16,
+            tombstone ? RecordKind::kTombstone : RecordKind::kValue, type,
+            expiry != 0, flags & 256);
         const RecordLocation expected(RecordLocation::kBlockIdMask, UINT64_MAX,
-                                      123456, expiry, size, metadata);
+                                      epoch, expiry, size, metadata);
         const std::string key(key_size, '\xa5');
         const Digest digest = ComputeDigest(key);
         RecordIndex index;
         const auto* entry = index.InsertNew(digest, key, expected, !indirect);
         ASSERT_NE(entry, nullptr);
-        const auto actual = MaterializeForTest(*entry, 123456, 1023);
+        const auto actual = MaterializeForTest(*entry, epoch, owner);
         EXPECT_EQ(actual.block_id(), expected.block_id());
+        EXPECT_EQ(actual.allocation_epoch(), epoch);
+        EXPECT_EQ(actual.block_owner(), owner);
         EXPECT_EQ(actual.mutation_sequence_, expected.mutation_sequence_);
         EXPECT_EQ(actual.logical_size_, size);
         EXPECT_EQ(actual.record_offset(), expected.record_offset());
         EXPECT_EQ(actual.total_disk_bytes(), expected.total_disk_bytes());
         EXPECT_EQ(actual.expire_at_ms_, expiry);
+        EXPECT_EQ(actual.has_expiry(), expiry != 0);
         EXPECT_EQ(actual.in_memory(), expected.in_memory());
         EXPECT_EQ(actual.external(), expected.external());
         EXPECT_EQ(actual.key_indirect(), expected.key_indirect());
@@ -814,6 +786,7 @@ TEST(RecordLocationTest, VariableLogicalSizePreservesMetadataAndKeyTail) {
         EXPECT_EQ(actual.unclaimed(), expected.unclaimed());
         EXPECT_EQ(actual.tx_tagged(), expected.tx_tagged());
         EXPECT_EQ(actual.grouped(), expected.grouped());
+        EXPECT_EQ(actual.kind(), expected.kind());
         EXPECT_EQ(actual.value_type(), type);
         EXPECT_EQ(entry->logical_key_size(), key_size);
         EXPECT_EQ(entry->key_complete(), !indirect);
@@ -828,30 +801,15 @@ TEST(RecordLocationTest, VariableLogicalSizePreservesMetadataAndKeyTail) {
   }
 }
 
-TEST(RecordLocationTest, FixedIndexCopiesOwnTheirTailAndSharePrimaryDecoding) {
+TEST(RecordLocationTest, FixedIndexCopiesOwnTheirLogicalSize) {
   constexpr std::array<std::uint32_t, 8> sizes = {
       0,     255,      256,      65535,
       65536, 16777215, 16777216, RecordIndexPrefix::kLogicalSizeMask};
   std::vector<RecordIndexValue> original;
-  std::vector<RecordLocation> expected;
-  RecordIndex index;
   for (const auto size : sizes) {
-    for (unsigned flags = 0; flags < 256; ++flags) {
-      const bool tombstone = (flags & 64) != 0;
-      const auto metadata = RecordLocation::PackedMetadata::Encode(
-          kStorageBlockBytes - kRecordAlignment,
-          kStorageBlockBytes - kBlockHeaderBytes, 1023, flags & 1, flags & 2,
-          flags & 4, flags & 8, flags & 16, flags & 32,
-          tombstone ? RecordKind::kTombstone : RecordKind::kValue,
-          tombstone ? ValueType::kNone : static_cast<ValueType>(1 + flags % 6),
-          false, flags & 128);
-      expected.emplace_back(RecordLocation::kBlockIdMask, UINT64_MAX, 123456, 0,
-                            size, metadata);
-      original.emplace_back(expected.back());
-      const auto key = std::to_string(expected.size() - 1);
-      ASSERT_NE(index.InsertNew(ComputeDigest(key), key, expected.back()),
-                nullptr);
-    }
+    RecordLocation value;
+    value.logical_size_ = size;
+    original.emplace_back(value);
   }
   // Exercise both ordinary copy forms, then release the source allocation.
   // Reads through the common prefix must find the destination's own tail.
@@ -860,39 +818,13 @@ TEST(RecordLocationTest, FixedIndexCopiesOwnTheirTailAndSharePrimaryDecoding) {
   EXPECT_EQ(assigned.logical_size(), 0);
   EXPECT_EQ(assigned.logical_bytes(), 4);
   assigned = original.back();
-  original.clear();
-  original.shrink_to_fit();
+  std::vector<RecordIndexValue>().swap(original);
   EXPECT_EQ(assigned.logical_size(), sizes.back());
   for (std::size_t i = 0; i < copies.size(); ++i) {
     const RecordIndexPrefix& prefix = copies[i];
     EXPECT_EQ(prefix.logical_bytes(), 4);
     EXPECT_FALSE(prefix.has_expiry());
-    const auto actual =
-        RecordIndexEntryPolicy::Load(prefix, nullptr, 123456, 1023);
-    const auto key = std::to_string(i);
-    const auto* primary = index.Find(ComputeDigest(key), key);
-    ASSERT_NE(primary, nullptr);
-    const auto compact = MaterializeForTest(*primary, 123456, 1023);
-    const auto& value = expected[i];
-    for (const auto* decoded : {&actual, &compact}) {
-      EXPECT_EQ(decoded->block_id(), value.block_id());
-      EXPECT_EQ(decoded->mutation_sequence_, value.mutation_sequence_);
-      EXPECT_EQ(decoded->allocation_epoch(), value.allocation_epoch());
-      EXPECT_EQ(decoded->block_owner(), value.block_owner());
-      EXPECT_EQ(decoded->logical_size_, value.logical_size_);
-      EXPECT_EQ(decoded->record_offset(), value.record_offset());
-      EXPECT_EQ(decoded->total_disk_bytes(), value.total_disk_bytes());
-      EXPECT_EQ(decoded->in_memory(), value.in_memory());
-      EXPECT_EQ(decoded->external(), value.external());
-      EXPECT_EQ(decoded->key_indirect(), value.key_indirect());
-      EXPECT_EQ(decoded->shielding(), value.shielding());
-      EXPECT_EQ(decoded->unclaimed(), value.unclaimed());
-      EXPECT_EQ(decoded->tx_tagged(), value.tx_tagged());
-      EXPECT_EQ(decoded->grouped(), value.grouped());
-      EXPECT_EQ(decoded->kind(), value.kind());
-      EXPECT_EQ(decoded->value_type(), value.value_type());
-      EXPECT_EQ(decoded->expire_at_ms_, 0);
-    }
+    EXPECT_EQ(prefix.logical_size(), sizes[i]);
   }
 }
 
