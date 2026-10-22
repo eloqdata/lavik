@@ -71,7 +71,7 @@
 - Aerospike CE 8.1.2.4-4: 2026-10-21T15:00:19Z – 2026-10-21T15:41:22Z (UTC).
 - Lavik v0.2.0: 2026-10-21T15:46:26Z – 2026-10-21T16:27:24Z (UTC).
 
-[Point data](results.csv) · [Provenance](provenance.json) · [Validation](validation.json) · [原始日志与测量凭据](raw-results.tar.gz)
+[Point data](results.csv) · [Provenance](provenance.json) · [Validation](validation.json) · [原始日志与测量凭据](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21)
 
 ## 运行命令
 

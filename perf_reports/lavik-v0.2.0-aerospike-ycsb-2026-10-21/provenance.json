@@ -143,8 +143,16 @@
     "formal_windows_before_repair": 0
   },
   "report_evidence": {
-    "file": "raw-results.tar.gz",
-    "sha256": "f5205d02c9d4bc645cc787a8fcc4393889aae7b66dfd85df110babfddd8135a6",
-    "files": 285
-  }
+    "repository": "eloqdata/lavik-agent",
+    "commit": "bb061b97e9836281e71c219f21570d742313fb8c",
+    "directory": "perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21",
+    "url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21",
+    "raw_url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/raw",
+    "manifest_url": "https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/raw/MANIFEST.json",
+    "manifest_sha256": "8a4c4f959dd17363aff1dcd9f28d7b232dd759077e79522fd86b7ff69b1dc001",
+    "checksums_url": "https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-aerospike-ycsb-2026-10-21/SHA256SUMS",
+    "files": 285,
+    "original_archive_sha256": "f5205d02c9d4bc645cc787a8fcc4393889aae7b66dfd85df110babfddd8135a6"
+  },
+  "acquisition_records_url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-experiment-2026-10-21"
 }

@@ -516,8 +516,16 @@
     }
   },
   "report_evidence": {
-    "file": "raw-results.tar.gz",
+    "repository": "eloqdata/lavik-agent",
+    "commit": "bb061b97e9836281e71c219f21570d742313fb8c",
+    "directory": "perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21",
+    "url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21",
+    "raw_url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/raw",
+    "manifest_url": "https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/raw/MANIFEST.json",
+    "manifest_sha256": "bf482665215117bc8293b88a5f2bf674f2392feb87f7aa133943feac68e863b3",
+    "checksums_url": "https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21/SHA256SUMS",
     "files": 1807,
-    "sha256": "c8b8b94d03438b6154ea7497fd613c7df18c6a9bf5781d7606f60ad20d9ac1b3"
-  }
+    "original_archive_sha256": "c8b8b94d03438b6154ea7497fd613c7df18c6a9bf5781d7606f60ad20d9ac1b3"
+  },
+  "acquisition_records_url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-experiment-2026-10-21"
 }

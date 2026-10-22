@@ -10,7 +10,7 @@
 | 16 | Lavik / Redis / Valkey 10M | 16 / 0–15 | 160 / 320 / 640 / 1280 | 30 | 88 |
 | 16 | Lavik 1B | 32 / 0–31 | 160 / 320 / 640 / 1280 | 60 | 8 |
 
-[完整逐点数据](results.csv) · [版本与硬件元数据](provenance.json) · [校验结果](validation.json) · [原始日志与测量凭据](raw-results.tar.gz)
+[完整逐点数据](results.csv) · [版本与硬件元数据](provenance.json) · [校验结果](validation.json) · [原始日志与测量凭据](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21)
 
 ## 2 vCPU：1M 与 100M key
 
@@ -221,9 +221,9 @@ Lavik 10M / 1B 与 Redis、Valkey 10M 使用同一组 160/320/640/1280 总连接
 
 [完整逐点数据](results.csv) · [版本、硬件与校验元数据](provenance.json)
 
-每点仅一次测量，不提供置信区间。不同产品的成功响应不代表相同的同步持久化保证。新机器的物理放置、网络延迟和运行时间均可能与旧报告不同。[原始日志与测量凭据](raw-results.tar.gz)包含逐文件 SHA-256 清单，归档哈希记录在元数据中。
+每点仅一次测量，不提供置信区间。不同产品的成功响应不代表相同的同步持久化保证。新机器的物理放置、网络延迟和运行时间均可能与旧报告不同。[原始日志与测量凭据](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21)保存在 `eloqdata/lavik-agent`，并包含逐文件 SHA-256 清单。
 
-原始证据按 `2vcpu`、`16vcpu-10m`、`16vcpu-1b` 分目录保存，统一归档包含逐文件 SHA-256 清单；CSV 中的 `suite` 和 `source` 可定位对应测量。
+原始证据按 `2vcpu`、`16vcpu-10m`、`16vcpu-1b` 分目录保存，归档目录包含逐文件 SHA-256 清单；CSV 中的 `suite` 和 `source` 可定位对应测量。
 
 ## 复现命令
 

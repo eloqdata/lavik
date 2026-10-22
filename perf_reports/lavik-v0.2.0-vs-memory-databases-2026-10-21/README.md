@@ -10,7 +10,7 @@ Compare Lavik, Redis 8.10.2 and Valkey 9.1.2 on two server sizes, including Lavi
 | 16 | Lavik / Redis / Valkey 10M | 16 / 0–15 | 160 / 320 / 640 / 1280 | 30 | 88 |
 | 16 | Lavik 1B | 32 / 0–31 | 160 / 320 / 640 / 1280 | 60 | 8 |
 
-[All measured points](results.csv) · [Provenance](provenance.json) · [Validation](validation.json) · [Raw logs and receipts](raw-results.tar.gz)
+[All measured points](results.csv) · [Provenance](provenance.json) · [Validation](validation.json) · [Raw logs and receipts](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21)
 
 ## 2 vCPUs: 1M and 100M keys
 
@@ -221,7 +221,7 @@ Load invocation wall time: **21.6 minutes**; reported fill throughput: **940,654
 
 [Complete point data](results.csv) · [Version, hardware and validation provenance](provenance.json)
 
-Each point has one measured run; no confidence interval is claimed. Successful responses do not imply equal synchronous durability guarantees. New hosts can differ from the historical run in physical placement, network latency and timing. [Raw logs and receipts](raw-results.tar.gz) includes a per-file SHA-256 manifest; its archive hash is recorded in provenance.
+Each point has one measured run; no confidence interval is claimed. Successful responses do not imply equal synchronous durability guarantees. New hosts can differ from the historical run in physical placement, network latency and timing. [Raw logs and receipts](https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-vs-memory-databases-2026-10-21) are stored in `eloqdata/lavik-agent` with a per-file SHA-256 manifest.
 
 Raw evidence is namespaced by `2vcpu`, `16vcpu-10m` and `16vcpu-1b`, with one per-file SHA-256 manifest. The CSV `suite` and `source` fields identify each measurement.
 

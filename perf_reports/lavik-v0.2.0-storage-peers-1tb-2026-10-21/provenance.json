@@ -114,10 +114,18 @@
     }
   },
   "formal_points": 48,
-  "raw_source": "raw-results.tar.gz; full experiment archive evidence-large-all.tar.gz",
+  "raw_source": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/raw",
   "report_evidence": {
-    "file": "raw-results.tar.gz",
-    "sha256": "d9f9acae55a1f3c1b4b95f3dd16dd025c922f772e369cba02bc2d505e20d04b4",
-    "files": 522
-  }
+    "repository": "eloqdata/lavik-agent",
+    "commit": "bb061b97e9836281e71c219f21570d742313fb8c",
+    "directory": "perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21",
+    "url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21",
+    "raw_url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/raw",
+    "manifest_url": "https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/raw/MANIFEST.json",
+    "manifest_sha256": "82e723484b2a5e3cf565aa7387036c9e433c86610eac6eefbe53f180f5037be8",
+    "checksums_url": "https://github.com/eloqdata/lavik-agent/blob/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-storage-peers-1tb-2026-10-21/SHA256SUMS",
+    "files": 522,
+    "original_archive_sha256": "d9f9acae55a1f3c1b4b95f3dd16dd025c922f772e369cba02bc2d505e20d04b4"
+  },
+  "acquisition_records_url": "https://github.com/eloqdata/lavik-agent/tree/bb061b97e9836281e71c219f21570d742313fb8c/perf_reports/lavik-v0.2.0-experiment-2026-10-21"
 }
