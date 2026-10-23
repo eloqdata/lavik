@@ -2134,6 +2134,7 @@ class StorageEngine {
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
   friend class TxCleanerPipelineTestPeer;
+  friend class WriteBufferTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

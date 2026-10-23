@@ -704,11 +704,27 @@ and commit-record append. Even an awaited `CommitTxWrites` only requests the
 commit-record flush; it is not a synchronous crash-durability fence.
 
 Staging-buffer pressure seals physical append streams before a writer waits
-for capacity. Live transaction leases and tagged records survive a pressure seal; later
-writes or commit decisions may open another transaction block. Flush completion returns sealed buffers after
+for capacity. Foreground and relocation writers release worker store state
+and join the same owner-local FIFO; a returned fixed slot transfers directly
+to its oldest waiter, so new borrowers cannot overtake it. While writers
+remain queued, record-write exits seal newly installed streams, including
+empty streams left by failed revalidation. Live transaction leases and tagged
+records survive a pressure seal; later writes or commit decisions may open
+another transaction block. Flush completion returns sealed buffers after
 their last reader pin drains, including tails that were already durable.
 Capacity therefore does not depend on completing transactions that themselves
-need a staging buffer to commit.
+need a staging buffer to commit. A failed storage writer fails pending slot
+acquisitions without recycling its still-referenced staging memory.
+
+Relocation bypasses the foreground physical-allocation gate and retains access
+to the defrag disk reserve: a foreground allocator may itself be waiting for
+reclamation. After write-slot waiting, relocation revalidates its source before
+publication. Old-block scan workspaces still borrow fixed write slots, with
+the existing extra-buffer fallback. If those workspaces exhaust the fixed pool
+and no fixed staging slot can be flushed, relocation ends its pass with
+resource exhaustion so the source workspace can be returned for a later retry.
+Atomic population rewrites that cannot release store state retain their
+extra-buffer fallback; relocation target staging uses the fixed pool.
 
 ### Reads and pins
 

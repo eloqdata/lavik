@@ -538,7 +538,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     // foreground allocation gate. Salvage may hold the last registered write
     // buffer while a foreground allocator owns that gate and waits for a
     // buffer: joining its queue would prevent either side from completing.
-    // Retain the store lock and use the defrag reserve/heap-buffer fallback.
+    // Use the defrag disk reserve without joining that gate. Write-slot
+    // pressure releases the store lock and joins the shared FIFO; the source
+    // is re-resolved below before publishing the relocated group.
     const RecordWriteRequest record_write{
         .key_ = key,
         .value_ = value,
@@ -665,8 +667,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   RecordLocation relocated;
   // Foreground allocation can wait for this defrag pass to reclaim a block
   // while holding the foreground-allocation gate. Relocation must therefore
-  // keep the store writer locked and allocate from the defrag reserve instead
-  // of waiting behind that gate, which would deadlock both sides.
+  // bypass that gate and allocate from the defrag reserve. It can still drop
+  // the store lock to wait fairly for a write slot: WriteRecordLocked checks
+  // the source's epoch and physical identity again before publication.
   const RecordWriteRequest record_write{
       .key_ = key,
       .value_ = value,

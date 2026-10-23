@@ -3432,6 +3432,7 @@ class StorageEngine::Impl {
   // NodeControl cleanup. Both are irreversible for this process.
   void LatchRuntimeFailure(WorkerStore& store) noexcept {
     store.write_failed_ = true;
+    store.buffers_.FailWriteWaiters();
     LatchRuntimeFailure();
   }
   void LatchRuntimeFailure() noexcept { FenceRequestServingUntilRestart(); }
@@ -3442,6 +3443,7 @@ class StorageEngine::Impl {
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
   friend class TxCleanerPipelineTestPeer;
+  friend class WriteBufferTestPeer;
   friend class StorageEngine::RemoteReadAwaitable;
 
   struct DurableSystemState {
@@ -4534,6 +4536,9 @@ class StorageEngine::Impl {
     // The request lives in the caller's coroutine frame. Pack these local
     // flags into one byte rather than adding another aligned word to it.
     bool for_defrag_ : 1 = false;
+    // Controls physical-block allocation and its foreground gate. Relocation
+    // bypasses that gate, but always unlocks for fixed write-buffer waiting;
+    // its source is revalidated before publishing the copied record.
     bool unlock_writer_while_waiting_ : 1 = true;
     bool external_ : 1 = false;
     bool key_indirect_ : 1 = false;

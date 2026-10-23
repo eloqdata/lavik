@@ -183,6 +183,7 @@ class RegisteredBufferPool {
   std::size_t available_write_buffers() const noexcept {
     return free_write_buffers_.size();
   }
+  bool has_write_waiters() const noexcept { return !write_waiters_.empty(); }
   bycorf::FixedBuffer write_buffer(std::uint16_t buffer_id = 0) const noexcept {
     if (buffer_id == 0) {
       return {};
@@ -192,12 +193,34 @@ class RegisteredBufferPool {
                                                   : bycorf::FixedBuffer{};
   }
 
+  // Never takes a slot already handed to a queued writer, including before
+  // that writer resumes. All write-pool borrowers obey the same ordering.
   bool TryAcquireWriteBuffer(std::uint16_t* buffer_id) noexcept;
-  // Foreground storage writers wait only for the statically reserved storage
-  // pool. A backlog-buffer release cannot wake or satisfy this waiter.
-  bycorf::AsyncNotification::Awaiter WaitForWriteBuffer() noexcept {
-    return storage_write_buffer_ready_.Wait();
+  class AcquireWriteAwaiter {
+   public:
+    explicit AcquireWriteAwaiter(RegisteredBufferPool* pool) : pool_(pool) {}
+    bool await_ready() noexcept;
+    bool await_suspend(std::coroutine_handle<> awaiting);
+    absl::StatusOr<std::uint16_t> await_resume();
+
+   private:
+    friend class RegisteredBufferPool;
+    RegisteredBufferPool* pool_;
+    std::coroutine_handle<> awaiting_{};
+    std::uint16_t assigned_buffer_id_ = 0;
+  };
+
+  // Owner-local FIFO acquisition from the fixed pool, shared by foreground
+  // and maintenance writers. Release hands ownership directly to the oldest
+  // waiter; callers must not hold locks needed by flush while awaiting it.
+  // The returned slot must be returned with ReleaseWriteBuffer(). A stopped
+  // writer reports FailedPrecondition instead of waiting on failed flushes.
+  AcquireWriteAwaiter AcquireWriteBuffer() noexcept {
+    return AcquireWriteAwaiter(this);
   }
+  // Irreversibly fail owner-local queued/future acquisitions without releasing
+  // staging memory that failed I/O or outstanding readers can still borrow.
+  void FailWriteWaiters() noexcept;
   void ReleaseWriteBuffer(std::uint16_t buffer_id) noexcept;
   bool TryAcquireHeapWriteBuffer(std::byte** buffer) noexcept;
   void ReleaseHeapWriteBuffer(std::byte* buffer) noexcept;
@@ -280,7 +303,8 @@ class RegisteredBufferPool {
   std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;
-  bycorf::AsyncNotification storage_write_buffer_ready_;
+  std::deque<AcquireWriteAwaiter*> write_waiters_;
+  bool write_acquisition_failed_ = false;
   std::vector<std::byte*> heap_write_buffers_;
   std::vector<std::byte*> free_heap_write_buffers_;
   // io_uring read/write slots share these allocations, ordered reads first.

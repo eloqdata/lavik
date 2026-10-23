@@ -628,7 +628,8 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateOverflowBuffer(
 }
 
 std::optional<std::uint16_t> RegisteredBufferPool::TakeWriteBuffer() {
-  if (free_write_buffers_.empty()) {
+  if (write_acquisition_failed_ || !write_waiters_.empty() ||
+      free_write_buffers_.empty()) {
     return std::nullopt;
   }
   const std::uint16_t buffer_id = free_write_buffers_.back();
@@ -649,6 +650,40 @@ bool RegisteredBufferPool::TryAcquireWriteBuffer(
   }
   *buffer_id = *taken;
   return true;
+}
+
+bool RegisteredBufferPool::AcquireWriteAwaiter::await_ready() noexcept {
+  return pool_->write_acquisition_failed_ || assigned_buffer_id_ != 0 ||
+         pool_->TryAcquireWriteBuffer(&assigned_buffer_id_);
+}
+
+bool RegisteredBufferPool::AcquireWriteAwaiter::await_suspend(
+    std::coroutine_handle<> awaiting) {
+  if (await_ready()) return false;
+  awaiting_ = awaiting;
+  pool_->write_waiters_.push_back(this);
+  return true;
+}
+
+absl::StatusOr<std::uint16_t>
+RegisteredBufferPool::AcquireWriteAwaiter::await_resume() {
+  if (pool_->write_acquisition_failed_) {
+    if (assigned_buffer_id_ != 0)
+      pool_->ReleaseWriteBuffer(std::exchange(assigned_buffer_id_, 0));
+    return absl::FailedPreconditionError(
+        "storage writer is stopped after an IO failure");
+  }
+  assert(assigned_buffer_id_ != 0);
+  return std::exchange(assigned_buffer_id_, 0);
+}
+
+void RegisteredBufferPool::FailWriteWaiters() noexcept {
+  write_acquisition_failed_ = true;
+  while (!write_waiters_.empty()) {
+    auto* waiter = write_waiters_.front();
+    write_waiters_.pop_front();
+    worker_->Enqueue(waiter->awaiting_);
+  }
 }
 
 void RegisteredBufferPool::ReleaseWriteBuffer(
@@ -695,9 +730,17 @@ void RegisteredBufferPool::ReleaseWriteBufferLocal(
   if (!write_buffer_in_use_[offset]) {
     return;
   }
+  if (!write_waiters_.empty()) {
+    auto* waiter = write_waiters_.front();
+    write_waiters_.pop_front();
+    waiter->assigned_buffer_id_ = buffer_id;
+    // Keep the slot in use across the handoff. A new borrower cannot steal it
+    // while the scheduled writer waits for its next worker time slice.
+    worker_->Enqueue(waiter->awaiting_);
+    return;
+  }
   write_buffer_in_use_[offset] = false;
   free_write_buffers_.push_back(buffer_id);
-  if (worker_ != nullptr) storage_write_buffer_ready_.NotifyAll(*worker_);
 }
 
 void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {

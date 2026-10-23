@@ -34,8 +34,10 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     }
     // The process failure latch can also be set by a non-runtime caller.
     // Normal progress is notified by I/O completion, without a timer wait.
-    if (store->write_failed_ || RuntimeFailureLatched())
+    if (store->write_failed_ || RuntimeFailureLatched()) {
+      store->buffers_.FailWriteWaiters();
       store->durability_progress_.NotifyAll(*store->worker_);
+    }
     // External shutdown/configuration callers cannot post owner notifications.
     // Actual cleaner completions and block returns wake capacity waiters at
     // once; this only delivers control-state changes from outside the runtime.

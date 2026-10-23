@@ -199,12 +199,10 @@ class BufferPoolWaitService final : public bycorf::Service {
  private:
   bycorf::Task<absl::Status> AcquireStorageAfterRelease() {
     storage_waiter_started_ = true;
-    std::uint16_t acquired = 0;
-    while (!pool_.TryAcquireWriteBuffer(&acquired)) {
-      co_await pool_.WaitForWriteBuffer();
-    }
+    const auto acquired = co_await pool_.AcquireWriteBuffer();
+    if (!acquired.ok()) co_return acquired.status();
     storage_waiter_acquired_ = true;
-    pool_.ReleaseWriteBuffer(acquired);
+    pool_.ReleaseWriteBuffer(*acquired);
     co_return absl::OkStatus();
   }
 
@@ -521,6 +519,104 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   pool_.reset();
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
+}
+
+TEST_F(BufferPoolMemlockTest, WriteSlotsTransferInFifoOrderWithoutBarging) {
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  std::uint16_t held = 0, other = 0;
+  ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&held));
+  ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&other));
+  std::vector<unsigned> order;
+  auto acquire = [&](unsigned position) -> bycorf::Task<std::uint16_t> {
+    const auto id = co_await pool_->AcquireWriteBuffer();
+    order.push_back(position);
+    EXPECT_TRUE(id.ok()) << id.status();
+    co_return id.value_or(0);
+  };
+  auto first = acquire(1);
+  auto second = acquire(2);
+  auto first_handle = std::move(first).ReleaseHandle();
+  first = bycorf::Task<std::uint16_t>(first_handle);
+  auto second_handle = std::move(second).ReleaseHandle();
+  second = bycorf::Task<std::uint16_t>(second_handle);
+  first_handle.resume();
+  second_handle.resume();
+  ASSERT_FALSE(first.done());
+  ASSERT_FALSE(second.done());
+  ASSERT_TRUE(pool_->has_write_waiters());
+
+  pool_->ReleaseWriteBuffer(held);
+  std::uint16_t stolen = 0;
+  EXPECT_FALSE(pool_->TryAcquireWriteBuffer(&stolen));
+  EXPECT_EQ(pool_->available_write_buffers(), 0);
+  auto third = acquire(3);
+  auto third_handle = std::move(third).ReleaseHandle();
+  third = bycorf::Task<std::uint16_t>(third_handle);
+  third_handle.resume();
+  ASSERT_FALSE(third.done());
+
+  auto finish = [&](auto& task, unsigned position) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!task.done() && std::chrono::steady_clock::now() < deadline)
+      worker_->RunOnce(false);
+    ASSERT_TRUE(task.done());
+    EXPECT_EQ(order.back(), position);
+    EXPECT_EQ(std::move(task).TakeResult(), held);
+    pool_->ReleaseWriteBuffer(held);
+  };
+  ASSERT_NO_FATAL_FAILURE(finish(first, 1));
+  EXPECT_FALSE(pool_->TryAcquireWriteBuffer(&stolen));
+  ASSERT_NO_FATAL_FAILURE(finish(second, 2));
+  EXPECT_FALSE(pool_->TryAcquireWriteBuffer(&stolen));
+  ASSERT_NO_FATAL_FAILURE(finish(third, 3));
+  EXPECT_EQ(order, (std::vector<unsigned>{1, 2, 3}));
+  EXPECT_FALSE(pool_->has_write_waiters());
+  EXPECT_EQ(pool_->available_write_buffers(), 1);
+  pool_->ReleaseWriteBuffer(other);
+  EXPECT_EQ(pool_->available_write_buffers(), 2);
+}
+
+TEST_F(BufferPoolMemlockTest, FailedFlushWakesQueuedAndAssignedWriters) {
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  std::uint16_t first_slot = 0, second_slot = 0;
+  ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&first_slot));
+  ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&second_slot));
+  auto acquire = [&]() -> bycorf::Task<absl::Status> {
+    auto acquired = co_await pool_->AcquireWriteBuffer();
+    co_return acquired.status();
+  };
+  auto first = acquire();
+  auto second = acquire();
+  auto first_handle = std::move(first).ReleaseHandle();
+  first = decltype(first)(first_handle);
+  auto second_handle = std::move(second).ReleaseHandle();
+  second = decltype(second)(second_handle);
+  first_handle.resume();
+  second_handle.resume();
+  // Fail after the first handoff but before its continuation runs. That slot
+  // is safe to return; the other remains owned by the failed staging block.
+  pool_->ReleaseWriteBuffer(first_slot);
+  pool_->FailWriteWaiters();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while ((!first.done() || !second.done()) &&
+         std::chrono::steady_clock::now() < deadline)
+    worker_->RunOnce(false);
+  ASSERT_TRUE(first.done());
+  ASSERT_TRUE(second.done());
+  EXPECT_TRUE(absl::IsFailedPrecondition(std::move(first).TakeResult()));
+  EXPECT_TRUE(absl::IsFailedPrecondition(std::move(second).TakeResult()));
+  EXPECT_FALSE(pool_->has_write_waiters());
+  EXPECT_EQ(pool_->available_write_buffers(), 1);
+  std::uint16_t acquired = 0;
+  EXPECT_FALSE(pool_->TryAcquireWriteBuffer(&acquired));
+  auto after_failure = pool_->AcquireWriteBuffer();
+  ASSERT_TRUE(after_failure.await_ready());
+  EXPECT_TRUE(
+      absl::IsFailedPrecondition(after_failure.await_resume().status()));
+  pool_->ReleaseWriteBuffer(second_slot);
+  EXPECT_EQ(pool_->available_write_buffers(), 2);
 }
 
 TEST_F(BufferPoolMemlockTest, RepeatedReadinessOwnsOneTemporaryLease) {

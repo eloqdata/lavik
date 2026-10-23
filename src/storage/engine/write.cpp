@@ -1764,7 +1764,7 @@ StorageEngine::Impl::WriteExtentValueLocked(
     });
     std::uint16_t write_buffer_id = 0;
     std::byte* heap_buffer = nullptr;
-    while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
+    if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
       // Extent construction is part of a foreground write. Do not let it
       // bypass the configured storage pool with an unbounded 8 MiB heap
       // allocation. Active append streams retain their buffers even after a
@@ -1772,8 +1772,13 @@ StorageEngine::Impl::WriteExtentValueLocked(
       // A live transaction may open a new Tx stream after this seal.
       SealActiveBlocks(store);
       store.store_state_mutex_.Unlock(*store.worker_);
-      co_await store.buffers_.WaitForWriteBuffer();
+      auto acquired = co_await store.buffers_.AcquireWriteBuffer();
       co_await store.store_state_mutex_.Lock();
+      if (!acquired.ok()) {
+        reclaim_allocated();
+        co_return acquired.status();
+      }
+      write_buffer_id = *acquired;
     }
     auto release_buffer = [&]() {
       if (write_buffer_id != 0) {
@@ -2655,6 +2660,17 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     SetLatencyTrace* trace
 #endif
 ) {
+  // Direct FIFO handoff does not wake the remaining writers to reseal a new
+  // active stream. A writer ahead of them must make its staging slot flushable
+  // on every exit, including stale-relocation/validation failures after an
+  // empty stream was installed. This guard runs with store state held.
+  struct FlushForWaitingWriters {
+    Impl& engine_;
+    WorkerStore& store_;
+    ~FlushForWaitingWriters() {
+      if (store_.buffers_.has_write_waiters()) engine_.SealActiveBlocks(store_);
+    }
+  } flush_for_waiters{*this, store};
   const std::size_t payload_bytes =
       request.inline_payload_ != nullptr
           ? request.inline_payload_->encoded_bytes()
@@ -2943,10 +2959,10 @@ acquire_active_stream:
       std::uint16_t write_buffer_id = 0;
       std::byte* heap_buffer = nullptr;
       if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-        if (request.for_defrag_ || !request.unlock_writer_while_waiting_) {
-          // Maintenance paths that deliberately keep store_state_mutex_
-          // across an atomic rewrite cannot wait for a flush that needs the
-          // same lock. Their concurrency is separately bounded.
+        if (!request.for_defrag_ && !request.unlock_writer_while_waiting_) {
+          // Atomic population rewrites still keep store_state_mutex_ across
+          // the whole operation. Relocation instead joins the ordinary FIFO
+          // below and revalidates its source before publication.
           if (!store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
             absl::Status returned = co_await return_reserved(*allocated);
             if (!returned.ok()) co_return returned;
@@ -2954,16 +2970,45 @@ acquire_active_stream:
                                    "no storage write buffer is available");
           }
         } else {
-          do {
-            // Active append streams can occupy every staging buffer.
-            // Transactions waiting to commit may still need a buffer, so seal
-            // the streams before waiting. Tagged records and transaction leases
-            // survive the seal, and flush returns their buffers.
-            SealActiveBlocks(store);
-            store.store_state_mutex_.Unlock(*store.worker_);
-            co_await store.buffers_.WaitForWriteBuffer();
-            co_await store.store_state_mutex_.Lock();
-          } while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id));
+          // Active append streams can occupy every staging buffer.
+          // Transactions waiting to commit may still need a buffer, so seal
+          // the streams before waiting. Tagged records and transaction leases
+          // survive the seal, and flush returns their buffers.
+          SealActiveBlocks(store);
+          const bool has_fixed_staging =
+              !request.for_defrag_ ||
+              std::any_of(store.staging_slots_.begin(),
+                          store.staging_slots_.end(),
+                          [](const StagingSlot& slot) {
+                            return slot.write_buffer_id_ != 0;
+                          });
+          if (request.for_defrag_ && !has_fixed_staging) {
+            // Source-block scans still borrow write slots. With a tiny pool,
+            // every slot may belong to a scan waiting for this relocation;
+            // there is then no flush to return one. End this pass so its scan
+            // releases the source workspace, rather than waiting on itself.
+            absl::Status returned = co_await return_reserved(*allocated);
+            if (!returned.ok()) co_return returned;
+            co_return absl::ResourceExhaustedError(
+                "relocation has no flushable storage write buffer");
+          }
+          store.store_state_mutex_.Unlock(*store.worker_);
+          auto acquired = co_await store.buffers_.AcquireWriteBuffer();
+          co_await store.store_state_mutex_.Lock();
+          if (!acquired.ok()) {
+            absl::Status returned = co_await return_reserved(*allocated);
+            if (!returned.ok()) co_return returned;
+            co_return acquired.status();
+          }
+          write_buffer_id = *acquired;
+
+          if (store.write_failed_ || RuntimeFailureLatched()) {
+            store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+            absl::Status returned = co_await return_reserved(*allocated);
+            if (!returned.ok()) co_return returned;
+            co_return absl::FailedPreconditionError(
+                "storage writer is stopped after an IO failure");
+          }
 
           // Another writer may have installed this append stream while this
           // coroutine was waiting without the store lock. It owns the stream;
