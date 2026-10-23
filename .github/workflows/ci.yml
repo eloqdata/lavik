@@ -49,7 +49,9 @@ jobs:
       - name: Check all maintained sources
         run: pre-commit run clang-format --all-files --show-diff-on-failure
 
-  admin:
+  # Separate job IDs keep dependency results local to each architecture.
+  # Singleton platform matrices let both architectures share the same steps.
+  admin-amd64:
     name: Admin tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
@@ -59,9 +61,7 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    steps:
+    steps: &admin-steps
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -77,7 +77,19 @@ jobs:
       - name: Run remote ownership and teardown tests
         run: python3 admin/test/remote_test.py
 
-  build:
+  admin-arm64:
+    name: Admin tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps: *admin-steps
+
+  build-amd64:
     name: Build tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -87,15 +99,13 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    env:
+    env: &build-env
       PYTHONPATH: ${{ github.workspace }}/build_ci/test_tools/redis_py
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content
       CCACHE_MAXSIZE: 1G
-    steps:
+    steps: &build-steps
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -166,9 +176,22 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  test-shard:
+  build-arm64:
+    name: Build tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env: *build-env
+    steps: *build-steps
+
+  test-shard-amd64:
     name: Test shard (${{ matrix.platform.arch }}, ${{ matrix.shard }})
-    needs: build
+    needs: build-amd64
     runs-on: ${{ matrix.platform.runner }}
     timeout-minutes: 90
     strategy:
@@ -177,12 +200,10 @@ jobs:
         platform:
           - arch: amd64
             runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
         shard: [0, 1, 2, 3, 4, 5]
-    env:
+    env: &shard-env
       PYTHONPATH: ${{ github.workspace }}/build_ci/test_tools/redis_py
-    steps:
+    steps: &shard-steps
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -255,26 +276,48 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  test:
-    # Preserve the existing branch-protection check names. Both gates require
-    # every build, shard and Admin job: failed, skipped, or cancelled work
-    # cannot pass.
-    name: Tests (${{ matrix.arch }})
-    if: ${{ always() }}
-    needs: [build, test-shard, admin]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  test-shard-arm64:
+    name: Test shard (${{ matrix.platform.arch }}, ${{ matrix.shard }})
+    needs: build-arm64
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
-    steps:
-      - name: Require all test shards
-        env:
-          BUILD_RESULT: ${{ needs.build.result }}
-          SHARD_RESULT: ${{ needs.test-shard.result }}
-          ADMIN_RESULT: ${{ needs.admin.result }}
+        platform:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+        shard: [0, 1, 2, 3, 4, 5]
+    env: *shard-env
+    steps: *shard-steps
+
+  # Preserve branch-protection check names and reject incomplete work within
+  # each architecture, without waiting for or inheriting the other's result.
+  test-amd64:
+    name: Tests (amd64)
+    if: ${{ always() }}
+    needs: [build-amd64, test-shard-amd64, admin-amd64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BUILD_RESULT: ${{ needs.build-amd64.result }}
+      SHARD_RESULT: ${{ needs.test-shard-amd64.result }}
+      ADMIN_RESULT: ${{ needs.admin-amd64.result }}
+    steps: &gate-steps
+      - name: Require all architecture tests
         run: |
           test "$BUILD_RESULT" = success
           test "$SHARD_RESULT" = success
           test "$ADMIN_RESULT" = success
+
+  test-arm64:
+    name: Tests (arm64)
+    if: ${{ always() }}
+    needs: [build-arm64, test-shard-arm64, admin-arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BUILD_RESULT: ${{ needs.build-arm64.result }}
+      SHARD_RESULT: ${{ needs.test-shard-arm64.result }}
+      ADMIN_RESULT: ${{ needs.admin-arm64.result }}
+    steps: *gate-steps
