@@ -23,6 +23,13 @@ namespace lavik::storage {
 
 namespace {
 
+// Limit the in-flight sweep read, not just the average rate between blocks.
+// A full-block submission can crowd out foreground reads even at low scan
+// rates.
+constexpr std::size_t kSweepReadChunkBytes = 256 * 1024;
+static_assert(kStorageBlockBytes % kSweepReadChunkBytes == 0);
+static_assert(kSweepReadChunkBytes % kDirectIoAlignment == 0);
+
 constexpr auto kMaxScheduleSleep = std::chrono::seconds(1);
 // Long operator-configured pacing sleeps stay cheap while replica transition
 // latency remains independent of that setting.
@@ -693,15 +700,23 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       // Slotless blocks are fully flushed and never appended to again, so
       // the on-disk image below `committed` is final.
       const auto [file_id, block_offset] = FileOffset(snapshot.block_id_);
-      auto read = co_await ReadStorageBuffer(
-          *store.worker_, store.files_[file_id], sweep.buffer_,
-          sweep.registered(), block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
-      if (*read != kStorageBlockBytes) {
-        co_return absl::Status(absl::StatusCode::kInternal,
-                               "short block read during tomb raider sweep");
+      // Keep only one chunk in flight and assemble the complete block before
+      // decoding: records may cross chunk boundaries. Subranges retain the
+      // original buffer registration and direct-I/O alignment.
+      for (std::size_t read_offset = 0; read_offset < kStorageBlockBytes;
+           read_offset += kSweepReadChunkBytes) {
+        auto part = sweep.buffer_;
+        part.data_ += read_offset;
+        part.size_ = kSweepReadChunkBytes;
+        auto read = co_await ReadStorageBuffer(
+            *store.worker_, store.files_[file_id], part, sweep.registered(),
+            block_offset + read_offset);
+        if (!read.ok()) co_return read.status();
+        if (*read != part.size_) {
+          co_return absl::Status(absl::StatusCode::kInternal,
+                                 "short block read during tomb raider sweep");
+        }
+        if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
       }
 #if LAVIK_FAULTS_ENABLED
       if (tomb_raider_test_hook_) {
@@ -811,8 +826,9 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         co_await bycorf::Yield(*store.worker_);
       }
     }
-    // Throttle: one block per sleep bounds the sweep's disk-bandwidth and
-    // CPU share, so a full-disk round never crowds out online traffic.
+    // Pace the average scan rate once per complete block. Chunked reads above
+    // bound the I/O burst; this sleep alone does not protect foreground
+    // latency.
     const std::uint32_t block_sleep_ms =
         tomb_raider_config_.block_sleep_ms_.load(std::memory_order_relaxed);
     auto sleep_remaining = std::chrono::milliseconds(block_sleep_ms);
