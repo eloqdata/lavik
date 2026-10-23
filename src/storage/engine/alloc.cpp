@@ -32,6 +32,34 @@ bool EpochIoFails(std::string_view kind, std::size_t device_index) {
 }  // namespace
 #endif
 
+DeviceAllocator::~DeviceAllocator() {
+  if (metadata_write_buffer_.data_ != nullptr) {
+    bycorf::FreeStorageBuffer(metadata_write_buffer_.data_, kDirectIoAlignment);
+  }
+}
+
+absl::Status DeviceAllocator::InitMetadataWriteBuffer(std::uint64_t device_id) {
+  if (metadata_write_buffer_.data_ != nullptr) return absl::OkStatus();
+  bool fail = false;
+  LAVIK_FAULT_INJECT(if (const char* device = std::getenv(
+                             "LAVIK_FAIL_DEVICE_METADATA_BUFFER_ALLOCATION")) {
+    fail = std::string_view(device) == std::to_string(device_id);
+  });
+  auto* data = fail ? nullptr
+                    : static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
+                          kBlockHeaderBytes, kDirectIoAlignment));
+  if (data == nullptr) {
+    return absl::ResourceExhaustedError(
+        "device " + std::to_string(device_id) +
+        " metadata write buffer allocation failed: requested " +
+        std::to_string(kBlockHeaderBytes) + " bytes (" +
+        (bycorf::SpdkStorageEnabled() ? "SPDK DMA" : "aligned") + ")");
+  }
+  metadata_write_buffer_ = {.data_ = data, .size_ = kBlockHeaderBytes};
+  metadata_write_buffer_charge_.Account(owner_ + 1, kBlockHeaderBytes);
+  return absl::OkStatus();
+}
+
 std::size_t StorageEngine::Impl::DeviceIndexForBlock(
     std::uint64_t block_id) const noexcept {
   const std::size_t device_index = DeviceIdForBlock(block_id);
@@ -74,12 +102,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
   page_indexes.erase(std::unique(page_indexes.begin(), page_indexes.end()),
                      page_indexes.end());
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   const StorageDevice& device = devices_[device_index];
   std::vector<MetadataPageState> committed;
@@ -104,8 +127,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
                                    payload_bytes),
         output);
     auto written = co_await WriteStorageBuffer(
-        *store.worker_, store.files_[device.file_index_], output,
-        lease.registered(), buffer,
+        *store.worker_, store.files_[device.file_index_], output, false, buffer,
         MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index,
                                next_slot));
     if (!written.ok() || *written != kDirectIoAlignment) {
@@ -138,12 +160,10 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
   assert(bycorf::ThisWorker().id_ == allocator.owner_);
   WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
-  auto* zero_header = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
-      kBlockHeaderBytes, options_.buffers_.alignment_));
-  if (zero_header == nullptr) {
-    co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                           "failed to allocate recycled-block header buffer");
-  }
+  auto* zero_header = allocator.metadata_write_buffer_.data_;
+  assert(zero_header != nullptr);
+  // Metadata writes may have used this workspace since the last activation.
+  // The caller holds allocator.mutex_ until the whole batch is durable.
   std::fill_n(zero_header, kBlockHeaderBytes, std::byte{0});
   absl::Status status = absl::OkStatus();
   for (const std::uint64_t block_id : block_ids) {
@@ -164,7 +184,6 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     status = co_await bycorf::Fdatasync(*store.worker_,
                                         store.files_[device.file_index_]);
   }
-  bycorf::FreeStorageBuffer(zero_header, options_.buffers_.alignment_);
   co_return status;
 }
 
@@ -440,20 +459,15 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
   const std::size_t payload_bytes = std::min(
       kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   LAVIK_FAULT_INJECT(if (!mutation.started_) {
     auto paused = co_await fault_injection::PauseWhileFileExists(
         "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE");
     if (!paused.ok()) co_return paused;
   });
-  // The allocator lock and buffer admission can suspend. Validate only after
-  // those waits, before changing pending metadata or issuing any epoch write.
+  // The allocator lock and test pause can suspend. Validate after those waits,
+  // before changing pending metadata or issuing any epoch write.
   absl::Status authorized = mutation.BeginWrite();
   if (!authorized.ok()) co_return authorized;
   allocator.epoch_values_[value_index] = desired;
@@ -479,8 +493,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
           co_return kDirectIoAlignment / 2;
         });
     co_return co_await WriteStorageBuffer(
-        *store.worker_, store.files_[device.file_index_], output,
-        lease.registered(), buffer,
+        *store.worker_, store.files_[device.file_index_], output, false, buffer,
         MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
   };
   auto written = co_await write();
@@ -571,10 +584,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
   }
 
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   std::vector<MetadataPageState> next_states = allocator.epoch_pages_;
   const StorageDevice& device = devices_[device_index];
@@ -583,8 +593,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
         "LAVIK_FLUSH_BEFORE_EPOCH_HOLD_FILE");
     if (!paused.ok()) co_return paused;
   });
-  // The allocator lock and buffer admission can suspend. Validate only after
-  // those waits, before changing pending metadata or issuing any epoch write.
+  // The allocator lock and test pause can suspend. Validate after those waits,
+  // before changing pending metadata or issuing any epoch write.
   absl::Status authorized = mutation.BeginWrite();
   if (!authorized.ok()) co_return authorized;
   for (const auto& [value_index, epoch] : values) {
@@ -618,8 +628,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
             co_return kDirectIoAlignment / 2;
           });
       co_return co_await WriteStorageBuffer(
-          *store.worker_, store.files_[device.file_index_], output,
-          lease.registered(), buffer,
+          *store.worker_, store.files_[device.file_index_], output, false,
+          buffer,
           MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
     };
     auto written = co_await write();

@@ -33,7 +33,109 @@ class WriteBufferTestPeer {
     kCheckpointAfterSubmit,
     kCheckpointMissingSlot,
     kRecoveryRead,
+    kDeviceMetadata,
   };
+
+  static Task<absl::Status> RunDeviceMetadata(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& pool = store.buffers_;
+    auto status = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!status.ok()) co_return status;
+    while (store.standby_prefetch_pending_)
+      co_await bycorf::Yield(*store.worker_);
+    std::vector<std::uint16_t> writes;
+    std::uint16_t id = 0;
+    while (pool.TryAcquireWriteBuffer(&id)) writes.push_back(id);
+    absl::Cleanup release = [&] {
+      for (auto slot : writes) pool.ReleaseWriteBuffer(slot);
+      unsetenv("LAVIK_FAIL_READ_BUFFER_ALLOCATION");
+    };
+    setenv("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1", 1);
+    std::vector<ReadBufferLease> reads;
+    while (pool.available_read_buffers() != 0) {
+      auto read = co_await pool.AcquireReadBuffer();
+      if (!read.ok()) co_return read.status();
+      reads.push_back(std::move(*read));
+    }
+    const auto retained = WorkerMemoryAccountingBytes(store.worker_->id());
+    // Two devices on one worker must own distinct images. Each round writes
+    // nonzero old headers, returns the blocks, and activates them again with
+    // every ordinary slot held and dynamic read allocation disabled.
+    if (impl.device_allocators_.size() != 2 ||
+        impl.device_allocators_[0]->metadata_write_buffer_.data_ ==
+            impl.device_allocators_[1]->metadata_write_buffer_.data_)
+      co_return absl::InternalError(
+          "devices do not own separate write buffers");
+    for (unsigned round = 0; round != 2; ++round) {
+      for (std::size_t device = 0; device != impl.devices_.size(); ++device) {
+        auto& allocator = *impl.device_allocators_[device];
+        auto* const buffer = allocator.metadata_write_buffer_.data_;
+        std::vector<std::uint64_t> blocks;
+        std::array<std::byte, kBlockHeaderBytes> header;
+        header.fill(std::byte{0x5a});
+        for (unsigned i = 0; i != 2; ++i) {
+          auto block = co_await impl.AllocateFromDeviceLocal(
+              device, AllocationPurpose::kForeground);
+          if (!block.ok()) co_return block.status();
+          blocks.push_back(block->block_id_);
+          status = WriteExactlyAt(impl.devices_[device].path_, header,
+                                  LocalBlockOffset(block->block_id_), true);
+          if (!status.ok()) co_return status;
+        }
+        status = co_await impl.ReturnColdBlocksLocal(device, blocks);
+        if (!status.ok()) co_return status;
+        {
+          co_await allocator.mutex_.Lock();
+          UnlockGuard unlock(&allocator.mutex_, store.worker_);
+          status = co_await impl.RefillReadyBlocksLocal(device, allocator);
+          if (!status.ok()) co_return status;
+        }
+        for (auto block : blocks) {
+          status = ReadExactlyAt(impl.devices_[device].path_, header,
+                                 LocalBlockOffset(block));
+          if (!status.ok()) co_return status;
+          if (!IsZero(header) ||
+              !impl.BitmapBit(allocator, LocalBlockId(block)))
+            co_return absl::DataLossError(
+                "reactivated block retained its old header");
+        }
+        StorageEngine::Impl::EpochMutation mutation;
+        const auto epoch = allocator.epoch_values_[0] + 1;
+        status = co_await impl.PersistEpochValueOnDeviceLocal(device, 0, epoch,
+                                                              mutation);
+        if (!status.ok()) co_return status;
+        const std::array<std::pair<std::size_t, std::uint64_t>, 2> updates{
+            {{0, epoch + 1}, {1, allocator.epoch_values_[1] + 1}}};
+        status = co_await impl.PersistEpochValuesOnDeviceLocal(device, updates,
+                                                               mutation);
+        if (!status.ok()) co_return status;
+        auto page = ReadMetadataPagePair(
+            impl.devices_[device].path_, kEpochMetadataOffset,
+            MetadataPageKind::kEpochs, 0, kMetadataPagePayloadBytes);
+        if (!page.ok()) co_return page.status();
+        for (const auto& [index, expected] : updates) {
+          std::uint64_t actual = 0;
+          std::memcpy(&actual, page->payload_.data() + index * sizeof(actual),
+                      sizeof(actual));
+          if (actual != expected)
+            co_return absl::DataLossError(
+                "device epoch write lost its payload");
+        }
+        if (buffer != allocator.metadata_write_buffer_.data_)
+          co_return absl::InternalError(
+              "metadata writes replaced their workspace");
+      }
+    }
+    if (pool.available_read_buffers() != 0 ||
+        pool.available_write_buffers() != 0 ||
+        pool.overflow_read_buffer_count() != 0 ||
+        WorkerMemoryAccountingBytes(store.worker_->id()) != retained)
+      co_return absl::InternalError(
+          "device metadata borrowed or grew ordinary pools");
+    co_return absl::OkStatus();
+  }
 
   static Task<absl::Status> RunRecoveryRead(StorageEngine& storage) {
     auto& impl = *storage.impl_;
@@ -137,6 +239,8 @@ class WriteBufferTestPeer {
   }
 
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kDeviceMetadata)
+      co_return co_await RunDeviceMetadata(storage);
     if (scenario == Scenario::kRecoveryRead)
       co_return co_await RunRecoveryRead(storage);
     if (scenario == Scenario::kCheckpoint ||
@@ -323,7 +427,8 @@ class WriteBufferService final : public bycorf::Service {
 class StorageWriteBufferTest
     : public testing::TestWithParam<WriteBufferTestPeer::Scenario> {};
 
-void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario) {
+void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
+                            unsigned devices = 1) {
   constexpr const char* fault = "LAVIK_FAIL_CHECKPOINT_AFTER_SUBMIT";
   std::optional<std::string> previous;
   if (const char* value = std::getenv(fault)) previous = value;
@@ -341,19 +446,27 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario) {
   } else {
     ASSERT_EQ(::unsetenv(fault), 0);
   }
-  const auto path = test::TestDataPath("lavik-write-fifo-" +
-                                       std::to_string(getpid()) + ".data");
-  const int fd =
-      open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-  ASSERT_GE(fd, 0);
-  absl::Cleanup remove = [&] { unlink(path.c_str()); };
-  ASSERT_EQ(ftruncate(fd, 256 * kMiB), 0);
-  close(fd);
+  std::vector<std::string> paths;
+  absl::Cleanup remove = [&] {
+    for (const auto& path : paths) unlink(path.c_str());
+  };
+  for (unsigned device = 0; device != devices; ++device) {
+    auto path =
+        test::TestDataPath("lavik-write-fifo-" + std::to_string(getpid()) +
+                           "-" + std::to_string(device) + ".data");
+    const int fd =
+        open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    paths.push_back(std::move(path));
+    const int sized = ftruncate(fd, 256 * kMiB);
+    close(fd);
+    ASSERT_EQ(sized, 0);
+  }
   InitWorkerMetrics(1);
   ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
   if (tx::TxRuntime::Get() == nullptr) tx::TxRuntime::Create(1);
   StorageEngineOptions options;
-  options.data_files_ = {path};
+  options.data_files_ = paths;
   options.database_count_ = 1;
   options.expiration_authority_ = false;
   options.tomb_raider_interval_ms_ = 0;
@@ -386,6 +499,50 @@ TEST(StorageRecoveryBufferTest, ScansWithoutOrdinarySlotsOrOverflow) {
   GTEST_SKIP() << "requires allocation failure injection";
 #endif
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kRecoveryRead);
+}
+
+TEST(DeviceMetadataBufferTest, ReusesBuffersWithOrdinaryPoolsExhausted) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires allocation failure injection";
+#endif
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kDeviceMetadata, 2);
+}
+
+TEST(DeviceMetadataBufferTest, AllocationFailureAndOwnerAccounting) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires allocation failure injection";
+#endif
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  const auto first_before = WorkerMemoryAccountingBytes(0);
+  const auto second_before = WorkerMemoryAccountingBytes(1);
+  ASSERT_EQ(setenv("LAVIK_FAIL_DEVICE_METADATA_BUFFER_ALLOCATION", "1", 1), 0);
+  absl::Cleanup restore = [] {
+    unsetenv("LAVIK_FAIL_DEVICE_METADATA_BUFFER_ALLOCATION");
+  };
+  {
+    DeviceAllocator first, second;
+    second.owner_ = 1;
+    ASSERT_TRUE(first.InitMetadataWriteBuffer(0).ok());
+    auto* const data = first.metadata_write_buffer_.data_;
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(data) % kDirectIoAlignment, 0);
+    ASSERT_TRUE(first.InitMetadataWriteBuffer(0).ok());
+    EXPECT_EQ(first.metadata_write_buffer_.data_, data);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), first_before + kBlockHeaderBytes);
+    auto failed = second.InitMetadataWriteBuffer(1);
+    EXPECT_TRUE(absl::IsResourceExhausted(failed));
+    EXPECT_NE(failed.message().find("device 1 metadata write buffer"),
+              std::string::npos);
+    EXPECT_NE(failed.message().find("8192 bytes (aligned)"), std::string::npos);
+    EXPECT_EQ(second.metadata_write_buffer_.data_, nullptr);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(1), second_before);
+    ASSERT_EQ(unsetenv("LAVIK_FAIL_DEVICE_METADATA_BUFFER_ALLOCATION"), 0);
+    ASSERT_TRUE(second.InitMetadataWriteBuffer(1).ok());
+    EXPECT_NE(second.metadata_write_buffer_.data_, data);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(1),
+              second_before + kBlockHeaderBytes);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), first_before);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(1), second_before);
 }
 
 TEST_P(StorageCheckpointBufferTest, KeepsBorrowedSlotsUntilIoCompletes) {

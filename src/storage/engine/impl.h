@@ -1345,8 +1345,18 @@ struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
 static_assert(sizeof(RecoveryDeviceCursor) % kCacheLineBytes == 0);
 
 struct DeviceAllocator {
+  ~DeviceAllocator();
+  // Allocate once during Prepare, before workers can issue allocator I/O.
+  // Failure prevents startup; no online path allocates fallback storage.
+  absl::Status InitMetadataWriteBuffer(std::uint64_t device_id);
+
   bycorf::WorkerId owner_ = 0;
   AsyncMutex mutex_;
+  // Cleared block headers and metadata pages share this write-only workspace
+  // under mutex_. Engine ownership outlives worker I/O and coroutine teardown.
+  // It is unregistered on io_uring and DMA-addressable on SPDK.
+  FixedBuffer metadata_write_buffer_{};
+  RetainedMemoryCharge metadata_write_buffer_charge_;
   std::uint32_t data_block_begin_ = 1;
   std::uint64_t next_pristine_ = 1;
   std::uint64_t next_allocation_epoch_ = 1;

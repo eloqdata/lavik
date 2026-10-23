@@ -80,7 +80,12 @@ Redis export also reserves one independent 8 MiB buffer per process at startup
 for capture writes and subsequent disk replay. It stays charged to shared
 retained memory between sessions and uses unregistered I/O on io_uring.
 Allocation failure identifies Redis export and fails startup. With defaults,
-total fixed storage-buffer capacity is `88 MiB × data workers + 8 MiB`.
+total fixed storage-buffer capacity is
+`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. Each device's 8 KiB
+write workspace handles recycled-block header clearing and online metadata
+writes under its allocator's coroutine mutex. It is charged to that device's
+owner worker and uses unregistered I/O on io_uring. Allocation failure names
+the device and prevents startup; it never borrows ordinary read/write slots.
 
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split

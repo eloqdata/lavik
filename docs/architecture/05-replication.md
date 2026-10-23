@@ -1383,8 +1383,8 @@ memory for the engine's lifetime; allocation failure stops startup. The sole
 session's connection owner holds exclusive use through disk capture and replay.
 Capture writes finish before replay reads reuse the same workspace. These
 data-block writes and replay reads neither borrow ordinary read/write slots nor
-allocate overflow DMA buffers. Block allocation and return still persist their
-bitmap metadata through ordinary small read slots.
+allocate overflow DMA buffers. Block allocation and return persist their
+bitmap metadata through the device's dedicated metadata write workspace.
 Cleanup joins disk I/O before returning the workspace for a subsequent owner.
 Stream group deltas are translated to Redis
 XGROUP/XCLAIM/XACK commands; private native payloads are never a Redis wire

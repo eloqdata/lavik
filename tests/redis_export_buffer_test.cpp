@@ -66,9 +66,9 @@ class RedisExportBufferTestPeer {
     auto& disk = store.redis_export_disk_backlog_;
     auto& pool = store.buffers_;
     std::vector<ReadBufferLease> reads;
-    // Block allocation/return persists bitmap metadata through one ordinary
-    // small read slot. Keep it available during capture and cleanup only.
-    while (pool.available_read_buffers() > 1) {
+    // Device metadata has its own write workspace, so allocation, capture,
+    // replay and cleanup must all progress with every ordinary slot held.
+    while (pool.available_read_buffers() != 0) {
       auto read = co_await pool.AcquireReadBuffer();
       if (!read.ok()) co_return read.status();
       reads.push_back(std::move(*read));
@@ -121,9 +121,6 @@ class RedisExportBufferTestPeer {
       if (!stopped.ok()) co_return stopped.status();
       if (*stopped != 3 || disk.active_buffer_ != nullptr)
         co_return absl::InternalError("export stop did not seal capture");
-      auto last_read = co_await pool.AcquireReadBuffer();
-      if (!last_read.ok()) co_return last_read.status();
-      reads.push_back(std::move(*last_read));
       if (pool.available_read_buffers() != 0)
         co_return absl::InternalError("replay fixture did not exhaust reads");
       ReplicationLogCursor next{.lsn_ = 1};
@@ -137,7 +134,6 @@ class RedisExportBufferTestPeer {
       }
       if (replayed != first + second)
         co_return absl::DataLossError("export replay changed payload bytes");
-      reads.pop_back();
     }
     pressure.Reset();
     status = co_await storage.ReleaseRedisExportDiskBacklog(session);
@@ -149,7 +145,7 @@ class RedisExportBufferTestPeer {
         impl.redis_export_buffer_.data_ != buffer ||
         impl.redis_export_buffer_.charge_.bytes() != kStorageBlockBytes ||
         pool.overflow_read_buffer_count() != 0 ||
-        pool.available_read_buffers() != 1 ||
+        pool.available_read_buffers() != 0 ||
         pool.available_write_buffers() != 0)
       co_return absl::InternalError("export cleanup changed fixed capacity");
     co_return absl::OkStatus();

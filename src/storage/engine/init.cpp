@@ -725,6 +725,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     auto allocator = std::make_unique<DeviceAllocator>();
     allocator->owner_ =
         static_cast<bycorf::WorkerId>(device_index % worker_count_);
+    absl::Status buffer_status = allocator->InitMetadataWriteBuffer(device.id_);
+    if (!buffer_status.ok()) return buffer_status;
     allocator->data_block_begin_ = device.data_block_begin_;
     allocator->next_pristine_ = device.data_block_begin_;
     allocator->scan_bitmap_.resize(bitmap_bytes, std::byte{0});

@@ -1068,10 +1068,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRootOnDeviceLocal(
   const std::size_t payload_bytes = std::min(
       kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   const MetadataPageState current = allocator.epoch_pages_[page_index];
   const std::uint8_t next_slot = current.active_slot_ == 0 ? 1 : 0;
@@ -1088,8 +1085,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRootOnDeviceLocal(
       output);
   const StorageDevice& device = devices_[device_index];
   auto written = co_await WriteStorageBuffer(
-      *store.worker_, store.files_[device.file_index_], output,
-      lease.registered(), buffer,
+      *store.worker_, store.files_[device.file_index_], output, false, buffer,
       MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
   if (!written.ok() || *written != kDirectIoAlignment) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
@@ -1743,10 +1739,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
     }
   }
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   const StorageDevice& device = devices_[device_index];
   const std::uint64_t base_offset =
@@ -1769,8 +1762,7 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
         std::span<const std::byte>(desired.data() + byte_offset, payload_bytes),
         output);
     auto written = co_await WriteStorageBuffer(
-        *store.worker_, store.files_[device.file_index_], output,
-        lease.registered(), buffer,
+        *store.worker_, store.files_[device.file_index_], output, false, buffer,
         MetadataPageSlotOffset(base_offset, page_index, next_slot));
     if (!written.ok() || *written != kDirectIoAlignment) {
       allocator.checkpoint_bitmap_valid_ = false;

@@ -529,10 +529,14 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
         }
       });
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  co_await allocator.mutex_.Lock();
+  UnlockGuard buffer_unlock(&allocator.mutex_, store.worker_);
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   std::array<std::byte, sizeof(SystemStateRoot)> payload{};
   EncodeSystemStateRoot(root, payload);
@@ -541,12 +545,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
                      std::span<std::byte, kDirectIoAlignment>(
                          buffer.data_, kDirectIoAlignment));
   const StorageDevice& device = devices_[device_index];
-  LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
-  });
-  // Buffer admission and the hop to this device's owner may suspend. This is
+  // The allocator lock and hop to this device's owner may suspend. This is
   // the first irreversible root write, not the earlier extent preparation.
   // The caller serially joins each device, so this flag has one writer at a
   // time. Never recheck between devices: a partial root set cannot be aborted
@@ -558,9 +557,12 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
   }
   auto written = co_await WriteStorageBuffer(
       *store.worker_, store.files_[device.file_index_],
-      std::span<const std::byte>(buffer.data_, kDirectIoAlignment),
-      lease.registered(), buffer,
+      std::span<const std::byte>(buffer.data_, kDirectIoAlignment), false,
+      buffer,
       MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, target_slot));
+  // Completion ends the DMA borrow. system_state_mutex_ still serializes root
+  // commits, so allocation can use the workspace while this root is synced.
+  buffer_unlock.Unlock();
   if (!written.ok() || *written != kDirectIoAlignment) {
     co_return written.ok()
         ? absl::InternalError("short system-state root write")

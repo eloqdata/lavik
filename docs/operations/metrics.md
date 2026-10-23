@@ -219,7 +219,8 @@ sum by (result) (rate(lavik_storage_defrag_runs_total[5m]))
   process heap usage; compare RSS and mimalloc diagnostics for that view.
   Includes primary-index object arrays and page directories, fixed storage
   read/write buffers, the three dedicated maintenance scan buffers per worker,
-  the process-wide Redis export workspace, and live overflow read buffers,
+  the process-wide Redis export workspace, one 8 KiB metadata write buffer per
+  device charged to its owner worker, and live overflow read buffers,
   in addition to retained entries, tables, and other tracked owners.
   Storage pools charge slot capacity on both io_uring and SPDK; allocator
   overhead and SPDK's full hugepage reservation are not included.
