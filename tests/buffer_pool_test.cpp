@@ -22,14 +22,19 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/status/status.h"
 #include "bycorf/net/server.h"
 #include "bycorf/runtime/task.h"
@@ -300,7 +305,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
     bycorf::MutableThisWorker() = std::move(saved_context_);
   }
 
-  void Init(rlim_t limit, unsigned runtime_workers = 1) {
+  void Init(rlim_t limit, unsigned runtime_workers = 1, bool init_pool = true) {
     if (limit > original_limit_.rlim_max) {
       GTEST_SKIP() << "test needs a higher memlock hard limit";
     }
@@ -324,6 +329,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
     reduced.rlim_cur = limit;
     ASSERT_EQ(setrlimit(RLIMIT_MEMLOCK, &reduced), 0);
     pool_ = std::make_unique<RegisteredBufferPool>();
+    if (!init_pool) return;
     auto status = pool_->Init(*worker_, options_);
     ASSERT_TRUE(status.ok()) << status;
     ASSERT_EQ(pool_->write_buffer_count(), 2);
@@ -440,6 +446,93 @@ class BufferPoolMemlockTest : public ::testing::Test {
   char path_[64] = "/tmp/lavik-buffer-memlock-XXXXXX";
 };
 
+TEST_F(BufferPoolMemlockTest, MaintenanceReadsDoNotBorrowExhaustedPools) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto retained = WorkerMemoryAccountingBytes(0);
+  std::vector<ReadBufferLease> held_reads;
+  while (pool_->available_read_buffers() != 0) {
+    auto acquired = pool_->AcquireReadBuffer().await_resume();
+    ASSERT_TRUE(acquired.ok());
+    held_reads.push_back(std::move(*acquired));
+  }
+  std::vector<std::uint16_t> held_writes;
+  while (pool_->available_write_buffers() != 0) {
+    std::uint16_t id = 0;
+    ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&id));
+    held_writes.push_back(id);
+  }
+  absl::Cleanup release_writes = [&] {
+    for (const auto id : held_writes) pool_->ReleaseWriteBuffer(id);
+  };
+  constexpr std::array kinds{MaintenanceReadKind::kDefrag,
+                             MaintenanceReadKind::kTxCleaner,
+                             MaintenanceReadKind::kTombRaider};
+  std::array<bycorf::FixedBuffer, 3> scans;
+  std::array<Completion, 3> reads;
+  for (std::size_t i = 0; i < kinds.size(); ++i) {
+    scans[i] = pool_->maintenance_read_buffer(kinds[i]);
+    ASSERT_EQ(scans[i].size_, 8 * kMiB);
+    ASSERT_NE(scans[i].data_, nullptr);
+    EXPECT_EQ(
+        reinterpret_cast<std::uintptr_t>(scans[i].data_) % options_.alignment_,
+        0);
+    // Hold all three images concurrently, including across real direct I/O.
+    // Reusing a write/read slot or another scanner's memory corrupts a tail.
+    std::fill_n(scans[i].data_, scans[i].size_, std::byte(i + 1));
+    for (const auto& lease : held_reads)
+      EXPECT_NE(scans[i].data_, lease.bytes().data());
+    for (const auto id : held_writes)
+      EXPECT_NE(scans[i].data_, pool_->write_buffer(id).data_);
+    ASSERT_TRUE(
+        worker_->SubmitRead({0}, {scans[i].data_, 4096}, 0, &reads[i]).ok());
+  }
+  for (std::size_t i = 0; i < kinds.size(); ++i) {
+    ASSERT_NO_FATAL_FAILURE(Drain(reads[i]));
+    ASSERT_EQ(reads[i].result, 4096);
+    EXPECT_EQ(scans[i].data_[0], std::byte{0});
+    EXPECT_EQ(scans[i].data_[scans[i].size_ - 1], std::byte(i + 1));
+    EXPECT_EQ(pool_->maintenance_read_buffer(kinds[i]).data_, scans[i].data_);
+  }
+  EXPECT_EQ(pool_->available_write_buffers(), 0);
+  EXPECT_EQ(pool_->available_read_buffers(), 0);
+  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
+}
+
+TEST_F(BufferPoolMemlockTest,
+       MaintenanceAllocationFailureNamesTaskAndRollsBack) {
+#if LAVIK_FAULTS_ENABLED
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0, 1, false));
+  const auto retained = WorkerMemoryAccountingBytes(0);
+  constexpr const char* variable = "LAVIK_FAIL_MAINTENANCE_BUFFER_ALLOCATION";
+  std::optional<std::string> previous;
+  if (const auto* value = std::getenv(variable)) previous = value;
+  absl::Cleanup restore = [&] {
+    if (previous)
+      ::setenv(variable, previous->c_str(), 1);
+    else
+      ::unsetenv(variable);
+  };
+  for (const auto* name : {"defrag", "tx-cleaner", "tomb-raider"}) {
+    ASSERT_EQ(::setenv(variable, name, 1), 0);
+    const auto status = pool_->Init(*worker_, options_);
+    EXPECT_TRUE(absl::IsResourceExhausted(status)) << status;
+    EXPECT_NE(status.message().find(name), std::string_view::npos);
+    EXPECT_NE(status.message().find("worker 0"), std::string_view::npos);
+    EXPECT_NE(status.message().find("8388608 bytes"), std::string_view::npos);
+    EXPECT_FALSE(pool_->initialized());
+    EXPECT_EQ(pool_->available_write_buffers(), 0);
+    EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
+  }
+  ASSERT_EQ(::unsetenv(variable), 0);
+  EXPECT_TRUE(pool_->Init(*worker_, options_).ok());
+#else
+  GTEST_SKIP() << "allocation failure test requires fault hooks";
+#endif
+}
+
 TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
   const auto baseline = WorkerMemoryAccountingBytes(0);
@@ -447,7 +540,7 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   ASSERT_NO_FATAL_FAILURE(Init(0, 2));
   const auto fixed_bytes =
       pool_->write_buffer_count() * options_.write_buffer_bytes_ +
-      pool_->read_buffer_count() * options_.read_slot_bytes_;
+      pool_->read_buffer_count() * options_.read_slot_bytes_ + 24 * kMiB;
   const auto fixed_total = baseline + fixed_bytes;
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);

@@ -522,41 +522,8 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
 
 Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
                                                        TombRaiderRound& round) {
-  struct SweepBuffer {
-    RegisteredBufferPool* pool_ = nullptr;
-    std::uint16_t buffer_id_ = 0;
-    std::byte* heap_data_ = nullptr;
-    FixedBuffer buffer_{};
-
-    ~SweepBuffer() {
-      if (buffer_id_ != 0) {
-        pool_->ReleaseWriteBuffer(buffer_id_);
-      } else if (heap_data_ != nullptr) {
-        pool_->ReleaseHeapWriteBuffer(heap_data_);
-      }
-    }
-
-    bool registered() const noexcept {
-      return pool_ != nullptr && pool_->buffer_registered(buffer_id_);
-    }
-  } sweep{.pool_ = &store.buffers_};
-  if (store.buffers_.TryAcquireWriteBuffer(&sweep.buffer_id_)) {
-    sweep.buffer_ = store.buffers_.write_buffer(sweep.buffer_id_);
-  } else if (store.buffers_.TryAcquireHeapWriteBuffer(&sweep.heap_data_)) {
-    sweep.buffer_ = FixedBuffer{
-        .data_ = sweep.heap_data_,
-        .size_ = options_.buffers_.write_buffer_bytes_,
-        .index_ = 0,
-    };
-  } else {
-    co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                           "failed to allocate a tomb raider sweep buffer");
-  }
-  if (sweep.buffer_.size_ < kStorageBlockBytes) {
-    co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                           "tomb raider sweep buffer is smaller than a block");
-  }
-  sweep.buffer_.size_ = kStorageBlockBytes;
+  const FixedBuffer sweep =
+      store.buffers_.maintenance_read_buffer(MaintenanceReadKind::kTombRaider);
 
   struct BlockSnapshot {
     std::uint64_t block_id_ = 0;
@@ -695,7 +662,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       if (staged.data_ == nullptr || staged.size_ < committed) {
         continue;
       }
-      std::memcpy(sweep.buffer_.data_, staged.data_, committed);
+      std::memcpy(sweep.data_, staged.data_, committed);
     } else {
       // Slotless blocks are fully flushed and never appended to again, so
       // the on-disk image below `committed` is final.
@@ -705,11 +672,11 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       // original buffer registration and direct-I/O alignment.
       for (std::size_t read_offset = 0; read_offset < kStorageBlockBytes;
            read_offset += kSweepReadChunkBytes) {
-        auto part = sweep.buffer_;
+        auto part = sweep;
         part.data_ += read_offset;
         part.size_ = kSweepReadChunkBytes;
         auto read = co_await ReadStorageBuffer(
-            *store.worker_, store.files_[file_id], part, sweep.registered(),
+            *store.worker_, store.files_[file_id], part, false,
             block_offset + read_offset);
         if (!read.ok()) co_return read.status();
         if (*read != part.size_) {
@@ -748,7 +715,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         continue;  // Re-resolve after the wait before decoding this record.
       }
       const std::optional<std::uint32_t> next =
-          NextRecordOffset(sweep.buffer_.data_, record_offset, committed);
+          NextRecordOffset(sweep.data_, record_offset, committed);
       if (!next.has_value()) {
         break;  // torn or foreign bytes: nothing decodable remains
       }
@@ -758,8 +725,8 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       }
       RecordHeader record{};
       std::string_view disk_key;
-      std::span<const std::byte> record_bytes(
-          sweep.buffer_.data_ + record_offset, committed - record_offset);
+      std::span<const std::byte> record_bytes(sweep.data_ + record_offset,
+                                              committed - record_offset);
       if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
           record.allocation_epoch_ != snapshot.allocation_epoch_ ||
           record.total_disk_bytes_ == 0 ||

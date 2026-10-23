@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <cassert>
 #include <coroutine>
 #include <cstddef>
@@ -138,6 +139,8 @@ class ReadBufferLease {
 
 static_assert(sizeof(ReadBufferLease) == 32);
 
+enum class MaintenanceReadKind { kDefrag, kTxCleaner, kTombRaider };
+
 class RegisteredBufferPool {
  public:
   RegisteredBufferPool() = default;
@@ -148,12 +151,15 @@ class RegisteredBufferPool {
   // Try full registration first. If io_uring rejects it, use the finite
   // memlock allowance to retry a subset, prioritizing read slots. Pool sizes
   // never shrink; unregistered slots use ordinary I/O. SPDK does not degrade.
+  // Also reserves one independent 8 MiB scan buffer per maintenance kind,
+  // outside registered_bytes_. Any allocation failure aborts initialization.
   absl::Status Init(bycorf::Worker& worker,
                     const RegisteredBufferPoolOptions& options = {});
 
   bool initialized() const noexcept { return worker_ != nullptr; }
-  // True only when the entire pool registered. Use buffer_registered(id) to
-  // select fixed I/O: a partially registered pool can contain both kinds.
+  // True only when all ordinary read/write slots registered. Use
+  // buffer_registered(id) to select fixed I/O: a partially registered pool can
+  // contain both kinds.
   bool buffers_registered() const noexcept { return buffers_registered_; }
   // Registration is immutable after Init, including across lease handoffs.
   // Slot ids identify pool ownership, independently of registration indices.
@@ -166,6 +172,14 @@ class RegisteredBufferPool {
     return buffer_id - write_buffers_.size() - 1 < registered_read_count_;
   }
   unsigned owner_worker() const noexcept { return owner_worker_; }
+  // Each kind has at most one scanner on this worker. Its buffer stays owned
+  // until teardown, including across I/O and relocation waits; callers must
+  // preserve that single-scanner invariant. Submit with ordinary I/O (not a
+  // registered index). SPDK still allocates these buffers from DMA memory.
+  bycorf::FixedBuffer maintenance_read_buffer(MaintenanceReadKind kind) const {
+    assert(initialized());
+    return maintenance_read_buffers_[static_cast<std::size_t>(kind)];
+  }
   std::size_t read_buffer_count() const noexcept {
     return read_buffers_.size();
   }
@@ -300,6 +314,7 @@ class RegisteredBufferPool {
   // Charge owned capacity for both aligned and SPDK DMA allocations. Pool
   // borrowing does not change ownership; teardown may run off the owner worker.
   RetainedMemoryCharge buffer_memory_;
+  std::array<bycorf::FixedBuffer, 3> maintenance_read_buffers_{};
   std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;

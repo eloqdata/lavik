@@ -4806,9 +4806,12 @@ class StorageEngine::Impl {
   // Rewrites every record in the block that is still current, so the block ends
   // up with no reachable data and the caller can free it. Clears `defragging`
   // on each failure path so the block stays eligible for a later pass.
+  // The caller lends its dedicated maintenance buffer through all relocation
+  // awaits; defrag and TxCleaner must never share the same workspace.
   Task<absl::Status> SalvageBlockRecords(
       WorkerStore& store, std::uint64_t block_id, BlockState& source,
       std::uint32_t source_file_id, std::uint64_t source_block_offset,
+      FixedBuffer block_data,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
           committed_txids = nullptr,
       bool stop_on_shutdown = false);

@@ -621,9 +621,10 @@ have been collected, every worker's remaining footprint must fit its normal
 failed transition stops startup. Recovery does not change the disk scan count.
 
 Storage buffer capacity also participates in retained accounting: fixed read
-and write pools are charged at initialization, and extra maintenance write
-buffers remain charged while cached for reuse. Oversized reads and reads that
-find the fixed pool exhausted allocate aligned or SPDK DMA overflow storage
+and write pools and dedicated maintenance scan buffers are charged at
+initialization. Extra recovery/population-rewrite buffers remain charged while
+cached for reuse. Oversized reads and reads that find the fixed pool exhausted
+allocate aligned or SPDK DMA overflow storage
 only while leased; returning a lease frees that storage and removes its charge
 on the owner worker. If temporary allocation fails, ordinary reads wait for a
 fixed slot in FIFO order. An oversized extent whose allocation fails falls
@@ -719,10 +720,15 @@ acquisitions without recycling its still-referenced staging memory.
 Relocation bypasses the foreground physical-allocation gate and retains access
 to the defrag disk reserve: a foreground allocator may itself be waiting for
 reclamation. After write-slot waiting, relocation revalidates its source before
-publication. Old-block scan workspaces still borrow fixed write slots, with
-the existing extra-buffer fallback. If those workspaces exhaust the fixed pool
-and no fixed staging slot can be flushed, relocation ends its pass with
-resource exhaustion so the source workspace can be returned for a later retry.
+publication. Each worker owns three independent 8 MiB scan buffers, one each
+for defrag, transaction cleaning, and Tomb Raider. Their schedulers permit at
+most one scanner of each kind per worker, so scans can retain their own image
+across I/O, relocation, and cross-worker waits without a buffer queue. They
+never borrow write slots or allocate fallback scan buffers. All three buffers
+are allocated at initialization, outside the ordinary pool budget; failure
+names the worker and task and prevents startup. They remain owned until
+worker teardown after I/O drains. io_uring uses them without registration;
+SPDK allocates DMA-addressable memory for them.
 Atomic population rewrites that cannot release store state retain their
 extra-buffer fallback; relocation target staging uses the fixed pool.
 

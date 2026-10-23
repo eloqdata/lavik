@@ -22,7 +22,7 @@ namespace lavik::storage {
 
 class WriteBufferTestPeer {
  public:
-  enum class Scenario { kProgress, kEpochChanged, kSourceChanged, kNoFlush };
+  enum class Scenario { kProgress, kEpochChanged, kSourceChanged, kNoStaging };
 
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
     auto& impl = *storage.impl_;
@@ -65,7 +65,7 @@ class WriteBufferTestPeer {
     }
 
     std::vector<std::uint16_t> held;
-    const auto keep_free = scenario == Scenario::kNoFlush ? 0u : 1u;
+    const auto keep_free = scenario == Scenario::kNoStaging ? 0u : 1u;
     while (store.buffers_.available_write_buffers() > keep_free) {
       std::uint16_t id = 0;
       if (!store.buffers_.TryAcquireWriteBuffer(&id))
@@ -75,7 +75,7 @@ class WriteBufferTestPeer {
     absl::Cleanup release_slots = [&] {
       for (const auto id : held) store.buffers_.ReleaseWriteBuffer(id);
     };
-    if (scenario != Scenario::kNoFlush) {
+    if (scenario != Scenario::kNoStaging) {
       wrote = co_await storage.Set(0, "occupy-last-write-slot", "payload");
       if (!wrote.ok()) co_return wrote.status();
       while (store.standby_prefetch_pending_) co_await bycorf::Yield(worker);
@@ -93,19 +93,6 @@ class WriteBufferTestPeer {
     auto handle = std::move(relocation).ReleaseHandle();
     relocation = decltype(relocation)(handle);
     handle.resume();
-    if (scenario == Scenario::kNoFlush) {
-      // Model a pool wholly borrowed by source workspaces. It must unwind,
-      // not wait on itself or allocate another target buffer.
-      while (!relocation.done()) co_await bycorf::Yield(worker);
-      auto result = std::move(relocation).TakeResult();
-      if (!absl::IsResourceExhausted(result.status()))
-        co_return absl::InternalError("unflushable relocation did not retry");
-      if (store.buffers_.has_write_waiters())
-        co_return absl::InternalError("unflushable relocation queued a waiter");
-      if (WorkerMemoryAccountingBytes(worker.id()) >= retained + 8 * kMiB)
-        co_return absl::InternalError("relocation grew the target buffer pool");
-      co_return absl::OkStatus();
-    }
     if (relocation.done() || !store.buffers_.has_write_waiters())
       co_return absl::InternalError(
           "relocation did not queue for a fixed slot");
@@ -148,6 +135,12 @@ class WriteBufferTestPeer {
     auto trailing_handle = std::move(trailing).ReleaseHandle();
     trailing = decltype(trailing)(trailing_handle);
     trailing_handle.resume();
+    if (scenario == Scenario::kNoStaging) {
+      // An in-flight extent writer can own a slot without a staging entry.
+      // Relocation must wait for its return just like any other FIFO borrower.
+      store.buffers_.ReleaseWriteBuffer(held.back());
+      held.pop_back();
+    }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while ((!relocation.done() || !trailing.done()) &&
@@ -159,11 +152,13 @@ class WriteBufferTestPeer {
     if (!result.ok()) co_return result.status();
     status = std::move(trailing).TakeResult();
     if (!status.ok()) co_return status;
-    if (result->has_value() != (scenario == Scenario::kProgress))
+    const bool moves_source =
+        scenario == Scenario::kProgress || scenario == Scenario::kNoStaging;
+    if (result->has_value() != moves_source)
       co_return absl::InternalError("unexpected relocation publication");
     const auto current =
         impl.MaterializeIndexLocation(*index.Find(digest, key));
-    if (scenario == Scenario::kProgress && current.SamePhysicalRecord(source))
+    if (moves_source && current.SamePhysicalRecord(source))
       co_return absl::InternalError("relocation did not move the source");
     if (scenario == Scenario::kEpochChanged &&
         !current.SamePhysicalRecord(source))
@@ -248,6 +243,6 @@ INSTANTIATE_TEST_SUITE_P(
     testing::Values(WriteBufferTestPeer::Scenario::kProgress,
                     WriteBufferTestPeer::Scenario::kEpochChanged,
                     WriteBufferTestPeer::Scenario::kSourceChanged,
-                    WriteBufferTestPeer::Scenario::kNoFlush));
+                    WriteBufferTestPeer::Scenario::kNoStaging));
 }  // namespace
 }  // namespace lavik::storage

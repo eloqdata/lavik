@@ -27,10 +27,13 @@
 #include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
+#include "absl/strings/str_cat.h"
 #include "bycorf/io/spdk_storage.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/fault_injection.h"
+#include "lavik/storage/format.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::storage {
@@ -120,6 +123,10 @@ void ReadBufferLease::Reset() noexcept {
 }
 
 RegisteredBufferPool::~RegisteredBufferPool() {
+  for (const auto& buffer : maintenance_read_buffers_) {
+    if (buffer.data_ != nullptr)
+      bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
+  }
   for (std::byte* arena : arenas_) {
     bycorf::FreeStorageBuffer(arena, options_.alignment_);
   }
@@ -218,6 +225,35 @@ absl::Status RegisteredBufferPool::Init(
   }
 
   const std::size_t read_base = registered_write_count + 1;
+  // Scanners can suspend while relocating or making cross-worker claims.
+  // Separate workspaces preserve their concurrency without consuming the
+  // write slots whose progress those same scans may need.
+  std::array<bycorf::FixedBuffer, 3> maintenance_buffers{};
+  absl::Cleanup free_maintenance = [&] {
+    for (const auto& buffer : maintenance_buffers) {
+      if (buffer.data_ != nullptr)
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+    }
+  };
+  constexpr std::array<const char*, 3> maintenance_names{"defrag", "tx-cleaner",
+                                                         "tomb-raider"};
+  for (std::size_t i = 0; i < maintenance_buffers.size(); ++i) {
+    bool fail_allocation = false;
+    LAVIK_FAULT_INJECT(
+        fail_allocation = LAVIK_FAULT_MATCHES(
+            "LAVIK_FAIL_MAINTENANCE_BUFFER_ALLOCATION", maintenance_names[i]););
+    auto* data = fail_allocation
+                     ? nullptr
+                     : static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
+                           kStorageBlockBytes, options.alignment_));
+    if (data == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "worker ", worker.id(), ": failed to allocate ", maintenance_names[i],
+          " maintenance read buffer (", kStorageBlockBytes, " bytes, ",
+          bycorf::SpdkStorageEnabled() ? "SPDK DMA" : "aligned memory", ")"));
+    }
+    maintenance_buffers[i] = {.data_ = data, .size_ = kStorageBlockBytes};
+  }
   const bool shared_arena = !bycorf::SpdkStorageEnabled();
   std::vector<iovec> iovecs;
   std::vector<bycorf::FixedBuffer> write_buffers;
@@ -424,6 +460,8 @@ absl::Status RegisteredBufferPool::Init(
   registered_read_count_ = registered_reads;
   registered_write_count_ = registered_writes;
   options_ = options;
+  maintenance_read_buffers_ = maintenance_buffers;
+  std::move(free_maintenance).Cancel();
   arenas_ = std::move(arenas);
   write_buffers_ = std::move(write_buffers);
   read_buffers_ = std::move(read_buffers);
@@ -440,8 +478,10 @@ absl::Status RegisteredBufferPool::Init(
   // Charge actual slot capacity, excluding any unused tail of the configured
   // budget. Registration fallback owns the same memory. Startup's recovery
   // budget checks include this fixed footprint before serving begins.
-  buffer_memory_.Account(worker.id() + 1,
-                         registered_write_bytes + read_count * read_slot_bytes);
+  buffer_memory_.Account(
+      worker.id() + 1,
+      registered_write_bytes + read_count * read_slot_bytes +
+          maintenance_read_buffers_.size() * kStorageBlockBytes);
   return absl::OkStatus();
 }
 
@@ -707,8 +747,8 @@ bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
     return false;
   }
   heap_write_buffers_.push_back(data);
-  // Maintenance may need this buffer to reclaim space while admission is
-  // closed. Charge its retained capacity without blocking that progress.
+  // Recovery scans and atomic population rewrites may need extra staging
+  // while admission is closed. Charge capacity without blocking that progress.
   buffer_memory_.Resize(buffer_memory_.bytes() + options_.write_buffer_bytes_);
   *buffer = data;
   return true;

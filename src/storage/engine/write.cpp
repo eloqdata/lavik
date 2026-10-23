@@ -2975,23 +2975,6 @@ acquire_active_stream:
           // the streams before waiting. Tagged records and transaction leases
           // survive the seal, and flush returns their buffers.
           SealActiveBlocks(store);
-          const bool has_fixed_staging =
-              !request.for_defrag_ ||
-              std::any_of(store.staging_slots_.begin(),
-                          store.staging_slots_.end(),
-                          [](const StagingSlot& slot) {
-                            return slot.write_buffer_id_ != 0;
-                          });
-          if (request.for_defrag_ && !has_fixed_staging) {
-            // Source-block scans still borrow write slots. With a tiny pool,
-            // every slot may belong to a scan waiting for this relocation;
-            // there is then no flush to return one. End this pass so its scan
-            // releases the source workspace, rather than waiting on itself.
-            absl::Status returned = co_await return_reserved(*allocated);
-            if (!returned.ok()) co_return returned;
-            co_return absl::ResourceExhaustedError(
-                "relocation has no flushable storage write buffer");
-          }
           store.store_state_mutex_.Unlock(*store.worker_);
           auto acquired = co_await store.buffers_.AcquireWriteBuffer();
           co_await store.store_state_mutex_.Lock();

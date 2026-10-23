@@ -653,9 +653,11 @@ Task<absl::Status> StorageEngine::Impl::PromoteTxBlockLocal(
       promoted = co_await tx_promotion_scan_for_test_();
     else
 #endif
-      promoted =
-          co_await SalvageBlockRecords(store, block.block_id_, *source, file_id,
-                                       offset, committed, !shutdown_drain);
+      promoted = co_await SalvageBlockRecords(
+          store, block.block_id_, *source, file_id, offset,
+          store.buffers_.maintenance_read_buffer(
+              MaintenanceReadKind::kTxCleaner),
+          committed, !shutdown_drain);
   }
   std::vector<RelocationDurabilityFence> fences;
   co_await store.store_state_mutex_.Lock();

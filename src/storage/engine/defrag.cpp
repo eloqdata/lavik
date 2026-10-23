@@ -850,7 +850,8 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
       salvaged = co_await SalvageIndirectKeys(store, block_id);
     else
       salvaged = co_await SalvageBlockRecords(
-          store, block_id, source, source_file_id, source_block_offset);
+          store, block_id, source, source_file_id, source_block_offset,
+          store.buffers_.maintenance_read_buffer(MaintenanceReadKind::kDefrag));
     if (!salvaged.ok()) {
       source.defragging_ = false;
       co_return salvaged;
@@ -895,49 +896,12 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
 Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     WorkerStore& store, std::uint64_t block_id, BlockState& source,
     std::uint32_t source_file_id, std::uint64_t source_block_offset,
+    FixedBuffer block_data,
     std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed_txids,
     bool stop_on_shutdown) {
-  struct DefragBuffer {
-    RegisteredBufferPool* pool_ = nullptr;
-    std::uint16_t buffer_id_ = 0;
-    std::byte* heap_data_ = nullptr;
-    FixedBuffer buffer_{};
-
-    ~DefragBuffer() {
-      if (buffer_id_ != 0) {
-        pool_->ReleaseWriteBuffer(buffer_id_);
-      } else if (heap_data_ != nullptr) {
-        pool_->ReleaseHeapWriteBuffer(heap_data_);
-      }
-    }
-
-    bool registered() const noexcept {
-      return pool_ != nullptr && pool_->buffer_registered(buffer_id_);
-    }
-  } block_data{.pool_ = &store.buffers_};
-  if (store.buffers_.TryAcquireWriteBuffer(&block_data.buffer_id_)) {
-    block_data.buffer_ = store.buffers_.write_buffer(block_data.buffer_id_);
-  } else if (store.buffers_.TryAcquireHeapWriteBuffer(&block_data.heap_data_)) {
-    block_data.buffer_ = FixedBuffer{
-        .data_ = block_data.heap_data_,
-        .size_ = options_.buffers_.write_buffer_bytes_,
-        .index_ = 0,
-    };
-  } else {
-    source.defragging_ = false;
-    co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                           "failed to allocate defrag block buffer");
-  }
-  if (block_data.buffer_.size_ < kStorageBlockBytes) {
-    source.defragging_ = false;
-    co_return absl::Status(
-        absl::StatusCode::kResourceExhausted,
-        "defrag block buffer is smaller than a storage block");
-  }
-  block_data.buffer_.size_ = kStorageBlockBytes;
-  auto read = co_await ReadStorageBuffer(
-      *store.worker_, store.files_[source_file_id], block_data.buffer_,
-      block_data.registered(), source_block_offset);
+  auto read =
+      co_await ReadStorageBuffer(*store.worker_, store.files_[source_file_id],
+                                 block_data, false, source_block_offset);
   if (!read.ok() || *read != kStorageBlockBytes) {
     source.defragging_ = false;
     co_return read.ok() ? absl::Status(absl::StatusCode::kInternal,
@@ -980,7 +944,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       break;
     }
     const std::optional<std::uint32_t> next = NextRecordOffset(
-        block_data.buffer_.data_, record_offset, source.committed_bytes_);
+        block_data.data_, record_offset, source.committed_bytes_);
     if (!next.has_value()) {
       source.defragging_ = false;
       co_return absl::Status(absl::StatusCode::kInternal,
@@ -993,7 +957,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     RecordHeader record{};
     std::string_view disk_key;
     std::span<const std::byte> record_bytes(
-        block_data.buffer_.data_ + record_offset,
+        block_data.data_ + record_offset,
         source.committed_bytes_ - record_offset);
     if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
         record.allocation_epoch_ != source.allocation_epoch_ ||
@@ -1024,7 +988,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       continue;
     }
     const std::byte* payload_data =
-        block_data.buffer_.data_ + record_offset + record.header_bytes_;
+        block_data.data_ + record_offset + record.header_bytes_;
     const auto payload =
         std::span<const std::byte>(payload_data, record.payload_bytes_);
     // An obsolete inline string cannot become a recovery winner through this

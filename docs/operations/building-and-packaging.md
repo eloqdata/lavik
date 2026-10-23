@@ -63,6 +63,13 @@ The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
 These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
+Each data worker also reserves three independent 8 MiB maintenance read
+buffers for defrag, transaction cleaning, and Tomb Raider. This adds 24 MiB
+outside `--registered-buffer-mb-per-worker` (88 MiB of fixed buffer capacity
+per worker with defaults). They are counted in retained memory, remain
+allocated until teardown, and use unregistered I/O on io_uring. Failure to
+allocate any one names the worker and task and fails startup.
+
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
 at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
