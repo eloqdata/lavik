@@ -111,13 +111,15 @@ is broader than this guide's selected controllers.
 
 Size the host's hugepage reservation for all simultaneous SPDK processes,
 including each worker's storage-buffer budget plus three dedicated 8 MiB DMA
-scan buffers for defrag, transaction cleaning, and Tomb Raider. The fixed
-buffer capacity is 88 MiB per worker with defaults; also allow for overflow,
-startup checkpoint read buffers, export buffers, and SPDK/DPDK overhead.
+scan buffers for defrag, transaction cleaning, and Tomb Raider, plus one
+independent 8 MiB Redis export buffer per process. With defaults, fixed
+storage-buffer capacity is `88 MiB × data workers + 8 MiB`; also allow for
+overflow, startup checkpoint read buffers, and SPDK/DPDK overhead. Export
+capture and disk replay reuse its one buffer without extra DMA allocation.
 Shutdown checkpoint writes reuse two drained ordinary write slots, adding no
-DMA capacity. Maintenance scan allocation failure names the worker and task
-and fails startup; it never
-falls back to borrowing write slots. Check free hugepages after startup; a
+DMA capacity. Maintenance scan allocation failure names the worker and task;
+export buffer allocation failure names Redis export. Either fails startup
+without borrowing write slots. Check free hugepages after startup; a
 per-worker buffer setting is not a process-wide cap. On NUMA hosts, keep the
 selected NVMe controllers, hugepages and worker CPUs on the same node where
 possible. Keep network IRQ

@@ -72,6 +72,12 @@ per worker with defaults). They are counted in retained memory, remain
 allocated until teardown, and use unregistered I/O on io_uring. Failure to
 allocate any one names the worker and task and fails startup.
 
+Redis export also reserves one independent 8 MiB buffer per process at startup
+for capture writes and subsequent disk replay. It stays charged to shared
+retained memory between sessions and uses unregistered I/O on io_uring.
+Allocation failure identifies Redis export and fails startup. With defaults,
+total fixed storage-buffer capacity is `88 MiB × data workers + 8 MiB`.
+
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
 at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.

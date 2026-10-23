@@ -1014,7 +1014,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     result.saw_accounting_shards_.resize(worker_count, false);
     result.capacity_chunks_by_shard_.resize(worker_count, 0);
   }
-  return absl::OkStatus();
+  return redis_export_buffer_.Init();
 }
 
 Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(

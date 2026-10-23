@@ -68,8 +68,10 @@ requires at least 8 MiB and rounds down to complete 8 MiB blocks. It does not
 limit RDB size. Configure it in the source config file, with
 `--redis-export-disk-backlog-size`, or with CONFIG SET. An active session keeps
 its starting disk quota. Provision free capacity on Lavik's data devices; this
-is separate from RedisShake's spool directory. Disk buffers also require
-retained-memory admission.
+is separate from RedisShake's spool directory. Lavik reserves one independent
+8 MiB buffer per process at startup for export capture and disk replay, counts
+it in retained memory even between sessions, and fails startup if allocation
+fails. The disk quota does not change this fixed buffer capacity.
 
 `replication-backlog-backpressure yes` is the default and applies to both native
 replicas and the exporter. A slow exporter can stall business writes. Setting

@@ -1633,6 +1633,8 @@ class StorageEngine {
   // The Redis connection owner stores one already-merged command stream in
   // temporary data-device blocks while sending RDB. This stream is unrelated
   // to the worker-local replication LSNs and is discarded on restart.
+  // Only one session may run across all workers. It borrows the engine's
+  // startup-allocated 8 MiB workspace until Release, for capture then replay.
   bycorf::Task<absl::Status> StartRedisExportDiskBacklog(
       std::uint64_t session_id, std::size_t capacity_bytes);
   // Append one complete, Redis-compatible RESP command or atomic envelope.
@@ -1641,10 +1643,12 @@ class StorageEngine {
   // Stop appends and return the exclusive end cursor for draining the blocks.
   bycorf::Task<absl::StatusOr<std::uint64_t>> StopRedisExportDiskBacklog(
       std::uint64_t session_id);
+  // Requires Stop; returned payloads own copies, so the workspace is reusable.
   bycorf::Task<absl::StatusOr<ReplicationLogBatch>> ReadRedisExportDiskBacklog(
       std::uint64_t session_id, ReplicationLogCursor next,
       std::size_t max_bytes, std::size_t max_frames);
   // Idempotent after Stop; also aborts an active capture on a failed export.
+  // Returns exclusive workspace use without freeing its retained capacity.
   bycorf::Task<absl::Status> ReleaseRedisExportDiskBacklog(
       std::uint64_t session_id);
   // Pins history needed by one ONLINE/downstream session. The cursor is the
@@ -2135,6 +2139,7 @@ class StorageEngine {
   friend class RemoteGetTestPeer;
   friend class TxCleanerPipelineTestPeer;
   friend class WriteBufferTestPeer;
+  friend class RedisExportBufferTestPeer;
   class Impl;
   std::unique_ptr<Impl> impl_;
 };

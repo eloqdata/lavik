@@ -1770,16 +1770,12 @@ class StorageEngine::Impl {
       std::uint32_t next_fragment_index_ = 0;
       std::size_t max_blocks_ = 0;
       std::vector<Block> blocks_;
+      // Borrowed from the engine for this session. Capture and replay are
+      // serialized under mutex_; only an unsealed block sets active_buffer_.
+      std::byte* buffer_ = nullptr;
       std::byte* active_buffer_ = nullptr;
-      RetainedMemoryCharge active_buffer_charge_;
       bool capturing_ = false;
       std::optional<absl::Status> failure_;
-
-      ~RedisExportDiskBacklog() {
-        if (active_buffer_ != nullptr) {
-          bycorf::FreeStorageBuffer(active_buffer_, kDirectIoAlignment);
-        }
-      }
     };
 
     struct FullSyncCapture {
@@ -3444,6 +3440,7 @@ class StorageEngine::Impl {
   friend class RemoteGetTestPeer;
   friend class TxCleanerPipelineTestPeer;
   friend class WriteBufferTestPeer;
+  friend class RedisExportBufferTestPeer;
   friend class StorageEngine::RemoteReadAwaitable;
 
   struct DurableSystemState {
@@ -4825,6 +4822,17 @@ class StorageEngine::Impl {
                                        BlockState& source);
 
   StorageEngineOptions options_;
+  // A single exporter owns this process-wide workspace from capture through
+  // disk replay. The atomic transfers exclusive use between connection owners
+  // without a cross-worker blocking mutex. It outlives the worker stores and
+  // is charged to shared startup accounting, including between sessions.
+  struct RedisExportBuffer {
+    absl::Status Init();
+    ~RedisExportBuffer();
+    std::byte* data_ = nullptr;
+    RetainedMemoryCharge charge_;
+    std::atomic<bool> in_use_{false};
+  } redis_export_buffer_;
   // CONFIG SET updates the next-shutdown policy without visiting workers.
   // FlushForShutdown snapshots it before publishing shutdown_flush_requested_,
   // so every worker enters the same barrier path for that shutdown.

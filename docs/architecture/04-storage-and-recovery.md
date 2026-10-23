@@ -622,23 +622,24 @@ failed transition stops startup. Recovery does not change the disk scan count.
 
 Storage buffer capacity also participates in retained accounting: fixed read
 and write pools and dedicated maintenance scan buffers are charged at
-initialization. Extra recovery/population-rewrite buffers remain charged while
-cached for reuse. Oversized reads and reads that find the fixed pool exhausted
-allocate aligned or SPDK DMA overflow storage
-only while leased; returning a lease frees that storage and removes its charge
-on the owner worker. If temporary allocation fails, ordinary reads wait for a
+initialization. Redis export owns one process-wide 8 MiB workspace, allocated
+and charged at startup, reused for capture writes and subsequent disk replay,
+and retained between sessions. Extra recovery/population-rewrite buffers remain
+charged while cached for reuse. Oversized reads and reads that find the fixed
+pool exhausted allocate aligned or SPDK DMA overflow storage only while leased;
+returning a lease frees that storage and removes its charge on the owner worker.
+If temporary allocation fails, ordinary reads wait for a
 fixed slot in FIFO order. Oversized record and extent reads whose allocation
 fails fall back to slot-sized reads when fixed read slots exist, retaining the
 block pin through pool waiting and all chunks. Records assemble a private image
 in ordinary heap memory and retain their identity, population, checksum, and
 relocation-retry checks. Extent paths validate the same header and, when enabled,
 the complete payload checksum before exposing the requested slice; fallback
-stages that slice in ordinary heap memory. Other oversized I/O, such as Redis
-export backlog reads, still reports allocation failure. Whole-value assembly
-uses ordinary heap memory, including on SPDK: page and extent reads copy into
-an output that neither consumes a fixed slot nor needs DMA addressability. Outputs retain
-reply framing space and follow the same owner-bound lease accounting and
-release lifecycle. These allocations are accounted without
+stages that slice in ordinary heap memory. Whole-value assembly uses ordinary
+heap memory, including on SPDK: page and extent reads copy into an output that
+neither consumes a fixed slot nor needs DMA addressability. Outputs retain reply
+framing space and follow the same owner-bound lease accounting and release
+lifecycle. These allocations are accounted without
 a separate admission gate so reads and reclamation can still progress at the
 memory waterline; subsequent retained growth observes their charges. Pool
 charges cover allocated slot capacity, not allocator overhead or SPDK's

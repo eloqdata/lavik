@@ -35,6 +35,34 @@ ReplicationLogCursor After(const ReplicationFrameHeader& frame) {
 
 }  // namespace
 
+absl::Status StorageEngine::Impl::RedisExportBuffer::Init() {
+  if (data_ != nullptr) return absl::OkStatus();
+  bool fail = false;
+  LAVIK_FAULT_INJECT(
+      fail =
+          std::getenv("LAVIK_FAIL_REDIS_EXPORT_BUFFER_ALLOCATION") != nullptr;);
+  if (!fail) {
+    data_ = static_cast<std::byte*>(
+        bycorf::AllocateStorageBuffer(kStorageBlockBytes, kDirectIoAlignment));
+  }
+  if (data_ == nullptr) {
+    return absl::ResourceExhaustedError(
+        "Redis export buffer allocation failed: requested " +
+        std::to_string(kStorageBlockBytes) + " bytes (" +
+        (bycorf::SpdkStorageEnabled() ? "SPDK DMA" : "aligned") + ")");
+  }
+  // Shared startup capacity is divided across worker admission shares. The
+  // session may move workers, but neither its charge nor its allocation moves.
+  charge_.Account(0, kStorageBlockBytes);
+  return absl::OkStatus();
+}
+
+StorageEngine::Impl::RedisExportBuffer::~RedisExportBuffer() {
+  if (data_ != nullptr) {
+    bycorf::FreeStorageBuffer(data_, kDirectIoAlignment);
+  }
+}
+
 Task<absl::Status> StorageEngine::Impl::StartRedisExportDiskBacklog(
     std::uint64_t session_id, std::size_t capacity_bytes) {
   WorkerStore& store = CurrentStore();
@@ -45,10 +73,20 @@ Task<absl::Status> StorageEngine::Impl::StartRedisExportDiskBacklog(
     co_return absl::InvalidArgumentError(
         "invalid Redis export disk backlog bounds");
   }
-  if (disk.session_id_ != 0 || disk.active_buffer_ != nullptr ||
+  if (disk.session_id_ != 0 || disk.buffer_ != nullptr ||
       !disk.blocks_.empty()) {
     co_return absl::AlreadyExistsError("Redis export disk backlog is active");
   }
+  if (redis_export_buffer_.data_ == nullptr) {
+    co_return absl::FailedPreconditionError(
+        "Redis export buffer was not initialized");
+  }
+  bool expected = false;
+  if (!redis_export_buffer_.in_use_.compare_exchange_strong(
+          expected, true, std::memory_order_acquire)) {
+    co_return absl::AlreadyExistsError("Redis export disk backlog is active");
+  }
+  disk.buffer_ = redis_export_buffer_.data_;
   disk.session_id_ = session_id;
   disk.start_lsn_ = 1;
   disk.next_stream_lsn_ = 1;
@@ -124,9 +162,7 @@ Task<absl::Status> StorageEngine::Impl::SealRedisExportDiskBlock(
         : written.status();
   }
   block.sealed_ = true;
-  bycorf::FreeStorageBuffer(disk.active_buffer_, kDirectIoAlignment);
   disk.active_buffer_ = nullptr;
-  disk.active_buffer_charge_.Reset();
   co_return absl::OkStatus();
 }
 
@@ -171,29 +207,10 @@ Task<absl::Status> StorageEngine::Impl::AppendRedisExportDiskFrame(
         disk.failure_ = reserved.status();
         break;
       }
-      auto staging = TryReserveMemory(kStorageBlockBytes);
-      if (!staging.has_value()) {
-        RecordMemoryRejection();
-        disk.failure_ = absl::ResourceExhaustedError(
-            "Redis export disk staging exceeds maxmemory");
-        absl::Status returned =
-            co_await ReturnColdBlocks({reserved->block_id_});
-        if (!returned.ok()) disk.failure_ = returned;
-        break;
-      }
-      auto* buffer = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
-          kStorageBlockBytes, kDirectIoAlignment));
-      if (buffer == nullptr) {
-        disk.failure_ = absl::ResourceExhaustedError(
-            "Redis export disk staging buffer allocation failed");
-        absl::Status returned =
-            co_await ReturnColdBlocks({reserved->block_id_});
-        if (!returned.ok()) disk.failure_ = returned;
-        break;
-      }
-      std::fill_n(buffer, kStorageBlockBytes, std::byte{0});
-      disk.active_buffer_ = buffer;
-      disk.active_buffer_charge_.Adopt(&*staging, kStorageBlockBytes);
+      // The previous block's write completed before sealing returned. Reuse
+      // the session workspace without allocating or borrowing a write slot.
+      std::fill_n(disk.buffer_, kStorageBlockBytes, std::byte{0});
+      disk.active_buffer_ = disk.buffer_;
       disk.blocks_.push_back(WorkerStore::RedisExportDiskBacklog::Block{
           .id_ = reserved->block_id_,
           .allocation_epoch_ = reserved->allocation_epoch_,
@@ -301,9 +318,10 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
   auto& disk = store.redis_export_disk_backlog_;
   co_await disk.mutex_.Lock();
   UnlockGuard unlock(&disk.mutex_, store.worker_);
-  if (disk.session_id_ != session_id || disk.end_lsn_ == 0 ||
-      disk.failure_.has_value() || next.lsn_ < disk.start_lsn_ ||
-      next.lsn_ > disk.end_lsn_ || max_bytes == 0 || max_frames == 0) {
+  if (disk.session_id_ != session_id || disk.end_lsn_ == 0 || disk.capturing_ ||
+      disk.buffer_ == nullptr || disk.failure_.has_value() ||
+      next.lsn_ < disk.start_lsn_ || next.lsn_ > disk.end_lsn_ ||
+      max_bytes == 0 || max_frames == 0) {
     co_return absl::FailedPreconditionError(
         "Redis export disk backlog is unavailable for this cursor");
   }
@@ -322,19 +340,15 @@ StorageEngine::Impl::ReadRedisExportDiskBacklog(std::uint64_t session_id,
       co_return absl::InternalError("unsealed Redis export disk block");
     }
     const std::size_t read_bytes = AlignDirect(block.committed_bytes_);
-    auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-    if (!acquired.ok()) co_return acquired.status();
-    ReadBufferLease lease = std::move(*acquired);
-    FixedBuffer buffer = lease.io_buffer();
-    if (buffer.size_ < read_bytes) {
-      co_return absl::ResourceExhaustedError(
-          "Redis export read buffer is too small");
+    if (read_bytes > kStorageBlockBytes) {
+      co_return absl::DataLossError("invalid Redis export disk block size");
     }
-    buffer.size_ = read_bytes;
+    // Stop has joined the final write. Replay owns the same workspace under
+    // disk.mutex_, and only copied frame payloads escape this critical section.
+    FixedBuffer buffer{.data_ = disk.buffer_, .size_ = read_bytes};
     const auto [file_index, offset] = FileOffset(block.id_);
-    auto read =
-        co_await ReadStorageBuffer(*store.worker_, store.files_[file_index],
-                                   buffer, lease.registered(), offset);
+    auto read = co_await ReadStorageBuffer(
+        *store.worker_, store.files_[file_index], buffer, false, offset);
     if (!read.ok() || *read != read_bytes) {
       co_return read.ok()
           ? absl::InternalError("short Redis export disk backlog read")
@@ -412,11 +426,11 @@ Task<absl::Status> StorageEngine::Impl::ReleaseRedisExportDiskBacklog(
         "Redis export disk session changed");
   }
   disk.capturing_ = false;
-  if (disk.active_buffer_ != nullptr) {
-    bycorf::FreeStorageBuffer(disk.active_buffer_, kDirectIoAlignment);
-    disk.active_buffer_ = nullptr;
-  }
-  disk.active_buffer_charge_.Reset();
+  disk.active_buffer_ = nullptr;
+  disk.buffer_ = nullptr;
+  // Lock acquisition joins any suspended disk I/O before another connection
+  // owner can acquire the workspace. Block return needs no export workspace.
+  redis_export_buffer_.in_use_.store(false, std::memory_order_release);
   std::vector<std::uint64_t> released;
   released.reserve(disk.blocks_.size());
   for (const auto& block : disk.blocks_) released.push_back(block.id_);
