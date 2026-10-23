@@ -114,8 +114,11 @@ including each worker's storage-buffer budget plus three dedicated 8 MiB DMA
 scan buffers for defrag, transaction cleaning, and Tomb Raider, plus one
 independent 8 MiB Redis export buffer per process. With defaults, fixed
 storage-buffer capacity is `88 MiB × data workers + 8 MiB`; also allow for
-overflow, startup checkpoint read buffers, and SPDK/DPDK overhead. Export
-capture and disk replay reuse its one buffer without extra DMA allocation.
+overflow, population-rewrite scratch, metadata scratch, and SPDK/DPDK overhead.
+Export capture and disk replay reuse its one buffer without extra DMA allocation.
+Worker recovery scans, nested extent reads, and checkpoint prefetch reuse the
+three maintenance read buffers, with no additional DMA reservation for those
+paths. Outstanding prefetch drains before fallback or maintenance reuse.
 Shutdown checkpoint writes reuse two drained ordinary write slots, adding no
 DMA capacity. Maintenance scan allocation failure names the worker and task;
 export buffer allocation failure names Redis export. Either fails startup

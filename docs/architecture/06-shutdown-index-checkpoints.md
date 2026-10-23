@@ -249,8 +249,12 @@ final winner per logical key, successful loading inserts those entries without
 the multi-version arbitration used by the ordinary record scan. If a later
 entry is invalid, the already installed valid prefix is marked as a checkpoint
 winner and participates in the same authoritative cold-scan merge as prefixes
-from earlier blocks. Each owner holds two 8 MiB I/O buffers. Complex-object
-encoding also uses a bounded stream buffer; encoding and decoding reserve
+from earlier blocks. Each owner borrows two of its fixed 8 MiB maintenance read
+buffers instead of allocating checkpoint DMA storage. An abandoned prefetch
+retains access until its I/O completion; startup drains these completions before
+another checkpoint phase or ordinary recovery can reuse the buffers. The loan
+also follows delegated SPDK reads and ends before maintenance starts.
+Complex-object encoding also uses a bounded stream buffer; encoding and decoding reserve
 scratch for one complete key and its directory metadata at a time. Temporary
 object memory therefore depends on the largest key/directory, not collection
 value bytes or the total key population. Barriers reduce the per-scanner block,

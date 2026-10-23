@@ -32,7 +32,57 @@ class WriteBufferTestPeer {
     kCheckpoint,
     kCheckpointAfterSubmit,
     kCheckpointMissingSlot,
+    kRecoveryRead,
   };
+
+  static Task<absl::Status> RunRecoveryRead(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& worker = *store.worker_;
+    auto status = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!status.ok()) co_return status;
+    auto wrote = co_await storage.Set(0, "recovery-source", "durable-value");
+    if (!wrote.ok()) co_return wrote.status();
+    impl.SealActiveBlocks(store);
+    while (store.flush_running_ || store.standby_prefetch_pending_)
+      co_await bycorf::Yield(worker);
+
+    std::vector<std::uint16_t> writes;
+    std::uint16_t id = 0;
+    while (store.buffers_.TryAcquireWriteBuffer(&id)) writes.push_back(id);
+    absl::Cleanup release = [&] {
+      for (auto slot : writes) store.buffers_.ReleaseWriteBuffer(slot);
+      unsetenv("LAVIK_FAIL_READ_BUFFER_ALLOCATION");
+    };
+    setenv("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1", 1);
+    std::vector<ReadBufferLease> reads;
+    while (store.buffers_.available_read_buffers() != 0) {
+      auto acquired = co_await store.buffers_.AcquireReadBuffer();
+      if (!acquired.ok()) co_return acquired.status();
+      reads.push_back(std::move(*acquired));
+    }
+    const auto retained = WorkerMemoryAccountingBytes(worker.id());
+    {
+      std::vector<RecoveryBatch> batches(1);
+      std::vector<std::uint64_t> zero_blocks;
+      absl::flat_hash_set<std::uint64_t> committed;
+      status = co_await impl.ScanAssignedBlocks(store, &batches, &zero_blocks,
+                                                &committed, false);
+      if (!status.ok()) co_return status;
+      if (batches[0].records_.size() != 1 ||
+          batches[0].records_[0].key_ != "recovery-source")
+        co_return absl::DataLossError(
+            "recovery did not read the durable record");
+    }
+    if (store.buffers_.available_read_buffers() != 0 ||
+        store.buffers_.available_write_buffers() != 0 ||
+        store.buffers_.overflow_read_buffer_count() != 0 ||
+        WorkerMemoryAccountingBytes(worker.id()) != retained)
+      co_return absl::InternalError(
+          "recovery allocated or borrowed ordinary buffers");
+    co_return absl::OkStatus();
+  }
 
   static Task<absl::Status> RunCheckpoint(StorageEngine& storage,
                                           Scenario scenario) {
@@ -87,6 +137,8 @@ class WriteBufferTestPeer {
   }
 
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kRecoveryRead)
+      co_return co_await RunRecoveryRead(storage);
     if (scenario == Scenario::kCheckpoint ||
         scenario == Scenario::kCheckpointAfterSubmit ||
         scenario == Scenario::kCheckpointMissingSlot)
@@ -328,6 +380,13 @@ TEST_P(StorageWriteBufferTest,
 
 class StorageCheckpointBufferTest
     : public testing::TestWithParam<WriteBufferTestPeer::Scenario> {};
+
+TEST(StorageRecoveryBufferTest, ScansWithoutOrdinarySlotsOrOverflow) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires allocation failure injection";
+#endif
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kRecoveryRead);
+}
 
 TEST_P(StorageCheckpointBufferTest, KeepsBorrowedSlotsUntilIoCompletes) {
   RunWriteBufferScenario(GetParam());

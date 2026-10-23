@@ -219,10 +219,12 @@ sum by (result) (rate(lavik_storage_defrag_runs_total[5m]))
   process heap usage; compare RSS and mimalloc diagnostics for that view.
   Includes primary-index object arrays and page directories, fixed storage
   read/write buffers, the three dedicated maintenance scan buffers per worker,
-  cached recovery/population-rewrite buffers, and live overflow read
-  buffers, in addition to retained entries, tables, and other tracked owners.
+  the process-wide Redis export workspace, cached population-rewrite buffers,
+  and live overflow read buffers, in addition to retained entries, tables, and
+  other tracked owners.
   Storage pools charge slot capacity on both io_uring and SPDK; allocator
   overhead and SPDK's full hugepage reservation are not included.
+  Worker recovery reuses maintenance buffers without an additional charge.
 - `lavik_memory_rss_bytes`: resident process memory, refreshed when metrics
   or `INFO memory` is requested.
 - `lavik_memory_committed_bytes`: pages committed by mimalloc; diagnostic

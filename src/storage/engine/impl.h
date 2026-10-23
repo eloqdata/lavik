@@ -1972,6 +1972,10 @@ class StorageEngine::Impl {
     // by worker_count, so allocation is local and needs no atomic operation.
     std::uint64_t next_lsn_ = 0;
     RegisteredBufferPool buffers_;
+    // Startup prefetch may outlive its decoder on checkpoint fallback. A
+    // delegated SPDK completion can run on another worker; drain this count
+    // before reusing the borrowed maintenance buffers in the next phase.
+    std::atomic<unsigned> checkpoint_reads_in_flight_{0};
     std::vector<FixedFile> files_;
     // Primary indexes and the UUID registry share one worker handle namespace.
     // Declaring the arena before partitions and detached populations makes it
@@ -4021,7 +4025,7 @@ class StorageEngine::Impl {
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
   Task<absl::Status> ReadRecoveryExtentInto(
       WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-      std::span<std::byte> destination,
+      FixedBuffer scratch, std::span<std::byte> destination,
       OrderedGroupMetadataDecoder* ordered = nullptr);
   // Read a bounded prefix while validating every extent in the manifest. Used
   // for group envelopes so an indivisible large field does not become a large
@@ -4617,6 +4621,8 @@ class StorageEngine::Impl {
 
   Task<absl::Status> DiscoverCheckpoint(WorkerStore& store,
                                         CheckpointLoadResult* result);
+
+  Task<absl::Status> DrainCheckpointReads(WorkerStore& store);
 
   Task<absl::Status> PrepareCheckpointIndexes();
 

@@ -177,6 +177,8 @@ class RegisteredBufferPool {
   // until teardown, including across I/O and relocation waits; callers must
   // preserve that single-scanner invariant. Submit with ordinary I/O (not a
   // registered index). SPDK still allocates these buffers from DMA memory.
+  // Startup recovery borrows these workspaces before maintenance can start;
+  // it must drain prefetch I/O before reuse or the transition to maintenance.
   bycorf::FixedBuffer maintenance_read_buffer(MaintenanceReadKind kind) const {
     assert(initialized());
     return maintenance_read_buffers_[static_cast<std::size_t>(kind)];

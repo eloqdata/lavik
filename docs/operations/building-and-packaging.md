@@ -71,6 +71,10 @@ outside `--registered-buffer-mb-per-worker` (88 MiB of fixed buffer capacity
 per worker with defaults). They are counted in retained memory, remain
 allocated until teardown, and use unregistered I/O on io_uring. Failure to
 allocate any one names the worker and task and fails startup.
+Startup recovery reuses these buffers for block scans, nested extent reads,
+and two-slot checkpoint prefetch. It drains outstanding reads before switching
+phases or starting maintenance, so these paths add no DMA capacity or write-slot
+requirement. Recovery uses unregistered I/O on io_uring for the borrowed buffers.
 
 Redis export also reserves one independent 8 MiB buffer per process at startup
 for capture writes and subsequent disk replay. It stays charged to shared

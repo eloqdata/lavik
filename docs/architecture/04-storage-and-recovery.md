@@ -394,6 +394,15 @@ worker-local boots. Request readiness follows successful completion of the
 complete recovery and allocator-cleanup sequence; the exact moment a listening
 socket exists is not the readiness boundary.
 
+Worker recovery reuses the three fixed maintenance read workspaces before
+maintenance starts. Checkpoint discovery and body loading alternate two
+workspaces; ordinary block scans reuse one, while nested key/group extent
+validation uses the third. Delegated SPDK reads carry the initiating task's
+workspace and join before reuse, so another worker's concurrent recovery cannot
+overwrite it. Each checkpoint phase drains outstanding prefetch, including
+abandoned reads after validation failure, before the next phase or cold-scan
+fallback can reuse those images. Recovery barriers precede maintenance reuse.
+
 After worker recovery, the Function catalog decodes the selected dump and
 stages it independently on every worker before Redis readiness. A missing root
 on a fresh set is the canonical empty catalog and needs no durable allocation.
@@ -624,9 +633,10 @@ Storage buffer capacity also participates in retained accounting: fixed read
 and write pools and dedicated maintenance scan buffers are charged at
 initialization. Redis export owns one process-wide 8 MiB workspace, allocated
 and charged at startup, reused for capture writes and subsequent disk replay,
-and retained between sessions. Extra recovery/population-rewrite buffers remain
-charged while cached for reuse. Oversized reads and reads that find the fixed
-pool exhausted allocate aligned or SPDK DMA overflow storage only while leased;
+and retained between sessions. Recovery reuses the charged maintenance buffers;
+extra population-rewrite buffers remain charged while cached for reuse.
+Oversized reads and reads that find the fixed pool exhausted allocate aligned
+or SPDK DMA overflow storage only while leased;
 returning a lease frees that storage and removes its charge on the owner worker.
 If temporary allocation fails, ordinary reads wait for a
 fixed slot in FIFO order. Oversized record and extent reads whose allocation

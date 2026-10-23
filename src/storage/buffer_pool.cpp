@@ -747,7 +747,7 @@ bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
     return false;
   }
   heap_write_buffers_.push_back(data);
-  // Recovery scans and atomic population rewrites may need extra staging
+  // Atomic population rewrites may need extra staging
   // while admission is closed. Charge capacity without blocking that progress.
   buffer_memory_.Resize(buffer_memory_.bytes() + options_.write_buffer_bytes_);
   *buffer = data;

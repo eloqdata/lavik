@@ -820,8 +820,9 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
 // A checkpoint reader alternates two of these slots. Each slot submits the
 // header immediately and chains the payload read from that completion, so the
 // next block remains in flight while the worker decodes the current block.
-// State and its DMA buffer outlive the owning coroutine if recovery abandons a
-// prefetch after detecting corruption; the I/O completion then reclaims both.
+// The buffer belongs to the worker's maintenance pool. If a decoder abandons
+// prefetch on corruption, completion reclaims State and drops its in-flight
+// count; startup drains that count before another phase reuses the buffer.
 class CheckpointPrefetchSlot {
   struct State;
 
@@ -833,13 +834,18 @@ class CheckpointPrefetchSlot {
   CheckpointPrefetchSlot& operator=(const CheckpointPrefetchSlot&) = delete;
   ~CheckpointPrefetchSlot() { Release(); }
 
-  absl::Status Initialize(std::size_t alignment) {
+  absl::Status Initialize(FixedBuffer buffer,
+                          std::atomic<unsigned>& in_flight) {
     assert(state_ == nullptr);
-    State* state = new (std::nothrow) State(alignment);
-    if (state == nullptr || state->data_ == nullptr) {
-      delete state;
+    if (buffer.data_ == nullptr || buffer.size_ < kStorageBlockBytes) {
+      return absl::FailedPreconditionError(
+          "checkpoint prefetch requires an initialized maintenance read "
+          "buffer");
+    }
+    State* state = new (std::nothrow) State(buffer, in_flight);
+    if (state == nullptr) {
       return absl::ResourceExhaustedError(
-          "failed to allocate checkpoint prefetch buffer");
+          "failed to allocate checkpoint prefetch state");
     }
     state_ = state;
     return absl::OkStatus();
@@ -890,12 +896,8 @@ class CheckpointPrefetchSlot {
 
  private:
   struct State final : bycorf::IoCompletion {
-    explicit State(std::size_t alignment)
-        : data_(static_cast<std::byte*>(
-              bycorf::AllocateStorageBuffer(kStorageBlockBytes, alignment))),
-          alignment_(alignment) {}
-
-    ~State() override { bycorf::FreeStorageBuffer(data_, alignment_); }
+    State(FixedBuffer buffer, std::atomic<unsigned>& in_flight)
+        : data_(buffer.data_), in_flight_(&in_flight) {}
 
     void Start(Worker& worker, FixedFile file, std::uint64_t offset,
                std::uint64_t block_id, std::uint64_t generation,
@@ -913,6 +915,7 @@ class CheckpointPrefetchSlot {
       orphaned_ = false;
       waiter_ = {};
       result_.reset();
+      in_flight_->fetch_add(1, std::memory_order_relaxed);
       absl::Status submitted = Submit(kBlockHeaderBytes);
       if (!submitted.ok()) Finish(std::move(submitted));
     }
@@ -973,19 +976,21 @@ class CheckpointPrefetchSlot {
     void Finish(Result result) {
       result_.emplace(std::move(result));
       complete_ = true;
+      auto* in_flight = in_flight_;
       if (orphaned_) {
         delete this;
-        return;
-      }
-      if (waiter_) {
+      } else if (waiter_) {
         worker_->Enqueue(std::exchange(waiter_, {}));
       }
+      // Publish only after all access to the borrowed image has ended, even
+      // when this completion was delegated to another worker's SPDK qpair.
+      in_flight->fetch_sub(1, std::memory_order_release);
     }
 
     enum class Phase : std::uint8_t { kHeader, kPayload };
 
     std::byte* data_ = nullptr;
-    std::size_t alignment_ = 0;
+    std::atomic<unsigned>* in_flight_;
     Worker* worker_ = nullptr;
     FixedFile file_{};
     std::uint64_t offset_ = 0;
@@ -1020,6 +1025,20 @@ class CheckpointPrefetchSlot {
 };
 
 }  // namespace
+
+Task<absl::Status> StorageEngine::Impl::DrainCheckpointReads(
+    WorkerStore& store) {
+  // A corrupt checkpoint can leave the next header/payload read in flight.
+  // Barriers rendezvous decoder tasks, not their orphaned I/O completions.
+  // This startup-only wait also precedes cold-scan and maintenance reuse.
+  while (store.checkpoint_reads_in_flight_.load(std::memory_order_acquire) !=
+         0) {
+    auto status =
+        co_await bycorf::SleepFor(*store.worker_, std::chrono::milliseconds(1));
+    if (!status.ok()) co_return status;
+  }
+  co_return absl::OkStatus();
+}
 
 Task<absl::Status> StorageEngine::Impl::PersistCheckpointRootOnDeviceLocal(
     std::size_t device_index, const CheckpointRoot& root) {
@@ -1902,8 +1921,12 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
   }
 
   std::array<CheckpointPrefetchSlot, 2> prefetch;
-  for (CheckpointPrefetchSlot& slot : prefetch) {
-    absl::Status initialized = slot.Initialize(options_.buffers_.alignment_);
+  constexpr std::array kinds{MaintenanceReadKind::kDefrag,
+                             MaintenanceReadKind::kTxCleaner};
+  for (std::size_t i = 0; i < prefetch.size(); ++i) {
+    absl::Status initialized =
+        prefetch[i].Initialize(store.buffers_.maintenance_read_buffer(kinds[i]),
+                               store.checkpoint_reads_in_flight_);
     if (!initialized.ok()) co_return initialized;
   }
   auto start_prefetch = [this, &store](CheckpointPrefetchSlot& slot,
@@ -1916,6 +1939,13 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
 
   std::vector<std::uint64_t> capacity_blocks;
   if (!candidates.empty()) start_prefetch(prefetch[0], candidates[0], true);
+  LAVIK_FAULT_INJECT(
+      if (!candidates.empty() &&
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_CHECKPOINT_PREFETCH_AFTER_SUBMIT",
+                              "discovery")) {
+        co_return absl::InternalError(
+            "injected checkpoint discovery failure after read submission");
+      });
   for (std::size_t index = 0; index < candidates.size(); ++index) {
     CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
     auto candidate = co_await current.Wait();
@@ -2176,8 +2206,12 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     co_return absl::OkStatus();
   }
   std::array<CheckpointPrefetchSlot, 2> prefetch;
-  for (CheckpointPrefetchSlot& slot : prefetch) {
-    absl::Status initialized = slot.Initialize(options_.buffers_.alignment_);
+  constexpr std::array kinds{MaintenanceReadKind::kDefrag,
+                             MaintenanceReadKind::kTxCleaner};
+  for (std::size_t i = 0; i < prefetch.size(); ++i) {
+    absl::Status initialized =
+        prefetch[i].Initialize(store.buffers_.maintenance_read_buffer(kinds[i]),
+                               store.checkpoint_reads_in_flight_);
     if (!initialized.ok()) co_return initialized;
   }
 
@@ -2533,6 +2567,14 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   if (!result->body_blocks_.empty()) {
     start_prefetch(prefetch[0], result->body_blocks_[0]);
   }
+  LAVIK_FAULT_INJECT(
+      if (store.checkpoint_reads_in_flight_.load(std::memory_order_relaxed) !=
+              0 &&
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_CHECKPOINT_PREFETCH_AFTER_SUBMIT",
+                              "body")) {
+        co_return absl::InternalError(
+            "injected checkpoint body failure after read submission");
+      });
   std::size_t remote_reads = 0;
   for (std::size_t index = 0; index < result->body_blocks_.size(); ++index) {
     CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
