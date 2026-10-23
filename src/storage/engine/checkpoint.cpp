@@ -520,9 +520,10 @@ absl::StatusOr<CheckpointObjectData> DecodeCheckpointObject(
   return result;
 }
 
-// Two slots let shutdown encode the next chunk while the prior direct write is
-// in flight. Heap-owned completion state keeps the DMA buffer alive if an
-// unrelated serialization error abandons the owning coroutine.
+// After the final shutdown drain, borrow two ordinary write slots to overlap
+// encoding with I/O without allocating more DMA memory. Completion state owns
+// each loan even if a serialization error abandons the coroutine: returning a
+// slot before its write completes would allow reuse while the device reads it.
 class CheckpointWriteSlot {
   struct State;
 
@@ -532,13 +533,27 @@ class CheckpointWriteSlot {
   CheckpointWriteSlot& operator=(const CheckpointWriteSlot&) = delete;
   ~CheckpointWriteSlot() { Release(); }
 
-  absl::Status Initialize(std::size_t alignment) {
+  absl::Status Initialize(RegisteredBufferPool& pool) {
     assert(state_ == nullptr);
-    State* state = new (std::nothrow) State(alignment);
-    if (state == nullptr || state->data_ == nullptr) {
-      delete state;
+    std::uint16_t buffer_id = 0;
+    // No ordinary writer remains after the freeze. A missing slot is a broken
+    // drain invariant; fail this optional checkpoint instead of waiting
+    // forever.
+    if (!pool.TryAcquireWriteBuffer(&buffer_id)) {
+      return absl::FailedPreconditionError(
+          "shutdown checkpoint requires two available storage write buffers "
+          "after drain");
+    }
+    if (pool.write_buffer(buffer_id).size_ < kStorageBlockBytes) {
+      pool.ReleaseWriteBuffer(buffer_id);
+      return absl::InvalidArgumentError(
+          "checkpoint write buffer is smaller than a storage block");
+    }
+    State* state = new (std::nothrow) State(pool, buffer_id);
+    if (state == nullptr) {
+      pool.ReleaseWriteBuffer(buffer_id);
       return absl::ResourceExhaustedError(
-          "failed to allocate checkpoint write buffer");
+          "failed to allocate checkpoint write completion state");
     }
     state_ = state;
     return absl::OkStatus();
@@ -661,12 +676,12 @@ class CheckpointWriteSlot {
 
  private:
   struct State final : bycorf::IoCompletion {
-    explicit State(std::size_t alignment)
-        : data_(static_cast<std::byte*>(
-              bycorf::AllocateStorageBuffer(kStorageBlockBytes, alignment))),
-          alignment_(alignment) {}
+    State(RegisteredBufferPool& pool, std::uint16_t buffer_id)
+        : data_(pool.write_buffer(buffer_id).data_),
+          pool_(&pool),
+          buffer_id_(buffer_id) {}
 
-    ~State() override { bycorf::FreeStorageBuffer(data_, alignment_); }
+    ~State() override { pool_->ReleaseWriteBuffer(buffer_id_); }
 
     absl::Status Start(Worker& worker, FixedFile file, std::uint64_t offset,
                        std::size_t write_bytes) {
@@ -678,8 +693,12 @@ class CheckpointWriteSlot {
       orphaned_ = false;
       waiter_ = {};
       result_.reset();
-      absl::Status submitted = worker.SubmitWrite(
-          file, std::span<const std::byte>(data_, write_bytes), offset, this);
+      FixedBuffer buffer = pool_->write_buffer(buffer_id_);
+      buffer.size_ = write_bytes;
+      absl::Status submitted =
+          pool_->buffer_registered(buffer_id_)
+              ? worker.SubmitWriteFixed(file, buffer, offset, this)
+              : worker.SubmitWrite(file, {data_, write_bytes}, offset, this);
       if (!submitted.ok()) active_ = false;
       return submitted;
     }
@@ -709,7 +728,8 @@ class CheckpointWriteSlot {
     }
 
     std::byte* data_ = nullptr;
-    std::size_t alignment_ = 0;
+    RegisteredBufferPool* pool_ = nullptr;
+    std::uint16_t buffer_id_ = 0;
     std::size_t payload_bytes_ = 0;
     std::size_t expected_bytes_ = 0;
     Worker* worker_ = nullptr;
@@ -1108,7 +1128,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
   result = {};
   std::array<CheckpointWriteSlot, 2> write_slots;
   for (CheckpointWriteSlot& slot : write_slots) {
-    absl::Status initialized = slot.Initialize(options_.buffers_.alignment_);
+    absl::Status initialized = slot.Initialize(store.buffers_);
     if (!initialized.ok()) co_return initialized;
   }
   std::size_t payload_slot = 0;
@@ -1128,6 +1148,11 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         *store.worker_, store.files_[file_id], block_offset, write_bytes);
     if (!submitted.ok()) co_return submitted;
     result.blocks_.push_back(reserved->block_id_);
+    LAVIK_FAULT_INJECT(
+        if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_CHECKPOINT_AFTER_SUBMIT", "1")) {
+          co_return absl::InternalError(
+              "injected checkpoint failure after write submission");
+        });
 
     payload_slot = (payload_slot + 1) % write_slots.size();
     payload = &write_slots[payload_slot];

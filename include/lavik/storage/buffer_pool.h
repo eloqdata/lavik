@@ -44,6 +44,7 @@ inline constexpr std::size_t kKiB = 1024;
 
 struct RegisteredBufferPoolOptions {
   std::size_t registered_bytes_ = 64 * kMiB;
+  // At least two; shutdown checkpoints borrow both after ordinary writes drain.
   std::size_t storage_write_buffer_count_ = 4;
   std::size_t write_buffer_bytes_ = 8 * kMiB;
   // Cover ordinary compact records and grouped pages, including record headers

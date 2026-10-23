@@ -53,9 +53,9 @@ class RemoteGetTestPeer : public testing::Test {
     block_.allocated_ = true;
 
     RegisteredBufferPoolOptions options;
-    options.storage_write_buffer_count_ = 1;
+    options.storage_write_buffer_count_ = 2;
     options.registered_bytes_ =
-        options.write_buffer_bytes_ + options.read_slot_bytes_;
+        2 * options.write_buffer_bytes_ + options.read_slot_bytes_;
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
     ASSERT_EQ(Pool().available_read_buffers(), 1);
 
@@ -121,6 +121,7 @@ class RemoteGetTestPeer : public testing::Test {
   void CheckFlushedBufferRelease(UnpinPoint point) {
     auto& engine = *storage_.impl_;
     auto& store = *engine.stores_[0];
+    const auto available = Pool().available_write_buffers();
     block_.Reset(0, 7);
     block_.allocated_ = true;
     block_.committed_bytes_ = kBlockHeaderBytes + 4096;
@@ -130,7 +131,7 @@ class RemoteGetTestPeer : public testing::Test {
     store.staging_slots_.emplace_back();
     ASSERT_TRUE(Pool().TryAcquireWriteBuffer(
         &store.staging_slots_.back().write_buffer_id_));
-    ASSERT_EQ(Pool().available_write_buffers(), 0);
+    ASSERT_EQ(Pool().available_write_buffers(), available - 1);
     ASSERT_TRUE(block_.TryRemotePin());
     auto unpin = [&] {
       bycorf::SetThisWorker(1, &cross_core_, &owner_);
@@ -158,7 +159,7 @@ class RemoteGetTestPeer : public testing::Test {
     if (point != UnpinPoint::kBeforeRelease) {
       EXPECT_TRUE(block_.release_pending_);
       EXPECT_FALSE(block_.TryRemotePin());
-      EXPECT_EQ(Pool().available_write_buffers(), 0);
+      EXPECT_EQ(Pool().available_write_buffers(), available - 1);
       if (point == UnpinPoint::kAfterRelease) unpin();
       // A one-way notification alone must finish the release; no later local
       // read/unpin or maintenance pass is allowed to rescue a lost wakeup.
@@ -171,7 +172,7 @@ class RemoteGetTestPeer : public testing::Test {
     EXPECT_EQ(block_.pin_count(), 0);
     EXPECT_FALSE(block_.release_pending_);
     EXPECT_EQ(block_.staging_slot_, 0);
-    EXPECT_EQ(Pool().available_write_buffers(), 1);
+    EXPECT_EQ(Pool().available_write_buffers(), available);
   }
 
   void Complete(Awaitable& read, int bytes = -1) {

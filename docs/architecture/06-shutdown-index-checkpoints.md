@@ -148,13 +148,19 @@ All chunk types share the checkpoint block kind,
 generation, bitmap, publication lifecycle, and payload CRC; an explicit
 chunk-kind field selects their entry layout.
 
-Each shard builder alternates two aligned 8 MiB buffers. Once one buffer has
-been encoded and submitted, the worker builds the next chunk in the other
-while the first write remains in flight; it waits only before reusing a slot.
+Each shard builder borrows two 8 MiB slots from its worker's ordinary write
+pool after the final shutdown drain, without allocating additional DMA
+buffers. Configuration requires at least two write slots even when checkpoint
+creation starts disabled, because it can be enabled at runtime. A missing
+slot after the drain fails the optional checkpoint rather than waiting for a
+writer that should no longer exist. Once one buffer has been encoded and
+submitted, the worker builds the next chunk in the other while the first
+write remains in flight; it waits only before reusing a slot.
 Both writes must complete before that shard enters the publication barrier.
 Abandoning a shard after a serialization or I/O error leaves any submitted
-buffer owned by its completion, so asynchronous device access cannot outlive
-the DMA memory.
+slot owned by its completion until I/O finishes, so returning it to the pool
+cannot race asynchronous device access. io_uring uses fixed I/O for registered
+slots and ordinary I/O otherwise; SPDK reuses the pool's DMA memory.
 
 Publication order is:
 

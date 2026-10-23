@@ -62,9 +62,9 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     block_.allocated_ = true;
 
     RegisteredBufferPoolOptions options;
-    options.storage_write_buffer_count_ = 1;
+    options.storage_write_buffer_count_ = 2;
     options.read_slot_bytes_ = ReadSlotBytes();
-    options.registered_bytes_ = options.write_buffer_bytes_ +
+    options.registered_bytes_ = 2 * options.write_buffer_bytes_ +
                                 ReadBufferCount() * options.read_slot_bytes_;
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
     ASSERT_EQ(Pool().available_read_buffers(), ReadBufferCount());

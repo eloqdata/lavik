@@ -56,7 +56,9 @@ CPU instruction-set and glibc requirements remain separate constraints.
 
 `--registered-buffer-mb-per-worker` sets each data worker's storage-buffer pool
 budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
-8 MiB write buffers by default; the remaining budget supplies read slots.
+8 MiB write buffers by default and requires at least two; the remaining budget
+supplies read slots. Shutdown checkpoints borrow two drained write slots for
+their encoding/write pipeline without allocating additional DMA buffers.
 `--storage-read-buffer-kb` is the total slot size, including framing space.
 The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
 4 KiB of tailroom. Values must be multiples of 4 KiB and greater than 8 KiB.

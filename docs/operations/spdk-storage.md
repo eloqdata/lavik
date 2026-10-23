@@ -113,8 +113,10 @@ Size the host's hugepage reservation for all simultaneous SPDK processes,
 including each worker's storage-buffer budget plus three dedicated 8 MiB DMA
 scan buffers for defrag, transaction cleaning, and Tomb Raider. The fixed
 buffer capacity is 88 MiB per worker with defaults; also allow for overflow,
-checkpoint and export buffers, and SPDK/DPDK overhead. Maintenance scan
-allocation failure names the worker and task and fails startup; it never
+startup checkpoint read buffers, export buffers, and SPDK/DPDK overhead.
+Shutdown checkpoint writes reuse two drained ordinary write slots, adding no
+DMA capacity. Maintenance scan allocation failure names the worker and task
+and fails startup; it never
 falls back to borrowing write slots. Check free hugepages after startup; a
 per-worker buffer setting is not a process-wide cap. On NUMA hosts, keep the
 selected NVMe controllers, hugepages and worker CPUs on the same node where

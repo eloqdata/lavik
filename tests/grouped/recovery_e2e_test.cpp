@@ -502,7 +502,12 @@ class ChildServer {
                   {"--rdb-dir", lavik::test::TestDataDirectory().string(),
                    "--dbfilename", dump_.substr(dump_.rfind('/') + 1)});
       if (!defrag) args.emplace_back("--defrag-paused");
-      if (checkpoint) args.emplace_back("--shutdown-checkpoint");
+      if (checkpoint) {
+        // Exercise the smallest supported pool: shutdown must borrow both
+        // slots, including when a long key spans multiple checkpoint chunks.
+        args.insert(args.end(), {"--shutdown-checkpoint",
+                                 "--storage-write-buffers-per-worker", "2"});
+      }
       std::vector<char*> argv;
       for (auto& arg : args) argv.push_back(arg.data());
       argv.push_back(nullptr);

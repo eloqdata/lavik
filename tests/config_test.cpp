@@ -898,6 +898,27 @@ TEST(RedisConfigTest, RequiresNodeIdAndMetaSeedWhenManaged) {
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 }
 
+TEST(RedisConfigTest, RequiresTwoWriteSlotsEvenWhenCheckpointStartsDisabled) {
+  ServerOptions options;
+  EXPECT_EQ(options.storage_write_buffer_count_, 4);
+  EXPECT_FALSE(options.shutdown_checkpoint_);
+  for (const unsigned count : {0, 1, 2, 4}) {
+    options.storage_write_buffer_count_ = count;
+    const auto status = ValidateServerOptions(options);
+    EXPECT_EQ(status.ok(), count >= 2) << status;
+    if (count < 2)
+      EXPECT_NE(status.message().find("at least 2"), std::string_view::npos);
+  }
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"storage-write-buffers-per-worker", "1"}, &options)
+                  .ok());
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"storage-write-buffers-per-worker", "2"}, &options)
+                  .ok());
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+}
+
 TEST(RedisConfigTest, ReadSlotSizeIncludesFraming) {
   ServerOptions options;
   EXPECT_EQ(options.storage_read_buffer_bytes_, 32 * 1024);

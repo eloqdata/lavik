@@ -172,9 +172,9 @@ absl::Status RegisteredBufferPool::Init(
         absl::StatusCode::kInvalidArgument,
         "registered buffer sizes must satisfy O_DIRECT alignment");
   }
-  if (options.storage_write_buffer_count_ == 0) {
+  if (options.storage_write_buffer_count_ < 2) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "storage write buffers are required");
+                        "at least two storage write buffers are required");
   }
   const std::size_t configured_write_count =
       options.storage_write_buffer_count_;

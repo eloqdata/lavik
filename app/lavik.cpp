@@ -263,9 +263,9 @@ int main(int argc, char** argv) {
       ->check(CLI::PositiveNumber);
   app.add_option("--storage-write-buffers-per-worker",
                  options.storage_write_buffer_count_,
-                 "Registered storage write buffers per worker")
+                 "Registered storage write buffers per worker (at least 2)")
       ->capture_default_str()
-      ->check(CLI::PositiveNumber);
+      ->check(CLI::Range(2u, std::numeric_limits<unsigned>::max()));
   app.add_option(
          "--storage-read-buffer-kb", storage_read_buffer_kb,
          "Total storage read slot size in KiB, including 8 KiB framing space")

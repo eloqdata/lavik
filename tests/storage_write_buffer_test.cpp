@@ -7,6 +7,8 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,9 +24,73 @@ namespace lavik::storage {
 
 class WriteBufferTestPeer {
  public:
-  enum class Scenario { kProgress, kEpochChanged, kSourceChanged, kNoStaging };
+  enum class Scenario {
+    kProgress,
+    kEpochChanged,
+    kSourceChanged,
+    kNoStaging,
+    kCheckpoint,
+    kCheckpointAfterSubmit,
+    kCheckpointMissingSlot,
+  };
+
+  static Task<absl::Status> RunCheckpoint(StorageEngine& storage,
+                                          Scenario scenario) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& worker = *store.worker_;
+    auto paused = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!paused.ok()) co_return paused;
+    if (store.buffers_.available_write_buffers() != 2)
+      co_return absl::InternalError("checkpoint fixture needs two free slots");
+
+    std::uint16_t held = 0;
+    absl::Cleanup release = [&] {
+      if (held != 0) store.buffers_.ReleaseWriteBuffer(held);
+    };
+    if (scenario == Scenario::kCheckpointMissingSlot &&
+        !store.buffers_.TryAcquireWriteBuffer(&held))
+      co_return absl::InternalError("could not hold checkpoint fixture slot");
+
+    // This empty shard has no foreground or maintenance writer. Its capacity
+    // chunk still submits real direct I/O through the normal checkpoint path.
+    const auto status = co_await impl.BuildShutdownCheckpointShard(store, 1);
+    if (scenario == Scenario::kCheckpointMissingSlot) {
+      if (!absl::IsFailedPrecondition(status) ||
+          store.buffers_.available_write_buffers() != 1)
+        co_return absl::InternalError(
+            "partial checkpoint acquisition did not return its first slot");
+      co_return absl::OkStatus();
+    }
+    if (scenario == Scenario::kCheckpointAfterSubmit) {
+      if (status.message() !=
+          "injected checkpoint failure after write submission")
+        co_return absl::InternalError("checkpoint did not reach failure hook");
+      // No yield occurs between submission, injected failure, and this check.
+      // The unused slot is returned; the submitted one belongs to completion.
+      if (store.buffers_.available_write_buffers() != 1)
+        co_return absl::InternalError(
+            "abandoned checkpoint returned a slot before I/O completed");
+    } else if (!status.ok()) {
+      co_return status;
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (store.buffers_.available_write_buffers() != 2 &&
+           std::chrono::steady_clock::now() < deadline)
+      co_await bycorf::Yield(worker);
+    if (store.buffers_.available_write_buffers() != 2)
+      co_return absl::DeadlineExceededError(
+          "checkpoint completion did not return its write slot");
+    co_return absl::OkStatus();
+  }
 
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kCheckpoint ||
+        scenario == Scenario::kCheckpointAfterSubmit ||
+        scenario == Scenario::kCheckpointMissingSlot)
+      co_return co_await RunCheckpoint(storage, scenario);
     auto& impl = *storage.impl_;
     auto& store = impl.CurrentStore();
     auto& worker = *store.worker_;
@@ -205,8 +271,24 @@ class WriteBufferService final : public bycorf::Service {
 class StorageWriteBufferTest
     : public testing::TestWithParam<WriteBufferTestPeer::Scenario> {};
 
-TEST_P(StorageWriteBufferTest,
-       RelocationWaitsWithoutHoldingStoreOrAllocationGate) {
+void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario) {
+  constexpr const char* fault = "LAVIK_FAIL_CHECKPOINT_AFTER_SUBMIT";
+  std::optional<std::string> previous;
+  if (const char* value = std::getenv(fault)) previous = value;
+  absl::Cleanup restore = [&] {
+    if (previous)
+      ::setenv(fault, previous->c_str(), 1);
+    else
+      ::unsetenv(fault);
+  };
+  if (scenario == WriteBufferTestPeer::Scenario::kCheckpointAfterSubmit) {
+#if !LAVIK_FAULTS_ENABLED
+    GTEST_SKIP() << "requires checkpoint submission failure injection";
+#endif
+    ASSERT_EQ(::setenv(fault, "1", 1), 0);
+  } else {
+    ASSERT_EQ(::unsetenv(fault), 0);
+  }
   const auto path = test::TestDataPath("lavik-write-fifo-" +
                                        std::to_string(getpid()) + ".data");
   const int fd =
@@ -224,9 +306,10 @@ TEST_P(StorageWriteBufferTest,
   options.expiration_authority_ = false;
   options.tomb_raider_interval_ms_ = 0;
   options.tx_cleaner_cooldown_ms_ = 0;
+  options.buffers_.storage_write_buffer_count_ = 2;
   StorageEngine storage(std::move(options));
   ASSERT_TRUE(storage.Prepare(1).ok());
-  WriteBufferService service(storage, GetParam());
+  WriteBufferService service(storage, scenario);
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions runtime;
@@ -237,6 +320,24 @@ TEST_P(StorageWriteBufferTest,
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result_.ok()) << service.result_;
 }
+
+TEST_P(StorageWriteBufferTest,
+       RelocationWaitsWithoutHoldingStoreOrAllocationGate) {
+  RunWriteBufferScenario(GetParam());
+}
+
+class StorageCheckpointBufferTest
+    : public testing::TestWithParam<WriteBufferTestPeer::Scenario> {};
+
+TEST_P(StorageCheckpointBufferTest, KeepsBorrowedSlotsUntilIoCompletes) {
+  RunWriteBufferScenario(GetParam());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Shutdown, StorageCheckpointBufferTest,
+    testing::Values(WriteBufferTestPeer::Scenario::kCheckpoint,
+                    WriteBufferTestPeer::Scenario::kCheckpointAfterSubmit,
+                    WriteBufferTestPeer::Scenario::kCheckpointMissingSlot));
 
 INSTANTIATE_TEST_SUITE_P(
     DefragFifo, StorageWriteBufferTest,

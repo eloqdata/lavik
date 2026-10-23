@@ -63,8 +63,8 @@ class BufferPoolWaitService final : public bycorf::Service {
       co_return result_;
     }
     RegisteredBufferPoolOptions options;
-    options.registered_bytes_ = 16 * kMiB;
-    options.storage_write_buffer_count_ = 1;
+    options.registered_bytes_ = 24 * kMiB;
+    options.storage_write_buffer_count_ = 2;
     options.write_buffer_bytes_ = 8 * kMiB;
     result_ = pool_.Init(worker, options);
     if (!result_.ok()) {
@@ -72,6 +72,16 @@ class BufferPoolWaitService final : public bycorf::Service {
       co_return result_;
     }
 
+    std::uint16_t other_storage = 0;
+    if (!pool_.TryAcquireWriteBuffer(&other_storage)) {
+      result_ = absl::FailedPreconditionError(
+          "test could not reserve the other storage write buffer");
+      worker.RequestStop();
+      co_return result_;
+    }
+    absl::Cleanup release_other = [&] {
+      pool_.ReleaseWriteBuffer(other_storage);
+    };
     std::uint16_t held_storage = 0;
     if (!pool_.TryAcquireWriteBuffer(&held_storage) || held_storage == 0) {
       result_ = absl::FailedPreconditionError(
@@ -247,6 +257,19 @@ TEST(BufferPoolTest, StorageWriteBufferWaiterIsReusable) {
   ASSERT_TRUE(server.Start(options).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(BufferPoolTest, RejectsFewerThanTwoWriteSlotsBeforeAllocation) {
+  bycorf::Worker worker;
+  RegisteredBufferPool pool;
+  RegisteredBufferPoolOptions options;
+  for (const std::size_t count : {0, 1}) {
+    options.storage_write_buffer_count_ = count;
+    const auto status = pool.Init(worker, options);
+    EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+    EXPECT_FALSE(pool.initialized());
+    EXPECT_EQ(pool.available_write_buffers(), 0);
+  }
 }
 
 TEST(BufferPoolTest, ReadAllocationFailureWaitsForFixedSlot) {
