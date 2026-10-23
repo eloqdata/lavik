@@ -899,9 +899,9 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     FixedBuffer block_data,
     std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed_txids,
     bool stop_on_shutdown) {
-  auto read =
-      co_await ReadStorageBuffer(*store.worker_, store.files_[source_file_id],
-                                 block_data, false, source_block_offset);
+  auto read = co_await ReadStorageBuffer(
+      *store.worker_, store.files_[source_file_id], block_data,
+      store.buffers_.workspace_registered(block_data), source_block_offset);
   if (!read.ok() || *read != kStorageBlockBytes) {
     source.defragging_ = false;
     co_return read.ok() ? absl::Status(absl::StatusCode::kInternal,

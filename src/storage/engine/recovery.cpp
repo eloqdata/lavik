@@ -90,8 +90,9 @@ Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
   FixedBuffer io = scratch;
   io.size_ = read_bytes;
   const auto [file_id, block_offset] = FileOffset(ref.block_id_);
-  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                         io, false, block_offset);
+  auto read = co_await ReadStorageBuffer(
+      *store.worker_, store.files_[file_id], io,
+      store.buffers_.workspace_registered(io), block_offset);
   if (!read.ok()) co_return read.status();
   if (*read != read_bytes) {
     co_return absl::InternalError("short recovered extent read");
@@ -370,9 +371,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       const std::uint32_t file_id = device.file_index_;
       const std::uint64_t block_offset =
           static_cast<std::uint64_t>(local_block) * kStorageBlockBytes;
-      auto read =
-          co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                     header_buffer, false, block_offset);
+      auto read = co_await ReadStorageBuffer(
+          *store.worker_, store.files_[file_id], header_buffer,
+          store.buffers_.workspace_registered(header_buffer), block_offset);
       if (!read.ok()) {
         co_return read.status();
       }
@@ -481,8 +482,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
 
-      read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                        recovery, false, block_offset);
+      read = co_await ReadStorageBuffer(
+          *store.worker_, store.files_[file_id], recovery,
+          store.buffers_.workspace_registered(recovery), block_offset);
       if (!read.ok()) {
         co_return read.status();
       }

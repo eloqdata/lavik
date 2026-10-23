@@ -309,7 +309,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
     saved_context_ = bycorf::MutableThisWorker();
     int fd = mkstemp(path_);
     ASSERT_GE(fd, 0);
-    ASSERT_EQ(ftruncate(fd, 4096), 0);
+    ASSERT_EQ(ftruncate(fd, 8 * kKiB), 0);
     close(fd);
     options_.registered_bytes_ = 8 * kMiB;
     options_.storage_write_buffer_count_ = 2;
@@ -322,6 +322,8 @@ class BufferPoolMemlockTest : public ::testing::Test {
     // table is gone. Restore the caller's worker context after shutdown.
     if (worker_) worker_->Shutdown();
     pool_.reset();
+    for (const auto& buffer : device_buffers_)
+      bycorf::FreeStorageBuffer(buffer.data_, 4096);
     if (wake_fd_ >= 0) close(wake_fd_);
     unlink(path_);
     if (limit_saved_) EXPECT_EQ(setrlimit(RLIMIT_MEMLOCK, &original_limit_), 0);
@@ -353,7 +355,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
     ASSERT_EQ(setrlimit(RLIMIT_MEMLOCK, &reduced), 0);
     if (pool_ == nullptr) pool_ = std::make_unique<RegisteredBufferPool>();
     if (!init_pool) return;
-    auto status = pool_->Init(*worker_, options_);
+    auto status = pool_->Init(*worker_, options_, device_buffers_);
     ASSERT_TRUE(status.ok()) << status;
     ASSERT_EQ(pool_->write_buffer_count(), 2);
     ASSERT_EQ(pool_->read_buffer_count(),
@@ -373,12 +375,52 @@ class BufferPoolMemlockTest : public ::testing::Test {
     ASSERT_EQ(completion.calls, 1);
   }
 
+  void AddDeviceBuffers(unsigned count) {
+    for (unsigned i = 0; i < count; ++i) {
+      auto* data = static_cast<std::byte*>(
+          bycorf::AllocateStorageBuffer(8 * kKiB, 4096));
+      ASSERT_NE(data, nullptr);
+      device_buffers_.push_back({.data_ = data, .size_ = 8 * kKiB});
+    }
+  }
+
+  void CheckWorkspaceIo(bycorf::FixedBuffer buffer, bool registered) {
+    ASSERT_EQ(pool_->workspace_registered(buffer), registered);
+    // Exercise the complete two-page header and then a metadata-page-sized
+    // subrange, including fixed index zero and fallback to ordinary I/O.
+    std::fill_n(buffer.data_, 8 * kKiB, std::byte{0x37});
+    auto write = buffer;
+    write.size_ = 8 * kKiB;
+    Completion written;
+    auto status = registered
+                      ? worker_->SubmitWriteFixed({0}, write, 0, &written)
+                      : worker_->SubmitWrite({0}, {write.data_, write.size_}, 0,
+                                             &written);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_NO_FATAL_FAILURE(Drain(written));
+    ASSERT_EQ(written.result, 8 * kKiB);
+    auto read = buffer;
+    read.data_ += 4096;
+    read.size_ = 4096;
+    ASSERT_EQ(pool_->workspace_registered(read), registered);
+    std::fill_n(read.data_, read.size_, std::byte{0});
+    Completion received;
+    status = registered ? worker_->SubmitReadFixed({0}, read, 4096, &received)
+                        : worker_->SubmitRead({0}, {read.data_, read.size_},
+                                              4096, &received);
+    ASSERT_TRUE(status.ok()) << status;
+    ASSERT_NO_FATAL_FAILURE(Drain(received));
+    ASSERT_EQ(received.result, 4096);
+    EXPECT_TRUE(std::all_of(read.data_, read.data_ + read.size_,
+                            [](std::byte b) { return b == std::byte{0x37}; }));
+  }
+
   // Exercise actual O_DIRECT I/O through both registered and ordinary paths.
   // Holding every read lease checks that pool capacity did not silently shrink;
   // Releasing and reacquiring checks that a shared registration index never
   // gets mistaken for a slot's release id.
   void CheckIo(unsigned expected_writes, unsigned min_reads, unsigned max_reads,
-               unsigned last_region = 0) {
+               unsigned last_region = 0, unsigned first_region = 0) {
     unsigned registered_writes = 0;
     for (unsigned i = 0; i < pool_->write_buffer_count(); ++i) {
       std::uint16_t id = 0;
@@ -426,7 +468,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
         if (round == 0) {
           EXPECT_EQ(lease.buffer_id(), i + 3);
           slot_addresses[i] = lease.bytes().data();
-          if (i == 0) EXPECT_EQ(buffer.index_, 0);
+          if (i == 0) EXPECT_EQ(buffer.index_, first_region);
           if (i + 1 == pool_->read_buffer_count())
             EXPECT_EQ(buffer.index_, last_region);
           if (i != 0 && buffer.index_ == leases[i - 1].io_buffer().index_) {
@@ -464,6 +506,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
   std::unique_ptr<bycorf::CrossCore> cross_core_;
   std::unique_ptr<bycorf::Worker> worker_;
   std::unique_ptr<RegisteredBufferPool> pool_;
+  std::vector<bycorf::FixedBuffer> device_buffers_;
   RegisteredBufferPoolOptions options_;
   int wake_fd_ = -1;
   char path_[64] = "/tmp/lavik-buffer-memlock-XXXXXX";
@@ -894,6 +937,80 @@ TEST_F(BufferPoolMemlockTest, NoFixedReadSlotsNeverWaitForAllocationFailure) {
   auto failed = pool_->AcquireReadBuffer();
   ASSERT_TRUE(failed.await_ready());
   EXPECT_TRUE(absl::IsResourceExhausted(failed.await_resume().status()));
+}
+
+TEST_F(BufferPoolMemlockTest, DeviceWorkspacesPrecedeReadsAndStayWhole) {
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
+  ASSERT_NO_FATAL_FAILURE(Init(12 * kKiB));
+  if (IsSkipped()) return;
+  ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(device_buffers_[0], true));
+  ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(device_buffers_[1], false));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 0, 0, 2, 2));
+  // A valid index from another allocation does not authorize fixed I/O.
+  auto wrong_index = device_buffers_[1];
+  wrong_index.index_ = device_buffers_[0].index_;
+  EXPECT_FALSE(pool_->workspace_registered(wrong_index));
+}
+
+TEST_F(BufferPoolMemlockTest, DeviceWorkspacesThenReadSlotsUseRemainingBudget) {
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
+  ASSERT_NO_FATAL_FAILURE(Init(16 * kKiB + 2 * options_.read_slot_bytes_));
+  if (IsSkipped()) return;
+  for (const auto& buffer : device_buffers_)
+    ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 2, 2, 2, 2));
+}
+
+TEST_F(BufferPoolMemlockTest, MaintenanceRegistersAfterAllOrdinarySlots) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
+  const auto addresses = device_buffers_;
+  ASSERT_NO_FATAL_FAILURE(Init(16 * kMiB + 16 * kKiB));
+  if (IsSkipped()) return;
+  ASSERT_TRUE(pool_->buffers_registered());
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, 341, 341, 2, 2));
+  for (std::size_t i = 0; i < device_buffers_.size(); ++i) {
+    EXPECT_EQ(device_buffers_[i].data_, addresses[i].data_);
+    ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(device_buffers_[i], true));
+  }
+  constexpr std::array kinds{MaintenanceReadKind::kDefrag,
+                             MaintenanceReadKind::kTxCleaner,
+                             MaintenanceReadKind::kTombRaider};
+  for (std::size_t i = 0; i < kinds.size(); ++i)
+    ASSERT_NO_FATAL_FAILURE(
+        CheckWorkspaceIo(pool_->maintenance_read_buffer(kinds[i]), i == 0));
+  // Registering caller-owned images neither reallocates nor charges them.
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+            baseline + 24 * kMiB + 2 * options_.write_buffer_bytes_ +
+                341 * options_.read_slot_bytes_);
+}
+
+TEST_F(BufferPoolMemlockTest, AllFixedWorkspacesRegisterWithEnoughMemlock) {
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
+  ASSERT_NO_FATAL_FAILURE(Init(40 * kMiB));
+  if (IsSkipped()) return;
+  for (const auto& buffer : device_buffers_)
+    ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
+  for (const auto kind :
+       {MaintenanceReadKind::kDefrag, MaintenanceReadKind::kTxCleaner,
+        MaintenanceReadKind::kTombRaider})
+    ASSERT_NO_FATAL_FAILURE(
+        CheckWorkspaceIo(pool_->maintenance_read_buffer(kind), true));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, 341, 341, 2, 2));
+}
+
+TEST_F(BufferPoolMemlockTest, DeviceAndMaintenanceWorkspacesAllowZeroMemlock) {
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  for (const auto& buffer : device_buffers_)
+    ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, false));
+  for (const auto kind :
+       {MaintenanceReadKind::kDefrag, MaintenanceReadKind::kTxCleaner,
+        MaintenanceReadKind::kTombRaider})
+    ASSERT_NO_FATAL_FAILURE(
+        CheckWorkspaceIo(pool_->maintenance_read_buffer(kind), false));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 0, 0, 2, 2));
 }
 
 TEST_F(BufferPoolMemlockTest, FullRegistrationPreservesConfiguredPool) {

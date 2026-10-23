@@ -150,12 +150,17 @@ class RegisteredBufferPool {
   ~RegisteredBufferPool();
 
   // Try full registration first. If io_uring rejects it, use the finite
-  // memlock allowance to retry a subset, prioritizing read slots. Pool sizes
-  // never shrink; unregistered slots use ordinary I/O. SPDK does not degrade.
+  // memlock allowance to retry a subset: borrowed device workspaces first,
+  // then ordinary read slots, write slots, and maintenance images. Pool sizes
+  // never shrink; unregistered buffers use ordinary I/O. SPDK does not degrade.
   // Reuses any prepared maintenance buffers, otherwise allocates them here.
+  // priority_buffers remain caller-owned and charged; successful Init updates
+  // their registration indices. Their allocations must outlive worker I/O and
+  // ring teardown. Registration never allocates or charges a second image.
   // Any allocation failure aborts initialization.
   absl::Status Init(bycorf::Worker& worker,
-                    const RegisteredBufferPoolOptions& options = {});
+                    const RegisteredBufferPoolOptions& options = {},
+                    std::span<bycorf::FixedBuffer> priority_buffers = {});
 
   // Reserve and account the three 8 MiB maintenance read buffers before a
   // worker exists. Startup may borrow them synchronously; Init must use the
@@ -180,10 +185,14 @@ class RegisteredBufferPool {
     return buffer_id - write_buffers_.size() - 1 < registered_read_count_;
   }
   unsigned owner_worker() const noexcept { return owner_worker_; }
+  // Check both index and address range against this worker's immutable
+  // registration table. Accepts subranges of registered workspaces; a borrowed
+  // image from another worker must not reuse that worker's fixed-buffer index.
+  bool workspace_registered(bycorf::FixedBuffer buffer) const noexcept;
   // Each kind has at most one scanner on this worker. Its buffer stays owned
   // until teardown, including across I/O and relocation waits; callers must
-  // preserve that single-scanner invariant. Submit with ordinary I/O (not a
-  // registered index). SPDK still allocates these buffers from DMA memory.
+  // preserve that single-scanner invariant. workspace_registered() selects
+  // fixed or ordinary I/O. SPDK allocates these buffers from DMA memory.
   // Startup recovery borrows these workspaces before maintenance can start;
   // it must drain prefetch I/O before reuse or the transition to maintenance.
   bycorf::FixedBuffer maintenance_read_buffer(MaintenanceReadKind kind) const {
@@ -318,6 +327,7 @@ class RegisteredBufferPool {
   bool buffers_registered_ = false;
   std::size_t registered_read_count_ = 0;
   std::size_t registered_write_count_ = 0;
+  std::vector<bycorf::FixedBuffer> registered_regions_;
   RegisteredBufferPoolOptions options_{};
   // Charge owned capacity for both aligned and SPDK DMA allocations. Pool
   // borrowing does not change ownership; teardown may run off the owner worker.

@@ -69,15 +69,17 @@ Each data worker also reserves three independent 8 MiB maintenance read
 buffers for defrag, transaction cleaning, and Tomb Raider. This adds 24 MiB
 outside `--registered-buffer-mb-per-worker` (88 MiB of fixed buffer capacity
 per worker with defaults). They are counted in retained memory, remain
-allocated until teardown, and use unregistered I/O on io_uring. Failure to
-allocate any one names the worker and task and fails startup.
+allocated until teardown, and participate in io_uring registration after
+ordinary read/write slots. Failure to allocate any one names the worker and
+task and fails startup.
 Worker zero's maintenance buffers are allocated before synchronous metadata
 loading, which borrows one read image for pages and system-state/catalog
 extents. Worker initialization reuses those allocations and retained charges.
 Startup recovery reuses these buffers for block scans, nested extent reads,
 and two-slot checkpoint prefetch. It drains outstanding reads before switching
 phases or starting maintenance, so these paths add no DMA capacity or write-slot
-requirement. Recovery uses unregistered I/O on io_uring for the borrowed buffers.
+requirement. Recovery and maintenance use fixed io_uring reads when their
+workspace is registered, otherwise ordinary I/O.
 
 Redis export also reserves one independent 8 MiB buffer per process at startup
 for capture writes and subsequent disk replay. It stays charged to shared
@@ -87,8 +89,10 @@ total fixed storage-buffer capacity is
 `88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. Each device's 8 KiB
 write workspace handles recycled-block header clearing and online metadata
 writes under its allocator's coroutine mutex. It is charged to that device's
-owner worker and uses unregistered I/O on io_uring. Allocation failure names
-the device and prevents startup; it never borrows ordinary read/write slots.
+owner worker and has the highest io_uring registration priority on that
+worker. Allocation failure names the device and prevents startup; it never
+borrows ordinary read/write slots. An unregistered workspace still uses ordinary
+I/O when memlock is insufficient.
 Synchronous startup label and reset writes use the same device workspace,
 with larger ranges split into chunks that fit it.
 
@@ -96,16 +100,29 @@ On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
 at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
 Registration covers these existing allocations; a retry does not move slots
-or allocate a second pool. The default pool uses one registered region shared
-by 1024 read slots and four write slots; no sentinel entry is reserved.
+or allocate a second pool. The default ordinary pool uses one region shared by
+1024 read slots and four write slots. Each owned device workspace precedes that region, and the three
+maintenance images follow it as separate entries; no sentinel entry is reserved.
+Index zero is valid, and an ordinary slot's lease identity does not change when
+its registration index shifts past the device entries.
 
-The pool first attempts full registration. If io_uring rejects it, Lavik uses
-the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in KiB) divided
-across runtime workers as a starting budget. It prioritizes read buffers and
-uses leftover space for whole write buffers. Failed retries reduce this
-registration budget; it is only an estimate because other locked resources
-can consume the allowance. Startup logs report the resulting registered read
-and write counts or complete fallback.
+The pool first attempts to register all fixed workspaces. If io_uring rejects
+it, Lavik uses the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in
+KiB) divided across runtime workers as a starting budget, with this priority:
+
+1. The owner worker's per-device 8 KiB metadata write buffers.
+2. Ordinary read slots.
+3. Ordinary write slots.
+4. The 8 MiB maintenance images, ordered defrag, TxCleaner, then Tomb Raider.
+
+Each class is admitted in complete buffers before considering the next class.
+Failed retries reduce this registration budget; it is only an estimate because
+other locked resources can consume the allowance. Startup logs report counts
+for all four classes or complete fallback. Redis export's process-wide 8 MiB
+workspace and temporary overflow buffers are not registered. With defaults,
+registration requests `88 MiB + 8 KiB × owned devices` per data worker, subject
+to ordinary slot rounding. Registration does not allocate another copy or add
+a second retained-memory charge.
 
 The allocated pool capacity never shrinks. Slots outside the registered subset
 use ordinary asynchronous direct I/O; slot selection automatically chooses

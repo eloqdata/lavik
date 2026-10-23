@@ -671,7 +671,8 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         part.data_ += read_offset;
         part.size_ = kSweepReadChunkBytes;
         auto read = co_await ReadStorageBuffer(
-            *store.worker_, store.files_[file_id], part, false,
+            *store.worker_, store.files_[file_id], part,
+            store.buffers_.workspace_registered(part),
             block_offset + read_offset);
         if (!read.ok()) co_return read.status();
         if (*read != part.size_) {

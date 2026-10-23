@@ -567,8 +567,8 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
   }
   auto written = co_await WriteStorageBuffer(
       *store.worker_, store.files_[device.file_index_],
-      std::span<const std::byte>(buffer.data_, kDirectIoAlignment), false,
-      buffer,
+      std::span<const std::byte>(buffer.data_, kDirectIoAlignment),
+      store.buffers_.workspace_registered(buffer), buffer,
       MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, target_slot));
   // Completion ends the DMA borrow. system_state_mutex_ still serializes root
   // commits, so allocation can use the workspace while this root is synced.

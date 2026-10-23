@@ -1129,7 +1129,20 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   store.worker_ = &worker;
   store.engine_ = this;
 
-  absl::Status status = store.buffers_.Init(worker, options_.buffers_);
+  std::vector<FixedBuffer> device_buffers;
+  for (const auto& allocator : device_allocators_) {
+    if (allocator->owner_ == worker.id())
+      device_buffers.push_back(allocator->metadata_write_buffer_);
+  }
+  absl::Status status =
+      store.buffers_.Init(worker, options_.buffers_, device_buffers);
+  if (status.ok()) {
+    std::size_t index = 0;
+    for (auto& allocator : device_allocators_) {
+      if (allocator->owner_ == worker.id())
+        allocator->metadata_write_buffer_ = device_buffers[index++];
+    }
+  }
   if (status.ok()) {
     status = worker.RegisterFixedFiles(
         static_cast<unsigned>(options_.data_files_.size()));

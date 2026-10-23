@@ -1389,7 +1389,8 @@ struct DeviceAllocator {
   AsyncMutex mutex_;
   // Cleared block headers and metadata pages share this write-only workspace
   // under mutex_. Engine ownership outlives worker I/O and coroutine teardown.
-  // It is unregistered on io_uring and DMA-addressable on SPDK.
+  // Its owner registers it before ordinary buffers when memlock permits;
+  // unregistered io_uring writes remain valid. SPDK requires DMA memory.
   FixedBuffer metadata_write_buffer_{};
   RetainedMemoryCharge metadata_write_buffer_charge_;
   std::uint32_t data_block_begin_ = 1;

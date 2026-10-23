@@ -127,7 +127,8 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
                                    payload_bytes),
         output);
     auto written = co_await WriteStorageBuffer(
-        *store.worker_, store.files_[device.file_index_], output, false, buffer,
+        *store.worker_, store.files_[device.file_index_], output,
+        store.buffers_.workspace_registered(buffer), buffer,
         MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index,
                                next_slot));
     if (!written.ok() || *written != kDirectIoAlignment) {
@@ -160,7 +161,8 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
   assert(bycorf::ThisWorker().id_ == allocator.owner_);
   WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
-  auto* zero_header = allocator.metadata_write_buffer_.data_;
+  const FixedBuffer buffer = allocator.metadata_write_buffer_;
+  auto* zero_header = buffer.data_;
   assert(zero_header != nullptr);
   // Metadata writes may have used this workspace since the last activation.
   // The caller holds allocator.mutex_ until the whole batch is durable.
@@ -170,7 +172,8 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     assert(DeviceIndexForBlock(block_id) == device_index);
     auto written = co_await WriteStorageBuffer(
         *store.worker_, store.files_[device.file_index_],
-        std::span<const std::byte>(zero_header, kBlockHeaderBytes), false, {},
+        std::span<const std::byte>(zero_header, kBlockHeaderBytes),
+        store.buffers_.workspace_registered(buffer), buffer,
         LocalBlockOffset(block_id));
     if (!written.ok() || *written != kBlockHeaderBytes) {
       status = written.ok()
@@ -493,7 +496,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
           co_return kDirectIoAlignment / 2;
         });
     co_return co_await WriteStorageBuffer(
-        *store.worker_, store.files_[device.file_index_], output, false, buffer,
+        *store.worker_, store.files_[device.file_index_], output,
+        store.buffers_.workspace_registered(buffer), buffer,
         MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
   };
   auto written = co_await write();
@@ -628,8 +632,8 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
             co_return kDirectIoAlignment / 2;
           });
       co_return co_await WriteStorageBuffer(
-          *store.worker_, store.files_[device.file_index_], output, false,
-          buffer,
+          *store.worker_, store.files_[device.file_index_], output,
+          store.buffers_.workspace_registered(buffer), buffer,
           MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
     };
     auto written = co_await write();

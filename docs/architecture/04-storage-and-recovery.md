@@ -118,7 +118,9 @@ direct I/O. Its read and write slots share worker-owned allocations;
 multiple slots share a registered region while keeping independent lease and
 release identities. Buffer-pool capacity is independent of registration success.
 If full io_uring registration fails, a finite memlock allowance permits a
-best-effort subset registration, prioritizing read slots. Each lease retains
+best-effort subset registration: per-device metadata workspaces on their owner
+worker first, then ordinary read slots, write slots, and maintenance images.
+The process-wide export image remains unregistered. Each lease retains
 its slot identity and immutable registration status; unregistered slots use
 the same aligned memory with plain asynchronous I/O. On SPDK, a
 worker opens only namespaces whose physical controller assigned it a qpair.
@@ -648,7 +650,10 @@ splitting larger ranges into buffer-sized chunks. The device's
 coroutine mutex serializes workspace use for recycled-block header clearing,
 bitmap and epoch pages, and checkpoint/system-state roots. These writes do not
 borrow read slots or ordinary write slots and allocate no fallback buffers.
-io_uring uses unregistered I/O for this workspace; SPDK uses DMA memory.
+The owning worker registers this workspace ahead of ordinary pools on
+io_uring, falling back to ordinary I/O if registration fails. Registration
+borrows the existing allocation without changing ownership or retained charges.
+SPDK uses DMA memory.
 Synchronous SPDK startup helpers submit these caller-owned DMA buffers directly
 without allocating bounce storage. Temporary metadata queue pairs are released
 before worker queue creation.
@@ -758,7 +763,9 @@ across I/O, relocation, and cross-worker waits without a buffer queue. They
 never borrow write slots or allocate fallback scan buffers. All three buffers
 are allocated at initialization, outside the ordinary pool budget; failure
 names the worker and task and prevents startup. They remain owned until
-worker teardown after I/O drains. io_uring uses them without registration;
+worker teardown after I/O drains. io_uring registers these images after
+ordinary read/write slots, using fixed I/O only for images in the registered
+subset. Recovery shares that registration state, including checkpoint prefetch.
 SPDK allocates DMA-addressable memory for them.
 
 ### Reads and pins

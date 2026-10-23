@@ -250,8 +250,10 @@ the multi-version arbitration used by the ordinary record scan. If a later
 entry is invalid, the already installed valid prefix is marked as a checkpoint
 winner and participates in the same authoritative cold-scan merge as prefixes
 from earlier blocks. Each owner borrows two of its fixed 8 MiB maintenance read
-buffers instead of allocating checkpoint DMA storage. An abandoned prefetch
-retains access until its I/O completion; startup drains these completions before
+buffers instead of allocating checkpoint DMA storage. io_uring prefetch uses
+the owner ring's registered image when available and ordinary reads otherwise;
+delegated SPDK reads do not reuse another worker's ring indices. An abandoned
+prefetch retains access until its I/O completion; startup drains these completions before
 another checkpoint phase or ordinary recovery can reuse the buffers. The loan
 also follows delegated SPDK reads and ends before maintenance starts.
 Complex-object encoding also uses a bounded stream buffer; encoding and decoding reserve

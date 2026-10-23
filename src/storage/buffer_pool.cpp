@@ -200,7 +200,8 @@ absl::Status RegisteredBufferPool::PrepareMaintenanceBuffers(
 }
 
 absl::Status RegisteredBufferPool::Init(
-    bycorf::Worker& worker, const RegisteredBufferPoolOptions& options) {
+    bycorf::Worker& worker, const RegisteredBufferPoolOptions& options,
+    std::span<bycorf::FixedBuffer> priority_buffers) {
   if (initialized()) {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is already initialized");
@@ -270,6 +271,14 @@ absl::Status RegisteredBufferPool::Init(
                         "total fixed-buffer count exceeds index range");
   }
 
+  for (const auto& buffer : priority_buffers) {
+    if (buffer.data_ == nullptr || buffer.size_ == 0 ||
+        reinterpret_cast<std::uintptr_t>(buffer.data_) % kDirectIoAlignment !=
+            0 ||
+        buffer.size_ % kDirectIoAlignment != 0) {
+      return absl::InvalidArgumentError("invalid priority storage workspace");
+    }
+  }
   const std::size_t read_base = registered_write_count + 1;
   absl::Status prepared =
       PrepareMaintenanceBuffers(worker.id(), options.alignment_);
@@ -373,113 +382,170 @@ absl::Status RegisteredBufferPool::Init(
     }
   }
 
+  absl::Cleanup free_pool = [&] {
+    if (shared_arena) {
+      for (auto* arena : arenas)
+        bycorf::FreeStorageBuffer(arena, options.alignment_);
+    } else {
+      for (const auto& buffer : write_buffers)
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+      for (const auto& buffer : read_buffers)
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+    }
+  };
+  const std::size_t priority_count = priority_buffers.size();
+  const std::size_t maintenance_count = maintenance_read_buffers_.size();
+  constexpr std::size_t kMaxRegions =
+      std::size_t{std::numeric_limits<std::uint16_t>::max()} + 1;
+  if (priority_count > kMaxRegions - maintenance_count ||
+      iovecs.size() > kMaxRegions - maintenance_count - priority_count) {
+    return absl::OutOfRangeError("too many storage registration regions");
+  }
+  // Registration borrows the device images; ownership and retained charges
+  // stay with their allocators. Ordinary arenas keep their existing layout,
+  // with only their ring indices shifted past these small, high-priority pages.
+  std::vector<iovec> registration;
+  registration.reserve(priority_count + iovecs.size() + maintenance_count);
+  for (const auto& buffer : priority_buffers)
+    registration.push_back({buffer.data_, buffer.size_});
+  registration.insert(registration.end(), iovecs.begin(), iovecs.end());
+  for (auto& buffer : read_buffers) buffer.index_ += priority_count;
+  for (auto& buffer : write_buffers) buffer.index_ += priority_count;
+  for (auto& buffer : maintenance_read_buffers_) {
+    buffer.index_ = static_cast<std::uint16_t>(registration.size());
+    registration.push_back({buffer.data_, buffer.size_});
+  }
+  iovecs = std::move(registration);
+  std::size_t requested_bytes = 0;
+  for (const auto& region : iovecs) requested_bytes += region.iov_len;
+
   absl::Status status = worker.RegisterBuffers(iovecs);
-  bool buffers_registered = status.ok();
-  std::size_t registered_reads = buffers_registered ? read_count : 0;
-  std::size_t registered_writes =
-      buffers_registered ? registered_write_count : 0;
+  std::size_t registered_priority = status.ok() ? priority_count : 0;
+  std::size_t registered_reads = status.ok() ? read_count : 0;
+  std::size_t registered_writes = status.ok() ? registered_write_count : 0;
+  std::size_t registered_maintenance = status.ok() ? maintenance_count : 0;
+  std::vector<iovec> registered = status.ok() ? iovecs : std::vector<iovec>{};
   if (!status.ok()) {
     if (bycorf::SpdkStorageEnabled()) {
-      // SPDK registration is a DMA-addressability check; memory that fails it
-      // cannot be handed to the device at all, so plain IO would fail the same
-      // way. Fail fast instead of degrading.
-      for (const bycorf::FixedBuffer& buffer : write_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
-      }
-      for (const bycorf::FixedBuffer& buffer : read_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
-      }
+      // SPDK registration validates DMA addressability. Ordinary I/O cannot
+      // rescue an invalid DMA image, so fail startup without degrading.
       return status;
-    } else {
-      rlimit memlock{};
-      if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
-        if (memlock.rlim_cur != RLIM_INFINITY) {
-          // Divide the allowance across runtime workers (including Meta is
-          // conservative). This is an estimate, not a reservation: other
-          // rings/registrations can consume it before this worker gets here.
-          const auto* cross_core = bycorf::ThisWorker().cross_core_;
-          const unsigned workers =
-              cross_core == nullptr ? 1 : cross_core->size();
-          std::uint64_t budget = memlock.rlim_cur / std::max(workers, 1U);
-          std::vector<iovec> partial(iovecs.size());
-          while (budget != 0) {
-            std::uint64_t remaining = budget;
-            const std::size_t reads = std::min<std::uint64_t>(
-                read_count, remaining / read_slot_bytes);
-            remaining -= reads * read_slot_bytes;
-            const std::size_t writes =
-                reads == read_count
-                    ? std::min<std::uint64_t>(
-                          registered_write_count,
-                          remaining / options.write_buffer_bytes_)
-                    : 0;
-            if (reads == 0 && writes == 0) break;
-            if (reads == read_count && writes == registered_write_count) {
-              budget /= 2;  // The full registration already failed.
-              continue;
-            }
-            // Pin a whole-slot prefix: read slots first, then complete write
-            // slots. Even slots sharing one index can be outside this prefix;
-            // buffer_registered(slot_id) selects ordinary I/O for those slots.
-            std::fill(partial.begin(), partial.end(), iovec{});
-            std::size_t bytes =
-                reads * read_slot_bytes + writes * options.write_buffer_bytes_;
-            for (std::size_t i = 0; i < iovecs.size() && bytes != 0; ++i) {
-              partial[i] = iovecs[i];
-              partial[i].iov_len = std::min(bytes, iovecs[i].iov_len);
-              bytes -= partial[i].iov_len;
-            }
-            status = worker.RegisterBuffers(partial);
-            if (status.ok()) {
-              registered_reads = reads;
-              registered_writes = writes;
-              spdlog::warn(
-                  "worker {}: io_uring buffer registration retried with "
-                  "RLIMIT_MEMLOCK soft={}; registered read slots={}/{} "
-                  "write slots={}/{} bytes={}; pool capacity unchanged, "
-                  "remaining slots use unregistered IO",
-                  worker.id(), static_cast<std::uint64_t>(memlock.rlim_cur),
-                  reads, read_count, writes, registered_write_count,
-                  reads * read_slot_bytes +
-                      writes * options.write_buffer_bytes_);
-              break;
-            }
-            // Existing registrations may leave less than the estimated
-            // share. Retry geometrically, with no cross-worker lock or wait.
-            budget /= 2;
+    }
+    rlimit memlock{};
+    if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
+      if (memlock.rlim_cur != RLIM_INFINITY) {
+        // The share is an estimate: other rings may pin memory concurrently.
+        // Retry geometrically without a cross-worker lock or reservation.
+        const auto* cross_core = bycorf::ThisWorker().cross_core_;
+        const unsigned workers = cross_core == nullptr ? 1 : cross_core->size();
+        std::uint64_t budget = memlock.rlim_cur / std::max(workers, 1U);
+        while (budget != 0) {
+          std::uint64_t remaining = budget;
+          std::size_t priority = 0;
+          while (priority < priority_count &&
+                 priority_buffers[priority].size_ <= remaining) {
+            remaining -= priority_buffers[priority++].size_;
           }
+          const std::size_t reads =
+              priority == priority_count
+                  ? std::min<std::uint64_t>(read_count,
+                                            remaining / read_slot_bytes)
+                  : 0;
+          remaining -= reads * read_slot_bytes;
+          const std::size_t writes =
+              priority == priority_count && reads == read_count
+                  ? std::min<std::uint64_t>(
+                        registered_write_count,
+                        remaining / options.write_buffer_bytes_)
+                  : 0;
+          remaining -= writes * options.write_buffer_bytes_;
+          const std::size_t maintenance =
+              priority == priority_count && reads == read_count &&
+                      writes == registered_write_count
+                  ? std::min<std::uint64_t>(maintenance_count,
+                                            remaining / kStorageBlockBytes)
+                  : 0;
+          remaining -= maintenance * kStorageBlockBytes;
+          const std::size_t bytes = budget - remaining;
+          if (bytes == 0) break;
+          if (bytes == requested_bytes) {
+            budget /= 2;  // The full registration already failed.
+            continue;
+          }
+          // All four priority classes form one prefix, rounded to complete
+          // buffers. Trim unused entries; even a metadata-only registration
+          // must work without reserving table space for the ordinary pool.
+          std::vector<iovec> partial;
+          std::size_t unfilled = bytes;
+          for (const auto& region : iovecs) {
+            if (unfilled == 0) break;
+            const auto size = std::min(unfilled, region.iov_len);
+            partial.push_back({region.iov_base, size});
+            unfilled -= size;
+          }
+          status = worker.RegisterBuffers(partial);
+          if (status.ok()) {
+            registered_priority = priority;
+            registered_reads = reads;
+            registered_writes = writes;
+            registered_maintenance = maintenance;
+            registered = std::move(partial);
+            spdlog::warn(
+                "worker {}: io_uring registration retried with RLIMIT_MEMLOCK "
+                "soft={}; device workspaces={}/{} read slots={}/{} write "
+                "slots={}/{} maintenance buffers={}/{} bytes={}; remaining "
+                "buffers use unregistered IO, capacity unchanged",
+                worker.id(), static_cast<std::uint64_t>(memlock.rlim_cur),
+                priority, priority_count, reads, read_count, writes,
+                registered_write_count, maintenance, maintenance_count, bytes);
+            break;
+          }
+          budget /= 2;
         }
-        if (!status.ok()) {
-          spdlog::warn(
-              "worker {}: io_uring buffer registration failed ({}); requested "
-              "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling "
-              "back "
-              "to the same reusable buffers with unregistered IO",
-              worker.id(), status.message(), options.registered_bytes_,
-              memlock.rlim_cur == RLIM_INFINITY
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : static_cast<std::uint64_t>(memlock.rlim_cur),
-              memlock.rlim_max == RLIM_INFINITY
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : static_cast<std::uint64_t>(memlock.rlim_max));
-        }
-      } else {
+      }
+      if (!status.ok()) {
         spdlog::warn(
             "worker {}: io_uring buffer registration failed ({}); requested "
-            "registered bytes={}; falling back to the same reusable buffers "
-            "with unregistered IO",
-            worker.id(), status.message(), options.registered_bytes_);
+            "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling back "
+            "to the same reusable buffers with unregistered IO",
+            worker.id(), status.message(), requested_bytes,
+            static_cast<std::uint64_t>(memlock.rlim_cur),
+            static_cast<std::uint64_t>(memlock.rlim_max));
       }
+    } else {
+      spdlog::warn(
+          "worker {}: io_uring buffer registration failed ({}); requested "
+          "registered bytes={}; falling back to the same reusable buffers "
+          "with unregistered IO",
+          worker.id(), status.message(), requested_bytes);
     }
+  }
+  if (registered_priority == priority_count && registered_reads == read_count &&
+      registered_writes == registered_write_count &&
+      registered_maintenance == maintenance_count) {
+    spdlog::info(
+        "worker {}: registered device workspaces={} read slots={} "
+        "write slots={} maintenance buffers={} bytes={}",
+        worker.id(), priority_count, read_count, registered_write_count,
+        maintenance_count, requested_bytes);
+  }
+  for (std::size_t i = 0; i < priority_count; ++i)
+    priority_buffers[i].index_ = static_cast<std::uint16_t>(i);
+  for (const auto& region : registered) {
+    registered_regions_.push_back(
+        {.data_ = static_cast<std::byte*>(region.iov_base),
+         .size_ = region.iov_len});
   }
 
   worker_ = &worker;
   cross_core_ = bycorf::ThisWorker().cross_core_;
   owner_worker_ = worker.id();
-  buffers_registered_ = buffers_registered;
+  buffers_registered_ = registered_reads == read_count &&
+                        registered_writes == registered_write_count;
   registered_read_count_ = registered_reads;
   registered_write_count_ = registered_writes;
   options_ = options;
+  std::move(free_pool).Cancel();
   arenas_ = std::move(arenas);
   write_buffers_ = std::move(write_buffers);
   read_buffers_ = std::move(read_buffers);
@@ -499,6 +565,17 @@ absl::Status RegisteredBufferPool::Init(
   buffer_memory_.Account(worker.id() + 1,
                          registered_write_bytes + read_count * read_slot_bytes);
   return absl::OkStatus();
+}
+
+bool RegisteredBufferPool::workspace_registered(
+    bycorf::FixedBuffer buffer) const noexcept {
+  if (buffer.data_ == nullptr || buffer.index_ >= registered_regions_.size())
+    return false;
+  const auto& region = registered_regions_[buffer.index_];
+  const auto begin = reinterpret_cast<std::uintptr_t>(region.data_);
+  const auto address = reinterpret_cast<std::uintptr_t>(buffer.data_);
+  return address >= begin && address - begin <= region.size_ &&
+         buffer.size_ <= region.size_ - (address - begin);
 }
 
 bool RegisteredBufferPool::IsWriteBufferId(
