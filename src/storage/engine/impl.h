@@ -3604,7 +3604,8 @@ class StorageEngine::Impl {
 
   // One physical extent read, including buffer waiting and slice validation,
   // embedded in the caller. Routing adds a runtime task bridge only when the
-  // block belongs to another worker; local reads need no child coroutine.
+  // block belongs to another worker. If an oversized DMA allocation fails, a
+  // lazy child reads the extent in slot-sized chunks without dropping its pin.
   class ReadExtentAwaitable final : public bycorf::OneShotIoAwaitable,
                                     private bycorf::RemoteWork {
    public:
@@ -3613,7 +3614,7 @@ class StorageEngine::Impl {
                         std::span<std::byte> destination, bool route = false);
     ~ReadExtentAwaitable();
     bool await_ready() const noexcept { return ready_.has_value(); }
-    bool await_suspend(std::coroutine_handle<> awaiting);
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
     absl::Status await_resume();
 
    private:
@@ -3629,7 +3630,11 @@ class StorageEngine::Impl {
     };
     void FinishBufferWait();
     static void BufferReady(bycorf::RemoteWork* work);
+    std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
     bool SubmitRead(std::coroutine_handle<> awaiting);
+    bool DecodeHeader(std::span<const std::byte, kBlockHeaderBytes> bytes,
+                      BlockHeader& header) const;
+    Task<absl::Status> ReadInChunks();
 
     Impl& engine_;
     WorkerStore& store_;
@@ -3643,6 +3648,7 @@ class StorageEngine::Impl {
     ReadBufferLease lease_;
     std::optional<RegisteredBufferPool::AcquireReadAwaiter> buffer_wait_;
     std::optional<bycorf::SubmitTaskAwaiter<RemoteRead>> remote_;
+    Task<absl::Status> chunked_;
   };
 
   // Owns the page lease while a grouped reader inspects its checked envelope.

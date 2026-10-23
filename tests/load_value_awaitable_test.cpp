@@ -27,6 +27,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   using ExtentRead = StorageEngine::Impl::ReadExtentAwaitable;
 
   virtual std::size_t ReadBufferCount() const { return 1; }
+  virtual std::size_t ReadSlotBytes() const { return 32 * kKiB; }
   virtual unsigned WorkerCount() const { return 1; }
 
   void SetUp() override {
@@ -62,6 +63,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
 
     RegisteredBufferPoolOptions options;
     options.storage_write_buffer_count_ = 1;
+    options.read_slot_bytes_ = ReadSlotBytes();
     options.registered_bytes_ = options.write_buffer_bytes_ +
                                 ReadBufferCount() * options.read_slot_bytes_;
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
@@ -842,6 +844,16 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     return storage_.impl_->ReadExtentSlice(Store(), ref, 0, offset,
                                            destination);
   }
+  auto RoutedExtentSlice(ExtentRef ref, std::size_t offset,
+                         std::span<std::byte> destination) {
+    return ExtentRead(*storage_.impl_, Store(), ref, 0, offset, destination,
+                      true);
+  }
+  bool ExtentChunksAreBackground(ExtentRead& read) {
+    return read.chunked_.valid() &&
+           worker_.IsBackground(
+               std::move(read.chunked_).operator co_await().handle_);
+  }
 
   // Use a real fixed-file read for pool -> I/O handoff, rather than completing
   // the request before the continuation actually submits it.
@@ -905,17 +917,18 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     // image. Every subsequent page must acquire a slot and complete real I/O.
     block_.in_memory_ = false;
   }
-  ExtentRef ExtentReference(bool no_crc = false) {
-    return {1, 7, static_cast<std::uint32_t>(value_.size()),
+  ExtentRef ExtentReference(bool no_crc = false, unsigned owner = 0) {
+    return {owner + 1, 7, static_cast<std::uint32_t>(value_.size()),
             no_crc ? 0 : Crc32c(std::as_bytes(std::span(value_)))};
   }
-  void InstallExtent(bool corrupt = false, bool no_crc = false) {
-    block_.kind_ = BlockKind::kPayloadExtent;
-    auto ref = ExtentReference(no_crc);
+  void InstallExtent(bool corrupt = false, bool no_crc = false,
+                     unsigned owner = 0, std::size_t truncated_bytes = 0) {
+    blocks_[owner].kind_ = BlockKind::kPayloadExtent;
+    auto ref = ExtentReference(no_crc, owner);
     std::vector<std::byte> bytes(
         AlignDirect(kBlockHeaderBytes + value_.size()));
     BlockHeader header;
-    header.block_id_ = 1;
+    header.block_id_ = owner + 1;
     header.allocation_epoch_ = 7;
     header.kind_ = BlockKind::kPayloadExtent;
     header.extent_no_crc_ = no_crc;
@@ -928,6 +941,8 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     std::memcpy(bytes.data() + kBlockHeaderBytes, value_.data(), value_.size());
     // Corrupt beyond the slice returned by the test, inside the actual payload.
     if (corrupt) bytes[kBlockHeaderBytes + value_.size() - 1] ^= std::byte{1};
+    ASSERT_LE(truncated_bytes, bytes.size());
+    bytes.resize(bytes.size() - truncated_bytes);
     InstallDiskImage(bytes);
   }
 
@@ -1134,6 +1149,184 @@ TEST_F(LoadValueAwaitableTestPeer, ExtentSliceChecksWholePayloadBeforeCopying) {
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(LoadValueAwaitableTestPeer,
+       ExtentAllocationFailureReadsChunksAfterSlotWait) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  value_.resize(3 * 24 * kKiB + 17);
+  for (std::size_t i = 0; i < value_.size(); ++i)
+    value_[i] = static_cast<char>(i % 251);
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  std::vector<std::byte> output(value_.size());
+  {
+    auto read = ExtentSlice(ExtentReference(), 0, output);
+    auto task = AwaitExtent(read);
+    Start(task, true);
+    EXPECT_FALSE(task.done());
+    EXPECT_TRUE(ExtentChunksAreBackground(read));
+    EXPECT_EQ(block_.pin_count(), 1);
+    held->Reset();
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ASSERT_TRUE(std::move(task).TakeResult().ok());
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                               output.size()),
+              value_);
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+class ExtentFaultFallbackTest : public LoadValueAwaitableTestPeer,
+                                public testing::WithParamInterface<bool> {};
+
+TEST_P(ExtentFaultFallbackTest, ValidatesWholePayloadAndNoCrc) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  value_.assign(3 * 24 * kKiB + 17, 'q');
+  const bool no_crc = GetParam();
+  ASSERT_NO_FATAL_FAILURE(InstallExtent(true, no_crc));
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  // Cross a chunk boundary and corrupt only the final, unrequested chunk.
+  std::vector<std::byte> output(19, std::byte{0x55});
+  {
+    auto read = ExtentSlice(ExtentReference(no_crc), 24 * kKiB - 5, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    const auto status = std::move(task).TakeResult();
+    if (no_crc) {
+      ASSERT_TRUE(status.ok()) << status;
+      EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                                 output.size()),
+                std::string(19, 'q'));
+    } else {
+      EXPECT_TRUE(absl::IsInternal(status));
+      EXPECT_EQ(status.message(), "extent payload checksum mismatch");
+      EXPECT_EQ(output, std::vector<std::byte>(19, std::byte{0x55}));
+    }
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+TEST_P(ExtentFaultFallbackTest, RejectsShortReadsAndBadHeaders) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  value_.assign(3 * 24 * kKiB + 17, 'r');
+  const bool short_read = GetParam();
+  ASSERT_NO_FATAL_FAILURE(
+      InstallExtent(false, false, 0, short_read ? kDirectIoAlignment : 0));
+  auto ref = ExtentReference();
+  if (!short_read) ++ref.payload_checksum_;
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  std::array<std::byte, 2> output{std::byte{0x55}, std::byte{0x55}};
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  {
+    auto read = ExtentSlice(ref, 0, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    const auto status = std::move(task).TakeResult();
+    EXPECT_TRUE(absl::IsInternal(status));
+    EXPECT_EQ(status.message(), short_read
+                                    ? "short extent block read"
+                                    : "extent header does not match manifest");
+    EXPECT_EQ(output[0], std::byte{0x55});
+    EXPECT_EQ(output[1], std::byte{0x55});
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+INSTANTIATE_TEST_SUITE_P(Modes, ExtentFaultFallbackTest, testing::Bool());
+
+class ExtentSmallSlotFallbackTest : public LoadValueAwaitableTestPeer {
+ protected:
+  std::size_t ReadSlotBytes() const override { return 12 * kKiB; }
+};
+
+TEST_F(ExtentSmallSlotFallbackTest, HeaderCanSpanMultipleFixedSlotReads) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  value_.assign(3 * 4 * kKiB + 17, 's');
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  std::vector<std::byte> output(value_.size());
+  {
+    auto read = ExtentSlice(ExtentReference(), 0, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ASSERT_TRUE(std::move(task).TakeResult().ok());
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                               output.size()),
+              value_);
+  }
+  ExpectNoPageLeases();
+}
+
+class ExtentRemoteFallbackTest : public LoadValueAwaitableTestPeer {
+ protected:
+  unsigned WorkerCount() const override { return 2; }
+};
+
+TEST_F(ExtentRemoteFallbackTest, ChunkFallbackRunsOnPhysicalOwner) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  value_.assign(3 * 24 * kKiB + 17, 't');
+  ASSERT_NO_FATAL_FAILURE(InstallExtent(false, false, 1));
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  const auto baseline = RetainedBytes();
+  std::vector<std::byte> output(19);
+  {
+    auto read =
+        RoutedExtentSlice(ExtentReference(false, 1), 24 * kKiB - 5, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ASSERT_TRUE(std::move(task).TakeResult().ok());
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(output.data()),
+                               output.size()),
+              std::string(19, 't'));
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(RetainedBytes(), baseline);
+}
+
+class ExtentNoSlotsFallbackTest : public LoadValueAwaitableTestPeer {
+ protected:
+  std::size_t ReadBufferCount() const override { return 0; }
+};
+
+TEST_F(ExtentNoSlotsFallbackTest,
+       AllocationFailureDoesNotWaitWithoutFixedSlots) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  ASSERT_NO_FATAL_FAILURE(InstallExtent());
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  std::array<std::byte, 2> output{};
+  {
+    auto read = ExtentSlice(ExtentReference(), 0, output);
+    auto task = AwaitExtent(read);
+    Start(task);
+    ASSERT_TRUE(task.done());
+    EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult()));
+  }
+  ExpectNoPageLeases();
 }
 
 TEST_F(LoadValueAwaitableTestPeer,

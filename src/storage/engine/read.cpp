@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "absl/crc/crc32c.h"
 #include "impl.h"
 #include "lavik/random_sample.h"
 
@@ -1304,25 +1305,39 @@ StorageEngine::Impl::ReadExtentAwaitable::~ReadExtentAwaitable() {
 void StorageEngine::Impl::ReadExtentAwaitable::FinishBufferWait() {
   auto acquired = buffer_wait_->await_resume();
   buffer_wait_.reset();
-  if (!acquired.ok())
-    ready_ = acquired.status();
-  else
+  // Limit end-to-end injection to dynamic extent buffers: recovery also needs
+  // unrelated record reads, which a process-wide allocator fault would block.
+  LAVIK_FAULT_INJECT(
+      if (acquired.ok() && acquired->buffer_id() == 0 &&
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_EXTENT_BUFFER_ALLOCATION", "1")) {
+        acquired = absl::ResourceExhaustedError(
+            "injected extent buffer allocation failure");
+      });
+  if (acquired.ok()) {
     lease_ = std::move(*acquired);
+  } else if (absl::IsResourceExhausted(acquired.status()) &&
+             store_.buffers_.read_buffer_count() != 0) {
+    // Large allocations can fail while fixed DMA slots remain usable. Keep
+    // the extent pinned and let ordinary pool acquisition provide backpressure.
+    chunked_ = ReadInChunks();
+  } else {
+    ready_ = acquired.status();
+  }
 }
 
 void StorageEngine::Impl::ReadExtentAwaitable::BufferReady(
     bycorf::RemoteWork* work) {
   auto& read = *static_cast<ReadExtentAwaitable*>(work);
   read.FinishBufferWait();
-  if (read.ready_ || !read.SubmitRead(read.awaiting_))
-    read.store_.worker_->Enqueue(read.awaiting_);
+  auto next = read.SuspendRead(read.awaiting_);
+  if (next != std::noop_coroutine()) read.store_.worker_->Enqueue(next);
 }
 
-bool StorageEngine::Impl::ReadExtentAwaitable::await_suspend(
+std::coroutine_handle<> StorageEngine::Impl::ReadExtentAwaitable::await_suspend(
     std::coroutine_handle<> awaiting) {
   if (remote_) {
     remote_->await_suspend(awaiting);
-    return true;
+    return std::noop_coroutine();
   }
   if (buffer_wait_) {
     awaiting_ = awaiting;
@@ -1330,11 +1345,23 @@ bool StorageEngine::Impl::ReadExtentAwaitable::await_suspend(
     task_class_ = store_.worker_->IsBackground(awaiting)
                       ? bycorf::TaskClass::kBackground
                       : bycorf::CurrentTaskClass();
-    if (buffer_wait_->SuspendWith(*this)) return true;
+    if (buffer_wait_->SuspendWith(*this)) return std::noop_coroutine();
     FinishBufferWait();
-    if (ready_) return false;
   }
-  return SubmitRead(awaiting);
+  return SuspendRead(awaiting);
+}
+
+std::coroutine_handle<> StorageEngine::Impl::ReadExtentAwaitable::SuspendRead(
+    std::coroutine_handle<> awaiting) {
+  if (chunked_.valid()) {
+    auto child =
+        std::move(chunked_).operator co_await().await_suspend(awaiting);
+    if (store_.worker_->IsBackground(awaiting))
+      store_.worker_->RegisterBackground(child);
+    return child;
+  }
+  if (ready_) return awaiting;
+  return SubmitRead(awaiting) ? std::noop_coroutine() : awaiting;
 }
 
 bool StorageEngine::Impl::ReadExtentAwaitable::SubmitRead(
@@ -1354,6 +1381,7 @@ bool StorageEngine::Impl::ReadExtentAwaitable::SubmitRead(
 absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
   if (remote_) return remote_->await_resume();
   if (ready_) return std::move(*ready_);
+  if (chunked_.valid()) return std::move(chunked_).TakeResult();
   auto read =
       Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
   if (!read.ok()) return read.status();
@@ -1362,15 +1390,9 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
     return absl::InternalError("short extent block read");
   const auto buffer = lease_.io_buffer();
   BlockHeader header{};
-  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                  buffer.data_, kBlockHeaderBytes),
-                              &header) ||
-      header.kind_ != BlockKind::kPayloadExtent ||
-      header.block_id_ != ref_.block_id_ ||
-      header.allocation_epoch_ != ref_.allocation_epoch_ ||
-      header.extent_index_ != extent_index_ ||
-      header.extent_payload_bytes_ != ref_.payload_bytes_ ||
-      header.extent_payload_checksum_ != ref_.payload_checksum_)
+  if (!DecodeHeader(std::span<const std::byte, kBlockHeaderBytes>(
+                        buffer.data_, kBlockHeaderBytes),
+                    header))
     return absl::InternalError("extent header does not match manifest");
   const auto payload = std::span<const std::byte>(
       buffer.data_ + kBlockHeaderBytes, ref_.payload_bytes_);
@@ -1381,6 +1403,85 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
   std::memcpy(destination_.data(), payload.data() + source_offset_,
               destination_.size());
   return absl::OkStatus();
+}
+
+bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
+    std::span<const std::byte, kBlockHeaderBytes> bytes,
+    BlockHeader& header) const {
+  return DecodeBlockHeaderPages(bytes, &header) &&
+         header.kind_ == BlockKind::kPayloadExtent &&
+         header.block_id_ == ref_.block_id_ &&
+         header.allocation_epoch_ == ref_.allocation_epoch_ &&
+         header.extent_index_ == extent_index_ &&
+         header.extent_payload_bytes_ == ref_.payload_bytes_ &&
+         header.extent_payload_checksum_ == ref_.payload_checksum_;
+}
+
+Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
+  auto acquired = co_await store_.buffers_.AcquireReadBuffer();
+  if (!acquired.ok()) co_return acquired.status();
+  ReadBufferLease chunk = std::move(*acquired);
+  const auto capacity = chunk.io_buffer().size_;
+  const auto [file_id, block_offset] = engine_.FileOffset(ref_.block_id_);
+  // Even the smallest configured slot can read the duplicated header pages
+  // separately. The pin retained by this awaitable prevents block recycling.
+  std::array<std::byte, kBlockHeaderBytes> header_bytes;
+  for (std::size_t offset = 0; offset < header_bytes.size();) {
+    auto buffer = chunk.io_buffer();
+    buffer.size_ = std::min(capacity, header_bytes.size() - offset);
+    auto read = co_await ReadStorageBuffer(
+        *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
+        block_offset + offset);
+    if (!read.ok()) co_return read.status();
+    store_.worker_->RecordStorageReadCompletion(*read);
+    if (*read != buffer.size_)
+      co_return absl::InternalError("short extent block read");
+    std::memcpy(header_bytes.data() + offset, buffer.data_, buffer.size_);
+    offset += buffer.size_;
+  }
+  BlockHeader header{};
+  if (!DecodeHeader(header_bytes, header))
+    co_return absl::InternalError("extent header does not match manifest");
+
+  // Preserve the full-read contract: no caller-visible bytes change on I/O or
+  // checksum failure, including corruption outside a requested slice. Only
+  // the requested slice is staged, in ordinary heap memory, never DMA memory.
+  auto staged = store_.buffers_.AllocateReadOutputBuffer(destination_.size());
+  if (!staged.ok()) co_return staged.status();
+  auto* output = staged->io_buffer().data_;
+  absl::crc32c_t checksum{0};
+  for (std::size_t offset = 0; offset < ref_.payload_bytes_;) {
+    auto buffer = chunk.io_buffer();
+    const auto remaining = ref_.payload_bytes_ - offset;
+    buffer.size_ = std::min(capacity, AlignDirect(remaining));
+    auto read = co_await ReadStorageBuffer(
+        *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
+        block_offset + kBlockHeaderBytes + offset);
+    if (!read.ok()) co_return read.status();
+    store_.worker_->RecordStorageReadCompletion(*read);
+    if (*read != buffer.size_)
+      co_return absl::InternalError("short extent block read");
+    const auto payload_bytes = std::min(remaining, buffer.size_);
+    if (!header.extent_no_crc_) {
+      checksum = absl::ExtendCrc32c(
+          checksum,
+          absl::string_view(reinterpret_cast<const char*>(buffer.data_),
+                            payload_bytes));
+    }
+    const auto begin = std::max(offset, source_offset_);
+    const auto end =
+        std::min(offset + payload_bytes, source_offset_ + destination_.size());
+    if (begin < end)
+      std::memcpy(output + begin - source_offset_,
+                  buffer.data_ + begin - offset, end - begin);
+    offset += payload_bytes;
+  }
+  if (!header.extent_no_crc_ &&
+      static_cast<std::uint32_t>(checksum) != ref_.payload_checksum_)
+    co_return absl::InternalError("extent payload checksum mismatch");
+  if (!destination_.empty())
+    std::memcpy(destination_.data(), output, destination_.size());
+  co_return absl::OkStatus();
 }
 
 Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadOutOfIndexKey(
