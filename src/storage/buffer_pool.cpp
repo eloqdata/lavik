@@ -138,12 +138,6 @@ RegisteredBufferPool::~RegisteredBufferPool() {
       bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
   }
-  for (std::byte* buffer : heap_write_buffers_) {
-    if (buffer != nullptr && IsAligned(reinterpret_cast<std::uintptr_t>(buffer),
-                                       options_.alignment_)) {
-      bycorf::FreeStorageBuffer(buffer, options_.alignment_);
-    }
-  }
   for (const auto& buffer : overflow_read_buffers_) {
     if (buffer.buffer_.data_ != nullptr &&
         IsAligned(reinterpret_cast<std::uintptr_t>(buffer.buffer_.data_),
@@ -729,36 +723,6 @@ void RegisteredBufferPool::FailWriteWaiters() noexcept {
 void RegisteredBufferPool::ReleaseWriteBuffer(
     std::uint16_t buffer_id) noexcept {
   ReleaseWriteBufferLocal(buffer_id);
-}
-
-bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
-    std::byte** buffer) noexcept {
-  if (buffer == nullptr) {
-    return false;
-  }
-  if (!free_heap_write_buffers_.empty()) {
-    *buffer = free_heap_write_buffers_.back();
-    free_heap_write_buffers_.pop_back();
-    return true;
-  }
-  auto* data = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
-      options_.write_buffer_bytes_, options_.alignment_));
-  if (data == nullptr) {
-    return false;
-  }
-  heap_write_buffers_.push_back(data);
-  // Atomic population rewrites may need extra staging
-  // while admission is closed. Charge capacity without blocking that progress.
-  buffer_memory_.Resize(buffer_memory_.bytes() + options_.write_buffer_bytes_);
-  *buffer = data;
-  return true;
-}
-
-void RegisteredBufferPool::ReleaseHeapWriteBuffer(std::byte* buffer) noexcept {
-  if (buffer == nullptr) {
-    return;
-  }
-  free_heap_write_buffers_.push_back(buffer);
 }
 
 void RegisteredBufferPool::ReleaseWriteBufferLocal(

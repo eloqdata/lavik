@@ -1735,14 +1735,11 @@ class StorageEngine {
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 
-  // Replica-side primitives. Reset returns a new local replication epoch that
-  // fences every record from an earlier copy of this partition.
-  bycorf::Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
-      std::uint16_t partition_id,
-      std::span<const std::uint64_t, 16> source_db_epochs);
   // Resets partitions owned by the current worker. Epoch metadata pages are
   // coalesced and persisted once for the whole batch before any new-epoch
-  // replica records can be applied.
+  // replica records can be applied. Each returned local replication epoch
+  // fences records from earlier copies of its partition; old indexes are
+  // detached for asynchronous reclamation without writing tombstones.
   bycorf::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::uint64_t session_id,
                          std::span<const ReplicaPartitionReset> resets);

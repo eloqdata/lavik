@@ -42,9 +42,7 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
           // This non-suspending callback runs on the owning worker, so no
           // store mutex or hot-path atomics are needed for the local snapshot.
           for (const StagingSlot& slot : store.staging_slots_) {
-            const bool allocated =
-                slot.write_buffer_id_ != 0 || slot.heap_data_ != nullptr;
-            if (!allocated) continue;
+            if (slot.write_buffer_id_ == 0) continue;
             if (slot.committed_bytes_ >= slot.durable_bytes_) {
               dirty += slot.committed_bytes_ - slot.durable_bytes_;
             }

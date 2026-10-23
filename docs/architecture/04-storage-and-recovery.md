@@ -633,8 +633,7 @@ Storage buffer capacity also participates in retained accounting: fixed read
 and write pools and dedicated maintenance scan buffers are charged at
 initialization. Redis export owns one process-wide 8 MiB workspace, allocated
 and charged at startup, reused for capture writes and subsequent disk replay,
-and retained between sessions. Recovery reuses the charged maintenance buffers;
-extra population-rewrite buffers remain charged while cached for reuse.
+and retained between sessions. Recovery reuses the charged maintenance buffers.
 Oversized reads and reads that find the fixed pool exhausted allocate aligned
 or SPDK DMA overflow storage only while leased;
 returning a lease frees that storage and removes its charge on the owner worker.
@@ -717,8 +716,9 @@ as SORT STORE and list-move operations still wait through tagged-record fences
 and commit-record append. Even an awaited `CommitTxWrites` only requests the
 commit-record flush; it is not a synchronous crash-durability fence.
 
-Staging-buffer pressure seals physical append streams before a writer waits
-for capacity. Foreground and relocation writers release worker store state
+Record and extent writes use only the fixed write pool. Staging-buffer
+pressure seals physical append streams before a writer waits for capacity.
+Foreground and relocation writers release worker store state
 and join the same owner-local FIFO; a returned fixed slot transfers directly
 to its oldest waiter, so new borrowers cannot overtake it. While writers
 remain queued, record-write exits seal newly installed streams, including
@@ -742,8 +742,6 @@ are allocated at initialization, outside the ordinary pool budget; failure
 names the worker and task and prevents startup. They remain owned until
 worker teardown after I/O drains. io_uring uses them without registration;
 SPDK allocates DMA-addressable memory for them.
-Atomic population rewrites that cannot release store state retain their
-extra-buffer fallback; relocation target staging uses the fixed pool.
 
 ### Reads and pins
 

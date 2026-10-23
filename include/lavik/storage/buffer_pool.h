@@ -239,8 +239,6 @@ class RegisteredBufferPool {
   // staging memory that failed I/O or outstanding readers can still borrow.
   void FailWriteWaiters() noexcept;
   void ReleaseWriteBuffer(std::uint16_t buffer_id) noexcept;
-  bool TryAcquireHeapWriteBuffer(std::byte** buffer) noexcept;
-  void ReleaseHeapWriteBuffer(std::byte* buffer) noexcept;
 
   class AcquireReadAwaiter {
    public:
@@ -323,8 +321,6 @@ class RegisteredBufferPool {
   std::vector<bool> write_buffer_in_use_;
   std::deque<AcquireWriteAwaiter*> write_waiters_;
   bool write_acquisition_failed_ = false;
-  std::vector<std::byte*> heap_write_buffers_;
-  std::vector<std::byte*> free_heap_write_buffers_;
   // io_uring read/write slots share these allocations, ordered reads first.
   // SPDK retains individual DMA allocations and leaves this vector empty.
   std::vector<std::byte*> arenas_;

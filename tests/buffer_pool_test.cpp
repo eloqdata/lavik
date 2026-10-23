@@ -583,18 +583,6 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   struct RestoreLimit {
     ~RestoreLimit() { (void)InitMemoryLimit(1024 * kMiB, 2); }
   } restore_limit;
-  std::byte* heap_write = nullptr;
-  ASSERT_TRUE(pool_->TryAcquireHeapWriteBuffer(&heap_write));
-  const auto cached_total = fixed_total + options_.write_buffer_bytes_;
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
-  pool_->ReleaseHeapWriteBuffer(heap_write);
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
-  std::byte* reused_write = nullptr;
-  ASSERT_TRUE(pool_->TryAcquireHeapWriteBuffer(&reused_write));
-  EXPECT_EQ(reused_write, heap_write);
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
-  pool_->ReleaseHeapWriteBuffer(reused_write);
-
   auto first = pool_->AcquireReadBuffer(kMiB).await_resume();
   auto second = pool_->AcquireReadBuffer(2 * kMiB).await_resume();
   ASSERT_TRUE(first.ok());
@@ -602,17 +590,17 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   const auto second_bytes = second->bytes().size();
   EXPECT_EQ(pool_->overflow_read_buffer_count(), 2);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0),
-            cached_total + first->bytes().size() + second_bytes);
+            fixed_total + first->bytes().size() + second_bytes);
   first->Reset();
   EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total + second_bytes);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total + second_bytes);
 
   // A remote return only queues the release. Keep its storage and charge until
   // the owner consumes that message, even if an earlier slot is reused.
   bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
   second->Reset();
   bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total + second_bytes);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total + second_bytes);
   auto reused_read = pool_->AcquireReadBuffer(3 * kMiB).await_resume();
   ASSERT_TRUE(reused_read.ok());
   const auto deadline =
@@ -623,10 +611,10 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   }
   EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0),
-            cached_total + reused_read->bytes().size());
+            fixed_total + reused_read->bytes().size());
   reused_read->Reset();
   EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), cached_total);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
 
   worker_->Shutdown();

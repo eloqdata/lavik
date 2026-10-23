@@ -215,8 +215,6 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     std::uint32_t durable_bytes_ = 0;
     std::uint64_t allocation_epoch_ = 0;
     std::uint16_t write_buffer_id_ = 0;
-    std::byte* heap_data_ = nullptr;
-    std::size_t heap_data_size_ = 0;
     std::uint8_t slot_ = 0;
     std::vector<RecordIdentity> staged_records_;
   };
@@ -336,8 +334,6 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           .durable_bytes_ = staging_state.durable_bytes_,
           .allocation_epoch_ = state->allocation_epoch_,
           .write_buffer_id_ = staging_state.write_buffer_id_,
-          .heap_data_ = staging_state.heap_data_,
-          .heap_data_size_ = staging_state.heap_data_size_,
           .slot_ = slot,
           .staged_records_ = {},
       });
@@ -352,11 +348,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
 
     const auto [file_id, block_offset] = FileOffset(pending->block_id_);
     FixedBuffer staging =
-        pending->write_buffer_id_ != 0
-            ? store->buffers_.write_buffer(pending->write_buffer_id_)
-            : FixedBuffer{.data_ = pending->heap_data_,
-                          .size_ = pending->heap_data_size_,
-                          .index_ = 0};
+        store->buffers_.write_buffer(pending->write_buffer_id_);
     LAVIK_FAULT_INJECT(
         // Deterministic regression hook for the dirty-tail ordering window: let
         // a command append beyond this immutable flush snapshot and roll to a

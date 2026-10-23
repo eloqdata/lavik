@@ -290,8 +290,6 @@ struct ActiveBlock {
   std::uint32_t record_count_ = 0;
   std::uint64_t max_lsn_ = 0;
   std::uint16_t write_buffer_id_ = 0;
-  std::byte* heap_buffer_ = nullptr;
-  std::size_t heap_buffer_size_ = 0;
   BlockKind kind_ = BlockKind::kRecords;
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
@@ -304,8 +302,6 @@ struct ActiveBlock {
 // of charging staging-only state to every block.
 struct StagingSlot {
   std::uint16_t write_buffer_id_ = 0;
-  std::byte* heap_data_ = nullptr;
-  std::size_t heap_data_size_ = 0;
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
   std::uint32_t durable_bytes_ = kBlockHeaderBytes;
@@ -3309,11 +3305,6 @@ class StorageEngine::Impl {
   void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                       std::uint64_t item_id);
 
-  Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
-      std::uint16_t partition_id,
-      std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
-      std::uint64_t persisted_replication_epoch = 0,
-      bool replica_lock_held = false);
   Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::uint64_t session_id,
                          std::span<const ReplicaPartitionReset> resets);

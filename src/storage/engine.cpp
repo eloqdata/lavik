@@ -583,12 +583,6 @@ void StorageEngine::AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
   impl_->AcknowledgeFullSyncPublishItem(session_id, item_id);
 }
 
-Task<absl::StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
-    std::uint16_t partition_id,
-    std::span<const std::uint64_t, 16> source_db_epochs) {
-  return impl_->ResetReplicaPartition(partition_id, source_db_epochs);
-}
-
 Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
 StorageEngine::ResetReplicaPartitions(
     std::uint64_t session_id, std::span<const ReplicaPartitionReset> resets) {

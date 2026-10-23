@@ -653,12 +653,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
       // would let a still-dangerous key reap its tombstone. The copy runs
       // without suspending, so the captured prefix is consistent and the
       // slot cannot be released underneath it.
-      FixedBuffer staged =
-          slot->write_buffer_id_ != 0
-              ? store.buffers_.write_buffer(slot->write_buffer_id_)
-              : FixedBuffer{.data_ = slot->heap_data_,
-                            .size_ = slot->heap_data_size_,
-                            .index_ = 0};
+      FixedBuffer staged = store.buffers_.write_buffer(slot->write_buffer_id_);
       if (staged.data_ == nullptr || staged.size_ < committed) {
         continue;
       }
