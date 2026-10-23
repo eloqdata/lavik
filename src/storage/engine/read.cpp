@@ -356,6 +356,9 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   if (!acquire.await_ready()) return;
   auto acquired = acquire.await_resume();
   if (!acquired.ok()) {
+    // The owner reader can stream an oversized record through fixed slots.
+    // Leave this admission attempt empty so its caller takes that route.
+    if (absl::IsResourceExhausted(acquired.status())) return;
     result.ready_.emplace(acquired.status());
     return;
   }
@@ -704,7 +707,12 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
 
       auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
       if (!acquired.ok()) {
-        results[candidate.result_index_] = acquired.status();
+        // Drain this wave before a fallback waits for a slot: an unsubmitted
+        // read in the wave may own the only fixed buffer.
+        if (absl::IsResourceExhausted(acquired.status()))
+          fallbacks.push_back(candidate.result_index_);
+        else
+          results[candidate.result_index_] = acquired.status();
         ++next;
         continue;
       }
@@ -1777,6 +1785,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   record_headroom_ = absolute - aligned_offset_;
   read_bytes_ =
       (record_headroom_ + location_.total_disk_bytes() + mask) & ~mask;
+  bool chunked = false;
   if (!lease_.valid()) {
     if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
     auto acquire = store_.buffers_.AcquireReadBuffer(read_bytes_);
@@ -1785,6 +1794,14 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
       return;
     }
     auto acquired = acquire.await_resume();
+    if (!acquired.ok() && absl::IsResourceExhausted(acquired.status()) &&
+        store_.buffers_.read_buffer_count() != 0) {
+      // Oversized records (including KeyRecords and indivisible collection
+      // entries) need not fit a DMA allocation. Own the assembled image in
+      // ordinary memory; fixed slots remain available for the actual I/O.
+      acquired = store_.buffers_.AllocateReadOutputBuffer(read_bytes_);
+      chunked = true;
+    }
     if (!acquired.ok()) {
       ready_.emplace(acquired.status());
       return;
@@ -1832,6 +1849,50 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   state->PinLocal();
   pinned_ = state;
   if (trace_) trace_->disk_read_ = true;
+  if (chunked) slow_ = ReadInChunks();
+}
+
+Task<StorageEngine::Impl::LoadValueAwaitable::Result>
+StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
+  // PrepareLocal pins the physical incarnation before this task can wait.
+  // Keep the pin across every chunk, and validate the complete private image
+  // with the same decoder/checksum rules as a single read before publishing it.
+  auto acquired = co_await store_.buffers_.AcquireReadBuffer();
+  if (!acquired.ok()) co_return acquired.status();
+  ReadBufferLease chunk = std::move(*acquired);
+  if (PopulationChanged()) co_return absl::NotFoundError("key not found");
+  if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
+  for (std::size_t offset = 0; offset < read_bytes_;) {
+    auto buffer = chunk.io_buffer();
+    buffer.size_ = std::min(buffer.size_, read_bytes_ - offset);
+    auto read = co_await ReadStorageBuffer(
+        *store_.worker_, store_.files_[file_id_], buffer, chunk.registered(),
+        aligned_offset_ + offset);
+    if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+    if (!read.ok()) co_return read.status();
+    store_.worker_->RecordStorageReadCompletion(*read);
+    if (*read != buffer.size_)
+      co_return absl::InternalError("short compact record read");
+    std::memcpy(lease_.io_buffer().data_ + offset, buffer.data_, buffer.size_);
+    offset += buffer.size_;
+  }
+  if (PopulationChanged()) co_return absl::NotFoundError("key not found");
+  const auto* data = lease_.io_buffer().data_ + record_headroom_;
+  auto parsed = ParseRecord(data);
+  if (!parsed.ok()) {
+    if (partition_ && absl::IsAborted(parsed.status())) {
+      // Release the slot before retrying: the successor may need the same
+      // sole slot. Do not replace slow_ while its own task is still running.
+      chunk.Reset();
+      Unpin();
+      lease_.Reset();
+      co_return co_await engine_.LoadValueSlow(store_, *partition_, db_id_,
+                                               key_, digest_, location_, {},
+                                               trace_, parsed.status());
+    }
+    co_return parsed.status();
+  }
+  co_return FinishRecord(data, *parsed, false);
 }
 
 bool StorageEngine::Impl::LoadValueAwaitable::PopulationChanged() const {
@@ -1891,8 +1952,14 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::await_suspend(
 
 std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
     std::coroutine_handle<> awaiting) {
-  if (slow_.valid())
-    return std::move(slow_).operator co_await().await_suspend(awaiting);
+  if (slow_.valid()) {
+    auto child = std::move(slow_).operator co_await().await_suspend(awaiting);
+    // A pool handoff or direct continuation can run outside the background
+    // caller's scheduled slice. Preserve its class for chunking and retries.
+    if (store_.worker_->IsBackground(awaiting))
+      store_.worker_->RegisterBackground(child);
+    return child;
+  }
   if (ready_) return awaiting;
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
@@ -1908,7 +1975,7 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
   if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
   if (partition_ && absl::IsAborted(status)) {
     Retry(std::move(status));
-    return std::move(slow_).operator co_await().await_suspend(awaiting);
+    return SuspendRead(awaiting);
   }
   return awaiting;
 }

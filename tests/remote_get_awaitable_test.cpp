@@ -18,6 +18,8 @@ class RemoteGetTestPeer : public testing::Test {
  protected:
   using Awaitable = StorageEngine::RemoteReadAwaitable;
 
+  virtual std::size_t ReadSlotBytes() const { return 32 * kKiB; }
+
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
     wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -54,6 +56,7 @@ class RemoteGetTestPeer : public testing::Test {
 
     RegisteredBufferPoolOptions options;
     options.storage_write_buffer_count_ = 2;
+    options.read_slot_bytes_ = ReadSlotBytes();
     options.registered_bytes_ =
         2 * options.write_buffer_bytes_ + options.read_slot_bytes_;
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
@@ -113,7 +116,16 @@ class RemoteGetTestPeer : public testing::Test {
     auto writer = index_.CloseAllReaders();
     auto* entry = index_.Find(ComputeDigest(key_), key_);
     ASSERT_NE(entry, nullptr);
-    entry->assign(RecordLocation(1, 9, 7, 0, header_.logical_size_, metadata));
+    const RecordLocation location(1, 9, 7, 0, header_.logical_size_, metadata);
+    if (entry->can_assign(location)) {
+      entry->assign(location);
+    } else {
+      RecordIndex::Entry* replaced = nullptr;
+      ASSERT_NE(
+          index_.ReplaceValue(entry, location, ComputeDigest(key_), &replaced),
+          nullptr);
+      index_.DestroyDetached(replaced);
+    }
   }
 
   enum class UnpinPoint { kBeforeRelease, kAfterCount, kAfterRelease };
@@ -283,6 +295,33 @@ TEST_F(RemoteGetTestPeer,
   {
     auto held = Pool().AcquireReadBuffer().await_resume();
     ASSERT_TRUE(held.ok());
+    auto read = Read();
+    ASSERT_TRUE(read.await_ready());
+    EXPECT_FALSE(read.await_resume().has_value());
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+class RemoteSmallSlotTest : public RemoteGetTestPeer {
+ protected:
+  std::size_t ReadSlotBytes() const override { return 12 * kKiB; }
+};
+
+TEST_F(RemoteSmallSlotTest, OversizedAllocationFailureFallsBackToOwner) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  // A smaller configured slot can make even a compact record oversized.
+  // Use a compact-sized payload and include its alignment/header overhead.
+  value_.assign(16 * kKiB - 1, 'v');
+  header_.payload_bytes_ = value_.size();
+  header_.total_disk_bytes_ =
+      AlignRecord(header_.header_bytes_ + value_.size());
+  header_.payload_checksum_ = Crc32c(std::as_bytes(std::span(value_)));
+  Publish(ValueType::kString);
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  {
     auto read = Read();
     ASSERT_TRUE(read.await_ready());
     EXPECT_FALSE(read.await_resume().has_value());

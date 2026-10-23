@@ -936,6 +936,78 @@ TEST(GroupedHashWriteE2e,
             std::string(128, 's'));
 }
 
+TEST(StorageReadFallbackE2e, LongKeysAndIndivisibleGroupsWithoutOverflow) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string long_key(64 * 1024 + 7, 'k');
+  const std::string hash_value(64 * 1024 + 17, 'h');
+  const std::string list_value(96 * 1024 + 29, 'l');
+  const std::string compact_value(9 * 1024, 'c');
+  // Four KiB of usable I/O space also exercises oversized compact reads in
+  // remote admission and MGET waves. CRC must validate the assembled image.
+  const std::array<std::string_view, 3> options{"--storage-read-buffer-kb",
+                                                "12", "--record-crc"};
+  {
+    Server server(disk, 2, {}, {}, false, 2, "1G", {}, {}, 0, 20, options);
+    Client client(server.port());
+    ASSERT_EQ(client.Command({"SET", long_key, "long-key-value"}).text_, "OK");
+    ASSERT_EQ(
+        client.Command({"HSET", "large-field", "field", hash_value}).text_,
+        "1");
+    ASSERT_EQ(
+        client.Command({"RPUSH", "large-item", "before", list_value, "after"})
+            .text_,
+        "3");
+    ASSERT_EQ(client.Command({"SET", "{same}compact", compact_value}).text_,
+              "OK");
+    ASSERT_EQ(client.Command({"SET", "{same}small", "small"}).text_, "OK");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Prove these are large records, not the already-supported extent fallback.
+  bool key_record = false, hash_record = false, list_record = false;
+  disk.VisitRecords(
+      [&](const BlockHeader& block, const RecordHeader& record,
+          std::string_view key, std::string_view payload) {
+        if (record.external_ || record.payload_bytes_ <= 24 * 1024) return;
+        EXPECT_FALSE(record.no_crc_);
+        if (block.kind_ == BlockKind::kIndirectKeys && payload == long_key)
+          key_record = true;
+        if (record.auxiliary_group_ && key == "large-field") hash_record = true;
+        if (record.auxiliary_group_ && key == "large-item") list_record = true;
+      },
+      true);
+  ASSERT_TRUE(key_record);
+  ASSERT_TRUE(hash_record);
+  ASSERT_TRUE(list_record);
+
+  ScopedEnvironment fault("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1");
+  Server recovered(disk, 3, {}, {}, false, 2, "1G", {}, {}, 0, 20, options);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", long_key}).text_, "long-key-value");
+  EXPECT_EQ(client.Command({"HGET", "large-field", "field"}).text_, hash_value);
+  const auto list = client.Command({"LRANGE", "large-item", "0", "-1"});
+  ASSERT_EQ(list.kind_, '*');
+  ASSERT_EQ(list.items_.size(), 3);
+  EXPECT_EQ(list.items_[0].text_, "before");
+  EXPECT_EQ(list.items_[1].text_, list_value);
+  EXPECT_EQ(list.items_[2].text_, "after");
+  EXPECT_EQ(client.Command({"GET", "{same}compact"}).text_, compact_value);
+  // A small record may occupy a wave's slot before the oversized candidate
+  // falls back. Retrying before submitting/draining that wave would deadlock.
+  const auto batch = client.Command(
+      {"MGET", "{same}small", "{same}compact", "{same}small", long_key});
+  ASSERT_EQ(batch.kind_, '*');
+  ASSERT_EQ(batch.items_.size(), 4);
+  EXPECT_EQ(batch.items_[0].text_, "small");
+  EXPECT_EQ(batch.items_[1].text_, compact_value);
+  EXPECT_EQ(batch.items_[2].text_, "small");
+  EXPECT_EQ(batch.items_[3].text_, "long-key-value");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 TEST(GroupedHashWriteE2e, OversizedFieldSplitsIntoExtentBackedLeaf) {
   PrivateDisk disk;
   const std::string large(9 * 1024 * 1024, 'L');

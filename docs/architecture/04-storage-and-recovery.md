@@ -627,14 +627,16 @@ cached for reuse. Oversized reads and reads that find the fixed pool exhausted
 allocate aligned or SPDK DMA overflow storage
 only while leased; returning a lease frees that storage and removes its charge
 on the owner worker. If temporary allocation fails, ordinary reads wait for a
-fixed slot in FIFO order. An oversized extent whose allocation fails falls
-back to slot-sized reads when fixed read slots exist, retaining its block pin
-through pool waiting and all chunks. Both paths validate the same header and,
-when enabled, the complete payload checksum before exposing the requested
-slice; fallback stages the slice in ordinary heap memory. Other oversized
-reads still report allocation failure. Whole-value assembly uses ordinary heap
-memory, including on SPDK: page and extent reads copy into an output that
-neither consumes a fixed slot nor needs DMA addressability. Outputs retain
+fixed slot in FIFO order. Oversized record and extent reads whose allocation
+fails fall back to slot-sized reads when fixed read slots exist, retaining the
+block pin through pool waiting and all chunks. Records assemble a private image
+in ordinary heap memory and retain their identity, population, checksum, and
+relocation-retry checks. Extent paths validate the same header and, when enabled,
+the complete payload checksum before exposing the requested slice; fallback
+stages that slice in ordinary heap memory. Other oversized I/O, such as Redis
+export backlog reads, still reports allocation failure. Whole-value assembly
+uses ordinary heap memory, including on SPDK: page and extent reads copy into
+an output that neither consumes a fixed slot nor needs DMA addressability. Outputs retain
 reply framing space and follow the same owner-bound lease accounting and
 release lifecycle. These allocations are accounted without
 a separate admission gate so reads and reclamation can still progress at the
@@ -750,9 +752,11 @@ commands can answer from the same protected index metadata without a block pin
 or payload buffer. Closed admission, unsupported representations, expired
 entries, concurrent admission contention, and an exhausted connection-worker
 read-buffer pool whose temporary allocation also fails return to the normal
-owner route. Stream and Sorted Set whole-value callbacks exceeding the bounded
-inline workspace also retain the owner's scratch-admission path. Index misses use the same transaction and
-population admission checks.
+owner route. Failed oversized allocation also takes that route, where the
+record reader can use fixed-slot chunks. Stream and Sorted Set whole-value
+callbacks exceeding the bounded inline workspace also retain the owner's
+scratch-admission path. Index misses use the same transaction and population
+admission checks.
 
 An admitted payload read submits I/O directly from an awaitable in the
 requesting coroutine. Completion validates the record and population and
@@ -804,10 +808,11 @@ representation-specific retry loop.
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size
 local inline records in waves paced by the fixed read-buffer pool; oversized
-records use aligned overflow leases. One completion barrier covers every I/O in
-a wave, and all leases are returned before relocation retries or the next wave
-can suspend. Staged, remote, external, indirect-key, and stale-validation cases
-fall back to the complete `GetLocked` state machine, preserving the ordinary
+records use aligned overflow leases or fall back to the complete reader if
+allocation fails. One completion barrier covers every I/O in a wave, and all
+leases are returned before a chunked fallback, relocation retry, or the next
+wave can suspend. Staged, remote, external, indirect-key, and stale-validation
+cases fall back to the complete `GetLocked` state machine, preserving the ordinary
 identity and relocation checks without one coroutine per key.
 
 Before returning disk bytes, storage validates block and record allocation

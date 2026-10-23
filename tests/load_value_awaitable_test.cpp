@@ -899,10 +899,29 @@ class LoadValueAwaitableTestPeer : public testing::Test {
       ASSERT_EQ(opened.result_, 0);
     }
   }
-  void InstallRecord() {
+  void ResizeRecord(std::size_t bytes) {
+    value_.resize(bytes);
+    for (std::size_t i = 0; i < bytes; ++i) value_[i] = 'a' + i % 23;
+    header_.logical_size_ = bytes;
+    header_.payload_bytes_ = bytes;
+    header_.total_disk_bytes_ = AlignRecord(header_.header_bytes_ + bytes);
+    header_.payload_checksum_ = Crc32c(std::as_bytes(std::span(value_)));
+    location_ =
+        RecordLocation(1, 9, 7, 0, bytes,
+                       RecordLocation::PackedMetadata::Encode(
+                           location_.record_offset(), header_.total_disk_bytes_,
+                           0, false, false, false, false, false, false,
+                           RecordKind::kValue, ValueType::kString));
+  }
+  void InstallRecord(bool corrupt = false, std::size_t truncated_bytes = 0) {
     std::vector<std::byte> bytes(
         AlignDirect(location_.record_offset() + location_.total_disk_bytes()));
     Encode(bytes.data() + location_.record_offset());
+    if (corrupt)
+      bytes[location_.record_offset() + header_.header_bytes_ + value_.size() -
+            1] ^= std::byte{1};
+    ASSERT_LE(truncated_bytes, bytes.size());
+    bytes.resize(bytes.size() - truncated_bytes);
     InstallDiskImage(bytes);
   }
   void InstallGroupedDiskImage() {
@@ -1182,6 +1201,216 @@ TEST_F(LoadValueAwaitableTestPeer,
   ExpectNoPageLeases();
   EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+}
+
+class RecordChunkFallbackTest : public LoadValueAwaitableTestPeer {
+ protected:
+  void SetUp() override {
+    LoadValueAwaitableTestPeer::SetUp();
+#if !LAVIK_FAULTS_ENABLED
+    GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+    failure_.emplace();
+    ResizeRecord(3 * 24 * kKiB + 17);
+  }
+  std::optional<lavik::test::ScopedReadBufferAllocationFailure> failure_;
+};
+
+TEST_F(RecordChunkFallbackTest, ReadsUnalignedRecordIntoAccountedHeapOutput) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  const auto baseline = RetainedBytes();
+  {
+    auto read = ReadLocal();
+    ASSERT_TRUE(HasHelper(read));
+    EXPECT_EQ(block_.pin_count(), 1);
+    auto task = AwaitExisting(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    auto result = std::move(task).TakeResult();
+    ExpectValue(result);
+    ASSERT_TRUE(result.ok());
+    EXPECT_EQ(result->lease_.buffer_id(), 0);
+    EXPECT_EQ(Pool().available_read_buffers(), 1);
+    EXPECT_GE(RetainedBytes() - baseline, value_.size());
+    // The reply may outlive another read using the sole DMA slot.
+    auto next = ReadLocal();
+    auto next_task = AwaitExisting(next);
+    Start(next_task);
+    ASSERT_NO_FATAL_FAILURE(Drain(next_task));
+    ExpectValue(std::move(next_task).TakeResult());
+    ExpectValue(result);
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(RetainedBytes(), baseline);
+}
+
+TEST_F(RecordChunkFallbackTest, WaitRetainsPinAndBackgroundScheduling) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  {
+    auto read = Read();
+    auto task = AwaitExisting(read);
+    Start(task, true);
+    EXPECT_FALSE(task.done());
+    EXPECT_EQ(block_.pin_count(), 1);
+    EXPECT_TRUE(HelperIsBackground(read));
+    held->Reset();
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectValue(std::move(task).TakeResult());
+  }
+  ExpectNoPageLeases();
+}
+
+TEST_F(RecordChunkFallbackTest, StagedRecordNeedsNoReadSlot) {
+  Stage();
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  {
+    auto read = Read();
+    ASSERT_TRUE(read.await_ready());
+    EXPECT_FALSE(HasHelper(read));
+    ExpectValue(read.await_resume());
+    EXPECT_EQ(block_.pin_count(), 0);
+  }
+  held->Reset();
+  ExpectNoPageLeases();
+}
+
+class RecordChunkValidationTest : public RecordChunkFallbackTest,
+                                  public testing::WithParamInterface<bool> {};
+
+TEST_P(RecordChunkValidationTest, ValidatesFinalChunkAndHonorsNoCrc) {
+  const bool no_crc = GetParam();
+  header_.no_crc_ = no_crc;
+  ASSERT_NO_FATAL_FAILURE(InstallRecord(true));
+  const auto baseline = RetainedBytes();
+  {
+    auto read = ReadLocal();
+    auto task = AwaitExisting(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    auto result = std::move(task).TakeResult();
+    if (no_crc) {
+      value_.back() ^= 1;
+      ExpectValue(result);
+    } else {
+      EXPECT_TRUE(absl::IsInternal(result.status()));
+      EXPECT_EQ(result.status().message(), "record value checksum mismatch");
+    }
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(RetainedBytes(), baseline);
+}
+
+TEST_P(RecordChunkValidationTest, RejectsShortFinalChunkAndStaleIdentity) {
+  const bool short_read = GetParam();
+  if (!short_read) ++header_.allocation_epoch_;
+  ASSERT_NO_FATAL_FAILURE(
+      InstallRecord(false, short_read ? kDirectIoAlignment : 0));
+  const auto baseline = RetainedBytes();
+  {
+    auto read = ReadLocal();
+    auto task = AwaitExisting(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    auto result = std::move(task).TakeResult();
+    EXPECT_EQ(result.status().code(), short_read ? absl::StatusCode::kInternal
+                                                 : absl::StatusCode::kAborted);
+  }
+  ExpectNoPageLeases();
+  EXPECT_EQ(RetainedBytes(), baseline);
+}
+
+INSTANTIATE_TEST_SUITE_P(Modes, RecordChunkValidationTest, testing::Bool());
+
+TEST_F(RecordChunkFallbackTest, PopulationChangeDuringWaitDiscardsOutput) {
+  for (bool database : {false, true}) {
+    SCOPED_TRACE(database);
+    auto held = Pool().AcquireReadBuffer().await_resume();
+    ASSERT_TRUE(held.ok());
+    {
+      auto read = Read();
+      auto task = AwaitExisting(read);
+      Start(task);
+      ASSERT_FALSE(task.done());
+      Invalidate(database);
+      held->Reset();
+      // No file was opened: the invalidated reader must skip even its first
+      // I/O.
+      ASSERT_NO_FATAL_FAILURE(Drain(task));
+      EXPECT_TRUE(absl::IsNotFound(std::move(task).TakeResult().status()));
+    }
+    ExpectNoPageLeases();
+  }
+}
+
+TEST_F(RecordChunkFallbackTest, RelocationRetryReleasesSoleSlot) {
+  ++header_.allocation_epoch_;
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  --header_.allocation_epoch_;
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  {
+    auto read = Read();
+    auto task = AwaitExisting(read);
+    Start(task, true);
+    ASSERT_FALSE(task.done());
+    location_.metadata_ = RecordLocation::PackedMetadata::Encode(
+        location_.record_offset() + 512, location_.total_disk_bytes(), 0, false,
+        false, false, false, false, false, RecordKind::kValue,
+        ValueType::kString);
+    Stage();
+    IndexLocation();
+    held->Reset();
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectValue(std::move(task).TakeResult());
+  }
+  ExpectNoPageLeases();
+}
+
+TEST_F(RecordChunkFallbackTest, UnchangedBadLocationStillReportsCorruption) {
+  IndexLocation();
+  ++header_.allocation_epoch_;
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  {
+    auto read = Read();
+    auto task = AwaitExisting(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    EXPECT_TRUE(absl::IsInternal(std::move(task).TakeResult().status()));
+  }
+  ExpectNoPageLeases();
+}
+
+class RecordSmallSlotFallbackTest : public RecordChunkFallbackTest {
+ protected:
+  std::size_t ReadSlotBytes() const override { return 12 * kKiB; }
+};
+
+TEST_F(RecordSmallSlotFallbackTest, ReadsWithMinimumConfiguredSlot) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  {
+    auto read = ReadLocal();
+    auto task = AwaitExisting(read);
+    Start(task);
+    ASSERT_NO_FATAL_FAILURE(Drain(task));
+    ExpectValue(std::move(task).TakeResult());
+  }
+  ExpectNoPageLeases();
+}
+
+class RecordNoSlotsFallbackTest : public RecordChunkFallbackTest {
+ protected:
+  std::size_t ReadBufferCount() const override { return 0; }
+};
+
+TEST_F(RecordNoSlotsFallbackTest, AllocationFailureDoesNotWaitWithoutSlots) {
+  auto read = ReadLocal();
+  ASSERT_TRUE(read.await_ready());
+  EXPECT_FALSE(HasHelper(read));
+  EXPECT_TRUE(absl::IsResourceExhausted(read.await_resume().status()));
+  ExpectNoPageLeases();
 }
 
 class ExtentFaultFallbackTest : public LoadValueAwaitableTestPeer,

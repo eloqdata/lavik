@@ -3535,10 +3535,10 @@ class StorageEngine::Impl {
   };
 
   // The awaitable lives in the caller's frame. Ordinary local reads suspend
-  // that caller directly, including through pool backpressure. Only multi-step
-  // logical reads need a lazy helper Task. Local mode returns stale-location
-  // errors to its caller, while logical mode resolves same-mutation relocations
-  // before returning.
+  // that caller directly, including through pool backpressure. Multi-step
+  // logical reads and oversized-allocation fallback use a lazy helper Task.
+  // Local mode returns stale-location errors to its caller, while logical mode
+  // resolves same-mutation relocations before returning.
   class LoadValueAwaitable final : public bycorf::OneShotIoAwaitable,
                                    private bycorf::RemoteWork {
    public:
@@ -3576,6 +3576,7 @@ class StorageEngine::Impl {
     std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
     absl::StatusOr<Payload> ParseRecord(const std::byte* data) const;
     Result FinishRecord(const std::byte* data, Payload payload, bool staged);
+    Task<Result> ReadInChunks();
     bool PopulationChanged() const;
     void Unpin();
     void Retry(absl::Status failure);
