@@ -1121,7 +1121,7 @@ inline absl::Status ReadExactlyAt(const std::string& path,
     }
     for (std::size_t done = 0; done < output.size();) {
       const std::size_t bytes = std::min(scratch.size_, output.size() - done);
-      absl::Status status = bycorf::ReadSpdkStorageDma(
+      absl::Status status = bycorf::spdk::sync::ReadDma(
           path, std::span<std::byte>(scratch.data_, bytes), offset + done);
       if (!status.ok()) return status;
       if (output.data() + done != scratch.data_)
@@ -1158,7 +1158,7 @@ inline absl::Status WriteExactlyAt(const std::string& path,
       const std::size_t bytes = std::min(scratch.size_, input.size() - done);
       if (input.data() + done != scratch.data_)
         std::memcpy(scratch.data_, input.data() + done, bytes);
-      absl::Status status = bycorf::WriteSpdkStorageDma(
+      absl::Status status = bycorf::spdk::sync::WriteDma(
           path, std::span<const std::byte>(scratch.data_, bytes), offset + done,
           flush && done + bytes == input.size());
       if (!status.ok()) return status;
