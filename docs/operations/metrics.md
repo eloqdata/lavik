@@ -225,6 +225,8 @@ sum by (result) (rate(lavik_storage_defrag_runs_total[5m]))
   Storage pools charge slot capacity on both io_uring and SPDK; allocator
   overhead and SPDK's full hugepage reservation are not included.
   Worker recovery reuses maintenance buffers without an additional charge.
+  Synchronous startup metadata I/O also reuses the prepared maintenance read
+  and device write workspaces; worker initialization does not charge them again.
 - `lavik_memory_rss_bytes`: resident process memory, refreshed when metrics
   or `INFO memory` is requested.
 - `lavik_memory_committed_bytes`: pages committed by mimalloc; diagnostic

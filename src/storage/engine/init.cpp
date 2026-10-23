@@ -37,14 +37,15 @@ struct MirroredSystemStateRoot {
 };
 
 absl::StatusOr<std::vector<MirroredSystemStateRoot>>
-ReadSystemStateRootCandidates(const std::string& path) {
+ReadSystemStateRootCandidates(const std::string& path,
+                              FixedBuffer read_buffer) {
   std::vector<MirroredSystemStateRoot> candidates;
   bool saw_nonzero = false;
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
     absl::Status read = ReadExactlyAt(
-        path, page,
-        MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
+        path, page, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+        read_buffer);
     if (!read.ok()) return read;
     if (IsZero(page)) continue;
     saw_nonzero = true;
@@ -65,13 +66,14 @@ ReadSystemStateRootCandidates(const std::string& path) {
 }
 
 absl::StatusOr<std::optional<MirroredSystemStateRoot>>
-SelectCommonSystemStateRoot(const std::vector<std::string>& paths) {
+SelectCommonSystemStateRoot(const std::vector<std::string>& paths,
+                            FixedBuffer read_buffer) {
   if (paths.empty()) return std::optional<MirroredSystemStateRoot>{};
   std::vector<std::vector<MirroredSystemStateRoot>> candidates;
   candidates.reserve(paths.size());
   bool saw_any = false;
   for (const std::string& path : paths) {
-    auto loaded = ReadSystemStateRootCandidates(path);
+    auto loaded = ReadSystemStateRootCandidates(path, read_buffer);
     if (!loaded.ok()) return loaded.status();
     saw_any |= !loaded->empty();
     candidates.push_back(std::move(*loaded));
@@ -102,19 +104,19 @@ SelectCommonSystemStateRoot(const std::vector<std::string>& paths) {
 }
 
 absl::Status InstallSystemStateRoot(
-    const std::string& path,
-    const std::optional<MirroredSystemStateRoot>& root) {
+    const std::string& path, const std::optional<MirroredSystemStateRoot>& root,
+    FixedBuffer write_buffer) {
   std::array<std::byte, kDirectIoAlignment> zero{};
   for (unsigned slot = 0; slot < 2; ++slot) {
     absl::Status cleared = WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
-        false);
+        false, write_buffer);
     if (!cleared.ok()) return cleared;
   }
   if (!root.has_value()) {
     return WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, 1),
-        true);
+        true, write_buffer);
   }
   std::array<std::byte, kDirectIoAlignment> page{};
   EncodeMetadataPage(MetadataPageKind::kSystemState, 0, root->generation_,
@@ -122,24 +124,26 @@ absl::Status InstallSystemStateRoot(
   const unsigned slot = static_cast<unsigned>((root->generation_ - 1) & 1);
   return WriteExactlyAt(
       path, page, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
-      true);
+      true, write_buffer);
 }
 
 absl::Status ResetStorageMetadata(const std::string& path,
-                                  std::uint64_t capacity_blocks) {
-  constexpr std::size_t kResetChunkBytes = 128 * 1024;
+                                  std::uint64_t capacity_blocks,
+                                  FixedBuffer write_buffer) {
+  const std::size_t kResetChunkBytes = write_buffer.size_;
   const std::uint64_t bytes =
       static_cast<std::uint64_t>(DataBlockBegin(capacity_blocks)) *
       kStorageBlockBytes;
-  std::vector<std::byte> zero(kResetChunkBytes, std::byte{0});
+  std::fill_n(write_buffer.data_, kResetChunkBytes, std::byte{0});
+  const std::span<const std::byte> zero(write_buffer.data_, kResetChunkBytes);
 
   if (bycorf::IsSpdkStoragePath(path)) {
     for (std::uint64_t offset = 0; offset < bytes; offset += kResetChunkBytes) {
       const std::size_t chunk = static_cast<std::size_t>(
           std::min<std::uint64_t>(kResetChunkBytes, bytes - offset));
-      absl::Status status = bycorf::WriteSpdkStorage(
-          path, std::span<const std::byte>(zero.data(), chunk), offset,
-          offset + chunk == bytes);
+      absl::Status status =
+          WriteExactlyAt(path, zero.first(chunk), offset,
+                         offset + chunk == bytes, write_buffer);
       if (!status.ok()) return status;
     }
     return absl::OkStatus();
@@ -173,9 +177,10 @@ absl::Status ResetStorageMetadata(const std::string& path,
 
 absl::Status InitializeAddedDeviceMetadata(
     const std::string& path, std::uint64_t capacity_blocks,
-    const std::vector<std::uint64_t>& epoch_values) {
+    const std::vector<std::uint64_t>& epoch_values, FixedBuffer write_buffer) {
   std::array<std::byte, kDirectIoAlignment> zero{};
-  absl::Status status = WriteExactlyAt(path, zero, kDeviceLabelOffset, true);
+  absl::Status status =
+      WriteExactlyAt(path, zero, kDeviceLabelOffset, true, write_buffer);
   if (!status.ok()) {
     return status;
   }
@@ -187,7 +192,7 @@ absl::Status InitializeAddedDeviceMetadata(
         std::min(kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
     status = WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 1),
-        false);
+        false, write_buffer);
     if (!status.ok()) {
       return status;
     }
@@ -201,7 +206,7 @@ absl::Status InitializeAddedDeviceMetadata(
         page);
     status = WriteExactlyAt(
         path, page, MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 0),
-        true);
+        true, write_buffer);
     if (!status.ok()) {
       return status;
     }
@@ -211,14 +216,15 @@ absl::Status InitializeAddedDeviceMetadata(
   for (std::size_t page_index = 0; page_index < bitmap_pages; ++page_index) {
     status = WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 0),
-        false);
+        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 0), false,
+        write_buffer);
     if (!status.ok()) {
       return status;
     }
     status = WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1), true);
+        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1), true,
+        write_buffer);
     if (!status.ok()) {
       return status;
     }
@@ -228,13 +234,15 @@ absl::Status InitializeAddedDeviceMetadata(
   for (std::size_t page_index = 0; page_index < bitmap_pages; ++page_index) {
     status = WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 0), false);
+        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 0), false,
+        write_buffer);
     if (!status.ok()) {
       return status;
     }
     status = WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 1), true);
+        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 1), true,
+        write_buffer);
     if (!status.ok()) {
       return status;
     }
@@ -242,7 +250,7 @@ absl::Status InitializeAddedDeviceMetadata(
   for (unsigned slot = 0; slot < 2; ++slot) {
     status = WriteExactlyAt(
         path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
-        slot == 1);
+        slot == 1, write_buffer);
     if (!status.ok()) return status;
   }
   return absl::OkStatus();
@@ -297,6 +305,29 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     path_info.push_back(*probed);
   }
 
+  // Bootstrap reads borrow worker zero's maintenance image before workers or
+  // registered pools exist. That exact allocation remains with the worker for
+  // recovery and maintenance. All synchronous uses finish before handoff.
+  stores_.reserve(worker_count);
+  stores_.push_back(std::make_unique<WorkerStore>(1));
+  absl::Status prepared = stores_[0]->buffers_.PrepareMaintenanceBuffers(
+      0, options_.buffers_.alignment_);
+  if (!prepared.ok()) return prepared;
+  const FixedBuffer startup_read = stores_[0]->buffers_.maintenance_read_buffer(
+      MaintenanceReadKind::kDefrag);
+  // Device ids are dense even when input paths are reordered. Allocate by id
+  // now, before reset/label writes, and resolve paths to these same owners
+  // below.
+  device_allocators_.clear();
+  device_allocators_.reserve(options_.data_files_.size());
+  for (std::size_t id = 0; id < options_.data_files_.size(); ++id) {
+    auto allocator = std::make_unique<DeviceAllocator>();
+    allocator->owner_ = static_cast<bycorf::WorkerId>(id % worker_count);
+    absl::Status status = allocator->InitMetadataWriteBuffer(id);
+    if (!status.ok()) return status;
+    device_allocators_.push_back(std::move(allocator));
+  }
+
   labels.resize(options_.data_files_.size());
   if (options_.reset_data_files_) {
     // Validate the complete target set before the first destructive write.
@@ -338,12 +369,13 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
                    options_.data_files_[i]);
       absl::Status reset =
           ResetStorageMetadata(options_.data_files_[i],
-                               path_info[i].size_bytes_ / kStorageBlockBytes);
+                               path_info[i].size_bytes_ / kStorageBlockBytes,
+                               device_allocators_[i]->metadata_write_buffer_);
       if (!reset.ok()) return reset;
     }
   } else {
     for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
-      auto label = ReadDeviceLabel(options_.data_files_[i]);
+      auto label = ReadDeviceLabel(options_.data_files_[i], startup_read);
       if (!label.ok()) return label.status();
       labels[i] = std::move(*label);
     }
@@ -591,7 +623,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         auto loaded = ReadMetadataPagePair(
             options_.data_files_[i], kEpochMetadataOffset,
             MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index),
-            payload_bytes);
+            payload_bytes, startup_read);
         if (!loaded.ok()) {
           return loaded.status();
         }
@@ -611,7 +643,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         }
       }
     }
-    auto inherited_system_state = SelectCommonSystemStateRoot(existing_paths);
+    auto inherited_system_state =
+        SelectCommonSystemStateRoot(existing_paths, startup_read);
     if (!inherited_system_state.ok()) {
       return inherited_system_state.status();
     }
@@ -620,12 +653,14 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         continue;
       }
       absl::Status initialized = InitializeAddedDeviceMetadata(
-          options_.data_files_[i], capacity_by_path[i], canonical_epochs);
+          options_.data_files_[i], capacity_by_path[i], canonical_epochs,
+          device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
       if (!initialized.ok()) {
         return initialized;
       }
       absl::Status system_state_installed = InstallSystemStateRoot(
-          options_.data_files_[i], *inherited_system_state);
+          options_.data_files_[i], *inherited_system_state,
+          device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
       if (!system_state_installed.ok()) return system_state_installed;
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
@@ -637,7 +672,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           .device_count_ = configured_device_count,
           .block_bytes_ = kStorageBlockBytes,
       };
-      absl::Status written = WriteDeviceLabel(options_.data_files_[i], label);
+      absl::Status written = WriteDeviceLabel(
+          options_.data_files_[i], label,
+          device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
       if (!written.ok()) {
         return written;
       }
@@ -650,8 +687,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         continue;
       }
       labels[i]->device_count_ = configured_device_count;
-      absl::Status written =
-          WriteDeviceLabel(options_.data_files_[i], *labels[i]);
+      absl::Status written = WriteDeviceLabel(
+          options_.data_files_[i], *labels[i],
+          device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
       if (!written.ok()) {
         return written;
       }
@@ -670,7 +708,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           .device_count_ = configured_device_count,
           .block_bytes_ = kStorageBlockBytes,
       };
-      absl::Status written = WriteDeviceLabel(options_.data_files_[i], label);
+      absl::Status written = WriteDeviceLabel(
+          options_.data_files_[i], label,
+          device_allocators_[assigned_device_ids[i]]->metadata_write_buffer_);
       if (!written.ok()) {
         return written;
       }
@@ -707,26 +747,20 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   spdlog::info("storage flush trigger={} bytes maximum submission={} bytes",
                options_.flush_size_bytes_, kMaxFlushWriteBytes);
 
-  absl::Status system_state = LoadSystemState();
+  absl::Status system_state = LoadSystemState(startup_read);
   if (!system_state.ok()) return system_state;
 
   worker_count_ = worker_count;
   epoch_values_ = InitialEpochValues();
   std::vector<CheckpointRoot> loaded_checkpoint_roots;
   loaded_checkpoint_roots.reserve(devices_.size());
-  device_allocators_.clear();
-  device_allocators_.reserve(devices_.size());
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
     const std::size_t bitmap_bytes = ScanBitmapBytes(device.capacity_blocks_);
     const std::size_t bitmap_page_count =
         ScanBitmapPageCount(device.capacity_blocks_);
-    auto allocator = std::make_unique<DeviceAllocator>();
-    allocator->owner_ =
-        static_cast<bycorf::WorkerId>(device_index % worker_count_);
-    absl::Status buffer_status = allocator->InitMetadataWriteBuffer(device.id_);
-    if (!buffer_status.ok()) return buffer_status;
+    auto& allocator = device_allocators_[device_index];
     allocator->data_block_begin_ = device.data_block_begin_;
     allocator->next_pristine_ = device.data_block_begin_;
     allocator->scan_bitmap_.resize(bitmap_bytes, std::byte{0});
@@ -745,7 +779,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
       auto loaded = ReadMetadataPagePair(
           device.path_, kEpochMetadataOffset, MetadataPageKind::kEpochs,
-          static_cast<std::uint32_t>(page_index), payload_bytes);
+          static_cast<std::uint32_t>(page_index), payload_bytes, startup_read);
       if (!loaded.ok()) {
         load_status = loaded.status();
         break;
@@ -789,7 +823,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       auto loaded = ReadMetadataPagePair(
           device.path_, kScanBitmapMetadataOffset,
           MetadataPageKind::kScanBitmap, static_cast<std::uint32_t>(page_index),
-          payload_bytes);
+          payload_bytes, startup_read);
       if (!loaded.ok()) {
         load_status = loaded.status();
         break;
@@ -808,7 +842,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       auto loaded = ReadMetadataPagePair(device.path_, checkpoint_bitmap_offset,
                                          MetadataPageKind::kCheckpointBitmap,
                                          static_cast<std::uint32_t>(page_index),
-                                         payload_bytes);
+                                         payload_bytes, startup_read);
       if (!loaded.ok()) {
         // Checkpoint discovery metadata is only an accelerator. A damaged page
         // disables this generation and is overwritten with zero at startup;
@@ -854,7 +888,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         ++recovery_allocated_blocks_;
       }
     }
-    device_allocators_.push_back(std::move(allocator));
   }
   checkpoint_root_ = {};
   for (const CheckpointRoot& root : loaded_checkpoint_roots) {
@@ -908,10 +941,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
                              .count();
   recovery_next_log_ms_.store(recovery_started_ms_ + 5000,
                               std::memory_order_relaxed);
-  stores_.reserve(worker_count);
   for (unsigned i = 0; i < worker_count; ++i) {
-    stores_.push_back(std::make_unique<WorkerStore>(i + 1));
-    WorkerStore& store = *stores_.back();
+    if (i != 0) stores_.push_back(std::make_unique<WorkerStore>(i + 1));
+    WorkerStore& store = *stores_[i];
     // Record and UUID insertion reserve a new page together with any bucket
     // growth before mutating durable staging. The arena must not reserve the
     // same bytes again after that point.

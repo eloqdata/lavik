@@ -115,7 +115,11 @@ scan buffers for defrag, transaction cleaning, and Tomb Raider, plus one
 independent 8 MiB Redis export buffer per process and an 8 KiB metadata write
 buffer per device. With defaults, fixed storage-buffer capacity is
 `88 MiB × data workers + 8 MiB + 8 KiB × storage devices`; also allow for
-overflow, synchronous startup metadata scratch, and SPDK/DPDK overhead.
+optional read overflow and SPDK/DPDK overhead.
+Synchronous startup metadata reads reuse worker zero's maintenance read image,
+allocated before metadata loading. Startup label, initialization, and reset
+writes reuse each device's fixed write workspace in bounded chunks. These
+paths add no DMA capacity and bypass the allocating SPDK convenience helpers.
 Online bitmap/epoch/root writes and recycled-block header clearing share the
 device's fixed write workspace without borrowing ordinary read/write slots.
 Export capture and disk replay reuse its one buffer without extra DMA allocation.

@@ -351,7 +351,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
     rlimit reduced = original_limit_;
     reduced.rlim_cur = limit;
     ASSERT_EQ(setrlimit(RLIMIT_MEMLOCK, &reduced), 0);
-    pool_ = std::make_unique<RegisteredBufferPool>();
+    if (pool_ == nullptr) pool_ = std::make_unique<RegisteredBufferPool>();
     if (!init_pool) return;
     auto status = pool_->Init(*worker_, options_);
     ASSERT_TRUE(status.ok()) << status;
@@ -554,6 +554,48 @@ TEST_F(BufferPoolMemlockTest,
 #else
   GTEST_SKIP() << "allocation failure test requires fault hooks";
 #endif
+}
+
+TEST_F(BufferPoolMemlockTest, PreparedMaintenanceSurvivesWorkerInitialization) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires allocation failure injection";
+#endif
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  const auto baseline = WorkerMemoryAccountingBytes(0);
+  pool_ = std::make_unique<RegisteredBufferPool>();
+  ASSERT_TRUE(pool_->PrepareMaintenanceBuffers(0, options_.alignment_).ok());
+  ASSERT_FALSE(pool_->initialized());
+  constexpr std::array kinds{MaintenanceReadKind::kDefrag,
+                             MaintenanceReadKind::kTxCleaner,
+                             MaintenanceReadKind::kTombRaider};
+  std::array<std::byte*, 3> images;
+  for (std::size_t i = 0; i != kinds.size(); ++i) {
+    images[i] = pool_->maintenance_read_buffer(kinds[i]).data_;
+    images[i][0] = std::byte(i + 1);
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline + 24 * kMiB);
+  EXPECT_TRUE(absl::IsFailedPrecondition(
+      pool_->PrepareMaintenanceBuffers(1, options_.alignment_)));
+  EXPECT_TRUE(absl::IsFailedPrecondition(
+      pool_->PrepareMaintenanceBuffers(0, options_.alignment_ * 2)));
+  ASSERT_EQ(setenv("LAVIK_FAIL_MAINTENANCE_BUFFER_ALLOCATION", "defrag", 1), 0);
+  absl::Cleanup restore = [] {
+    unsetenv("LAVIK_FAIL_MAINTENANCE_BUFFER_ALLOCATION");
+  };
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  for (std::size_t i = 0; i != kinds.size(); ++i) {
+    EXPECT_EQ(pool_->maintenance_read_buffer(kinds[i]).data_, images[i]);
+    EXPECT_EQ(images[i][0], std::byte(i + 1));
+  }
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0),
+            baseline + 24 * kMiB +
+                pool_->write_buffer_count() * options_.write_buffer_bytes_ +
+                pool_->read_buffer_count() * options_.read_slot_bytes_);
+  worker_->Shutdown();
+  worker_.reset();
+  bycorf::MutableThisWorker() = saved_context_;
+  pool_.reset();
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
 }
 
 TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {

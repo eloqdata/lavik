@@ -350,7 +350,10 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
   return state;
 }
 
-absl::Status StorageEngine::Impl::LoadSystemState() {
+absl::Status StorageEngine::Impl::LoadSystemState(FixedBuffer read_buffer) {
+  if (read_buffer.data_ == nullptr || read_buffer.size_ < kStorageBlockBytes)
+    return absl::FailedPreconditionError(
+        "system-state startup read buffer is missing");
   struct Candidate {
     std::uint64_t generation_ = 0;
     SystemStateRoot root_{};
@@ -364,7 +367,8 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
       std::array<std::byte, kDirectIoAlignment> page{};
       absl::Status read = ReadExactlyAt(
           device.path_, page,
-          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
+          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+          read_buffer);
       if (!read.ok()) return read;
       if (IsZero(page)) continue;
       saw_any_root = true;
@@ -410,7 +414,7 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
 
   auto read_extent =
       [&](const ExtentRef& ref,
-          std::uint32_t expected_index) -> absl::StatusOr<std::string> {
+          std::uint32_t expected_index) -> absl::StatusOr<std::string_view> {
     const std::size_t device_index = DeviceIdForBlock(ref.block_id_);
     if (device_index >= devices_.size() ||
         devices_[device_index].id_ != device_index) {
@@ -418,9 +422,15 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
     }
     const std::size_t read_bytes =
         AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-    std::vector<std::byte> bytes(read_bytes);
-    absl::Status read = ReadExactlyAt(devices_[device_index].path_, bytes,
-                                      LocalBlockOffset(ref.block_id_));
+    if (read_bytes > read_buffer.size_)
+      return absl::DataLossError("system-state extent exceeds its read buffer");
+    // The returned view lasts only until the next startup read. Manifest
+    // decoding owns its fields, and catalog assembly copies into ordinary
+    // heap memory before this one maintenance image is reused.
+    std::span<std::byte> bytes(read_buffer.data_, read_bytes);
+    absl::Status read =
+        ReadExactlyAt(devices_[device_index].path_, bytes,
+                      LocalBlockOffset(ref.block_id_), read_buffer);
     if (!read.ok()) return read;
     BlockHeader header;
     if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
@@ -440,8 +450,8 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
     if (Crc32c(payload) != ref.payload_checksum_) {
       return absl::InternalError("system-state extent checksum mismatch");
     }
-    return std::string(reinterpret_cast<const char*>(payload.data()),
-                       payload.size());
+    return std::string_view(reinterpret_cast<const char*>(payload.data()),
+                            payload.size());
   };
 
   auto manifest = read_extent(selected->root_.manifest_, 0);

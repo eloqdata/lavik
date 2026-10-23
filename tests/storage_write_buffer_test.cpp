@@ -34,7 +34,37 @@ class WriteBufferTestPeer {
     kCheckpointMissingSlot,
     kRecoveryRead,
     kDeviceMetadata,
+    kStartupCatalog,
   };
+
+  static std::string StartupCatalog() {
+    std::string dump(9 * kMiB + 17, 'a');
+    std::fill(dump.begin() + 4 * kMiB, dump.end(), 'z');
+    dump.back() = '\0';
+    return dump;
+  }
+
+  static void CheckStartupCatalog(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& pool = impl.stores_[0]->buffers_;
+    ASSERT_FALSE(pool.initialized());
+    ASSERT_TRUE(impl.recovered_catalog_dump_.has_value());
+    const auto expected = StartupCatalog();
+    EXPECT_EQ(*impl.recovered_catalog_dump_, expected);
+    auto read = pool.maintenance_read_buffer(MaintenanceReadKind::kDefrag);
+    BlockHeader header;
+    ASSERT_TRUE(
+        DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                   read.data_, kBlockHeaderBytes),
+                               &header));
+    EXPECT_EQ(header.kind_, BlockKind::kPayloadExtent);
+    EXPECT_EQ(header.extent_index_, 1);
+    // Prepare has not started any worker or ordinary pool. The last extent
+    // came directly through this future scan image; assembled bytes own heap
+    // storage and survive its subsequent reuse.
+    std::fill_n(read.data_, read.size_, std::byte{0});
+    EXPECT_EQ(*impl.recovered_catalog_dump_, expected);
+  }
 
   static Task<absl::Status> RunDeviceMetadata(StorageEngine& storage) {
     auto& impl = *storage.impl_;
@@ -239,6 +269,10 @@ class WriteBufferTestPeer {
   }
 
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kStartupCatalog) {
+      auto committed = co_await storage.CommitFunctionCatalog(StartupCatalog());
+      co_return committed.status();
+    }
     if (scenario == Scenario::kDeviceMetadata)
       co_return co_await RunDeviceMetadata(storage);
     if (scenario == Scenario::kRecoveryRead)
@@ -484,6 +518,15 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
   ASSERT_TRUE(server.Start(runtime).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result_.ok()) << service.result_;
+  if (scenario == WriteBufferTestPeer::Scenario::kStartupCatalog &&
+      service.result_.ok()) {
+    StorageEngineOptions reopened;
+    reopened.data_files_ = paths;
+    reopened.database_count_ = 1;
+    StorageEngine recovered(std::move(reopened));
+    ASSERT_TRUE(recovered.Prepare(1).ok());
+    WriteBufferTestPeer::CheckStartupCatalog(recovered);
+  }
 }
 
 TEST_P(StorageWriteBufferTest,
@@ -506,6 +549,17 @@ TEST(DeviceMetadataBufferTest, ReusesBuffersWithOrdinaryPoolsExhausted) {
   GTEST_SKIP() << "requires allocation failure injection";
 #endif
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kDeviceMetadata, 2);
+}
+
+TEST(StartupScratchTest, CatalogExtentsReusePreparedMaintenanceReadBuffer) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kStartupCatalog);
+}
+
+TEST(StartupScratchTest, SpdkMetadataRequiresExplicitScratch) {
+  std::array<std::byte, kDirectIoAlignment> page{};
+  constexpr const char* path = "spdk://0000:01:00.0/1";
+  EXPECT_TRUE(absl::IsFailedPrecondition(ReadExactlyAt(path, page, 0)));
+  EXPECT_TRUE(absl::IsFailedPrecondition(WriteExactlyAt(path, page, 0, true)));
 }
 
 TEST(DeviceMetadataBufferTest, AllocationFailureAndOwnerAccounting) {

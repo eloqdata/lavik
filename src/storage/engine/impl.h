@@ -1107,11 +1107,28 @@ inline absl::Status WriteExactlyAt(int fd, std::span<const std::byte> input,
   return absl::OkStatus();
 }
 
+// SPDK bootstrap calls must borrow an existing DMA read workspace. File I/O
+// needs no bounce buffer; the optional workspace keeps file-only tools/tests
+// usable before storage pools exist. Never allocate DMA on this path.
 inline absl::Status ReadExactlyAt(const std::string& path,
                                   std::span<std::byte> output,
-                                  std::uint64_t offset) {
+                                  std::uint64_t offset,
+                                  FixedBuffer scratch = {}) {
   if (bycorf::IsSpdkStoragePath(path)) {
-    return bycorf::ReadSpdkStorage(path, output, offset);
+    if (scratch.data_ == nullptr || scratch.size_ == 0) {
+      return absl::FailedPreconditionError(
+          "SPDK startup read buffer is missing");
+    }
+    for (std::size_t done = 0; done < output.size();) {
+      const std::size_t bytes = std::min(scratch.size_, output.size() - done);
+      absl::Status status = bycorf::ReadSpdkStorageDma(
+          path, std::span<std::byte>(scratch.data_, bytes), offset + done);
+      if (!status.ok()) return status;
+      if (output.data() + done != scratch.data_)
+        std::memcpy(output.data() + done, scratch.data_, bytes);
+      done += bytes;
+    }
+    return absl::OkStatus();
   }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -1130,9 +1147,24 @@ inline absl::Status ReadExactlyAt(const std::string& path,
 
 inline absl::Status WriteExactlyAt(const std::string& path,
                                    std::span<const std::byte> input,
-                                   std::uint64_t offset, bool flush) {
+                                   std::uint64_t offset, bool flush,
+                                   FixedBuffer scratch = {}) {
   if (bycorf::IsSpdkStoragePath(path)) {
-    return bycorf::WriteSpdkStorage(path, input, offset, flush);
+    if (scratch.data_ == nullptr || scratch.size_ == 0 || input.empty()) {
+      return absl::FailedPreconditionError(
+          "SPDK startup write buffer is missing or empty");
+    }
+    for (std::size_t done = 0; done < input.size();) {
+      const std::size_t bytes = std::min(scratch.size_, input.size() - done);
+      if (input.data() + done != scratch.data_)
+        std::memcpy(scratch.data_, input.data() + done, bytes);
+      absl::Status status = bycorf::WriteSpdkStorageDma(
+          path, std::span<const std::byte>(scratch.data_, bytes), offset + done,
+          flush && done + bytes == input.size());
+      if (!status.ok()) return status;
+      done += bytes;
+    }
+    return absl::OkStatus();
   }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -1155,9 +1187,9 @@ inline absl::Status WriteExactlyAt(const std::string& path,
 }
 
 inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
-    const std::string& path) {
+    const std::string& path, FixedBuffer scratch = {}) {
   std::array<std::byte, kDirectIoAlignment> page{};
-  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset);
+  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset, scratch);
   if (!status.ok()) {
     return status;
   }
@@ -1173,10 +1205,11 @@ inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
 }
 
 inline absl::Status WriteDeviceLabel(const std::string& path,
-                                     const DeviceLabel& label) {
+                                     const DeviceLabel& label,
+                                     FixedBuffer scratch = {}) {
   std::array<std::byte, kDirectIoAlignment> page{};
   EncodeDeviceLabel(label, page);
-  return WriteExactlyAt(path, page, kDeviceLabelOffset, true);
+  return WriteExactlyAt(path, page, kDeviceLabelOffset, true, scratch);
 }
 
 struct MetadataPageState {
@@ -1191,7 +1224,8 @@ struct LoadedMetadataPage {
 
 inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
     const std::string& path, std::uint64_t base_offset, MetadataPageKind kind,
-    std::uint32_t page_index, std::size_t payload_bytes) {
+    std::uint32_t page_index, std::size_t payload_bytes,
+    FixedBuffer scratch = {}) {
   LoadedMetadataPage selected;
   selected.payload_.resize(payload_bytes, std::byte{0});
   bool saw_nonzero = false;
@@ -1199,7 +1233,8 @@ inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
     absl::Status read = ReadExactlyAt(
-        path, page, MetadataPageSlotOffset(base_offset, page_index, slot));
+        path, page, MetadataPageSlotOffset(base_offset, page_index, slot),
+        scratch);
     if (!read.ok()) {
       return read;
     }
@@ -3462,7 +3497,7 @@ class StorageEngine::Impl {
     bool catalog_ready_ = false;
   };
 
-  absl::Status LoadSystemState();
+  absl::Status LoadSystemState(FixedBuffer read_buffer);
   Task<absl::Status> CommitSystemState(
       DurableSystemState next, std::string_view catalog_dump,
       bool replace_catalog, bool shutdown_metadata = false,

@@ -152,10 +152,17 @@ class RegisteredBufferPool {
   // Try full registration first. If io_uring rejects it, use the finite
   // memlock allowance to retry a subset, prioritizing read slots. Pool sizes
   // never shrink; unregistered slots use ordinary I/O. SPDK does not degrade.
-  // Also reserves one independent 8 MiB scan buffer per maintenance kind,
-  // outside registered_bytes_. Any allocation failure aborts initialization.
+  // Reuses any prepared maintenance buffers, otherwise allocates them here.
+  // Any allocation failure aborts initialization.
   absl::Status Init(bycorf::Worker& worker,
                     const RegisteredBufferPoolOptions& options = {});
+
+  // Reserve and account the three 8 MiB maintenance read buffers before a
+  // worker exists. Startup may borrow them synchronously; Init must use the
+  // same owner/alignment and does not allocate or charge them again. Prepared
+  // buffers remain owned until teardown, including if later Init fails.
+  absl::Status PrepareMaintenanceBuffers(unsigned owner_worker,
+                                         std::size_t alignment);
 
   bool initialized() const noexcept { return worker_ != nullptr; }
   // True only when all ordinary read/write slots registered. Use
@@ -180,7 +187,7 @@ class RegisteredBufferPool {
   // Startup recovery borrows these workspaces before maintenance can start;
   // it must drain prefetch I/O before reuse or the transition to maintenance.
   bycorf::FixedBuffer maintenance_read_buffer(MaintenanceReadKind kind) const {
-    assert(initialized());
+    assert(maintenance_alignment_ != 0);
     return maintenance_read_buffers_[static_cast<std::size_t>(kind)];
   }
   std::size_t read_buffer_count() const noexcept {
@@ -315,6 +322,8 @@ class RegisteredBufferPool {
   // Charge owned capacity for both aligned and SPDK DMA allocations. Pool
   // borrowing does not change ownership; teardown may run off the owner worker.
   RetainedMemoryCharge buffer_memory_;
+  RetainedMemoryCharge maintenance_memory_;
+  std::size_t maintenance_alignment_ = 0;
   std::array<bycorf::FixedBuffer, 3> maintenance_read_buffers_{};
   std::vector<bycorf::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;

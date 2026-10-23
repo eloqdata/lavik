@@ -633,14 +633,25 @@ Storage buffer capacity also participates in retained accounting: fixed read
 and write pools and dedicated maintenance scan buffers are charged at
 initialization. Redis export owns one process-wide 8 MiB workspace, allocated
 and charged at startup, reused for capture writes and subsequent disk replay,
-and retained between sessions. Recovery reuses the charged maintenance buffers.
+and retained between sessions. Startup preparation allocates worker zero's
+maintenance buffers before reading device metadata. Synchronous reads borrow
+one of those images for metadata pages and whole system-state/catalog extents;
+decoded state and the assembled catalog own ordinary heap memory. Preparation
+finishes all synchronous I/O before worker initialization reuses the same
+buffers without another allocation or charge. Worker recovery then borrows
+the maintenance buffers before their normal scanners start.
 Each device allocator owns one 8 KiB metadata write buffer, charged to its
 owner worker at startup and retained until engine teardown after I/O drains.
-Allocation failure identifies the device and prevents startup. The device's
+Allocation failure identifies the device and prevents startup. Preparation
+uses that same workspace for label, metadata initialization, and reset writes,
+splitting larger ranges into buffer-sized chunks. The device's
 coroutine mutex serializes workspace use for recycled-block header clearing,
 bitmap and epoch pages, and checkpoint/system-state roots. These writes do not
 borrow read slots or ordinary write slots and allocate no fallback buffers.
 io_uring uses unregistered I/O for this workspace; SPDK uses DMA memory.
+Synchronous SPDK startup helpers submit these caller-owned DMA buffers directly
+without allocating bounce storage. Temporary metadata queue pairs are released
+before worker queue creation.
 Oversized reads and reads that find the fixed pool exhausted allocate aligned
 or SPDK DMA overflow storage only while leased;
 returning a lease frees that storage and removes its charge on the owner worker.

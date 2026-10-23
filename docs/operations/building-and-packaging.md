@@ -71,6 +71,9 @@ outside `--registered-buffer-mb-per-worker` (88 MiB of fixed buffer capacity
 per worker with defaults). They are counted in retained memory, remain
 allocated until teardown, and use unregistered I/O on io_uring. Failure to
 allocate any one names the worker and task and fails startup.
+Worker zero's maintenance buffers are allocated before synchronous metadata
+loading, which borrows one read image for pages and system-state/catalog
+extents. Worker initialization reuses those allocations and retained charges.
 Startup recovery reuses these buffers for block scans, nested extent reads,
 and two-slot checkpoint prefetch. It drains outstanding reads before switching
 phases or starting maintenance, so these paths add no DMA capacity or write-slot
@@ -86,6 +89,8 @@ write workspace handles recycled-block header clearing and online metadata
 writes under its allocator's coroutine mutex. It is charged to that device's
 owner worker and uses unregistered I/O on io_uring. Allocation failure names
 the device and prevents startup; it never borrows ordinary read/write slots.
+Synchronous startup label and reset writes use the same device workspace,
+with larger ranges split into chunks that fit it.
 
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
