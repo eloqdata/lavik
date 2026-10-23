@@ -586,8 +586,10 @@ Logs, JUnit, and plans are under `<build>/test-results/`, with
 `shard-N-of-M/` subdirectories for partitioned runs. Per-architecture/shard
 artifacts are retained for seven days; build bundles for one day.
 The existing required check names `Tests (amd64)` and `Tests (arm64)` are
-preserved as completion gates. Both require every build, shard and Admin job
-to succeed; failure, cancellation, or skipped work cannot report a passing test gate.
+preserved as completion gates. Each requires its own architecture's build,
+six shards, and Admin job to succeed; failure, cancellation, or skipped work
+cannot report a passing test gate. Each architecture's shards start after its
+own build succeeds, and its gate waits only for that architecture's jobs.
 
 The RedisShake ScanReader integration test additionally needs RedisShake on
 PATH (or `-DLAVIK_REDIS_SHAKE_EXECUTABLE=/path/to/redis-shake`) and Meta enabled.
