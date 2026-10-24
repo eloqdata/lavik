@@ -16,6 +16,11 @@
 
 #include <thread>
 
+#if BYCORF_KERNEL_BYPASS
+#include <spdk/env.h>
+#include <spdk/env_dpdk.h>
+#endif
+
 #include "absl/strings/str_cat.h"
 #include "device_affinity.h"
 #include "flush_policy.h"
@@ -23,6 +28,56 @@
 
 namespace lavik::storage {
 namespace {
+
+#if BYCORF_KERNEL_BYPASS
+// Called once after every worker has allocated its fixed buffers and opened
+// its SPDK queues. Read the already initialized EAL; diagnostics must not
+// initialize it or turn a statistics failure into a storage startup failure.
+// EAL heap usage includes Lavik's retained-accounted DMA buffers, so these
+// numbers must not be added to retained memory. Heap capacity is not RSS or
+// the host's hugepage reservation. NUMA snapshots are sampled sequentially.
+void LogSpdkMemoryStats() {
+  spdk_env_dpdk_mem_stats total{};
+  std::size_t numa_nodes = 0;
+  std::int32_t numa_id;
+  SPDK_ENV_FOREACH_NUMA_ID(numa_id) {
+    spdk_env_dpdk_mem_stats stats{};
+    const int rc = spdk_env_dpdk_get_mem_stats(&stats, numa_id);
+    if (rc != 0) {
+      // Do not publish a partial sum as the process total.
+      spdlog::warn(
+          "SPDK/EAL memory phase=storage-open numa={} statistics failed: "
+          "rc={}; aggregate unavailable",
+          numa_id, rc);
+      return;
+    }
+    spdlog::info(
+        "SPDK/EAL memory phase=storage-open numa={} heap_total_bytes={} "
+        "heap_allocated_bytes={} heap_free_bytes={} "
+        "largest_free_block_bytes={}",
+        numa_id, stats.heap_totalsz_bytes, stats.heap_allocsz_bytes,
+        stats.heap_freesz_bytes, stats.greatest_free_size);
+    ++numa_nodes;
+    total.heap_totalsz_bytes += stats.heap_totalsz_bytes;
+    total.heap_allocsz_bytes += stats.heap_allocsz_bytes;
+    total.heap_freesz_bytes += stats.heap_freesz_bytes;
+    // Separate free blocks cannot satisfy one larger contiguous allocation.
+    total.greatest_free_size =
+        std::max(total.greatest_free_size, stats.greatest_free_size);
+  }
+  if (numa_nodes == 0) {
+    spdlog::warn("SPDK/EAL memory phase=storage-open has no NUMA statistics");
+    return;
+  }
+  spdlog::info(
+      "SPDK/EAL memory phase=storage-open numa=all numa_nodes={} "
+      "heap_total_bytes={} heap_allocated_bytes={} heap_free_bytes={} "
+      "largest_free_block_bytes={} (includes retained-accounted storage "
+      "buffers; do not add to retained memory)",
+      numa_nodes, total.heap_totalsz_bytes, total.heap_allocsz_bytes,
+      total.heap_freesz_bytes, total.greatest_free_size);
+}
+#endif
 
 std::vector<std::uint64_t> InitialEpochValues() {
   std::vector<std::uint64_t> values(kEpochValueCount, 1);
@@ -1191,6 +1246,12 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   if (!status.ok()) {
     co_return status;
   }
+
+#if BYCORF_KERNEL_BYPASS
+  if (worker.id() == 0 && bycorf::SpdkStorageEnabled()) {
+    LogSpdkMemoryStats();
+  }
+#endif
 
   std::vector<RecoveryBatch> batches(worker_count_);
   std::vector<std::uint64_t> zero_blocks;

@@ -193,6 +193,27 @@ keeps its startup default; verify `spdk_foreground_pre_poll_us=5` in the startup
 log rather than through `CONFIG GET`. Inspect startup logs
 for SPDK initialization and the selected namespaces before loading data.
 
+With SPDK storage, `SPDK/EAL memory phase=storage-open` logs a snapshot after
+all data workers have allocated their fixed storage buffers and opened their
+NVMe queue pairs, before recovery completes. It reports each EAL NUMA node and
+one `numa=all` aggregate, with byte-valued fields:
+
+| Field | Meaning |
+|---|---|
+| `heap_total_bytes` | Capacity currently managed by the EAL heap |
+| `heap_allocated_bytes` | Allocated EAL heap space, including storage DMA buffers and SPDK/DPDK internal allocations |
+| `heap_free_bytes` | Unallocated space within that heap |
+| `largest_free_block_bytes` | Largest individual free heap block; the aggregate takes the maximum across nodes, not their sum |
+
+These are allocator statistics, not RSS, the host's hugepage reservation, or a
+runtime peak. They also apply to an EAL configured with `--no-huge`. Storage
+buffers are already charged to retained memory, so do not add the EAL totals to
+retained memory or treat all allocated bytes as additional internal overhead.
+The NUMA samples are sequential; the largest free block does not guarantee a
+future allocation's alignment, DMA-contiguity, or NUMA requirements. A failed
+statistics query emits a warning and omits the aggregate without failing
+startup. io_uring storage does not emit this snapshot or initialize EAL for it.
+
 Separate instances must use disjoint namespaces and distinct listener ports.
 For storage-set expansion, worker/controller affinity and queue-capacity
 constraints, follow [multi-device storage](multi-device-storage.md). Benchmark
