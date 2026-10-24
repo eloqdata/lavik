@@ -631,6 +631,8 @@ VMs. Local callers can set `LAVIK_TEST_DATA_DIR` to another writable directory.
 Logs, JUnit, and plans are under `<build>/test-results/`, with
 `shard-N-of-M/` subdirectories for partitioned runs. Per-architecture/shard
 artifacts are retained for seven days; build bundles for one day.
+The software test command is capped at 80 minutes within the 90-minute shard
+job, leaving time to upload diagnostics when a shard times out.
 The existing required check names `Tests (amd64)` and `Tests (arm64)` are
 preserved as completion gates. Each requires its own architecture's build,
 six shards, and Admin job to succeed; failure, cancellation, or skipped work

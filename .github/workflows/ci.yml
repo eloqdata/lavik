@@ -255,7 +255,10 @@ jobs:
           scratch_device=$(sudo losetup --find --show "$scratch_image")
           export LAVIK_CLUSTER_HARDWARE_OPT_IN=1
           export LAVIK_CLUSTER_SCRATCH_DEVICE="$scratch_device"
-          ./scripts/run_ci_tests.sh build_ci --shard-index "$SHARD_INDEX" --shard-count 6
+          # Finish before the 90-minute job limit so failed/hung shards can
+          # still upload their last test output instead of losing all logs.
+          timeout --kill-after=30s 80m ./scripts/run_ci_tests.sh build_ci \
+            --shard-index "$SHARD_INDEX" --shard-count 6
       - name: Upload test results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7

@@ -26,15 +26,19 @@
 namespace lavik::test {
 
 // Preserve the working allowance of storage admission tests while accounting
-// for fixed primary-map objects and I/O pools. Page directories are already
-// included in working_limit. The returned value is the actual --max-memory;
-// keep client quotas explicit when they are part of the scenario.
+// for fixed primary-map objects and I/O pools, including three maintenance
+// readers per worker, one process-wide export workspace and one device's
+// metadata workspace. Page directories are already included in working_limit.
+// The returned value is the actual --max-memory; keep client quotas explicit
+// when they are part of the scenario.
 inline std::string WithStorageBaseline(std::uint64_t working_limit,
                                        unsigned workers) {
   const auto fixed_bytes =
       sizeof(storage::RecordIndex) * storage::kLogicalStorageShards *
           storage::kLogicalDatabaseCount +
-      workers * storage::RegisteredBufferPoolOptions{}.registered_bytes_;
+      workers * (storage::RegisteredBufferPoolOptions{}.registered_bytes_ +
+                 3 * storage::kStorageBlockBytes) +
+      storage::kStorageBlockBytes + 2 * storage::kDirectIoAlignment;
   return std::to_string(working_limit + (fixed_bytes * 10 + 8) / 9);
 }
 

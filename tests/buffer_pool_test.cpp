@@ -18,6 +18,8 @@
 
 #include <fcntl.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -303,6 +305,13 @@ class BufferPoolMemlockTest : public ::testing::Test {
   };
 
   void SetUp() override {
+    // Exact memlock boundaries require base pages. Pinning an 8 KiB slice of
+    // a transparent huge page can charge the entire huge page on some kernels.
+    // The production fallback permits that extra charge; these tests isolate
+    // registration priority from the host's THP policy.
+    original_thp_disabled_ = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+    ASSERT_GE(original_thp_disabled_, 0);
+    ASSERT_EQ(prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0), 0);
     const int rc = getrlimit(RLIMIT_MEMLOCK, &original_limit_);
     limit_saved_ = rc == 0;
     ASSERT_EQ(rc, 0);
@@ -323,10 +332,12 @@ class BufferPoolMemlockTest : public ::testing::Test {
     if (worker_) worker_->Shutdown();
     pool_.reset();
     for (const auto& buffer : device_buffers_)
-      bycorf::FreeStorageBuffer(buffer.data_, 4096);
+      EXPECT_EQ(munmap(buffer.data_, buffer.size_), 0);
     if (wake_fd_ >= 0) close(wake_fd_);
     unlink(path_);
     if (limit_saved_) EXPECT_EQ(setrlimit(RLIMIT_MEMLOCK, &original_limit_), 0);
+    if (original_thp_disabled_ >= 0)
+      EXPECT_EQ(prctl(PR_SET_THP_DISABLE, original_thp_disabled_, 0, 0, 0), 0);
     bycorf::MutableThisWorker() = std::move(saved_context_);
   }
 
@@ -377,9 +388,13 @@ class BufferPoolMemlockTest : public ::testing::Test {
 
   void AddDeviceBuffers(unsigned count) {
     for (unsigned i = 0; i < count; ++i) {
+      // A fresh mapping cannot inherit a heap page collapsed before SetUp
+      // disabled THP. Ownership stays here, just as it does in the allocator
+      // that lends device workspaces to the production pool.
       auto* data = static_cast<std::byte*>(
-          bycorf::AllocateStorageBuffer(8 * kKiB, 4096));
-      ASSERT_NE(data, nullptr);
+          mmap(nullptr, 8 * kKiB, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+      ASSERT_NE(data, MAP_FAILED);
       device_buffers_.push_back({.data_ = data, .size_ = 8 * kKiB});
     }
   }
@@ -507,6 +522,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
   std::unique_ptr<bycorf::Worker> worker_;
   std::unique_ptr<RegisteredBufferPool> pool_;
   std::vector<bycorf::FixedBuffer> device_buffers_;
+  int original_thp_disabled_ = -1;
   RegisteredBufferPoolOptions options_;
   int wake_fd_ = -1;
   char path_[64] = "/tmp/lavik-buffer-memlock-XXXXXX";
