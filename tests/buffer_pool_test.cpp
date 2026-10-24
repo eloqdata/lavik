@@ -386,16 +386,16 @@ class BufferPoolMemlockTest : public ::testing::Test {
     ASSERT_EQ(completion.calls, 1);
   }
 
-  void AddDeviceBuffers(unsigned count) {
+  void AddDeviceBuffers(unsigned count, std::size_t bytes = 8 * kKiB) {
     for (unsigned i = 0; i < count; ++i) {
       // A fresh mapping cannot inherit a heap page collapsed before SetUp
       // disabled THP. Ownership stays here, just as it does in the allocator
       // that lends device workspaces to the production pool.
-      auto* data = static_cast<std::byte*>(
-          mmap(nullptr, 8 * kKiB, PROT_READ | PROT_WRITE,
-               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+      auto* data =
+          static_cast<std::byte*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
       ASSERT_NE(data, MAP_FAILED);
-      device_buffers_.push_back({.data_ = data, .size_ = 8 * kKiB});
+      device_buffers_.push_back({.data_ = data, .size_ = bytes});
     }
   }
 
@@ -956,8 +956,11 @@ TEST_F(BufferPoolMemlockTest, NoFixedReadSlotsNeverWaitForAllocationFailure) {
 }
 
 TEST_F(BufferPoolMemlockTest, DeviceWorkspacesPrecedeReadsAndStayWhole) {
-  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
-  ASSERT_NO_FATAL_FAILURE(Init(12 * kKiB));
+  // Kernels that charge the io_uring queues to memlock need headroom outside
+  // the registered buffers. Scale these workspaces so one fits with queue
+  // overhead, but two cannot fit even on kernels that charge only buffers.
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2, kMiB));
+  ASSERT_NO_FATAL_FAILURE(Init(kMiB + 512 * kKiB));
   if (IsSkipped()) return;
   ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(device_buffers_[0], true));
   ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(device_buffers_[1], false));
@@ -969,8 +972,11 @@ TEST_F(BufferPoolMemlockTest, DeviceWorkspacesPrecedeReadsAndStayWhole) {
 }
 
 TEST_F(BufferPoolMemlockTest, DeviceWorkspacesThenReadSlotsUseRemainingBudget) {
-  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
-  ASSERT_NO_FATAL_FAILURE(Init(16 * kKiB + 2 * options_.read_slot_bytes_));
+  options_.read_slot_bytes_ = 256 * kKiB;
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2, kMiB));
+  // Spare memlock covers the ring itself, but is smaller than another slot.
+  ASSERT_NO_FATAL_FAILURE(
+      Init(2 * kMiB + 2 * options_.read_slot_bytes_ + 128 * kKiB));
   if (IsSkipped()) return;
   for (const auto& buffer : device_buffers_)
     ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
@@ -982,7 +988,8 @@ TEST_F(BufferPoolMemlockTest, MaintenanceRegistersAfterAllOrdinarySlots) {
   const auto baseline = WorkerMemoryAccountingBytes(0);
   ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2));
   const auto addresses = device_buffers_;
-  ASSERT_NO_FATAL_FAILURE(Init(16 * kMiB + 16 * kKiB));
+  // Leave room for kernel ring accounting, but not a second 8 MiB workspace.
+  ASSERT_NO_FATAL_FAILURE(Init(16 * kMiB + 512 * kKiB));
   if (IsSkipped()) return;
   ASSERT_TRUE(pool_->buffers_registered());
   ASSERT_NO_FATAL_FAILURE(CheckIo(2, 341, 341, 2, 2));

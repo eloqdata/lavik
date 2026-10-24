@@ -3409,7 +3409,13 @@ class ReplicationLogService final : public bycorf::Service {
   }
 
   bycorf::Task<absl::Status> ExercisePublishedStringCommands() {
-    absl::Status status;
+    // Earlier independent cases leave large values and transaction versions
+    // on the same 256 MiB device, and their intentional OOMs can delay GC.
+    // Reclaim that fixture before creating and replaying another large value;
+    // this case verifies replication, not capacity shared with prior cases.
+    absl::Status status =
+        co_await ExecuteClientCommand(0, {"FLUSHALL", "SYNC"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
     // Client command dispatch transfers committed writes to the asynchronous
     // publisher. Large arguments may span replication frames, but decode and
     // apply still see one command and one LSN.
