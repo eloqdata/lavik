@@ -177,10 +177,11 @@ TEST(GroupedTransferE2e, FullImageScratchOomPreservesValuesAndMetadataReads) {
   }
   {
     // After its fixed 16 MiB arena directory, each worker has less than the
-    // 9 MiB reply left in its 21.6 MiB steady-state quota. Reject the full
+    // 9 MiB reply left in its 21.6 MiB working quota (after fixed map
+    // objects and I/O pools). Reject the full
     // image even when a read retains just one copy, without relying on mutation
     // scratch multipliers to make an otherwise affordable reply fail.
-    Server server(disk, 4, {}, {}, false, 2, "96M");
+    Server server(disk, 4, {}, {}, false, 2, WithStorageBaseline(96 * kMiB, 4));
     Client client(server.port());
     for (const std::vector<std::string> command :
          {std::vector<std::string>{"HGETALL", "hash"},
@@ -215,7 +216,8 @@ TEST(GroupedTransferE2e, ScanUsesOneLeafAndSurvivesDeletingEarlierFields) {
   {
     // Recovery changes the process digest seed. Grouped scan must use its
     // persisted routing seed, not the compact decoder's current-process hash.
-    Server server(disk, 4, {}, {}, false, 2, "128M");
+    Server server(disk, 4, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 4));
     Client client(server.port());
     for (const bool hash : {true, false}) {
       const std::string key = hash ? "hash" : "set";
@@ -271,10 +273,12 @@ TEST(GroupedTransferE2e, ListSearchRetainsOnePageAndInsertOnlyItsInterval) {
   {
     // Four owner shares cannot admit a four-copy image of the oversized
     // unrelated item. Searching still needs only one decoded page at a time.
-    Server server(disk, 4, {}, {}, false, 2, "128M");
+    Server server(disk, 4, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 4));
     Client client(server.port());
     ASSERT_NE(client.Command({"INFO", "MEMORY"})
-                  .text_.find("maxmemory:134217728\r\n"),
+                  .text_.find("maxmemory:" +
+                              WithStorageBaseline(128 * kMiB, 4) + "\r\n"),
               std::string::npos);
     EXPECT_EQ(client.Command({"LPOS", "list", "needle"}).text_, "257");
     EXPECT_EQ(client.Command({"LPOS", "list", "needle", "RANK", "-1"}).text_,
@@ -314,6 +318,10 @@ TEST(GroupedTransferE2e, ListSearchRetainsOnePageAndInsertOnlyItsInterval) {
 TEST(GroupedTransferE2e, RandomFieldsAndSetPopDoNotMaterializeTheCollection) {
   PrivateDisk disk;
   const std::string huge(9 * 1024 * 1024, 'H');
+  // The Hash projection retains its 9 MiB read image and 9 MiB reply together.
+  // Leave room for both above the directory footprint, while the full Set
+  // rewrite below must still fail admission atomically.
+  constexpr std::uint64_t working_limit = 192 * kMiB;
   std::set<std::string> members;
   for (unsigned i = 0; i < 256; ++i)
     members.insert(std::string(96 * 1024, 's') + std::to_string(i));
@@ -329,10 +337,12 @@ TEST(GroupedTransferE2e, RandomFieldsAndSetPopDoNotMaterializeTheCollection) {
   }
   std::set<std::string> removed;
   {
-    Server server(disk, 4, {}, {}, false, 2, "128M");
+    Server server(disk, 4, {}, {}, false, 2,
+                  WithStorageBaseline(working_limit, 4));
     Client client(server.port());
     ASSERT_NE(client.Command({"INFO", "MEMORY"})
-                  .text_.find("maxmemory:134217728\r\n"),
+                  .text_.find("maxmemory:" +
+                              WithStorageBaseline(working_limit, 4) + "\r\n"),
               std::string::npos);
     const auto fields = client.Command({"HRANDFIELD", "hash", "257"});
     ASSERT_EQ(fields.kind_, '*') << fields.text_ << server.Log();
@@ -629,7 +639,8 @@ TEST(GroupedTransferE2e, SetMultiKeyOomLeavesDestinationAndHoldsIntact) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    Server server(disk, 4, {}, {}, false, 2, "128M");
+    Server server(disk, 4, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 4));
     Client client(server.port());
     // Each source is readable independently, but admitting the complete
     // aggregate output and overlapping reply/STORE buffers exceeds an owner

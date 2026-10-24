@@ -2368,7 +2368,7 @@ void RunPromotionPrepareCase(std::string_view fault_stage) {
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
@@ -4146,7 +4146,7 @@ void RunCandidateRecoveryCase(unsigned mode, unsigned parent_mode = 0,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
   lavik::ReplicationOptions options;
   options.meta_managed_ = true;
@@ -5912,7 +5912,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
@@ -5991,7 +5991,7 @@ void RunTargetLeaseAdmissionRetryCase(unsigned suspended_responses,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
@@ -6078,7 +6078,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
@@ -6121,7 +6121,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
@@ -6166,7 +6166,7 @@ void RunRecoverableEmptyPopulationFault(const char* environment_name,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions replication_options;
@@ -6351,7 +6351,7 @@ void RunFailoverActionDispositionCase(PreparedActionDisposition disposition,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6482,7 +6482,7 @@ void RunFailoverActionWatchdogCase(std::string_view fault_variable,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6538,7 +6538,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6604,7 +6604,7 @@ void RunInFlightSelfOriginActionCase(NativeActionDisposition disposition,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6654,7 +6654,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6702,7 +6702,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6742,7 +6742,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;
@@ -6799,7 +6799,7 @@ TEST(ReplicationManagerIntegrationTest,
   storage_options.replication_publish_queue_bytes_ = 16 * kMiB;
   lavik::storage::StorageEngine storage(std::move(storage_options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
 
   lavik::ReplicationOptions options;

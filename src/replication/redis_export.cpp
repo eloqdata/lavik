@@ -60,8 +60,9 @@ Task<absl::Status> ConsumeRedisExportAcks(
   co_return status;
 }
 
-// Multiple storage workers encode the point-in-time image concurrently, but
-// the Redis wire remains one ordered byte stream. Queue pressure suspends only
+// Storage workers scan the point-in-time image concurrently. Encoding and
+// enqueueing hold an entry lease so different keys cannot interleave bytes,
+// including across streamed collection pages. Queue pressure suspends only
 // these background scanners; it never holds command admission closed.
 class RedisRdbStreamQueue
     : public std::enable_shared_from_this<RedisRdbStreamQueue> {

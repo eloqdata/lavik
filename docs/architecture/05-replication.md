@@ -1359,8 +1359,11 @@ The connection owner reads the per-worker streams, preserving each flow's
 order. Independent keys on different workers may interleave; transaction
 envelopes wait for every participant and database-wide controls wait for every
 worker before the owner writes a single Redis-compatible command to the disk
-stream. The RDB queue holds only bounded encoded fragments. After RDB EOF,
-another short gate and publisher fence fix the disk stream's end cursors.
+stream. RDB workers scan concurrently, but encoding and enqueueing hold an
+exclusive entry lease so different keys cannot interleave bytes, including
+across streamed collection pages. The queue holds bounded encoded fragments.
+After RDB EOF, another short gate and publisher fence fix the disk stream's end
+cursors.
 A nonzero FULLRESYNC initial offset and an initial ACK after EOF separate the
 RDB from incremental bytes without depending on TCP packet boundaries. ACKs
 may include Redis's optional FACK durability offset; it is validated but does
@@ -1374,8 +1377,11 @@ a slow consumer by default or disconnects it on a revoked coverage gap.
 runtime changes use the same worker update and publisher wakeup path. Disk
 quota or device exhaustion always cancels this export and releases its pins.
 The disk quota defaults to 1 GiB, floors to whole 8 MiB blocks, and is sampled
-at session start; CONFIG SET affects subsequent sessions. Staging remains
-charged to retained memory. Stream group deltas are translated to Redis
+at session start; CONFIG SET affects subsequent sessions. Storage reserves one
+process-wide 8 MiB export workspace at startup, charged for the engine's lifetime.
+The sole session owns it exclusively through capture and replay, draining I/O
+before reuse or release to the next session. The disk quota does not change
+this capacity. Stream group deltas are translated to Redis
 XGROUP/XCLAIM/XACK commands; private native payloads are never a Redis wire
 format. RedisShake does not make imported transactions atomically visible to
 other clients, so the target remains isolated until cutover.

@@ -158,7 +158,8 @@ TEST(GroupedRandomStreamE2e, GroupedSnapshotsKeepPairsAfterExecDeletesKey) {
 
 TEST(GroupedRandomStreamE2e, DisconnectDuringLargeBulkReleasesStreamState) {
   PrivateDisk disk;
-  Server server(disk, 2, {}, {}, false, 2, "128M", {}, "32M");
+  Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(128 * kMiB, 2),
+                {}, "32M");
   Client client(server.port());
   const std::string item(2 * 1024 * 1024, 'b');
   for (const auto* type : {"hash", "set", "zset"}) {

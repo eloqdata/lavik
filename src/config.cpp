@@ -794,9 +794,11 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError(
         "dbfilename must be a plain filename without '/'");
   }
-  if (options.storage_write_buffer_count_ == 0) {
+  // Shutdown checkpoints reuse two drained write slots. Keep them available
+  // even when checkpoints start disabled: CONFIG SET can enable one later.
+  if (options.storage_write_buffer_count_ < 2) {
     return absl::InvalidArgumentError(
-        "storage write buffer count must be nonzero");
+        "storage-write-buffers-per-worker must be at least 2");
   }
   storage::RegisteredBufferPoolOptions buffers;
   buffers.read_slot_bytes_ = options.storage_read_buffer_bytes_;

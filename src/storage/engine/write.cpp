@@ -477,21 +477,13 @@ FixedBuffer StorageEngine::Impl::StagingBufferFor(
   if (slot == nullptr) {
     return FixedBuffer{};
   }
-  if (slot->write_buffer_id_ != 0) {
-    return store.buffers_.write_buffer(slot->write_buffer_id_);
-  }
-  return FixedBuffer{
-      .data_ = slot->heap_data_, .size_ = slot->heap_data_size_, .index_ = 0};
+  return store.buffers_.write_buffer(slot->write_buffer_id_);
 }
 
 void StorageEngine::Impl::ReleaseStagingBuffer(WorkerStore& store,
                                                BlockState& state) {
   if (StagingSlot* slot = StagingFor(store, state); slot != nullptr) {
-    if (slot->write_buffer_id_ != 0) {
-      store.buffers_.ReleaseWriteBuffer(slot->write_buffer_id_);
-    } else if (slot->heap_data_ != nullptr) {
-      store.buffers_.ReleaseHeapWriteBuffer(slot->heap_data_);
-    }
+    store.buffers_.ReleaseWriteBuffer(slot->write_buffer_id_);
     *slot = StagingSlot{};
     slot->next_free_ = store.free_staging_slot_;
     store.free_staging_slot_ = state.staging_slot_;
@@ -1763,31 +1755,24 @@ StorageEngine::Impl::WriteExtentValueLocked(
         .payload_checksum_ = 0,
     });
     std::uint16_t write_buffer_id = 0;
-    std::byte* heap_buffer = nullptr;
-    while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-      // Extent construction is part of a foreground write. Do not let it
-      // bypass the configured storage pool with an unbounded 8 MiB heap
-      // allocation. Active append streams retain their buffers even after a
-      // flush; seal them before waiting so capacity can actually be returned.
+    if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
+      // Active append streams retain their buffers even after a flush; seal
+      // them before waiting so capacity can actually be returned.
       // A live transaction may open a new Tx stream after this seal.
       SealActiveBlocks(store);
       store.store_state_mutex_.Unlock(*store.worker_);
-      co_await store.buffers_.WaitForWriteBuffer();
+      auto acquired = co_await store.buffers_.AcquireWriteBuffer();
       co_await store.store_state_mutex_.Lock();
+      if (!acquired.ok()) {
+        reclaim_allocated();
+        co_return acquired.status();
+      }
+      write_buffer_id = *acquired;
     }
     auto release_buffer = [&]() {
-      if (write_buffer_id != 0) {
-        store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-      } else {
-        store.buffers_.ReleaseHeapWriteBuffer(heap_buffer);
-      }
+      store.buffers_.ReleaseWriteBuffer(write_buffer_id);
     };
-    FixedBuffer staging =
-        write_buffer_id != 0
-            ? store.buffers_.write_buffer(write_buffer_id)
-            : FixedBuffer{.data_ = heap_buffer,
-                          .size_ = options_.buffers_.write_buffer_bytes_,
-                          .index_ = 0};
+    FixedBuffer staging = store.buffers_.write_buffer(write_buffer_id);
     if (staging.data_ == nullptr || staging.size_ < kStorageBlockBytes) {
       release_buffer();
       reclaim_allocated();
@@ -2655,6 +2640,22 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     SetLatencyTrace* trace
 #endif
 ) {
+  // Direct FIFO handoff does not wake the remaining writers to reseal a new
+  // active stream. A writer ahead of them must make its staging slot flushable
+  // on every exit, including stale-relocation/validation failures after an
+  // empty stream was installed. Executing returns hold store state, but forced
+  // teardown can destroy a frame suspended without that lock. Never schedule
+  // flush work then. A graceful shutdown request alone must still allow this
+  // handoff: shutdown joins maintenance writers before its own seal/drain.
+  struct FlushForWaitingWriters {
+    Impl& engine_;
+    WorkerStore& store_;
+    ~FlushForWaitingWriters() {
+      if (store_.worker_->stop_requested()) [[unlikely]]
+        return;
+      if (store_.buffers_.has_write_waiters()) engine_.SealActiveBlocks(store_);
+    }
+  } flush_for_waiters{*this, store};
   const std::size_t payload_bytes =
       request.inline_payload_ != nullptr
           ? request.inline_payload_->encoded_bytes()
@@ -2941,54 +2942,44 @@ acquire_active_stream:
     }
     {
       std::uint16_t write_buffer_id = 0;
-      std::byte* heap_buffer = nullptr;
       if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-        if (request.for_defrag_ || !request.unlock_writer_while_waiting_) {
-          // Maintenance paths that deliberately keep store_state_mutex_
-          // across an atomic rewrite cannot wait for a flush that needs the
-          // same lock. Their concurrency is separately bounded.
-          if (!store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
-            absl::Status returned = co_await return_reserved(*allocated);
-            if (!returned.ok()) co_return returned;
-            co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                                   "no storage write buffer is available");
-          }
-        } else {
-          do {
-            // Active append streams can occupy every staging buffer.
-            // Transactions waiting to commit may still need a buffer, so seal
-            // the streams before waiting. Tagged records and transaction leases
-            // survive the seal, and flush returns their buffers.
-            SealActiveBlocks(store);
-            store.store_state_mutex_.Unlock(*store.worker_);
-            co_await store.buffers_.WaitForWriteBuffer();
-            co_await store.store_state_mutex_.Lock();
-          } while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id));
+        // Active append streams can occupy every staging buffer.
+        // Transactions waiting to commit may still need a buffer, so seal
+        // the streams before waiting. Tagged records and transaction leases
+        // survive the seal, and flush returns their buffers.
+        SealActiveBlocks(store);
+        store.store_state_mutex_.Unlock(*store.worker_);
+        auto acquired = co_await store.buffers_.AcquireWriteBuffer();
+        co_await store.store_state_mutex_.Lock();
+        if (!acquired.ok()) {
+          absl::Status returned = co_await return_reserved(*allocated);
+          if (!returned.ok()) co_return returned;
+          co_return acquired.status();
+        }
+        write_buffer_id = *acquired;
 
-          // Another writer may have installed this append stream while this
-          // coroutine was waiting without the store lock. It owns the stream;
-          // return both resources and let the outer loop append to it.
-          if (active_stream().has_value()) {
-            store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-            absl::Status returned = co_await return_reserved(*allocated);
-            if (!returned.ok()) co_return returned;
-            continue;
-          }
+        if (store.write_failed_ || RuntimeFailureLatched()) {
+          store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+          absl::Status returned = co_await return_reserved(*allocated);
+          if (!returned.ok()) co_return returned;
+          co_return absl::FailedPreconditionError(
+              "storage writer is stopped after an IO failure");
+        }
+
+        // Another writer may have installed this append stream while this
+        // coroutine was waiting without the store lock. It owns the stream;
+        // return both resources and let the outer loop append to it.
+        if (active_stream().has_value()) {
+          store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+          absl::Status returned = co_await return_reserved(*allocated);
+          if (!returned.ok()) co_return returned;
+          continue;
         }
       }
-      FixedBuffer staging_buffer =
-          write_buffer_id != 0
-              ? store.buffers_.write_buffer(write_buffer_id)
-              : FixedBuffer{.data_ = heap_buffer,
-                            .size_ = options_.buffers_.write_buffer_bytes_,
-                            .index_ = 0};
+      FixedBuffer staging_buffer = store.buffers_.write_buffer(write_buffer_id);
       if (staging_buffer.data_ == nullptr ||
           staging_buffer.size_ < kBlockHeaderBytes) {
-        if (write_buffer_id != 0) {
-          store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-        } else {
-          store.buffers_.ReleaseHeapWriteBuffer(heap_buffer);
-        }
+        store.buffers_.ReleaseWriteBuffer(write_buffer_id);
         absl::Status returned = co_await return_reserved(*allocated);
         if (!returned.ok()) co_return returned;
         co_return absl::Status(absl::StatusCode::kInternal,
@@ -3011,8 +3002,6 @@ acquire_active_stream:
           .record_count_ = 0,
           .max_lsn_ = 0,
           .write_buffer_id_ = write_buffer_id,
-          .heap_buffer_ = heap_buffer,
-          .heap_buffer_size_ = options_.buffers_.write_buffer_bytes_,
           .kind_ = append_block_kind,
       };
       if (!transaction_append && !request.indirect_key_record_) {
@@ -3042,8 +3031,6 @@ acquire_active_stream:
       state.staging_slot_ = AcquireStagingSlot(store);
       StagingSlot& staging_state = store.staging_slots_[state.staging_slot_];
       staging_state.write_buffer_id_ = write_buffer_id;
-      staging_state.heap_data_ = heap_buffer;
-      staging_state.heap_data_size_ = options_.buffers_.write_buffer_bytes_;
       staging_state.committed_bytes_ = kBlockHeaderBytes;
       store.staged_records_.erase(block_id);
 
@@ -3285,12 +3272,7 @@ acquire_active_stream:
     co_return absl::Status(absl::StatusCode::kInternal,
                            "active block has no staging slot");
   }
-  FixedBuffer staging =
-      updated.write_buffer_id_ != 0
-          ? store.buffers_.write_buffer(updated.write_buffer_id_)
-          : FixedBuffer{.data_ = updated.heap_buffer_,
-                        .size_ = updated.heap_buffer_size_,
-                        .index_ = 0};
+  FixedBuffer staging = store.buffers_.write_buffer(updated.write_buffer_id_);
   if (staging.data_ == nullptr ||
       record_offset + total_disk_bytes > staging.size_) {
     co_return absl::Status(absl::StatusCode::kInternal,

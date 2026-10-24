@@ -244,7 +244,8 @@ class ServerProcess {
  public:
   ServerProcess(std::string_view binary, std::uint16_t redis_port,
                 std::uint16_t metrics_port, std::string_view data_path,
-                std::string_view log_path, unsigned workers = 2) {
+                std::string_view log_path, unsigned workers = 2,
+                std::uint64_t max_memory = 1024ULL * 1024 * 1024) {
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("fork failed");
@@ -271,7 +272,7 @@ class ServerProcess {
           "--recv-buffers-per-worker",
           "0",
           "--max-memory",
-          "1073741824",
+          std::to_string(max_memory),
           "--flush-max-ms",
           "20",
           "--data-file",
@@ -389,8 +390,10 @@ TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
   auto metrics_port = FindFreePort();
   while (metrics_port == redis_port) metrics_port = FindFreePort();
   constexpr unsigned kWorkers = 4, kWriters = 4, kWrites = 64, kRounds = 16;
+  // Four workers' fixed indexes and storage pools exceed the retained-memory
+  // waterline at 1 GiB. Leave room for the concurrent allocation workload.
   ServerProcess server(g_lavik_binary, redis_port, metrics_port, data_path,
-                       log_path, kWorkers);
+                       log_path, kWorkers, 2ULL * 1024 * 1024 * 1024);
   RespClient control(redis_port);
   ASSERT_EQ(control.Command({"PING"}), "+PONG");
   auto require = [](bool ok, std::string_view message) {

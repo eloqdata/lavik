@@ -24,11 +24,16 @@
 #include <limits>
 #include <new>
 #include <optional>
+#include <utility>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"
+#include "absl/strings/str_cat.h"
 #include "bycorf/io/spdk_storage.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/fault_injection.h"
+#include "lavik/storage/format.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik::storage {
@@ -118,6 +123,10 @@ void ReadBufferLease::Reset() noexcept {
 }
 
 RegisteredBufferPool::~RegisteredBufferPool() {
+  for (const auto& buffer : maintenance_read_buffers_) {
+    if (buffer.data_ != nullptr)
+      bycorf::FreeStorageBuffer(buffer.data_, maintenance_alignment_);
+  }
   for (std::byte* arena : arenas_) {
     bycorf::FreeStorageBuffer(arena, options_.alignment_);
   }
@@ -129,23 +138,70 @@ RegisteredBufferPool::~RegisteredBufferPool() {
       bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
     }
   }
-  for (std::byte* buffer : heap_write_buffers_) {
-    if (buffer != nullptr && IsAligned(reinterpret_cast<std::uintptr_t>(buffer),
-                                       options_.alignment_)) {
-      bycorf::FreeStorageBuffer(buffer, options_.alignment_);
-    }
-  }
-  for (const bycorf::FixedBuffer& buffer : overflow_read_buffers_) {
-    if (buffer.data_ != nullptr &&
-        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
+  for (const auto& buffer : overflow_read_buffers_) {
+    if (buffer.buffer_.data_ != nullptr &&
+        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.buffer_.data_),
                   options_.alignment_)) {
-      bycorf::FreeStorageBuffer(buffer.data_, options_.alignment_);
+      buffer.Free(options_.alignment_);
     }
   }
 }
 
+absl::Status RegisteredBufferPool::PrepareMaintenanceBuffers(
+    unsigned owner_worker, std::size_t alignment) {
+  if (!IsPowerOfTwo(alignment) || alignment < kDirectIoAlignment ||
+      kStorageBlockBytes % alignment != 0) {
+    return absl::InvalidArgumentError("invalid maintenance buffer alignment");
+  }
+  if (maintenance_alignment_ != 0) {
+    if (owner_worker_ != owner_worker || maintenance_alignment_ != alignment) {
+      return absl::FailedPreconditionError(
+          "prepared maintenance buffer owner or alignment changed");
+    }
+    return absl::OkStatus();
+  }
+  // Scanners can suspend while relocating or making cross-worker claims.
+  // Separate workspaces preserve their concurrency without consuming the
+  // write slots whose progress those same scans may need.
+  std::array<bycorf::FixedBuffer, 3> maintenance_buffers{};
+  absl::Cleanup free_maintenance = [&] {
+    for (const auto& buffer : maintenance_buffers) {
+      if (buffer.data_ != nullptr)
+        bycorf::FreeStorageBuffer(buffer.data_, alignment);
+    }
+  };
+  constexpr std::array<const char*, 3> maintenance_names{"defrag", "tx-cleaner",
+                                                         "tomb-raider"};
+  for (std::size_t i = 0; i < maintenance_buffers.size(); ++i) {
+    bool fail_allocation = false;
+    LAVIK_FAULT_INJECT(
+        fail_allocation = LAVIK_FAULT_MATCHES(
+            "LAVIK_FAIL_MAINTENANCE_BUFFER_ALLOCATION", maintenance_names[i]););
+    auto* data = fail_allocation
+                     ? nullptr
+                     : static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
+                           kStorageBlockBytes, alignment));
+    if (data == nullptr) {
+      return absl::ResourceExhaustedError(absl::StrCat(
+          "worker ", owner_worker, ": failed to allocate ",
+          maintenance_names[i], " maintenance read buffer (",
+          kStorageBlockBytes, " bytes, ",
+          bycorf::SpdkStorageEnabled() ? "SPDK DMA" : "aligned memory", ")"));
+    }
+    maintenance_buffers[i] = {.data_ = data, .size_ = kStorageBlockBytes};
+  }
+  maintenance_read_buffers_ = maintenance_buffers;
+  maintenance_alignment_ = alignment;
+  owner_worker_ = owner_worker;
+  std::move(free_maintenance).Cancel();
+  maintenance_memory_.Account(
+      owner_worker + 1, maintenance_read_buffers_.size() * kStorageBlockBytes);
+  return absl::OkStatus();
+}
+
 absl::Status RegisteredBufferPool::Init(
-    bycorf::Worker& worker, const RegisteredBufferPoolOptions& options) {
+    bycorf::Worker& worker, const RegisteredBufferPoolOptions& options,
+    std::span<bycorf::FixedBuffer> priority_buffers) {
   if (initialized()) {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is already initialized");
@@ -163,9 +219,9 @@ absl::Status RegisteredBufferPool::Init(
         absl::StatusCode::kInvalidArgument,
         "registered buffer sizes must satisfy O_DIRECT alignment");
   }
-  if (options.storage_write_buffer_count_ == 0) {
+  if (options.storage_write_buffer_count_ < 2) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "storage write buffers are required");
+                        "at least two storage write buffers are required");
   }
   const std::size_t configured_write_count =
       options.storage_write_buffer_count_;
@@ -215,7 +271,18 @@ absl::Status RegisteredBufferPool::Init(
                         "total fixed-buffer count exceeds index range");
   }
 
+  for (const auto& buffer : priority_buffers) {
+    if (buffer.data_ == nullptr || buffer.size_ == 0 ||
+        reinterpret_cast<std::uintptr_t>(buffer.data_) % kDirectIoAlignment !=
+            0 ||
+        buffer.size_ % kDirectIoAlignment != 0) {
+      return absl::InvalidArgumentError("invalid priority storage workspace");
+    }
+  }
   const std::size_t read_base = registered_write_count + 1;
+  absl::Status prepared =
+      PrepareMaintenanceBuffers(worker.id(), options.alignment_);
+  if (!prepared.ok()) return prepared;
   const bool shared_arena = !bycorf::SpdkStorageEnabled();
   std::vector<iovec> iovecs;
   std::vector<bycorf::FixedBuffer> write_buffers;
@@ -315,113 +382,170 @@ absl::Status RegisteredBufferPool::Init(
     }
   }
 
+  absl::Cleanup free_pool = [&] {
+    if (shared_arena) {
+      for (auto* arena : arenas)
+        bycorf::FreeStorageBuffer(arena, options.alignment_);
+    } else {
+      for (const auto& buffer : write_buffers)
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+      for (const auto& buffer : read_buffers)
+        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
+    }
+  };
+  const std::size_t priority_count = priority_buffers.size();
+  const std::size_t maintenance_count = maintenance_read_buffers_.size();
+  constexpr std::size_t kMaxRegions =
+      std::size_t{std::numeric_limits<std::uint16_t>::max()} + 1;
+  if (priority_count > kMaxRegions - maintenance_count ||
+      iovecs.size() > kMaxRegions - maintenance_count - priority_count) {
+    return absl::OutOfRangeError("too many storage registration regions");
+  }
+  // Registration borrows the device images; ownership and retained charges
+  // stay with their allocators. Ordinary arenas keep their existing layout,
+  // with only their ring indices shifted past these small, high-priority pages.
+  std::vector<iovec> registration;
+  registration.reserve(priority_count + iovecs.size() + maintenance_count);
+  for (const auto& buffer : priority_buffers)
+    registration.push_back({buffer.data_, buffer.size_});
+  registration.insert(registration.end(), iovecs.begin(), iovecs.end());
+  for (auto& buffer : read_buffers) buffer.index_ += priority_count;
+  for (auto& buffer : write_buffers) buffer.index_ += priority_count;
+  for (auto& buffer : maintenance_read_buffers_) {
+    buffer.index_ = static_cast<std::uint16_t>(registration.size());
+    registration.push_back({buffer.data_, buffer.size_});
+  }
+  iovecs = std::move(registration);
+  std::size_t requested_bytes = 0;
+  for (const auto& region : iovecs) requested_bytes += region.iov_len;
+
   absl::Status status = worker.RegisterBuffers(iovecs);
-  bool buffers_registered = status.ok();
-  std::size_t registered_reads = buffers_registered ? read_count : 0;
-  std::size_t registered_writes =
-      buffers_registered ? registered_write_count : 0;
+  std::size_t registered_priority = status.ok() ? priority_count : 0;
+  std::size_t registered_reads = status.ok() ? read_count : 0;
+  std::size_t registered_writes = status.ok() ? registered_write_count : 0;
+  std::size_t registered_maintenance = status.ok() ? maintenance_count : 0;
+  std::vector<iovec> registered = status.ok() ? iovecs : std::vector<iovec>{};
   if (!status.ok()) {
     if (bycorf::SpdkStorageEnabled()) {
-      // SPDK registration is a DMA-addressability check; memory that fails it
-      // cannot be handed to the device at all, so plain IO would fail the same
-      // way. Fail fast instead of degrading.
-      for (const bycorf::FixedBuffer& buffer : write_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
-      }
-      for (const bycorf::FixedBuffer& buffer : read_buffers) {
-        bycorf::FreeStorageBuffer(buffer.data_, options.alignment_);
-      }
+      // SPDK registration validates DMA addressability. Ordinary I/O cannot
+      // rescue an invalid DMA image, so fail startup without degrading.
       return status;
-    } else {
-      rlimit memlock{};
-      if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
-        if (memlock.rlim_cur != RLIM_INFINITY) {
-          // Divide the allowance across runtime workers (including Meta is
-          // conservative). This is an estimate, not a reservation: other
-          // rings/registrations can consume it before this worker gets here.
-          const auto* cross_core = bycorf::ThisWorker().cross_core_;
-          const unsigned workers =
-              cross_core == nullptr ? 1 : cross_core->size();
-          std::uint64_t budget = memlock.rlim_cur / std::max(workers, 1U);
-          std::vector<iovec> partial(iovecs.size());
-          while (budget != 0) {
-            std::uint64_t remaining = budget;
-            const std::size_t reads = std::min<std::uint64_t>(
-                read_count, remaining / read_slot_bytes);
-            remaining -= reads * read_slot_bytes;
-            const std::size_t writes =
-                reads == read_count
-                    ? std::min<std::uint64_t>(
-                          registered_write_count,
-                          remaining / options.write_buffer_bytes_)
-                    : 0;
-            if (reads == 0 && writes == 0) break;
-            if (reads == read_count && writes == registered_write_count) {
-              budget /= 2;  // The full registration already failed.
-              continue;
-            }
-            // Pin a whole-slot prefix: read slots first, then complete write
-            // slots. Even slots sharing one index can be outside this prefix;
-            // buffer_registered(slot_id) selects ordinary I/O for those slots.
-            std::fill(partial.begin(), partial.end(), iovec{});
-            std::size_t bytes =
-                reads * read_slot_bytes + writes * options.write_buffer_bytes_;
-            for (std::size_t i = 0; i < iovecs.size() && bytes != 0; ++i) {
-              partial[i] = iovecs[i];
-              partial[i].iov_len = std::min(bytes, iovecs[i].iov_len);
-              bytes -= partial[i].iov_len;
-            }
-            status = worker.RegisterBuffers(partial);
-            if (status.ok()) {
-              registered_reads = reads;
-              registered_writes = writes;
-              spdlog::warn(
-                  "worker {}: io_uring buffer registration retried with "
-                  "RLIMIT_MEMLOCK soft={}; registered read slots={}/{} "
-                  "write slots={}/{} bytes={}; pool capacity unchanged, "
-                  "remaining slots use unregistered IO",
-                  worker.id(), static_cast<std::uint64_t>(memlock.rlim_cur),
-                  reads, read_count, writes, registered_write_count,
-                  reads * read_slot_bytes +
-                      writes * options.write_buffer_bytes_);
-              break;
-            }
-            // Existing registrations may leave less than the estimated
-            // share. Retry geometrically, with no cross-worker lock or wait.
-            budget /= 2;
+    }
+    rlimit memlock{};
+    if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
+      if (memlock.rlim_cur != RLIM_INFINITY) {
+        // The share is an estimate: other rings may pin memory concurrently.
+        // Retry geometrically without a cross-worker lock or reservation.
+        const auto* cross_core = bycorf::ThisWorker().cross_core_;
+        const unsigned workers = cross_core == nullptr ? 1 : cross_core->size();
+        std::uint64_t budget = memlock.rlim_cur / std::max(workers, 1U);
+        while (budget != 0) {
+          std::uint64_t remaining = budget;
+          std::size_t priority = 0;
+          while (priority < priority_count &&
+                 priority_buffers[priority].size_ <= remaining) {
+            remaining -= priority_buffers[priority++].size_;
           }
+          const std::size_t reads =
+              priority == priority_count
+                  ? std::min<std::uint64_t>(read_count,
+                                            remaining / read_slot_bytes)
+                  : 0;
+          remaining -= reads * read_slot_bytes;
+          const std::size_t writes =
+              priority == priority_count && reads == read_count
+                  ? std::min<std::uint64_t>(
+                        registered_write_count,
+                        remaining / options.write_buffer_bytes_)
+                  : 0;
+          remaining -= writes * options.write_buffer_bytes_;
+          const std::size_t maintenance =
+              priority == priority_count && reads == read_count &&
+                      writes == registered_write_count
+                  ? std::min<std::uint64_t>(maintenance_count,
+                                            remaining / kStorageBlockBytes)
+                  : 0;
+          remaining -= maintenance * kStorageBlockBytes;
+          const std::size_t bytes = budget - remaining;
+          if (bytes == 0) break;
+          if (bytes == requested_bytes) {
+            budget /= 2;  // The full registration already failed.
+            continue;
+          }
+          // All four priority classes form one prefix, rounded to complete
+          // buffers. Trim unused entries; even a metadata-only registration
+          // must work without reserving table space for the ordinary pool.
+          std::vector<iovec> partial;
+          std::size_t unfilled = bytes;
+          for (const auto& region : iovecs) {
+            if (unfilled == 0) break;
+            const auto size = std::min(unfilled, region.iov_len);
+            partial.push_back({region.iov_base, size});
+            unfilled -= size;
+          }
+          status = worker.RegisterBuffers(partial);
+          if (status.ok()) {
+            registered_priority = priority;
+            registered_reads = reads;
+            registered_writes = writes;
+            registered_maintenance = maintenance;
+            registered = std::move(partial);
+            spdlog::warn(
+                "worker {}: io_uring registration retried with RLIMIT_MEMLOCK "
+                "soft={}; device workspaces={}/{} read slots={}/{} write "
+                "slots={}/{} maintenance buffers={}/{} bytes={}; remaining "
+                "buffers use unregistered IO, capacity unchanged",
+                worker.id(), static_cast<std::uint64_t>(memlock.rlim_cur),
+                priority, priority_count, reads, read_count, writes,
+                registered_write_count, maintenance, maintenance_count, bytes);
+            break;
+          }
+          budget /= 2;
         }
-        if (!status.ok()) {
-          spdlog::warn(
-              "worker {}: io_uring buffer registration failed ({}); requested "
-              "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling "
-              "back "
-              "to the same reusable buffers with unregistered IO",
-              worker.id(), status.message(), options.registered_bytes_,
-              memlock.rlim_cur == RLIM_INFINITY
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : static_cast<std::uint64_t>(memlock.rlim_cur),
-              memlock.rlim_max == RLIM_INFINITY
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : static_cast<std::uint64_t>(memlock.rlim_max));
-        }
-      } else {
+      }
+      if (!status.ok()) {
         spdlog::warn(
             "worker {}: io_uring buffer registration failed ({}); requested "
-            "registered bytes={}; falling back to the same reusable buffers "
-            "with unregistered IO",
-            worker.id(), status.message(), options.registered_bytes_);
+            "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling back "
+            "to the same reusable buffers with unregistered IO",
+            worker.id(), status.message(), requested_bytes,
+            static_cast<std::uint64_t>(memlock.rlim_cur),
+            static_cast<std::uint64_t>(memlock.rlim_max));
       }
+    } else {
+      spdlog::warn(
+          "worker {}: io_uring buffer registration failed ({}); requested "
+          "registered bytes={}; falling back to the same reusable buffers "
+          "with unregistered IO",
+          worker.id(), status.message(), requested_bytes);
     }
+  }
+  if (registered_priority == priority_count && registered_reads == read_count &&
+      registered_writes == registered_write_count &&
+      registered_maintenance == maintenance_count) {
+    spdlog::info(
+        "worker {}: registered device workspaces={} read slots={} "
+        "write slots={} maintenance buffers={} bytes={}",
+        worker.id(), priority_count, read_count, registered_write_count,
+        maintenance_count, requested_bytes);
+  }
+  for (std::size_t i = 0; i < priority_count; ++i)
+    priority_buffers[i].index_ = static_cast<std::uint16_t>(i);
+  for (const auto& region : registered) {
+    registered_regions_.push_back(
+        {.data_ = static_cast<std::byte*>(region.iov_base),
+         .size_ = region.iov_len});
   }
 
   worker_ = &worker;
   cross_core_ = bycorf::ThisWorker().cross_core_;
   owner_worker_ = worker.id();
-  buffers_registered_ = buffers_registered;
+  buffers_registered_ = registered_reads == read_count &&
+                        registered_writes == registered_write_count;
   registered_read_count_ = registered_reads;
   registered_write_count_ = registered_writes;
   options_ = options;
+  std::move(free_pool).Cancel();
   arenas_ = std::move(arenas);
   write_buffers_ = std::move(write_buffers);
   read_buffers_ = std::move(read_buffers);
@@ -435,7 +559,23 @@ absl::Status RegisteredBufferPool::Init(
   for (std::size_t i = read_count; i > 0; --i) {
     free_read_buffers_.push_back(static_cast<std::uint16_t>(read_base + i - 1));
   }
+  // Charge actual slot capacity, excluding any unused tail of the configured
+  // budget. Registration fallback owns the same memory. Startup's recovery
+  // budget checks include this fixed footprint before serving begins.
+  buffer_memory_.Account(worker.id() + 1,
+                         registered_write_bytes + read_count * read_slot_bytes);
   return absl::OkStatus();
+}
+
+bool RegisteredBufferPool::workspace_registered(
+    bycorf::FixedBuffer buffer) const noexcept {
+  if (buffer.data_ == nullptr || buffer.index_ >= registered_regions_.size())
+    return false;
+  const auto& region = registered_regions_[buffer.index_];
+  const auto begin = reinterpret_cast<std::uintptr_t>(region.data_);
+  const auto address = reinterpret_cast<std::uintptr_t>(buffer.data_);
+  return address >= begin && address - begin <= region.size_ &&
+         buffer.size_ <= region.size_ - (address - begin);
 }
 
 bool RegisteredBufferPool::IsWriteBufferId(
@@ -455,15 +595,26 @@ bool RegisteredBufferPool::IsReadBufferId(
   return index >= read_base && index < read_base + read_buffers_.size();
 }
 
-bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() const noexcept {
-  if (pool_ == nullptr || !pool_->initialized()) {
+bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() {
+  if (pool_ == nullptr || !pool_->initialized() || assigned_buffer_id_ != 0 ||
+      overflow_.valid()) {
     return true;
   }
-  // Oversized reads cannot use a fixed slot and retain the aligned overflow
-  // path. Ordinary reads wait for their worker's bounded fixed pool instead
-  // of turning a transient hand-back delay into unbounded DMA allocation.
-  return minimum_payload_bytes_ > pool_->options_.read_payload_bytes() ||
-         !pool_->free_read_buffers_.empty();
+  // Oversized reads (and pools with no fixed read slots) cannot wait for a
+  // usable slot. Allocate in await_resume so failure is returned to the caller.
+  if (minimum_payload_bytes_ > pool_->options_.read_payload_bytes() ||
+      pool_->read_buffers_.empty() || !pool_->free_read_buffers_.empty()) {
+    return true;
+  }
+  // A temporary lease can absorb a delayed hand-back without stalling I/O.
+  // Attempt once per awaiter; if allocation fails, both suspension APIs use
+  // the existing FIFO fixed-slot handoff instead of retrying or spinning.
+  if (!overflow_attempted_) {
+    overflow_attempted_ = true;
+    auto acquired = pool_->AllocateOverflowBuffer(minimum_payload_bytes_, true);
+    if (acquired.ok()) overflow_ = std::move(*acquired);
+  }
+  return overflow_.valid();
 }
 
 bool RegisteredBufferPool::AcquireReadAwaiter::await_suspend(
@@ -490,6 +641,7 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is not initialized");
   }
+  if (overflow_.valid()) return std::move(overflow_);
   if (assigned_buffer_id_ != 0) {
     return pool_->LeaseReadBuffer(assigned_buffer_id_);
   }
@@ -497,11 +649,12 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
       !pool_->free_read_buffers_.empty()) {
     return pool_->TakeReadBuffer();
   }
-  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes()) {
+  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes() &&
+      !pool_->read_buffers_.empty()) {
     return absl::Status(absl::StatusCode::kInternal,
                         "read buffer waiter resumed without a buffer");
   }
-  return pool_->AllocateHeapReadBuffer(minimum_payload_bytes_);
+  return pool_->AllocateOverflowBuffer(minimum_payload_bytes_, true);
 }
 
 ReadBufferLease RegisteredBufferPool::TakeReadBuffer() {
@@ -521,8 +674,26 @@ ReadBufferLease RegisteredBufferPool::LeaseReadBuffer(std::uint16_t buffer_id) {
                          options_.read_tailroom_bytes_, buffer_id);
 }
 
-absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
+absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateReadOutputBuffer(
     std::size_t minimum_payload_bytes) {
+  if (!initialized()) {
+    return absl::FailedPreconditionError(
+        "registered buffer pool is not initialized");
+  }
+  return AllocateOverflowBuffer(minimum_payload_bytes, false);
+}
+
+void RegisteredBufferPool::OverflowBuffer::Free(
+    std::size_t alignment) const noexcept {
+  if (storage_io_) {
+    bycorf::FreeStorageBuffer(buffer_.data_, alignment);
+  } else {
+    ::operator delete[](buffer_.data_, std::align_val_t(alignment));
+  }
+}
+
+absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateOverflowBuffer(
+    std::size_t minimum_payload_bytes, bool storage_io) {
   std::size_t payload_bytes =
       std::max(options_.read_payload_bytes(), minimum_payload_bytes);
   if (payload_bytes >
@@ -547,48 +718,51 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
                         "overflow read buffer exceeds the 32-bit lease "
                         "representation");
   }
-  std::size_t best_free = free_overflow_read_buffers_.size();
-  std::size_t best_bytes = std::numeric_limits<std::size_t>::max();
-  for (std::size_t i = 0; i < free_overflow_read_buffers_.size(); ++i) {
-    const std::size_t overflow_id = free_overflow_read_buffers_[i];
-    const std::size_t candidate_bytes =
-        overflow_read_buffers_[overflow_id - 1].size_;
-    if (candidate_bytes >= bytes && candidate_bytes < best_bytes) {
-      best_free = i;
-      best_bytes = candidate_bytes;
-    }
+  if (free_overflow_read_buffers_.empty() &&
+      overflow_read_buffers_.size() >= ReadBufferLease::kReleaseTokenMask) {
+    return absl::ResourceExhaustedError(
+        "overflow read buffer id space exhausted");
   }
-  if (best_free != free_overflow_read_buffers_.size()) {
-    const std::size_t overflow_id = free_overflow_read_buffers_[best_free];
-    free_overflow_read_buffers_[best_free] = free_overflow_read_buffers_.back();
-    free_overflow_read_buffers_.pop_back();
-    overflow_read_buffer_in_use_[overflow_id - 1] = true;
-    return ReadBufferLease(this, overflow_read_buffers_[overflow_id - 1],
-                           options_.read_headroom_bytes_,
-                           options_.read_tailroom_bytes_, overflow_id);
-  }
+  LAVIK_FAULT_INJECT(
+      if (storage_io &&
+          LAVIK_FAULT_MATCHES("LAVIK_FAIL_READ_BUFFER_ALLOCATION", "1")) {
+        return absl::ResourceExhaustedError(
+            "injected read buffer allocation failure");
+      });
+  // Assembly destinations are only written by memcpy, never storage DMA.
+  // Keep their framing/alignment layout without consuming SPDK hugepages.
   auto* data = static_cast<std::byte*>(
-      bycorf::AllocateStorageBuffer(bytes, options_.alignment_));
+      storage_io
+          ? bycorf::AllocateStorageBuffer(bytes, options_.alignment_)
+          : ::operator new[](bytes, std::align_val_t(options_.alignment_),
+                             std::nothrow));
   if (data == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned heap read buffer allocation failed");
   }
-  if (overflow_read_buffers_.size() >= ReadBufferLease::kReleaseTokenMask) {
-    bycorf::FreeStorageBuffer(data, options_.alignment_);
-    return absl::Status(absl::StatusCode::kResourceExhausted,
-                        "overflow read buffer id space exhausted");
+  std::size_t overflow_id;
+  const bycorf::FixedBuffer buffer{.data_ = data, .size_ = bytes, .index_ = 0};
+  if (free_overflow_read_buffers_.empty()) {
+    overflow_read_buffers_.push_back({buffer, storage_io});
+    overflow_read_buffer_in_use_.push_back(true);
+    overflow_id = overflow_read_buffers_.size();
+  } else {
+    overflow_id = free_overflow_read_buffers_.back();
+    free_overflow_read_buffers_.pop_back();
+    overflow_read_buffers_[overflow_id - 1] = {buffer, storage_io};
+    overflow_read_buffer_in_use_[overflow_id - 1] = true;
   }
-  overflow_read_buffers_.push_back(
-      bycorf::FixedBuffer{.data_ = data, .size_ = bytes, .index_ = 0});
-  overflow_read_buffer_in_use_.push_back(true);
-  const std::size_t overflow_id = overflow_read_buffers_.size();
-  return ReadBufferLease(this, overflow_read_buffers_.back(),
-                         options_.read_headroom_bytes_,
+  // Reads and maintenance I/O must still make progress at the retained limit.
+  // Account their live storage without a new admission gate; subsequent
+  // retained growth observes it, and returning this lease releases the charge.
+  buffer_memory_.Resize(buffer_memory_.bytes() + bytes);
+  return ReadBufferLease(this, buffer, options_.read_headroom_bytes_,
                          options_.read_tailroom_bytes_, overflow_id);
 }
 
 std::optional<std::uint16_t> RegisteredBufferPool::TakeWriteBuffer() {
-  if (free_write_buffers_.empty()) {
+  if (write_acquisition_failed_ || !write_waiters_.empty() ||
+      free_write_buffers_.empty()) {
     return std::nullopt;
   }
   const std::uint16_t buffer_id = free_write_buffers_.back();
@@ -611,36 +785,43 @@ bool RegisteredBufferPool::TryAcquireWriteBuffer(
   return true;
 }
 
-void RegisteredBufferPool::ReleaseWriteBuffer(
-    std::uint16_t buffer_id) noexcept {
-  ReleaseWriteBufferLocal(buffer_id);
+bool RegisteredBufferPool::AcquireWriteAwaiter::await_ready() noexcept {
+  return pool_->write_acquisition_failed_ || assigned_buffer_id_ != 0 ||
+         pool_->TryAcquireWriteBuffer(&assigned_buffer_id_);
 }
 
-bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
-    std::byte** buffer) noexcept {
-  if (buffer == nullptr) {
-    return false;
-  }
-  if (!free_heap_write_buffers_.empty()) {
-    *buffer = free_heap_write_buffers_.back();
-    free_heap_write_buffers_.pop_back();
-    return true;
-  }
-  auto* data = static_cast<std::byte*>(bycorf::AllocateStorageBuffer(
-      options_.write_buffer_bytes_, options_.alignment_));
-  if (data == nullptr) {
-    return false;
-  }
-  heap_write_buffers_.push_back(data);
-  *buffer = data;
+bool RegisteredBufferPool::AcquireWriteAwaiter::await_suspend(
+    std::coroutine_handle<> awaiting) {
+  if (await_ready()) return false;
+  awaiting_ = awaiting;
+  pool_->write_waiters_.push_back(this);
   return true;
 }
 
-void RegisteredBufferPool::ReleaseHeapWriteBuffer(std::byte* buffer) noexcept {
-  if (buffer == nullptr) {
-    return;
+absl::StatusOr<std::uint16_t>
+RegisteredBufferPool::AcquireWriteAwaiter::await_resume() {
+  if (pool_->write_acquisition_failed_) {
+    if (assigned_buffer_id_ != 0)
+      pool_->ReleaseWriteBuffer(std::exchange(assigned_buffer_id_, 0));
+    return absl::FailedPreconditionError(
+        "storage writer is stopped after an IO failure");
   }
-  free_heap_write_buffers_.push_back(buffer);
+  assert(assigned_buffer_id_ != 0);
+  return std::exchange(assigned_buffer_id_, 0);
+}
+
+void RegisteredBufferPool::FailWriteWaiters() noexcept {
+  write_acquisition_failed_ = true;
+  while (!write_waiters_.empty()) {
+    auto* waiter = write_waiters_.front();
+    write_waiters_.pop_front();
+    worker_->Enqueue(waiter->awaiting_);
+  }
+}
+
+void RegisteredBufferPool::ReleaseWriteBuffer(
+    std::uint16_t buffer_id) noexcept {
+  ReleaseWriteBufferLocal(buffer_id);
 }
 
 void RegisteredBufferPool::ReleaseWriteBufferLocal(
@@ -652,9 +833,17 @@ void RegisteredBufferPool::ReleaseWriteBufferLocal(
   if (!write_buffer_in_use_[offset]) {
     return;
   }
+  if (!write_waiters_.empty()) {
+    auto* waiter = write_waiters_.front();
+    write_waiters_.pop_front();
+    waiter->assigned_buffer_id_ = buffer_id;
+    // Keep the slot in use across the handoff. A new borrower cannot steal it
+    // while the scheduled writer waits for its next worker time slice.
+    worker_->Enqueue(waiter->awaiting_);
+    return;
+  }
   write_buffer_in_use_[offset] = false;
   free_write_buffers_.push_back(buffer_id);
-  if (worker_ != nullptr) storage_write_buffer_ready_.NotifyAll(*worker_);
 }
 
 void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
@@ -702,6 +891,9 @@ void RegisteredBufferPool::ReleaseOverflowLocal(
   if (!overflow_read_buffer_in_use_[offset]) {
     return;
   }
+  const auto buffer = std::exchange(overflow_read_buffers_[offset], {});
+  buffer.Free(options_.alignment_);
+  buffer_memory_.Resize(buffer_memory_.bytes() - buffer.buffer_.size_);
   overflow_read_buffer_in_use_[offset] = false;
   free_overflow_read_buffers_.push_back(overflow_id);
 }

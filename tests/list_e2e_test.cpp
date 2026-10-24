@@ -46,6 +46,7 @@
 #include "lavik/command_table.h"
 #include "lavik/rdb.h"
 #include "lavik/storage/format.h"
+#include "support/storage_memory.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -3013,13 +3014,11 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
     ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2,
                          point);
     RespClient ready(port_);
-    if (point == "hash-group-defrag-copy-staged") {
-      // This case explicitly tests GC, not default pressure scheduling. Arm a
-      // short cleaner cadence so an auxiliary page is actually relocated.
-      ASSERT_EQ(
-          ready.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
-          "+OK");
-    }
+    // Both crash points require relocation to run. Recovered transaction
+    // blocks can retain the Hash's pages; promote them without depending on
+    // the default idle cleaner cadence or incidental allocation pressure.
+    ASSERT_EQ(ready.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+              "+OK");
     std::vector<std::string_view> command{"DEL"};
     for (const auto& key : fillers) command.push_back(key);
     const int fd = ConnectSocket(port_);
@@ -3061,8 +3060,10 @@ void LargeHashDurabilityE2eTest::CheckOom(bool injected_storage_failure) {
     const std::vector<std::string> arguments =
         injected_storage_failure
             ? std::vector<std::string>{}
-            : std::vector<std::string>{"--max-memory", "64M",
-                                       "--maxmemory-clients", "64M"};
+            : std::vector<std::string>{
+                  "--max-memory",
+                  lavik::test::WithStorageBaseline(64ULL * 1024 * 1024, 2),
+                  "--maxmemory-clients", "64M"};
     const std::vector<std::pair<std::string, std::string>> environment =
         injected_storage_failure
             ? std::vector<std::pair<

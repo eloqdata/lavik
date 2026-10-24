@@ -32,6 +32,11 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
     co_return absl::Status(absl::StatusCode::kInternal,
                            "recovered external key manifest is invalid");
   }
+  // Only the initiating recovery task borrows this image. A delegated SPDK
+  // read carries it to the qpair owner and joins before it is reused, so
+  // concurrent recovery requests never contend for the reader's own buffer.
+  const FixedBuffer scratch =
+      store.buffers_.maintenance_read_buffer(MaintenanceReadKind::kTombRaider);
   std::string key;
   key.resize(key_bytes);
   std::size_t offset = 0;
@@ -46,19 +51,21 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
       const unsigned owner = owners[ref.block_id_ % owners.size()];
       if (owner == store.worker_->id()) {
         read = co_await ReadRecoveryExtentInto(
-            store, ref, static_cast<std::uint32_t>(index), destination);
+            store, ref, static_cast<std::uint32_t>(index), scratch,
+            destination);
       } else {
         read = co_await bycorf::SubmitTaskTo(
             owner,
-            [this, owner, ref, index, destination]() -> Task<absl::Status> {
+            [this, owner, ref, index, scratch,
+             destination]() -> Task<absl::Status> {
               co_return co_await ReadRecoveryExtentInto(
                   *stores_[owner], ref, static_cast<std::uint32_t>(index),
-                  destination);
+                  scratch, destination);
             });
       }
     } else {
       read = co_await ReadRecoveryExtentInto(
-          store, ref, static_cast<std::uint32_t>(index), destination);
+          store, ref, static_cast<std::uint32_t>(index), scratch, destination);
     }
     if (!read.ok()) co_return read;
     offset += std::min<std::size_t>(ref.payload_bytes_, destination.size());
@@ -72,17 +79,20 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
 
 Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::span<std::byte> destination, OrderedGroupMetadataDecoder* ordered) {
+    FixedBuffer scratch, std::span<std::byte> destination,
+    OrderedGroupMetadataDecoder* ordered) {
   const std::size_t read_bytes =
       AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer io = lease.io_buffer();
+  if (scratch.data_ == nullptr || read_bytes > scratch.size_) {
+    co_return absl::DataLossError(
+        "recovered extent exceeds its read workspace");
+  }
+  FixedBuffer io = scratch;
   io.size_ = read_bytes;
   const auto [file_id, block_offset] = FileOffset(ref.block_id_);
-  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                         io, lease.registered(), block_offset);
+  auto read = co_await ReadStorageBuffer(
+      *store.worker_, store.files_[file_id], io,
+      store.buffers_.workspace_registered(io), block_offset);
   if (!read.ok()) co_return read.status();
   if (*read != read_bytes) {
     co_return absl::InternalError("short recovered extent read");
@@ -130,6 +140,10 @@ StorageEngine::Impl::LoadRecoveryPayloadPrefix(
   if (extents == nullptr || bytes > kMaxRecordPayloadBytes) {
     co_return absl::DataLossError("recovered payload prefix has no manifest");
   }
+  // This third startup workspace stays distinct from both checkpoint
+  // prefetch images and the ordinary block being decoded by the caller.
+  const FixedBuffer scratch =
+      store.buffers_.maintenance_read_buffer(MaintenanceReadKind::kTombRaider);
   std::string result(bytes, '\0');
   std::size_t copied = 0;
   for (std::size_t index = 0; index < extents->size(); ++index) {
@@ -152,20 +166,21 @@ StorageEngine::Impl::LoadRecoveryPayloadPrefix(
       if (owner != store.worker_->id()) {
         read = co_await bycorf::SubmitTaskTo(
             owner,
-            [this, owner, ref, index, destination,
+            [this, owner, ref, index, scratch, destination,
              ordered]() -> Task<absl::Status> {
               co_return co_await ReadRecoveryExtentInto(
                   *stores_[owner], ref, static_cast<std::uint32_t>(index),
-                  destination, ordered);
+                  scratch, destination, ordered);
             });
       } else {
         read = co_await ReadRecoveryExtentInto(
-            store, ref, static_cast<std::uint32_t>(index), destination,
+            store, ref, static_cast<std::uint32_t>(index), scratch, destination,
             ordered);
       }
     } else {
-      read = co_await ReadRecoveryExtentInto(
-          store, ref, static_cast<std::uint32_t>(index), destination, ordered);
+      read = co_await ReadRecoveryExtentInto(store, ref,
+                                             static_cast<std::uint32_t>(index),
+                                             scratch, destination, ordered);
     }
     if (!read.ok()) co_return read;
     copied += count;
@@ -284,50 +299,15 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     std::vector<std::uint64_t>* zero_blocks,
     absl::flat_hash_set<std::uint64_t>* committed_txids,
     bool indirect_key_pass) {
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) {
-    co_return acquired.status();
-  }
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer header_buffer = lease.io_buffer();
+  // Startup drains checkpoint prefetch before this phase. All scan/grouped
+  // recovery passes finish before maintenance can use these images; nested
+  // extent validation borrows the separate Tomb Raider workspace.
+  assert(store.checkpoint_reads_in_flight_.load(std::memory_order_acquire) ==
+         0);
+  FixedBuffer recovery =
+      store.buffers_.maintenance_read_buffer(MaintenanceReadKind::kDefrag);
+  FixedBuffer header_buffer = recovery;
   header_buffer.size_ = kBlockHeaderBytes;
-
-  struct RecoveryBuffer {
-    RegisteredBufferPool* pool_ = nullptr;
-    std::uint16_t buffer_id_ = 0;
-    std::byte* heap_data_ = nullptr;
-    FixedBuffer buffer_{};
-
-    ~RecoveryBuffer() {
-      if (buffer_id_ != 0) {
-        pool_->ReleaseWriteBuffer(buffer_id_);
-      } else if (heap_data_ != nullptr) {
-        pool_->ReleaseHeapWriteBuffer(heap_data_);
-      }
-    }
-
-    bool registered() const noexcept {
-      return pool_ != nullptr && pool_->buffer_registered(buffer_id_);
-    }
-  } recovery{.pool_ = &store.buffers_};
-  if (store.buffers_.TryAcquireWriteBuffer(&recovery.buffer_id_)) {
-    recovery.buffer_ = store.buffers_.write_buffer(recovery.buffer_id_);
-  } else if (store.buffers_.TryAcquireHeapWriteBuffer(&recovery.heap_data_)) {
-    recovery.buffer_ = FixedBuffer{
-        .data_ = recovery.heap_data_,
-        .size_ = options_.buffers_.write_buffer_bytes_,
-        .index_ = 0,
-    };
-  } else {
-    co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                           "failed to allocate recovery block buffer");
-  }
-  if (recovery.buffer_.size_ < kStorageBlockBytes) {
-    co_return absl::Status(
-        absl::StatusCode::kResourceExhausted,
-        "recovery block buffer is smaller than a storage block");
-  }
-  recovery.buffer_.size_ = kStorageBlockBytes;
   // Merge recovered entries incrementally. The byte target is divided across
   // scan workers, so adding recovery concurrency cannot multiply temporary
   // routing memory without bound. One maximum-size key may overshoot its
@@ -393,7 +373,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           static_cast<std::uint64_t>(local_block) * kStorageBlockBytes;
       auto read = co_await ReadStorageBuffer(
           *store.worker_, store.files_[file_id], header_buffer,
-          lease.registered(), block_offset);
+          store.buffers_.workspace_registered(header_buffer), block_offset);
       if (!read.ok()) {
         co_return read.status();
       }
@@ -502,9 +482,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
 
-      read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
-                                        recovery.buffer_, recovery.registered(),
-                                        block_offset);
+      read = co_await ReadStorageBuffer(
+          *store.worker_, store.files_[file_id], recovery,
+          store.buffers_.workspace_registered(recovery), block_offset);
       if (!read.ok()) {
         co_return read.status();
       }
@@ -517,7 +497,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       std::uint32_t records = 0;
       while (record_offset < block.committed_bytes_) {
         const std::optional<std::uint32_t> next = NextRecordOffset(
-            recovery.buffer_.data_, record_offset, block.committed_bytes_);
+            recovery.data_, record_offset, block.committed_bytes_);
         if (!next.has_value()) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
@@ -529,7 +509,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         RecordHeader record{};
         std::string_view key;
         std::span<const std::byte> record_bytes(
-            recovery.buffer_.data_ + record_offset,
+            recovery.data_ + record_offset,
             block.committed_bytes_ - record_offset);
         if (!DecodeRecordHeader(record_bytes, &record, &key) ||
             record.allocation_epoch_ != block.allocation_epoch_ ||
@@ -586,7 +566,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           continue;
         }
         const std::byte* payload =
-            recovery.buffer_.data_ + record_offset + record.header_bytes_;
+            recovery.data_ + record_offset + record.header_bytes_;
         const auto payload_span =
             std::span<const std::byte>(payload, record.payload_bytes_);
         if (!ValidateRecordPayload(record, payload_span)) {

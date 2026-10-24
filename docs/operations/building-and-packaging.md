@@ -56,27 +56,46 @@ CPU instruction-set and glibc requirements remain separate constraints.
 
 `--registered-buffer-mb-per-worker` sets each data worker's storage-buffer pool
 budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
-8 MiB write buffers by default; the remaining budget supplies read slots.
+8 MiB write buffers by default and requires at least two; the remaining budget
+supplies read slots. Shutdown checkpoints reuse two drained write slots.
 `--storage-read-buffer-kb` is the total slot size, including framing space.
 The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
 4 KiB of tailroom. Values must be multiples of 4 KiB and greater than 8 KiB.
 These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
+Additional fixed allocations are 24 MiB per data worker for the three
+maintenance readers, 8 MiB per process for Redis export, and 8 KiB per device
+for metadata writes. With defaults, total fixed storage-buffer capacity is
+`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. All count toward
+retained memory, and allocation failure prevents startup. Startup metadata I/O,
+recovery, and shutdown checkpoints reuse these allocations. See
+[storage ownership](../architecture/04-storage-and-recovery.md) for their lifetimes
+and [SPDK sizing](spdk-storage.md) for hugepage headroom.
+
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
 at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
 Registration covers these existing allocations; a retry does not move slots
-or allocate a second pool. The default pool uses one registered region shared
-by 1024 read slots and four write slots; no sentinel entry is reserved.
+or allocate a second pool. The default ordinary pool shares one region across
+1024 read slots and four write slots.
 
-The pool first attempts full registration. If io_uring rejects it, Lavik uses
-the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in KiB) divided
-across runtime workers as a starting budget. It prioritizes read buffers and
-uses leftover space for whole write buffers. Failed retries reduce this
-registration budget; it is only an estimate because other locked resources
-can consume the allowance. Startup logs report the resulting registered read
-and write counts or complete fallback.
+The pool first attempts to register all fixed workspaces. If io_uring rejects
+it, Lavik uses the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in
+KiB) divided across runtime workers as a starting budget, with this priority:
+
+1. The owner worker's per-device 8 KiB metadata write buffers.
+2. Ordinary read slots.
+3. Ordinary write slots.
+4. The 8 MiB maintenance images, ordered defrag, TxCleaner, then Tomb Raider.
+
+Each class is admitted in complete buffers before considering the next class.
+Failed retries reduce this registration budget; it is only an estimate because
+other locked resources can consume the allowance. Startup logs report counts
+for all four classes or complete fallback. Export and temporary overflow
+buffers are not registered. With defaults, registration requests
+`88 MiB + 8 KiB × owned devices` per data worker, subject to ordinary slot
+rounding. Registration does not allocate another copy or add a second charge.
 
 The allocated pool capacity never shrinks. Slots outside the registered subset
 use ordinary asynchronous direct I/O; slot selection automatically chooses
@@ -585,6 +604,8 @@ VMs. Local callers can set `LAVIK_TEST_DATA_DIR` to another writable directory.
 Logs, JUnit, and plans are under `<build>/test-results/`, with
 `shard-N-of-M/` subdirectories for partitioned runs. Per-architecture/shard
 artifacts are retained for seven days; build bundles for one day.
+The software test command is capped at 80 minutes within the 90-minute shard
+job, leaving time to upload diagnostics when a shard times out.
 The existing required check names `Tests (amd64)` and `Tests (arm64)` are
 preserved as completion gates. Each requires its own architecture's build,
 six shards, and Admin job to succeed; failure, cancellation, or skipped work

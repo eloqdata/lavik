@@ -85,7 +85,8 @@ TEST(GroupedListWriteE2e, RangeReadsFitReplyBudgetAndKeepRankOrder) {
   // The 8 MiB payload and its reply fit this limit. Reserving four complete
   // mutation/encoding copies exceeds it before the first range page is read.
   // Disable the separate client-buffer quota to isolate storage admission.
-  Server server(disk, 1, {}, {}, false, 2, "96M", {}, "0");
+  Server server(disk, 1, {}, {}, false, 2, WithStorageBaseline(96 * kMiB, 1),
+                {}, "0");
   Client client(server.port());
   const auto all = client.Command({"LRANGE", key, "0", "-1"});
   ASSERT_EQ(all.kind_, '*') << all.text_;
@@ -898,13 +899,15 @@ TEST(IndirectKeyE2e, RemoteGroupedReadsRespectParentKeyOwnership) {
     // owner before the first request, bypassing the key-copy admission path.
     ScopedEnvironment pause_cleaner("LAVIK_TX_CLEANER_START_PAUSED", "1");
     // Each logical owner retains two 16 MiB side-index keys plus its fixed
-    // 16 MiB arena directory. Its 57.6 MiB steady-state quota fits the pages,
+    // 16 MiB arena directory. Its 57.6 MiB working quota, after fixed map
+    // objects and I/O pools, fits the pages,
     // but not another complete key copy.
     // Hash remote reads still own a key copy and must reject that allocation.
     // Ordered remote reads borrow the caller's key across the awaited hop, so
     // they must succeed with only page scratch. Client request buffers have a
     // separate budget so they cannot mask this storage admission check.
-    Server limited(disk, 3, {}, {}, false, 2, "192M", {}, "128M");
+    Server limited(disk, 3, {}, {}, false, 2,
+                   WithStorageBaseline(192 * kMiB, 3), {}, "128M");
     limited.PreserveOnFailure();
     Client client(limited.port());
     const auto stats = client.Command({"INFO", "STATS"}).text_;
@@ -932,7 +935,8 @@ TEST(IndirectKeyE2e, RemoteGroupedReadsRespectParentKeyOwnership) {
               std::string::npos);
     ASSERT_EQ(limited.Wait(true), 0) << limited.Log();
   }
-  Server recovered(disk, 3, {}, {}, false, 2, "1G", {}, "128M");
+  Server recovered(disk, 3, {}, {}, false, 2,
+                   WithStorageBaseline(1024 * kMiB, 3), {}, "128M");
   Client client(recovered.port());
   for (const auto& key : hash_keys)
     EXPECT_EQ(client.Command({"HGET", key, "field"}).text_, value);

@@ -15,10 +15,8 @@
 from contextlib import contextmanager
 import os
 from pathlib import Path
-import socket
 import sys
 import tempfile
-import time
 
 import redis
 import redis_sync_reader_e2e as I
@@ -39,7 +37,6 @@ def source(root, mode):
             "lavik",
             extra=("--requirepass", I.PASSWORD),
             password=I.PASSWORD,
-            max_memory="256M",
         ) as (_, port, _):
             yield port
     else:

@@ -7,6 +7,7 @@
 
 #include "../src/storage/engine/impl.h"
 #include "gtest/gtest.h"
+#include "support/read_buffer_fault.h"
 
 namespace lavik::storage {
 
@@ -16,6 +17,8 @@ namespace lavik::storage {
 class RemoteGetTestPeer : public testing::Test {
  protected:
   using Awaitable = StorageEngine::RemoteReadAwaitable;
+
+  virtual std::size_t ReadSlotBytes() const { return 32 * kKiB; }
 
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
@@ -52,9 +55,10 @@ class RemoteGetTestPeer : public testing::Test {
     block_.allocated_ = true;
 
     RegisteredBufferPoolOptions options;
-    options.storage_write_buffer_count_ = 1;
+    options.storage_write_buffer_count_ = 2;
+    options.read_slot_bytes_ = ReadSlotBytes();
     options.registered_bytes_ =
-        options.write_buffer_bytes_ + options.read_slot_bytes_;
+        2 * options.write_buffer_bytes_ + options.read_slot_bytes_;
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
     ASSERT_EQ(Pool().available_read_buffers(), 1);
 
@@ -112,7 +116,16 @@ class RemoteGetTestPeer : public testing::Test {
     auto writer = index_.CloseAllReaders();
     auto* entry = index_.Find(ComputeDigest(key_), key_);
     ASSERT_NE(entry, nullptr);
-    entry->assign(RecordLocation(1, 9, 7, 0, header_.logical_size_, metadata));
+    const RecordLocation location(1, 9, 7, 0, header_.logical_size_, metadata);
+    if (entry->can_assign(location)) {
+      entry->assign(location);
+    } else {
+      RecordIndex::Entry* replaced = nullptr;
+      ASSERT_NE(
+          index_.ReplaceValue(entry, location, ComputeDigest(key_), &replaced),
+          nullptr);
+      index_.DestroyDetached(replaced);
+    }
   }
 
   enum class UnpinPoint { kBeforeRelease, kAfterCount, kAfterRelease };
@@ -120,6 +133,7 @@ class RemoteGetTestPeer : public testing::Test {
   void CheckFlushedBufferRelease(UnpinPoint point) {
     auto& engine = *storage_.impl_;
     auto& store = *engine.stores_[0];
+    const auto available = Pool().available_write_buffers();
     block_.Reset(0, 7);
     block_.allocated_ = true;
     block_.committed_bytes_ = kBlockHeaderBytes + 4096;
@@ -129,7 +143,7 @@ class RemoteGetTestPeer : public testing::Test {
     store.staging_slots_.emplace_back();
     ASSERT_TRUE(Pool().TryAcquireWriteBuffer(
         &store.staging_slots_.back().write_buffer_id_));
-    ASSERT_EQ(Pool().available_write_buffers(), 0);
+    ASSERT_EQ(Pool().available_write_buffers(), available - 1);
     ASSERT_TRUE(block_.TryRemotePin());
     auto unpin = [&] {
       bycorf::SetThisWorker(1, &cross_core_, &owner_);
@@ -157,7 +171,7 @@ class RemoteGetTestPeer : public testing::Test {
     if (point != UnpinPoint::kBeforeRelease) {
       EXPECT_TRUE(block_.release_pending_);
       EXPECT_FALSE(block_.TryRemotePin());
-      EXPECT_EQ(Pool().available_write_buffers(), 0);
+      EXPECT_EQ(Pool().available_write_buffers(), available - 1);
       if (point == UnpinPoint::kAfterRelease) unpin();
       // A one-way notification alone must finish the release; no later local
       // read/unpin or maintenance pass is allowed to rescue a lost wakeup.
@@ -170,7 +184,7 @@ class RemoteGetTestPeer : public testing::Test {
     EXPECT_EQ(block_.pin_count(), 0);
     EXPECT_FALSE(block_.release_pending_);
     EXPECT_EQ(block_.staging_slot_, 0);
-    EXPECT_EQ(Pool().available_write_buffers(), 1);
+    EXPECT_EQ(Pool().available_write_buffers(), available);
   }
 
   void Complete(Awaitable& read, int bytes = -1) {
@@ -272,7 +286,12 @@ TEST_F(RemoteGetTestPeer, UnawaitedReadReleasesPinAndBuffer) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(RemoteGetTestPeer, ExhaustedPoolFallsBackWithoutEnqueuingWaiter) {
+TEST_F(RemoteGetTestPeer,
+       ExhaustedPoolAllocationFailureFallsBackWithoutWaiting) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  lavik::test::ScopedReadBufferAllocationFailure failure;
   {
     auto held = Pool().AcquireReadBuffer().await_resume();
     ASSERT_TRUE(held.ok());
@@ -282,6 +301,53 @@ TEST_F(RemoteGetTestPeer, ExhaustedPoolFallsBackWithoutEnqueuingWaiter) {
   }
   EXPECT_EQ(block_.pin_count(), 0);
   EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+class RemoteSmallSlotTest : public RemoteGetTestPeer {
+ protected:
+  std::size_t ReadSlotBytes() const override { return 12 * kKiB; }
+};
+
+TEST_F(RemoteSmallSlotTest, OversizedAllocationFailureFallsBackToOwner) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires read buffer allocation failure injection";
+#endif
+  // A smaller configured slot can make even a compact record oversized.
+  // Use a compact-sized payload and include its alignment/header overhead.
+  value_.assign(16 * kKiB - 1, 'v');
+  header_.payload_bytes_ = value_.size();
+  header_.total_disk_bytes_ =
+      AlignRecord(header_.header_bytes_ + value_.size());
+  header_.payload_checksum_ = Crc32c(std::as_bytes(std::span(value_)));
+  Publish(ValueType::kString);
+  lavik::test::ScopedReadBufferAllocationFailure failure;
+  {
+    auto read = Read();
+    ASSERT_TRUE(read.await_ready());
+    EXPECT_FALSE(read.await_resume().has_value());
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
+}
+
+TEST_F(RemoteGetTestPeer, ExhaustedPoolUsesAndReleasesTemporaryReplyLease) {
+  auto held = Pool().AcquireReadBuffer().await_resume();
+  ASSERT_TRUE(held.ok());
+  Awaitable::Result result;
+  {
+    auto read = Read();
+    ASSERT_FALSE(read.await_ready());
+    EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
+    ASSERT_NO_FATAL_FAILURE(Complete(read));
+    result = read.await_resume();
+    ASSERT_TRUE(result && result->ok());
+    EXPECT_EQ(result->value().view().encoded_, value_);
+  }
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), 0);
+  EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
+  result.reset();
+  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
 }
 
 TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {

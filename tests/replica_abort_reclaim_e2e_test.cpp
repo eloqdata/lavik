@@ -1102,8 +1102,10 @@ int Run(const std::string& path, lavik::storage::ValueType large_type,
   options.flush_max_ms_ = 10;
   StorageEngine storage(std::move(options));
   lavik::InitWorkerMetrics(1);
-  absl::Status memory = lavik::InitMemoryLimit(
-      (large_type == lavik::storage::ValueType::kNone ? 512 : 2048) * kMiB, 1);
+  // Fixed index objects and I/O buffers count even for an empty population.
+  // Leave headroom so these disk-reclamation cases do not fail memory
+  // admission.
+  absl::Status memory = lavik::InitMemoryLimit(2048 * kMiB, 1);
   if (!memory.ok()) {
     std::cerr << memory << '\n';
     return 1;

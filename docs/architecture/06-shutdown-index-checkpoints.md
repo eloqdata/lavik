@@ -148,13 +148,13 @@ All chunk types share the checkpoint block kind,
 generation, bitmap, publication lifecycle, and payload CRC; an explicit
 chunk-kind field selects their entry layout.
 
-Each shard builder alternates two aligned 8 MiB buffers. Once one buffer has
-been encoded and submitted, the worker builds the next chunk in the other
-while the first write remains in flight; it waits only before reusing a slot.
-Both writes must complete before that shard enters the publication barrier.
-Abandoning a shard after a serialization or I/O error leaves any submitted
-buffer owned by its completion, so asynchronous device access cannot outlive
-the DMA memory.
+Each shard builder borrows two 8 MiB slots from its worker's ordinary write
+pool after the final shutdown drain, adding no DMA capacity. Configuration
+requires at least two slots because checkpoint creation can be enabled at
+runtime. Missing slots fail the optional checkpoint. The builder encodes the
+next chunk while the previous write is in flight and waits before reusing a
+slot. Both writes complete before the publication barrier; on failure, each
+submitted slot stays owned by its completion until I/O finishes.
 
 Publication order is:
 
@@ -243,8 +243,10 @@ final winner per logical key, successful loading inserts those entries without
 the multi-version arbitration used by the ordinary record scan. If a later
 entry is invalid, the already installed valid prefix is marked as a checkpoint
 winner and participates in the same authoritative cold-scan merge as prefixes
-from earlier blocks. Each owner holds two 8 MiB I/O buffers. Complex-object
-encoding also uses a bounded stream buffer; encoding and decoding reserve
+from earlier blocks. Each owner borrows two fixed maintenance read buffers.
+Startup drains all prefetch I/O, including abandoned and delegated reads, before
+another checkpoint phase, cold scan, or maintenance can reuse those images.
+Complex-object encoding also uses a bounded stream buffer; encoding and decoding reserve
 scratch for one complete key and its directory metadata at a time. Temporary
 object memory therefore depends on the largest key/directory, not collection
 value bytes or the total key population. Barriers reduce the per-scanner block,

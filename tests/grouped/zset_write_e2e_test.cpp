@@ -299,7 +299,8 @@ TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
   const std::string key = "dense-source-probe";
   std::map<std::string, double> expected;
   {
-    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Server server(disk, 1, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
     client.Durable();
@@ -309,10 +310,12 @@ TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
   {
     ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
     ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
-    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 3));
     Client client(server.port());
     ASSERT_NE(client.Command({"INFO", "MEMORY"})
-                  .text_.find("maxmemory:134217728\r\n"),
+                  .text_.find("maxmemory:" +
+                              WithStorageBaseline(128 * kMiB, 3) + "\r\n"),
               std::string::npos);
     // Dense 32-byte members have small encoded pages but substantial decoder
     // admission. A recovered source page must survive into the mutation plan
@@ -338,7 +341,8 @@ TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Server recovered(disk, 2, {}, {}, false, 2,
+                   WithStorageBaseline(128 * kMiB, 2));
   Client client(recovered.port());
   ExpectDenseZSet(client, key, expected);
 }
@@ -352,7 +356,8 @@ TEST(GroupedSortedSetWriteE2e,
   const std::string key = "dense-boundary-probe";
   std::map<std::string, double> expected;
   {
-    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Server server(disk, 1, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
     // Make room without changing the first page's upper score. The point
@@ -371,10 +376,12 @@ TEST(GroupedSortedSetWriteE2e,
   {
     ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
     ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
-    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 3));
     Client client(server.port());
     ASSERT_NE(client.Command({"INFO", "MEMORY"})
-                  .text_.find("maxmemory:134217728\r\n"),
+                  .text_.find("maxmemory:" +
+                              WithStorageBaseline(128 * kMiB, 3) + "\r\n"),
               std::string::npos);
     const auto changed =
         client.Command({"ZINCRBY", key, std::to_string(boundary_score - 500),
@@ -386,7 +393,8 @@ TEST(GroupedSortedSetWriteE2e,
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Server recovered(disk, 2, {}, {}, false, 2,
+                   WithStorageBaseline(128 * kMiB, 2));
   Client client(recovered.port());
   ExpectDenseZSet(client, key, expected);
 }
@@ -406,7 +414,8 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
     return std::stoull(info.substr(offset + field.size()));
   };
   {
-    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Server server(disk, 1, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
     ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(20)}).text_, "1");
@@ -423,10 +432,12 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
   ScopedEnvironment reservation_failure(
       "LAVIK_FAIL_ZSET_PROBE_RETAIN_RESERVE_KEY", key.c_str());
   {
-    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 3));
     Client client(server.port());
     ASSERT_NE(client.Command({"INFO", "MEMORY"})
-                  .text_.find("maxmemory:134217728\r\n"),
+                  .text_.find("maxmemory:" +
+                              WithStorageBaseline(128 * kMiB, 3) + "\r\n"),
               std::string::npos);
     const auto rejected_before = rejections(client);
     // Only the optional cache-preserving reservation fails. The ordinary
@@ -454,7 +465,8 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
     // planner read now fails. Both indexes must retain the previous value.
     ScopedEnvironment fault("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
     ScopedEnvironment page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "1");
-    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 3));
     Client client(server.port());
     const auto rejected_before = rejections(client);
     const auto failed =
@@ -466,7 +478,8 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Server recovered(disk, 2, {}, {}, false, 2,
+                   WithStorageBaseline(128 * kMiB, 2));
   Client client(recovered.port());
   ExpectDenseZSet(client, key, expected);
 }
@@ -689,7 +702,8 @@ TEST(GroupedSortedSetWriteE2e,
   const std::string key = "encoded-member-insert";
   std::map<std::string, double> expected;
   {
-    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Server server(disk, 1, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
     client.Durable();
@@ -708,7 +722,8 @@ TEST(GroupedSortedSetWriteE2e,
   }
   ASSERT_GT(trim.size(), 2);
   {
-    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Server server(disk, 2, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 2));
     Client client(server.port());
     ASSERT_EQ(client.Command(trim).text_, std::to_string(trim.size() - 2));
     client.Durable();
@@ -718,7 +733,8 @@ TEST(GroupedSortedSetWriteE2e,
             layout.root_.group_count_);
   {
     ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY", key.c_str());
-    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 3));
     Client client(server.port());
     const std::string binary("\0member\xff\0", 9);
     const std::string long_member(1024, '\xff');
@@ -757,7 +773,8 @@ TEST(GroupedSortedSetWriteE2e,
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  Server recovered(disk, 2, {}, {}, false, 2, "128M");
+  Server recovered(disk, 2, {}, {}, false, 2,
+                   WithStorageBaseline(128 * kMiB, 2));
   Client client(recovered.port());
   ExpectDenseZSet(client, key, expected);
 }
@@ -771,7 +788,8 @@ TEST(GroupedSortedSetWriteE2e,
   const std::string key = "encoded-member-overflow";
   std::map<std::string, double> expected;
   {
-    Server server(disk, 1, {}, {}, false, 2, "128M");
+    Server server(disk, 1, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
     client.Durable();
@@ -803,7 +821,8 @@ TEST(GroupedSortedSetWriteE2e,
   const auto overflow = routed_member(32, "overflow-");
   const std::string oversized(16384, 'z');
   {
-    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Server server(disk, 2, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 2));
     Client client(server.port());
     ASSERT_EQ(client.Command({"ZADD", key, "511", filler}).text_, "1");
     expected[filler] = 511;
@@ -818,7 +837,8 @@ TEST(GroupedSortedSetWriteE2e,
             kCollectionGroupTargetBytes);
   {
     ScopedEnvironment fault("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY", key.c_str());
-    Server server(disk, 3, {}, {}, false, 2, "128M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 3));
     Client client(server.port());
     for (const auto& member : {overflow, oversized}) {
       const auto failed = client.Command({"ZADD", key, "511", member});
@@ -834,7 +854,8 @@ TEST(GroupedSortedSetWriteE2e,
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    Server server(disk, 2, {}, {}, false, 2, "128M");
+    Server server(disk, 2, {}, {}, false, 2,
+                  WithStorageBaseline(128 * kMiB, 2));
     Client client(server.port());
     for (const auto& member : {overflow, oversized}) {
       ASSERT_EQ(client.Command({"ZADD", key, "511", member}).text_, "1");
@@ -848,7 +869,8 @@ TEST(GroupedSortedSetWriteE2e,
   // also retains its existing bounded owned-encoder path.
   ASSERT_GT(InspectZSetMembers(disk, key).root_.group_count_,
             layout.root_.group_count_);
-  Server recovered(disk, 1, {}, {}, false, 2, "128M");
+  Server recovered(disk, 1, {}, {}, false, 2,
+                   WithStorageBaseline(128 * kMiB, 1));
   Client client(recovered.port());
   ExpectDenseZSet(client, key, expected);
 }
@@ -1928,7 +1950,8 @@ TEST(GroupedSortedSetWriteE2e, FullImageAndRandomReplyOomAreAtomic) {
     // The full-image adapter alone could admit this 16 MiB value. The decoded
     // callback/planner copies must also fit, while bounded score/card reads
     // and ordinary String commands remain usable on the same worker budget.
-    Server server(disk, 2, {}, {}, false, 2, "128M", {}, "128M");
+    Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(128 * kMiB, 2),
+                  {}, "128M");
     Client client(server.port());
     auto expect_oom = [&](const std::vector<std::string>& command) {
       const auto reply = client.Command(command);
@@ -2018,7 +2041,8 @@ TEST(GroupedSortedSetWriteE2e, RangeRemovalFitsSelectedPagesAndRecovers) {
   {
     // The old 6x full-image reservation exceeds this per-worker budget. Only
     // matching members and neighbouring rewrite pages should be admitted.
-    Server server(disk, 2, {}, {}, false, 2, "128M", {}, "128M");
+    Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(128 * kMiB, 2),
+                  {}, "128M");
     Client client(server.port());
     EXPECT_EQ(
         client.Command({"ZREMRANGEBYRANK", "remove-range", "0", "0"}).text_,
@@ -2355,9 +2379,11 @@ TEST(GroupedSortedSetWriteE2e,
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    // Every source individually fits; their retained inputs plus the map and
-    // result must still be admitted on the computing worker before STORE.
-    Server server(disk, 2, {}, {}, false, 2, "64M", {}, "32M");
+    // Admit each 1 MiB input's read image alongside previously retained inputs
+    // before reaching the aggregate map/result reservation. The latter must
+    // still reject on the computing worker before STORE publishes anything.
+    Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(80 * kMiB, 2),
+                  {}, "32M");
     server.PreserveOnFailure();
     DiagnosedZSetClient client(server, disk);
     for (const auto* operation : {"ZUNION", "ZINTER", "ZDIFF"}) {
@@ -2419,7 +2445,8 @@ TEST(GroupedSortedSetWriteE2e, AggregateAbove512MiBRemainsBoundedAndRecovers) {
   {
     // The request-buffer limit is a startup option, not a mutable CONFIG key.
     // Keep it independent of the intentionally constrained storage budget.
-    Server server(disk, 2, {}, {}, false, 2, "512M", {}, "128M");
+    Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(512 * kMiB, 2),
+                  {}, "128M");
     server.PreserveOnFailure();
     DiagnosedZSetClient client(server, disk);
     for (unsigned i = 0; i < 64; ++i)
@@ -2469,7 +2496,8 @@ TEST(GroupedSortedSetWriteE2e, AggregateAbove512MiBRemainsBoundedAndRecovers) {
   {
     // One page fits; the cross-end write's selected-page scratch does not.
     // Reject before staging any auxiliary/root and keep the previous view.
-    Server limited(disk, 2, {}, {}, false, 2, "256M", {}, "128M");
+    Server limited(disk, 2, {}, {}, false, 2,
+                   WithStorageBaseline(256 * kMiB, 2), {}, "128M");
     limited.PreserveOnFailure();
     DiagnosedZSetClient client(limited, disk);
     EXPECT_EQ(client.Command({"ZCARD", "large"}).text_, "64");
@@ -2493,7 +2521,8 @@ TEST(GroupedSortedSetWriteE2e, AggregateAbove512MiBRemainsBoundedAndRecovers) {
     EXPECT_EQ(bounded_reply.items_[0].text_, member(64));
     ASSERT_EQ(limited.Wait(true), 0) << limited.Log();
   }
-  Server recovered(disk, 3, {}, {}, false, 2, "512M", {}, "128M");
+  Server recovered(disk, 3, {}, {}, false, 2,
+                   WithStorageBaseline(512 * kMiB, 3), {}, "128M");
   recovered.PreserveOnFailure();
   DiagnosedZSetClient client(recovered, disk);
   EXPECT_EQ(client.Command({"ZCARD", "large"}).text_, "64");
@@ -2512,7 +2541,8 @@ TEST(GroupedSortedSetWriteE2e, AggregateAbove512MiBRemainsBoundedAndRecovers) {
   EXPECT_EQ(multi.items_[1].items_[0].items_[0].text_, member(63));
   client.Durable();
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
-  Server final_recovery(disk, 4, {}, {}, false, 2, "512M", {}, "128M");
+  Server final_recovery(disk, 4, {}, {}, false, 2,
+                        WithStorageBaseline(512 * kMiB, 4), {}, "128M");
   final_recovery.PreserveOnFailure();
   DiagnosedZSetClient final_client(final_recovery, disk);
   EXPECT_EQ(final_client.Command({"ZCARD", "large"}).text_, "62");

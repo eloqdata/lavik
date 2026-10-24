@@ -464,13 +464,15 @@ TEST(GroupedStreamE2e, ExpirationDeletionAndFlushCannotResurrectOldGraphs) {
 TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
   PrivateDisk disk(4ULL * 1024 * 1024 * 1024);
   {
-    Server server(disk, 2, {}, {}, false, 2, "256M");
+    Server server(disk, 2, {}, {}, false, 2,
+                  WithStorageBaseline(256 * kMiB, 2));
     Client client(server.port());
     ASSERT_EQ(
         client.Command({"XGROUP", "CREATE", "s", "g", "0", "MKSTREAM"}).text_,
         "OK");
     // One entry fits the admitted page workspace; the complete Stream exceeds
-    // both maxmemory and the old compact image's 512 MiB encoding limit.
+    // both the working memory budget and the old compact image's 512 MiB
+    // encoding limit.
     PopulateStream(client, "s", 2050, 256 * 1024);
     ASSERT_EQ(client.Command({"XLEN", "s"}).text_, "2050");
     ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "new", "$"}).text_,
@@ -519,7 +521,8 @@ TEST(GroupedStreamE2e, AggregateAbove512MiBKeepsHotPathsAndRecoveryBounded) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    Server server(disk, 3, {}, {}, false, 2, "256M");
+    Server server(disk, 3, {}, {}, false, 2,
+                  WithStorageBaseline(256 * kMiB, 3));
     Client client(server.port());
     ASSERT_EQ(client.Command({"XLEN", "s"}).text_, "2050");
     ASSERT_EQ(client.Command({"XADD", "s", "2051-0", "f", "tail"}).text_,
@@ -689,7 +692,8 @@ TEST(GroupedStreamE2e, LargeRepliesKeepSnapshotsAndDeletedHistory) {
   PrivateDisk disk(2ULL * 1024 * 1024 * 1024);
   // Keep this budget tight: RESTORE must leave headroom for the destination's
   // first side-index arena span while coalescing the large decoded messages.
-  Server server(disk, 2, {}, {}, false, 2, "256M", {}, "128M");
+  Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(256 * kMiB, 2),
+                {}, "128M");
   server.PreserveOnFailure();
   Client client(server.port());
   PopulateStream(client, "s", 256, 256 * 1024);
@@ -759,7 +763,8 @@ TEST(GroupedStreamE2e, LargeRdbRoundTripKeepsMessagesAndDeletedPendingBounded) {
     ~Cleanup() { ::unlink(path.c_str()); }
   } cleanup{input};
   {
-    Server server(source, 2, {}, {}, false, 2, "256M");
+    Server server(source, 2, {}, {}, false, 2,
+                  WithStorageBaseline(256 * kMiB, 2));
     Client client(server.port());
     PopulateStream(client, "s", 2050, 256 * 1024);
     ASSERT_EQ(client.Command({"XGROUP", "CREATE", "s", "g", "0"}).text_, "OK");
@@ -780,7 +785,8 @@ TEST(GroupedStreamE2e, LargeRdbRoundTripKeepsMessagesAndDeletedPendingBounded) {
     ASSERT_EQ(::rename((source.path() + ".rdb").c_str(), input.c_str()), 0);
   }
   {
-    Server server(target, 3, {}, {}, false, 2, "256M", input);
+    Server server(target, 3, {}, {}, false, 2,
+                  WithStorageBaseline(256 * kMiB, 3), input);
     const auto deadline = std::chrono::steady_clock::now() + 180s;
     while (server.Log().find("loaded RDB file") == std::string::npos &&
            server.Running() && std::chrono::steady_clock::now() < deadline)
@@ -809,7 +815,8 @@ TEST(GroupedStreamE2e, LargeRdbRoundTripKeepsMessagesAndDeletedPendingBounded) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  Server server(target, 2, {}, {}, false, 2, "256M");
+  Server server(target, 2, {}, {}, false, 2,
+                WithStorageBaseline(256 * kMiB, 2));
   Client client(server.port());
   EXPECT_EQ(client.Command({"XLEN", "s"}).text_, "2050");
 }

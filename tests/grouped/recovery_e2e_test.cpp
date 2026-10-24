@@ -39,6 +39,7 @@
 
 #include "../support/test_data_path.h"
 #include "gtest/gtest.h"
+#include "lavik/fault_injection.h"
 #include "lavik/rdb.h"
 #include "lavik/storage/detail/grouped/collection.h"
 #include "lavik/storage/detail/grouped/hash.h"
@@ -502,7 +503,12 @@ class ChildServer {
                   {"--rdb-dir", lavik::test::TestDataDirectory().string(),
                    "--dbfilename", dump_.substr(dump_.rfind('/') + 1)});
       if (!defrag) args.emplace_back("--defrag-paused");
-      if (checkpoint) args.emplace_back("--shutdown-checkpoint");
+      if (checkpoint) {
+        // Exercise the smallest supported pool: shutdown must borrow both
+        // slots, including when a long key spans multiple checkpoint chunks.
+        args.insert(args.end(), {"--shutdown-checkpoint",
+                                 "--storage-write-buffers-per-worker", "2"});
+      }
       std::vector<char*> argv;
       for (auto& arg : args) argv.push_back(arg.data());
       argv.push_back(nullptr);
@@ -1135,6 +1141,8 @@ TEST(GroupedRecoveryE2e, ObsoleteGroupDoesNotReadAlreadyReclaimedValueExtents) {
 }
 
 TEST(GroupedRecoveryE2e, CheckpointRestoresGroupedGraphAndExternalPayload) {
+  grouped_e2e::ScopedEnvironment overflow("LAVIK_FAIL_READ_BUFFER_ALLOCATION",
+                                          "1");
   RecordImage image(64);
   image.Group("hash", SingleGroup(9 * 1024 * 1024), 1, 0, true);
   image.Root(
@@ -1193,6 +1201,8 @@ TEST(GroupedRecoveryE2e, CheckpointAccountsForReassignedPhysicalOwners) {
 }
 
 TEST(GroupedRecoveryE2e, CheckpointRestoresAllGroupedTypesWithIndirectKeys) {
+  grouped_e2e::ScopedEnvironment overflow("LAVIK_FAIL_READ_BUFFER_ALLOCATION",
+                                          "1");
   RecordImage image(128);
   image.Finish();
   const std::string prefix(3000, 'k');
@@ -1273,6 +1283,8 @@ TEST(GroupedRecoveryE2e, CheckpointRestoresAllGroupedTypesWithIndirectKeys) {
 
 TEST(GroupedRecoveryE2e,
      CorruptObjectCheckpointFallsBackWithIndirectDependencies) {
+  grouped_e2e::ScopedEnvironment overflow("LAVIK_FAIL_READ_BUFFER_ALLOCATION",
+                                          "1");
   RecordImage image(128);
   image.Finish();
   const std::string key(3000, 'k');
@@ -1299,6 +1311,51 @@ TEST(GroupedRecoveryE2e,
   EXPECT_EQ(recovered.Command({"HGET", key, "field"}), value);
   EXPECT_EQ(recovered.Command({"GET", huge_key}), "large-key");
   EXPECT_EQ(recovered.Command({"EXISTS", key + "deleted"}), ":0");
+}
+
+TEST(GroupedRecoveryE2e, FailedCheckpointPrefetchDrainsBeforeRecoveryReuse) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires prefetch submission failure injection";
+#endif
+  grouped_e2e::ScopedEnvironment overflow("LAVIK_FAIL_READ_BUFFER_ALLOCATION",
+                                          "1");
+  for (const auto phase : {"discovery", "body"}) {
+    SCOPED_TRACE(phase);
+    RecordImage image(128);
+    image.Finish();
+    const std::string key(9 * 1024 * 1024, 'K');
+    {
+      ChildServer server(image, true);
+      ASSERT_EQ(server.Command({"SET", "inline", "value"}), "+OK");
+      ASSERT_EQ(server.Command({"SET", key, "key-extents"}), "+OK");
+      ASSERT_EQ(server.Command({"HSET", "hash", "field", "payload"}), ":1");
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+      ASSERT_NE(server.Log().find("published shutdown checkpoint generation="),
+                std::string::npos)
+          << server.Log();
+    }
+    {
+      grouped_e2e::ScopedEnvironment fail(
+          "LAVIK_FAIL_CHECKPOINT_PREFETCH_AFTER_SUBMIT", phase);
+      ChildServer recovered(image, true);
+      EXPECT_EQ(recovered.Command({"GET", "inline"}), "value");
+      EXPECT_EQ(recovered.Command({"GET", key}), "key-extents");
+      EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}), "payload");
+      EXPECT_NE(recovered.Log().find(std::string("injected checkpoint ") +
+                                     phase + " failure after read submission"),
+                std::string::npos)
+          << recovered.Log();
+      EXPECT_NE(recovered.Log().find("falling back to record scan"),
+                std::string::npos)
+          << recovered.Log();
+      ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+    }
+    ChildServer restarted(image, true);
+    EXPECT_EQ(restarted.Command({"GET", key}), "key-extents");
+    EXPECT_NE(restarted.Log().find("loaded shutdown checkpoint generation="),
+              std::string::npos)
+        << restarted.Log();
+  }
 }
 
 TEST(GroupedRecoveryE2e, FlushDbDetachesAndRetiresTheCompleteGraph) {

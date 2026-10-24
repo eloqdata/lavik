@@ -1378,116 +1378,6 @@ void StorageEngine::Impl::AcknowledgeFullSyncPublishItem(
   store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
 }
 
-Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
-    std::uint16_t partition_id,
-    std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
-    std::uint64_t persisted_replication_epoch, bool replica_lock_held) {
-  WorkerStore& store = CurrentStore();
-  WorkerStore::PopulationReadFence population_fence(store);
-  std::unique_ptr<UnlockGuard> replica_unlock;
-  if (!replica_lock_held) {
-    co_await store.replica_apply_mutex_.Lock();
-    replica_unlock = std::make_unique<UnlockGuard>(&store.replica_apply_mutex_,
-                                                   store.worker_);
-  }
-  if (persisted_replication_epoch == 0) {
-    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      absl::Status advanced =
-          co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
-      if (!advanced.ok()) {
-        co_return advanced;
-      }
-    }
-  }
-
-  auto& partition = PartitionFor(store, partition_id);
-  if (partition.replication_epoch_ ==
-      std::numeric_limits<std::uint64_t>::max()) {
-    co_return absl::Status(absl::StatusCode::kOutOfRange,
-                           "partition replication epoch exhausted");
-  }
-  const auto aborted_stage = co_await AbortReplicaValueStage(store, partition);
-  if (!aborted_stage.ok()) co_return aborted_stage;
-  // Stop this worker's append stream before making the new epoch durable.
-  // Otherwise a concurrent command could append an old-epoch record after
-  // the metadata commit and receive OK even though restart must discard it.
-  co_await store.store_state_mutex_.Lock();
-  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  const std::uint64_t next_epoch = partition.replication_epoch_ + 1;
-  if (persisted_replication_epoch != 0 &&
-      persisted_replication_epoch != next_epoch) {
-    co_return absl::Status(absl::StatusCode::kAborted,
-                           "replica reset superseded by another session");
-  }
-  if (persisted_replication_epoch == 0) {
-    absl::Status persisted = co_await PersistEpochValue(
-        kLogicalDatabaseCount + partition_id, next_epoch);
-    if (!persisted.ok()) {
-      co_return persisted;
-    }
-  }
-
-  struct OldKey {
-    std::uint8_t db_id_ = 0;
-    std::string key_;
-  };
-  std::vector<OldKey> old_keys;
-  for (std::uint8_t db_id = 0; db_id < options_.database_count_; ++db_id) {
-    struct ExternalKey {
-      RecordLocation location_;
-      std::uint32_t key_bytes_ = 0;
-    };
-    std::vector<ExternalKey> external_keys;
-    partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
-      if (entry.key_complete()) [[likely]] {
-        old_keys.push_back(
-            OldKey{.db_id_ = db_id, .key_ = std::string(entry.key())});
-      } else [[unlikely]] {
-        external_keys.push_back(ExternalKey{
-            .location_ = MaterializeIndexLocation(entry),
-            .key_bytes_ = entry.logical_key_size(),
-        });
-      }
-    });
-    for (const ExternalKey& external : external_keys) {
-      auto key = co_await LoadOutOfIndexKey(store, external.location_,
-                                            external.key_bytes_);
-      if (!key.ok()) {
-        co_return key.status();
-      }
-      old_keys.push_back(OldKey{.db_id_ = db_id, .key_ = std::move(*key)});
-    }
-  }
-  tomb_raider_index_generation_.fetch_add(1, std::memory_order_release);
-  partition.replication_epoch_ = next_epoch;
-  remote_replication_epochs_[partition_id].store(next_epoch,
-                                                 std::memory_order_release);
-  partition.mutation_sequence_ = 0;
-  for (auto& [session_id, capture] : partition.fullsync_subscribers_) {
-    ClearFullSyncCapture(store, session_id, capture);
-  }
-  partition.fullsync_subscribers_.clear();
-  partition.replica_value_stage_.reset();
-  for (const OldKey& old : old_keys) {
-    const std::uint8_t db_id = old.db_id_;
-    const std::string& key = old.key_;
-    const Digest digest = ComputeDigest(key);
-    const bool key_indirect = key.size() > kInlineKeyMaxBytes;
-    const RecordWriteRequest record_write{
-        .key_ = key,
-        .digest_ = digest,
-        .logical_size_ = 0,
-        .db_id_ = db_id,
-        .kind_ = RecordKind::kTombstone,
-        .unlock_writer_while_waiting_ = false,
-        .key_indirect_ = key_indirect,
-    };
-    absl::Status tombstone = co_await WriteRecordLocked(store, record_write);
-    if (!tombstone.ok()) co_return tombstone;
-  }
-  co_return next_epoch;
-}
-
 Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
 StorageEngine::Impl::ResetReplicaPartitions(
     std::uint64_t session_id, std::span<const ReplicaPartitionReset> resets) {
@@ -1718,15 +1608,6 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
   co_return absl::OkStatus();
 }
 
-// TODO(replication): ResetReplicaPartition above holds store_state_mutex across
-// its whole tombstone loop (unlock_writer_while_waiting=false), so on a full
-// device its inline block allocation waits for reclaim progress while the
-// flush that would free space is itself waiting for this store_state_mutex — a
-// three-way stall that never resolves. When the epoch redesign lands, the
-// loop should release the mutex around allocation waits and revalidate
-// (db_epoch, replication_epoch, index_generation) afterwards, the same
-// expected-version handoff defrag relocation uses.
-//
 // Replica apply deliberately bypasses source publication. ReplicationManager
 // rejects downstream native sessions while an upstream is configured, so this
 // path never has to act as a cascading relay.

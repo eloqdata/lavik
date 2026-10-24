@@ -757,7 +757,7 @@ TEST(StorageExpirationAuthorityTest,
   options.tx_cleaner_cooldown_ms_ = 0;
   lavik::storage::StorageEngine storage(std::move(options));
   lavik::InitWorkerMetrics(1);
-  ASSERT_TRUE(lavik::InitMemoryLimit(512 * kMiB, 1).ok());
+  ASSERT_TRUE(lavik::InitMemoryLimit(1024 * kMiB, 1).ok());
   ASSERT_TRUE(storage.Prepare(1).ok());
   if (lavik::tx::TxRuntime::Get() == nullptr) lavik::tx::TxRuntime::Create(1);
 
@@ -771,6 +771,44 @@ TEST(StorageExpirationAuthorityTest,
   ASSERT_TRUE(server.Start(runtime).ok());
   server.WaitUntilStopped();
   EXPECT_TRUE(service.result().ok()) << service.result();
+}
+
+TEST(StorageCapacityTest, EmptyIndexesAreChargedToTheirWorkers) {
+  const std::string path = lavik::test::TestDataPath(
+      "lavik-index-accounting-" + std::to_string(::getpid()) + ".data");
+  Cleanup cleanup{{path}};
+  ASSERT_TRUE(CreateFile(path, 96 * kMiB));
+  ASSERT_TRUE(lavik::InitMemoryLimit(2048 * kMiB, 2).ok());
+  const auto first_baseline = lavik::WorkerMemoryAccountingBytes(0);
+  const auto second_baseline = lavik::WorkerMemoryAccountingBytes(1);
+  for (unsigned databases : {1u, 16u}) {
+    SCOPED_TRACE(databases);
+    {
+      lavik::storage::StorageEngineOptions options;
+      options.data_files_ = {path};
+      options.database_count_ = databases;
+      lavik::storage::StorageEngine storage(std::move(options));
+      ASSERT_TRUE(storage.Prepare(2).ok());
+      // Each worker owns a fixed page directory and half of the primary map
+      // objects, including their inline reader states even before any insert.
+      const auto minimum_bytes =
+          16 * kMiB + lavik::storage::kLogicalStorageShards / 2 * databases *
+                          sizeof(lavik::storage::RecordIndex);
+      EXPECT_GE(lavik::WorkerMemoryAccountingBytes(0) - first_baseline,
+                minimum_bytes);
+      EXPECT_GE(lavik::WorkerMemoryAccountingBytes(1) - second_baseline,
+                minimum_bytes);
+      // The fixed footprint must participate in recovery's transition to the
+      // steady waterline, even for an empty database.
+      ASSERT_TRUE(lavik::InitMemoryLimit(32 * kMiB, 2).ok());
+      lavik::RecoveryMemoryBudget recovery;
+      EXPECT_TRUE(absl::IsResourceExhausted(recovery.Finish()));
+      ASSERT_TRUE(lavik::InitMemoryLimit(2048 * kMiB, 2).ok());
+      EXPECT_TRUE(recovery.Finish().ok());
+    }
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(0), first_baseline);
+    EXPECT_EQ(lavik::WorkerMemoryAccountingBytes(1), second_baseline);
+  }
 }
 
 TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {

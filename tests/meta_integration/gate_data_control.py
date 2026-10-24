@@ -148,7 +148,9 @@ class DataProcess:
             "--repl-backlog-size",
             f"{8 * self.workers}mb",
             "--max-memory",
-            "1073741824",
+            # Three-worker replicas must also admit publisher staging when
+            # promoted, above their fixed indexes and 88 MiB/worker I/O pools.
+            "2147483648",
             "--flush-max-ms",
             "20",
             "--data-file",

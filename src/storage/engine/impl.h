@@ -290,8 +290,6 @@ struct ActiveBlock {
   std::uint32_t record_count_ = 0;
   std::uint64_t max_lsn_ = 0;
   std::uint16_t write_buffer_id_ = 0;
-  std::byte* heap_buffer_ = nullptr;
-  std::size_t heap_buffer_size_ = 0;
   BlockKind kind_ = BlockKind::kRecords;
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
@@ -304,8 +302,6 @@ struct ActiveBlock {
 // of charging staging-only state to every block.
 struct StagingSlot {
   std::uint16_t write_buffer_id_ = 0;
-  std::byte* heap_data_ = nullptr;
-  std::size_t heap_data_size_ = 0;
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
   std::uint32_t durable_bytes_ = kBlockHeaderBytes;
@@ -1111,11 +1107,28 @@ inline absl::Status WriteExactlyAt(int fd, std::span<const std::byte> input,
   return absl::OkStatus();
 }
 
+// SPDK bootstrap calls must borrow an existing DMA read workspace. File I/O
+// needs no bounce buffer; the optional workspace keeps file-only tools/tests
+// usable before storage pools exist. Never allocate DMA on this path.
 inline absl::Status ReadExactlyAt(const std::string& path,
                                   std::span<std::byte> output,
-                                  std::uint64_t offset) {
+                                  std::uint64_t offset,
+                                  FixedBuffer scratch = {}) {
   if (bycorf::IsSpdkStoragePath(path)) {
-    return bycorf::ReadSpdkStorage(path, output, offset);
+    if (scratch.data_ == nullptr || scratch.size_ == 0) {
+      return absl::FailedPreconditionError(
+          "SPDK startup read buffer is missing");
+    }
+    for (std::size_t done = 0; done < output.size();) {
+      const std::size_t bytes = std::min(scratch.size_, output.size() - done);
+      absl::Status status = bycorf::spdk::sync::ReadDma(
+          path, std::span<std::byte>(scratch.data_, bytes), offset + done);
+      if (!status.ok()) return status;
+      if (output.data() + done != scratch.data_)
+        std::memcpy(output.data() + done, scratch.data_, bytes);
+      done += bytes;
+    }
+    return absl::OkStatus();
   }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -1134,9 +1147,24 @@ inline absl::Status ReadExactlyAt(const std::string& path,
 
 inline absl::Status WriteExactlyAt(const std::string& path,
                                    std::span<const std::byte> input,
-                                   std::uint64_t offset, bool flush) {
+                                   std::uint64_t offset, bool flush,
+                                   FixedBuffer scratch = {}) {
   if (bycorf::IsSpdkStoragePath(path)) {
-    return bycorf::WriteSpdkStorage(path, input, offset, flush);
+    if (scratch.data_ == nullptr || scratch.size_ == 0 || input.empty()) {
+      return absl::FailedPreconditionError(
+          "SPDK startup write buffer is missing or empty");
+    }
+    for (std::size_t done = 0; done < input.size();) {
+      const std::size_t bytes = std::min(scratch.size_, input.size() - done);
+      if (input.data() + done != scratch.data_)
+        std::memcpy(scratch.data_, input.data() + done, bytes);
+      absl::Status status = bycorf::spdk::sync::WriteDma(
+          path, std::span<const std::byte>(scratch.data_, bytes), offset + done,
+          flush && done + bytes == input.size());
+      if (!status.ok()) return status;
+      done += bytes;
+    }
+    return absl::OkStatus();
   }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -1159,9 +1187,9 @@ inline absl::Status WriteExactlyAt(const std::string& path,
 }
 
 inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
-    const std::string& path) {
+    const std::string& path, FixedBuffer scratch = {}) {
   std::array<std::byte, kDirectIoAlignment> page{};
-  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset);
+  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset, scratch);
   if (!status.ok()) {
     return status;
   }
@@ -1177,10 +1205,11 @@ inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
 }
 
 inline absl::Status WriteDeviceLabel(const std::string& path,
-                                     const DeviceLabel& label) {
+                                     const DeviceLabel& label,
+                                     FixedBuffer scratch = {}) {
   std::array<std::byte, kDirectIoAlignment> page{};
   EncodeDeviceLabel(label, page);
-  return WriteExactlyAt(path, page, kDeviceLabelOffset, true);
+  return WriteExactlyAt(path, page, kDeviceLabelOffset, true, scratch);
 }
 
 struct MetadataPageState {
@@ -1195,7 +1224,8 @@ struct LoadedMetadataPage {
 
 inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
     const std::string& path, std::uint64_t base_offset, MetadataPageKind kind,
-    std::uint32_t page_index, std::size_t payload_bytes) {
+    std::uint32_t page_index, std::size_t payload_bytes,
+    FixedBuffer scratch = {}) {
   LoadedMetadataPage selected;
   selected.payload_.resize(payload_bytes, std::byte{0});
   bool saw_nonzero = false;
@@ -1203,7 +1233,8 @@ inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
     absl::Status read = ReadExactlyAt(
-        path, page, MetadataPageSlotOffset(base_offset, page_index, slot));
+        path, page, MetadataPageSlotOffset(base_offset, page_index, slot),
+        scratch);
     if (!read.ok()) {
       return read;
     }
@@ -1349,8 +1380,19 @@ struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
 static_assert(sizeof(RecoveryDeviceCursor) % kCacheLineBytes == 0);
 
 struct DeviceAllocator {
+  ~DeviceAllocator();
+  // Allocate once during Prepare, before workers can issue allocator I/O.
+  // Failure prevents startup; no online path allocates fallback storage.
+  absl::Status InitMetadataWriteBuffer(std::uint64_t device_id);
+
   bycorf::WorkerId owner_ = 0;
   AsyncMutex mutex_;
+  // Cleared block headers and metadata pages share this write-only workspace
+  // under mutex_. Engine ownership outlives worker I/O and coroutine teardown.
+  // Its owner registers it before ordinary buffers when memlock permits;
+  // unregistered io_uring writes remain valid. SPDK requires DMA memory.
+  FixedBuffer metadata_write_buffer_{};
+  RetainedMemoryCharge metadata_write_buffer_charge_;
   std::uint32_t data_block_begin_ = 1;
   std::uint64_t next_pristine_ = 1;
   std::uint64_t next_allocation_epoch_ = 1;
@@ -1643,6 +1685,10 @@ class StorageEngine::Impl {
  public:
   struct FullSyncCollection;
   struct WorkerStore {
+    explicit WorkerStore(unsigned memory_owner = CurrentMemoryAccountingShard())
+        : partition_indexes_(RetainedAllocator<RecordIndex>(
+              {.owner_shard_ = memory_owner, .externally_admitted_ = true})) {}
+
     Impl* engine_ = nullptr;
     bycorf::AsyncNotification block_pin_progress_;
     // Only genuinely exhausted foreground allocations wait here. Notification
@@ -1766,16 +1812,12 @@ class StorageEngine::Impl {
       std::uint32_t next_fragment_index_ = 0;
       std::size_t max_blocks_ = 0;
       std::vector<Block> blocks_;
+      // Borrowed from the engine for this session. Capture and replay are
+      // serialized under mutex_; only an unsealed block sets active_buffer_.
+      std::byte* buffer_ = nullptr;
       std::byte* active_buffer_ = nullptr;
-      RetainedMemoryCharge active_buffer_charge_;
       bool capturing_ = false;
       std::optional<absl::Status> failure_;
-
-      ~RedisExportDiskBacklog() {
-        if (active_buffer_ != nullptr) {
-          bycorf::FreeStorageBuffer(active_buffer_, kDirectIoAlignment);
-        }
-      }
     };
 
     struct FullSyncCapture {
@@ -1972,12 +2014,19 @@ class StorageEngine::Impl {
     // by worker_count, so allocation is local and needs no atomic operation.
     std::uint64_t next_lsn_ = 0;
     RegisteredBufferPool buffers_;
+    // Startup prefetch may outlive its decoder on checkpoint fallback. A
+    // delegated SPDK completion can run on another worker; drain this count
+    // before reusing the borrowed maintenance buffers in the next phase.
+    std::atomic<unsigned> checkpoint_reads_in_flight_{0};
     std::vector<FixedFile> files_;
     // Primary indexes and the UUID registry share one worker handle namespace.
     // Declaring the arena before partitions and detached populations makes it
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
-    std::vector<RecordIndex> partition_indexes_;
+    // Constructed before workers start, but charged to the eventual owner.
+    // Startup recovery includes this fixed footprint in its budget checks;
+    // allocator ownership also survives main-thread teardown.
+    std::vector<RecordIndex, RetainedAllocator<RecordIndex>> partition_indexes_;
     std::vector<GroupedObjectIndex> partition_grouped_objects_;
     std::vector<PartitionStore> partitions_;
     // Present only while a shutdown checkpoint is being restored. Keeping the
@@ -3302,11 +3351,6 @@ class StorageEngine::Impl {
   void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                       std::uint64_t item_id);
 
-  Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
-      std::uint16_t partition_id,
-      std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
-      std::uint64_t persisted_replication_epoch = 0,
-      bool replica_lock_held = false);
   Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::uint64_t session_id,
                          std::span<const ReplicaPartitionReset> resets);
@@ -3425,6 +3469,7 @@ class StorageEngine::Impl {
   // NodeControl cleanup. Both are irreversible for this process.
   void LatchRuntimeFailure(WorkerStore& store) noexcept {
     store.write_failed_ = true;
+    store.buffers_.FailWriteWaiters();
     LatchRuntimeFailure();
   }
   void LatchRuntimeFailure() noexcept { FenceRequestServingUntilRestart(); }
@@ -3435,6 +3480,8 @@ class StorageEngine::Impl {
   friend class LoadValueAwaitableTestPeer;
   friend class RemoteGetTestPeer;
   friend class TxCleanerPipelineTestPeer;
+  friend class WriteBufferTestPeer;
+  friend class RedisExportBufferTestPeer;
   friend class StorageEngine::RemoteReadAwaitable;
 
   struct DurableSystemState {
@@ -3451,7 +3498,7 @@ class StorageEngine::Impl {
     bool catalog_ready_ = false;
   };
 
-  absl::Status LoadSystemState();
+  absl::Status LoadSystemState(FixedBuffer read_buffer);
   Task<absl::Status> CommitSystemState(
       DurableSystemState next, std::string_view catalog_dump,
       bool replace_catalog, bool shutdown_metadata = false,
@@ -3526,10 +3573,10 @@ class StorageEngine::Impl {
   };
 
   // The awaitable lives in the caller's frame. Ordinary local reads suspend
-  // that caller directly, including through pool backpressure. Only multi-step
-  // logical reads need a lazy helper Task. Local mode returns stale-location
-  // errors to its caller, while logical mode resolves same-mutation relocations
-  // before returning.
+  // that caller directly, including through pool backpressure. Multi-step
+  // logical reads and oversized-allocation fallback use a lazy helper Task.
+  // Local mode returns stale-location errors to its caller, while logical mode
+  // resolves same-mutation relocations before returning.
   class LoadValueAwaitable final : public bycorf::OneShotIoAwaitable,
                                    private bycorf::RemoteWork {
    public:
@@ -3567,6 +3614,7 @@ class StorageEngine::Impl {
     std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
     absl::StatusOr<Payload> ParseRecord(const std::byte* data) const;
     Result FinishRecord(const std::byte* data, Payload payload, bool staged);
+    Task<Result> ReadInChunks();
     bool PopulationChanged() const;
     void Unpin();
     void Retry(absl::Status failure);
@@ -3597,7 +3645,8 @@ class StorageEngine::Impl {
 
   // One physical extent read, including buffer waiting and slice validation,
   // embedded in the caller. Routing adds a runtime task bridge only when the
-  // block belongs to another worker; local reads need no child coroutine.
+  // block belongs to another worker. If an oversized DMA allocation fails, a
+  // lazy child reads the extent in slot-sized chunks without dropping its pin.
   class ReadExtentAwaitable final : public bycorf::OneShotIoAwaitable,
                                     private bycorf::RemoteWork {
    public:
@@ -3606,7 +3655,7 @@ class StorageEngine::Impl {
                         std::span<std::byte> destination, bool route = false);
     ~ReadExtentAwaitable();
     bool await_ready() const noexcept { return ready_.has_value(); }
-    bool await_suspend(std::coroutine_handle<> awaiting);
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
     absl::Status await_resume();
 
    private:
@@ -3622,7 +3671,11 @@ class StorageEngine::Impl {
     };
     void FinishBufferWait();
     static void BufferReady(bycorf::RemoteWork* work);
+    std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
     bool SubmitRead(std::coroutine_handle<> awaiting);
+    bool DecodeHeader(std::span<const std::byte, kBlockHeaderBytes> bytes,
+                      BlockHeader& header) const;
+    Task<absl::Status> ReadInChunks();
 
     Impl& engine_;
     WorkerStore& store_;
@@ -3636,6 +3689,7 @@ class StorageEngine::Impl {
     ReadBufferLease lease_;
     std::optional<RegisteredBufferPool::AcquireReadAwaiter> buffer_wait_;
     std::optional<bycorf::SubmitTaskAwaiter<RemoteRead>> remote_;
+    Task<absl::Status> chunked_;
   };
 
   // Owns the page lease while a grouped reader inspects its checked envelope.
@@ -4008,7 +4062,7 @@ class StorageEngine::Impl {
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
   Task<absl::Status> ReadRecoveryExtentInto(
       WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-      std::span<std::byte> destination,
+      FixedBuffer scratch, std::span<std::byte> destination,
       OrderedGroupMetadataDecoder* ordered = nullptr);
   // Read a bounded prefix while validating every extent in the manifest. Used
   // for group envelopes so an indivisible large field does not become a large
@@ -4521,6 +4575,9 @@ class StorageEngine::Impl {
     // The request lives in the caller's coroutine frame. Pack these local
     // flags into one byte rather than adding another aligned word to it.
     bool for_defrag_ : 1 = false;
+    // Controls physical-block allocation and its foreground gate. Relocation
+    // bypasses that gate, but always unlocks for fixed write-buffer waiting;
+    // its source is revalidated before publishing the copied record.
     bool unlock_writer_while_waiting_ : 1 = true;
     bool external_ : 1 = false;
     bool key_indirect_ : 1 = false;
@@ -4601,6 +4658,8 @@ class StorageEngine::Impl {
 
   Task<absl::Status> DiscoverCheckpoint(WorkerStore& store,
                                         CheckpointLoadResult* result);
+
+  Task<absl::Status> DrainCheckpointReads(WorkerStore& store);
 
   Task<absl::Status> PrepareCheckpointIndexes();
 
@@ -4788,9 +4847,12 @@ class StorageEngine::Impl {
   // Rewrites every record in the block that is still current, so the block ends
   // up with no reachable data and the caller can free it. Clears `defragging`
   // on each failure path so the block stays eligible for a later pass.
+  // The caller lends its dedicated maintenance buffer through all relocation
+  // awaits; defrag and TxCleaner must never share the same workspace.
   Task<absl::Status> SalvageBlockRecords(
       WorkerStore& store, std::uint64_t block_id, BlockState& source,
       std::uint32_t source_file_id, std::uint64_t source_block_offset,
+      FixedBuffer block_data,
       std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
           committed_txids = nullptr,
       bool stop_on_shutdown = false);
@@ -4803,6 +4865,17 @@ class StorageEngine::Impl {
                                        BlockState& source);
 
   StorageEngineOptions options_;
+  // A single exporter owns this process-wide workspace from capture through
+  // disk replay. The atomic transfers exclusive use between connection owners
+  // without a cross-worker blocking mutex. It outlives the worker stores and
+  // is charged to shared startup accounting, including between sessions.
+  struct RedisExportBuffer {
+    absl::Status Init();
+    ~RedisExportBuffer();
+    std::byte* data_ = nullptr;
+    RetainedMemoryCharge charge_;
+    std::atomic<bool> in_use_{false};
+  } redis_export_buffer_;
   // CONFIG SET updates the next-shutdown policy without visiting workers.
   // FlushForShutdown snapshots it before publishing shutdown_flush_requested_,
   // so every worker enters the same barrier path for that shutdown.

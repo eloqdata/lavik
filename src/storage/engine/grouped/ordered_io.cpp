@@ -338,10 +338,10 @@ StorageEngine::Impl::LoadGroupedStringValue(
   }
   const auto size = static_cast<std::size_t>(root.item_count_);
   const auto& options = options_.buffers_;
-  // The output survives every page read. Even a small grouped String must use
-  // overflow storage: retaining a fixed slot while waiting for another can
-  // deadlock a bounded pool when concurrent readers each hold their output.
-  const auto minimum_output = std::max(size, options.read_payload_bytes() + 1);
+  // The output is assembled by copying pages, so it needs no DMA allocation.
+  // It must not hold a fixed slot while children wait for their read buffers.
+  // Match AllocateReadOutputBuffer's capacity for scratch admission.
+  const auto minimum_output = std::max(size, options.read_payload_bytes());
   constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
   if (options.alignment_ == 0 || options.alignment_ > limit ||
       minimum_output > limit - (options.alignment_ - 1)) {
@@ -403,7 +403,7 @@ StorageEngine::Impl::LoadGroupedStringValue(
     if (!plan->ReserveWindow<std::size_t>(page_scratch)) plan.reset();
   }
 
-  auto buffer = co_await store.buffers_.AcquireReadBuffer(minimum_output);
+  auto buffer = store.buffers_.AllocateReadOutputBuffer(minimum_output);
   if (!buffer.ok()) co_return buffer.status();
   const auto output = buffer->io_buffer();
   if (output.size_ < size)

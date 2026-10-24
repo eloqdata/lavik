@@ -118,7 +118,9 @@ direct I/O. Its read and write slots share worker-owned allocations;
 multiple slots share a registered region while keeping independent lease and
 release identities. Buffer-pool capacity is independent of registration success.
 If full io_uring registration fails, a finite memlock allowance permits a
-best-effort subset registration, prioritizing read slots. Each lease retains
+best-effort subset registration: per-device metadata workspaces on their owner
+worker first, then ordinary read slots, write slots, and maintenance images.
+The process-wide export image remains unregistered. Each lease retains
 its slot identity and immutable registration status; unregistered slots use
 the same aligned memory with plain asynchronous I/O. On SPDK, a
 worker opens only namespaces whose physical controller assigned it a qpair.
@@ -394,6 +396,12 @@ worker-local boots. Request readiness follows successful completion of the
 complete recovery and allocator-cleanup sequence; the exact moment a listening
 socket exists is not the readiness boundary.
 
+Startup metadata I/O borrows the prepared maintenance read and device write
+workspaces; temporary SPDK metadata qpairs close before worker queues open.
+Recovery then borrows the maintenance images, including for delegated reads,
+and drains outstanding I/O before reuse or maintenance startup. Checkpoint
+prefetch and fallback follow the [checkpoint lifecycle](06-shutdown-index-checkpoints.md).
+
 After worker recovery, the Function catalog decodes the selected dump and
 stages it independently on every worker before Redis readiness. A missing root
 on a fresh set is the canonical empty catalog and needs no durable allocation.
@@ -555,8 +563,10 @@ allocation when the caller protects the resolved entry and arena lifetimes;
 it does not pin entries or make the hash tables safe for concurrent access.
 Allocator mutation remains owner-local. Private auxiliary arenas retain
 incremental directory allocation and owner-only access.
-Each primary key index reserves 32 cache-line-isolated atomic read-admission
-states, including while empty. Its bucket arrays remain demand-allocated,
+The primary-index object arrays are allocated once for the worker's partitions
+and enabled logical databases and charged to that worker, including while
+empty. Each primary key index reserves 32 cache-line-isolated atomic
+read-admission states within those objects. Its bucket arrays remain demand-allocated,
 start at 32 buckets, and never shrink below 32 while nonempty; checkpoint
 recovery applies the same floor. Reader admission is explicitly enabled only
 for a published map with a fixed arena directory and an externally protected
@@ -617,6 +627,23 @@ headroom. After all storage recovery coroutines have returned and their heaps
 have been collected, every worker's remaining footprint must fit its normal
 90-percent share before the server permits startup import and serving. A
 failed transition stops startup. Recovery does not change the disk scan count.
+
+Retained memory includes fixed read/write pools and maintenance, device-metadata,
+and export workspaces. These are allocated at startup and retained until their
+owners tear down after I/O drains; allocation failure prevents startup.
+Registration and reuse across startup, recovery, and serving do not allocate
+or charge a second copy. Each device allocator owns an 8 KiB write workspace
+for metadata and recycled-block headers, serialized by its coroutine mutex.
+[Redis export](05-replication.md#redis-psync-export) owns a separate process-wide
+workspace.
+
+Live overflow read buffers and ordinary-heap assembly outputs are also charged;
+returning a lease frees its allocation when the owner processes the return.
+I/O allocations have no separate retained-admission gate, allowing reads and
+reclamation to progress at the waterline; their charges constrain later growth.
+Accounting covers owned capacity, excluding allocator overhead and SPDK's full
+hugepage reservation. See the [memory metrics](../operations/metrics.md#memory-metrics)
+for the reported counters.
 
 Accounting ownership remains bound to the allocation's origin,
 so destruction credits the same worker even when it occurs elsewhere. INFO and
@@ -680,14 +707,35 @@ as SORT STORE and list-move operations still wait through tagged-record fences
 and commit-record append. Even an awaited `CommitTxWrites` only requests the
 commit-record flush; it is not a synchronous crash-durability fence.
 
-Staging-buffer pressure seals physical append streams before a writer waits
-for capacity. Live transaction leases and tagged records survive a pressure seal; later
-writes or commit decisions may open another transaction block. Flush completion returns sealed buffers after
+Record and extent writes use only the fixed write pool. Staging-buffer
+pressure seals physical append streams before a writer waits for capacity.
+Foreground and relocation writers release worker store state
+and join the same owner-local FIFO; a returned fixed slot transfers directly
+to its oldest waiter, so new borrowers cannot overtake it. Queued writers
+keep new append streams flushable. Live transaction leases and tagged
+records survive a pressure seal; later writes or commit decisions may open
+another transaction block. Flush completion returns sealed buffers after
 their last reader pin drains, including tails that were already durable.
 Capacity therefore does not depend on completing transactions that themselves
-need a staging buffer to commit.
+need a staging buffer to commit. A failed storage writer fails pending slot
+acquisitions without recycling its still-referenced staging memory.
+
+Relocation bypasses the foreground physical-allocation gate and retains access
+to the defrag disk reserve: a foreground allocator may itself be waiting for
+reclamation. After write-slot waiting, relocation revalidates its source before
+publication. Each worker owns three independent 8 MiB read buffers, one each
+for defrag, transaction cleaning, and Tomb Raider. At most one scanner of each
+kind runs per worker, so it can retain its image across I/O and relocation waits
+without borrowing write slots or allocating fallback scan buffers.
 
 ### Reads and pins
+
+With fixed read slots configured, reads try temporary overflow on exhaustion
+and wait FIFO if allocation fails. Oversized records and extents fall back to
+slot-sized chunks on allocation failure. Block pins survive waiting and all
+chunks, and the same identity, population, checksum, and relocation checks
+apply before exposing data. Assembly outputs use ordinary heap memory, including
+on SPDK, so retaining an output cannot exhaust the DMA slots needed to read it.
 
 Standalone single-key reads explicitly admitted by the command table can
 read directly on their connection worker after ordinary request, database and
@@ -704,10 +752,12 @@ owner qualify, and the connection worker must have device I/O access. Length
 commands can answer from the same protected index metadata without a block pin
 or payload buffer. Closed admission, unsupported representations, expired
 entries, concurrent admission contention, and an exhausted connection-worker
-read-buffer pool return to the normal owner route. Stream and Sorted Set
-whole-value callbacks exceeding the bounded inline workspace also retain the
-owner's scratch-admission path. Index misses use the same transaction and
-population admission checks.
+read-buffer pool whose temporary allocation also fails return to the normal
+owner route. Failed oversized allocation also takes that route, where the
+record reader can use fixed-slot chunks. Stream and Sorted Set whole-value
+callbacks exceeding the bounded inline workspace also retain the owner's
+scratch-admission path. Index misses use the same transaction and population
+admission checks.
 
 An admitted payload read submits I/O directly from an awaitable in the
 requesting coroutine. Completion validates the record and population and
@@ -759,10 +809,11 @@ representation-specific retry loop.
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size
 local inline records in waves paced by the fixed read-buffer pool; oversized
-records use aligned overflow leases. One completion barrier covers every I/O in
-a wave, and all leases are returned before relocation retries or the next wave
-can suspend. Staged, remote, external, indirect-key, and stale-validation cases
-fall back to the complete `GetLocked` state machine, preserving the ordinary
+records use aligned overflow leases or fall back to the complete reader if
+allocation fails. One completion barrier covers every I/O in a wave, and all
+leases are returned before a chunked fallback, relocation retry, or the next
+wave can suspend. Staged, remote, external, indirect-key, and stale-validation
+cases fall back to the complete `GetLocked` state machine, preserving the ordinary
 identity and relocation checks without one coroutine per key.
 
 Before returning disk bytes, storage validates block and record allocation

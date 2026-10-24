@@ -109,13 +109,17 @@ before starting other large services and inspect the helper's error output.
 Never run `setup.sh config` with an empty allowlist: its default device scope
 is broader than this guide's selected controllers.
 
-Size the host's hugepage reservation for all simultaneous SPDK processes,
-including each worker's storage-buffer budget, overflow buffers and SPDK/DPDK
-overhead. Check free hugepages after startup; a per-worker buffer setting is
-not a process-wide cap. On NUMA hosts, keep the selected NVMe controllers,
-hugepages and worker CPUs on the same node where possible. Keep network IRQ
-cores separate from workers when following the
-[IRQ affinity guide](irq-affinity-tuning.md).
+Size hugepages for all simultaneous SPDK processes. Start with each process's
+[fixed storage-buffer capacity](building-and-packaging.md#io_uring-storage-buffers-and-memlock),
+then allow for optional read overflow and SPDK/DPDK internal allocations.
+Startup metadata, recovery, and shutdown checkpoints reuse fixed workspaces;
+failure to allocate any required workspace prevents startup. A per-worker
+buffer setting is not a process-wide DMA cap. Check free hugepages after
+startup and use the EAL diagnostics below when sizing headroom.
+
+On NUMA hosts, keep selected NVMe controllers, hugepages and worker CPUs on the
+same node where possible. Keep network IRQ cores separate from workers when
+following the [IRQ affinity guide](irq-affinity-tuning.md).
 
 The benchmark VM did not expose an IOMMU and temporarily used VFIO's unsafe
 no-IOMMU mode. This removes DMA isolation and is specific to that dedicated
@@ -172,6 +176,24 @@ Expect `PONG` and `16`, respectively. The foreground pre-poll option
 keeps its startup default; verify `spdk_foreground_pre_poll_us=5` in the startup
 log rather than through `CONFIG GET`. Inspect startup logs
 for SPDK initialization and the selected namespaces before loading data.
+
+With SPDK storage, `SPDK/EAL memory phase=storage-open` logs a snapshot after
+all data workers have allocated their fixed storage buffers and opened their
+NVMe queue pairs, before recovery completes. It reports each EAL NUMA node and
+one `numa=all` aggregate, with byte-valued fields:
+
+| Field | Meaning |
+|---|---|
+| `heap_total_bytes` | Capacity currently managed by the EAL heap |
+| `heap_allocated_bytes` | Allocated EAL heap space, including storage DMA buffers and SPDK/DPDK internal allocations |
+| `heap_free_bytes` | Unallocated space within that heap |
+| `largest_free_block_bytes` | Largest individual free heap block; the aggregate takes the maximum across nodes, not their sum |
+
+This allocator snapshot is not RSS, a host hugepage reservation, or a runtime
+peak. It includes already-accounted storage buffers: do not add it to retained
+memory or interpret all allocated bytes as internal overhead. Free capacity and
+largest-block size do not guarantee future DMA allocations. A query failure
+warns and suppresses the aggregate without preventing startup.
 
 Separate instances must use disjoint namespaces and distinct listener ports.
 For storage-set expansion, worker/controller affinity and queue-capacity

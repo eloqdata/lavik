@@ -350,7 +350,10 @@ StorageEngine::Impl::DecodeSystemStateManifest(std::string_view encoded) {
   return state;
 }
 
-absl::Status StorageEngine::Impl::LoadSystemState() {
+absl::Status StorageEngine::Impl::LoadSystemState(FixedBuffer read_buffer) {
+  if (read_buffer.data_ == nullptr || read_buffer.size_ < kStorageBlockBytes)
+    return absl::FailedPreconditionError(
+        "system-state startup read buffer is missing");
   struct Candidate {
     std::uint64_t generation_ = 0;
     SystemStateRoot root_{};
@@ -364,7 +367,8 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
       std::array<std::byte, kDirectIoAlignment> page{};
       absl::Status read = ReadExactlyAt(
           device.path_, page,
-          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
+          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+          read_buffer);
       if (!read.ok()) return read;
       if (IsZero(page)) continue;
       saw_any_root = true;
@@ -410,7 +414,7 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
 
   auto read_extent =
       [&](const ExtentRef& ref,
-          std::uint32_t expected_index) -> absl::StatusOr<std::string> {
+          std::uint32_t expected_index) -> absl::StatusOr<std::string_view> {
     const std::size_t device_index = DeviceIdForBlock(ref.block_id_);
     if (device_index >= devices_.size() ||
         devices_[device_index].id_ != device_index) {
@@ -418,9 +422,15 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
     }
     const std::size_t read_bytes =
         AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-    std::vector<std::byte> bytes(read_bytes);
-    absl::Status read = ReadExactlyAt(devices_[device_index].path_, bytes,
-                                      LocalBlockOffset(ref.block_id_));
+    if (read_bytes > read_buffer.size_)
+      return absl::DataLossError("system-state extent exceeds its read buffer");
+    // The returned view lasts only until the next startup read. Manifest
+    // decoding owns its fields, and catalog assembly copies into ordinary
+    // heap memory before this one maintenance image is reused.
+    std::span<std::byte> bytes(read_buffer.data_, read_bytes);
+    absl::Status read =
+        ReadExactlyAt(devices_[device_index].path_, bytes,
+                      LocalBlockOffset(ref.block_id_), read_buffer);
     if (!read.ok()) return read;
     BlockHeader header;
     if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
@@ -440,8 +450,8 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
     if (Crc32c(payload) != ref.payload_checksum_) {
       return absl::InternalError("system-state extent checksum mismatch");
     }
-    return std::string(reinterpret_cast<const char*>(payload.data()),
-                       payload.size());
+    return std::string_view(reinterpret_cast<const char*>(payload.data()),
+                            payload.size());
   };
 
   auto manifest = read_extent(selected->root_.manifest_, 0);
@@ -529,10 +539,14 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
         }
       });
   WorkerStore& store = *stores_[allocator.owner_];
-  auto acquired = co_await store.buffers_.AcquireReadBuffer();
-  if (!acquired.ok()) co_return acquired.status();
-  ReadBufferLease lease = std::move(*acquired);
-  FixedBuffer buffer = lease.io_buffer();
+  LAVIK_FAULT_INJECT(if (device_index == 0) {
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE");
+    if (!paused.ok()) co_return paused;
+  });
+  co_await allocator.mutex_.Lock();
+  UnlockGuard buffer_unlock(&allocator.mutex_, store.worker_);
+  FixedBuffer buffer = allocator.metadata_write_buffer_;
   buffer.size_ = kDirectIoAlignment;
   std::array<std::byte, sizeof(SystemStateRoot)> payload{};
   EncodeSystemStateRoot(root, payload);
@@ -541,12 +555,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
                      std::span<std::byte, kDirectIoAlignment>(
                          buffer.data_, kDirectIoAlignment));
   const StorageDevice& device = devices_[device_index];
-  LAVIK_FAULT_INJECT(if (device_index == 0) {
-    auto paused = co_await fault_injection::PauseWhileFileExists(
-        "LAVIK_FUNCTION_CATALOG_BEFORE_ROOT_HOLD_FILE");
-    if (!paused.ok()) co_return paused;
-  });
-  // Buffer admission and the hop to this device's owner may suspend. This is
+  // The allocator lock and hop to this device's owner may suspend. This is
   // the first irreversible root write, not the earlier extent preparation.
   // The caller serially joins each device, so this flag has one writer at a
   // time. Never recheck between devices: a partial root set cannot be aborted
@@ -559,8 +568,11 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
   auto written = co_await WriteStorageBuffer(
       *store.worker_, store.files_[device.file_index_],
       std::span<const std::byte>(buffer.data_, kDirectIoAlignment),
-      lease.registered(), buffer,
+      store.buffers_.workspace_registered(buffer), buffer,
       MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, target_slot));
+  // Completion ends the DMA borrow. system_state_mutex_ still serializes root
+  // commits, so allocation can use the workspace while this root is synced.
+  buffer_unlock.Unlock();
   if (!written.ok() || *written != kDirectIoAlignment) {
     co_return written.ok()
         ? absl::InternalError("short system-state root write")

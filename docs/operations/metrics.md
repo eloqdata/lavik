@@ -55,7 +55,11 @@ is passive headroom, not a separately admitted temporary-memory pool. The
 default 5% client-request quota can occupy half of that space. Bounded command,
 IO, and protocol scratch may briefly push process memory above `--max-memory`,
 so this setting is a retained-memory waterline rather than a strict
-instantaneous RSS ceiling.
+instantaneous RSS ceiling. Fixed primary-index arrays, page directories, and
+storage buffer pools consume this retained budget even for an empty database;
+startup rejects a budget that cannot cover the recovered worker footprint.
+Storage I/O allocations remain possible at the waterline to let reads and
+reclamation progress, and their charges reduce headroom for later growth.
 
 `--maxmemory-clients` bounds ordinary client request and queued `MULTI` bytes.
 It accepts either a percentage such as `5%` or an absolute size such as
@@ -213,6 +217,12 @@ sum by (result) (rate(lavik_storage_defrag_runs_total[5m]))
   limit enforcement.
 - `lavik_memory_used_bytes`: explicitly retained bytes. This is not total
   process heap usage; compare RSS and mimalloc diagnostics for that view.
+  Includes primary-index objects and directories, fixed read/write,
+  maintenance, device-metadata and export workspaces, live overflow and heap
+  read outputs, and retained entries, tables, and other tracked owners.
+  Charges cover owned capacity on both io_uring and SPDK, excluding allocator
+  overhead and SPDK's full hugepage reservation. Workspace reuse and registration
+  do not add another charge.
 - `lavik_memory_rss_bytes`: resident process memory, refreshed when metrics
   or `INFO memory` is requested.
 - `lavik_memory_committed_bytes`: pages committed by mimalloc; diagnostic
@@ -256,8 +266,9 @@ the process-wide admission decision as:
 
 Admission is enforced per worker, so a single worker can still reject growth
 before this process-wide aggregate reaches 100%. Oversized publisher surplus,
-client buffers, temporary heap usage, and RSS are intentionally absent from
-this retained-admission gauge.
+ordinary client buffers, untracked temporary heap usage, and RSS are absent
+from this retained-admission gauge. Live overflow storage read buffers are
+tracked; their charge disappears when the owner processes the lease return.
 
 The provisioned Grafana dashboard keeps the per-worker retained-admission bars
 in a collapsed **Worker Memory** row. Expanding it shows

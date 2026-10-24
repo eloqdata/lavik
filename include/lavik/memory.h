@@ -121,8 +121,8 @@ class RetainedMemoryCharge {
   // Accounts an existing logical retained owner. Callers that require
   // admission must reserve before using this operation.
   void Account(unsigned owner_shard, std::size_t retained_bytes) noexcept;
-  // Adjusts an existing charge owned by the same shard. Growth must already
-  // be covered by an enclosing admission.
+  // Adjusts an existing charge owned by the same shard. Callers that require
+  // admission must reserve before growing the charge.
   void Resize(std::size_t retained_bytes) noexcept;
   void Reset() noexcept;
 

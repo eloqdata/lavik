@@ -504,11 +504,13 @@ int main(int argc, char** argv) {
     (void)::unlink(data_path.c_str());
     (void)::unlink(log_path.c_str());
 
-    // A single staging buffer must be recycled between these full blocks.
+    // Two staging buffers must be reused across these four large values.
     // Nonzero prior contents must not escape into the next block's headers,
     // record alignment bytes, or the page tails of periodic partial flushes.
     // Disable checkpoints so the restart validates the actual record stream.
-    CreateDataFile(data_path, 256ULL * 1024 * 1024);
+    // With reclamation paused, transaction blocks and pressure-sealed short
+    // blocks also remain on disk. Leave room for them through the tail writes.
+    CreateDataFile(data_path, 1024ULL * 1024 * 1024);
     std::vector<std::pair<std::string, std::string>> reused_records;
     for (int i = 0; i < 4; ++i) {
       const std::string key = "reuse-full-" + std::to_string(i);
@@ -526,12 +528,13 @@ int main(int argc, char** argv) {
     {
       ServerProcess server(
           argv[1], port, data_path, log_path, 1,
-          {"--storage-write-buffers-per-worker=1", "--flush-max-ms=10",
+          {"--storage-write-buffers-per-worker=2", "--flush-max-ms=10",
            "--defrag-paused", "--no-shutdown-checkpoint"});
       RespClient client = ConnectReady(port);
       for (std::size_t i = 0; i < reused_records.size(); ++i) {
         const auto& [key, payload] = reused_records[i];
-        Expect(client.Command({"SET", key, payload}), "+OK", "recycled SET");
+        Expect(client.Command({"SET", key, payload}), "+OK",
+               "recycled SET " + std::to_string(i));
         if (i >= 4 && i % 4 == 0) {
           std::this_thread::sleep_for(25ms);
         }
