@@ -803,23 +803,6 @@ absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
   return result;
 }
 
-absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
-    std::string_view payload, std::size_t expected_count,
-    std::span<const std::string_view> fields,
-    std::span<const std::string_view> values, std::size_t max_bytes) {
-  auto plan =
-      PlanCompactHashEdit(payload, expected_count, fields, values, max_bytes);
-  if (!plan.ok()) return plan.status();
-  if (!*plan) return std::nullopt;
-  auto& edit = **plan;
-  auto encoded = EncodeInlineRecordPayload(edit.payload_);
-  if (!encoded.ok()) return encoded.status();
-  return CompactHashEdit{.changed_ = edit.changed_,
-                         .added_ = edit.added_,
-                         .count_ = edit.count_,
-                         .payload_ = std::move(*encoded)};
-}
-
 namespace {
 absl::StatusOr<std::string> EncodeHashCursor(
     absl::StatusOr<HashValueEncoder> encoder) {

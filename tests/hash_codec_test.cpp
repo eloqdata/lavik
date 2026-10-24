@@ -217,12 +217,14 @@ TEST(HashV2, CompactAndGroupedEditsResolveCollidingTagsAndRepeatedOperands) {
   for (auto version : {kLegacyHashValueVersion, kHashValueVersion}) {
     auto bytes = EncodeHashValue(original, version);
     ASSERT_TRUE(bytes.ok());
-    auto compact = EditCompactHash(*bytes, 65, fields, values, 16383);
+    auto compact = PlanCompactHashEdit(*bytes, 65, fields, values, 16383);
     ASSERT_TRUE(compact.ok());
     ASSERT_TRUE(*compact);
     EXPECT_TRUE((**compact).changed_);
     EXPECT_EQ((**compact).added_, 1);
-    EXPECT_EQ((**compact).payload_, *reference);
+    auto output = EncodeInlineRecordPayload((**compact).payload_);
+    ASSERT_TRUE(output.ok());
+    EXPECT_EQ(*output, *reference);
     auto grouped = EncodeHashGroup({.incarnation_ = 17, .value_ = original});
     ASSERT_TRUE(grouped.ok());
     grouped->resize(kHashGroupHeaderBytes);
@@ -248,8 +250,8 @@ TEST(HashV2, CompactNoopRejectsDuplicateRequestedFieldsWithValidTags) {
   for (auto version : {kLegacyHashValueVersion, kHashValueVersion}) {
     auto bytes = EncodeHashValue(value, version);
     ASSERT_TRUE(bytes.ok());
-    auto result =
-        EditCompactHash(*bytes, value.entries_.size(), fields, values, 16383);
+    auto result = PlanCompactHashEdit(*bytes, value.entries_.size(), fields,
+                                      values, 16383);
     EXPECT_EQ(result.status().code(), absl::StatusCode::kDataLoss);
   }
 }
@@ -335,15 +337,17 @@ TEST(HashV2, LegacyAndIndexedEditsProduceTheSameV2AfterImage) {
   for (auto version : {kLegacyHashValueVersion, kHashValueVersion}) {
     auto bytes = EncodeHashValue(original, version);
     ASSERT_TRUE(bytes.ok());
-    auto edited = EditCompactHash(*bytes, 65, fields, values, 16383);
+    auto edited = PlanCompactHashEdit(*bytes, 65, fields, values, 16383);
     ASSERT_TRUE(edited.ok());
     ASSERT_TRUE(*edited);
-    EXPECT_EQ(Get((**edited).payload_, 8), kHashValueVersion);
+    auto output = EncodeInlineRecordPayload((**edited).payload_);
+    ASSERT_TRUE(output.ok());
+    EXPECT_EQ(Get(*output, 8), kHashValueVersion);
     if (expected)
-      EXPECT_EQ((**edited).payload_, *expected);
+      EXPECT_EQ(*output, *expected);
     else
-      expected = (**edited).payload_;
-    auto decoded = DecodeHashValue((**edited).payload_);
+      expected = *output;
+    auto decoded = DecodeHashValue(*output);
     ASSERT_TRUE(decoded.ok());
     EXPECT_EQ(decoded->entries_.size(), 66);
   }
@@ -357,10 +361,11 @@ TEST(HashV2, CompactEditsAddAndRemoveTheOptionalFieldLengthArray) {
     ASSERT_TRUE(bytes.ok());
     for (std::string_view replacement : {"nonempty", ""}) {
       const std::array<std::string_view, 1> values{replacement};
-      auto edited = EditCompactHash(*bytes, 33, fields, values, 16383);
+      auto edited = PlanCompactHashEdit(*bytes, 33, fields, values, 16383);
       ASSERT_TRUE(edited.ok());
       ASSERT_TRUE(*edited);
-      bytes = std::move((**edited).payload_);
+      bytes = EncodeInlineRecordPayload((**edited).payload_);
+      ASSERT_TRUE(bytes.ok());
       EXPECT_EQ(Get(*bytes, 20), replacement.empty() ? 1 : 0);
       auto reader = HashValueReader::Open(*bytes);
       ASSERT_TRUE(reader.ok());
@@ -465,10 +470,12 @@ TEST(HashV2, EqualSizeSpliceCanBorrowSourceAndKeepsEveryOtherByte) {
   EXPECT_EQ(**result, expected);
   const std::array<std::string_view, 1> fields{target->field_},
       values{source->value_};
-  auto compact = EditCompactHash(*bytes, 33, fields, values, bytes->size());
+  auto compact = PlanCompactHashEdit(*bytes, 33, fields, values, bytes->size());
   ASSERT_TRUE(compact.ok());
   ASSERT_TRUE(*compact);
-  EXPECT_EQ((**compact).payload_, expected);
+  auto output = EncodeInlineRecordPayload((**compact).payload_);
+  ASSERT_TRUE(output.ok());
+  EXPECT_EQ(*output, expected);
 }
 
 TEST(HashV2, SpliceRejectsInvalidOperandsAndDefersV1Migration) {
@@ -509,21 +516,25 @@ TEST(HashV2, BatchedEqualSizeUpdatesPreserveMetadataAndSequentialSemantics) {
   expected.entries_[1].value_ = changed;
   auto reference = EncodeHashValue(expected);
   ASSERT_TRUE(reference.ok());
-  auto result = EditCompactHash(*bytes, 33, fields, values, bytes->size());
+  auto result = PlanCompactHashEdit(*bytes, 33, fields, values, bytes->size());
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(*result);
   EXPECT_TRUE((**result).changed_);
   EXPECT_EQ((**result).added_, 0);
-  EXPECT_EQ((**result).payload_, *reference);
+  auto output = EncodeInlineRecordPayload((**result).payload_);
+  ASSERT_TRUE(output.ok());
+  EXPECT_EQ(*output, *reference);
   // A -> B -> A still publishes a write even when all final bytes match.
   const std::array<std::string_view, 2> repeated{"", ""};
   const std::array<std::string_view, 2> restored{temporary,
                                                  original.entries_[0].value_};
-  result = EditCompactHash(*bytes, 33, repeated, restored, bytes->size());
+  result = PlanCompactHashEdit(*bytes, 33, repeated, restored, bytes->size());
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(*result);
   EXPECT_TRUE((**result).changed_);
-  EXPECT_EQ((**result).payload_, *bytes);
+  output = EncodeInlineRecordPayload((**result).payload_);
+  ASSERT_TRUE(output.ok());
+  EXPECT_EQ(*output, *bytes);
 }
 
 TEST(HashV2, FastPointEditsStillRejectUnrelatedCorruptionAndInvalidRoutes) {
@@ -536,7 +547,7 @@ TEST(HashV2, FastPointEditsStillRejectUnrelatedCorruptionAndInvalidRoutes) {
     auto broken = *bytes;
     broken.back() ^= 1;
     const std::array<std::string_view, 1> fields{""}, values{value};
-    EXPECT_FALSE(EditCompactHash(broken, 33, fields, values, 16383).ok());
+    EXPECT_FALSE(PlanCompactHashEdit(broken, 33, fields, values, 16383).ok());
     auto grouped = EncodeHashGroup({.incarnation_ = 17, .value_ = original});
     ASSERT_TRUE(grouped.ok());
     const std::array<HashEntryView, 1> edit{{{"", value}}};

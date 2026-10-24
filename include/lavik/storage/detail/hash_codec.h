@@ -180,33 +180,14 @@ struct CompactHashEditPlan {
 // need only remain immutable during preparation; no source lease is retained.
 // Duplicate operands retain sequential command semantics. Delete accepts no
 // values. Nullopt selects promotion without allocating an oversized image.
+// Repeated assignments retain last-value and transient-write semantics; new
+// fields are counted once. A no-op or empty after-image has no payload.
 // Callers admit O(fields.size()) planning space plus bounded output bytes.
 absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
     std::string_view payload, std::size_t expected_count,
     std::span<const std::string_view> fields,
     std::span<const std::string_view> values, std::size_t max_bytes,
     CompactHashEditKind kind = CompactHashEditKind::kSet);
-
-// A bounded HSET after-image. No-op results have no payload; a changed result
-// owns its bytes independently of both the old payload and request operands.
-struct CompactHashEdit {
-  bool changed_ = false;
-  std::size_t added_ = 0;
-  std::size_t count_ = 0;
-  std::string payload_;
-};
-
-// Edits an existing compact Hash without materializing its fields. Validates
-// all framing and the expected count, including entries after a match. Input
-// views must stay alive until return. Repeated operands retain sequential HSET
-// semantics (last value wins, new fields counted once, transient changes count
-// as writes). A nullopt result requests the owned promotion path when the final
-// encoding exceeds max_bytes; it does not allocate that oversized after-image.
-// Callers admit O(fields.size()) planning space plus the bounded output first.
-absl::StatusOr<std::optional<CompactHashEdit>> EditCompactHash(
-    std::string_view payload, std::size_t expected_count,
-    std::span<const std::string_view> fields,
-    std::span<const std::string_view> values, std::size_t max_bytes);
 
 // Checked v1 size accumulation, also used to bound individual fields/values.
 // Failure leaves the caller's running size intact. Indexed payload sizing

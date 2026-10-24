@@ -249,20 +249,23 @@ TEST(CompactHashEdit, MatchesSequentialOwnedUpdates) {
     }
     const auto expected_bytes = EncodeHashValue(expected);
     ASSERT_TRUE(expected_bytes.ok());
-    auto result = EditCompactHash(*encoded, original.entries_.size(), fields,
-                                  values, SIZE_MAX);
+    auto result = PlanCompactHashEdit(*encoded, original.entries_.size(),
+                                      fields, values, SIZE_MAX);
     ASSERT_TRUE(result.ok()) << result.status();
     ASSERT_TRUE(result->has_value());
     EXPECT_EQ((**result).changed_, changed);
     EXPECT_EQ((**result).added_, added);
     EXPECT_EQ((**result).count_, expected.entries_.size());
-    EXPECT_EQ((**result).payload_, changed ? *expected_bytes : "");
-    auto bounded = EditCompactHash(*encoded, original.entries_.size(), fields,
-                                   values, expected_bytes->size() - 1);
+    auto output = EncodeInlineRecordPayload((**result).payload_);
+    ASSERT_TRUE(output.ok()) << output.status();
+    EXPECT_EQ(*output, changed ? *expected_bytes : "");
+    auto bounded =
+        PlanCompactHashEdit(*encoded, original.entries_.size(), fields, values,
+                            expected_bytes->size() - 1);
     ASSERT_TRUE(bounded.ok());
     EXPECT_FALSE(bounded->has_value());
-    auto exact = EditCompactHash(*encoded, original.entries_.size(), fields,
-                                 values, expected_bytes->size());
+    auto exact = PlanCompactHashEdit(*encoded, original.entries_.size(), fields,
+                                     values, expected_bytes->size());
     ASSERT_TRUE(exact.ok());
     ASSERT_TRUE(exact->has_value());
   }
@@ -275,24 +278,30 @@ TEST(CompactHashEdit, NoopTransientChangesBinaryAndBorrowedInputs) {
   auto bytes = EncodeHashValue(value);
   ASSERT_TRUE(bytes.ok());
   std::vector<std::string_view> fields{"", ""}, values{"", ""};
-  auto result = EditCompactHash(*bytes, 2, fields, values, 16383);
+  auto result = PlanCompactHashEdit(*bytes, 2, fields, values, 16383);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(result->has_value());
   EXPECT_FALSE((**result).changed_);
   EXPECT_TRUE((**result).payload_.empty());
   values = {"temporary", ""};
-  result = EditCompactHash(*bytes, 2, fields, values, 16383);
+  result = PlanCompactHashEdit(*bytes, 2, fields, values, 16383);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(result->has_value());
   EXPECT_TRUE((**result).changed_);
-  EXPECT_EQ((**result).payload_, *bytes);
+  auto output = EncodeInlineRecordPayload((**result).payload_);
+  ASSERT_TRUE(output.ok());
+  EXPECT_EQ(*output, *bytes);
   fields = {std::string_view("a\0b", 3)};
   values = {std::string_view("x\0y", 3)};
-  result = EditCompactHash(*bytes, 2, fields, values, 16383);
+  result = PlanCompactHashEdit(*bytes, 2, fields, values, 16383);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(result->has_value());
+  // Production retains the plan until append. Destroy the source before
+  // consuming its payload to exercise that ownership boundary directly.
   bytes->assign(bytes->size(), '!');
-  auto decoded = DecodeHashValue((**result).payload_);
+  output = EncodeInlineRecordPayload((**result).payload_);
+  ASSERT_TRUE(output.ok());
+  auto decoded = DecodeHashValue(*output);
   ASSERT_TRUE(decoded.ok());
   EXPECT_EQ(decoded->entries_[1].value_, std::string("x\0y", 3));
 }
@@ -303,16 +312,16 @@ TEST(CompactHashEdit, ValidatesPastMatchesAndChecksCounts) {
   ASSERT_TRUE(bytes.ok());
   const std::array<std::string_view, 1> fields{"field-0"},
       values{value.entries_[0].value_};
-  EXPECT_FALSE(EditCompactHash(*bytes, 3, fields, values, 16383).ok());
-  EXPECT_FALSE(EditCompactHash(*bytes, 2, fields, {}, 16383).ok());
+  EXPECT_FALSE(PlanCompactHashEdit(*bytes, 3, fields, values, 16383).ok());
+  EXPECT_FALSE(PlanCompactHashEdit(*bytes, 2, fields, {}, 16383).ok());
   auto broken = *bytes;
   const auto second = kHashValueHeaderBytes + 8 + 7 + 32;
   broken[second] = static_cast<char>(255);
   // A no-op on the first field must still reject a damaged later entry.
-  EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
+  EXPECT_FALSE(PlanCompactHashEdit(broken, 2, fields, values, 16383).ok());
   broken = *bytes;
   broken.replace(broken.find("field-1"), 7, "field-0");
-  EXPECT_FALSE(EditCompactHash(broken, 2, fields, values, 16383).ok());
+  EXPECT_FALSE(PlanCompactHashEdit(broken, 2, fields, values, 16383).ok());
 }
 
 TEST(CompactHashEdit, DeletePlanMatchesSequentialSetRemoval) {
