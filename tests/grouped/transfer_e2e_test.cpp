@@ -318,6 +318,10 @@ TEST(GroupedTransferE2e, ListSearchRetainsOnePageAndInsertOnlyItsInterval) {
 TEST(GroupedTransferE2e, RandomFieldsAndSetPopDoNotMaterializeTheCollection) {
   PrivateDisk disk;
   const std::string huge(9 * 1024 * 1024, 'H');
+  // The Hash projection retains its 9 MiB read image and 9 MiB reply together.
+  // Leave room for both above the directory footprint, while the full Set
+  // rewrite below must still fail admission atomically.
+  constexpr std::uint64_t working_limit = 192 * kMiB;
   std::set<std::string> members;
   for (unsigned i = 0; i < 256; ++i)
     members.insert(std::string(96 * 1024, 's') + std::to_string(i));
@@ -334,11 +338,11 @@ TEST(GroupedTransferE2e, RandomFieldsAndSetPopDoNotMaterializeTheCollection) {
   std::set<std::string> removed;
   {
     Server server(disk, 4, {}, {}, false, 2,
-                  WithStorageBaseline(128 * kMiB, 4));
+                  WithStorageBaseline(working_limit, 4));
     Client client(server.port());
     ASSERT_NE(client.Command({"INFO", "MEMORY"})
                   .text_.find("maxmemory:" +
-                              WithStorageBaseline(128 * kMiB, 4) + "\r\n"),
+                              WithStorageBaseline(working_limit, 4) + "\r\n"),
               std::string::npos);
     const auto fields = client.Command({"HRANDFIELD", "hash", "257"});
     ASSERT_EQ(fields.kind_, '*') << fields.text_ << server.Log();

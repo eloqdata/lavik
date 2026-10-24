@@ -2379,9 +2379,10 @@ TEST(GroupedSortedSetWriteE2e,
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   {
-    // Every source individually fits; their retained inputs plus the map and
-    // result must still be admitted on the computing worker before STORE.
-    Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(64 * kMiB, 2),
+    // Admit each 1 MiB input's read image alongside previously retained inputs
+    // before reaching the aggregate map/result reservation. The latter must
+    // still reject on the computing worker before STORE publishes anything.
+    Server server(disk, 2, {}, {}, false, 2, WithStorageBaseline(80 * kMiB, 2),
                   {}, "32M");
     server.PreserveOnFailure();
     DiagnosedZSetClient client(server, disk);
