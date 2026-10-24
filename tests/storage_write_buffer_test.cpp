@@ -29,6 +29,8 @@ class WriteBufferTestPeer {
     kEpochChanged,
     kSourceChanged,
     kNoStaging,
+    kShutdownProgress,
+    kStoppedFrame,
     kCheckpoint,
     kCheckpointAfterSubmit,
     kCheckpointMissingSlot,
@@ -268,7 +270,66 @@ class WriteBufferTestPeer {
     co_return absl::OkStatus();
   }
 
+  static Task<absl::Status> RunStoppedFrame(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& worker = *store.worker_;
+    auto status = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!status.ok()) co_return status;
+    const std::string value(4 * kMiB, 'x');
+    StorageEngine::Impl::RecordWriteRequest request{
+        .key_ = "active-before-stop",
+        .value_ = value,
+        .digest_ = ComputeDigest("active-before-stop"),
+        .value_type_ = ValueType::kString};
+    co_await store.store_state_mutex_.Lock();
+    status = co_await impl.WriteRecordLocked(store, request);
+    store.store_state_mutex_.Unlock(worker);
+    if (!status.ok()) co_return status;
+    while (store.standby_prefetch_pending_) co_await bycorf::Yield(worker);
+    if (!store.active_block_ || store.flush_running_)
+      co_return absl::InternalError("fixture needs an unflushed active block");
+    const auto block_id = store.active_block_->block_id_;
+    std::uint16_t held = 0;
+    if (!store.buffers_.TryAcquireWriteBuffer(&held))
+      co_return absl::InternalError("fixture could not hold its spare slot");
+
+    auto borrow = [&]() -> Task<absl::Status> {
+      auto acquired = co_await store.buffers_.AcquireWriteBuffer();
+      co_return acquired.status();
+    };
+    auto borrower = borrow();
+    auto borrower_handle = std::move(borrower).ReleaseHandle();
+    borrower = decltype(borrower)(borrower_handle);
+    borrower_handle.resume();
+
+    // The next record cannot fit. Hold its allocation gate so its frame
+    // suspends with store state unlocked while the old stream remains active.
+    co_await store.active_block_allocation_mutex_.Lock();
+    co_await store.store_state_mutex_.Lock();
+    request.key_ = "suspended-at-stop";
+    request.digest_ = ComputeDigest(request.key_);
+    auto writer = impl.WriteRecordLocked(store, request);
+    auto writer_handle = std::move(writer).ReleaseHandle();
+    writer = decltype(writer)(writer_handle);
+    writer_handle.resume();
+    worker.RequestStop();
+    if (writer.done() || borrower.done() || !store.buffers_.has_write_waiters())
+      co_return absl::InternalError("fixture did not suspend both writers");
+    writer = {};
+    // Teardown leaves queues and staging storage to their worker-lifetime
+    // owners. Do not unlock the gate or return slots to destroyed waiters.
+    if (!store.active_block_ || store.active_block_->block_id_ != block_id ||
+        store.flush_running_ || !store.flush_queue_.empty() ||
+        impl.active_flushes_.load(std::memory_order_acquire) != 0)
+      co_return absl::InternalError("frame teardown scheduled a storage flush");
+    co_return absl::OkStatus();
+  }
+
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kStoppedFrame)
+      co_return co_await RunStoppedFrame(storage);
     if (scenario == Scenario::kStartupCatalog) {
       auto committed = co_await storage.CommitFunctionCatalog(StartupCatalog());
       co_return committed.status();
@@ -391,6 +452,12 @@ class WriteBufferTestPeer {
     auto trailing_handle = std::move(trailing).ReleaseHandle();
     trailing = decltype(trailing)(trailing_handle);
     trailing_handle.resume();
+    if (scenario == Scenario::kShutdownProgress)
+      impl.shutdown_flush_requested_.store(true, std::memory_order_release);
+    absl::Cleanup restore_shutdown = [&] {
+      if (scenario == Scenario::kShutdownProgress)
+        impl.shutdown_flush_requested_.store(false, std::memory_order_release);
+    };
     if (scenario == Scenario::kNoStaging) {
       // An in-flight extent writer can own a slot without a staging entry.
       // Relocation must wait for its return just like any other FIFO borrower.
@@ -408,8 +475,9 @@ class WriteBufferTestPeer {
     if (!result.ok()) co_return result.status();
     status = std::move(trailing).TakeResult();
     if (!status.ok()) co_return status;
-    const bool moves_source =
-        scenario == Scenario::kProgress || scenario == Scenario::kNoStaging;
+    const bool moves_source = scenario == Scenario::kProgress ||
+                              scenario == Scenario::kNoStaging ||
+                              scenario == Scenario::kShutdownProgress;
     if (result->has_value() != moves_source)
       co_return absl::InternalError("unexpected relocation publication");
     const auto current =
@@ -506,6 +574,13 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
   options.tomb_raider_interval_ms_ = 0;
   options.tx_cleaner_cooldown_ms_ = 0;
   options.buffers_.storage_write_buffer_count_ = 2;
+  if (scenario == WriteBufferTestPeer::Scenario::kShutdownProgress ||
+      scenario == WriteBufferTestPeer::Scenario::kStoppedFrame) {
+    // Exercise only waiter-triggered flushing; the periodic loop must not
+    // advance the fixture or consume its synthetic shutdown request.
+    options.flush_max_ms_ = 60 * 60 * 1000;
+    options.flush_size_bytes_ = kStorageBlockBytes;
+  }
   StorageEngine storage(std::move(options));
   ASSERT_TRUE(storage.Prepare(1).ok());
   WriteBufferService service(storage, scenario);
@@ -532,6 +607,14 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
 TEST_P(StorageWriteBufferTest,
        RelocationWaitsWithoutHoldingStoreOrAllocationGate) {
   RunWriteBufferScenario(GetParam());
+}
+
+TEST(StorageWriteBufferShutdownTest, StoppedFrameDoesNotSealActiveStream) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kStoppedFrame);
+}
+
+TEST(StorageWriteBufferShutdownTest, GracefulShutdownPreservesFifoProgress) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kShutdownProgress);
 }
 
 class StorageCheckpointBufferTest

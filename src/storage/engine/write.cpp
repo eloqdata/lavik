@@ -2643,12 +2643,17 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // Direct FIFO handoff does not wake the remaining writers to reseal a new
   // active stream. A writer ahead of them must make its staging slot flushable
   // on every exit, including stale-relocation/validation failures after an
-  // empty stream was installed. This guard runs with store state held.
+  // empty stream was installed. Executing returns hold store state, but forced
+  // teardown can destroy a frame suspended without that lock. Never schedule
+  // flush work then. A graceful shutdown request alone must still allow this
+  // handoff: shutdown joins maintenance writers before its own seal/drain.
   struct FlushForWaitingWriters {
     Impl& engine_;
     WorkerStore& store_;
     ~FlushForWaitingWriters() {
-      if (store_.buffers_.has_write_waiters()) engine_.SealActiveBlocks(store_);
+      if (!store_.worker_->stop_requested() &&
+          store_.buffers_.has_write_waiters())
+        engine_.SealActiveBlocks(store_);
     }
   } flush_for_waiters{*this, store};
   const std::size_t payload_bytes =

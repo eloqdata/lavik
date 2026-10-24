@@ -1277,7 +1277,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         co_await DiscoverCheckpoint(store, &checkpoint_load);
   }
   status = co_await DrainCheckpointReads(store);
-  if (!status.ok()) co_return status;
+  if (!status.ok()) {
+    Fail(status);
+    co_return status;
+  }
 
   status = co_await checkpoint_capacity_loaded_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
@@ -1331,7 +1334,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     checkpoint_load.status_ = co_await LoadCheckpoint(store, &checkpoint_load);
   }
   status = co_await DrainCheckpointReads(store);
-  if (!status.ok()) co_return status;
+  if (!status.ok()) {
+    Fail(status);
+    co_return status;
+  }
 
   status = co_await checkpoint_loaded_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
