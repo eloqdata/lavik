@@ -2651,9 +2651,9 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     Impl& engine_;
     WorkerStore& store_;
     ~FlushForWaitingWriters() {
-      if (!store_.worker_->stop_requested() &&
-          store_.buffers_.has_write_waiters())
-        engine_.SealActiveBlocks(store_);
+      if (store_.worker_->stop_requested()) [[unlikely]]
+        return;
+      if (store_.buffers_.has_write_waiters()) engine_.SealActiveBlocks(store_);
     }
   } flush_for_waiters{*this, store};
   const std::size_t payload_bytes =
