@@ -472,6 +472,30 @@ TEST(CompactPointWriteE2e, SingleReadSlotUsesOwnedFallback) {
               "2");
     EXPECT_EQ(client.Command({"HSET", key, "a", "new"}).text_, "0");
     EXPECT_EQ(client.Command({"HGET", key, "a"}).text_, "new");
+    EXPECT_EQ(client.Command({"HSETNX", key, "a", "ignored"}).text_, "0");
+    EXPECT_EQ(client.Command({"HSETNX", key, "c", "first"}).text_, "1");
+    EXPECT_EQ(client.Command({"HINCRBY", key, "counter", "2"}).text_, "2");
+    EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, "counter", "0.5"}).text_,
+              "2.5");
+    EXPECT_EQ(client.Command({"HDEL", key, "counter", "counter"}).text_, "1");
+    // Promotion must locate original slots through the immutable v2 source
+    // while repeated new fields see preceding operands. The read lease must
+    // be released before the indirect key's append needs this sole read slot.
+    const std::string large(20000, 'h');
+    EXPECT_EQ(client
+                  .Command({"HSET", key, "a", large, "d", "first", "c",
+                            "changed", "d", "last", "a", large})
+                  .text_,
+              "1");
+    EXPECT_EQ(client.Command({"HGET", key, "a"}).text_, large);
+    EXPECT_EQ(client.Command({"HGET", key, "b"}).text_, "keep");
+    EXPECT_EQ(client.Command({"HGET", key, "c"}).text_, "changed");
+    EXPECT_EQ(client.Command({"HGET", key, "d"}).text_, "last");
+    EXPECT_EQ(client.Command({"HLEN", key}).text_, "4");
+    EXPECT_EQ(client.Command({"HINCRBY", key, "counter", "2"}).text_, "2");
+    EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, "counter", "0.5"}).text_,
+              "2.5");
+    EXPECT_EQ(client.Command({"HDEL", key, "counter", "counter"}).text_, "1");
     ASSERT_EQ(client.Command({"DEL", key}).text_, "1");
     ASSERT_EQ(client.Command({"SADD", key, "a", "b"}).text_, "2");
     EXPECT_EQ(client.Command({"SREM", key, "a"}).text_, "1");
@@ -489,6 +513,65 @@ TEST(CompactPointWriteE2e, SingleReadSlotUsesOwnedFallback) {
   }
   client.Durable();
   ASSERT_EQ(server.Wait(true), 0) << server.Log();
+}
+
+TEST(CompactPointWriteE2e, IndexedDeletionFallbackWorksAtMaxmemory) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires post-recovery OOM injection";
+#endif
+  PrivateDisk disk(kPrivateDiskBytes);
+  const std::string binary("a\0b", 3);
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    EXPECT_EQ(client
+                  .Command({"HSET", "hash", "", "empty", binary, "binary",
+                            "keep", "survivor", "drop", "gone"})
+                  .text_,
+              "4");
+    EXPECT_EQ(client.Command({"SADD", "set", "", binary, "keep", "drop"}).text_,
+              "4");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    // Recovery completes normally, then all new scratch reservations fail.
+    // Shrinking must retain the existing bounded fallback, including stable
+    // source slots across repeated operands and compaction of survivors.
+    ScopedFault oom("LAVIK_TEST_OOM_AFTER_RECOVERY", "1");
+    Server server(disk, 1);
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"HDEL", "hash", "missing"}).text_, "0");
+    EXPECT_EQ(
+        client.Command({"HDEL", "hash", binary, binary, "drop", "missing"})
+            .text_,
+        "2");
+    // Value replies need their own output reservation, which the injected
+    // limit denies. Probe membership here and verify values after recovery.
+    EXPECT_EQ(client.Command({"HEXISTS", "hash", "keep"}).text_, "1");
+    EXPECT_EQ(client.Command({"HEXISTS", "hash", ""}).text_, "1");
+    EXPECT_EQ(client.Command({"HLEN", "hash"}).text_, "2");
+    EXPECT_EQ(client.Command({"SREM", "set", binary, binary, "drop", "missing"})
+                  .text_,
+              "2");
+    EXPECT_EQ(client.Command({"SISMEMBER", "set", "keep"}).text_, "1");
+    EXPECT_EQ(client.Command({"SISMEMBER", "set", ""}).text_, "1");
+    EXPECT_EQ(client.Command({"SCARD", "set"}).text_, "2");
+    EXPECT_EQ(client.Command({"SREM", "set", "keep", "", "keep"}).text_, "2");
+    EXPECT_EQ(client.Command({"EXISTS", "set"}).text_, "0");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HLEN", "hash"}).text_, "2");
+  EXPECT_EQ(client.Command({"HGET", "hash", "keep"}).text_, "survivor");
+  EXPECT_EQ(client.Command({"HGET", "hash", ""}).text_, "empty");
+  EXPECT_EQ(client.Command({"HSET", "hash", "keep", "updated"}).text_, "0");
+  EXPECT_EQ(client.Command({"HDEL", "hash", "keep", "", "keep"}).text_, "2");
+  EXPECT_EQ(client.Command({"EXISTS", "hash"}).text_, "0");
+  EXPECT_EQ(client.Command({"EXISTS", "set"}).text_, "0");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
 class CompactCollectionWriteE2e : public testing::TestWithParam<Collection> {};

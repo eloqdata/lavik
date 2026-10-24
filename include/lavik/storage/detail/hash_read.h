@@ -31,10 +31,11 @@ enum class HashOperationKind : std::uint8_t;
 
 // Scans a group whose envelope and physical identity the loader has verified;
 // field_count must be that envelope's count, and field must route to this
-// group. Checks the inner header/count and bounds of traversed entries,
-// stopping at the first match. Published field uniqueness is trusted; record
-// checksum validation belongs to the storage loader. A returned view borrows
-// payload; nullopt means missing, including in an empty routing leaf.
+// group. V2 scans fingerprints and checks candidate slot bounds; v1 parses
+// sequential entries through the first match. Both check the inner
+// header/count. Published field uniqueness is trusted; record checksum
+// validation belongs to the storage loader. A returned view borrows payload;
+// nullopt means missing, including in an empty routing leaf.
 absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
     std::string_view payload, std::uint32_t field_count,
     std::string_view field);
@@ -56,11 +57,12 @@ absl::Status FindHashGroupFields(std::string_view payload,
                                  std::uint32_t field_count,
                                  std::span<HashFieldLookup> requests);
 
-// Compact equivalents: check the header/count and bounds of traversed entries,
-// trusting published field uniqueness. Return the first match for each field
-// without scanning unused trailing entries. Returned views borrow payload.
-// Batch requests must be sorted by field; repeated requested fields retain
-// distinct result positions. An empty batch checks only the header/count.
+// Compact equivalents: check header/count and candidate (v2) or traversed
+// entry (v1) bounds, trusting published field uniqueness and fingerprints.
+// Return the first match for each field without scanning unused trailing
+// entries. Returned views borrow payload. Batch requests must be sorted by
+// field; repeated requested fields retain distinct result positions. An empty
+// batch checks only the header/count.
 absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
     std::string_view payload, std::size_t field_count, std::string_view field);
 absl::Status FindCompactHashFields(std::string_view payload,

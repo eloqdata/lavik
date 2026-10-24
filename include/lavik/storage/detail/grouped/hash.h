@@ -142,7 +142,8 @@ struct HashGroupEdit {
 };
 
 // A bounded, owned copy of a fully validated leaf and one existing field's
-// byte offsets. No read lease or per-field strings survive lookup. Equal-size
+// byte offsets. Legacy leaves must also fit after conversion to v2.
+// No read lease or per-field strings survive lookup. Equal-size
 // replacement and deletion cannot change routing or require a split, so they
 // can transfer the checked bytes directly to the normal group encoder.
 class HashGroupPointProbe {
@@ -155,8 +156,8 @@ class HashGroupPointProbe {
       std::string_view payload, const DigestSeed& seed, std::string_view field);
   GroupedRecordId id() const noexcept { return payload_.id(); }
   std::string_view field() const noexcept {
-    return payload_.record_payload().substr(entry_offset_ + 8,
-                                            value_offset_ - entry_offset_ - 8);
+    return payload_.record_payload().substr(entry_offset_,
+                                            value_offset_ - entry_offset_);
   }
   std::string_view value() const noexcept {
     return payload_.record_payload().substr(value_offset_, value_bytes_);
@@ -184,10 +185,10 @@ class HashGroupPointProbe {
 // Apply ordered operands to one encoded leaf, checking all old fields for
 // uniqueness and routing. HSET uses last-value-wins, NX uses first-value-wins,
 // and repeated removals count once. Inputs need only survive this call. Small
-// replacements copy views directly into checked bytes; a single edit copies
-// unchanged encoded spans without an entry-position table. Splits and oversized
-// entries retain the bounded-state owned encoder path. Caller admits page and
-// operand scratch before calling; this function performs no storage writes.
+// replacements encode borrowed fields into v2 data and index arrays. Splits and
+// oversized entries retain the bounded-state owned encoder path. Caller admits
+// page and operand scratch before calling; this function performs no storage
+// writes.
 absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     std::string_view payload, const DigestSeed& seed, HashGroupEditKind kind,
     std::span<const HashEntryView> edits);
@@ -209,7 +210,7 @@ class HashGroupEncoder {
  private:
   const HashGroupSnapshot* group_ = nullptr;
   std::array<char, kHashGroupHeaderBytes + kHashValueHeaderBytes> header_{};
-  std::array<char, 8> lengths_{};
+  std::optional<HashValueEncoder> value_encoder_;
   std::size_t encoded_bytes_ = 0;
   std::size_t entry_ = 0;
   unsigned phase_ = 0;

@@ -27,6 +27,7 @@
 #include "absl/container/node_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "lavik/memory.h"
+#include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/stream_records.h"
 #include "lavik/storage/format.h"
 #include "rdb_record_spool.h"
@@ -2050,29 +2051,18 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
   }
   if (raw.value_type_ == storage::ValueType::kSet ||
       raw.value_type_ == storage::ValueType::kHash) {
-    if (input.size() < 32) return Bad("invalid Lavik Hash");
-    Reader reader(input);
-    std::uint64_t magic = 0, bytes = 0;
-    std::uint32_t version = 0, header = 0, count = 0, reserved = 0;
-    if (!reader.Le64(&magic) || !reader.Le32(&version) ||
-        !reader.Le32(&header) || !reader.Le32(&count) ||
-        !reader.Le32(&reserved) || !reader.Le64(&bytes) ||
-        magic != storage::kHashValueMagic ||
-        version != storage::kStorageFormatVersion || header != 32 ||
-        reserved != 0 || bytes != input.size() || count == 0 ||
-        count != raw.logical_size_)
+    auto reader = storage::HashValueReader::Open(input);
+    if (!reader.ok() || reader->size() != raw.logical_size_)
       return Bad("invalid Lavik Hash header");
+    auto valid = reader->ValidateFingerprints();
+    if (!valid.ok()) return Bad(std::string(valid.message()));
     Pairs pairs;
-    pairs.reserve(count);
-    for (std::uint32_t i = 0; i < count; ++i) {
-      std::string_view field, value;
-      std::uint32_t fs = 0, vs = 0;
-      if (!reader.Le32(&fs) || !reader.Le32(&vs) || !reader.View(fs, &field) ||
-          !reader.View(vs, &value))
-        return Bad("truncated Lavik Hash");
-      pairs.emplace_back(std::string(field), std::string(value));
+    pairs.reserve(reader->size());
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return Bad(std::string(entry.status().message()));
+      pairs.emplace_back(entry->field_, entry->value_);
     }
-    if (!reader.done()) return Bad("trailing Lavik Hash data");
     if (raw.value_type_ == storage::ValueType::kSet) {
       Strings values;
       values.reserve(pairs.size());
@@ -2189,7 +2179,7 @@ void AppendHashRaw(std::string* output, const Pairs& pairs) {
   for (const auto& [field, value] : pairs)
     bytes += 8 + field.size() + value.size();
   PutLe64(output, storage::kHashValueMagic);
-  PutLe32(output, storage::kStorageFormatVersion);
+  PutLe32(output, storage::kLegacyHashValueVersion);
   PutLe32(output, 32);
   PutLe32(output, static_cast<std::uint32_t>(pairs.size()));
   PutLe32(output, 0);

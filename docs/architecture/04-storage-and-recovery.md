@@ -220,7 +220,10 @@ and optional nested-command transaction decision.
 Its identity is available without reading an external value; group payloads
 retain complete snapshots, not read-time mutation logs. The group payload
 envelope leaves framing space within the 1 GiB record-payload limit while
-preserving the independent 512 MiB limit for each field and value. Hash and Set
+preserving the independent 512 MiB limit for each field and value. Hash payloads
+use an independent v2 indexed encoding with v1 read compatibility; this does not
+change outer record version 1. See [Grouped collections](09-grouped-collections.md)
+for the payload and logical-stream contracts. Hash and Set
 use persisted-seed hash prefixes; List uses stable ordered page identities.
 Sorted Sets use both disjoint identity spaces under their collection type.
 The version-1 ordered-root payload has a checked presence flag for its appended

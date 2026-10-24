@@ -1814,11 +1814,20 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
             operation.entries_.size() == 1) {
           const auto& entry = operation.entries_.front();
           const auto old_bytes = payload.size() - kHashGroupHeaderBytes;
-          const auto base_bytes = std::max(old_bytes, kHashValueHeaderBytes);
-          // A missing field does not invalidate the checked byte-splice
+          auto base_bytes = std::max(old_bytes, kHashValueHeaderBytes + 4);
+          if (leaf->field_count_ != 0) {
+            auto inner =
+                HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
+            if (!inner.ok()) co_return inner.status();
+            // Member scores are nonempty. Migrating v1 adds one tag per field
+            // and the sentinel offset before accounting for the new member.
+            if (inner->version() == kLegacyHashValueVersion)
+              base_bytes = old_bytes + leaf->field_count_ + 4;
+          }
+          // A missing field does not invalidate the checked encoded-page
           // editor. Keep the ordinary decoder for a split or large member,
           // and never turn repeated request operands into a point insertion.
-          constexpr std::size_t kEntryFrameAndScoreBytes = 8 + sizeof(double);
+          constexpr std::size_t kEntryFrameAndScoreBytes = 9 + sizeof(double);
           if (entry.member_.size() <=
                   kCollectionGroupTargetBytes - kEntryFrameAndScoreBytes &&
               base_bytes <= kCollectionGroupTargetBytes -

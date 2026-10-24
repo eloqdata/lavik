@@ -19,19 +19,28 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <memory>
+#include <string>
 
 #include "absl/container/inlined_vector.h"
 #include "lavik/storage/detail/record_payload_cursor.h"
 
 namespace lavik::storage {
 
-// A preflighted compact after-image: framing is owned, payload fragments borrow
-// immutable read leases or command operands. Keep those owners alive through
-// append's allocation waits. The plan may move before encoding, because owned
-// framing uses no self-referential views. Encoding consumes it once, only after
-// the writer's final suspension; it allocates and publishes nothing itself.
+// A preflighted compact after-image owns either framing or a complete bounded
+// image. Other fragments borrow immutable read leases or command operands;
+// keep those owners alive through append's allocation waits. The plan can move
+// without invalidating its views. Encoding consumes it once, only after the
+// writer's final suspension, and neither allocates nor publishes.
 class CompactPayload {
  public:
+  // A compact indexed codec can own one bounded complete image. Indirection
+  // keeps borrowed parts valid across moves, including short-string storage.
+  void AppendOwnedBytes(std::string bytes) {
+    assert(!owned_bytes_);
+    owned_bytes_ = std::make_unique<const std::string>(std::move(bytes));
+    AppendBytes(*owned_bytes_);
+  }
   void AppendBytes(std::string_view bytes) {
     if (bytes.empty()) return;
     assert(bytes.size() <= SIZE_MAX - bytes_);
@@ -68,6 +77,7 @@ class CompactPayload {
     unsigned owned_size = 0;
   };
   absl::InlinedVector<Part, 8> parts_;
+  std::unique_ptr<const std::string> owned_bytes_;
   std::size_t bytes_ = 0;
   std::size_t next_ = 0;
 };

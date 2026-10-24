@@ -59,41 +59,60 @@ HashValue Value(std::size_t count, std::size_t length = 128) {
   return value;
 }
 
+// Explicit legacy fixture: outer grouped framing is unchanged; only the
+// embedded Hash payload uses v1. Raw byte-offset tests below remain v1 tests.
+absl::StatusOr<std::string> EncodeLegacyHashGroup(
+    const HashGroupSnapshot& group) {
+  auto bytes = EncodeHashGroup(group);
+  if (!bytes.ok() || group.value_.entries_.empty()) return bytes;
+  auto compact = EncodeHashValue(group.value_, kLegacyHashValueVersion);
+  if (!compact.ok()) return compact.status();
+  bytes->resize(kHashGroupHeaderBytes);
+  bytes->append(*compact);
+  for (unsigned i = 0; i < 4; ++i)
+    (*bytes)[36 + i] = static_cast<char>(compact->size() >> (8 * i));
+  return bytes;
+}
+
 TEST(HashGroupPointProbe, OwnsValidatedBytesAcrossMovesAndKeepsWireFormat) {
-  for (std::size_t count : {1U, 3U}) {
-    for (std::size_t target = 0; target < count; ++target) {
-      for (bool remove : {false, true}) {
-        HashGroupSnapshot group{.incarnation_ = 17, .value_ = Value(count, 8)};
-        auto& entry = group.value_.entries_[target];
-        entry.field_.append("\0\xff", 2);
-        const auto field = entry.field_;
-        const std::string replacement("\0\1\2\3\xff\xfe\xfd\xfc", 8);
-        auto payload = EncodeHashGroup(group);
-        ASSERT_TRUE(payload.ok()) << payload.status();
-        auto probe = HashGroupPointProbe::Create(*payload, Seed(), field);
-        ASSERT_TRUE(probe.ok()) << probe.status();
-        ASSERT_TRUE(*probe);
-        payload->assign(payload->size(), '!');
-        auto moved = std::move(**probe);
-        EXPECT_EQ(moved.field(), field);
-        EXPECT_EQ(moved.value(), entry.value_);
-        auto changed = std::move(moved).Apply(
-            remove ? std::nullopt
-                   : std::optional<std::string_view>(replacement));
-        ASSERT_TRUE(changed.ok()) << changed.status();
-        ASSERT_TRUE(changed->prepared_);
-        if (remove)
-          group.value_.entries_.erase(group.value_.entries_.begin() + target);
-        else
-          entry.value_ = replacement;
-        auto expected = EncodeHashGroup(group);
-        auto actual = EncodeHashGroup(*changed);
-        ASSERT_TRUE(expected.ok()) << expected.status();
-        ASSERT_TRUE(actual.ok()) << actual.status();
-        EXPECT_EQ(*actual, *expected);
-        auto decoded = DecodeHashGroup(*actual);
-        ASSERT_TRUE(decoded.ok()) << decoded.status();
-        EXPECT_EQ(decoded->field_count(), count - remove);
+  for (bool legacy : {false, true}) {
+    for (std::size_t count : {1U, 3U}) {
+      for (std::size_t target = 0; target < count; ++target) {
+        for (bool remove : {false, true}) {
+          HashGroupSnapshot group{.incarnation_ = 17,
+                                  .value_ = Value(count, 8)};
+          auto& entry = group.value_.entries_[target];
+          entry.field_.append("\0\xff", 2);
+          const auto field = entry.field_;
+          const std::string replacement("\0\1\2\3\xff\xfe\xfd\xfc", 8);
+          auto payload =
+              legacy ? EncodeLegacyHashGroup(group) : EncodeHashGroup(group);
+          ASSERT_TRUE(payload.ok()) << payload.status();
+          auto probe = HashGroupPointProbe::Create(*payload, Seed(), field);
+          ASSERT_TRUE(probe.ok()) << probe.status();
+          ASSERT_TRUE(*probe);
+          payload->assign(payload->size(), '!');
+          auto moved = std::move(**probe);
+          EXPECT_EQ(moved.field(), field);
+          EXPECT_EQ(moved.value(), entry.value_);
+          auto changed = std::move(moved).Apply(
+              remove ? std::nullopt
+                     : std::optional<std::string_view>(replacement));
+          ASSERT_TRUE(changed.ok()) << changed.status();
+          ASSERT_TRUE(changed->prepared_);
+          if (remove)
+            group.value_.entries_.erase(group.value_.entries_.begin() + target);
+          else
+            entry.value_ = replacement;
+          auto expected = EncodeHashGroup(group);
+          auto actual = EncodeHashGroup(*changed);
+          ASSERT_TRUE(expected.ok()) << expected.status();
+          ASSERT_TRUE(actual.ok()) << actual.status();
+          EXPECT_EQ(*actual, *expected);
+          auto decoded = DecodeHashGroup(*actual);
+          ASSERT_TRUE(decoded.ok()) << decoded.status();
+          EXPECT_EQ(decoded->field_count(), count - remove);
+        }
       }
     }
   }
@@ -119,6 +138,20 @@ TEST(HashGroupPointProbe, RejectsUnrelatedCorruptionBeforeCertifyingMatch) {
   auto truncated = *payload;
   truncated.pop_back();
   reject(truncated);
+}
+
+TEST(HashGroupPointProbe, LegacyMigrationAccountsForIndexGrowth) {
+  HashGroupSnapshot group{
+      .incarnation_ = 17,
+      .value_ = Value(
+          1, kCollectionGroupTargetBytes - kHashValueHeaderBytes - 8 - 7)};
+  auto payload = EncodeLegacyHashGroup(group);
+  ASSERT_TRUE(payload.ok());
+  ASSERT_EQ(payload->size() - kHashGroupHeaderBytes,
+            kCollectionGroupTargetBytes);
+  auto probe = HashGroupPointProbe::Create(*payload, Seed(), "field-0");
+  ASSERT_TRUE(probe.ok());
+  EXPECT_FALSE(*probe);
 }
 
 TEST(HashGroupPointProbe, MissingAndOversizedLeavesRequireCheckedFallback) {
@@ -266,7 +299,7 @@ TEST(CompactHashEdit, NoopTransientChangesBinaryAndBorrowedInputs) {
 
 TEST(CompactHashEdit, ValidatesPastMatchesAndChecksCounts) {
   auto value = Value(2, 32);
-  auto bytes = EncodeHashValue(value);
+  auto bytes = EncodeHashValue(value, kLegacyHashValueVersion);
   ASSERT_TRUE(bytes.ok());
   const std::array<std::string_view, 1> fields{"field-0"},
       values{value.entries_[0].value_};
@@ -588,7 +621,7 @@ TEST(GroupedHashTest, CompactPayloadHasAnExplicitLittleEndianHeader) {
   ASSERT_EQ(value->entries_.size(), 1);
   EXPECT_EQ(value->entries_[0].field_, "f");
   EXPECT_EQ(value->entries_[0].value_, "v");
-  auto encoded = EncodeHashValue(*value);
+  auto encoded = EncodeHashValue(*value, kLegacyHashValueVersion);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   EXPECT_EQ(*encoded, bytes);
   for (std::size_t offset : {8, 12, 16, 20, 24, 32, 36}) {
@@ -622,7 +655,7 @@ TEST(GroupedHashTest, CompactEncodingMatchesAppendReferenceAtUnalignedLengths) {
       reference.push_back(static_cast<char>(number >> (8 * i)));
   };
   append_integer(kHashValueMagic, 8);
-  append_integer(kStorageFormatVersion, 4);
+  append_integer(kLegacyHashValueVersion, 4);
   append_integer(kHashValueHeaderBytes, 4);
   append_integer(value.entries_.size(), 4);
   append_integer(0, 4);
@@ -633,7 +666,7 @@ TEST(GroupedHashTest, CompactEncodingMatchesAppendReferenceAtUnalignedLengths) {
     reference.append(entry.field_);
     reference.append(entry.value_);
   }
-  auto encoded = EncodeHashValue(value);
+  auto encoded = EncodeHashValue(value, kLegacyHashValueVersion);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   EXPECT_EQ(*encoded, reference);
   EXPECT_EQ((*encoded)[encoded->size()], '\0');
@@ -668,7 +701,7 @@ TEST(GroupedHashTest, CompactReaderPreservesBinaryViewsAndCopiedPosition) {
 }
 
 TEST(GroupedHashTest, CompactReaderRejectsMalformedUnselectedBytes) {
-  auto encoded = EncodeHashValue(Value(2));
+  auto encoded = EncodeHashValue(Value(2), kLegacyHashValueVersion);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   auto check = [](std::string_view payload) {
     auto reader = HashValueReader::Open(payload);
@@ -920,7 +953,8 @@ TEST(GroupedHashTest, PointLookupDistinguishesMissingEmptyAndBinaryValues) {
 }
 
 TEST(GroupedHashTest, PointLookupStopsAtMatchAndChecksTraversedEncoding) {
-  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(2)});
+  auto encoded =
+      EncodeLegacyHashGroup({.incarnation_ = 17, .value_ = Value(2)});
   ASSERT_TRUE(encoded.ok());
   for (bool compact : {false, true}) {
     SCOPED_TRACE(compact ? "compact" : "grouped");
@@ -992,7 +1026,8 @@ TEST(GroupedHashTest, PersistedVisitorBorrowsEmptyAndBinaryFields) {
 }
 
 TEST(GroupedHashTest, PersistedVisitorKeepsFramingChecksAndVisitorErrors) {
-  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(2)});
+  auto encoded =
+      EncodeLegacyHashGroup({.incarnation_ = 17, .value_ = Value(2)});
   ASSERT_TRUE(encoded.ok());
   auto check = [](const std::string& bytes) {
     auto metadata = DecodeHashGroupMetadata(bytes, bytes.size());
@@ -1073,6 +1108,9 @@ TEST(GroupedHashTest,
   auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(3)});
   ASSERT_TRUE(encoded.ok());
   encoded->replace(encoded->find("field-2"), 7, "field-1");
+  // Keep the v2 filter consistent so this specifically exercises duplicate
+  // detection, independently of the strict reader's fingerprint check.
+  encoded->back() = static_cast<char>(HashFieldFingerprint("field-1"));
   auto found = FindHashGroupField(*encoded, 3, "field-0");
   ASSERT_TRUE(found.ok());
   ASSERT_TRUE(found->has_value());
@@ -1124,7 +1162,7 @@ TEST(GroupedHashTest,
      MultiLookupPreservesRepeatedOperandsAndStopsAfterAllMatches) {
   auto value = Value(3);
   value.entries_[0].value_.clear();
-  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = value});
+  auto encoded = EncodeLegacyHashGroup({.incarnation_ = 17, .value_ = value});
   ASSERT_TRUE(encoded.ok());
   for (bool compact : {false, true}) {
     SCOPED_TRACE(compact ? "compact" : "grouped");
@@ -1167,7 +1205,7 @@ TEST(GroupedHashTest,
               "Hash element count does not match record metadata");
 
     if (!compact) {
-      auto empty = EncodeHashGroup({.incarnation_ = 17});
+      auto empty = EncodeLegacyHashGroup({.incarnation_ = 17});
       ASSERT_TRUE(empty.ok());
       ASSERT_TRUE(find(*empty, 0, requests).ok());
       for (const auto& request : requests) EXPECT_FALSE(request.value_);
@@ -1176,7 +1214,8 @@ TEST(GroupedHashTest,
 }
 
 TEST(GroupedHashTest, RankLookupPreservesDrawPositionsAndSkipsUnusedTail) {
-  auto encoded = EncodeHashGroup({.incarnation_ = 17, .value_ = Value(3)});
+  auto encoded =
+      EncodeLegacyHashGroup({.incarnation_ = 17, .value_ = Value(3)});
   ASSERT_TRUE(encoded.ok());
   encoded->replace(encoded->find("field-2") - 8, 4, 4, '\xff');
   for (const bool compact : {false, true}) {
@@ -1244,7 +1283,7 @@ TEST_F(HashLookupMemoryTest, CompactMultiGetOwnsBytesAndPreservesOperandOrder) {
 }
 
 TEST_F(HashLookupMemoryTest, CompactSetMembershipSkipsUnvisitedTail) {
-  auto encoded = EncodeHashValue(Value(3, 0));
+  auto encoded = EncodeHashValue(Value(3, 0), kLegacyHashValueVersion);
   ASSERT_TRUE(encoded.ok());
   encoded->replace(encoded->find("field-2") - 8, 4, 4, '\xff');
   CompactReadResult snapshot = std::optional<CompactValueView>{
@@ -1473,7 +1512,8 @@ TEST_F(HashLookupMemoryTest, PackedFullReadsRejectInvalidPayloadWithoutCharge) {
   auto payload = EncodeHashValue(Value(3, 32));
   ASSERT_TRUE(payload.ok());
   auto broken = *payload;
-  broken.replace(broken.find("field-2") - 8, 4, 4, '\xff');
+  // V2 stores field lengths immediately before the three fingerprint bytes.
+  broken.replace(broken.size() - 3 - 4, 4, 4, '\xff');
   const auto before = GetWorkerMemoryStats(0);
   for (const auto kind : {HashOperationKind::kKeys, HashOperationKind::kValues,
                           HashOperationKind::kGetAll}) {

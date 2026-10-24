@@ -78,8 +78,15 @@ replica_get() {
     "${redis_cli}" --raw -p "${port}" -n "${db}" | tail -n 1
 }
 
+replica_hget() {
+  local port=$1 key=$2 field=$3
+  printf 'READONLY\nHGET %s %s\n' "${key}" "${field}" |
+    "${redis_cli}" --raw -p "${port}" | tail -n 1
+}
+
 [[ $("${redis_cli}" -p "${source_port}" set baseline before) == OK ]]
 [[ $("${redis_cli}" -p "${source_port}" -n 1 set other-db initial) == OK ]]
+[[ $("${redis_cli}" -p "${source_port}" HSET simd-hash a old b keep) == 2 ]]
 [[ $("${redis_cli}" -p "${replica_port}" LAVIK.REPLICAOF 127.0.0.1 "${source_port}") == OK ]]
 
 for _ in {1..600}; do
@@ -99,6 +106,28 @@ for _ in {1..600}; do
   sleep 0.05
 done
 [[ $(replica_get "${replica_port}" baseline) == online ]]
+
+# Replay follows the same indexed field lookup as foreground Hash writes,
+# including compact promotion, increments and repeated deletes.
+[[ $("${redis_cli}" -p "${source_port}" HINCRBY simd-hash count 2) == 2 ]]
+[[ $("${redis_cli}" -p "${source_port}" HINCRBY simd-hash count 3) == 5 ]]
+[[ $("${redis_cli}" -p "${source_port}" HDEL simd-hash b b absent) == 1 ]]
+large_hash_value=$(printf '%20000s' '' | tr ' ' h)
+[[ $("${redis_cli}" -p "${source_port}" HSET simd-hash a "${large_hash_value}" c first c last) == 1 ]]
+[[ $("${redis_cli}" -p "${source_port}" HSETNX simd-hash c ignored) == 0 ]]
+[[ $("${redis_cli}" -p "${source_port}" HSET simd-hash b changed d first d interim) == 2 ]]
+[[ $("${redis_cli}" -p "${source_port}" HINCRBYFLOAT simd-hash count 0.5) == 5.5 ]]
+[[ $("${redis_cli}" -p "${source_port}" HDEL simd-hash c c absent) == 1 ]]
+[[ $("${redis_cli}" -p "${source_port}" HSET simd-hash d final) == 0 ]]
+for _ in {1..600}; do
+  [[ $(replica_hget "${replica_port}" simd-hash d 2>/dev/null || true) == final ]] && break
+  sleep 0.05
+done
+[[ $(replica_hget "${replica_port}" simd-hash a) == "${large_hash_value}" ]]
+[[ $(replica_hget "${replica_port}" simd-hash b) == changed ]]
+[[ -z $(replica_hget "${replica_port}" simd-hash c) ]]
+[[ $(replica_hget "${replica_port}" simd-hash count) == 5.5 ]]
+[[ $(replica_hget "${replica_port}" simd-hash d) == final ]]
 
 # A replica is not a native source. Probe rejection must leave the third node
 # writable and must not replace the active source/replica relationship.

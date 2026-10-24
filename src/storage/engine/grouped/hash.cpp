@@ -100,15 +100,12 @@ absl::StatusOr<std::size_t> PayloadBytes(const HashValue& value) {
   if (value.entries_.size() > std::numeric_limits<std::uint32_t>::max()) {
     return absl::OutOfRangeError("Hash group contains too many fields");
   }
-  std::uint64_t bytes = value.entries_.empty() ? 0 : kCompactHeaderBytes;
-  for (const auto& entry : value.entries_) {
-    auto next =
-        AppendHashEntrySize(bytes, entry.field_.size(), entry.value_.size(),
-                            kHashGroupPayloadLimit);
-    if (!next.ok()) return next.status();
-    bytes = *next;
-  }
-  return static_cast<std::size_t>(bytes);
+  if (value.entries_.empty()) return 0;
+  auto encoder = HashValueEncoder::Create(value.entries_);
+  if (!encoder.ok()) return encoder.status();
+  if (encoder->encoded_bytes() > kHashGroupPayloadLimit)
+    return absl::OutOfRangeError("Hash group payload exceeds record limit");
+  return encoder->encoded_bytes();
 }
 
 absl::Status ValidateFields(const HashGroupSnapshot& group,
@@ -207,11 +204,12 @@ absl::StatusOr<HashGroupEncoder> HashGroupEncoder::Create(
   auto& bytes = cursor.header_;
   EncodeGroupHeader(bytes, group, group.field_count(), *size);
   if (!group.value_.entries_.empty()) {
-    Store(bytes, 48, kHashValueMagic, 8);
-    Store(bytes, 56, kStorageFormatVersion, 4);
-    Store(bytes, 60, kHashValueHeaderBytes, 4);
-    Store(bytes, 64, group.value_.entries_.size(), 4);
-    Store(bytes, 72, *size, 8);
+    auto encoder = HashValueEncoder::Create(group.value_.entries_);
+    if (!encoder.ok()) return encoder.status();
+    cursor.value_encoder_ = std::move(*encoder);
+    const auto header = cursor.value_encoder_->Next();
+    std::copy(header->begin(), header->end(),
+              bytes.begin() + kGroupHeaderBytes);
   }
   return cursor;
 }
@@ -231,21 +229,7 @@ std::optional<std::string_view> HashGroupEncoder::Next() noexcept {
                                                 ? kGroupHeaderBytes
                                                 : header_.size());
   }
-  if (entry_ == group_->value_.entries_.size()) return std::nullopt;
-  const auto& entry = group_->value_.entries_[entry_];
-  if (phase_ == 1) {
-    Store(lengths_, 0, entry.field_.size(), 4);
-    Store(lengths_, 4, entry.value_.size(), 4);
-    phase_ = 2;
-    return std::string_view(lengths_.data(), lengths_.size());
-  }
-  if (phase_ == 2) {
-    phase_ = 3;
-    return entry.field_;
-  }
-  phase_ = 1;
-  ++entry_;
-  return entry.value_;
+  return value_encoder_ ? value_encoder_->Next() : std::nullopt;
 }
 
 absl::StatusOr<std::string> EncodeHashGroup(const HashGroupSnapshot& group) {
@@ -280,7 +264,7 @@ absl::StatusOr<HashGroupMetadata> DecodeHashGroupMetadata(
       (metadata.field_count_ == 0 && payload_bytes != 0) ||
       (metadata.field_count_ != 0 &&
        (payload_bytes < kCompactHeaderBytes ||
-        metadata.field_count_ > (payload_bytes - kCompactHeaderBytes) / 8))) {
+        metadata.field_count_ > (payload_bytes - kCompactHeaderBytes) / 5))) {
     return absl::DataLossError("invalid Hash group envelope metadata");
   }
   return metadata;
@@ -325,6 +309,8 @@ absl::Status VisitHashGroupFields(
   if (reader->size() != field_count)
     return absl::DataLossError(
         "Hash group inner count disagrees with envelope");
+  auto valid_tags = reader->ValidateFingerprints();
+  if (!valid_tags.ok()) return absl::DataLossError(valid_tags.message());
   absl::flat_hash_set<FieldKey, FieldHash> fields;
   fields.reserve(field_count);
   for (std::size_t i = 0; i < reader->size(); ++i) {
@@ -372,29 +358,27 @@ absl::StatusOr<std::optional<HashGroupPointProbe>> HashGroupPointProbe::Create(
       metadata->field_count_ == 0)
     return std::nullopt;
   // An absent member leaves uniqueness validation to the caller's checked
-  // splice or decoded fallback. Locate first without hashing or allocating a
-  // duplicate set, so insertion does not repeat that validation. A hit still
-  // checks every field before certifying bytes.
+  // editor or decoded fallback. Locate first without hashing every field or
+  // allocating a duplicate set, so insertion does not repeat that validation. A
+  // hit still checks every field before certifying bytes.
   auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
   if (!reader.ok()) return absl::DataLossError(reader.status().message());
   if (reader->size() != metadata->field_count_)
     return absl::DataLossError(
         "Hash group inner count disagrees with envelope");
-  std::optional<HashEntryView> matched;
-  for (std::size_t i = 0; i < reader->size(); ++i) {
-    auto entry = reader->Next();
-    if (!entry.ok()) return absl::DataLossError(entry.status().message());
-    if (entry->field_ == field) {
-      matched = *entry;
-      break;
-    }
-  }
+  if (reader->version() == kLegacyHashValueVersion &&
+      payload.size() - kGroupHeaderBytes + metadata->field_count_ + 4 >
+          kCollectionGroupTargetBytes)
+    return std::nullopt;
+  auto found = reader->Find(field);
+  if (!found.ok()) return absl::DataLossError(found.status().message());
+  auto matched = *found;
   if (!matched) return std::nullopt;
   auto valid = VisitHashGroupFields(
       payload, metadata->field_count_, metadata->id_, seed,
       [](const HashEntryView&) { return absl::OkStatus(); });
   if (!valid.ok()) return valid;
-  const auto entry_offset = matched->field_.data() - payload.data() - 8;
+  const auto entry_offset = matched->field_.data() - payload.data();
   const auto value_offset = matched->value_.data() - payload.data();
   return HashGroupPointProbe(
       PreparedHashGroupPayload(std::string(payload), metadata->field_count_,
@@ -410,25 +394,38 @@ absl::StatusOr<HashGroupSnapshot> HashGroupPointProbe::Apply(
                            .id_ = payload_.id(),
                            .value_ = {}};
   auto& bytes = payload_.bytes_;
-  if (replacement) {
-    // The replacement may borrow this probe's old value. memmove also keeps
-    // that synchronous use valid without allocating another encoded page.
+  auto reader = HashValueReader::Open(payload_.bytes());
+  if (!reader.ok()) return reader.status();
+  if (replacement && reader->version() == kHashValueVersion) {
+    // An equal-size value edit leaves offsets, fields and fingerprints intact.
+    // memmove permits a replacement borrowed from this same probe.
     if (!replacement->empty())
       std::memmove(bytes.data() + value_offset_, replacement->data(),
                    replacement->size());
   } else {
-    --payload_.count_;
-    if (payload_.count_ == 0) {
-      bytes.resize(kGroupHeaderBytes);
-    } else {
-      bytes.erase(entry_offset_, value_offset_ + value_bytes_ - entry_offset_);
-      std::span<char> compact(bytes.data() + kGroupHeaderBytes,
-                              bytes.size() - kGroupHeaderBytes);
-      Store(compact, 16, payload_.count_, 4);
-      Store(compact, 24, compact.size(), 8);
+    // Deletion compacts data and all three arrays together. Legacy mutations
+    // migrate to v2 without retaining any process-local digest in the payload.
+    const auto target = field();
+    std::vector<HashEntryView> entries;
+    entries.reserve(payload_.count_);
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return entry.status();
+      if (entry->field_ == target) {
+        if (replacement) entries.push_back({entry->field_, *replacement});
+      } else
+        entries.push_back(*entry);
     }
-    EncodeGroupHeader({bytes.data(), kGroupHeaderBytes}, result,
-                      payload_.count_, bytes.size() - kGroupHeaderBytes);
+    payload_.count_ = entries.size();
+    std::string encoded(kGroupHeaderBytes, '\0');
+    if (!entries.empty()) {
+      auto compact = EncodeHashValueViews(entries);
+      if (!compact.ok()) return compact.status();
+      encoded.append(*compact);
+    }
+    EncodeGroupHeader({encoded.data(), kGroupHeaderBytes}, result,
+                      payload_.count_, encoded.size() - kGroupHeaderBytes);
+    bytes = std::move(encoded);
   }
   result.prepared_.emplace(std::move(payload_));
   return result;
@@ -441,157 +438,44 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
   if (!metadata.ok()) return metadata.status();
   if (metadata->retired_)
     return absl::DataLossError("cannot edit a retired Hash leaf");
-  if (edits.size() == 1) {
-    const auto& edit = edits.front();
-    std::optional<HashEntryView> current;
-    auto valid =
-        VisitHashGroupFields(payload, metadata->field_count_, metadata->id_,
-                             seed, [&](const HashEntryView& entry) {
-                               if (entry.field_ == edit.field_) current = entry;
-                               return absl::OkStatus();
-                             });
-    if (!valid.ok()) return valid;
-    auto size = AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
-                                    edit.value_.size(), kHashGroupPayloadLimit);
-    if (!size.ok()) return size.status();
-    if (!metadata->id_.ContainsHash(ComputeDigest(edit.field_, seed).value_))
-      return absl::InvalidArgumentError("Hash edit outside its group route");
-    HashGroupEdit result;
-    const bool remove = kind == HashGroupEditKind::kDelete;
-    if ((remove && !current) ||
-        (current && (kind == HashGroupEditKind::kSetIfAbsent ||
-                     (!remove && current->value_ == edit.value_))))
-      return result;
-    result.changed_ = true;
-    result.added_ = !current;
-    result.removed_ = remove;
-    const auto count =
-        std::uint64_t{metadata->field_count_} + result.added_ - result.removed_;
-    if (count > UINT32_MAX)
-      return absl::OutOfRangeError("Hash edit cardinality overflow");
-    const auto old_bytes = payload.size() - kGroupHeaderBytes;
-    const auto removed_bytes =
-        current ? 8 + current->field_.size() + current->value_.size() : 0;
-    const auto added_bytes = remove ? 0 : *size - kCompactHeaderBytes;
-    const auto bytes =
-        count == 0 ? 0
-                   : (old_bytes == 0 ? kCompactHeaderBytes : old_bytes) -
-                         removed_bytes + added_bytes;
-    HashGroupSnapshot replacement{.incarnation_ = metadata->incarnation_,
-                                  .id_ = metadata->id_,
-                                  .value_ = {}};
-    if (bytes <= kCollectionGroupTargetBytes) {
-      // A point edit needs no field-to-position map or vector of every entry.
-      // Full route/duplicate validation above remains mandatory, even for a
-      // no-op. Copy unchanged encoded spans once, without rebuilding each
-      // field header. Views borrow the live read lease until this returns.
-      std::string encoded;
-      const auto total = kGroupHeaderBytes + bytes;
-      encoded.resize_and_overwrite(
-          total, [&](char* output, std::size_t) noexcept {
-            EncodeGroupHeader({output, kGroupHeaderBytes}, replacement, count,
-                              bytes);
-            if (count == 0) return total;
-            std::span<char> compact(output + kGroupHeaderBytes, bytes);
-            Store(compact, 0, kHashValueMagic, 8);
-            Store(compact, 8, kStorageFormatVersion, 4);
-            Store(compact, 12, kCompactHeaderBytes, 4);
-            Store(compact, 16, count, 4);
-            Store(compact, 20, 0, 4);
-            Store(compact, 24, bytes, 8);
-            const auto body = payload.substr(kGroupHeaderBytes);
-            const std::size_t at =
-                current ? static_cast<std::size_t>(current->field_.data() -
-                                                   body.data()) -
-                              8
-                        : old_bytes;
-            std::size_t offset = kCompactHeaderBytes;
-            if (at > kCompactHeaderBytes) {
-              const auto prefix = at - kCompactHeaderBytes;
-              std::memcpy(compact.data() + offset,
-                          body.data() + kCompactHeaderBytes, prefix);
-              offset += prefix;
-            }
-            if (!remove) {
-              Store(compact, offset, edit.field_.size(), 4);
-              Store(compact, offset + 4, edit.value_.size(), 4);
-              offset += 8;
-              if (!edit.field_.empty())
-                std::memcpy(compact.data() + offset, edit.field_.data(),
-                            edit.field_.size());
-              offset += edit.field_.size();
-              if (!edit.value_.empty())
-                std::memcpy(compact.data() + offset, edit.value_.data(),
-                            edit.value_.size());
-              offset += edit.value_.size();
-            }
-            const auto end = at + removed_bytes;
-            if (end < old_bytes)
-              std::memcpy(compact.data() + offset, body.data() + end,
-                          old_bytes - end);
-            return total;
-          });
-      replacement.prepared_ = PreparedHashGroupPayload(
-          std::move(encoded), count, metadata->id_, metadata->incarnation_);
-      result.leaves_.push_back(std::move(replacement));
-    } else {
-      // Splits and oversized values still use owned streaming snapshots. The
-      // checked reader needs no second route/duplicate index on this pass.
-      replacement.value_.entries_.reserve(count);
-      auto append = [&](const HashEntryView& entry) {
-        replacement.value_.entries_.push_back(
-            {.digest_ = ComputeDigest(entry.field_),
-             .field_ = std::string(entry.field_),
-             .value_ = std::string(entry.value_)});
-      };
-      if (metadata->field_count_ != 0) {
-        auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
-        if (!reader.ok()) return reader.status();
-        for (std::size_t i = 0; i < reader->size(); ++i) {
-          auto entry = reader->Next();
-          if (!entry.ok()) return entry.status();
-          if (entry->field_ == edit.field_) {
-            if (!remove) append(edit);
-          } else {
-            append(*entry);
-          }
-        }
-      }
-      if (!current) append(edit);
-      auto leaves = SplitHashGroup(std::move(replacement), seed);
-      if (!leaves.ok()) return leaves.status();
-      result.leaves_ = std::move(*leaves);
-    }
-    return result;
-  }
   struct Entry {
     HashEntryView view;
     bool removed = false;
   };
   std::vector<Entry> entries;
-  absl::flat_hash_map<FieldKey, std::size_t, FieldHash> positions;
+  std::optional<HashValueReader> source;
   if (edits.size() > UINT32_MAX - metadata->field_count_)
     return absl::OutOfRangeError("Hash edit cardinality overflow");
   entries.reserve(metadata->field_count_ + edits.size());
-  positions.reserve(metadata->field_count_ + edits.size());
   if (metadata->field_count_ != 0) {
     auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
     if (!reader.ok()) return absl::DataLossError(reader.status().message());
     if (reader->size() != metadata->field_count_)
       return absl::DataLossError(
           "Hash group inner count disagrees with envelope");
+    auto valid_tags = reader->ValidateFingerprints();
+    if (!valid_tags.ok()) return absl::DataLossError(valid_tags.message());
+    source = *reader;
+    // Validation still checks every field's route and uniqueness. This set
+    // certifies the immutable source and is discarded before applying edits;
+    // locating an existing field uses its persisted fingerprint and offset.
+    absl::flat_hash_set<FieldKey, FieldHash> fields;
+    fields.reserve(metadata->field_count_);
     for (std::size_t i = 0; i < reader->size(); ++i) {
       auto entry = reader->Next();
       if (!entry.ok()) return absl::DataLossError(entry.status().message());
       const auto hash = ComputeDigest(entry->field_, seed).value_;
       if (!metadata->id_.ContainsHash(hash))
         return absl::DataLossError("Hash field outside its group route");
-      if (!positions.emplace(FieldKey{entry->field_, hash}, entries.size())
-               .second)
+      if (!fields.emplace(FieldKey{entry->field_, hash}).second)
         return absl::DataLossError("duplicate field in Hash group");
       entries.push_back({*entry});
     }
   }
+  // Only fields introduced by this command need a mutable index: they are
+  // absent from the immutable page. It preserves repeated-operand semantics
+  // while existing fields always resolve to their original physical slot.
+  absl::flat_hash_map<std::string_view, std::size_t> additions;
   HashGroupEdit result;
   for (const auto& edit : edits) {
     auto size = AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
@@ -600,71 +484,56 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     const FieldKey key{edit.field_, ComputeDigest(edit.field_, seed).value_};
     if (!metadata->id_.ContainsHash(key.hash))
       return absl::InvalidArgumentError("Hash edit outside its group route");
-    const auto found = positions.find(key);
+    std::size_t slot = SIZE_MAX;
+    const auto added = additions.find(edit.field_);
+    if (added != additions.end()) {
+      slot = added->second;
+    } else if (source) {
+      auto found = source->Find(edit.field_, false, &slot);
+      if (!found.ok()) return absl::DataLossError(found.status().message());
+    }
     if (kind == HashGroupEditKind::kDelete) {
-      if (found != positions.end()) {
-        entries[found->second].removed = true;
-        positions.erase(found);
+      if (slot != SIZE_MAX && !entries[slot].removed) {
+        entries[slot].removed = true;
         ++result.removed_;
         result.changed_ = true;
       }
-    } else if (found == positions.end()) {
-      positions.emplace(key, entries.size());
+    } else if (slot == SIZE_MAX) {
+      additions.emplace(edit.field_, entries.size());
       entries.push_back({edit});
       ++result.added_;
       result.changed_ = true;
     } else if (kind == HashGroupEditKind::kSet &&
-               entries[found->second].view.value_ != edit.value_) {
-      entries[found->second].view.value_ = edit.value_;
+               entries[slot].view.value_ != edit.value_) {
+      entries[slot].view.value_ = edit.value_;
       result.changed_ = true;
     }
   }
   if (!result.changed_) return result;
-  const auto count = positions.size();
-  std::uint64_t bytes = count == 0 ? 0 : kCompactHeaderBytes;
+  const auto count = metadata->field_count_ + result.added_ - result.removed_;
+  std::vector<HashEntryView> survivors;
+  survivors.reserve(count);
   for (const auto& entry : entries)
-    if (!entry.removed)
-      bytes += 8 + entry.view.field_.size() + entry.view.value_.size();
+    if (!entry.removed) survivors.push_back(entry.view);
+  std::size_t bytes = 0;
+  if (count != 0) {
+    auto encoder =
+        HashValueEncoder::Create(std::span<const HashEntryView>(survivors));
+    if (!encoder.ok()) return encoder.status();
+    bytes = encoder->encoded_bytes();
+  }
   HashGroupSnapshot replacement{.incarnation_ = metadata->incarnation_,
                                 .id_ = metadata->id_,
                                 .value_ = {}};
   if (bytes <= kCollectionGroupTargetBytes) {
-    // All views still borrow the read lease or immutable request. Copy each
-    // surviving byte once, then discard the index and lease before publication.
-    std::string encoded;
-    const auto encoded_bytes = kGroupHeaderBytes + bytes;
-    encoded.resize_and_overwrite(encoded_bytes, [&](char* output,
-                                                    std::size_t) noexcept {
-      EncodeGroupHeader({output, kGroupHeaderBytes}, replacement, count, bytes);
-      if (count == 0) return encoded_bytes;
-      std::span<char> compact(output + kGroupHeaderBytes, bytes);
-      Store(compact, 0, kHashValueMagic, 8);
-      Store(compact, 8, kStorageFormatVersion, 4);
-      Store(compact, 12, kCompactHeaderBytes, 4);
-      Store(compact, 16, count, 4);
-      Store(compact, 20, 0, 4);
-      Store(compact, 24, bytes, 8);
-      std::size_t offset = kCompactHeaderBytes;
-      for (const auto& entry : entries) {
-        if (entry.removed) continue;
-        const auto& view = entry.view;
-        Store(compact, offset, view.field_.size(), 4);
-        Store(compact, offset + 4, view.value_.size(), 4);
-        offset += 8;
-        // The destination was sized once above and cannot alias these views
-        // of the read lease/request. Copy bytes directly; Set values are empty
-        // and need no string mutation (or a zero-length copy from nullptr).
-        if (!view.field_.empty())
-          std::memcpy(compact.data() + offset, view.field_.data(),
-                      view.field_.size());
-        offset += view.field_.size();
-        if (!view.value_.empty())
-          std::memcpy(compact.data() + offset, view.value_.data(),
-                      view.value_.size());
-        offset += view.value_.size();
-      }
-      return encoded_bytes;
-    });
+    std::string encoded(kGroupHeaderBytes, '\0');
+    if (count != 0) {
+      auto compact = EncodeHashValueViews(survivors);
+      if (!compact.ok()) return compact.status();
+      encoded.append(*compact);
+    }
+    EncodeGroupHeader({encoded.data(), kGroupHeaderBytes}, replacement, count,
+                      bytes);
     replacement.prepared_ = PreparedHashGroupPayload(
         std::move(encoded), count, metadata->id_, metadata->incarnation_);
     result.leaves_.push_back(std::move(replacement));
@@ -727,28 +596,33 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
     std::size_t first_;
     std::size_t last_;
     std::uint64_t entry_bytes_;
+    std::size_t values_;
   };
   if (group.value_.entries_.size() > std::numeric_limits<std::uint32_t>::max())
     return absl::OutOfRangeError("Hash group contains too many fields");
   std::vector<Route> routes;
   routes.reserve(group.value_.entries_.size());
   std::uint64_t entry_bytes = 0;
+  std::size_t values = 0;
   for (const auto& entry : group.value_.entries_) {
     routes.push_back({ComputeDigest(entry.field_, seed).value_, routes.size()});
-    entry_bytes += 8 + entry.field_.size() + entry.value_.size();
+    entry_bytes += entry.field_.size() + entry.value_.size();
+    values += !entry.value_.empty();
   }
   // A uint32 entry count and individually checked physical payload sizes
   // bound this sum below uint64_t, even when the whole value spans records.
   std::vector<Range> pending;
   pending.reserve(65);
-  pending.push_back({group.id_, 0, routes.size(), entry_bytes});
+  pending.push_back({group.id_, 0, routes.size(), entry_bytes, values});
   std::vector<HashGroupSnapshot> leaves;
   while (!pending.empty()) {
     const auto current = pending.back();
     pending.pop_back();
     const auto count = current.last_ - current.first_;
     const auto payload_bytes =
-        count == 0 ? 0 : kCompactHeaderBytes + current.entry_bytes_;
+        count == 0 ? 0
+                   : kCompactHeaderBytes + 4 + current.entry_bytes_ +
+                         count * (current.values_ == 0 ? 5 : 9);
     if ((payload_bytes <= target_bytes &&
          payload_bytes <= kHashGroupPayloadLimit) ||
         count <= 1 || current.id_.bits_ == 64) {
@@ -766,21 +640,27 @@ absl::StatusOr<std::vector<HashGroupSnapshot>> SplitHashGroup(
     const auto child_bits = static_cast<std::uint8_t>(current.id_.bits_ + 1);
     const std::uint64_t branch_bit = std::uint64_t{1} << (64 - child_bits);
     std::uint64_t left_bytes = 0;
+    std::size_t left_values = 0;
     const auto middle = std::partition(
         routes.begin() + current.first_, routes.begin() + current.last_,
         [&](const Route& route) {
           if (route.hash_ & branch_bit) return false;
           const auto& entry = group.value_.entries_[route.index_];
-          left_bytes += 8 + entry.field_.size() + entry.value_.size();
+          left_bytes += entry.field_.size() + entry.value_.size();
+          left_values += !entry.value_.empty();
           return true;
         });
     const auto split = static_cast<std::size_t>(middle - routes.begin());
     pending.push_back({{current.id_.prefix_ | branch_bit, child_bits},
                        split,
                        current.last_,
-                       current.entry_bytes_ - left_bytes});
-    pending.push_back(
-        {{current.id_.prefix_, child_bits}, current.first_, split, left_bytes});
+                       current.entry_bytes_ - left_bytes,
+                       current.values_ - left_values});
+    pending.push_back({{current.id_.prefix_, child_bits},
+                       current.first_,
+                       split,
+                       left_bytes,
+                       left_values});
   }
   return leaves;
 }

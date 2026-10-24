@@ -537,6 +537,20 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endif()
 endif()
 
+# An isolated codec benchmark uses the production codec/format translation
+# units without linking the server or starting workers. Build explicitly; use
+# a Release configuration for timing. No benchmark dependency is downloaded.
+add_executable(lavik_hash_lookup_bench EXCLUDE_FROM_ALL
+  tests/hash_lookup_bench.cpp
+  src/storage/engine/hash_codec.cpp
+  src/storage/format.cpp)
+target_include_directories(lavik_hash_lookup_bench PRIVATE include)
+target_link_libraries(lavik_hash_lookup_bench PRIVATE
+  absl::flat_hash_map absl::statusor absl::crc32c)
+if(LAVIK_ENABLE_OPT AND NOT LAVIK_MARCH STREQUAL "")
+  target_compile_options(lavik_hash_lookup_bench PRIVATE "-march=${LAVIK_MARCH}")
+endif()
+
 add_executable(lavik
   app/lavik.cpp
   app/mimalloc_new_delete.cpp
@@ -1762,6 +1776,7 @@ if (BUILD_TESTING)
     tests/device_affinity_test.cpp
     tests/foreign_executor_test.cpp
     tests/grouped/hash_test.cpp
+    tests/hash_codec_test.cpp
     tests/packed_list_read_test.cpp
     tests/grouped/commit_decision_test.cpp
     tests/grouped/collection_test.cpp
