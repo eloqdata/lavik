@@ -119,12 +119,13 @@ class HashValueReader {
   // Splices one resolved edit into a fully validated v2 source, preserving
   // unchanged data and fingerprints. slot == size() appends; null replacement
   // removes an existing slot. Replacement fields must match the old field.
-  // Callers validate all source entries/tags (and grouped route/uniqueness)
-  // before calling. This method does not locate fields or repeat validation.
-  // Output owns its bytes; prefix_bytes reserves a zeroed outer envelope.
-  // max_bytes bounds only the inner Hash. An empty result has only the prefix.
-  // Nullopt selects the legacy migration or oversized/split fallback before
-  // allocating output. Sources and replacements may alias each other.
+  // Requires v2; callers handle v1 migration separately and validate all source
+  // entries/tags (and grouped route/uniqueness) before calling. This method
+  // does not locate fields or repeat validation. Output owns its bytes;
+  // prefix_bytes reserves a zeroed outer envelope. max_bytes bounds only the
+  // inner Hash. An empty result has only the prefix. Nullopt selects the
+  // oversized/split fallback before allocating output. Sources and replacements
+  // may alias each other.
   absl::StatusOr<std::optional<std::string>> SpliceValidated(
       std::size_t slot, std::optional<HashEntryView> replacement,
       std::size_t max_bytes, std::size_t prefix_bytes = 0) const;

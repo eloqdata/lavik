@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cstring>
 #include <limits>
 
@@ -489,8 +490,7 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
 absl::StatusOr<std::optional<std::string>> HashValueReader::SpliceValidated(
     std::size_t slot, std::optional<HashEntryView> replacement,
     std::size_t max_bytes, std::size_t prefix_bytes) const {
-  if (version_ != kHashValueVersion) [[unlikely]]
-    return std::nullopt;
+  assert(version_ == kHashValueVersion);
   if (slot > size_ || (slot == size_ && !replacement))
     return absl::InvalidArgumentError("invalid Hash splice slot");
   if (replacement && (replacement->field_.size() > kMaxStringBytes ||

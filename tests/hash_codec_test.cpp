@@ -478,26 +478,17 @@ TEST(HashV2, EqualSizeSpliceCanBorrowSourceAndKeepsEveryOtherByte) {
   EXPECT_EQ(*output, expected);
 }
 
-TEST(HashV2, SpliceRejectsInvalidOperandsAndDefersV1Migration) {
+TEST(HashV2, SpliceRejectsInvalidOperands) {
   const auto original = Value(2, false);
-  for (auto version : {kLegacyHashValueVersion, kHashValueVersion}) {
-    auto bytes = EncodeHashValue(original, version);
-    ASSERT_TRUE(bytes.ok());
-    auto reader = HashValueReader::Open(*bytes);
-    ASSERT_TRUE(reader.ok());
-    if (version == kLegacyHashValueVersion) {
-      auto result = reader->SpliceValidated(0, HashEntryView{"", "new"}, 16383);
-      ASSERT_TRUE(result.ok());
-      EXPECT_FALSE(*result);
-    } else {
-      EXPECT_FALSE(
-          reader->SpliceValidated(3, HashEntryView{"new", "v"}, 16383).ok());
-      EXPECT_FALSE(reader->SpliceValidated(2, std::nullopt, 16383).ok());
-      EXPECT_FALSE(
-          reader->SpliceValidated(0, HashEntryView{"renamed", "v"}, 16383)
-              .ok());
-    }
-  }
+  auto bytes = EncodeHashValue(original);
+  ASSERT_TRUE(bytes.ok());
+  auto reader = HashValueReader::Open(*bytes);
+  ASSERT_TRUE(reader.ok());
+  EXPECT_FALSE(
+      reader->SpliceValidated(3, HashEntryView{"new", "v"}, 16383).ok());
+  EXPECT_FALSE(reader->SpliceValidated(2, std::nullopt, 16383).ok());
+  EXPECT_FALSE(
+      reader->SpliceValidated(0, HashEntryView{"renamed", "v"}, 16383).ok());
 }
 
 TEST(HashV2, BatchedEqualSizeUpdatesPreserveMetadataAndSequentialSemantics) {
