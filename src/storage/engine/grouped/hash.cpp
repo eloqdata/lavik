@@ -438,6 +438,59 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
   if (!metadata.ok()) return metadata.status();
   if (metadata->retired_)
     return absl::DataLossError("cannot edit a retired Hash leaf");
+  bool source_validated = false;
+  if (edits.size() == 1 && metadata->field_count_ != 0) {
+    auto reader = HashValueReader::Open(payload.substr(kGroupHeaderBytes));
+    if (!reader.ok()) return absl::DataLossError(reader.status().message());
+    if (reader->version() == kHashValueVersion) {
+      // Keep point edits independent of the batch editor's entry/survivor
+      // vectors. Validate the whole source even on a no-op, then splice raw
+      // spans; equal-size overwrites copy the index without rebuilding it.
+      auto valid = VisitHashGroupFields(
+          payload, metadata->field_count_, metadata->id_, seed,
+          [](const HashEntryView&) { return absl::OkStatus(); });
+      if (!valid.ok()) return valid;
+      source_validated = true;
+      const auto& edit = edits.front();
+      auto size =
+          AppendHashEntrySize(kCompactHeaderBytes, edit.field_.size(),
+                              edit.value_.size(), kHashGroupPayloadLimit);
+      if (!size.ok()) return size.status();
+      if (!metadata->id_.ContainsHash(ComputeDigest(edit.field_, seed).value_))
+        return absl::InvalidArgumentError("Hash edit outside its group route");
+      std::size_t slot = reader->size();
+      auto current = reader->Find(edit.field_, false, &slot);
+      if (!current.ok()) return absl::DataLossError(current.status().message());
+      const bool remove = kind == HashGroupEditKind::kDelete;
+      HashGroupEdit result;
+      if ((remove && !*current) ||
+          (*current && (kind == HashGroupEditKind::kSetIfAbsent ||
+                        (!remove && (**current).value_ == edit.value_))))
+        return result;
+      auto encoded = reader->SpliceValidated(
+          slot, remove ? std::nullopt : std::optional<HashEntryView>{edit},
+          kCollectionGroupTargetBytes, kGroupHeaderBytes);
+      if (!encoded.ok()) return encoded.status();
+      if (*encoded) {
+        result.changed_ = true;
+        result.added_ = !*current;
+        result.removed_ = remove;
+        const auto count =
+            metadata->field_count_ + result.added_ - result.removed_;
+        HashGroupSnapshot replacement{.incarnation_ = metadata->incarnation_,
+                                      .id_ = metadata->id_,
+                                      .value_ = {}};
+        EncodeGroupHeader({(**encoded).data(), kGroupHeaderBytes}, replacement,
+                          count, (**encoded).size() - kGroupHeaderBytes);
+        replacement.prepared_ = PreparedHashGroupPayload(
+            std::move(**encoded), count, metadata->id_, metadata->incarnation_);
+        result.leaves_.push_back(std::move(replacement));
+        return result;
+      }
+      // Splits/oversized values use the owned streaming fallback below. V1
+      // sources also retain that migration path and are never spliced as v2.
+    }
+  }
   struct Entry {
     HashEntryView view;
     bool removed = false;
@@ -453,22 +506,29 @@ absl::StatusOr<HashGroupEdit> ApplyHashGroupEdits(
     if (reader->size() != metadata->field_count_)
       return absl::DataLossError(
           "Hash group inner count disagrees with envelope");
-    auto valid_tags = reader->ValidateFingerprints();
-    if (!valid_tags.ok()) return absl::DataLossError(valid_tags.message());
+    if (!source_validated) {
+      auto valid_tags = reader->ValidateFingerprints();
+      if (!valid_tags.ok()) return absl::DataLossError(valid_tags.message());
+    }
     source = *reader;
     // Validation still checks every field's route and uniqueness. This set
     // certifies the immutable source and is discarded before applying edits;
     // locating an existing field uses its persisted fingerprint and offset.
     absl::flat_hash_set<FieldKey, FieldHash> fields;
-    fields.reserve(metadata->field_count_);
+    if (!source_validated) fields.reserve(metadata->field_count_);
     for (std::size_t i = 0; i < reader->size(); ++i) {
       auto entry = reader->Next();
       if (!entry.ok()) return absl::DataLossError(entry.status().message());
-      const auto hash = ComputeDigest(entry->field_, seed).value_;
-      if (!metadata->id_.ContainsHash(hash))
-        return absl::DataLossError("Hash field outside its group route");
-      if (!fields.emplace(FieldKey{entry->field_, hash}).second)
-        return absl::DataLossError("duplicate field in Hash group");
+      // An oversized point edit already checked this immutable source before
+      // selecting the streaming fallback. Do not repeat hashing or allocate a
+      // second uniqueness set merely because the result requires splitting.
+      if (!source_validated) {
+        const auto hash = ComputeDigest(entry->field_, seed).value_;
+        if (!metadata->id_.ContainsHash(hash))
+          return absl::DataLossError("Hash field outside its group route");
+        if (!fields.emplace(FieldKey{entry->field_, hash}).second)
+          return absl::DataLossError("duplicate field in Hash group");
+      }
       entries.push_back({*entry});
     }
   }

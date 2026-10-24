@@ -76,7 +76,7 @@ class HashValueEncoder {
  private:
   absl::Status Initialize(std::uint32_t version);
   [[gnu::noinline, gnu::cold]] std::optional<std::string_view>
-  NextLegacy() noexcept;
+  NextV1() noexcept;
   HashEntryView Entry(std::size_t index) const noexcept;
   std::span<const HashEntry> entries_;
   std::span<const HashEntryView> views_;
@@ -116,16 +116,29 @@ class HashValueReader {
   // Strict readers/writers validate the persisted filter before trusting it.
   // Ordinary point reads retain the loader's CRC policy and check candidates.
   absl::Status ValidateFingerprints() const;
+  // Splices one resolved edit into a fully validated v2 source, preserving
+  // unchanged data and fingerprints. slot == size() appends; null replacement
+  // removes an existing slot. Replacement fields must match the old field.
+  // Callers validate all source entries/tags (and grouped route/uniqueness)
+  // before calling. This method does not locate fields or repeat validation.
+  // Output owns its bytes; prefix_bytes reserves a zeroed outer envelope.
+  // max_bytes bounds only the inner Hash. An empty result has only the prefix.
+  // Nullopt selects the legacy migration or oversized/split fallback before
+  // allocating output. Sources and replacements may alias each other.
+  absl::StatusOr<std::optional<std::string>> SpliceValidated(
+      std::size_t slot, std::optional<HashEntryView> replacement,
+      std::size_t max_bytes, std::size_t prefix_bytes = 0) const;
   // Failure does not advance the reader. Calling past the last entry fails.
   absl::StatusOr<HashEntryView> Next();
 
  private:
-  [[gnu::noinline, gnu::cold]] static absl::StatusOr<HashValueReader>
-  OpenLegacy(std::string_view payload);
-  [[gnu::noinline, gnu::cold]] absl::StatusOr<HashEntryView> NextLegacy();
+  [[gnu::noinline, gnu::cold]] static absl::StatusOr<HashValueReader> OpenV1(
+      std::string_view payload);
+  [[gnu::noinline, gnu::cold]] absl::StatusOr<HashEntryView> NextV1();
   [[gnu::noinline, gnu::cold]]
-  absl::StatusOr<std::optional<HashEntryView>> FindLegacy(
-      std::string_view field, std::size_t* slot, std::size_t first) const;
+  absl::StatusOr<std::optional<HashEntryView>> FindV1(std::string_view field,
+                                                      std::size_t* slot,
+                                                      std::size_t first) const;
   HashValueReader(std::string_view payload, std::size_t count)
       : payload_(payload), size_(count), remaining_(count) {}
   std::string_view payload_;

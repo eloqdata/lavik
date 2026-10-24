@@ -99,7 +99,7 @@ absl::StatusOr<std::size_t> AppendHashEntrySize(std::size_t encoded_bytes,
   return encoded_bytes + 8 + field_bytes + value_bytes;
 }
 
-absl::StatusOr<HashValueReader> HashValueReader::OpenLegacy(
+absl::StatusOr<HashValueReader> HashValueReader::OpenV1(
     std::string_view payload) {
   if (payload.size() < kHashValueHeaderBytes) {
     return absl::InternalError("Hash value is truncated");
@@ -135,7 +135,7 @@ absl::StatusOr<HashValueReader> HashValueReader::OpenLegacy(
   return HashValueReader(payload, element_count);
 }
 
-absl::StatusOr<HashEntryView> HashValueReader::NextLegacy() {
+absl::StatusOr<HashEntryView> HashValueReader::NextV1() {
   if (remaining_ == 0) {
     return absl::OutOfRangeError("Hash reader is exhausted");
   }
@@ -228,7 +228,7 @@ std::optional<std::string_view> HashValueEncoder::Next() noexcept {
     return std::string_view(header_.data(), header_.size());
   }
   if (version_ == kLegacyHashValueVersion) [[unlikely]]
-    return NextLegacy();
+    return NextV1();
   if (phase_ <= 2 && entry_ < count_) {
     const auto entry = Entry(entry_);
     borrowed_ = true;
@@ -273,7 +273,7 @@ std::optional<std::string_view> HashValueEncoder::Next() noexcept {
   return std::string_view(metadata_.data(), used);
 }
 
-std::optional<std::string_view> HashValueEncoder::NextLegacy() noexcept {
+std::optional<std::string_view> HashValueEncoder::NextV1() noexcept {
   if (entry_ == count_) return std::nullopt;
   const auto entry = Entry(entry_);
   if (phase_ == 1) {
@@ -298,7 +298,7 @@ absl::StatusOr<HashValueReader> HashValueReader::Open(
     return absl::InternalError("Hash value is truncated");
   const auto version = Load32(payload, 8);
   if (version == kLegacyHashValueVersion) [[unlikely]]
-    return OpenLegacy(payload);
+    return OpenV1(payload);
   if (version == kHashValueVersion) [[likely]] {
     const auto count = Load32(payload, 16);
     const auto flags = Load32(payload, 20);
@@ -353,7 +353,7 @@ absl::StatusOr<HashEntryView> HashValueReader::At(std::size_t index) const {
 
 absl::StatusOr<HashEntryView> HashValueReader::Next() {
   if (version_ == kLegacyHashValueVersion) [[unlikely]]
-    return NextLegacy();
+    return NextV1();
   if (remaining_ == 0) return absl::OutOfRangeError("Hash reader is exhausted");
   auto entry = At(size_ - remaining_);
   if (entry.ok()) --remaining_;
@@ -373,14 +373,14 @@ absl::Status HashValueReader::ValidateFingerprints() const {
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::optional<HashEntryView>> HashValueReader::FindLegacy(
+absl::StatusOr<std::optional<HashEntryView>> HashValueReader::FindV1(
     std::string_view field, std::size_t* slot, std::size_t first) const {
   auto reader = *this;
   reader.offset_ = kHashValueHeaderBytes;
   reader.remaining_ = size_;
   while (reader.remaining_ != 0) {
     const auto index = size_ - reader.remaining_;
-    auto entry = reader.NextLegacy();
+    auto entry = reader.NextV1();
     if (!entry.ok()) return entry.status();
     if (index >= first && entry->field_ == field) {
       if (slot) *slot = index;
@@ -396,7 +396,7 @@ absl::StatusOr<std::optional<HashEntryView>> HashValueReader::Find(
   if (first > size_) return absl::OutOfRangeError("Hash slot is out of range");
   if (first == size_) return std::nullopt;
   if (version_ == kLegacyHashValueVersion) [[unlikely]]
-    return FindLegacy(field, slot, first);
+    return FindV1(field, slot, first);
   const auto tag = HashFieldFingerprint(field);
   const auto* tags = payload_.data() + tags_begin_;
   std::size_t i = first;
@@ -486,6 +486,143 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
   return value;
 }
 
+absl::StatusOr<std::optional<std::string>> HashValueReader::SpliceValidated(
+    std::size_t slot, std::optional<HashEntryView> replacement,
+    std::size_t max_bytes, std::size_t prefix_bytes) const {
+  if (version_ != kHashValueVersion) [[unlikely]]
+    return std::nullopt;
+  if (slot > size_ || (slot == size_ && !replacement))
+    return absl::InvalidArgumentError("invalid Hash splice slot");
+  if (replacement && (replacement->field_.size() > kMaxStringBytes ||
+                      replacement->value_.size() > kMaxStringBytes))
+    return absl::OutOfRangeError("Hash splice entry exceeds encoding limits");
+  if (prefix_bytes > std::string{}.max_size())
+    return absl::OutOfRangeError("Hash splice prefix overflows");
+  const bool append = slot == size_;
+  const bool remove = !replacement;
+  if (append && size_ == UINT32_MAX)
+    return absl::OutOfRangeError("Hash splice count overflows");
+  std::optional<HashEntryView> old;
+  if (!append) {
+    auto entry = At(slot);
+    if (!entry.ok()) return entry.status();
+    old = *entry;
+    if (replacement && replacement->field_ != old->field_)
+      return absl::InvalidArgumentError("Hash splice cannot rename a field");
+  }
+  // Equal-size overwrites leave every index byte intact. The new image is
+  // private; replacing a value borrowed from the immutable source is safe.
+  if (old && replacement && old->value_.size() == replacement->value_.size()) {
+    if (payload_.size() > max_bytes) return std::nullopt;
+    if (prefix_bytes > std::string{}.max_size() - payload_.size())
+      return absl::OutOfRangeError("Hash splice output overflows");
+    std::string output;
+    output.resize_and_overwrite(
+        prefix_bytes + payload_.size(), [&](char* data, std::size_t) noexcept {
+          std::memset(data, 0, prefix_bytes);
+          std::memcpy(data + prefix_bytes, payload_.data(), payload_.size());
+          if (!replacement->value_.empty())
+            std::memcpy(
+                data + prefix_bytes + (old->value_.data() - payload_.data()),
+                replacement->value_.data(), replacement->value_.size());
+          return prefix_bytes + payload_.size();
+        });
+    return output;
+  }
+  const auto count = size_ + append - remove;
+  if (count == 0) return std::string(prefix_bytes, '\0');
+  const auto begin = Load32(payload_, offsets_begin_ + slot * 4);
+  const auto end =
+      append ? begin : Load32(payload_, offsets_begin_ + (slot + 1) * 4);
+  const auto added =
+      replacement ? replacement->field_.size() + replacement->value_.size() : 0;
+  const std::uint64_t data_bytes = data_bytes_ - (end - begin) + added;
+  if (data_bytes > UINT32_MAX) return std::nullopt;
+  bool empty_values =
+      empty_values_ && (!replacement || replacement->value_.empty());
+  if (!empty_values_ && (!replacement || replacement->value_.empty())) {
+    // Removing/replacing the last nonempty value drops the lengths array.
+    // Inspect only numeric metadata, without decoding or hashing fields.
+    empty_values = true;
+    for (std::size_t i = 0; i < size_; ++i) {
+      if (i == slot) continue;
+      if (Load32(payload_, offsets_begin_ + (i + 1) * 4) -
+              Load32(payload_, offsets_begin_ + i * 4) !=
+          Load32(payload_, lengths_begin_ + i * 4)) {
+        empty_values = false;
+        break;
+      }
+    }
+  }
+  const std::uint64_t bytes = kHashValueHeaderBytes + data_bytes + 4 +
+                              std::uint64_t{count} * (empty_values ? 5 : 9);
+  if (bytes > max_bytes) return std::nullopt;
+  if (bytes > std::string{}.max_size() ||
+      prefix_bytes > std::string{}.max_size() - bytes)
+    return absl::OutOfRangeError("Hash splice output overflows");
+  std::string output;
+  output.resize_and_overwrite(prefix_bytes + bytes, [&](char* data,
+                                                        std::size_t) noexcept {
+    std::memset(data, 0, prefix_bytes);
+    std::span<char> out(data + prefix_bytes, bytes);
+    Header(out, kHashValueVersion, count, bytes, empty_values);
+    auto copy = [&](std::size_t at, std::string_view part) {
+      if (!part.empty()) std::memcpy(out.data() + at, part.data(), part.size());
+    };
+    // Copy untouched data as two spans. Value lengths may change without
+    // re-encoding each field or recalculating any surviving fingerprint.
+    copy(kHashValueHeaderBytes, payload_.substr(kHashValueHeaderBytes, begin));
+    if (replacement) {
+      copy(kHashValueHeaderBytes + begin, replacement->field_);
+      copy(kHashValueHeaderBytes + begin + replacement->field_.size(),
+           replacement->value_);
+    }
+    copy(kHashValueHeaderBytes + begin + added,
+         payload_.substr(kHashValueHeaderBytes + end, data_bytes_ - end));
+    const auto offsets = kHashValueHeaderBytes + data_bytes;
+    const auto lengths = offsets + (count + 1) * 4;
+    const auto tags = bytes - count;
+    // Offsets before the splice, including its start, are unchanged.
+    copy(offsets, payload_.substr(offsets_begin_, (slot + 1) * 4));
+    for (std::size_t i = slot + 1; i <= count; ++i) {
+      const auto old_end =
+          append ? data_bytes_
+                 : Load32(payload_, offsets_begin_ + (i + remove) * 4);
+      Put(out, offsets + i * 4, old_end - (end - begin) + added, 4);
+    }
+    const auto tail = size_ - slot - !append;
+    if (!empty_values) {
+      if (empty_values_) {
+        // The source omitted lengths. Its offsets already delimit fields.
+        for (std::size_t i = 0; i < count; ++i) {
+          const auto old_slot = i + (remove && i >= slot);
+          const auto length =
+              i == slot && replacement
+                  ? replacement->field_.size()
+                  : Load32(payload_, offsets_begin_ + (old_slot + 1) * 4) -
+                        Load32(payload_, offsets_begin_ + old_slot * 4);
+          Put(out, lengths + i * 4, length, 4);
+        }
+      } else {
+        copy(lengths, payload_.substr(lengths_begin_, slot * 4));
+        if (replacement)
+          Put(out, lengths + slot * 4, replacement->field_.size(), 4);
+        copy(lengths + (slot + !remove) * 4,
+             payload_.substr(lengths_begin_ + (slot + !append) * 4, tail * 4));
+      }
+    }
+    copy(tags, payload_.substr(tags_begin_, slot));
+    if (replacement)
+      out[tags + slot] =
+          append ? static_cast<char>(HashFieldFingerprint(replacement->field_))
+                 : payload_[tags_begin_ + slot];
+    copy(tags + slot + !remove,
+         payload_.substr(tags_begin_ + slot + !append, tail));
+    return prefix_bytes + bytes;
+  });
+  return output;
+}
+
 absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
     std::string_view payload, std::size_t expected_count,
     std::span<const std::string_view> fields,
@@ -505,6 +642,7 @@ absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
     std::string_view value;
     bool varied = false;
     std::size_t slot = SIZE_MAX;
+    std::size_t overwrite_at = SIZE_MAX;
   };
   // Single-field HSET keeps its entire plan inline. Batch plans index only
   // operands, never every field in the old value. First-seen order determines
@@ -557,6 +695,9 @@ absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
     if (*duplicate)
       return absl::DataLossError("duplicate requested Hash field");
     existing.push_back(i);
+    if (!erase && source.version() == kHashValueVersion &&
+        edit.value.size() == (**entry).value_.size())
+      edit.overwrite_at = (**entry).value_.data() - payload.data();
     result.changed_ |= erase || edit.varied || edit.value != (**entry).value_;
     if (erase) {
       ++result.removed_;
@@ -573,6 +714,33 @@ absl::StatusOr<std::optional<CompactHashEditPlan>> PlanCompactHashEdit(
     }
   }
   if (!result.changed_ || result.count_ == 0) return result;
+  if (!erase && std::all_of(edits.begin(), edits.end(), [](const Edit& edit) {
+        return edit.overwrite_at != SIZE_MAX;
+      })) {
+    if (payload.size() > max_bytes) return std::nullopt;
+    // Single and batched equal-size replacements share one private page copy.
+    // Deduplicated final values preserve transient-write semantics without
+    // sorting slots or rewriting offsets, field lengths or fingerprints.
+    std::string encoded(payload);
+    for (const auto& edit : edits)
+      if (!edit.value.empty())
+        std::memcpy(encoded.data() + edit.overwrite_at, edit.value.data(),
+                    edit.value.size());
+    result.payload_.AppendOwnedBytes(std::move(encoded));
+    return result;
+  }
+  if (edits.size() == 1 && source.version() == kHashValueVersion) {
+    const auto& edit = edits.front();
+    auto encoded = source.SpliceValidated(
+        edit.slot == SIZE_MAX ? source.size() : edit.slot,
+        erase ? std::nullopt
+              : std::optional<HashEntryView>{{edit.field, edit.value}},
+        max_bytes);
+    if (!encoded.ok()) return encoded.status();
+    if (!*encoded) return std::nullopt;
+    result.payload_.AppendOwnedBytes(std::move(**encoded));
+    return result;
+  }
   // Sort only the requested matches. Rebuilding follows physical ordinals;
   // no per-stored-field hash map or repeated field comparison is needed.
   std::sort(existing.begin(), existing.end(),

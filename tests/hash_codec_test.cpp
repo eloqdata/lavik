@@ -375,5 +375,182 @@ TEST(HashV2, CompactEditsAddAndRemoveTheOptionalFieldLengthArray) {
     }
   }
 }
+
+TEST(HashV2, SplicesMatchFullEncodingAcrossSlotsAndLengthArrayTransitions) {
+  for (std::size_t count : {1, 2, 17, 65}) {
+    for (unsigned layout = 0; layout < 3; ++layout) {
+      auto original = Value(count, layout != 0);
+      // The sole nonempty value exercises deleting or emptying the last one.
+      if (layout == 2) original.entries_[count / 2].value_ = "only-value";
+      auto encoded = EncodeHashValue(original);
+      ASSERT_TRUE(encoded.ok());
+      const std::string backing = "!" + *encoded;
+      const std::string_view source(backing.data() + 1, encoded->size());
+      auto reader = HashValueReader::Open(source);
+      ASSERT_TRUE(reader.ok());
+      ASSERT_TRUE(reader->ValidateFingerprints().ok());
+      for (std::size_t slot = 0; slot <= count; ++slot) {
+        const bool append = slot == count;
+        const auto field = append ? std::string("new\0field", 9)
+                                  : original.entries_[slot].field_;
+        const auto old_size =
+            append ? 0 : original.entries_[slot].value_.size();
+        for (int operation = 0; operation < 5; ++operation) {
+          if (append && operation == 0) continue;
+          const std::string replacement =
+              operation == 1   ? ""
+              : operation == 2 ? std::string(old_size, 'z')
+              : operation == 3 ? std::string("v\0", 2)
+                               : std::string(256, 'w');
+          auto expected = original;
+          if (operation == 0)
+            expected.entries_.erase(expected.entries_.begin() + slot);
+          else if (append)
+            expected.entries_.push_back(
+                {.field_ = field, .value_ = replacement});
+          else
+            expected.entries_[slot].value_ = replacement;
+          const auto reference =
+              expected.entries_.empty()
+                  ? absl::StatusOr<std::string>(std::string{})
+                  : EncodeHashValue(expected);
+          ASSERT_TRUE(reference.ok());
+          for (std::size_t prefix : {std::size_t{0}, kHashGroupHeaderBytes}) {
+            SCOPED_TRACE(testing::Message()
+                         << count << ':' << layout << ':' << slot << ':'
+                         << operation << ':' << prefix);
+            const auto edit =
+                operation == 0
+                    ? std::nullopt
+                    : std::optional<HashEntryView>{{field, replacement}};
+            auto result =
+                reader->SpliceValidated(slot, edit, reference->size(), prefix);
+            ASSERT_TRUE(result.ok()) << result.status();
+            ASSERT_TRUE(*result);
+            EXPECT_EQ(**result, std::string(prefix, '\0') + *reference);
+            EXPECT_EQ(source, *encoded);  // Never mutate a published source.
+            if (!reference->empty()) {
+              auto bounded = reader->SpliceValidated(
+                  slot, edit, reference->size() - 1, prefix);
+              ASSERT_TRUE(bounded.ok());
+              EXPECT_FALSE(*bounded);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(HashV2, EqualSizeSpliceCanBorrowSourceAndKeepsEveryOtherByte) {
+  auto original = Value(33, false);
+  for (auto& entry : original.entries_) entry.value_ = std::string(256, 'v');
+  original.entries_.back().value_ = std::string(256, 'x');
+  auto bytes = EncodeHashValue(original);
+  ASSERT_TRUE(bytes.ok());
+  auto reader = HashValueReader::Open(*bytes);
+  ASSERT_TRUE(reader.ok());
+  ASSERT_TRUE(reader->ValidateFingerprints().ok());
+  auto source = reader->At(32);
+  auto target = reader->At(1);
+  ASSERT_TRUE(source.ok());
+  ASSERT_TRUE(target.ok());
+  auto expected = *bytes;
+  expected.replace(target->value_.data() - bytes->data(), target->value_.size(),
+                   source->value_);
+  auto result = reader->SpliceValidated(
+      1, HashEntryView{target->field_, source->value_}, bytes->size());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(*result);
+  EXPECT_EQ(**result, expected);
+  const std::array<std::string_view, 1> fields{target->field_},
+      values{source->value_};
+  auto compact = EditCompactHash(*bytes, 33, fields, values, bytes->size());
+  ASSERT_TRUE(compact.ok());
+  ASSERT_TRUE(*compact);
+  EXPECT_EQ((**compact).payload_, expected);
+}
+
+TEST(HashV2, SpliceRejectsInvalidOperandsAndDefersV1Migration) {
+  const auto original = Value(2, false);
+  for (auto version : {kLegacyHashValueVersion, kHashValueVersion}) {
+    auto bytes = EncodeHashValue(original, version);
+    ASSERT_TRUE(bytes.ok());
+    auto reader = HashValueReader::Open(*bytes);
+    ASSERT_TRUE(reader.ok());
+    if (version == kLegacyHashValueVersion) {
+      auto result = reader->SpliceValidated(0, HashEntryView{"", "new"}, 16383);
+      ASSERT_TRUE(result.ok());
+      EXPECT_FALSE(*result);
+    } else {
+      EXPECT_FALSE(
+          reader->SpliceValidated(3, HashEntryView{"new", "v"}, 16383).ok());
+      EXPECT_FALSE(reader->SpliceValidated(2, std::nullopt, 16383).ok());
+      EXPECT_FALSE(
+          reader->SpliceValidated(0, HashEntryView{"renamed", "v"}, 16383)
+              .ok());
+    }
+  }
+}
+
+TEST(HashV2, BatchedEqualSizeUpdatesPreserveMetadataAndSequentialSemantics) {
+  auto original = Value(33, false);
+  for (auto& entry : original.entries_) entry.value_ = std::string(256, 'v');
+  auto bytes = EncodeHashValue(original);
+  ASSERT_TRUE(bytes.ok());
+  const std::string temporary(7, 't');
+  const std::string changed(256, 'x');
+  const std::array<std::string_view, 5> fields{"field-32", "", "field-32",
+                                               original.entries_[1].field_, ""};
+  const std::array<std::string_view, 5> values{
+      temporary, temporary, original.entries_[32].value_, changed,
+      original.entries_[0].value_};
+  auto expected = original;
+  expected.entries_[1].value_ = changed;
+  auto reference = EncodeHashValue(expected);
+  ASSERT_TRUE(reference.ok());
+  auto result = EditCompactHash(*bytes, 33, fields, values, bytes->size());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(*result);
+  EXPECT_TRUE((**result).changed_);
+  EXPECT_EQ((**result).added_, 0);
+  EXPECT_EQ((**result).payload_, *reference);
+  // A -> B -> A still publishes a write even when all final bytes match.
+  const std::array<std::string_view, 2> repeated{"", ""};
+  const std::array<std::string_view, 2> restored{temporary,
+                                                 original.entries_[0].value_};
+  result = EditCompactHash(*bytes, 33, repeated, restored, bytes->size());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(*result);
+  EXPECT_TRUE((**result).changed_);
+  EXPECT_EQ((**result).payload_, *bytes);
+}
+
+TEST(HashV2, FastPointEditsStillRejectUnrelatedCorruptionAndInvalidRoutes) {
+  auto original = Value(33, false);
+  for (auto& entry : original.entries_) entry.value_ = "old";
+  auto bytes = EncodeHashValue(original);
+  ASSERT_TRUE(bytes.ok());
+  for (std::string_view value : {"old", "new", "longer", ""}) {
+    // Both no-ops and same-size updates must check the unrelated tail tag.
+    auto broken = *bytes;
+    broken.back() ^= 1;
+    const std::array<std::string_view, 1> fields{""}, values{value};
+    EXPECT_FALSE(EditCompactHash(broken, 33, fields, values, 16383).ok());
+    auto grouped = EncodeHashGroup({.incarnation_ = 17, .value_ = original});
+    ASSERT_TRUE(grouped.ok());
+    const std::array<HashEntryView, 1> edit{{{"", value}}};
+    auto corrupt = *grouped;
+    corrupt.back() ^= 1;
+    EXPECT_FALSE(ApplyHashGroupEdits(corrupt, DigestSeed{},
+                                     HashGroupEditKind::kSet, edit)
+                     .ok());
+    corrupt = *grouped;
+    corrupt[40] = 64;
+    EXPECT_FALSE(ApplyHashGroupEdits(corrupt, DigestSeed{},
+                                     HashGroupEditKind::kSet, edit)
+                     .ok());
+  }
+}
 }  // namespace
 }  // namespace lavik::storage

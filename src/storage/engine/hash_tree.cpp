@@ -556,7 +556,7 @@ absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
 }
 
 namespace {
-[[gnu::noinline, gnu::cold]] absl::Status FindLegacyHashFields(
+[[gnu::noinline, gnu::cold]] absl::Status FindV1HashFields(
     HashValueReader reader, std::span<HashFieldLookup> requests) {
   // Count request positions, including repeated operands, so a complete reply
   // does not require parsing the unused tail of the stored Hash.
@@ -607,7 +607,7 @@ absl::Status FindCompactHashFields(std::string_view payload,
     }
     return absl::OkStatus();
   }
-  return FindLegacyHashFields(*reader, requests);
+  return FindV1HashFields(*reader, requests);
 }
 
 absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
