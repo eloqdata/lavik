@@ -57,54 +57,28 @@ CPU instruction-set and glibc requirements remain separate constraints.
 `--registered-buffer-mb-per-worker` sets each data worker's storage-buffer pool
 budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
 8 MiB write buffers by default and requires at least two; the remaining budget
-supplies read slots. Shutdown checkpoints borrow two drained write slots for
-their encoding/write pipeline without allocating additional DMA buffers.
+supplies read slots. Shutdown checkpoints reuse two drained write slots.
 `--storage-read-buffer-kb` is the total slot size, including framing space.
 The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
 4 KiB of tailroom. Values must be multiples of 4 KiB and greater than 8 KiB.
 These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
-Each data worker also reserves three independent 8 MiB maintenance read
-buffers for defrag, transaction cleaning, and Tomb Raider. This adds 24 MiB
-outside `--registered-buffer-mb-per-worker` (88 MiB of fixed buffer capacity
-per worker with defaults). They are counted in retained memory, remain
-allocated until teardown, and participate in io_uring registration after
-ordinary read/write slots. Failure to allocate any one names the worker and
-task and fails startup.
-Worker zero's maintenance buffers are allocated before synchronous metadata
-loading, which borrows one read image for pages and system-state/catalog
-extents. Worker initialization reuses those allocations and retained charges.
-Startup recovery reuses these buffers for block scans, nested extent reads,
-and two-slot checkpoint prefetch. It drains outstanding reads before switching
-phases or starting maintenance, so these paths add no DMA capacity or write-slot
-requirement. Recovery and maintenance use fixed io_uring reads when their
-workspace is registered, otherwise ordinary I/O.
-
-Redis export also reserves one independent 8 MiB buffer per process at startup
-for capture writes and subsequent disk replay. It stays charged to shared
-retained memory between sessions and uses unregistered I/O on io_uring.
-Allocation failure identifies Redis export and fails startup. With defaults,
-total fixed storage-buffer capacity is
-`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. Each device's 8 KiB
-write workspace handles recycled-block header clearing and online metadata
-writes under its allocator's coroutine mutex. It is charged to that device's
-owner worker and has the highest io_uring registration priority on that
-worker. Allocation failure names the device and prevents startup; it never
-borrows ordinary read/write slots. An unregistered workspace still uses ordinary
-I/O when memlock is insufficient.
-Synchronous startup label and reset writes use the same device workspace,
-with larger ranges split into chunks that fit it.
+Additional fixed allocations are 24 MiB per data worker for the three
+maintenance readers, 8 MiB per process for Redis export, and 8 KiB per device
+for metadata writes. With defaults, total fixed storage-buffer capacity is
+`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. All count toward
+retained memory, and allocation failure prevents startup. Startup metadata I/O,
+recovery, and shutdown checkpoints reuse these allocations. See
+[storage ownership](../architecture/04-storage-and-recovery.md) for their lifetimes
+and [SPDK sizing](spdk-storage.md) for hugepage headroom.
 
 On io_uring, read and write slots share allocations made once at startup, with
 read slots placed first. Large pools span multiple registered regions, split
 at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
 Registration covers these existing allocations; a retry does not move slots
-or allocate a second pool. The default ordinary pool uses one region shared by
-1024 read slots and four write slots. Each owned device workspace precedes that region, and the three
-maintenance images follow it as separate entries; no sentinel entry is reserved.
-Index zero is valid, and an ordinary slot's lease identity does not change when
-its registration index shifts past the device entries.
+or allocate a second pool. The default ordinary pool shares one region across
+1024 read slots and four write slots.
 
 The pool first attempts to register all fixed workspaces. If io_uring rejects
 it, Lavik uses the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in
@@ -118,11 +92,10 @@ KiB) divided across runtime workers as a starting budget, with this priority:
 Each class is admitted in complete buffers before considering the next class.
 Failed retries reduce this registration budget; it is only an estimate because
 other locked resources can consume the allowance. Startup logs report counts
-for all four classes or complete fallback. Redis export's process-wide 8 MiB
-workspace and temporary overflow buffers are not registered. With defaults,
-registration requests `88 MiB + 8 KiB × owned devices` per data worker, subject
-to ordinary slot rounding. Registration does not allocate another copy or add
-a second retained-memory charge.
+for all four classes or complete fallback. Export and temporary overflow
+buffers are not registered. With defaults, registration requests
+`88 MiB + 8 KiB × owned devices` per data worker, subject to ordinary slot
+rounding. Registration does not allocate another copy or add a second charge.
 
 The allocated pool capacity never shrinks. Slots outside the registered subset
 use ordinary asynchronous direct I/O; slot selection automatically chooses

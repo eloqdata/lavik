@@ -1378,15 +1378,10 @@ runtime changes use the same worker update and publisher wakeup path. Disk
 quota or device exhaustion always cancels this export and releases its pins.
 The disk quota defaults to 1 GiB, floors to whole 8 MiB blocks, and is sampled
 at session start; CONFIG SET affects subsequent sessions. Storage reserves one
-process-wide 8 MiB export workspace at startup and charges it to shared retained
-memory for the engine's lifetime; allocation failure stops startup. The sole
-session's connection owner holds exclusive use through disk capture and replay.
-Capture writes finish before replay reads reuse the same workspace. These
-data-block writes and replay reads neither borrow ordinary read/write slots nor
-allocate overflow DMA buffers. Block allocation and return persist their
-bitmap metadata through the device's dedicated metadata write workspace.
-Cleanup joins disk I/O before returning the workspace for a subsequent owner.
-Stream group deltas are translated to Redis
+process-wide 8 MiB export workspace at startup, charged for the engine's lifetime.
+The sole session owns it exclusively through capture and replay, draining I/O
+before reuse or release to the next session. The disk quota does not change
+this capacity. Stream group deltas are translated to Redis
 XGROUP/XCLAIM/XACK commands; private native payloads are never a Redis wire
 format. RedisShake does not make imported transactions atomically visible to
 other clients, so the target remains isolated until cutover.

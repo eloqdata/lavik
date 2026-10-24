@@ -396,14 +396,11 @@ worker-local boots. Request readiness follows successful completion of the
 complete recovery and allocator-cleanup sequence; the exact moment a listening
 socket exists is not the readiness boundary.
 
-Worker recovery reuses the three fixed maintenance read workspaces before
-maintenance starts. Checkpoint discovery and body loading alternate two
-workspaces; ordinary block scans reuse one, while nested key/group extent
-validation uses the third. Delegated SPDK reads carry the initiating task's
-workspace and join before reuse, so another worker's concurrent recovery cannot
-overwrite it. Each checkpoint phase drains outstanding prefetch, including
-abandoned reads after validation failure, before the next phase or cold-scan
-fallback can reuse those images. Recovery barriers precede maintenance reuse.
+Startup metadata I/O borrows the prepared maintenance read and device write
+workspaces; temporary SPDK metadata qpairs close before worker queues open.
+Recovery then borrows the maintenance images, including for delegated reads,
+and drains outstanding I/O before reuse or maintenance startup. Checkpoint
+prefetch and fallback follow the [checkpoint lifecycle](06-shutdown-index-checkpoints.md).
 
 After worker recovery, the Function catalog decodes the selected dump and
 stages it independently on every worker before Redis readiness. A missing root
@@ -631,51 +628,22 @@ have been collected, every worker's remaining footprint must fit its normal
 90-percent share before the server permits startup import and serving. A
 failed transition stops startup. Recovery does not change the disk scan count.
 
-Storage buffer capacity also participates in retained accounting: fixed read
-and write pools and dedicated maintenance scan buffers are charged at
-initialization. Redis export owns one process-wide 8 MiB workspace, allocated
-and charged at startup, reused for capture writes and subsequent disk replay,
-and retained between sessions. Startup preparation allocates worker zero's
-maintenance buffers before reading device metadata. Synchronous reads borrow
-one of those images for metadata pages and whole system-state/catalog extents;
-decoded state and the assembled catalog own ordinary heap memory. Preparation
-finishes all synchronous I/O before worker initialization reuses the same
-buffers without another allocation or charge. Worker recovery then borrows
-the maintenance buffers before their normal scanners start.
-Each device allocator owns one 8 KiB metadata write buffer, charged to its
-owner worker at startup and retained until engine teardown after I/O drains.
-Allocation failure identifies the device and prevents startup. Preparation
-uses that same workspace for label, metadata initialization, and reset writes,
-splitting larger ranges into buffer-sized chunks. The device's
-coroutine mutex serializes workspace use for recycled-block header clearing,
-bitmap and epoch pages, and checkpoint/system-state roots. These writes do not
-borrow read slots or ordinary write slots and allocate no fallback buffers.
-The owning worker registers this workspace ahead of ordinary pools on
-io_uring, falling back to ordinary I/O if registration fails. Registration
-borrows the existing allocation without changing ownership or retained charges.
-SPDK uses DMA memory.
-Synchronous SPDK startup helpers submit these caller-owned DMA buffers directly
-without allocating bounce storage. Temporary metadata queue pairs are released
-before worker queue creation.
-Oversized reads and reads that find the fixed pool exhausted allocate aligned
-or SPDK DMA overflow storage only while leased;
-returning a lease frees that storage and removes its charge on the owner worker.
-If temporary allocation fails, ordinary reads wait for a
-fixed slot in FIFO order. Oversized record and extent reads whose allocation
-fails fall back to slot-sized reads when fixed read slots exist, retaining the
-block pin through pool waiting and all chunks. Records assemble a private image
-in ordinary heap memory and retain their identity, population, checksum, and
-relocation-retry checks. Extent paths validate the same header and, when enabled,
-the complete payload checksum before exposing the requested slice; fallback
-stages that slice in ordinary heap memory. Whole-value assembly uses ordinary
-heap memory, including on SPDK: page and extent reads copy into an output that
-neither consumes a fixed slot nor needs DMA addressability. Outputs retain reply
-framing space and follow the same owner-bound lease accounting and release
-lifecycle. These allocations are accounted without
-a separate admission gate so reads and reclamation can still progress at the
-memory waterline; subsequent retained growth observes their charges. Pool
-charges cover allocated slot capacity, not allocator overhead or SPDK's
-entire hugepage reservation.
+Retained memory includes fixed read/write pools and maintenance, device-metadata,
+and export workspaces. These are allocated at startup and retained until their
+owners tear down after I/O drains; allocation failure prevents startup.
+Registration and reuse across startup, recovery, and serving do not allocate
+or charge a second copy. Each device allocator owns an 8 KiB write workspace
+for metadata and recycled-block headers, serialized by its coroutine mutex.
+[Redis export](05-replication.md#redis-psync-export) owns a separate process-wide
+workspace.
+
+Live overflow read buffers and ordinary-heap assembly outputs are also charged;
+returning a lease frees its allocation when the owner processes the return.
+I/O allocations have no separate retained-admission gate, allowing reads and
+reclamation to progress at the waterline; their charges constrain later growth.
+Accounting covers owned capacity, excluding allocator overhead and SPDK's full
+hugepage reservation. See the [memory metrics](../operations/metrics.md#memory-metrics)
+for the reported counters.
 
 Accounting ownership remains bound to the allocation's origin,
 so destruction credits the same worker even when it occurs elsewhere. INFO and
@@ -743,9 +711,8 @@ Record and extent writes use only the fixed write pool. Staging-buffer
 pressure seals physical append streams before a writer waits for capacity.
 Foreground and relocation writers release worker store state
 and join the same owner-local FIFO; a returned fixed slot transfers directly
-to its oldest waiter, so new borrowers cannot overtake it. While writers
-remain queued, record-write exits seal newly installed streams, including
-empty streams left by failed revalidation. Live transaction leases and tagged
+to its oldest waiter, so new borrowers cannot overtake it. Queued writers
+keep new append streams flushable. Live transaction leases and tagged
 records survive a pressure seal; later writes or commit decisions may open
 another transaction block. Flush completion returns sealed buffers after
 their last reader pin drains, including tails that were already durable.
@@ -756,19 +723,19 @@ acquisitions without recycling its still-referenced staging memory.
 Relocation bypasses the foreground physical-allocation gate and retains access
 to the defrag disk reserve: a foreground allocator may itself be waiting for
 reclamation. After write-slot waiting, relocation revalidates its source before
-publication. Each worker owns three independent 8 MiB scan buffers, one each
-for defrag, transaction cleaning, and Tomb Raider. Their schedulers permit at
-most one scanner of each kind per worker, so scans can retain their own image
-across I/O, relocation, and cross-worker waits without a buffer queue. They
-never borrow write slots or allocate fallback scan buffers. All three buffers
-are allocated at initialization, outside the ordinary pool budget; failure
-names the worker and task and prevents startup. They remain owned until
-worker teardown after I/O drains. io_uring registers these images after
-ordinary read/write slots, using fixed I/O only for images in the registered
-subset. Recovery shares that registration state, including checkpoint prefetch.
-SPDK allocates DMA-addressable memory for them.
+publication. Each worker owns three independent 8 MiB read buffers, one each
+for defrag, transaction cleaning, and Tomb Raider. At most one scanner of each
+kind runs per worker, so it can retain its image across I/O and relocation waits
+without borrowing write slots or allocating fallback scan buffers.
 
 ### Reads and pins
+
+With fixed read slots configured, reads try temporary overflow on exhaustion
+and wait FIFO if allocation fails. Oversized records and extents fall back to
+slot-sized chunks on allocation failure. Block pins survive waiting and all
+chunks, and the same identity, population, checksum, and relocation checks
+apply before exposing data. Assembly outputs use ordinary heap memory, including
+on SPDK, so retaining an output cannot exhaust the DMA slots needed to read it.
 
 Standalone single-key reads explicitly admitted by the command table can
 read directly on their connection worker after ordinary request, database and

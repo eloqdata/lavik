@@ -109,33 +109,17 @@ before starting other large services and inspect the helper's error output.
 Never run `setup.sh config` with an empty allowlist: its default device scope
 is broader than this guide's selected controllers.
 
-Size the host's hugepage reservation for all simultaneous SPDK processes,
-including each worker's storage-buffer budget plus three dedicated 8 MiB DMA
-scan buffers for defrag, transaction cleaning, and Tomb Raider, plus one
-independent 8 MiB Redis export buffer per process and an 8 KiB metadata write
-buffer per device. With defaults, fixed storage-buffer capacity is
-`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`; also allow for
-optional read overflow and SPDK/DPDK overhead.
-Synchronous startup metadata reads reuse worker zero's maintenance read image,
-allocated before metadata loading. Startup label, initialization, and reset
-writes reuse each device's fixed write workspace in bounded chunks. These
-paths add no DMA capacity and bypass the allocating SPDK convenience helpers.
-Online bitmap/epoch/root writes and recycled-block header clearing share the
-device's fixed write workspace without borrowing ordinary read/write slots.
-Export capture and disk replay reuse its one buffer without extra DMA allocation.
-Worker recovery scans, nested extent reads, and checkpoint prefetch reuse the
-three maintenance read buffers, with no additional DMA reservation for those
-paths. Outstanding prefetch drains before fallback or maintenance reuse.
-Shutdown checkpoint writes reuse two drained ordinary write slots, adding no
-DMA capacity. Maintenance scan allocation failure names the worker and task;
-export buffer allocation failure names Redis export; metadata write buffer
-allocation failure names the device. Any of these fails startup
-without borrowing write slots. Check free hugepages after startup; a
-per-worker buffer setting is not a process-wide cap. On NUMA hosts, keep the
-selected NVMe controllers, hugepages and worker CPUs on the same node where
-possible. Keep network IRQ
-cores separate from workers when following the
-[IRQ affinity guide](irq-affinity-tuning.md).
+Size hugepages for all simultaneous SPDK processes. Start with each process's
+[fixed storage-buffer capacity](building-and-packaging.md#io_uring-storage-buffers-and-memlock),
+then allow for optional read overflow and SPDK/DPDK internal allocations.
+Startup metadata, recovery, and shutdown checkpoints reuse fixed workspaces;
+failure to allocate any required workspace prevents startup. A per-worker
+buffer setting is not a process-wide DMA cap. Check free hugepages after
+startup and use the EAL diagnostics below when sizing headroom.
+
+On NUMA hosts, keep selected NVMe controllers, hugepages and worker CPUs on the
+same node where possible. Keep network IRQ cores separate from workers when
+following the [IRQ affinity guide](irq-affinity-tuning.md).
 
 The benchmark VM did not expose an IOMMU and temporarily used VFIO's unsafe
 no-IOMMU mode. This removes DMA isolation and is specific to that dedicated
@@ -205,14 +189,11 @@ one `numa=all` aggregate, with byte-valued fields:
 | `heap_free_bytes` | Unallocated space within that heap |
 | `largest_free_block_bytes` | Largest individual free heap block; the aggregate takes the maximum across nodes, not their sum |
 
-These are allocator statistics, not RSS, the host's hugepage reservation, or a
-runtime peak. They also apply to an EAL configured with `--no-huge`. Storage
-buffers are already charged to retained memory, so do not add the EAL totals to
-retained memory or treat all allocated bytes as additional internal overhead.
-The NUMA samples are sequential; the largest free block does not guarantee a
-future allocation's alignment, DMA-contiguity, or NUMA requirements. A failed
-statistics query emits a warning and omits the aggregate without failing
-startup. io_uring storage does not emit this snapshot or initialize EAL for it.
+This allocator snapshot is not RSS, a host hugepage reservation, or a runtime
+peak. It includes already-accounted storage buffers: do not add it to retained
+memory or interpret all allocated bytes as internal overhead. Free capacity and
+largest-block size do not guarantee future DMA allocations. A query failure
+warns and suppresses the aggregate without preventing startup.
 
 Separate instances must use disjoint namespaces and distinct listener ports.
 For storage-set expansion, worker/controller affinity and queue-capacity

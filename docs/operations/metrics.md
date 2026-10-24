@@ -217,16 +217,12 @@ sum by (result) (rate(lavik_storage_defrag_runs_total[5m]))
   limit enforcement.
 - `lavik_memory_used_bytes`: explicitly retained bytes. This is not total
   process heap usage; compare RSS and mimalloc diagnostics for that view.
-  Includes primary-index object arrays and page directories, fixed storage
-  read/write buffers, the three dedicated maintenance scan buffers per worker,
-  the process-wide Redis export workspace, one 8 KiB metadata write buffer per
-  device charged to its owner worker, and live overflow read buffers,
-  in addition to retained entries, tables, and other tracked owners.
-  Storage pools charge slot capacity on both io_uring and SPDK; allocator
-  overhead and SPDK's full hugepage reservation are not included.
-  Worker recovery reuses maintenance buffers without an additional charge.
-  Synchronous startup metadata I/O also reuses the prepared maintenance read
-  and device write workspaces; worker initialization does not charge them again.
+  Includes primary-index objects and directories, fixed read/write,
+  maintenance, device-metadata and export workspaces, live overflow and heap
+  read outputs, and retained entries, tables, and other tracked owners.
+  Charges cover owned capacity on both io_uring and SPDK, excluding allocator
+  overhead and SPDK's full hugepage reservation. Workspace reuse and registration
+  do not add another charge.
 - `lavik_memory_rss_bytes`: resident process memory, refreshed when metrics
   or `INFO memory` is requested.
 - `lavik_memory_committed_bytes`: pages committed by mimalloc; diagnostic

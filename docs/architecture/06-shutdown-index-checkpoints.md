@@ -149,18 +149,12 @@ generation, bitmap, publication lifecycle, and payload CRC; an explicit
 chunk-kind field selects their entry layout.
 
 Each shard builder borrows two 8 MiB slots from its worker's ordinary write
-pool after the final shutdown drain, without allocating additional DMA
-buffers. Configuration requires at least two write slots even when checkpoint
-creation starts disabled, because it can be enabled at runtime. A missing
-slot after the drain fails the optional checkpoint rather than waiting for a
-writer that should no longer exist. Once one buffer has been encoded and
-submitted, the worker builds the next chunk in the other while the first
-write remains in flight; it waits only before reusing a slot.
-Both writes must complete before that shard enters the publication barrier.
-Abandoning a shard after a serialization or I/O error leaves any submitted
-slot owned by its completion until I/O finishes, so returning it to the pool
-cannot race asynchronous device access. io_uring uses fixed I/O for registered
-slots and ordinary I/O otherwise; SPDK reuses the pool's DMA memory.
+pool after the final shutdown drain, adding no DMA capacity. Configuration
+requires at least two slots because checkpoint creation can be enabled at
+runtime. Missing slots fail the optional checkpoint. The builder encodes the
+next chunk while the previous write is in flight and waits before reusing a
+slot. Both writes complete before the publication barrier; on failure, each
+submitted slot stays owned by its completion until I/O finishes.
 
 Publication order is:
 
@@ -249,13 +243,9 @@ final winner per logical key, successful loading inserts those entries without
 the multi-version arbitration used by the ordinary record scan. If a later
 entry is invalid, the already installed valid prefix is marked as a checkpoint
 winner and participates in the same authoritative cold-scan merge as prefixes
-from earlier blocks. Each owner borrows two of its fixed 8 MiB maintenance read
-buffers instead of allocating checkpoint DMA storage. io_uring prefetch uses
-the owner ring's registered image when available and ordinary reads otherwise;
-delegated SPDK reads do not reuse another worker's ring indices. An abandoned
-prefetch retains access until its I/O completion; startup drains these completions before
-another checkpoint phase or ordinary recovery can reuse the buffers. The loan
-also follows delegated SPDK reads and ends before maintenance starts.
+from earlier blocks. Each owner borrows two fixed maintenance read buffers.
+Startup drains all prefetch I/O, including abandoned and delegated reads, before
+another checkpoint phase, cold scan, or maintenance can reuse those images.
 Complex-object encoding also uses a bounded stream buffer; encoding and decoding reserve
 scratch for one complete key and its directory metadata at a time. Temporary
 object memory therefore depends on the largest key/directory, not collection
