@@ -717,11 +717,21 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                         std::string_view new_field) {
     ASSERT_EQ(old_field.size(), new_field.size());
     auto& payload = grouped_payloads_[page];
-    const auto offset = payload.find(old_field);
-    ASSERT_NE(offset, std::string::npos);
+    auto reader = HashValueReader::Open(
+        std::string_view(payload).substr(kHashGroupHeaderBytes));
+    ASSERT_TRUE(reader.ok()) << reader.status();
+    std::size_t slot;
+    auto entry = reader->Find(old_field, false, &slot);
+    ASSERT_TRUE(entry.ok()) << entry.status();
+    ASSERT_TRUE(*entry);
+    const auto offset = (**entry).field_.data() - payload.data();
     payload.replace(offset, old_field.size(), new_field);
-    // Repair CRC to distinguish trusted terminal reads from strict logical
-    // validation. Fixed field widths preserve the encoded framing.
+    if (reader->version() == kHashValueVersion)
+      payload[payload.size() - reader->size() + slot] =
+          static_cast<char>(HashFieldFingerprint(new_field));
+    // Preserve framing and filter consistency, then repair CRC. Only the
+    // requested route/uniqueness invariant is broken, so strict materialization
+    // must reach that check while terminal enumeration returns stored fields.
     ASSERT_NO_FATAL_FAILURE(StageGroupedPage(page));
   }
   void ExpectStoredHashFields(std::string_view strict_error, bool packed) {

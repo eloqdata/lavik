@@ -1762,6 +1762,7 @@ if (BUILD_TESTING)
     tests/device_affinity_test.cpp
     tests/foreign_executor_test.cpp
     tests/grouped/hash_test.cpp
+    tests/hash_codec_test.cpp
     tests/packed_list_read_test.cpp
     tests/grouped/commit_decision_test.cpp
     tests/grouped/collection_test.cpp

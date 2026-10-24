@@ -72,6 +72,100 @@ TEST(CompactHashWriteE2e, ColdUpdateKeepsCompactEncodingAndRecovers) {
   ASSERT_EQ(server.Wait(true), 0) << server.Log();
 }
 
+TEST(HashPointWriteE2e, IndexedIncrementsAndDeletesPreserveCommandSemantics) {
+  PrivateDisk disk;
+  const std::string binary("float\0field", 11);
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    for (const auto* key : {"compact", "grouped"}) {
+      std::vector<std::string> seed{
+          "HSET", key,   "",       "7",        binary,
+          "1.5",  "bad", "broken", "overflow", "9223372036854775807"};
+      for (unsigned i = 0; i < 64; ++i) {
+        seed.push_back("field" + std::to_string(i));
+        seed.push_back(std::to_string(i));
+      }
+      if (std::string_view(key) == "grouped") {
+        seed.push_back("large");
+        seed.emplace_back(20000, 'x');
+      }
+      ASSERT_EQ(client.Command(seed).text_,
+                std::string_view(key) == "grouped" ? "69" : "68");
+      EXPECT_EQ(client.Command({"PEXPIRE", key, "600000"}).text_, "1");
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    Client watched(server.port());
+    for (const auto* key : {"compact", "grouped"}) {
+      SCOPED_TRACE(key);
+      EXPECT_EQ(client.Command({"HINCRBY", key, "", "5"}).text_, "12");
+      EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, binary, "0.25"}).text_,
+                "1.75");
+      EXPECT_EQ(client.Command({"HINCRBY", key, "new-int", "10"}).text_, "10");
+      EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, "new-float", "0.5"}).text_,
+                "0.5");
+      EXPECT_EQ(client
+                    .Command({"HDEL", key, "field0", binary, "field0", binary,
+                              "missing", "field63"})
+                    .text_,
+                "3");
+      EXPECT_EQ(client.Command({"HGET", key, "field1"}).text_, "1");
+      EXPECT_EQ(client.Command({"HEXISTS", key, binary}).text_, "0");
+      EXPECT_EQ(watched.Command({"WATCH", key}).text_, "OK");
+      EXPECT_EQ(client.Command({"HINCRBY", key, "bad", "1"}).kind_, '-');
+      EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, "bad", "1"}).kind_, '-');
+      EXPECT_EQ(client.Command({"HINCRBY", key, "overflow", "1"}).kind_, '-');
+      EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, "new-float", "nan"}).kind_,
+                '-');
+      EXPECT_EQ(client.Command({"HDEL", key, "absent", "absent"}).text_, "0");
+      EXPECT_EQ(watched.Command({"MULTI"}).text_, "OK");
+      EXPECT_EQ(watched.Command({"HGET", key, "bad"}).text_, "QUEUED");
+      auto unchanged = watched.Command({"EXEC"});
+      ASSERT_EQ(unchanged.items_.size(), 1);
+      EXPECT_EQ(unchanged.items_[0].text_, "broken");
+      EXPECT_EQ(client.Command({"HGET", key, "overflow"}).text_,
+                "9223372036854775807");
+      EXPECT_EQ(watched.Command({"WATCH", key}).text_, "OK");
+      // Even a zero increment is a write; deletion of a missing field above
+      // and numeric errors must leave WATCH intact.
+      EXPECT_EQ(client.Command({"HINCRBY", key, "", "0"}).text_, "12");
+      EXPECT_EQ(watched.Command({"MULTI"}).text_, "OK");
+      EXPECT_EQ(watched.Command({"HLEN", key}).text_, "QUEUED");
+      EXPECT_EQ(watched.Command({"EXEC"}).text_, "-1");
+      EXPECT_EQ(client.Command({"MULTI"}).text_, "OK");
+      EXPECT_EQ(client.Command({"HINCRBY", key, "", "3"}).text_, "QUEUED");
+      EXPECT_EQ(client.Command({"HDEL", key, "field62", "field62"}).text_,
+                "QUEUED");
+      auto executed = client.Command({"EXEC"});
+      ASSERT_EQ(executed.items_.size(), 2);
+      EXPECT_EQ(executed.items_[0].text_, "15");
+      EXPECT_EQ(executed.items_[1].text_, "1");
+      EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (const auto* key : {"compact", "grouped"}) {
+    SCOPED_TRACE(key);
+    EXPECT_EQ(client.Command({"HGET", key, ""}).text_, "15");
+    EXPECT_EQ(client.Command({"HGET", key, "new-int"}).text_, "10");
+    EXPECT_EQ(client.Command({"HGET", key, "new-float"}).text_, "0.5");
+    EXPECT_EQ(client.Command({"HEXISTS", key, binary}).text_, "0");
+    EXPECT_EQ(client.Command({"HEXISTS", key, "field62"}).text_, "0");
+    EXPECT_EQ(client.Command({"HLEN", key}).text_,
+              std::string_view(key) == "grouped" ? "67" : "66");
+    EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
+  }
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 TEST(GroupedHashWriteE2e, ConcurrentLocalAndExecWritesRecover) {
   PrivateDisk disk;
   disk.PreserveOnFailure();
@@ -189,13 +283,16 @@ TEST(GroupedHashWriteE2e,
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   ASSERT_EQ(disk.LatestRootGrouped("demote-hash"), true);
-  // One Hash page is 48-byte group envelope, 32-byte compact header,
-  // 8-byte entry framing, one field byte and the value bytes.
+  // One v2 Hash page has a group envelope, compact header, two offsets,
+  // one field length, one fingerprint, one field byte and the value bytes.
+  constexpr std::size_t boundary = kCollectionGroupTargetBytes -
+                                   kHashGroupHeaderBytes -
+                                   kHashValueHeaderBytes - 14;
   {
     Server server(disk);
     Client client(server.port());
     ASSERT_EQ(
-        client.Command({"HSET", "demote-hash", "f", std::string(8103, 'b')})
+        client.Command({"HSET", "demote-hash", "f", std::string(boundary, 'b')})
             .text_,
         "0");
     client.Durable();
@@ -206,15 +303,16 @@ TEST(GroupedHashWriteE2e,
     Server server(disk);
     Client client(server.port());
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
-    ASSERT_EQ(
-        client.Command({"HSET", "demote-hash", "f", std::string(8102, 'c')})
-            .text_,
-        "QUEUED");
+    ASSERT_EQ(client
+                  .Command({"HSET", "demote-hash", "f",
+                            std::string(boundary - 1, 'c')})
+                  .text_,
+              "QUEUED");
     const auto executed = client.Command({"EXEC"});
     ASSERT_EQ(executed.items_.size(), 1);
     ASSERT_EQ(executed.items_[0].text_, "0");
     ASSERT_EQ(client.Command({"HGET", "demote-hash", "f"}).text_,
-              std::string(8102, 'c'));
+              std::string(boundary - 1, 'c'));
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -222,7 +320,7 @@ TEST(GroupedHashWriteE2e,
   Server recovered(disk);
   Client client(recovered.port());
   EXPECT_EQ(client.Command({"HGET", "demote-hash", "f"}).text_,
-            std::string(8102, 'c'));
+            std::string(boundary - 1, 'c'));
 }
 
 TEST(GroupedHashWriteE2e, BatchedFieldsPreserveOrderAcrossGrowthAndRecovery) {
@@ -398,7 +496,7 @@ TEST(HashReplaceE2e, DifferentRequestSizesPreserveLastDuplicateAfterRecovery) {
 TEST(HashReplaceE2e, PromotionUsesFinalDeduplicatedBytes) {
   PrivateDisk disk;
   constexpr std::size_t boundary =
-      kCollectionPromotionBytes - kHashValueHeaderBytes - 9;
+      kCollectionPromotionBytes - kHashValueHeaderBytes - 14;
   {
     Server server(disk);
     Client client(server.port());

@@ -158,7 +158,7 @@ std::string Legacy(const CollectionPage& page) {
           {.field_ = field.field_, .value_ = field.value_});
     for (const auto& member : page.elements_)
       value.entries_.push_back({.field_ = member});
-    auto result = EncodeHashValue(value);
+    auto result = EncodeHashValue(value, kLegacyHashValueVersion);
     EXPECT_TRUE(result.ok()) << result.status();
     return result.ok() ? *result : std::string{};
   }

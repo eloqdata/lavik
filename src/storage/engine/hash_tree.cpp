@@ -96,12 +96,9 @@ bool NeedsGroupedHash(const HashValue& value) {
   // Small hashes keep the compact path. Crossing the threshold publishes a
   // complete grouped graph atomically; grouped publication separately decides
   // whether a shrinking after-image can return to compact storage.
-  std::uint64_t bytes = kHashValueHeaderBytes;
-  for (const auto& entry : value.entries_) {
-    bytes += 8 + entry.field_.size() + entry.value_.size();
-    if (bytes >= kCollectionPromotionBytes) return true;
-  }
-  return false;
+  if (value.entries_.empty()) return false;
+  auto encoder = HashValueEncoder::Create(value.entries_);
+  return !encoder.ok() || encoder->encoded_bytes() >= kCollectionPromotionBytes;
 }
 
 bool IsCompactPointRead(HashOperationKind kind) {
@@ -552,33 +549,20 @@ absl::StatusOr<std::optional<std::string_view>> FindCompactHashField(
     return absl::DataLossError(
         "Hash element count does not match record metadata");
 
-  // Published fields are unique by construction. The storage loader applies
-  // the record's checksum policy; a point lookup only parses through its match.
-  for (std::size_t i = 0; i < reader->size(); ++i) {
-    auto entry = reader->Next();
-    if (!entry.ok()) [[unlikely]]
-      return absl::DataLossError(entry.status().message());
-    if (entry->field_ == field)
-      return std::optional<std::string_view>{entry->value_};
-  }
-  return std::nullopt;
+  auto found = reader->Find(field);
+  if (!found.ok()) return absl::DataLossError(found.status().message());
+  return *found ? std::optional<std::string_view>((**found).value_)
+                : std::nullopt;
 }
 
-absl::Status FindCompactHashFields(std::string_view payload,
-                                   std::size_t field_count,
-                                   std::span<HashFieldLookup> requests) {
-  for (auto& request : requests) request.value_.reset();
-  auto reader = HashValueReader::Open(payload);
-  if (!reader.ok()) [[unlikely]]
-    return absl::DataLossError(reader.status().message());
-  if (reader->size() != field_count) [[unlikely]]
-    return absl::DataLossError(
-        "Hash element count does not match record metadata");
+namespace {
+[[gnu::noinline, gnu::cold]] absl::Status FindV1HashFields(
+    HashValueReader reader, std::span<HashFieldLookup> requests) {
   // Count request positions, including repeated operands, so a complete reply
   // does not require parsing the unused tail of the stored Hash.
   std::size_t remaining = requests.size();
-  for (std::size_t i = 0; i < reader->size() && remaining != 0; ++i) {
-    auto entry = reader->Next();
+  for (std::size_t i = 0; i < reader.size() && remaining != 0; ++i) {
+    auto entry = reader.Next();
     if (!entry.ok()) [[unlikely]]
       return absl::DataLossError(entry.status().message());
     // Binary search avoids hashing every unrelated encoded field. The sorted
@@ -597,6 +581,33 @@ absl::Status FindCompactHashFields(std::string_view payload,
     }
   }
   return absl::OkStatus();
+}
+}  // namespace
+
+absl::Status FindCompactHashFields(std::string_view payload,
+                                   std::size_t field_count,
+                                   std::span<HashFieldLookup> requests) {
+  for (auto& request : requests) request.value_.reset();
+  auto reader = HashValueReader::Open(payload);
+  if (!reader.ok()) [[unlikely]]
+    return absl::DataLossError(reader.status().message());
+  if (reader->size() != field_count) [[unlikely]]
+    return absl::DataLossError(
+        "Hash element count does not match record metadata");
+  if (reader->version() == kHashValueVersion) [[likely]] {
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      auto& request = requests[i];
+      if (i != 0 && request.field_ == requests[i - 1].field_) {
+        request.value_ = requests[i - 1].value_;
+        continue;
+      }
+      auto found = reader->Find(request.field_);
+      if (!found.ok()) return absl::DataLossError(found.status().message());
+      if (*found) request.value_ = (**found).value_;
+    }
+    return absl::OkStatus();
+  }
+  return FindV1HashFields(*reader, requests);
 }
 
 absl::StatusOr<std::optional<std::string_view>> FindHashGroupField(
@@ -879,6 +890,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   // exceptions escaping a coroutine body, even when its caller has a catch.
   assert(db_id < kLogicalDatabaseCount);
   const bool replace = operation.kind_ == HashOperationKind::kReplaceOnly;
+  const bool increment =
+      operation.kind_ == HashOperationKind::kIncrementInteger ||
+      operation.kind_ == HashOperationKind::kIncrementFloat;
   if (replace && (value_type != ValueType::kHash || operation.fields_.empty() ||
                   operation.fields_.size() != operation.values_.size())) {
     co_return absl::InvalidArgumentError("invalid Hash replacement fields");
@@ -888,6 +902,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     co_return absl::InvalidArgumentError(
         "Hash scan COUNT must be greater than zero");
   }
+  if (increment &&
+      (operation.fields_.size() != 1 || operation.values_.size() != 1))
+    co_return absl::InvalidArgumentError("invalid Hash increment operands");
 
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -1176,8 +1193,10 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   // Point writes keep the selected leaves until planning finishes; other
   // materializing operations keep the entire decoded value. Admit that
   // peak before any leaf allocations, including copies made by the planner.
+  // Locked replication replay uses the same indexed editor as foreground
+  // writes; only the state-lock/yield policy differs during preparation.
   const bool edit_leaves =
-      unlocked_grouped_write &&
+      grouped != nullptr &&
       (operation.kind_ == HashOperationKind::kSet ||
        operation.kind_ == HashOperationKind::kSetIfAbsent ||
        operation.kind_ == HashOperationKind::kDelete);
@@ -1298,7 +1317,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   HashValue compact;
   std::optional<MemoryReservation> compact_edit_scratch;
   std::optional<CompactHashEditPlan> compact_edit;
-  std::optional<LoadedValue> compact_source;
+  std::optional<LoadedValue> compact_lookup_source;
+  std::optional<HashValueReader> compact_lookup;
+  std::size_t increment_slot = SIZE_MAX;
   std::optional<HashGroupMutationPlan> grouped_plan;
   std::uint64_t edited_length = location.logical_size_;
   if (edit_leaves) {
@@ -1315,7 +1336,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     for (std::size_t begin = 0; begin < leaf_edits.size();) {
       // Yield between pages for batch fairness, without scheduling an extra
       // turn before every single-field write. Actual IO still suspends.
-      if (begin != 0) co_await bycorf::Yield(*store.worker_);
+      if (begin != 0 && unlocked_grouped_write)
+        co_await bycorf::Yield(*store.worker_);
       const auto id = leaf_edits[begin].id_;
       edits.clear();
       do {
@@ -1357,14 +1379,39 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       // group.
       for (const auto id : selected) {
         if (unlocked_grouped_write) co_await bycorf::Yield(*store.worker_);
-        auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id,
-                                                     key, digest, grouped, id);
+        auto loaded = co_await LoadHashGroupPayload(store, partition, db_id,
+                                                    key, digest, grouped, id);
         if (!loaded.ok()) {
           if (read_epoch_changed()) co_return HashResult{};
           co_return loaded.status();
         }
-        for (auto& entry : loaded->snapshot_.value_.entries_) {
-          compact.entries_.push_back(std::move(entry));
+        const auto bytes = loaded->loaded_.value();
+        const std::string_view payload(
+            reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        const auto base = compact.entries_.size();
+        // Remaining point mutations are increments. Validate/materialize the
+        // source once, retaining its physical order, then resolve the target
+        // through the same fingerprint lookup used by point reads and HSET.
+        // Only the ordinal survives this lease; numeric parsing uses owned
+        // data.
+        auto valid = VisitHashGroupFields(
+            payload, loaded->field_count_, id,
+            grouped->directory().root().seed_, [&](const HashEntryView& entry) {
+              compact.entries_.push_back(
+                  {.digest_ = ComputeDigest(entry.field_),
+                   .field_ = std::string(entry.field_),
+                   .value_ = std::string(entry.value_)});
+              return absl::OkStatus();
+            });
+        if (!valid.ok()) co_return valid;
+        if (increment && loaded->field_count_ != 0) {
+          auto reader =
+              HashValueReader::Open(payload.substr(kHashGroupHeaderBytes));
+          if (!reader.ok()) co_return reader.status();
+          std::size_t slot;
+          auto matched = reader->Find(operation.fields_.front(), false, &slot);
+          if (!matched.ok()) co_return matched.status();
+          if (*matched) increment_slot = base + slot;
         }
       }
     } else {
@@ -1389,22 +1436,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (read_only)
       co_return ReadEncodedHash(payload, location.logical_size_, operation,
                                 value_type);
-    // A prepared write may wait behind a state-lock owner that needs a read
-    // slot. Do not retain the pool's last slot across that wait. Remote pool
-    // availability cannot be inspected here, so those leases use owned edits.
-    const bool borrow_source =
-        loaded->lease_.buffer_id() == 0 ||
-        (loaded->lease_.owner_worker() == store.worker_->id() &&
-         store.buffers_.available_read_buffers() != 0);
-    if (borrow_source && ((value_type == ValueType::kHash &&
-                           operation.kind_ == HashOperationKind::kSet) ||
-                          (value_type == ValueType::kSet &&
-                           (operation.kind_ == HashOperationKind::kSet ||
-                            operation.kind_ == HashOperationKind::kDelete)))) {
-      // Only operand views and framing survive preparation; unchanged bytes
-      // remain borrowed from compact_source through the awaited append.
-      // Publication still uses the existing key intent, snapshot validation and
-      // append boundary.
+    if (operation.kind_ == HashOperationKind::kSet ||
+        operation.kind_ == HashOperationKind::kDelete) {
+      // Indexed compact edits own one bounded after-image. The source lease
+      // ends before append can suspend; scratch covers operands and output,
+      // without retaining one decoded field object per stored entry.
       GroupedScratchBudget budget;
       if (operation.fields_.size() > SIZE_MAX / 256)
         co_return absl::ResourceExhaustedError(
@@ -1433,7 +1469,6 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           result.integer_ = operation.kind_ == HashOperationKind::kDelete
                                 ? compact_edit->removed_
                                 : compact_edit->added_;
-          compact_source.emplace(std::move(*loaded));
         } else {
           // Promotion keeps the existing owned builder and its admission. No
           // oversized output was allocated by the bounded editor.
@@ -1448,6 +1483,24 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       if (compact.entries_.size() != location.logical_size_) {
         co_return absl::InternalError(
             "Hash element count does not match record metadata");
+      }
+      if (operation.kind_ == HashOperationKind::kSet ||
+          operation.kind_ == HashOperationKind::kSetIfAbsent ||
+          operation.kind_ == HashOperationKind::kDelete) {
+        // Promotion, conditional writes and deletion fallback locate fields
+        // through the encoded index. Decode preserves slot order. Keep the
+        // source only through synchronous editing, then release it before any
+        // lock or append wait can require this read-pool slot.
+        auto reader = HashValueReader::Open(payload);
+        if (!reader.ok()) co_return reader.status();
+        compact_lookup = *reader;
+        compact_lookup_source.emplace(std::move(*loaded));
+      } else if (increment) {
+        auto reader = HashValueReader::Open(payload);
+        if (!reader.ok()) co_return reader.status();
+        auto matched =
+            reader->Find(operation.fields_.front(), false, &increment_slot);
+        if (!matched.ok()) co_return matched.status();
       }
     }
   }
@@ -1464,24 +1517,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
   };
 
-  auto find_entry = [&](std::string_view field) {
-    const Digest field_digest = ComputeDigest(field);
-    return std::find_if(compact.entries_.begin(), compact.entries_.end(),
-                        [&](const HashEntry& entry) {
-                          return entry.digest_ == field_digest &&
-                                 entry.field_ == field;
-                        });
-  };
-  auto lookup = [&](std::string_view field) -> HashEntry* {
-    auto entry = find_entry(field);
-    return entry == compact.entries_.end() ? nullptr : &*entry;
-  };
-
   auto incremented_value = [&](std::optional<std::string_view> current)
       -> absl::StatusOr<std::string> {
-    if (operation.fields_.size() != 1 || operation.values_.size() != 1) {
-      return absl::InvalidArgumentError("invalid Hash increment operands");
-    }
     if (operation.kind_ == HashOperationKind::kIncrementInteger) {
       std::int64_t previous = 0;
       std::int64_t increment = 0;
@@ -1588,11 +1625,10 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           field_positions(0, FieldPositionHash{&compact.entries_},
                           FieldPositionEqual{&compact.entries_});
       if (indexed) {
-        // Selected groups share one vector, so scanning it for every input
-        // field makes a growing batch quadratic. Index positions, and
-        // destroy the index before the planner sorts/moves entries.
-        // Unlocked creation may suspend but retains exclusive ownership of
-        // this vector. Single-field writes need only a scan.
+        // An encoded source resolves existing fields with SIMD. Index only
+        // newly appended fields so repeated operands see preceding writes.
+        // Creation has no persisted index; its request-built entries use the
+        // same position table. No pointer into the growing vector is stored.
         GroupedScratchBudget budget;
         // Sparse slots/control bytes and allocation rounding, without
         // copies of field bytes. Count duplicates to admit the peak up
@@ -1602,19 +1638,19 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             4 * (sizeof(std::size_t) + sizeof(std::uint8_t));
         constexpr auto kMaxPositions =
             std::numeric_limits<std::size_t>::max() / kPositionBytes;
-        if (compact.entries_.size() > kMaxPositions ||
-            operation.fields_.size() > kMaxPositions - compact.entries_.size())
+        const auto indexed_entries =
+            compact_lookup ? 0 : compact.entries_.size();
+        if (indexed_entries > kMaxPositions ||
+            operation.fields_.size() > kMaxPositions - indexed_entries)
           co_return absl::ResourceExhaustedError("field index size overflow");
         auto added = budget.AddBytes(
-            (compact.entries_.size() + operation.fields_.size()) *
-            kPositionBytes);
+            (indexed_entries + operation.fields_.size()) * kPositionBytes);
         if (!added.ok()) co_return added;
         auto admitted = budget.Reserve(1);
         if (!admitted.ok()) co_return admitted.status();
         lookup_scratch.emplace(std::move(*admitted));
-        field_positions.reserve(compact.entries_.size() +
-                                operation.fields_.size());
-        for (std::size_t i = 0; i < compact.entries_.size(); ++i)
+        field_positions.reserve(indexed_entries + operation.fields_.size());
+        for (std::size_t i = 0; i < indexed_entries; ++i)
           field_positions.insert(i);
       }
       for (std::size_t i = 0; i < operation.fields_.size(); ++i) {
@@ -1630,8 +1666,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
           auto position = field_positions.find(operation.fields_[i]);
           if (position != field_positions.end())
             current = &compact.entries_[*position];
-        } else {
-          current = lookup(operation.fields_[i]);
+        }
+        if (current == nullptr && compact_lookup) {
+          std::size_t slot;
+          auto found = compact_lookup->Find(operation.fields_[i], false, &slot);
+          if (!found.ok()) co_return found.status();
+          if (*found) current = &compact.entries_[slot];
         }
         if (current != nullptr) {
           if (operation.kind_ == HashOperationKind::kSetIfAbsent) continue;
@@ -1653,24 +1693,43 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       }
       break;
     }
-    case HashOperationKind::kDelete:
+    case HashOperationKind::kDelete: {
       if (edit_leaves || compact_edit) break;
+      if (!compact_lookup) break;  // Missing key.
+      // Low-memory deletion fallback cannot allocate a separate removal bitmap.
+      // This vector is unpublished scratch and only its encoded source is used
+      // for lookup: temporarily reuse disposable runtime digests as removal
+      // marks, compact once, then reconstruct every surviving digest. Keeping
+      // slots stable until all operands finish also handles repeated deletions.
+      for (auto& entry : compact.entries_) entry.digest_.value_ = 0;
       for (std::string_view field : operation.fields_) {
-        auto entry = find_entry(field);
-        if (entry != compact.entries_.end()) {
-          mark_group_changed(field);
-          compact.entries_.erase(entry);
+        std::size_t slot;
+        auto matched = compact_lookup->Find(field, false, &slot);
+        if (!matched.ok()) co_return matched.status();
+        if (*matched && compact.entries_[slot].digest_.value_ == 0) {
+          auto duplicate =
+              compact_lookup->Find(field, false, nullptr, slot + 1);
+          if (!duplicate.ok()) co_return duplicate.status();
+          if (*duplicate)
+            co_return absl::DataLossError("duplicate requested Hash field");
+          compact.entries_[slot].digest_.value_ = 1;
           ++result.integer_;
           result.changed_ = true;
         }
       }
+      std::erase_if(compact.entries_, [](const HashEntry& entry) {
+        return entry.digest_.value_ != 0;
+      });
+      for (auto& entry : compact.entries_)
+        entry.digest_ = ComputeDigest(entry.field_);
       break;
+    }
     case HashOperationKind::kIncrementInteger:
     case HashOperationKind::kIncrementFloat: {
-      if (operation.fields_.size() != 1 || operation.values_.size() != 1)
-        co_return absl::InvalidArgumentError("invalid Hash increment operands");
       const std::string_view field = operation.fields_.front();
-      HashEntry* current = lookup(field);
+      HashEntry* current = increment_slot == SIZE_MAX
+                               ? nullptr
+                               : &compact.entries_[increment_slot];
       auto updated = incremented_value(
           current == nullptr
               ? std::optional<std::string_view>{}
@@ -1708,6 +1767,12 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       co_return absl::InternalError("read operation reached Hash mutation");
   }
 
+  // No existing-key assignment or deletion yields during the loop above.
+  // Release its borrowed lookup index before reacquiring state or publishing a
+  // promotion; an indirect-key write may need the pool's last slot for its own
+  // key read.
+  compact_lookup.reset();
+  compact_lookup_source.reset();
   result.length_ = compact_edit  ? compact_edit->count_
                    : edit_leaves ? edited_length
                    : grouped == nullptr
@@ -1812,10 +1877,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             ? std::to_string(result.signed_integer_)
             : result.scalar_};
   }
+  // A prepared compact edit already proved its encoded size fits. It has no
+  // decoded entry vector to size again, including on the locked EXEC path.
   if (result.key_exists_ &&
-      (grouped != nullptr || ((unlocked_compact_write || unlocked_create)
-                                  ? compact_write_promotes
-                                  : NeedsGroupedHash(compact)))) {
+      (grouped != nullptr ||
+       ((unlocked_compact_write || unlocked_create)
+            ? compact_write_promotes
+            : (!compact_edit && NeedsGroupedHash(compact))))) {
     absl::Status written = co_await CommitGroupedHashMutationLocked(
         store, partition, db_id, key, digest, grouped, std::move(compact),
         std::vector<GroupedRecordId>(changed_groups.begin(),
@@ -1832,7 +1900,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     kind = RecordKind::kTombstone;
     published_type = ValueType::kNone;
   } else if (compact_edit) {
-    // The borrowed plan is consumed directly into the unpublished record.
+    // The owned plan is consumed directly into the unpublished record.
   } else if (prepared_compact_payload.has_value()) {
     payload = std::move(*prepared_compact_payload);
   } else {

@@ -124,7 +124,7 @@ absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
     Put(out + 4, count, 4);
   } else if (HashWire(type)) {
     Put(out, kHashValueMagic, 8);
-    Put(out + 8, kStorageFormatVersion, 4);
+    Put(out + 8, kLegacyHashValueVersion, 4);
     Put(out + 12, kHashValueHeaderBytes, 4);
     Put(out + 16, count, 4);
     Put(out + 24, bytes, 8);
@@ -291,7 +291,7 @@ absl::Status CollectionCompactDecoder::ReadHeader() {
     total_count_ = Get(in + 4, 4);
   } else if (HashWire(type_)) {
     if (Get(in, 8) != kHashValueMagic ||
-        Get(in + 8, 4) != kStorageFormatVersion ||
+        Get(in + 8, 4) != kLegacyHashValueVersion ||
         Get(in + 12, 4) != kHashValueHeaderBytes ||
         Get(in + 16, 4) != total_count_ || Get(in + 20, 4) != 0 ||
         Get(in + 24, 8) != total_bytes_)

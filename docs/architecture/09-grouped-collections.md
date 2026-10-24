@@ -236,8 +236,25 @@ identity space under the same Sorted Set type and incarnation. Recovery
 bounds each graph by its own root revision.
 
 New keys, compact promotions and streaming imports build both Sorted Set
-graphs before publication. The current unreleased v1 schema has no
-compatibility decoders or migration for earlier development layouts.
+graphs before publication. Ordered/grouped root and envelope formats retain
+version 1. The embedded Hash payload has its own version, independent of the
+outer storage version: readers accept v1 and v2, and ordinary encoders and
+changed compact/grouped after-images emit v2. Unchanged v1 records remain valid;
+older binaries do not understand v2 payloads.
+
+Hash payload v2 is shared by Hash, Set and Sorted Set member-index pages. Its
+32-byte header identifies the version, count, flags and total encoded size.
+The data area concatenates field/value bytes; the tail contains little-endian
+32-bit entry offsets with an end sentinel, optional 32-bit field lengths, and
+one fingerprint byte per field. Pages whose values are all empty omit field
+lengths. A version-fixed SipHash-1-2 seed makes fingerprints independent of
+process lookup seeds and grouped routing prefixes. Complete field comparison
+resolves collisions. Strict decoders, mutation preparation and grouped recovery
+validate fingerprints and entry bounds; point readers trust the published filter and
+retain physical identity, configured CRC and candidate-bound checks.
+Logical full images exceeding the 32-bit offset range retain v1. The bounded
+native collection stream and RDB logical bridge also retain the v1 sequential
+encoding, independently of the indexed physical representation.
 
 Page score bounds are derived runtime metadata, not new durable fields. Writes
 derive them from complete replacement pages and publish them with the same
@@ -328,9 +345,10 @@ cleaner disabling or the allocator's authoritative capacity checks.
 
 ## Command access paths
 
-Compact Hash/Set point edits, List end edits, single-member Sorted Set writes
-and bounded String range edits can prepare borrowed after-images. Their read
-leases and command operands remain immutable through append allocation waits;
+Compact Hash/Set edits own one bounded indexed after-image and release their
+source read lease before append waits. List end edits, single-member Sorted Set
+writes and bounded String range edits can prepare borrowed after-images. Their
+read leases and command operands remain immutable through append allocation waits;
 only framing and changed command data need separate ownership. The append
 funnel consumes each encoder after its final suspension, then publishes the
 same complete checked record format. Published records and commit receipts
@@ -375,23 +393,33 @@ to its own owner; the group window does not impose a separate extent-owner limit
 External group assembly also keeps its output in ordinary heap memory so
 waiting for extent buffers cannot exhaust the fixed pool.
 
-Hash/Set point operations load each affected prefix group once. Point reads
-scan encoded entries and retain only requested values. Multi-field reads group
+Hash/Set point operations load each affected prefix group once. V2 point reads
+scan contiguous fingerprints in SIMD batches, access matching candidates through
+the offset array, and retain only requested values. V1 point reads scan
+sequential encoded entries through the match. Multi-field reads group
 request positions by routing leaf, fill result slots in command order, and
 release each page before loading the next; repeated operands retain repeated results.
-Point reads trust published field uniqueness, validate the bounds of traversed
-entries, and stop once all requested fields are found. Unused trailing entries
-are not scanned. Storage checks payload checksums on records whose persisted
-flags enable CRC. Full replies and read-only random selection consume published
+Point reads trust published field uniqueness and filter consistency. They
+validate v2 candidate bounds or v1 traversed entry bounds; unrelated v2 entries
+are not parsed. Repeated multi-field operands share the preceding lookup result.
+Storage checks payload checksums on records whose persisted flags enable CRC.
+Full replies and read-only random selection consume published
 leaves without rebuilding field digests or a uniqueness set; the physical loader
 still validates record identity, framing and counts. Compact reads use the same
 borrowed-entry projections. Writers and strict
 materialization/recovery decoders validate every field's uniqueness and route.
 Hash/Set field updates and removals validate complete affected
 leaves using borrowed entry views, then own only changed replacement pages.
+Field-addressed Hash writes (HSET/HMSET, HSETNX, HDEL, HINCRBY and
+HINCRBYFLOAT) and Set additions/removals locate existing fields through the
+same v2 fingerprint index as point reads, including compact-to-grouped promotion
+and compact deletion's low-memory fallback. Legacy v1 uses sequential lookup.
+Mutation planning keeps entry ordinals separate from whole-page validation
+and re-encoding; repeated new fields use command-local state until publication.
 Small replacements retain checked encoded bytes until publication; splits and
-oversized entries use owned fields and the bounded-state encoder. Other point
-writes decode affected groups. All paths replace only changed groups and any
+oversized entries use owned fields and the bounded-state encoder. Increments
+decode affected groups, preserving physical ordinals for indexed target lookup.
+All paths replace only changed groups and any
 split-parent retirement records, without retaining user payloads in the index.
 HSCAN/SSCAN consume one routing leaf per call and use field digests under the
 persisted seed as cursors. Their temporary index borrows fields and values from

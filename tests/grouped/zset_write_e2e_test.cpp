@@ -804,7 +804,9 @@ TEST(GroupedSortedSetWriteE2e,
   const auto encoded = EncodeHashGroup(leaf);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
   const auto old_bytes = encoded->size() - kHashGroupHeaderBytes;
-  ASSERT_LE(old_bytes + 16 + 32, kCollectionGroupTargetBytes);
+  // A v2 member adds an offset, field length, fingerprint and 8-byte score.
+  constexpr std::size_t member_overhead = 4 + 4 + 1 + sizeof(double);
+  ASSERT_LE(old_bytes + member_overhead + 32, kCollectionGroupTargetBytes);
   auto routed_member = [&](std::size_t size, std::string prefix) {
     for (unsigned i = 0; i < 100000; ++i) {
       auto member = prefix + std::to_string(i);
@@ -816,8 +818,8 @@ TEST(GroupedSortedSetWriteE2e,
     }
     throw std::runtime_error("cannot find fixture member in selected prefix");
   };
-  const auto filler =
-      routed_member(kCollectionGroupTargetBytes - old_bytes - 16, "fill-");
+  const auto filler = routed_member(
+      kCollectionGroupTargetBytes - old_bytes - member_overhead, "fill-");
   const auto overflow = routed_member(32, "overflow-");
   const std::string oversized(16384, 'z');
   {
