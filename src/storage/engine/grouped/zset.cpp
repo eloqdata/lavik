@@ -479,6 +479,65 @@ absl::Status ReadIndexedRange(const IndexedOrderedReader& reader,
     else
       first += skip;
   }
+  if (operation.limit_ && operation.count_ >= 0) {
+    const auto count = std::min<std::uint64_t>(
+        end - first, operation.count_ - result.member_count());
+    if (operation.reverse_)
+      first = end - count;
+    else
+      end = first + count;
+  }
+  if (first == end) return absl::OkStatus();
+  if (operation.packed_output_) {
+    auto begin = reader.At(first), last = reader.At(end - 1);
+    if (!begin.ok()) return begin.status();
+    if (!last.ok()) return last.status();
+    const auto start = begin->value_.data();
+    const auto stop = last->value_.data() + last->value_.size();
+    if (stop < start)
+      return absl::DataLossError("invalid indexed Sorted Set range offsets");
+    const auto bytes = static_cast<std::size_t>(stop - start);
+    auto reserved = ReservePackedOutput(&result, end - first, 1);
+    if (!reserved.ok()) return reserved;
+    const auto capacity = std::max(bytes, std::string{}.capacity());
+    if (capacity == SIZE_MAX ||
+        capacity + 1 > SIZE_MAX - result.retained_charge_.bytes())
+      return absl::ResourceExhaustedError("Sorted Set packed output overflow");
+    auto admission = TryReserveMemory(capacity + 1);
+    if (!admission) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError("OOM indexed Sorted Set reply");
+    }
+    auto& output = *result.packed_members_;
+    const auto block = output.members_.blocks_.size();
+    // One exact selected block, regardless of member count or reply direction.
+    // Reversing descriptors preserves the single copy of contiguous bytes.
+    output.members_.blocks_.emplace_back(start, bytes);
+    if (output.members_.blocks_.back().capacity() > capacity)
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set packed capacity exceeds admission");
+    result.retained_charge_.Account(
+        CurrentMemoryAccountingShard(),
+        result.retained_charge_.bytes() +
+            output.members_.blocks_.back().capacity() + 1);
+    for (std::size_t i = 0; i < end - first && !cursor.done_; ++i) {
+      const auto index = operation.reverse_ ? end - 1 - i : first + i;
+      auto entry = reader.At(index);
+      if (!entry.ok()) return entry.status();
+      if (entry->value_.data() < start ||
+          entry->value_.data() + entry->value_.size() > stop)
+        return absl::DataLossError("invalid indexed Sorted Set reply interval");
+      auto visited = cursor.VisitWithOutput(*entry, base_rank + index, [&] {
+        output.members_.values_.push_back(
+            {block, static_cast<std::size_t>(entry->value_.data() - start),
+             entry->value_.size()});
+        output.scores_.push_back(entry->score_);
+        return absl::OkStatus();
+      });
+      if (!visited.ok()) return visited;
+    }
+    return absl::OkStatus();
+  }
   for (std::size_t i = 0; i < end - first && !cursor.done_; ++i) {
     const auto index = operation.reverse_ ? end - 1 - i : first + i;
     auto entry = reader.At(index);
@@ -692,7 +751,7 @@ absl::StatusOr<MemoryReservation> ReserveInputs(
 
 absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
     std::optional<CompactValueView> value, const SortedSetOperation& operation,
-    Members& members, SortedSetResult& result, CompactPayload& output) {
+    Members& members, SortedSetResult& result, OrderedCompactPayload& payload) {
   const bool add = operation.kind_ == SortedSetOperationKind::kAdd;
   if (!value || (add ? operation.entries_.size() != 1
                      : operation.kind_ != SortedSetOperationKind::kRemove ||
@@ -739,53 +798,33 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
     return update;
   }
   if (reader->indexed()) {
-    std::vector<OrderedCollectionEntryView> entries;
-    entries.reserve(result.length_);
+    auto& output = payload.V2(*reader->indexed());
     bool inserted = !state.after_;
+    std::size_t first = 0;
+    // Removing and inserting one member splits the immutable source into at
+    // most three surviving ranges. Keep positions, not an O(N) view vector.
     for (std::size_t i = 0; i < reader->size(); ++i) {
-      auto entry = reader->indexed()->At(i);
-      if (!entry.ok()) return entry.status();
-      if (entry->value_ == member) continue;
+      const auto entry = reader->indexed()->At(i);
+      assert(entry.ok());  // The complete source was preflighted above.
+      if (entry->value_ == member) {
+        output.AppendSource(first, i - first);
+        first = i + 1;
+        continue;
+      }
       if (!inserted &&
           (*state.after_ < entry->score_ ||
            (*state.after_ == entry->score_ && member < entry->value_))) {
-        entries.push_back({member, *state.after_});
+        output.AppendSource(first, i - first);
+        first = i;
+        output.AppendMember(member, *state.after_);
         inserted = true;
       }
-      entries.push_back(*entry);
     }
-    if (!inserted) entries.push_back({member, *state.after_});
-    output.AppendBytes("LZS2");
-    output.AppendUnsigned(result.length_, 4);
-    // Reuse the surviving data spans across the append wait. Only the fixed
-    // arrays change; avoid serializing/copying the complete value twice.
-    std::string_view run;
-    for (const auto& entry : entries) {
-      if (run.data() && run.data() + run.size() == entry.value_.data()) {
-        run = std::string_view(run.data(), run.size() + entry.value_.size());
-      } else {
-        if (run.data()) output.AppendBytes(run);
-        run = entry.value_;
-      }
-    }
-    if (run.data()) output.AppendBytes(run);
-    std::string arrays;
-    arrays.reserve(entries.size() * 12 + 4);
-    auto append = [&](std::uint64_t value, unsigned width) {
-      for (unsigned i = 0; i < width; ++i)
-        arrays.push_back(static_cast<char>(value >> (8 * i)));
-    };
-    for (const auto& entry : entries)
-      append(std::bit_cast<std::uint64_t>(entry.score_), 8);
-    std::uint32_t offset = 0;
-    append(0, 4);
-    for (const auto& entry : entries) {
-      offset += entry.value_.size();
-      append(offset, 4);
-    }
-    output.AppendOwnedBytes(std::move(arrays));
+    output.AppendSource(first, reader->size() - first);
+    if (!inserted) output.AppendMember(member, *state.after_);
     return update;
   }
+  auto& output = payload.V1();
   output.AppendBytes("LZS1");
   output.AppendUnsigned(result.length_, 4);
   auto append = [&] {
@@ -827,7 +866,7 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     std::optional<CompactValueView> value, const SortedSetOperation& operation,
     Members& members, SortedSetResult& result,
     std::optional<MemoryReservation>& compact_admission,
-    CompactPayload* point_payload = nullptr) {
+    OrderedCompactPayload* point_payload = nullptr) {
   if (value && value->encoded_.starts_with("LZS2") && ReadOnly(operation) &&
       (operation.kind_ == SortedSetOperationKind::kRandom ||
        ((operation.kind_ == SortedSetOperationKind::kRange ||
@@ -1178,7 +1217,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   // The encoded callback result survives until the compact writer returns.
   // Keep its admission outside the synchronous callback's stack frame.
   std::optional<MemoryReservation> compact_admission;
-  CompactPayload point_payload;
+  OrderedCompactPayload point_payload;
   std::optional<InlineRecordPayload> inline_payload;
   auto callback = [&](std::optional<CompactValueView> value)
       -> absl::StatusOr<CompactValueUpdate> {
@@ -1854,6 +1893,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           auto visited = ReadIndexedRange(*page->page_.indexed_, base, cursor);
           if (!visited.ok()) co_return visited;
           rank = reverse ? base : base + metadata[i].item_count_;
+        } else if (operation.packed_output_ &&
+                   operation.kind_ == SortedSetOperationKind::kRange) {
+          // Keep v1's single packed page block and transfer path. Falling
+          // back from an indexed probe must not introduce 4 KiB reply blocks.
+          auto packed = PackSortedSetPage(page->page_.entries_);
+          if (!packed.ok()) co_return packed.status();
+          auto visited = consume_packed_page(*packed, false);
+          if (!visited.ok()) co_return visited;
         } else {
           auto visited = consume_page(page->page_.entries_, false);
           if (!visited.ok()) co_return visited;

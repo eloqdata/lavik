@@ -353,5 +353,51 @@ TEST_F(PackedCompactListTest,
     }
 }
 
+TEST_F(PackedCompactListTest, IndexedSortedSetReplyOwnsOneSelectedBlock) {
+  std::vector<OrderedCollectionEntry> entries;
+  for (unsigned i = 0; i < 20; ++i)
+    entries.push_back({std::string(512 + i, static_cast<char>(i)), double(i)});
+  auto encoded =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
+  ASSERT_TRUE(encoded.ok());
+  for (bool reverse : {false, true}) {
+    for (const auto mode :
+         {SortedSetRangeMode::kRank, SortedSetRangeMode::kScore}) {
+      SortedSetOperation operation{.kind_ = SortedSetOperationKind::kRange,
+                                   .range_mode_ = mode,
+                                   .reverse_ = reverse,
+                                   .first_ = 2,
+                                   .last_ = 17,
+                                   .packed_output_ = true};
+      operation.minimum_score_.value_ = 2;
+      operation.maximum_score_.value_ = 17;
+      if (mode == SortedSetRangeMode::kScore) {
+        operation.limit_ = true;
+        operation.offset_ = 1;
+        operation.count_ = 14;
+      }
+      const std::size_t first = mode == SortedSetRangeMode::kRank ? 2 : 3;
+      const std::size_t end = mode == SortedSetRangeMode::kRank ? 18 : 17;
+      auto source = *encoded;
+      auto result =
+          ReadCompactSortedSet(CompactView(source, entries.size()), operation);
+      ASSERT_TRUE(result.ok()) << result.status();
+      ASSERT_TRUE(result->packed_members_);
+      const auto& packed = *result->packed_members_;
+      ASSERT_EQ(packed.members_.blocks_.size(), 1);
+      ASSERT_EQ(packed.members_.values_.size(), end - first);
+      std::size_t bytes = 0;
+      for (auto i = first; i < end; ++i) bytes += entries[i].value_.size();
+      EXPECT_EQ(packed.members_.blocks_[0].size(), bytes);
+      source.assign(source.size(), 'x');
+      for (std::size_t i = 0; i < end - first; ++i) {
+        const auto index = reverse ? end - 1 - i : first + i;
+        EXPECT_EQ(result->member_view(i).member_, entries[index].value_);
+        EXPECT_EQ(result->member_view(i).score_, entries[index].score_);
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace lavik::storage

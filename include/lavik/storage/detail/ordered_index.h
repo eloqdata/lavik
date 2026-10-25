@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "lavik/storage/detail/grouped/collection.h"
 
 namespace lavik::storage {
@@ -55,6 +57,7 @@ class IndexedOrderedReader {
                                          std::size_t count) const;
 
  private:
+  friend class IndexedOrderedSplice;
   IndexedOrderedReader(std::string_view body, std::size_t count,
                        std::size_t data_bytes, std::size_t offsets, bool sorted)
       : body_(body),
@@ -69,14 +72,49 @@ class IndexedOrderedReader {
   bool sorted_;
 };
 
-// Encode only the shared body. The caller supplies its envelope and owns the
-// ordering/uniqueness contract; individual sizes and numeric scores are
-// checked.
-absl::StatusOr<std::string> EncodeIndexedOrderedEntries(
-    OrderedCollectionKind kind,
-    std::span<const OrderedCollectionEntry> entries);
-absl::StatusOr<std::string> EncodeIndexedOrderedEntries(
-    OrderedCollectionKind kind,
-    std::span<const OrderedCollectionEntryView> entries);
+// A preflighted v2 end/point edit. At most three surviving source intervals
+// and one insertion describe the complete after-image. No per-item vector or
+// numeric-array buffer is owned: Next borrows value/score spans and generates
+// rebased offsets in fixed framing storage. Sources and operands must remain
+// immutable and alive through consumption; the unstarted plan may move.
+// Callers validate every source interval, operand size/score and output size
+// before constructing this encoder. Encoded bytes are published only after
+// the destination writer has consumed the complete plan successfully.
+class IndexedOrderedSplice {
+ public:
+  explicit IndexedOrderedSplice(IndexedOrderedReader source) noexcept
+      : source_(source) {}
+  void AppendSource(std::size_t first, std::size_t count) noexcept;
+  // One insertion per plan: List operand views (optionally reversed), or a
+  // Sorted Set member. Neither method copies operand bytes.
+  void AppendValues(std::span<const std::string_view> values,
+                    bool reverse) noexcept;
+  void AppendMember(std::string_view member, double score) noexcept;
+  std::size_t encoded_bytes() const noexcept {
+    return 12 + data_bytes_ + count_ * (source_.sorted_ ? 12 : 4);
+  }
+  std::optional<std::string_view> Next() noexcept;
+
+ private:
+  struct Part {
+    std::size_t first_ = 0;
+    std::size_t count_ = 0;
+    bool inserted_ = false;
+  };
+  std::string_view SourceBytes(const Part& part) const noexcept;
+  std::string_view Value(const Part& part, std::size_t index) const noexcept;
+  void Add(Part part, std::size_t bytes) noexcept;
+  IndexedOrderedReader source_;
+  std::array<Part, 4> parts_{};
+  std::span<const std::string_view> inputs_;
+  OrderedCollectionEntryView member_{};
+  bool reverse_inputs_ = false;
+  bool has_inputs_ = false;
+  bool inserted_ = false;
+  std::size_t parts_size_ = 0, count_ = 0, data_bytes_ = 0;
+  std::size_t part_ = 0, item_ = 0, offset_ = 0;
+  unsigned phase_ = 0;
+  std::array<char, 8> framing_{};
+};
 
 }  // namespace lavik::storage

@@ -4528,6 +4528,8 @@ class StorageEngine::Impl {
       bool indexed = false);
   // Copies one checked page into a contiguous member block before releasing
   // its lease. The caller admits page scratch/output before launch.
+  static absl::StatusOr<PackedSortedSetValues> PackSortedSetPage(
+      std::span<const OrderedCollectionEntryView> entries);
   Task<absl::StatusOr<PackedSortedSetValues>> LoadPackedSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

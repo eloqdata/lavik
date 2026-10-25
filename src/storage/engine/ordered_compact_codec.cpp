@@ -17,6 +17,7 @@
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -139,10 +140,135 @@ absl::StatusOr<PackedValues> IndexedOrderedReader::CopyRange(
   return result;
 }
 
+std::string_view IndexedOrderedSplice::SourceBytes(
+    const Part& part) const noexcept {
+  const auto begin = Get(source_.body_, source_.offsets_ + part.first_ * 4, 4);
+  const auto end =
+      Get(source_.body_, source_.offsets_ + (part.first_ + part.count_) * 4, 4);
+  return source_.body_.substr(begin, end - begin);
+}
+
+std::string_view IndexedOrderedSplice::Value(const Part& part,
+                                             std::size_t index) const noexcept {
+  if (part.inserted_) {
+    if (!has_inputs_) return member_.value_;
+    return inputs_[reverse_inputs_ ? inputs_.size() - 1 - index : index];
+  }
+  const auto slot = part.first_ + index;
+  const auto begin = Get(source_.body_, source_.offsets_ + slot * 4, 4);
+  const auto end = Get(source_.body_, source_.offsets_ + (slot + 1) * 4, 4);
+  return source_.body_.substr(begin, end - begin);
+}
+
+void IndexedOrderedSplice::Add(Part part, std::size_t bytes) noexcept {
+  assert(phase_ == 0 && parts_size_ < parts_.size());
+  assert(part.count_ <= UINT32_MAX - count_ &&
+         bytes <= UINT32_MAX - data_bytes_);
+  parts_[parts_size_++] = part;
+  count_ += part.count_;
+  data_bytes_ += bytes;
+}
+
+void IndexedOrderedSplice::AppendSource(std::size_t first,
+                                        std::size_t count) noexcept {
+  assert(first <= source_.size() && count <= source_.size() - first);
+  if (count == 0) return;
+  const Part part{first, count, false};
+  Add(part, SourceBytes(part).size());
+}
+
+void IndexedOrderedSplice::AppendValues(
+    std::span<const std::string_view> values, bool reverse) noexcept {
+  assert(!source_.sorted_ && !inserted_);
+  if (values.empty()) return;
+  inserted_ = has_inputs_ = true;
+  inputs_ = values;
+  reverse_inputs_ = reverse;
+  std::size_t bytes = 0;
+  for (auto value : values) bytes += value.size();
+  Add({0, values.size(), true}, bytes);
+}
+
+void IndexedOrderedSplice::AppendMember(std::string_view member,
+                                        double score) noexcept {
+  assert(source_.sorted_ && !inserted_);
+  inserted_ = true;
+  member_ = {member, score};
+  Add({0, 1, true}, member.size());
+}
+
+std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
+  auto number = [&](std::uint64_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i)
+      framing_[i] = static_cast<char>(value >> (8 * i));
+    return std::string_view(framing_.data(), width);
+  };
+  if (phase_ == 0) {
+    std::memcpy(framing_.data(), source_.sorted_ ? "LZS2" : "LVL2", 4);
+    for (unsigned i = 0; i < 4; ++i)
+      framing_[4 + i] = static_cast<char>(count_ >> (8 * i));
+    phase_ = 1;
+    return std::string_view(framing_.data(), framing_.size());
+  }
+  if (phase_ == 1) {
+    if (part_ < parts_size_) {
+      const auto& part = parts_[part_];
+      if (!part.inserted_) {
+        ++part_;
+        return SourceBytes(part);
+      }
+      const auto value = Value(part, item_++);
+      if (item_ == part.count_) {
+        item_ = 0;
+        ++part_;
+      }
+      return value;
+    }
+    phase_ = source_.sorted_ ? 2 : 3;
+    part_ = 0;
+  }
+  if (phase_ == 2) {
+    if (part_ < parts_size_) {
+      const auto& part = parts_[part_++];
+      if (!part.inserted_)
+        return source_.body_.substr(source_.data_bytes_ + part.first_ * 8,
+                                    part.count_ * 8);
+      return number(std::bit_cast<std::uint64_t>(member_.score_), 8);
+    }
+    phase_ = 3;
+    part_ = 0;
+  }
+  if (phase_ == 3) {
+    if (part_ == parts_size_) {
+      assert(offset_ == data_bytes_);
+      phase_ = 4;
+      return number(offset_, 4);
+    }
+    const auto& part = parts_[part_];
+    // Unshifted source offsets need no regeneration. Other offsets use only
+    // fixed framing storage, consumed before the next call, like v1 lengths.
+    if (!part.inserted_ && item_ == 0 &&
+        offset_ == Get(source_.body_, source_.offsets_ + part.first_ * 4, 4)) {
+      offset_ += SourceBytes(part).size();
+      ++part_;
+      return source_.body_.substr(source_.offsets_ + part.first_ * 4,
+                                  part.count_ * 4);
+    }
+    const auto value = number(offset_, 4);
+    offset_ += Value(part, item_++).size();
+    if (item_ == part.count_) {
+      item_ = 0;
+      ++part_;
+    }
+    return value;
+  }
+  return std::nullopt;
+}
+
 namespace {
-template <typename Entry>
-absl::StatusOr<std::string> EncodeIndexedEntries(
-    OrderedCollectionKind kind, std::span<const Entry> entries) {
+absl::StatusOr<std::string> EncodeIndexedCompactValue(
+    OrderedCollectionKind kind,
+    std::span<const OrderedCollectionEntry> entries) {
   if (!ValidKind(kind) || entries.size() > UINT32_MAX)
     return absl::InvalidArgumentError("invalid indexed ordered kind/count");
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
@@ -158,7 +284,9 @@ absl::StatusOr<std::string> EncodeIndexedEntries(
     size += entry.value_.size();
   }
   std::string output;
-  output.reserve(size);
+  output.reserve(8 + size);
+  output.append(sorted ? "LZS2" : "LVL2");
+  Put(output, entries.size(), 4);
   for (const auto& entry : entries) output.append(entry.value_);
   if (sorted)
     for (const auto& entry : entries)
@@ -172,18 +300,6 @@ absl::StatusOr<std::string> EncodeIndexedEntries(
   return output;
 }
 }  // namespace
-
-absl::StatusOr<std::string> EncodeIndexedOrderedEntries(
-    OrderedCollectionKind kind,
-    std::span<const OrderedCollectionEntry> entries) {
-  return EncodeIndexedEntries(kind, entries);
-}
-
-absl::StatusOr<std::string> EncodeIndexedOrderedEntries(
-    OrderedCollectionKind kind,
-    std::span<const OrderedCollectionEntryView> entries) {
-  return EncodeIndexedEntries(kind, entries);
-}
 
 absl::StatusOr<OrderedCompactReader> OrderedCompactReader::Open(
     OrderedCollectionKind kind, std::string_view encoded,
@@ -276,16 +392,7 @@ absl::StatusOr<std::string> EncodeOrderedCompactValue(
     return absl::InvalidArgumentError("invalid ordered full-image kind/count");
   }
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
-  if (version == 2) {
-    auto body = EncodeIndexedOrderedEntries(kind, entries);
-    if (!body.ok()) return body.status();
-    std::string encoded;
-    encoded.reserve(8 + body->size());
-    encoded.append(sorted ? "LZS2" : "LVL2");
-    Put(encoded, entries.size(), 4);
-    encoded.append(*body);
-    return encoded;
-  }
+  if (version == 2) return EncodeIndexedCompactValue(kind, entries);
   std::string encoded;
   std::size_t size = 8;
   for (const auto& entry : entries) {

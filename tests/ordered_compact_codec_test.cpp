@@ -296,10 +296,11 @@ TEST(IndexedOrderedTest,
       entries.push_back({member, score});
   std::sort(entries.begin(), entries.end(), OrderedEntryLess);
   auto body =
-      EncodeIndexedOrderedEntries(OrderedCollectionKind::kSortedSet, entries);
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
   ASSERT_TRUE(body.ok());
   auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kSortedSet,
-                                           *body, entries.size());
+                                           std::string_view(*body).substr(8),
+                                           entries.size());
   ASSERT_TRUE(reader.ok());
   for (double score :
        {-infinity, -3.0, -2.0, -1.0, -0.0, 0.0, 0.5, 1.25, 2.0, infinity}) {
@@ -417,13 +418,14 @@ TEST(IndexedOrderedTest,
   for (std::size_t i = 0; i < 128; ++i)
     entries.push_back({std::to_string(i), 0});
   auto body =
-      EncodeIndexedOrderedEntries(OrderedCollectionKind::kList, entries);
+      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 2);
   ASSERT_TRUE(body.ok());
   const auto offsets = body->size() - (entries.size() + 1) * 4;
   // The strict decoder must reject this page, but a point read checks its own
   // bounded interval, not a full-page walk hidden behind the offset lookup.
   IndexPut(*body, offsets + 9 * 4, UINT32_MAX, 4);
-  auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kList, *body,
+  auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kList,
+                                           std::string_view(*body).substr(8),
                                            entries.size());
   ASSERT_TRUE(reader.ok());
   EXPECT_FALSE(reader->At(8).ok());
@@ -435,6 +437,139 @@ TEST(IndexedOrderedTest,
   body->assign(body->size(), '\xff');
   for (std::size_t i = 0; i < 3; ++i)
     EXPECT_EQ(packed->view(i), std::to_string(100 + i));
+}
+
+// Test the real append adapters after moving an unstarted plan. Framing views
+// are ephemeral; one-byte extent reads must not overwrite a still-pending span.
+void CheckIndexedSplice(const OrderedCompactPayload& source,
+                        OrderedCollectionKind kind,
+                        const std::vector<OrderedCollectionEntry>& entries) {
+  auto expected = EncodeOrderedCompactValue(kind, entries, 2);
+  ASSERT_TRUE(expected.ok());
+  EXPECT_EQ(source.encoded_bytes(), expected->size());
+  for (const std::size_t chunk : {1, 3, 8, 257, 4096}) {
+    auto copied = source;
+    auto moved = std::move(copied);
+    RecordPayloadCursor cursor(moved);
+    std::string output(expected->size(), '\0');
+    for (std::size_t at = 0; at < output.size(); at += chunk) {
+      const auto size = std::min(chunk, output.size() - at);
+      ASSERT_TRUE(
+          cursor
+              .Read(std::as_writable_bytes(std::span(output.data() + at, size)))
+              .ok());
+    }
+    ASSERT_TRUE(cursor.Finish().ok());
+    EXPECT_EQ(output, *expected);
+  }
+  auto copied = source;
+  InlineRecordPayload payload(copied);
+  std::string output(expected->size() + 2, 'x');
+  ASSERT_TRUE(payload
+                  .WriteTo(std::as_writable_bytes(
+                      std::span(output.data() + 1, expected->size())))
+                  .ok());
+  EXPECT_EQ(output.substr(1, expected->size()), *expected);
+  EXPECT_EQ(output.front(), 'x');
+  EXPECT_EQ(output.back(), 'x');
+}
+
+TEST(IndexedOrderedSpliceTest, ListEndEditsBorrowValuesAndStreamOffsets) {
+  // The indexed alternative fits inside the existing v1 plan's inline space;
+  // cardinality changes neither the plan size nor its number of descriptors.
+  static_assert(sizeof(IndexedOrderedSplice) <= sizeof(CompactPayload));
+  const std::vector<std::string_view> inputs{"", "new",
+                                             std::string_view("a\0b", 3)};
+  for (std::size_t count : {1, 8, 257}) {
+    std::vector<OrderedCollectionEntry> entries;
+    for (std::size_t i = 0; i < count; ++i)
+      entries.push_back({std::string(i % 13, static_cast<char>(i)), 0});
+    auto bytes =
+        EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 2);
+    ASSERT_TRUE(bytes.ok());
+    auto reader =
+        OrderedCompactReader::Open(OrderedCollectionKind::kList, *bytes, count);
+    ASSERT_TRUE(reader.ok());
+    for (const auto first : {std::size_t{0}, count / 2, count}) {
+      for (const auto end : {first, count}) {
+        for (bool left : {false, true}) {
+          OrderedCompactPayload plan;
+          auto& splice = plan.V2(*reader->indexed());
+          if (left) splice.AppendValues(inputs, true);
+          splice.AppendSource(first, end - first);
+          if (!left) splice.AppendValues(inputs, false);
+          std::vector<OrderedCollectionEntry> expected(entries.begin() + first,
+                                                       entries.begin() + end);
+          for (const auto value : inputs) {
+            if (left)
+              expected.insert(expected.begin(), {std::string(value), 0});
+            else
+              expected.push_back({std::string(value), 0});
+          }
+          CheckIndexedSplice(plan, OrderedCollectionKind::kList, expected);
+        }
+      }
+    }
+    OrderedCompactPayload plan;
+    plan.V2(*reader->indexed()).AppendSource(0, count);
+    ASSERT_TRUE(plan.Next());  // Compact envelope.
+    auto values = plan.Next();
+    ASSERT_TRUE(values);
+    EXPECT_EQ(values->data(), bytes->data() + 8);
+    EXPECT_EQ(*values, reader->indexed()->data());
+  }
+}
+
+TEST(IndexedOrderedSpliceTest, SortedSetMovesDeleteAndInsertWithoutViewArrays) {
+  const std::vector<OrderedCollectionEntry> entries{{"", -10},
+                                                    {std::string("a\0b", 3), 0},
+                                                    {"bb", 0},
+                                                    {std::string(8000, 'c'), 5},
+                                                    {"tail", 10}};
+  auto bytes =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
+  ASSERT_TRUE(bytes.ok());
+  auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
+                                           *bytes, entries.size());
+  ASSERT_TRUE(reader.ok());
+  for (std::size_t removed = 0; removed <= entries.size(); ++removed) {
+    for (const std::optional<double> score :
+         {std::optional<double>{}, std::optional<double>{-20},
+          std::optional<double>{0}, std::optional<double>{7},
+          std::optional<double>{20}}) {
+      if (removed == entries.size() && !score) continue;
+      const auto member = removed == entries.size()
+                              ? std::string_view("new")
+                              : std::string_view(entries[removed].value_);
+      auto expected = entries;
+      if (removed < entries.size()) expected.erase(expected.begin() + removed);
+      if (score) expected.push_back({std::string(member), *score});
+      std::sort(expected.begin(), expected.end(), OrderedEntryLess);
+      OrderedCompactPayload plan;
+      auto& splice = plan.V2(*reader->indexed());
+      // Derive source runs from the independent final vector rather than the
+      // production planner's old-position/new-position traversal.
+      for (std::size_t i = 0; i < expected.size();) {
+        if (score && expected[i].value_ == member) {
+          splice.AppendMember(member, *score);
+          ++i;
+          continue;
+        }
+        const auto found =
+            std::find(entries.begin(), entries.end(), expected[i]);
+        ASSERT_NE(found, entries.end());
+        const auto first = static_cast<std::size_t>(found - entries.begin());
+        std::size_t count = 1;
+        while (i + count < expected.size() && first + count < entries.size() &&
+               first + count != removed &&
+               expected[i + count] == entries[first + count])
+          ++count;
+        splice.AppendSource(first, count);
+        i += count;
+      }
+      CheckIndexedSplice(plan, OrderedCollectionKind::kSortedSet, expected);
+    }
+  }
 }
 
 }  // namespace

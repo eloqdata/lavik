@@ -122,7 +122,7 @@ absl::StatusOr<std::string> EncodeList(std::span<const std::string> elements) {
 
 struct CompactListEdit {
   std::optional<MemoryReservation> admission_;
-  CompactPayload payload_;
+  OrderedCompactPayload payload_;
 };
 
 // Indexed end edits retain one data span and rebuild only numeric offsets.
@@ -167,10 +167,6 @@ absl::StatusOr<std::optional<CompactListEdit>> PlanIndexedListEnds(
     }
   if (length != 0 && size >= kCollectionPromotionBytes) return std::nullopt;
   CompactListEdit edit;
-  auto admission = TryReserveMemory(sizeof(std::string) + 1 + (length + 1) * 4 +
-                                    added * 256);
-  if (!admission) return std::nullopt;
-  edit.admission_.emplace(std::move(*admission));
   if (pop) {
     for (std::size_t i = 0; i < removed; ++i)
       result.values_.emplace_back(
@@ -179,29 +175,10 @@ absl::StatusOr<std::optional<CompactListEdit>> PlanIndexedListEnds(
   result.changed_ = pop ? removed != 0 : added != 0;
   result.length_ = length;
   if (length == 0) return edit;
-  auto& output = edit.payload_;
-  output.AppendBytes("LVL2");
-  output.AppendUnsigned(length, 4);
-  std::string offsets;
-  offsets.reserve((length + 1) * 4);
-  std::uint32_t offset = 0;
-  AppendU32(&offsets, 0);
-  auto append_inputs = [&] {
-    for (std::size_t i = 0; i < added; ++i) {
-      const auto value = operation.values_[left ? added - 1 - i : i];
-      output.AppendBytes(value);
-      offset += value.size();
-      AppendU32(&offsets, offset);
-    }
-  };
-  if (!pop && left) append_inputs();
-  if (!kept.empty()) output.AppendBytes(kept);
-  for (std::size_t i = first; i < last; ++i) {
-    offset += reader.At(i)->value_.size();
-    AppendU32(&offsets, offset);
-  }
-  if (!pop && !left) append_inputs();
-  output.AppendOwnedBytes(std::move(offsets));
+  auto& output = edit.payload_.V2(reader);
+  if (!pop && left) output.AppendValues(operation.values_, true);
+  output.AppendSource(first, last - first);
+  if (!pop && !left) output.AppendValues(operation.values_, false);
   return edit;
 }
 
@@ -247,7 +224,7 @@ absl::StatusOr<std::optional<CompactListEdit>> PlanCompactListEdit(
     edit.admission_ = TryReserveMemory(operation.values_.size() * 256);
     if (!edit.admission_) return std::nullopt;
   }
-  auto& output = edit.payload_;
+  auto& output = edit.payload_.V1();
   if (length != 0) {
     output.AppendBytes(kListMagic);
     output.AppendUnsigned(length, 4);

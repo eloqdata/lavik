@@ -499,7 +499,9 @@ a temporary hash set; write preparation and strict decoders retain that check.
 Public range replies opt into packed member bytes with separate scores and
 offset-based views; they do not require one owned string per returned member.
 Rank/score page readers copy borrowed members into page blocks before releasing
-the read lease, then transfer selected slices and blocks into the result.
+the read lease. Indexed serial reads copy the selected contiguous interval
+directly into a result block; page windows transfer selected slices and blocks
+from their admitted page results.
 Reverse order, bounds and LIMIT select the same logical members in either
 output representation. Replies retain their admitted buffers through encoding,
 including EXEC and Lua. Single-member mutation probes and after-images may

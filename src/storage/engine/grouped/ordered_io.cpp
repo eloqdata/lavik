@@ -257,6 +257,31 @@ StorageEngine::Impl::LoadSortedSetPage(
       });
 }
 
+absl::StatusOr<PackedSortedSetValues> StorageEngine::Impl::PackSortedSetPage(
+    std::span<const OrderedCollectionEntryView> entries) {
+  std::size_t bytes = 0;
+  for (const auto& entry : entries) {
+    if (entry.value_.size() > SIZE_MAX - bytes)
+      return absl::ResourceExhaustedError("Sorted Set page size overflow");
+    bytes += entry.value_.size();
+  }
+  PackedSortedSetValues result;
+  result.members_.blocks_.emplace_back(bytes, '\0');
+  result.members_.values_.reserve(entries.size());
+  result.scores_.reserve(entries.size());
+  auto& block = result.members_.blocks_.front();
+  std::size_t offset = 0;
+  for (const auto& entry : entries) {
+    result.members_.values_.push_back({0, offset, entry.value_.size()});
+    if (!entry.value_.empty())
+      std::memcpy(block.data() + offset, entry.value_.data(),
+                  entry.value_.size());
+    offset += entry.value_.size();
+    result.scores_.push_back(entry.score_);
+  }
+  return result;
+}
+
 Task<absl::StatusOr<PackedSortedSetValues>>
 StorageEngine::Impl::LoadPackedSortedSetPage(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -274,28 +299,7 @@ StorageEngine::Impl::LoadPackedSortedSetPage(
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)
           return absl::DataLossError("ordered page score bounds mismatch");
-        std::size_t bytes = 0;
-        for (const auto& entry : *entries) {
-          if (entry.value_.size() > SIZE_MAX - bytes)
-            return absl::ResourceExhaustedError(
-                "Sorted Set page size overflow");
-          bytes += entry.value_.size();
-        }
-        PackedSortedSetValues result;
-        result.members_.blocks_.emplace_back(bytes, '\0');
-        result.members_.values_.reserve(entries->size());
-        result.scores_.reserve(entries->size());
-        auto& block = result.members_.blocks_.front();
-        std::size_t offset = 0;
-        for (const auto& entry : *entries) {
-          result.members_.values_.push_back({0, offset, entry.value_.size()});
-          if (!entry.value_.empty())
-            std::memcpy(block.data() + offset, entry.value_.data(),
-                        entry.value_.size());
-          offset += entry.value_.size();
-          result.scores_.push_back(entry.score_);
-        }
-        return result;
+        return PackSortedSetPage(*entries);
       },
       limiter);
 }
