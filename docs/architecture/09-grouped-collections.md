@@ -236,15 +236,30 @@ identity space under the same Sorted Set type and incarnation. Recovery
 bounds each graph by its own root revision.
 
 New keys, compact promotions and streaming imports build both Sorted Set
-graphs before publication. The current unreleased v1 schema has no
-compatibility decoders or migration for earlier development layouts.
+graphs before publication. List and Sorted Set physical payloads accept v1 and
+v2 independently of the outer record/root version. Newly built compact values
+use `LVL2`/`LZS2`; newly built live ordered pages use envelope version 2.
+String/Stream pages and retired pages retain version 1. Existing v1 data
+remains readable; byte-splicing edits may retain its encoding, while rebuilt
+pages use v2. Older binaries cannot read v2 physical images.
 
-Page score bounds are derived runtime metadata, not new durable fields. Writes
-derive them from complete replacement pages and publish them with the same
-immutable directory/root view. Recovery derives them from the existing entry
-headers during the selected pages' checksum pass, skipping member payloads in
-bounded space. Physical relocation does not change logical bounds, and old
-read/snapshot views retain their own bounds.
+The indexed body concatenates item bytes, followed by a little-endian double
+score array for Sorted Sets and a little-endian u32 offset array with an end
+sentinel. Lists omit scores. Compact and grouped envelopes share this body;
+offsets address only the body data and permit empty items. Grouped full-image
+materialization and bounded collection streams emit v1 independently of the
+physical format; compact native after-images can carry either version. RDB
+export accepts both physical versions. The root/member Hash graph format is
+unchanged.
+
+Page score bounds are derived runtime metadata. Writers validate complete
+replacement pages before publication. Grouped recovery streams every offset
+and numeric score, skipping member data in bounded space; full decoders also
+check member uniqueness and binary ordering within score ties. Ordinary v2
+point/range reads trust published ordering, retain physical identity and the
+record's CRC policy, and validate the array envelope and accessed intervals.
+They do not repeat a full-page decode. Physical relocation preserves bounds,
+and retained snapshots keep their matching immutable directory/root view.
 
 Each group contains a complete snapshot, not a mutation log requiring read-time
 replay or compaction. An indivisible large field, list item or sorted-set
@@ -435,8 +450,9 @@ before deleting its destination. Failure paths release no-longer-needed
 working state before compensation and propagate compensation failure rather
 than disguising it as an ordinary admission rejection.
 
-List length uses root metadata. Indexed/range reads validate the corresponding
-rank pages completely and copy only requested values into owned replies.
+List length uses root metadata. V2 index/range reads use page-local offsets
+and copy only requested values into owned replies; v1 reads retain sequential
+framing validation. Compact Lists use the same indexed body and read contract.
 LRANGE opts into immutable byte blocks and element offsets: each selected
 page interval is copied once, and multi-page results keep rank order after
 out-of-order owner completion. Compact LRANGE uses the same result contract.
@@ -471,8 +487,13 @@ in requested order. Boundary pages and LIMIT bound speculative reads; optional
 window admission falls back to the single-page path. Window children release
 physical read leases before joining, while admitted decoded pages and reply
 ownership survive until consumption. Other range modes, rank, count, scan and
-random selection borrow member bytes from one owned read lease. These reads
-validate complete page framing, ordering and identity before consumption.
+random selection borrow member bytes from one owned read lease. V2 single-page
+ranges and serial fallbacks seek directly by rank or binary-search score bounds;
+score counts use the bound positions. Random selection accesses selected
+slots directly, and member ranks binary-search `(score, member)` within pages
+selected by the member graph and score directory. Full scans and mutation
+preparation retain complete decoding; ordinary indexed reads check only the
+accessed intervals after the common identity and CRC policy checks.
 Ordinary read-only scans trust the writer's member uniqueness without building
 a temporary hash set; write preparation and strict decoders retain that check.
 Public range replies opt into packed member bytes with separate scores and

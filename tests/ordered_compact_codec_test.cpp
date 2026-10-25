@@ -16,10 +16,12 @@
 
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
+#include <algorithm>
 #include <bit>
 #include <limits>
 
 #include "gtest/gtest.h"
+#include "support/ordered_v1.h"
 
 namespace lavik::storage {
 namespace {
@@ -208,6 +210,231 @@ TEST(OrderedCompactCodecTest, LargeListRoundTripsBeyondRecordLimit) {
 
 TEST(OrderedCompactCodecTest, LargeSortedSetRoundTripsBeyondRecordLimit) {
   CheckLargeLogicalRoundTrip(OrderedCollectionKind::kSortedSet);
+}
+
+void IndexPut(std::string& bytes, std::size_t offset, std::uint64_t value,
+              unsigned width) {
+  for (unsigned i = 0; i < width; ++i)
+    bytes[offset + i] = static_cast<char>(value >> (8 * i));
+}
+
+TEST(IndexedOrderedTest, CompactAndGroupedShareBodyAndPreserveV1) {
+  for (auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    for (std::size_t count : {1, 2, 17, 257}) {
+      std::vector<OrderedCollectionEntry> entries;
+      for (std::size_t i = 0; i < count; ++i)
+        entries.push_back(
+            {i % 3 == 0 ? std::string{}
+                        : std::string(i % 37, '\0') + std::to_string(i),
+             kind == OrderedCollectionKind::kSortedSet ? double(i) : 0});
+      // Sorted Sets cannot contain duplicate empty names even at different
+      // scores.
+      if (kind == OrderedCollectionKind::kSortedSet)
+        for (std::size_t i = 1; i < count; ++i)
+          entries[i].value_ += std::to_string(i);
+      auto compact = EncodeOrderedCompactValue(kind, entries, 2);
+      ASSERT_TRUE(compact.ok()) << compact.status();
+      EXPECT_EQ(compact->substr(0, 4),
+                kind == OrderedCollectionKind::kList ? "LVL2" : "LZS2");
+      OrderedGroupSnapshot page{
+          .kind_ = kind, .incarnation_ = 17, .id_ = 3, .entries_ = entries};
+      auto grouped = EncodeOrderedGroup(page);
+      ASSERT_TRUE(grouped.ok()) << grouped.status();
+      EXPECT_EQ((*grouped)[8], 2);
+      EXPECT_EQ(compact->substr(8), grouped->substr(kOrderedGroupHeaderBytes));
+      auto reader = OrderedCompactReader::Open(kind, *compact, count);
+      ASSERT_TRUE(reader.ok());
+      ASSERT_TRUE(reader->indexed());
+      for (std::size_t i = 0; i < count; ++i) {
+        auto at = reader->indexed()->At(count - i - 1);
+        auto next = reader->Next();
+        ASSERT_TRUE(at.ok());
+        ASSERT_TRUE(next.ok());
+        EXPECT_EQ(at->value_, entries[count - i - 1].value_);
+        EXPECT_EQ(next->value_, entries[i].value_);
+        EXPECT_EQ(at->score_, entries[count - i - 1].score_);
+      }
+      EXPECT_FALSE(reader->Next().ok());
+      auto decoded = DecodeOrderedGroup(*grouped);
+      ASSERT_TRUE(decoded.ok());
+      EXPECT_EQ(decoded->entries_, entries);
+      auto legacy = EncodeOrderedCompactValue(kind, entries);
+      ASSERT_TRUE(legacy.ok());
+      auto old_reader = OrderedCompactReader::Open(kind, *legacy, count);
+      ASSERT_TRUE(old_reader.ok());
+      EXPECT_FALSE(old_reader->indexed());
+      auto old_page = test::EncodeOrderedGroupV1(page);
+      ASSERT_TRUE(old_page.ok());
+      auto old_decoded = DecodeOrderedGroup(*old_page);
+      ASSERT_TRUE(old_decoded.ok());
+      EXPECT_EQ(old_decoded->entries_, entries);
+      for (const auto* wire : {&*grouped, &*old_page}) {
+        for (std::size_t chunk : {1, 3, 4, 7, 8, 63, 64, 65, 4096}) {
+          OrderedGroupMetadataDecoder decoder(wire->size());
+          for (std::size_t at = 0; at < wire->size(); at += chunk)
+            ASSERT_TRUE(
+                decoder.Read(std::string_view(*wire).substr(at, chunk)).ok());
+          auto metadata = decoder.Finish();
+          ASSERT_TRUE(metadata.ok()) << metadata.status();
+          EXPECT_EQ(metadata->item_count_, count);
+          EXPECT_EQ(metadata->min_score_, entries.front().score_);
+          EXPECT_EQ(metadata->max_score_, entries.back().score_);
+        }
+      }
+    }
+  }
+}
+
+TEST(IndexedOrderedTest,
+     BinaryBoundsMatchLinearReferenceIncludingTiesAndInfinities) {
+  const auto infinity = std::numeric_limits<double>::infinity();
+  std::vector<OrderedCollectionEntry> entries;
+  for (double score : {-infinity, -2.0, -0.0, 0.0, 1.25, infinity})
+    for (auto member : {std::string{}, std::string("a\0", 2),
+                        std::string("a\xff", 2), std::string("z")})
+      entries.push_back({member, score});
+  std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+  auto body =
+      EncodeIndexedOrderedEntries(OrderedCollectionKind::kSortedSet, entries);
+  ASSERT_TRUE(body.ok());
+  auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kSortedSet,
+                                           *body, entries.size());
+  ASSERT_TRUE(reader.ok());
+  for (double score :
+       {-infinity, -3.0, -2.0, -1.0, -0.0, 0.0, 0.5, 1.25, 2.0, infinity}) {
+    for (bool exclusive : {false, true}) {
+      const auto expected = std::find_if(entries.begin(), entries.end(),
+                                         [&](const auto& entry) {
+                                           return exclusive
+                                                      ? entry.score_ > score
+                                                      : entry.score_ >= score;
+                                         }) -
+                            entries.begin();
+      auto found = reader->LowerBoundScore(score, exclusive);
+      ASSERT_TRUE(found.ok());
+      EXPECT_EQ(*found, expected);
+    }
+    for (auto member : {std::string{}, std::string("a"), std::string("a\0", 2),
+                        std::string("zz")}) {
+      const OrderedCollectionEntry needle{member, score};
+      const auto expected = std::lower_bound(entries.begin(), entries.end(),
+                                             needle, OrderedEntryLess) -
+                            entries.begin();
+      auto found = reader->LowerBound(score, member);
+      ASSERT_TRUE(found.ok());
+      EXPECT_EQ(*found, expected);
+    }
+  }
+}
+
+TEST(IndexedOrderedTest, RejectsTruncatedArraysBadOffsetsAndUnknownVersions) {
+  for (auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    const std::vector<OrderedCollectionEntry> entries{
+        {"", 0}, {std::string("a\0b", 3), 0}, {"tail", 1}};
+    auto values = entries;
+    if (kind == OrderedCollectionKind::kList) values.back().score_ = 0;
+    auto encoded = EncodeOrderedCompactValue(kind, values, 2);
+    ASSERT_TRUE(encoded.ok());
+    for (std::size_t size = 0; size < encoded->size(); ++size) {
+      const auto truncated = encoded->substr(0, size);
+      auto reader = OrderedCompactReader::Open(kind, truncated, values.size());
+      bool valid = reader.ok();
+      if (reader.ok())
+        for (std::size_t i = 0; i < values.size(); ++i) {
+          if (!reader->Next().ok()) {
+            valid = false;
+            break;
+          }
+        }
+      EXPECT_FALSE(valid) << size;
+    }
+    auto bad = *encoded;
+    bad[3] = '3';
+    EXPECT_FALSE(OrderedCompactReader::Open(kind, bad, values.size()).ok());
+    const auto offsets = encoded->size() - (values.size() + 1) * 4;
+    for (std::size_t i = 0; i <= values.size(); ++i) {
+      bad = *encoded;
+      IndexPut(bad, offsets + i * 4, UINT32_MAX, 4);
+      EXPECT_FALSE(DecodeOrderedCompactValue(kind, bad, values.size()).ok());
+    }
+    if (kind == OrderedCollectionKind::kSortedSet) {
+      bad = *encoded;
+      IndexPut(bad, offsets - values.size() * 8 + 8,
+               std::bit_cast<std::uint64_t>(
+                   std::numeric_limits<double>::quiet_NaN()),
+               8);
+      EXPECT_FALSE(DecodeOrderedCompactValue(kind, bad, values.size()).ok());
+    }
+  }
+}
+
+TEST(IndexedOrderedTest,
+     GroupedRecoveryValidatesEveryOffsetAndScoreWithoutMemberStorage) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    OrderedGroupSnapshot page{
+        .kind_ = kind, .incarnation_ = 17, .id_ = 3, .entries_ = {}};
+    for (unsigned i = 0; i < 32; ++i)
+      page.entries_.push_back(
+          {std::to_string(i), kind == OrderedCollectionKind::kList ? 0.0 : i});
+    auto encoded = EncodeOrderedGroup(page);
+    ASSERT_TRUE(encoded.ok());
+    auto rejected = [&](const std::string& bytes) {
+      for (std::size_t chunk : {1, 7, 4096}) {
+        OrderedGroupMetadataDecoder decoder(bytes.size());
+        bool valid = true;
+        for (std::size_t at = 0; at < bytes.size(); at += chunk) {
+          if (!decoder.Read(std::string_view(bytes).substr(at, chunk)).ok()) {
+            valid = false;
+            break;
+          }
+        }
+        EXPECT_FALSE(valid && decoder.Finish().ok());
+      }
+    };
+    const auto offsets = encoded->size() - (page.entries_.size() + 1) * 4;
+    for (std::size_t i = 0; i <= page.entries_.size(); ++i) {
+      auto bad = *encoded;
+      IndexPut(bad, offsets + i * 4, UINT32_MAX, 4);
+      rejected(bad);
+    }
+    if (kind == OrderedCollectionKind::kSortedSet) {
+      for (double score : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
+        auto bad = *encoded;
+        IndexPut(bad, offsets - page.entries_.size() * 8 + 16 * 8,
+                 std::bit_cast<std::uint64_t>(score), 8);
+        rejected(bad);
+      }
+    }
+  }
+}
+
+TEST(IndexedOrderedTest,
+     PointReadsDoNotWalkUnrelatedEntriesAndRangesOwnTheirBytes) {
+  std::vector<OrderedCollectionEntry> entries;
+  for (std::size_t i = 0; i < 128; ++i)
+    entries.push_back({std::to_string(i), 0});
+  auto body =
+      EncodeIndexedOrderedEntries(OrderedCollectionKind::kList, entries);
+  ASSERT_TRUE(body.ok());
+  const auto offsets = body->size() - (entries.size() + 1) * 4;
+  // The strict decoder must reject this page, but a point read checks its own
+  // bounded interval, not a full-page walk hidden behind the offset lookup.
+  IndexPut(*body, offsets + 9 * 4, UINT32_MAX, 4);
+  auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kList, *body,
+                                           entries.size());
+  ASSERT_TRUE(reader.ok());
+  EXPECT_FALSE(reader->At(8).ok());
+  auto last = reader->At(127);
+  ASSERT_TRUE(last.ok());
+  EXPECT_EQ(last->value_, "127");
+  auto packed = reader->CopyRange(100, 3);
+  ASSERT_TRUE(packed.ok());
+  body->assign(body->size(), '\xff');
+  for (std::size_t i = 0; i < 3; ++i)
+    EXPECT_EQ(packed->view(i), std::to_string(100 + i));
 }
 
 }  // namespace

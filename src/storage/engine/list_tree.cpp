@@ -49,6 +49,19 @@ bool ReadU32(std::string_view input, std::size_t* offset,
 
 absl::StatusOr<std::vector<std::string>> DecodeList(
     std::string_view encoded, std::uint64_t expected_count) {
+  if (encoded.starts_with("LVL2")) {
+    auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kList,
+                                             encoded, expected_count);
+    if (!reader.ok()) return reader.status();
+    std::vector<std::string> elements;
+    elements.reserve(expected_count);
+    for (std::size_t i = 0; i < expected_count; ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return entry.status();
+      elements.emplace_back(entry->value_);
+    }
+    return elements;
+  }
   if (expected_count > std::numeric_limits<std::uint32_t>::max() ||
       encoded.size() < kListHeaderBytes ||
       encoded.substr(0, kListMagic.size()) != kListMagic) {
@@ -85,19 +98,24 @@ absl::StatusOr<std::string> EncodeList(std::span<const std::string> elements) {
     return absl::OutOfRangeError("invalid List element count");
   }
   std::string output;
-  std::size_t bytes = kListHeaderBytes;
+  std::size_t bytes = kListHeaderBytes + 4;
   for (const std::string& element : elements) {
     auto next = AppendOrderedEntrySize(OrderedCollectionKind::kList, bytes,
                                        element.size(), output.max_size());
     if (!next.ok()) return next.status();
     bytes = *next;
   }
+  if (bytes > UINT32_MAX)
+    return absl::OutOfRangeError("List index exceeds offset range");
   output.reserve(bytes);
-  output.append(kListMagic);
+  output.append("LVL2");
   AppendU32(&output, static_cast<std::uint32_t>(elements.size()));
-  for (const std::string& element : elements) {
-    AppendU32(&output, static_cast<std::uint32_t>(element.size()));
-    output.append(element);
+  for (const auto& element : elements) output.append(element);
+  std::uint32_t offset = 0;
+  AppendU32(&output, 0);
+  for (const auto& element : elements) {
+    offset += element.size();
+    AppendU32(&output, offset);
   }
   return output;
 }
@@ -106,6 +124,86 @@ struct CompactListEdit {
   std::optional<MemoryReservation> admission_;
   CompactPayload payload_;
 };
+
+// Indexed end edits retain one data span and rebuild only numeric offsets.
+// Published bytes remain immutable; the caller holds the source lease through
+// consumption of this borrowed plan, as for the v1 byte-splicing path.
+absl::StatusOr<std::optional<CompactListEdit>> PlanIndexedListEnds(
+    const IndexedOrderedReader& reader, const ListOperation& operation,
+    ListResult& result) {
+  using Kind = ListOperationKind;
+  const bool pop =
+      operation.kind_ == Kind::kPopLeft || operation.kind_ == Kind::kPopRight;
+  const bool left = operation.kind_ == Kind::kPushLeft ||
+                    operation.kind_ == Kind::kPushLeftIfExists ||
+                    operation.kind_ == Kind::kPopLeft;
+  const auto removed =
+      pop ? std::min<std::uint64_t>(operation.count_, reader.size()) : 0;
+  const auto added = pop ? 0 : operation.values_.size();
+  if (added > UINT32_MAX - (reader.size() - removed))
+    return absl::OutOfRangeError("invalid List element count");
+  const auto length = reader.size() - removed + added;
+  const auto first = pop && left ? removed : 0;
+  const auto last = reader.size() - (pop && !left ? removed : 0);
+  // Writers still inspect the complete immutable source before accepting an
+  // after-image. Point readers use the already-published index independently.
+  for (std::size_t i = 0; i < reader.size(); ++i) {
+    auto entry = reader.At(i);
+    if (!entry.ok()) return entry.status();
+  }
+  std::string_view kept;
+  if (first != last) {
+    const auto begin = reader.At(first)->value_;
+    const auto end = reader.At(last - 1)->value_;
+    kept =
+        std::string_view(begin.data(), end.data() + end.size() - begin.data());
+  }
+  std::size_t size = 12 + length * 4 + kept.size();
+  if (!pop)
+    for (const auto value : operation.values_) {
+      if (value.size() > kMaxStringBytes || value.size() > SIZE_MAX - size)
+        return absl::OutOfRangeError("List element exceeds encoding limits");
+      size += value.size();
+    }
+  if (length != 0 && size >= kCollectionPromotionBytes) return std::nullopt;
+  CompactListEdit edit;
+  auto admission = TryReserveMemory(sizeof(std::string) + 1 + (length + 1) * 4 +
+                                    added * 256);
+  if (!admission) return std::nullopt;
+  edit.admission_.emplace(std::move(*admission));
+  if (pop) {
+    for (std::size_t i = 0; i < removed; ++i)
+      result.values_.emplace_back(
+          reader.At(left ? i : reader.size() - 1 - i)->value_);
+  }
+  result.changed_ = pop ? removed != 0 : added != 0;
+  result.length_ = length;
+  if (length == 0) return edit;
+  auto& output = edit.payload_;
+  output.AppendBytes("LVL2");
+  output.AppendUnsigned(length, 4);
+  std::string offsets;
+  offsets.reserve((length + 1) * 4);
+  std::uint32_t offset = 0;
+  AppendU32(&offsets, 0);
+  auto append_inputs = [&] {
+    for (std::size_t i = 0; i < added; ++i) {
+      const auto value = operation.values_[left ? added - 1 - i : i];
+      output.AppendBytes(value);
+      offset += value.size();
+      AppendU32(&offsets, offset);
+    }
+  };
+  if (!pop && left) append_inputs();
+  if (!kept.empty()) output.AppendBytes(kept);
+  for (std::size_t i = first; i < last; ++i) {
+    offset += reader.At(i)->value_.size();
+    AppendU32(&offsets, offset);
+  }
+  if (!pop && !left) append_inputs();
+  output.AppendOwnedBytes(std::move(offsets));
+  return edit;
+}
 
 // Only end edits need this borrowed plan. General List operations and
 // promotion keep their owned builder. Pop owns just the returned elements.
@@ -127,6 +225,8 @@ absl::StatusOr<std::optional<CompactListEdit>> PlanCompactListEdit(
   auto reader =
       OrderedCompactReader::Open(OrderedCollectionKind::kList, payload, count);
   if (!reader.ok()) return reader.status();
+  if (reader->indexed())
+    return PlanIndexedListEnds(*reader->indexed(), operation, result);
   std::size_t size = payload.size();
   if (push) {
     if (operation.values_.size() > UINT32_MAX - count)
@@ -222,6 +322,75 @@ std::pair<std::uint64_t, std::uint64_t> NormalizeRange(std::int64_t start,
                                 ? size
                                 : static_cast<std::uint64_t>(last) + 1;
   return begin < end ? std::pair(begin, end) : std::pair(size, size);
+}
+
+// Stored v2 point/range reads validate only the selected intervals. The
+// encoders validate the complete source; the loader checks record
+// identity and configured CRC before this projection sees immutable bytes.
+absl::StatusOr<ListResult> ReadIndexedList(std::string_view encoded,
+                                           std::uint64_t expected_count,
+                                           const ListOperation& operation) {
+  auto source = OrderedCompactReader::Open(OrderedCollectionKind::kList,
+                                           encoded, expected_count);
+  if (!source.ok()) return source.status();
+  assert(source->indexed());
+  const auto& reader = *source->indexed();
+  ListResult result;
+  result.key_exists_ = true;
+  result.length_ = reader.size();
+  auto [first, last] =
+      NormalizeRange(operation.first_, operation.second_, reader.size());
+  if (operation.kind_ == ListOperationKind::kIndex) {
+    const auto at = NormalizeIndex(operation.first_, reader.size());
+    if (!at) return result;
+    first = *at;
+    last = first + 1;
+  }
+  if (first == last) return result;
+  auto begin = reader.At(first);
+  auto end = reader.At(last - 1);
+  if (!begin.ok()) return begin.status();
+  if (!end.ok()) return end.status();
+  const auto start =
+      static_cast<std::size_t>(begin->value_.data() - reader.data().data());
+  const auto stop =
+      static_cast<std::size_t>(end->value_.data() - reader.data().data()) +
+      end->value_.size();
+  if (stop < start) return absl::DataLossError("invalid List range offsets");
+  const auto count = last - first;
+  auto admission = TryReserveMemory(
+      sizeof(PackedValues) + 2 * sizeof(std::string) + stop - start +
+      count * (sizeof(std::string) + sizeof(PackedValues::Slice) + 32));
+  if (!admission) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("OOM List indexed output");
+  }
+  std::size_t retained = 0;
+  if (operation.kind_ == ListOperationKind::kRange &&
+      operation.packed_output_) {
+    auto packed = reader.CopyRange(first, count);
+    if (!packed.ok()) return packed.status();
+    result.packed_values_ = std::make_unique<PackedValues>(std::move(*packed));
+    retained = sizeof(PackedValues) +
+               result.packed_values_->values_.capacity() *
+                   sizeof(PackedValues::Slice) +
+               result.packed_values_->blocks_.capacity() * sizeof(std::string) +
+               result.packed_values_->blocks_[0].capacity() + 1;
+  } else {
+    result.values_.reserve(count);
+    for (std::size_t i = first; i < last; ++i) {
+      auto entry = reader.At(i);
+      if (!entry.ok()) return entry.status();
+      result.values_.emplace_back(entry->value_);
+      retained += result.values_.back().capacity() + 1;
+    }
+    retained += result.values_.capacity() * sizeof(std::string);
+  }
+  if (retained > admission->bytes())
+    return absl::ResourceExhaustedError(
+        "List indexed output exceeds admission");
+  result.retained_charge_.Adopt(&*admission, retained);
+  return result;
 }
 
 // Compact LRANGE projects directly while the source read lease is live.
@@ -345,7 +514,7 @@ bool IsReadOnly(const ListOperation& operation) {
 }
 
 bool NeedsGroupedList(std::span<const std::string> elements) {
-  std::size_t bytes = kListHeaderBytes;
+  std::size_t bytes = kListHeaderBytes + 4;
   for (const auto& element : elements) {
     bytes += sizeof(std::uint32_t) + element.size();
     if (bytes >= kCollectionPromotionBytes) return true;
@@ -427,6 +596,11 @@ absl::StatusOr<ListResult> ReadCompactList(const CompactReadResult& value,
   ListResult result;
   result.key_exists_ = value->has_value();
   result.length_ = *value ? (**value).logical_size_ : 0;
+  if (*value && (**value).encoded_.starts_with("LVL2") &&
+      (operation.kind_ == ListOperationKind::kIndex ||
+       operation.kind_ == ListOperationKind::kRange))
+    return ReadIndexedList((**value).encoded_, (**value).logical_size_,
+                           operation);
   if (*value && operation.kind_ == ListOperationKind::kRange &&
       operation.packed_output_)
     return ReadPackedListRange((**value).encoded_, (**value).logical_size_,
@@ -643,6 +817,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     const auto bytes = loaded->value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                    bytes.size());
+    if (read_only && payload.starts_with("LVL2") &&
+        (operation.kind_ == ListOperationKind::kIndex ||
+         operation.kind_ == ListOperationKind::kRange))
+      co_return ReadIndexedList(payload, location.logical_size_, operation);
     if (read_only && operation.kind_ == ListOperationKind::kRange &&
         operation.packed_output_)
       co_return ReadPackedListRange(payload, location.logical_size_, operation);

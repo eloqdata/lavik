@@ -219,25 +219,41 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::LoadOrderedListRange(
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedSortedSetPage>>
-StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
-                                       WorkerStore::PartitionStore& partition,
-                                       std::uint8_t db_id, std::string_view key,
-                                       const Digest& digest,
-                                       GroupedObject::Handle object,
-                                       std::uint64_t page_id,
-                                       SortedSetMemberValidation validation) {
+StorageEngine::Impl::LoadSortedSetPage(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, std::uint64_t page_id,
+    SortedSetMemberValidation validation, bool indexed) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
-      [validation](
+      [validation, indexed](
           std::string_view payload, std::uint64_t,
           const OrderedGroupEntry& route,
           LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
+        if (indexed && validation == SortedSetMemberValidation::kTrustStored) {
+          auto metadata = DecodeOrderedGroupMetadata(payload, payload.size());
+          if (!metadata.ok()) return metadata.status();
+          if (metadata->version_ == 2) {
+            auto reader = IndexedOrderedReader::Open(
+                metadata->kind_, payload.substr(kOrderedGroupHeaderBytes),
+                metadata->item_count_);
+            if (!reader.ok()) return reader.status();
+            const auto first = reader->Score(0),
+                       last = reader->Score(reader->size() - 1);
+            if (!first.ok()) return first.status();
+            if (!last.ok()) return last.status();
+            if (*first != route.min_score_ || *last != route.max_score_)
+              return absl::DataLossError("ordered page score bounds mismatch");
+            return LoadedSortedSetPage{std::move(loaded), {}, *reader};
+          }
+        }
         auto entries = DecodeSortedSetGroupViews(payload, validation);
         if (!entries.ok()) return entries.status();
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)
           return absl::DataLossError("ordered page score bounds mismatch");
-        return LoadedSortedSetPage{std::move(loaded), std::move(*entries)};
+        return LoadedSortedSetPage{std::move(loaded), std::move(*entries),
+                                   std::nullopt};
       });
 }
 

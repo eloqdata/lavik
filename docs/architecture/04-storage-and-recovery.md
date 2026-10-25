@@ -250,9 +250,11 @@ The compact Stream payload uses the current `LXS1` layout, including persisted
 macro-node entry counts that preserve approximate-trim boundaries across
 restart and RDB export/import. It does not reconstruct those boundaries from
 current settings or accept earlier development layouts without node counts.
-Lavik-owned storage schemas remain at v1 while unreleased; incompatible
-development media is recreated, not migrated. Redis RDB versions follow the
-external Redis format independently. Grouped Streams
+Outer records, roots and Stream payloads retain version 1. List and Sorted Set
+physical payloads independently accept v1 and indexed v2, as described in
+[grouped collections](09-grouped-collections.md); older binaries cannot consume
+v2 payloads. Redis RDB versions follow the external Redis format independently.
+Grouped Streams
 project their ordered records into the same logical format; the grouped root
 and page identities remain local durable metadata.
 

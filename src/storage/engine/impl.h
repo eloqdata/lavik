@@ -66,6 +66,7 @@
 #include "lavik/storage/detail/compact_write.h"
 #include "lavik/storage/detail/grouped/object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
+#include "lavik/storage/detail/ordered_index.h"
 #include "lavik/storage/detail/record_index.h"
 #include "lavik/storage/detail/record_payload_cursor.h"
 #include "lavik/storage/detail/replica_collection_stage.h"
@@ -3710,6 +3711,9 @@ class StorageEngine::Impl {
   struct LoadedSortedSetPage {
     LoadedValue loaded_;
     std::vector<OrderedCollectionEntryView> entries_;
+    // Only opt-in point/range callers use this borrowed index. Full scans and
+    // mutation preparation retain their checked, materialized entry vectors.
+    std::optional<IndexedOrderedReader> indexed_;
   };
 
   std::size_t DirectGetValueLimit() const noexcept;
@@ -4520,7 +4524,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       SortedSetMemberValidation validation =
-          SortedSetMemberValidation::kVerifyUnique);
+          SortedSetMemberValidation::kVerifyUnique,
+      bool indexed = false);
   // Copies one checked page into a contiguous member block before releasing
   // its lease. The caller admits page scratch/output before launch.
   Task<absl::StatusOr<PackedSortedSetValues>> LoadPackedSortedSetPage(

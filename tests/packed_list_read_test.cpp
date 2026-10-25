@@ -9,7 +9,9 @@
 
 #include "gtest/gtest.h"
 #include "lavik/storage/detail/grouped/collection.h"
+#include "lavik/storage/detail/ordered_compact_codec.h"
 #include "lavik/storage/engine.h"
+#include "support/ordered_v1.h"
 
 namespace lavik::storage {
 namespace {
@@ -64,9 +66,9 @@ TEST(PackedListPageTest, ProjectsEveryIntervalWithoutBorrowingTheSource) {
   EXPECT_EQ(selected->blocks_[0].size(), 3);
 }
 
-TEST(PackedListPageTest, ValidatesSkippedEntriesAndEnvelope) {
+TEST(PackedListPageTest, V1ValidatesSkippedEntriesAndEnvelope) {
   auto page = ListPage({"item-0", "item-1", "item-2"});
-  auto encoded = EncodeOrderedGroup(page);
+  auto encoded = test::EncodeOrderedGroupV1(page);
   ASSERT_TRUE(encoded.ok());
   for (const auto index : {0, 2}) {
     const auto offset = kOrderedGroupHeaderBytes + index * (12 + 6);
@@ -96,7 +98,7 @@ TEST(PackedListPageTest, ValidatesSkippedEntriesAndEnvelope) {
       DecodePackedOrderedListRange(*encoded, 1, SIZE_MAX).status()));
   page.entries_.clear();
   page.retired_ = true;
-  auto retired = EncodeOrderedGroup(page);
+  auto retired = test::EncodeOrderedGroupV1(page);
   ASSERT_TRUE(retired.ok());
   EXPECT_TRUE(
       absl::IsDataLoss(DecodePackedOrderedListRange(*retired, 0, 0).status()));
@@ -220,6 +222,135 @@ TEST_F(PackedCompactListTest, FlagDoesNotChangeMutableConsumerRepresentation) {
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(result->packed_values_, nullptr);
   EXPECT_EQ(result->values_, std::vector<std::string>{"second"});
+}
+
+TEST_F(PackedCompactListTest, IndexedRangesAndIndexesMatchV1) {
+  const std::vector<std::string> items{"", std::string("a\0b", 3),
+                                       std::string(8192, 'x'), "tail"};
+  std::vector<OrderedCollectionEntry> entries;
+  for (const auto& item : items) entries.push_back({item, 0});
+  auto indexed =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 2);
+  ASSERT_TRUE(indexed.ok());
+  const auto legacy = CompactList(items);
+  const std::vector<std::int64_t> bounds{INT64_MIN, -6, -4, -2,  -1,       0,
+                                         1,         3,  4,  100, INT64_MAX};
+  for (auto first : bounds) {
+    for (auto last : bounds) {
+      const ListOperation expected_op{
+          .kind_ = ListOperationKind::kRange, .first_ = first, .second_ = last};
+      auto expected =
+          ReadCompactList(CompactView(legacy, items.size()), expected_op);
+      ASSERT_TRUE(expected.ok());
+      for (bool packed : {false, true}) {
+        auto source = *indexed;
+        auto op = expected_op;
+        op.packed_output_ = packed;
+        auto result = ReadCompactList(CompactView(source, items.size()), op);
+        ASSERT_TRUE(result.ok()) << result.status();
+        source.assign(source.size(), '\xff');
+        auto moved = std::move(*result);
+        ASSERT_EQ(moved.value_count(), expected->value_count());
+        for (std::size_t i = 0; i < moved.value_count(); ++i)
+          EXPECT_EQ(moved.value_view(i), expected->value_view(i));
+      }
+    }
+    const ListOperation op{.kind_ = ListOperationKind::kIndex, .first_ = first};
+    auto expected = ReadCompactList(CompactView(legacy, items.size()), op);
+    auto result = ReadCompactList(CompactView(*indexed, items.size()), op);
+    ASSERT_TRUE(expected.ok());
+    ASSERT_TRUE(result.ok()) << result.status();
+    EXPECT_EQ(result->values_, expected->values_);
+  }
+}
+
+TEST_F(PackedCompactListTest,
+       IndexedProductionPointReadDoesNotDecodeUnselectedEntries) {
+  std::vector<OrderedCollectionEntry> entries;
+  for (std::size_t i = 0; i < 128; ++i)
+    entries.push_back({std::to_string(i), 0});
+  auto bytes =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 2);
+  ASSERT_TRUE(bytes.ok());
+  const auto offset = bytes->size() - (entries.size() + 1) * 4 + 9 * 4;
+  for (unsigned i = 0; i < 4; ++i) (*bytes)[offset + i] = '\xff';
+  EXPECT_FALSE(DecodeOrderedCompactValue(OrderedCollectionKind::kList, *bytes,
+                                         entries.size())
+                   .ok());
+  auto result = ReadCompactList(
+      CompactView(*bytes, entries.size()),
+      ListOperation{.kind_ = ListOperationKind::kIndex, .first_ = -1});
+  ASSERT_TRUE(result.ok()) << result.status();
+  ASSERT_EQ(result->values_.size(), 1);
+  EXPECT_EQ(result->values_.front(), "127");
+  EXPECT_FALSE(ReadCompactList(CompactView(*bytes, entries.size()),
+                               ListOperation{.kind_ = ListOperationKind::kIndex,
+                                             .first_ = 8})
+                   .ok());
+}
+
+TEST_F(PackedCompactListTest,
+       IndexedSortedSetQueriesMatchV1BoundsLimitsAndReverse) {
+  const auto infinity = std::numeric_limits<double>::infinity();
+  const std::vector<OrderedCollectionEntry> entries{
+      {"lo", -infinity}, {"", -2}, {std::string("a\0", 2), -0.0},
+      {"b", 0},          {"c", 0}, {"d", 1.25},
+      {"hi", infinity}};
+  auto legacy =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+  auto indexed =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
+  ASSERT_TRUE(legacy.ok());
+  ASSERT_TRUE(indexed.ok());
+  auto compare = [&](const SortedSetOperation& op) {
+    auto expected =
+        ReadCompactSortedSet(CompactView(*legacy, entries.size()), op);
+    auto source = *indexed;
+    auto result = ReadCompactSortedSet(CompactView(source, entries.size()), op);
+    ASSERT_TRUE(expected.ok()) << expected.status();
+    ASSERT_TRUE(result.ok()) << result.status();
+    source.assign(source.size(), '\xff');
+    EXPECT_EQ(result->count_, expected->count_);
+    ASSERT_EQ(result->member_count(), expected->member_count());
+    for (std::size_t i = 0; i < result->member_count(); ++i) {
+      EXPECT_EQ(result->member_view(i).member_,
+                expected->member_view(i).member_);
+      EXPECT_EQ(result->member_view(i).score_, expected->member_view(i).score_);
+    }
+  };
+  for (bool reverse : {false, true})
+    for (bool packed : {false, true}) {
+      for (std::int64_t first : {INT64_MIN, std::int64_t(-8), std::int64_t(-1),
+                                 std::int64_t(0), std::int64_t(2), INT64_MAX})
+        for (std::int64_t last :
+             {std::int64_t(-1), std::int64_t(0), std::int64_t(3), INT64_MAX})
+          compare(SortedSetOperation{.kind_ = SortedSetOperationKind::kRange,
+                                     .reverse_ = reverse,
+                                     .first_ = first,
+                                     .last_ = last,
+                                     .packed_output_ = packed});
+      for (double low : {-infinity, -2.0, -0.0, 1.25, infinity})
+        for (double high : {-2.0, 0.0, 1.25, infinity})
+          for (bool exclusive : {false, true}) {
+            SortedSetOperation op{.kind_ = SortedSetOperationKind::kRange,
+                                  .range_mode_ = SortedSetRangeMode::kScore,
+                                  .reverse_ = reverse,
+                                  .minimum_score_ = {low, exclusive},
+                                  .maximum_score_ = {high, !exclusive},
+                                  .packed_output_ = packed};
+            compare(op);
+            op.limit_ = true;
+            for (std::int64_t offset : {-1, 0, 2, 20})
+              for (std::int64_t count : {-1, 0, 1, 3}) {
+                op.offset_ = offset;
+                op.count_ = count;
+                compare(op);
+              }
+            op.kind_ = SortedSetOperationKind::kCount;
+            op.limit_ = false;
+            compare(op);
+          }
+    }
 }
 
 }  // namespace

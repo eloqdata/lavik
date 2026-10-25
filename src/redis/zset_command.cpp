@@ -316,30 +316,6 @@ void Put64(std::string* out, std::uint64_t value) {
     out->push_back(static_cast<char>(value >> (i * 8)));
 }
 
-bool Get32(std::string_view in, std::size_t* offset, std::uint32_t* value) {
-  if (*offset > in.size() || in.size() - *offset < 4) return false;
-  *value = 0;
-  for (unsigned i = 0; i != 4; ++i) {
-    *value |=
-        static_cast<std::uint32_t>(static_cast<unsigned char>(in[*offset + i]))
-        << (i * 8);
-  }
-  *offset += 4;
-  return true;
-}
-
-bool Get64(std::string_view in, std::size_t* offset, std::uint64_t* value) {
-  if (*offset > in.size() || in.size() - *offset < 8) return false;
-  *value = 0;
-  for (unsigned i = 0; i != 8; ++i) {
-    *value |=
-        static_cast<std::uint64_t>(static_cast<unsigned char>(in[*offset + i]))
-        << (i * 8);
-  }
-  *offset += 8;
-  return true;
-}
-
 void Sort(ZSet* set) {
   std::sort(set->begin(), set->end(), [](const Element& a, const Element& b) {
     return a.score_ < b.score_ ||
@@ -350,33 +326,17 @@ void Sort(ZSet* set) {
 absl::StatusOr<ZSet> Decode(
     const std::optional<storage::CompactValueView>& value) {
   if (!value.has_value()) return ZSet{};
-  const std::string_view in = value->encoded_;
-  if (!in.starts_with(kMagic))
-    return absl::InternalError("invalid persisted Sorted Set");
-  std::size_t offset = kMagic.size();
-  std::uint32_t count = 0;
-  if (!Get32(in, &offset, &count) || count != value->logical_size_ ||
-      count > (in.size() - offset) / 12) {
-    return absl::InternalError("invalid persisted Sorted Set cardinality");
-  }
+  auto reader = storage::OrderedCompactReader::Open(
+      storage::OrderedCollectionKind::kSortedSet, value->encoded_,
+      value->logical_size_);
+  if (!reader.ok()) return reader.status();
   ZSet set;
-  set.reserve(count);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    std::uint64_t bits = 0;
-    std::uint32_t size = 0;
-    if (!Get64(in, &offset, &bits) || !Get32(in, &offset, &size) ||
-        offset > in.size() || size > storage::kMaxStringBytes ||
-        size > in.size() - offset) {
-      return absl::InternalError("truncated persisted Sorted Set");
-    }
-    const double score = std::bit_cast<double>(bits);
-    if (std::isnan(score))
-      return absl::InternalError("NaN persisted Sorted Set score");
-    set.push_back({std::string(in.substr(offset, size)), score});
-    offset += size;
+  set.reserve(reader->size());
+  for (std::size_t i = 0; i < reader->size(); ++i) {
+    auto entry = reader->Next();
+    if (!entry.ok()) return entry.status();
+    set.push_back({std::string(entry->value_), entry->score_});
   }
-  if (offset != in.size())
-    return absl::InternalError("trailing persisted Sorted Set bytes");
   Sort(&set);
   return set;
 }

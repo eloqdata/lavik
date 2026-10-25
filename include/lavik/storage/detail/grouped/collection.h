@@ -82,7 +82,8 @@ constexpr OrderedCollectionKind OrderedKind(ValueType type) noexcept {
 
 struct OrderedCollectionEntry {
   std::string value_;
-  double score_ = 0;  // Lists and Streams require positive zero on disk.
+  double score_ =
+      0;  // Lists/Streams require +0; indexed Lists omit it on disk.
   bool operator==(const OrderedCollectionEntry&) const noexcept = default;
 };
 
@@ -133,6 +134,7 @@ class EncodedSortedSetEntries {
     return entries_;
   }
   std::string_view bytes() const noexcept { return *bytes_; }
+  std::uint32_t version() const noexcept { return version_; }
 
  private:
   friend absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
@@ -144,11 +146,15 @@ class EncodedSortedSetEntries {
                             std::optional<double> after,
                             std::size_t target_bytes);
   EncodedSortedSetEntries(LocalSharedPtr<const std::string> bytes,
-                          std::vector<OrderedCollectionEntryView> entries)
-      : bytes_(std::move(bytes)), entries_(std::move(entries)) {}
+                          std::vector<OrderedCollectionEntryView> entries,
+                          std::uint32_t version = 1)
+      : bytes_(std::move(bytes)),
+        entries_(std::move(entries)),
+        version_(version) {}
   // Declare the owner first so every borrowing view dies before its bytes.
   LocalSharedPtr<const std::string> bytes_;
   std::vector<OrderedCollectionEntryView> entries_;
+  std::uint32_t version_;
 };
 
 struct OrderedCollectionRoot {
@@ -236,8 +242,22 @@ inline std::size_t OrderedGroupSize(
 }
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
-// Each ordered item stores its byte length and score before its value.
+// Version 1 and Stream items store length/score before each value. Version 2
+// Lists/Sorted Sets instead have tail arrays; their planners use the helpers
+// below, including one extra end offset per live page.
 inline constexpr std::size_t kOrderedEntryHeaderBytes = 12;
+constexpr bool HasOrderedIndex(OrderedCollectionKind kind) noexcept {
+  return kind == OrderedCollectionKind::kList ||
+         kind == OrderedCollectionKind::kSortedSet;
+}
+constexpr std::size_t OrderedEntryOverhead(
+    OrderedCollectionKind kind) noexcept {
+  return kind == OrderedCollectionKind::kList ? 4 : 12;
+}
+constexpr std::size_t OrderedGroupFixedBytes(
+    OrderedCollectionKind kind) noexcept {
+  return kOrderedGroupHeaderBytes + (HasOrderedIndex(kind) ? 4 : 0);
+}
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
 inline constexpr std::size_t kGroupedStreamRootBytes =
     kOrderedCollectionRootBytes + 8;
@@ -252,10 +272,12 @@ struct OrderedGroupMetadata {
   std::uint64_t next_ = 0;
   std::uint32_t item_count_ = 0;
   bool retired_ = false;
-  // Derived from entry headers, not additional durable fields. List and
-  // retired pages use zero; live Sorted Set pages retain exact score bounds.
+  // Derived from v1 entry headers or v2 score arrays, not additional fields.
+  // List and retired pages use zero; live Sorted Set pages retain exact score
+  // bounds.
   double min_score_ = 0;
   double max_score_ = 0;
+  std::uint32_t version_ = 1;
 };
 
 // Recovery reads this checked envelope only after the outer-header winner and
@@ -266,11 +288,12 @@ struct OrderedGroupMetadata {
 absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes);
 
-// Reconstructs routing metadata from the existing page encoding in bounded
+// Reconstructs routing metadata from either page encoding in bounded
 // space. Feed the complete payload in order, after verifying any physical
 // checksum present on each fragment. Member bytes are skipped, never retained.
-// This validates framing and numeric score order, not member uniqueness or
-// equal-score member ordering; full page decoding checks those properties.
+// This validates framing, all v2 offsets and numeric score order, not member
+// uniqueness or equal-score member ordering; full page decoding checks those
+// properties.
 class OrderedGroupMetadataDecoder {
  public:
   explicit OrderedGroupMetadataDecoder(std::size_t encoded_bytes) noexcept
@@ -288,6 +311,9 @@ class OrderedGroupMetadataDecoder {
   bool failed_ = false;
   std::array<char, kOrderedGroupHeaderBytes> header_{};
   OrderedGroupMetadata metadata_;
+  std::size_t data_bytes_ = 0;
+  std::size_t previous_offset_ = 0;
+  std::size_t scores_ = 0;
 };
 
 // The cursor validates before emitting any data and borrows immutable entry
@@ -309,6 +335,8 @@ class OrderedGroupEncoder {
   std::size_t encoded_bytes_ = 0;
   std::size_t entry_ = 0;
   unsigned phase_ = 0;
+  std::uint32_t version_ = 1;
+  std::size_t value_offset_ = 0;
 };
 
 absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
@@ -349,13 +377,14 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
 // unchanged.
 void MaterializeOrderedGroupEntries(OrderedGroupSnapshot& page);
 
-// Validates a complete live List page, including entries outside the requested
-// interval, but allocates/copies only [first, first + count). The interval must
-// fit the page. Returned strings own their bytes independently of the payload.
+// Projects [first, first + count) from a live stored List page. V2 validates
+// the index envelope and selected intervals without walking other entries;
+// v1 retains full framing validation. Strict imports/mutations use
+// DecodeOrderedGroup. Returned strings own their bytes independently of input.
 absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
     std::string_view bytes, std::size_t first, std::size_t count);
 
-// Same full-page validation, with one owned block for the selected interval
+// Same stored-read contract, with one owned block for the selected interval
 // and offsets for its elements. No returned view borrows the source payload.
 // The caller admits output and temporary slice storage before decoding.
 absl::StatusOr<PackedValues> DecodePackedOrderedListRange(
