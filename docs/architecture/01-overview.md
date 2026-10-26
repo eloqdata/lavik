@@ -42,6 +42,10 @@ plaintext IPv4 TCP through Bycorf's private FreeBSD stack while preserving the
 same RESP stream interface and worker ownership. Software packet forwarding
 allows connection owners to outnumber hardware queue pairs. File I/O and
 cross-worker wakeups retain io_uring, and networking shares one EAL with SPDK.
+Before publishing storage readiness or opening Redis listeners, startup checks
+DPDK's remaining EAL memory after storage recovery and optional RDB import.
+Insufficient capacity or unavailable heap statistics stop startup on all
+workers; kernel networking skips this check.
 This integration is an experimental standalone serving profile; its TLS,
 replication handoff, and cluster paths are outside the validation scope. See
 the [build guide](../operations/building-and-packaging.md#experimental-dpdk-networking)

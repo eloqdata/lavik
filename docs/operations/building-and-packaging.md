@@ -221,6 +221,12 @@ The downloadable release archive below includes all three executables.
 
 ### Experimental DPDK networking
 
+DPDK startup requires an EAL memory allowance after storage initialization.
+Insufficient capacity prevents Redis readiness and logs the per-NUMA deficit,
+budget breakdown, and host hugepage counts. See the
+[startup memory allowance](../../bycorf/docs/dpdk-prototype.md#startup-memory-allowance)
+for sizing and diagnostics.
+
 On Ubuntu 24.04, install the additional build dependencies before configuring
 bypass support:
 
