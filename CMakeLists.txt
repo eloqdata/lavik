@@ -124,6 +124,7 @@ file(GLOB_RECURSE LAVIK_FORMAT_FILES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/src/*.h
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/microbench/*.cpp
 )
 # CLI11.hpp is an upstream-generated single header; rewriting it makes local
 # formatting depend on the generated artifact instead of its upstream source.
@@ -699,6 +700,18 @@ get_target_property(LAVIK_MODULE_IFACE_LIBS lavik_module
 if (LAVIK_MODULE_IFACE_LIBS MATCHES "lavik_raft")
   message(FATAL_ERROR
     "lavik_module must not link Raft; Raft is meta-plane only")
+endif()
+
+# Microbenchmarks are opt-in build targets, independent of the server and tests.
+add_executable(lavik_tlsf_range_allocator_bench EXCLUDE_FROM_ALL
+  microbench/tlsf_range_allocator_bench.cpp)
+target_include_directories(lavik_tlsf_range_allocator_bench PRIVATE include)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  target_compile_options(lavik_tlsf_range_allocator_bench PRIVATE
+    -Wall -Wextra -Wpedantic)
+  if (LAVIK_ENABLE_WERROR)
+    target_compile_options(lavik_tlsf_range_allocator_bench PRIVATE -Werror)
+  endif()
 endif()
 
 if (BUILD_TESTING)
@@ -1745,6 +1758,22 @@ if (BUILD_TESTING)
   target_link_libraries(lavik_meta_connector_tests PRIVATE lavik::module GTest::gtest_main)
   add_test(NAME meta_connector COMMAND lavik_meta_connector_tests)
   set_tests_properties(meta_connector PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+
+  # The range allocator has no runtime/storage dependencies. Keep its tests
+  # usable without initializing workers, io_uring, or the DMA environment.
+  add_executable(lavik_tlsf_range_allocator_tests tests/tlsf_range_allocator_test.cpp)
+  target_include_directories(lavik_tlsf_range_allocator_tests PRIVATE include)
+  target_link_libraries(lavik_tlsf_range_allocator_tests PRIVATE GTest::gtest_main)
+  gtest_discover_tests(lavik_tlsf_range_allocator_tests
+    PROPERTIES LABELS allocator TIMEOUT 30)
+
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lavik_tlsf_range_allocator_tests PRIVATE
+      -Wall -Wextra -Wpedantic)
+    if (LAVIK_ENABLE_WERROR)
+      target_compile_options(lavik_tlsf_range_allocator_tests PRIVATE -Werror)
+    endif()
+  endif()
 
   add_executable(lavik_unit_tests
     tests/buffer_pool_test.cpp

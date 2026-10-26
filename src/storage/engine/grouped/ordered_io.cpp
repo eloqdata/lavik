@@ -341,7 +341,7 @@ StorageEngine::Impl::LoadGroupedStringValue(
   // The output is assembled by copying pages, so it needs no DMA allocation.
   // It must not hold a fixed slot while children wait for their read buffers.
   // Match AllocateReadOutputBuffer's capacity for scratch admission.
-  const auto minimum_output = std::max(size, options.read_payload_bytes());
+  const auto minimum_output = std::max(size, options.alignment_);
   constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
   if (options.alignment_ == 0 || options.alignment_ > limit ||
       minimum_output > limit - (options.alignment_ - 1)) {

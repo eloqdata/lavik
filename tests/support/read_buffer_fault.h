@@ -25,6 +25,7 @@
 
 namespace lavik::test {
 
+// Fail speculative full-range probes; chunk/exact waiting paths still work.
 // Arm before starting worker threads, or while a fixture drives all workers
 // synchronously. Restore the environment after every assertion exit.
 class ScopedReadBufferAllocationFailure {

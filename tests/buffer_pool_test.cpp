@@ -17,10 +17,13 @@
 #include "lavik/storage/buffer_pool.h"
 
 #include <fcntl.h>
+#include <liburing.h>
+#include <linux/capability.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -34,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"
@@ -49,9 +53,6 @@ namespace {
 
 class BufferPoolWaitService final : public bycorf::Service {
  public:
-  explicit BufferPoolWaitService(bool allocation_failure = false)
-      : allocation_failure_(allocation_failure) {}
-
   void Prepare(unsigned thread_count) override {
     prepared_ = thread_count == 1;
   }
@@ -126,13 +127,13 @@ class BufferPoolWaitService final : public bycorf::Service {
       }
       held_reads.push_back(std::move(*acquired));
     }
-    if (allocation_failure_) {
+    {
       read_waiter_started_ = false;
       read_waiter_acquired_ = false;
       worker.Spawn(AcquireReadAfterRelease());
       co_await bycorf::Yield(worker);
       if (!read_waiter_started_ || read_waiter_acquired_ ||
-          pool_.overflow_read_buffer_count() != 0) {
+          pool_.output_buffer_count() != 0) {
         result_ = absl::FailedPreconditionError(
             "read-buffer exhaustion allocated overflow instead of waiting");
         worker.RequestStop();
@@ -144,14 +145,15 @@ class BufferPoolWaitService final : public bycorf::Service {
            ++attempt) {
         co_await bycorf::Yield(worker);
       }
-      if (!read_waiter_acquired_ || pool_.overflow_read_buffer_count() != 0) {
+      if (!read_waiter_acquired_ || pool_.output_buffer_count() != 0) {
         result_ = absl::DeadlineExceededError(
             "fixed-read-buffer release did not wake its waiter");
         worker.RequestStop();
         co_return result_;
       }
 
-      auto oversized = co_await pool_.AcquireReadBuffer(2 * kMiB);
+      auto oversized =
+          co_await pool_.AcquireReadBuffer(pool_.read_capacity_bytes());
       if (!absl::IsResourceExhausted(oversized.status())) {
         result_ = absl::FailedPreconditionError(
             "oversized allocation failure waited for an unusable fixed slot");
@@ -159,54 +161,6 @@ class BufferPoolWaitService final : public bycorf::Service {
       worker.RequestStop();
       co_return result_;
     }
-
-    const auto retained = WorkerMemoryAccountingBytes(worker.id());
-    auto temporary = co_await pool_.AcquireReadBuffer();
-    if (!temporary.ok() || temporary->buffer_id() != 0 ||
-        temporary->registered() || pool_.overflow_read_buffer_count() != 1 ||
-        pool_.available_read_buffers() != 0 ||
-        WorkerMemoryAccountingBytes(worker.id()) !=
-            retained + temporary->bytes().size()) {
-      result_ = absl::FailedPreconditionError(
-          "exhausted fixed pool did not acquire an accounted temporary lease");
-      worker.RequestStop();
-      co_return result_;
-    }
-    temporary->Reset();
-    if (pool_.overflow_read_buffer_count() != 0 ||
-        WorkerMemoryAccountingBytes(worker.id()) != retained) {
-      result_ = absl::FailedPreconditionError(
-          "temporary read buffer was not released after pool exhaustion");
-      worker.RequestStop();
-      co_return result_;
-    }
-
-    // Overflow leases encode their one-based release id in the same token as
-    // fixed-buffer ids. Exercise destruction and reuse so a representation
-    // change cannot silently return an overflow buffer through the fixed path.
-    auto overflow = co_await pool_.AcquireReadBuffer(2 * kMiB);
-    if (!overflow.ok() || overflow->buffer_id() != 0 ||
-        overflow->registered() || pool_.overflow_read_buffer_count() != 1) {
-      result_ = absl::FailedPreconditionError(
-          "oversized read did not acquire an overflow lease");
-      worker.RequestStop();
-      co_return result_;
-    }
-    overflow->Reset();
-    if (pool_.overflow_read_buffer_count() != 0) {
-      result_ = absl::FailedPreconditionError(
-          "released overflow read buffer still owns storage");
-      worker.RequestStop();
-      co_return result_;
-    }
-    auto reused = co_await pool_.AcquireReadBuffer(2 * kMiB);
-    if (!reused.ok() || reused->buffer_id() != 0 ||
-        pool_.overflow_read_buffer_count() != 1) {
-      result_ = absl::FailedPreconditionError(
-          "released overflow read slot was not reusable");
-    }
-    worker.RequestStop();
-    co_return result_;
   }
 
   void Stop() noexcept override {}
@@ -237,7 +191,6 @@ class BufferPoolWaitService final : public bycorf::Service {
   }
 
   RegisteredBufferPool pool_;
-  bool allocation_failure_ = false;
   bool prepared_ = false;
   bool storage_waiter_started_ = false;
   bool storage_waiter_acquired_ = false;
@@ -279,7 +232,7 @@ TEST(BufferPoolTest, ReadAllocationFailureWaitsForFixedSlot) {
   GTEST_SKIP() << "requires read buffer allocation failure injection";
 #endif
   lavik::test::ScopedReadBufferAllocationFailure failure;
-  BufferPoolWaitService service(true);
+  BufferPoolWaitService service;
   bycorf::Server server;
   server.AddService(&service);
   bycorf::ServerOptions options;
@@ -316,6 +269,21 @@ class BufferPoolMemlockTest : public ::testing::Test {
     limit_saved_ = rc == 0;
     ASSERT_EQ(rc, 0);
     saved_context_ = bycorf::MutableThisWorker();
+    // io_uring records the memlock exemption when each ring is created.
+    // Temporarily disable only this thread's effective CAP_IPC_LOCK so root
+    // runs exercise the same real registration limits as unprivileged runs.
+    // Keep the permitted set intact so TearDown can restore the caller.
+    ASSERT_EQ(
+        syscall(SYS_capget, &capability_header_, saved_capabilities_.data()),
+        0);
+    auto capabilities = saved_capabilities_;
+    auto& effective = capabilities[CAP_TO_INDEX(CAP_IPC_LOCK)].effective;
+    if ((effective & CAP_TO_MASK(CAP_IPC_LOCK)) != 0) {
+      effective &= ~CAP_TO_MASK(CAP_IPC_LOCK);
+      ASSERT_EQ(syscall(SYS_capset, &capability_header_, capabilities.data()),
+                0);
+      capability_changed_ = true;
+    }
     int fd = mkstemp(path_);
     ASSERT_GE(fd, 0);
     ASSERT_EQ(ftruncate(fd, 8 * kKiB), 0);
@@ -338,6 +306,10 @@ class BufferPoolMemlockTest : public ::testing::Test {
     if (limit_saved_) EXPECT_EQ(setrlimit(RLIMIT_MEMLOCK, &original_limit_), 0);
     if (original_thp_disabled_ >= 0)
       EXPECT_EQ(prctl(PR_SET_THP_DISABLE, original_thp_disabled_, 0, 0, 0), 0);
+    if (capability_changed_)
+      EXPECT_EQ(
+          syscall(SYS_capset, &capability_header_, saved_capabilities_.data()),
+          0);
     bycorf::MutableThisWorker() = std::move(saved_context_);
   }
 
@@ -441,7 +413,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
       std::uint16_t id = 0;
       ASSERT_TRUE(pool_->TryAcquireWriteBuffer(&id));
       auto buffer = pool_->write_buffer(id);
-      EXPECT_EQ(buffer.index_, last_region);
+      EXPECT_EQ(buffer.index_, last_region + id);
       buffer.size_ = 4096;
       std::fill_n(buffer.data_, buffer.size_, std::byte{0x5a});
       Completion written;
@@ -478,10 +450,9 @@ class BufferPoolMemlockTest : public ::testing::Test {
         EXPECT_GE(buffer.index_, 0);
         EXPECT_LE(buffer.index_, last_region);
         EXPECT_EQ(lease.registered_buffer().index_, buffer.index_);
-        ASSERT_GE(lease.buffer_id(), 3);
-        ASSERT_LT(lease.buffer_id() - 3, slot_addresses.size());
+        ASSERT_EQ(lease.buffer_id(),
+                  1 + i * options_.read_slot_bytes_ / options_.alignment_);
         if (round == 0) {
-          EXPECT_EQ(lease.buffer_id(), i + 3);
           slot_addresses[i] = lease.bytes().data();
           if (i == 0) EXPECT_EQ(buffer.index_, first_region);
           if (i + 1 == pool_->read_buffer_count())
@@ -491,8 +462,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
                       slot_addresses[i - 1] + leases[i - 1].bytes().size());
           }
         } else {
-          EXPECT_EQ(lease.bytes().data(),
-                    slot_addresses[lease.buffer_id() - 3]);
+          EXPECT_EQ(lease.bytes().data(), slot_addresses[i]);
         }
         Completion read;
         auto status = lease.registered()
@@ -509,7 +479,7 @@ class BufferPoolMemlockTest : public ::testing::Test {
       EXPECT_GE(registered_reads, min_reads);
       EXPECT_LE(registered_reads, max_reads);
       EXPECT_EQ(pool_->available_read_buffers(), 0);
-      EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+      EXPECT_EQ(pool_->output_buffer_count(), 0);
       leases.clear();
       EXPECT_EQ(pool_->available_read_buffers(), pool_->read_buffer_count());
     }
@@ -517,6 +487,11 @@ class BufferPoolMemlockTest : public ::testing::Test {
 
   rlimit original_limit_{};
   bool limit_saved_ = false;
+  __user_cap_header_struct capability_header_{
+      .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+  std::array<__user_cap_data_struct, _LINUX_CAPABILITY_U32S_3>
+      saved_capabilities_{};
+  bool capability_changed_ = false;
   bycorf::CurrentWorker saved_context_;
   std::unique_ptr<bycorf::CrossCore> cross_core_;
   std::unique_ptr<bycorf::Worker> worker_;
@@ -578,7 +553,7 @@ TEST_F(BufferPoolMemlockTest, MaintenanceReadsDoNotBorrowExhaustedPools) {
   }
   EXPECT_EQ(pool_->available_write_buffers(), 0);
   EXPECT_EQ(pool_->available_read_buffers(), 0);
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(pool_->output_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
 }
 
@@ -649,7 +624,10 @@ TEST_F(BufferPoolMemlockTest, PreparedMaintenanceSurvivesWorkerInitialization) {
   EXPECT_EQ(WorkerMemoryAccountingBytes(0),
             baseline + 24 * kMiB +
                 pool_->write_buffer_count() * options_.write_buffer_bytes_ +
-                pool_->read_buffer_count() * options_.read_slot_bytes_);
+                pool_->read_capacity_bytes() +
+                pool_->read_capacity_bytes() / options_.alignment_ *
+                    sizeof(TlsfRangeAllocator::Metadata) +
+                sizeof(TlsfRangeAllocator));
   worker_->Shutdown();
   worker_.reset();
   bycorf::MutableThisWorker() = saved_context_;
@@ -657,14 +635,17 @@ TEST_F(BufferPoolMemlockTest, PreparedMaintenanceSurvivesWorkerInitialization) {
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
 }
 
-TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
+TEST_F(BufferPoolMemlockTest, AccountsArenaMetadataAndHeapOutputs) {
   ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
   const auto baseline = WorkerMemoryAccountingBytes(0);
   const auto other_baseline = WorkerMemoryAccountingBytes(1);
   ASSERT_NO_FATAL_FAILURE(Init(0, 2));
   const auto fixed_bytes =
       pool_->write_buffer_count() * options_.write_buffer_bytes_ +
-      pool_->read_buffer_count() * options_.read_slot_bytes_ + 24 * kMiB;
+      pool_->read_capacity_bytes() +
+      pool_->read_capacity_bytes() / options_.alignment_ *
+          sizeof(TlsfRangeAllocator::Metadata) +
+      sizeof(TlsfRangeAllocator) + 24 * kMiB;
   const auto fixed_total = baseline + fixed_bytes;
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
@@ -684,16 +665,16 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   struct RestoreLimit {
     ~RestoreLimit() { (void)InitMemoryLimit(1024 * kMiB, 2); }
   } restore_limit;
-  auto first = pool_->AcquireReadBuffer(kMiB).await_resume();
-  auto second = pool_->AcquireReadBuffer(2 * kMiB).await_resume();
+  auto first = pool_->AllocateReadOutputBuffer(kMiB);
+  auto second = pool_->AllocateReadOutputBuffer(2 * kMiB);
   ASSERT_TRUE(first.ok());
   ASSERT_TRUE(second.ok());
   const auto second_bytes = second->bytes().size();
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 2);
+  EXPECT_EQ(pool_->output_buffer_count(), 2);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0),
             fixed_total + first->bytes().size() + second_bytes);
   first->Reset();
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
+  EXPECT_EQ(pool_->output_buffer_count(), 1);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total + second_bytes);
 
   // A remote return only queues the release. Keep its storage and charge until
@@ -702,19 +683,19 @@ TEST_F(BufferPoolMemlockTest, AccountsOwnedCapacityAndReleasesOverflow) {
   second->Reset();
   bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total + second_bytes);
-  auto reused_read = pool_->AcquireReadBuffer(3 * kMiB).await_resume();
+  auto reused_read = pool_->AllocateReadOutputBuffer(3 * kMiB);
   ASSERT_TRUE(reused_read.ok());
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (pool_->overflow_read_buffer_count() != 1 &&
+  while (pool_->output_buffer_count() != 1 &&
          std::chrono::steady_clock::now() < deadline) {
     worker_->RunOnce(false);
   }
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
+  EXPECT_EQ(pool_->output_buffer_count(), 1);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0),
             fixed_total + reused_read->bytes().size());
   reused_read->Reset();
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(pool_->output_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), fixed_total);
   EXPECT_EQ(WorkerMemoryAccountingBytes(1), other_baseline);
 
@@ -824,37 +805,137 @@ TEST_F(BufferPoolMemlockTest, FailedFlushWakesQueuedAndAssignedWriters) {
   EXPECT_EQ(pool_->available_write_buffers(), 2);
 }
 
-TEST_F(BufferPoolMemlockTest, RepeatedReadinessOwnsOneTemporaryLease) {
-  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+TEST_F(BufferPoolMemlockTest, RepeatedReadinessOwnsOneArenaRange) {
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto available = pool_->available_read_bytes();
+  const auto retained = WorkerMemoryAccountingBytes(0);
+  {
+    auto acquire = pool_->AcquireReadBuffer(8 * kKiB);
+    ASSERT_TRUE(acquire.await_ready());
+    ASSERT_TRUE(acquire.await_ready());
+    EXPECT_EQ(pool_->available_read_bytes(), available - 16 * kKiB);
+    EXPECT_EQ(pool_->output_buffer_count(), 0);
+  }
+  EXPECT_EQ(pool_->available_read_bytes(), available);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
+}
+
+TEST_F(BufferPoolMemlockTest,
+       VariableRangesCoalesceWithoutChangingRetainedMemory) {
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto retained = WorkerMemoryAccountingBytes(0);
+  const auto capacity = pool_->read_capacity_bytes();
+  auto first = pool_->TryAcquireReadBuffer(1);
+  auto second = pool_->TryAcquireReadBuffer(24 * kKiB);
+  auto third = pool_->TryAcquireReadBuffer(40 * kKiB);
+  ASSERT_TRUE(first.ok() && second.ok() && third.ok());
+  EXPECT_EQ(first->bytes().size(), 12 * kKiB);
+  EXPECT_EQ(second->bytes().size(), 32 * kKiB);
+  EXPECT_EQ(third->bytes().size(), 48 * kKiB);
+  const auto* base = first->bytes().data();
+  EXPECT_EQ(second->bytes().data(), base + 12 * kKiB);
+  EXPECT_EQ(third->bytes().data(), base + 44 * kKiB);
+  EXPECT_EQ(pool_->available_read_bytes(), capacity - 92 * kKiB);
+  second->Reset();
+  first->Reset();
+  third->Reset();
+  auto whole = pool_->TryAcquireReadBuffer(capacity - 8 * kKiB);
+  ASSERT_TRUE(whole.ok());
+  EXPECT_EQ(whole->bytes().data(), base);
+  EXPECT_EQ(pool_->available_read_bytes(), 0);
+  EXPECT_EQ(pool_->output_buffer_count(), 0);
+  EXPECT_EQ(WorkerMemoryAccountingBytes(0), retained);
+}
+
+TEST_F(BufferPoolMemlockTest, FragmentedArenaShrinksChunksAndRecoversCapacity) {
+  options_.registered_bytes_ = 2 * options_.write_buffer_bytes_ + 64 * kKiB;
+  options_.read_slot_bytes_ = 32 * kKiB;
   ASSERT_NO_FATAL_FAILURE(Init(0));
   std::vector<ReadBufferLease> held;
-  while (pool_->available_read_buffers() != 0) {
-    auto read = pool_->AcquireReadBuffer().await_resume();
+  for (unsigned i = 0; i < 4; ++i) {
+    auto read = pool_->TryAcquireReadBuffer(4 * kKiB);
     ASSERT_TRUE(read.ok());
     held.push_back(std::move(*read));
   }
-  const auto baseline = WorkerMemoryAccountingBytes(0);
-  {
-    auto acquire = pool_->AcquireReadBuffer();
-    ASSERT_TRUE(acquire.await_ready());
-    ASSERT_TRUE(acquire.await_ready());
-    EXPECT_EQ(pool_->overflow_read_buffer_count(), 1);
-    EXPECT_EQ(WorkerMemoryAccountingBytes(0),
-              baseline + options_.read_slot_bytes_);
-    // Destroying an unconsumed ready awaiter must release its temporary lease.
-  }
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
-  auto acquire = pool_->AcquireReadBuffer();
+  auto tail = pool_->TryAcquireReadBuffer(8 * kKiB);
+  ASSERT_TRUE(tail.ok());
+  held[0].Reset();
+  held[2].Reset();
+  ASSERT_EQ(pool_->available_read_bytes(), 24 * kKiB);
+  EXPECT_TRUE(absl::IsResourceExhausted(
+      pool_->TryAcquireReadBuffer(16 * kKiB).status()));
+  auto acquire = pool_->AcquireReadChunk();
   ASSERT_TRUE(acquire.await_ready());
-  auto lease = acquire.await_resume();
-  ASSERT_TRUE(lease.ok());
-  EXPECT_EQ(lease->buffer_id(), 0);
-  EXPECT_FALSE(lease->registered());
+  auto chunk = acquire.await_resume();
+  ASSERT_TRUE(chunk.ok());
+  EXPECT_EQ(chunk->io_buffer().size_, 4 * kKiB);
+  chunk->Reset();
   held.clear();
-  lease->Reset();
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
-  EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
+  tail->Reset();
+  auto whole = pool_->TryAcquireReadBuffer(56 * kKiB);
+  ASSERT_TRUE(whole.ok());
+}
+
+TEST_F(BufferPoolMemlockTest, DifferentSizeReadWaitersCannotBarge) {
+  options_.registered_bytes_ = 2 * options_.write_buffer_bytes_ + 24 * kKiB;
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  auto held = pool_->TryAcquireReadBuffer(16 * kKiB);
+  ASSERT_TRUE(held.ok());
+  std::vector<unsigned> order;
+  auto acquire =
+      [&](unsigned position,
+          std::size_t bytes) -> bycorf::Task<absl::StatusOr<ReadBufferLease>> {
+    auto lease = co_await pool_->AcquireReadBuffer(bytes);
+    order.push_back(position);
+    co_return lease;
+  };
+  auto first = acquire(1, 16 * kKiB);
+  auto second = acquire(2, 4 * kKiB);
+  auto start = [](auto& task) {
+    auto handle = std::move(task).ReleaseHandle();
+    task = std::remove_reference_t<decltype(task)>(handle);
+    handle.resume();
+  };
+  start(first);
+  start(second);
+  EXPECT_FALSE(first.done());
+  EXPECT_FALSE(second.done());
+  held->Reset();
+  EXPECT_FALSE(pool_->TryAcquireReadBuffer(4 * kKiB).ok());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!first.done() && std::chrono::steady_clock::now() < deadline)
+    worker_->RunOnce(false);
+  ASSERT_TRUE(first.done());
+  EXPECT_FALSE(second.done());
+  auto returned = std::move(first).TakeResult();
+  ASSERT_TRUE(returned.ok());
+  returned->Reset();
+  while (!second.done() && std::chrono::steady_clock::now() < deadline)
+    worker_->RunOnce(false);
+  ASSERT_TRUE(second.done());
+  auto smaller = std::move(second).TakeResult();
+  ASSERT_TRUE(smaller.ok());
+  EXPECT_EQ(order, (std::vector<unsigned>{1, 2}));
+}
+
+TEST_F(BufferPoolMemlockTest, RemoteRangeReturnWaitsForItsOwner) {
+  ASSERT_NO_FATAL_FAILURE(Init(0, 2));
+  const auto capacity = pool_->read_capacity_bytes();
+  auto read = pool_->TryAcquireReadBuffer(40 * kKiB);
+  ASSERT_TRUE(read.ok());
+  bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+  read->Reset();
+  bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+  EXPECT_EQ(pool_->available_read_bytes(), capacity - 48 * kKiB);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool_->available_read_bytes() != capacity &&
+         std::chrono::steady_clock::now() < deadline)
+    worker_->RunOnce(false);
+  EXPECT_EQ(pool_->available_read_bytes(), capacity);
+  auto whole = pool_->TryAcquireReadBuffer(capacity - 8 * kKiB);
+  ASSERT_TRUE(whole.ok());
 }
 
 TEST_F(BufferPoolMemlockTest, AssemblyOutputBypassesStorageAllocationAndSlots) {
@@ -867,7 +948,7 @@ TEST_F(BufferPoolMemlockTest, AssemblyOutputBypassesStorageAllocationAndSlots) {
   const auto available = pool_->available_read_buffers();
   lavik::test::ScopedReadBufferAllocationFailure failure;
   EXPECT_TRUE(absl::IsResourceExhausted(
-      pool_->AcquireReadBuffer(kMiB).await_resume().status()));
+      pool_->TryAcquireReadBuffer(pool_->read_capacity_bytes()).status()));
   for (const auto payload : {std::size_t{1}, kMiB}) {
     auto output = pool_->AllocateReadOutputBuffer(payload);
     ASSERT_TRUE(output.ok()) << output.status();
@@ -883,7 +964,7 @@ TEST_F(BufferPoolMemlockTest, AssemblyOutputBypassesStorageAllocationAndSlots) {
     EXPECT_FALSE(output->valid());
     moved.Reset();
     EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
-    EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+    EXPECT_EQ(pool_->output_buffer_count(), 0);
   }
 }
 
@@ -906,11 +987,11 @@ TEST_F(BufferPoolMemlockTest, AssemblyOutputRemoteReleaseAndMixedIdReuse) {
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline + output_bytes);
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (pool_->overflow_read_buffer_count() != 0 &&
+  while (pool_->output_buffer_count() != 0 &&
          std::chrono::steady_clock::now() < deadline) {
     worker_->RunOnce(false);
   }
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(pool_->output_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
   auto reused = pool_->AcquireReadBuffer(kMiB).await_resume();
   ASSERT_TRUE(reused.ok());
@@ -933,26 +1014,16 @@ TEST_F(BufferPoolMemlockTest,
     EXPECT_TRUE(
         absl::IsOutOfRange(pool_->AllocateReadOutputBuffer(bytes).status()));
   }
-  EXPECT_EQ(pool_->overflow_read_buffer_count(), 0);
+  EXPECT_EQ(pool_->output_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
 }
 
-TEST_F(BufferPoolMemlockTest, NoFixedReadSlotsNeverWaitForAllocationFailure) {
-#if !LAVIK_FAULTS_ENABLED
-  GTEST_SKIP() << "requires read buffer allocation failure injection";
-#endif
+TEST_F(BufferPoolMemlockTest, EmptyReadArenaRejectsStartup) {
+  ASSERT_NO_FATAL_FAILURE(Init(0, 1, false));
   options_.registered_bytes_ = 2 * options_.write_buffer_bytes_;
-  ASSERT_NO_FATAL_FAILURE(Init(0));
-  auto acquire = pool_->AcquireReadBuffer();
-  ASSERT_TRUE(acquire.await_ready());
-  auto lease = acquire.await_resume();
-  ASSERT_TRUE(lease.ok());
-  EXPECT_EQ(lease->buffer_id(), 0);
-  lease->Reset();
-  lavik::test::ScopedReadBufferAllocationFailure failure;
-  auto failed = pool_->AcquireReadBuffer();
-  ASSERT_TRUE(failed.await_ready());
-  EXPECT_TRUE(absl::IsResourceExhausted(failed.await_resume().status()));
+  const auto status = pool_->Init(*worker_, options_);
+  EXPECT_TRUE(absl::IsInvalidArgument(status)) << status;
+  EXPECT_FALSE(pool_->initialized());
 }
 
 TEST_F(BufferPoolMemlockTest, DeviceWorkspacesPrecedeReadsAndStayWhole) {
@@ -971,13 +1042,46 @@ TEST_F(BufferPoolMemlockTest, DeviceWorkspacesPrecedeReadsAndStayWhole) {
   EXPECT_FALSE(pool_->workspace_registered(wrong_index));
 }
 
-TEST_F(BufferPoolMemlockTest, DeviceWorkspacesThenReadSlotsUseRemainingBudget) {
+TEST_F(BufferPoolMemlockTest, DeviceWorkspacesThenReadArenaUseRemainingBudget) {
   options_.read_slot_bytes_ = 256 * kKiB;
   ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2, kMiB));
-  // Spare memlock covers the ring itself, but is smaller than another slot.
-  ASSERT_NO_FATAL_FAILURE(
-      Init(2 * kMiB + 2 * options_.read_slot_bytes_ + 128 * kKiB));
+  // An arena prefix consumes the whole page-aligned allowance, unlike fixed
+  // slots which left a remainder. Kernels charging the ring to memlock reject
+  // that first prefix and trigger the geometric retry. Both the 5 MiB probe
+  // and its 2.5 MiB retry must fit the two device images followed by some
+  // reads, while neither can register the entire 4 MiB read arena or any write
+  // slot.
+  ASSERT_NO_FATAL_FAILURE(Init(5 * kMiB));
   if (IsSkipped()) return;
+  for (const auto& buffer : device_buffers_)
+    ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 2, 12, 2, 2));
+}
+
+TEST_F(BufferPoolMemlockTest,
+       DeviceWorkspacesStayFirstWithExistingRegistrations) {
+  options_.read_slot_bytes_ = 256 * kKiB;
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2, kMiB));
+  ASSERT_NO_FATAL_FAILURE(Init(5 * kMiB, 1, false));
+  if (IsSkipped()) return;
+
+  // Keep another ring's pages pinned to exercise the geometric retry even on
+  // kernels that do not charge ring metadata. The initial 5 MiB arena prefix
+  // cannot fit; the 2.5 MiB retry can fit both device images and two read
+  // chunks.
+  constexpr std::size_t kPinnedBytes = 128 * kKiB;
+  void* pinned = mmap(nullptr, kPinnedBytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(pinned, MAP_FAILED);
+  absl::Cleanup unmap = [&] { EXPECT_EQ(munmap(pinned, kPinnedBytes), 0); };
+  io_uring ring{};
+  ASSERT_EQ(io_uring_queue_init(8, &ring, 0), 0);
+  absl::Cleanup close_ring = [&] { io_uring_queue_exit(&ring); };
+  iovec region{.iov_base = pinned, .iov_len = kPinnedBytes};
+  ASSERT_EQ(io_uring_register_buffers(&ring, &region, 1), 0);
+
+  const auto status = pool_->Init(*worker_, options_, device_buffers_);
+  ASSERT_TRUE(status.ok()) << status;
   for (const auto& buffer : device_buffers_)
     ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
   ASSERT_NO_FATAL_FAILURE(CheckIo(0, 2, 2, 2, 2));
@@ -1006,7 +1110,10 @@ TEST_F(BufferPoolMemlockTest, MaintenanceRegistersAfterAllOrdinarySlots) {
   // Registering caller-owned images neither reallocates nor charges them.
   EXPECT_EQ(WorkerMemoryAccountingBytes(0),
             baseline + 24 * kMiB + 2 * options_.write_buffer_bytes_ +
-                341 * options_.read_slot_bytes_);
+                pool_->read_capacity_bytes() +
+                pool_->read_capacity_bytes() / options_.alignment_ *
+                    sizeof(TlsfRangeAllocator::Metadata) +
+                sizeof(TlsfRangeAllocator));
 }
 
 TEST_F(BufferPoolMemlockTest, AllFixedWorkspacesRegisterWithEnoughMemlock) {
@@ -1043,7 +1150,7 @@ TEST_F(BufferPoolMemlockTest, FullRegistrationPreservesConfiguredPool) {
   ASSERT_NO_FATAL_FAILURE(CheckIo(2, 341, 341));
 }
 
-TEST_F(BufferPoolMemlockTest, DefaultSlotIncludesFramingAndUsesIndexZero) {
+TEST_F(BufferPoolMemlockTest, VariableRangesIncludeFramingAndUseIndexZero) {
   options_.read_slot_bytes_ = RegisteredBufferPoolOptions{}.read_slot_bytes_;
   ASSERT_EQ(options_.read_slot_bytes_, 32 * kKiB);
   ASSERT_EQ(options_.read_payload_bytes(), 24 * kKiB);
@@ -1058,11 +1165,11 @@ TEST_F(BufferPoolMemlockTest, DefaultSlotIncludesFramingAndUsesIndexZero) {
   EXPECT_EQ(ordinary->io_buffer().size_, 24 * kKiB);
   EXPECT_EQ(ordinary->io_buffer().index_, 0);
   EXPECT_TRUE(ordinary->registered());
-  auto overflow = pool_->AcquireReadBuffer(24 * kKiB + 1).await_resume();
-  ASSERT_TRUE(overflow.ok());
-  EXPECT_EQ(overflow->buffer_id(), 0);
-  EXPECT_FALSE(overflow->registered());
-  EXPECT_GE(overflow->io_buffer().size_, 24 * kKiB + 1);
+  auto larger = pool_->AcquireReadBuffer(24 * kKiB + 1).await_resume();
+  ASSERT_TRUE(larger.ok());
+  EXPECT_NE(larger->buffer_id(), 0);
+  EXPECT_TRUE(larger->registered());
+  EXPECT_EQ(larger->io_buffer().size_, 28 * kKiB);
 }
 
 TEST_F(BufferPoolMemlockTest, LowMemlockPrioritizesReadSlots) {
@@ -1116,7 +1223,7 @@ TEST_F(BufferPoolMemlockTest, LargePoolSpansMultipleRegisteredAllocations) {
   ASSERT_TRUE(pool_->buffers_registered());
   // Reads span two allocations; both write slots share the second allocation
   // with its remaining reads. Kernel I/O verifies indices on both sides.
-  ASSERT_NO_FATAL_FAILURE(CheckIo(2, slots, slots, 1));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(2, slots - 1, slots - 1, 1));
 }
 
 TEST_F(BufferPoolMemlockTest, PartialRegistrationSpansMultipleAllocations) {
@@ -1129,7 +1236,7 @@ TEST_F(BufferPoolMemlockTest, PartialRegistrationSpansMultipleAllocations) {
   ASSERT_FALSE(pool_->buffers_registered());
   // The last region contains both registered and ordinary write slots, after
   // all reads. Sharing its registration index must not register the tail slot.
-  ASSERT_NO_FATAL_FAILURE(CheckIo(1, slots, slots, 1));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(1, slots - 1, slots - 1, 1));
 }
 
 }  // namespace

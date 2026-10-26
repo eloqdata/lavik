@@ -30,6 +30,7 @@
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/sync.h"
 #include "lavik/memory.h"
+#include "lavik/tlsf_range_allocator.h"
 
 namespace bycorf {
 class CrossCore;
@@ -47,17 +48,15 @@ struct RegisteredBufferPoolOptions {
   // At least two; shutdown checkpoints borrow both after ordinary writes drain.
   std::size_t storage_write_buffer_count_ = 4;
   std::size_t write_buffer_bytes_ = 8 * kMiB;
-  // Cover ordinary compact records and grouped pages, including record headers
-  // and direct-I/O alignment, without reserving a large slot for every small
-  // read. Oversized disk reads use on-demand overflow buffers; whole-value
-  // assembly uses ordinary heap memory. The group target is not a hard limit.
-  // Total slot size includes both framing margins.
+  // Preferred chunk size, including framing margins, for streamed reads and
+  // acquisitions without an explicit length. Explicit reads use exact aligned
+  // ranges from the fixed arena; this is not their maximum allocation size.
   std::size_t read_slot_bytes_ = 32 * kKiB;
   std::size_t read_headroom_bytes_ = 4 * kKiB;
   std::size_t read_tailroom_bytes_ = 4 * kKiB;
   std::size_t alignment_ = 4 * kKiB;
 
-  // Capacity available to disk I/O; zero means the slot cannot fit framing.
+  // Preferred chunk's I/O capacity; zero means it cannot fit framing.
   std::size_t read_payload_bytes() const noexcept {
     if (read_slot_bytes_ <= read_headroom_bytes_ ||
         read_slot_bytes_ - read_headroom_bytes_ <= read_tailroom_bytes_) {
@@ -82,22 +81,20 @@ class ReadBufferLease {
   ~ReadBufferLease();
 
   bool valid() const noexcept { return data_ != nullptr; }
-  // True only when the slot is backed by a ring-registered iovec, so it gates
-  // fixed-buffer IO. Partial registration and unregistered fallback preserve
-  // slot ids; registration is checked per slot. Defined after the pool.
+  // True only when the complete lease fits one registered region. A range
+  // crossing a registration boundary uses ordinary I/O on io_uring.
   bool registered() const noexcept;
   // Pool ownership is immutable after Init; do not duplicate it in every
   // lease moved through the direct-GET coroutine chain.
   unsigned owner_worker() const noexcept;
-  // Pool release id; fixed I/O uses io_buffer().index_, which can be zero.
-  std::uint16_t buffer_id() const noexcept {
-    return (release_token_ & kOverflowTokenBit) == 0
-               ? static_cast<std::uint16_t>(release_token_)
-               : 0;
+  // Nonzero arena offset token, independent of write slots and fixed-I/O
+  // indices. Zero identifies an ordinary-heap assembly output or empty lease.
+  std::uint32_t buffer_id() const noexcept {
+    return (release_token_ & kOutputTokenBit) == 0 ? release_token_ : 0;
   }
 
-  // Entire slot, including framing/alignment space. Its registration index
-  // may identify a larger arena shared by multiple slots.
+  // Entire leased range, including framing/alignment space. Its index names
+  // the region containing its start; registered() checks the complete range.
   bycorf::FixedBuffer registered_buffer() const noexcept;
 
   // Aligned region intended as the destination of READ_FIXED.
@@ -113,18 +110,12 @@ class ReadBufferLease {
   friend class RegisteredBufferPool;
   ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
                   std::size_t headroom_bytes, std::size_t tailroom_bytes,
-                  std::uint16_t slot_id) noexcept;
-  ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
-                  std::size_t headroom_bytes, std::size_t tailroom_bytes,
-                  std::size_t overflow_id) noexcept;
+                  std::uint32_t release_token) noexcept;
 
-  // A lease releases either a fixed slot or an overflow slot, never both. The
-  // high bit distinguishes the latter so their mutually exclusive ids occupy
-  // one word. The remaining 31-bit id space is far beyond the practical
-  // number of separately allocated, page-aligned buffers in one worker while
-  // keeping release O(1) for large-value GETs.
-  static constexpr std::uint32_t kOverflowTokenBit = std::uint32_t{1} << 31;
-  static constexpr std::uint32_t kReleaseTokenMask = kOverflowTokenBit - 1;
+  // Arena leases encode offset + 1; size_ supplies the allocation length.
+  // Heap outputs use a separate reusable ID space marked by the high bit.
+  static constexpr std::uint32_t kOutputTokenBit = std::uint32_t{1} << 31;
+  static constexpr std::uint32_t kReleaseTokenMask = kOutputTokenBit - 1;
 
   // Every lease is pool-owned. Buffer dimensions are bounded to uint32_t by
   // Init and the 1 GiB limit on the single string record carried by a direct
@@ -151,13 +142,13 @@ class RegisteredBufferPool {
 
   // Try full registration first. If io_uring rejects it, use the finite
   // memlock allowance to retry a subset: borrowed device workspaces first,
-  // then ordinary read slots, write slots, and maintenance images. Pool sizes
-  // never shrink; unregistered buffers use ordinary I/O. SPDK does not degrade.
-  // Reuses any prepared maintenance buffers, otherwise allocates them here.
-  // priority_buffers remain caller-owned and charged; successful Init updates
-  // their registration indices. Their allocations must outlive worker I/O and
-  // ring teardown. Registration never allocates or charges a second image.
-  // Any allocation failure aborts initialization.
+  // then an aligned read-arena prefix, write slots, and maintenance images.
+  // Pool sizes never shrink; unregistered buffers use ordinary I/O. SPDK does
+  // not degrade. Reuses any prepared maintenance buffers, otherwise allocates
+  // them here. priority_buffers remain caller-owned and charged; successful
+  // Init updates their registration indices. Their allocations must outlive
+  // worker I/O and ring teardown. Registration never allocates or charges a
+  // second image. Any allocation failure aborts initialization.
   absl::Status Init(bycorf::Worker& worker,
                     const RegisteredBufferPoolOptions& options = {},
                     std::span<bycorf::FixedBuffer> priority_buffers = {});
@@ -170,19 +161,19 @@ class RegisteredBufferPool {
                                          std::size_t alignment);
 
   bool initialized() const noexcept { return worker_ != nullptr; }
-  // True only when all ordinary read/write slots registered. Use
-  // buffer_registered(id) to select fixed I/O: a partially registered pool can
-  // contain both kinds.
+  // True when the ordinary arena and all write slots registered. A read can
+  // still cross two registration regions: use lease.registered() for reads
+  // and buffer_registered(id) for write slots when selecting fixed I/O.
   bool buffers_registered() const noexcept { return buffers_registered_; }
   // Registration is immutable after Init, including across lease handoffs.
-  // Slot ids identify pool ownership, independently of registration indices.
+  // Write-slot ids identify ownership independently of registration indices.
   [[gnu::always_inline]] bool buffer_registered(
       std::uint16_t buffer_id) const noexcept {
     if (buffer_id == 0) return false;
     if (buffer_id <= write_buffers_.size()) {
       return buffer_id <= registered_write_count_;
     }
-    return buffer_id - write_buffers_.size() - 1 < registered_read_count_;
+    return false;
   }
   unsigned owner_worker() const noexcept { return owner_worker_; }
   // Check both index and address range against this worker's immutable
@@ -200,15 +191,20 @@ class RegisteredBufferPool {
     return maintenance_read_buffers_[static_cast<std::size_t>(kind)];
   }
   std::size_t read_buffer_count() const noexcept {
-    return read_buffers_.size();
+    return read_capacity_bytes() / options_.read_slot_bytes_;
   }
+  // Nominal preferred-chunk counts for diagnostics, not a contiguous-fit
+  // guarantee. Acquisition must use TryAcquireReadBuffer or an awaiter.
   std::size_t available_read_buffers() const noexcept {
-    return free_read_buffers_.size();
+    return available_read_bytes() / options_.read_slot_bytes_;
   }
-  // Live dynamic allocations, including heap assembly outputs; idle release
-  // IDs own no buffer.
-  std::size_t overflow_read_buffer_count() const noexcept {
-    return overflow_read_buffers_.size() - free_overflow_read_buffers_.size();
+  std::size_t read_capacity_bytes() const noexcept { return read_arena_.size_; }
+  std::size_t available_read_bytes() const noexcept {
+    return std::size_t{read_allocator_.free_units()} << read_unit_shift_;
+  }
+  // Only assembled results use dynamic memory; it is never submitted to disk.
+  std::size_t output_buffer_count() const noexcept {
+    return output_buffers_.size() - free_output_buffers_.size();
   }
   std::size_t write_buffer_count() const noexcept {
     return options_.storage_write_buffer_count_;
@@ -259,14 +255,16 @@ class RegisteredBufferPool {
   class AcquireReadAwaiter {
    public:
     AcquireReadAwaiter(RegisteredBufferPool* pool,
-                       std::size_t minimum_payload_bytes)
-        : pool_(pool), minimum_payload_bytes_(minimum_payload_bytes) {}
+                       std::size_t minimum_payload_bytes, bool chunk = false)
+        : pool_(pool),
+          minimum_payload_bytes_(minimum_payload_bytes),
+          chunk_(chunk) {}
 
     bool await_ready();
     bool await_suspend(std::coroutine_handle<> awaiting);
     absl::StatusOr<ReadBufferLease> await_resume();
 
-    // Queue an owner-local continuation when a slot is handed off. This uses
+    // Queue an owner-local continuation when a range is handed off. This uses
     // the worker's scheduled work queue (including its task-class budget),
     // never runs inline in Release(), and sends no cross-worker reply. The
     // caller supplies run_fn_/task_class_ and keeps both objects alive until
@@ -280,23 +278,33 @@ class RegisteredBufferPool {
     std::size_t minimum_payload_bytes_ = 0;
     std::coroutine_handle<> awaiting_{};
     bycorf::RemoteWork* continuation_ = nullptr;
-    std::uint16_t assigned_buffer_id_ = 0;
-    // Keep a successful speculative allocation until await_resume consumes it.
-    // Readiness may be checked again by either suspension API.
-    ReadBufferLease overflow_;
-    bool overflow_attempted_ = false;
+    // Own the reservation before scheduling the waiter: newcomers cannot steal
+    // it, and repeated readiness checks cannot acquire a second range.
+    ReadBufferLease assigned_;
+    bool chunk_ = false;
   };
 
-  // Prefer a fixed slot. On exhaustion, try a temporary aligned/DMA lease,
-  // then wait for a fixed slot if allocation fails. Oversized requests always
-  // use overflow and report allocation failure because no fixed slot fits.
+  // Exact aligned acquisition, FIFO on exhaustion/fragmentation. A request
+  // larger than the arena fails immediately. Never allocates more DMA memory.
+  // Callers must not retain resources needed by earlier waiters while waiting.
   AcquireReadAwaiter AcquireReadBuffer(
       std::size_t minimum_payload_bytes = 0) noexcept {
     return AcquireReadAwaiter(this, minimum_payload_bytes);
   }
 
+  // Nonblocking exact acquisition for full-record reads and batch assembly.
+  // ResourceExhausted means the caller should drain its batch or stream chunks.
+  absl::StatusOr<ReadBufferLease> TryAcquireReadBuffer(
+      std::size_t minimum_payload_bytes);
+
+  // Prefer a normal chunk, reducing its size under fragmentation/pressure.
+  // Wait FIFO only when even one aligned payload page plus framing cannot fit.
+  AcquireReadAwaiter AcquireReadChunk() noexcept {
+    return AcquireReadAwaiter(this, 0, true);
+  }
+
   // Allocate ordinary heap memory for assembling a value, even on SPDK.
-  // Never consumes a fixed read slot and must not be submitted to storage I/O.
+  // Never consumes arena capacity and must not be submitted to storage I/O.
   // Preserves reply framing space, retained accounting and owner-local release
   // through the same lease type as disk reads. Allocation failure is returned.
   absl::StatusOr<ReadBufferLease> AllocateReadOutputBuffer(
@@ -305,27 +313,29 @@ class RegisteredBufferPool {
  private:
   friend class ReadBufferLease;
 
-  ReadBufferLease TakeReadBuffer();
-  ReadBufferLease LeaseReadBuffer(std::uint16_t buffer_id);
-  absl::StatusOr<ReadBufferLease> AllocateOverflowBuffer(
-      std::size_t minimum_payload_bytes, bool storage_io);
-  void ReleaseOverflow(std::size_t overflow_id) noexcept;
-  void ReleaseOverflowLocal(std::size_t overflow_id) noexcept;
+  ReadBufferLease TakeReadBuffer(std::size_t payload_bytes, bool chunk);
+  std::uint32_t ReadUnits(std::size_t payload_bytes) const noexcept;
+  void ReleaseRead(std::uint32_t offset, std::uint32_t units) noexcept;
+  void ReleaseReadLocal(std::uint32_t offset, std::uint32_t units) noexcept;
+  void WakeReadWaiters();
+  void ReleaseOutput(std::size_t output_id) noexcept;
+  void ReleaseOutputLocal(std::size_t output_id) noexcept;
   std::optional<std::uint16_t> TakeWriteBuffer();
   void ReleaseWriteBufferLocal(std::uint16_t buffer_id) noexcept;
-  void Release(std::uint16_t buffer_id) noexcept;
-  void ReleaseLocal(std::uint16_t buffer_id) noexcept;
-  static void HandleRemoteRelease(void* context, std::uint64_t value) noexcept;
-  static void HandleRemoteOverflowRelease(void* context,
-                                          std::uint64_t value) noexcept;
-  bool IsReadBufferId(std::uint16_t buffer_id) const noexcept;
+  static void HandleRemoteReadRelease(void* context,
+                                      std::uint64_t value) noexcept;
+  static void HandleRemoteOutputRelease(void* context,
+                                        std::uint64_t value) noexcept;
   bool IsWriteBufferId(std::uint16_t buffer_id) const noexcept;
 
   bycorf::Worker* worker_ = nullptr;
   bycorf::CrossCore* cross_core_ = nullptr;
   unsigned owner_worker_ = 0;
   bool buffers_registered_ = false;
-  std::size_t registered_read_count_ = 0;
+  // Linux limits registered regions to 1 GiB. The arena remains contiguous;
+  // leases crossing a region boundary use plain I/O rather than READ_FIXED.
+  static constexpr std::size_t kReadRegionBytes = 1024 * kMiB;
+  std::size_t registered_read_bytes_ = 0;
   std::size_t registered_write_count_ = 0;
   std::vector<bycorf::FixedBuffer> registered_regions_;
   RegisteredBufferPoolOptions options_{};
@@ -340,47 +350,41 @@ class RegisteredBufferPool {
   std::vector<bool> write_buffer_in_use_;
   std::deque<AcquireWriteAwaiter*> write_waiters_;
   bool write_acquisition_failed_ = false;
-  // io_uring read/write slots share these allocations, ordered reads first.
-  // SPDK retains individual DMA allocations and leaves this vector empty.
-  std::vector<std::byte*> arenas_;
-  std::vector<bycorf::FixedBuffer> read_buffers_;
-  std::vector<std::uint16_t> free_read_buffers_;
-  std::vector<bool> read_buffer_in_use_;
+  bycorf::FixedBuffer read_arena_{};
+  unsigned read_unit_shift_ = 12;
+  std::vector<TlsfRangeAllocator::Metadata> read_metadata_;
+  TlsfRangeAllocator read_allocator_;
   std::deque<AcquireReadAwaiter*> read_waiters_;
-  struct OverflowBuffer {
-    bycorf::FixedBuffer buffer_{};
-    // Assembly outputs bypass the backend allocator. Keep its matching free
-    // operation with the owner, including across remote returns and ID reuse.
-    bool storage_io_ = false;
-    void Free(std::size_t alignment) const noexcept;
-  };
-  // Dynamic buffers retain DMA/aligned storage only while leased. Reuse empty
-  // release IDs so repeated large reads do not grow the bookkeeping forever;
-  // live IDs stay stable across cross-worker lease returns.
-  std::vector<OverflowBuffer> overflow_read_buffers_;
-  std::vector<std::size_t> free_overflow_read_buffers_;
-  std::vector<bool> overflow_read_buffer_in_use_;
+  // Only ordinary-heap outputs are dynamic. Vacant IDs own no storage and are
+  // reused after local or remote return; the backing arena never grows.
+  std::vector<bycorf::FixedBuffer> output_buffers_;
+  std::vector<std::size_t> free_output_buffers_;
 };
 
-// Keep slot lookup and registration checks in the read coroutine: GCC can
+// Keep address and registration checks in the read coroutine: GCC can
 // otherwise outline even these small accessors under Release LTO.
 [[gnu::always_inline]] inline bool ReadBufferLease::registered()
     const noexcept {
-  // Full registration is the common case. Overflow leases have no fixed slot
-  // even then; only partial registration needs the per-slot prefix check.
-  return pool_ != nullptr && buffer_id() != 0 &&
-         (pool_->buffers_registered() || pool_->buffer_registered(buffer_id()));
+  const auto id = buffer_id();
+  if (pool_ == nullptr || id == 0) return false;
+  const auto offset = std::size_t{id - 1} << pool_->read_unit_shift_;
+  const auto end = offset + size_;
+  // Registration is an immutable arena prefix; both endpoints must belong to
+  // the same kernel region. No descriptor lookup on a connection worker.
+  return end <= pool_->registered_read_bytes_ &&
+         offset / RegisteredBufferPool::kReadRegionBytes ==
+             (end - 1) / RegisteredBufferPool::kReadRegionBytes;
 }
 
 [[gnu::always_inline]] inline bycorf::FixedBuffer
 ReadBufferLease::registered_buffer() const noexcept {
-  const std::uint16_t id = buffer_id();
-  // The immutable pool table maps release ids to arena registrations. Keeping
-  // this mapping in the pool preserves the compact cross-worker lease.
+  const std::uint32_t id = buffer_id();
   const std::uint16_t index =
-      id == 0
-          ? 0
-          : pool_->read_buffers_[id - pool_->write_buffers_.size() - 1].index_;
+      id == 0 ? 0
+              : static_cast<std::uint16_t>(
+                    pool_->read_arena_.index_ +
+                    (std::size_t{id - 1} << pool_->read_unit_shift_) /
+                        RegisteredBufferPool::kReadRegionBytes);
   return {.data_ = data_, .size_ = size_, .index_ = index};
 }
 

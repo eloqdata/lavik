@@ -18,7 +18,7 @@ class RemoteGetTestPeer : public testing::Test {
  protected:
   using Awaitable = StorageEngine::RemoteReadAwaitable;
 
-  virtual std::size_t ReadSlotBytes() const { return 32 * kKiB; }
+  virtual std::size_t ReadSlotBytes() const { return 12 * kKiB; }
 
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
@@ -330,24 +330,18 @@ TEST_F(RemoteSmallSlotTest, OversizedAllocationFailureFallsBackToOwner) {
   EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
-TEST_F(RemoteGetTestPeer, ExhaustedPoolUsesAndReleasesTemporaryReplyLease) {
+TEST_F(RemoteGetTestPeer, ExhaustedPoolDefersToOwnerWithoutGrowingDmaMemory) {
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
-  Awaitable::Result result;
   {
     auto read = Read();
-    ASSERT_FALSE(read.await_ready());
-    EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
-    ASSERT_NO_FATAL_FAILURE(Complete(read));
-    result = read.await_resume();
-    ASSERT_TRUE(result && result->ok());
-    EXPECT_EQ(result->value().view().encoded_, value_);
+    ASSERT_TRUE(read.await_ready());
+    EXPECT_FALSE(read.await_resume().has_value());
+    EXPECT_EQ(Pool().output_buffer_count(), 0);
   }
   EXPECT_EQ(block_.pin_count(), 0);
-  EXPECT_EQ(Pool().available_read_buffers(), 0);
-  EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
-  result.reset();
-  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
+  held->Reset();
+  EXPECT_EQ(Pool().available_read_buffers(), 1);
 }
 
 TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {

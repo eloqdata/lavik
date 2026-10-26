@@ -111,11 +111,13 @@ is broader than this guide's selected controllers.
 
 Size hugepages for all simultaneous SPDK processes. Start with each process's
 [fixed storage-buffer capacity](building-and-packaging.md#io_uring-storage-buffers-and-memlock),
-then allow for optional read overflow and SPDK/DPDK internal allocations.
-Startup metadata, recovery, and shutdown checkpoints reuse fixed workspaces;
-failure to allocate any required workspace prevents startup. A per-worker
-buffer setting is not a process-wide DMA cap. Check free hugepages after
-startup and use the EAL diagnostics below when sizing headroom.
+then allow for SPDK/DPDK internal allocations. Ordinary reads use fixed
+per-worker arenas; pressure leads to smaller reads and waiting, without runtime
+DMA overflow allocations. Read-arena descriptors and assembled outputs use
+ordinary memory. Startup metadata, recovery, and shutdown checkpoints reuse
+fixed workspaces; failure to allocate any required workspace prevents startup.
+The storage-buffer formula excludes SPDK/DPDK internal resources. Use the EAL
+diagnostics below to inspect those allocations after initialization.
 
 On NUMA hosts, keep selected NVMe controllers, hugepages and worker CPUs on the
 same node where possible. Keep network IRQ cores separate from workers when

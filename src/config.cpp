@@ -807,7 +807,7 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
       buffers.read_slot_bytes_ > std::numeric_limits<std::uint32_t>::max()) {
     return absl::InvalidArgumentError(
         "storage-read-buffer-kb must be a 4 KiB multiple greater than 8 KiB "
-        "and fit the 32-bit slot size");
+        "and fit the 32-bit chunk size");
   }
   if (static_cast<std::size_t>(options.shard_count_) >
           std::numeric_limits<std::size_t>::max() /
