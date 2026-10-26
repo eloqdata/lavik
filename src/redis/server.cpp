@@ -54,6 +54,9 @@
 #include "backup.h"
 #include "blocking_wait.h"
 #include "bycorf/io/backend_options.h"
+#if BYCORF_KERNEL_BYPASS
+#include "bycorf/io/dpdk_backend.h"
+#endif
 #include "bycorf/net/server.h"
 #include "bycorf/net/tcp_service.h"
 #include "bycorf/net/tcp_stream.h"
@@ -858,6 +861,15 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     if (imported.ok() && !load_rdb_file_.empty()) {
       imported = co_await ImportRdb();
     }
+#if BYCORF_KERNEL_BYPASS
+    if (imported.ok()) {
+      // All storage workers and startup imports have finished allocating.
+      // Check the actual shared EAL remainder after SPDK (if selected), before
+      // releasing maintenance, listener, replication, or cluster readiness.
+      // The existing startup barrier propagates failure to every data worker.
+      imported = bycorf::DpdkBackend::CheckMemoryBudget();
+    }
+#endif
     if (imported.ok()) {
       // Physical reclamation needs all recovered indexes and the complete
       // startup catalog/import. It does not need a serving role or lease;
@@ -878,8 +890,7 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   if (!status.ok()) [[unlikely]] {
     startup_failed_.store(true, std::memory_order_release);
     if (worker.id() == 0) {
-      spdlog::error("startup catalog/RDB recovery failed: {}",
-                    status.message());
+      spdlog::error("storage startup failed: {}", status.message());
     }
     server_->RequestStop();
     co_return status;

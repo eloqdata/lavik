@@ -197,6 +197,15 @@ memory or interpret all allocated bytes as internal overhead. Free capacity and
 largest-block size do not guarantee future DMA allocations. A query failure
 warns and suppresses the aggregate without preventing startup.
 
+When DPDK networking is also selected, a separate `DPDK memory budget` check
+runs after recovery and optional RDB import, before Redis starts serving. It
+compares the actual EAL remainder with the network growth allowance; an
+insufficient or unavailable heap snapshot prevents startup. Logs include the
+per-node shortfall and separate host hugepage counts. See the
+[budget and diagnostic fields](../../bycorf/docs/dpdk-prototype.md#startup-memory-allowance).
+With DPDK networking and io_uring storage, the same check runs without an SPDK
+storage allocation component.
+
 Separate instances must use disjoint namespaces and distinct listener ports.
 For storage-set expansion, worker/controller affinity and queue-capacity
 constraints, follow [multi-device storage](multi-device-storage.md). Benchmark
