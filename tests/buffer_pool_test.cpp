@@ -17,6 +17,7 @@
 #include "lavik/storage/buffer_pool.h"
 
 #include <fcntl.h>
+#include <liburing.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -1015,13 +1016,46 @@ TEST_F(BufferPoolMemlockTest, DeviceWorkspacesPrecedeReadsAndStayWhole) {
   EXPECT_FALSE(pool_->workspace_registered(wrong_index));
 }
 
-TEST_F(BufferPoolMemlockTest, DeviceWorkspacesThenReadSlotsUseRemainingBudget) {
+TEST_F(BufferPoolMemlockTest, DeviceWorkspacesThenReadArenaUseRemainingBudget) {
   options_.read_slot_bytes_ = 256 * kKiB;
   ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2, kMiB));
-  // Spare memlock covers the ring itself, but is smaller than another slot.
-  ASSERT_NO_FATAL_FAILURE(
-      Init(2 * kMiB + 2 * options_.read_slot_bytes_ + 128 * kKiB));
+  // An arena prefix consumes the whole page-aligned allowance, unlike fixed
+  // slots which left a remainder. Kernels charging the ring to memlock reject
+  // that first prefix and trigger the geometric retry. Both the 5 MiB probe
+  // and its 2.5 MiB retry must fit the two device images followed by some
+  // reads, while neither can register the entire 4 MiB read arena or any write
+  // slot.
+  ASSERT_NO_FATAL_FAILURE(Init(5 * kMiB));
   if (IsSkipped()) return;
+  for (const auto& buffer : device_buffers_)
+    ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
+  ASSERT_NO_FATAL_FAILURE(CheckIo(0, 2, 12, 2, 2));
+}
+
+TEST_F(BufferPoolMemlockTest,
+       DeviceWorkspacesStayFirstWithExistingRegistrations) {
+  options_.read_slot_bytes_ = 256 * kKiB;
+  ASSERT_NO_FATAL_FAILURE(AddDeviceBuffers(2, kMiB));
+  ASSERT_NO_FATAL_FAILURE(Init(5 * kMiB, 1, false));
+  if (IsSkipped()) return;
+
+  // Keep another ring's pages pinned to exercise the geometric retry even on
+  // kernels that do not charge ring metadata. The initial 5 MiB arena prefix
+  // cannot fit; the 2.5 MiB retry can fit both device images and two read
+  // chunks.
+  constexpr std::size_t kPinnedBytes = 128 * kKiB;
+  void* pinned = mmap(nullptr, kPinnedBytes, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE(pinned, MAP_FAILED);
+  absl::Cleanup unmap = [&] { EXPECT_EQ(munmap(pinned, kPinnedBytes), 0); };
+  io_uring ring{};
+  ASSERT_EQ(io_uring_queue_init(8, &ring, 0), 0);
+  absl::Cleanup close_ring = [&] { io_uring_queue_exit(&ring); };
+  iovec region{.iov_base = pinned, .iov_len = kPinnedBytes};
+  ASSERT_EQ(io_uring_register_buffers(&ring, &region, 1), 0);
+
+  const auto status = pool_->Init(*worker_, options_, device_buffers_);
+  ASSERT_TRUE(status.ok()) << status;
   for (const auto& buffer : device_buffers_)
     ASSERT_NO_FATAL_FAILURE(CheckWorkspaceIo(buffer, true));
   ASSERT_NO_FATAL_FAILURE(CheckIo(0, 2, 2, 2, 2));
