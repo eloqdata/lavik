@@ -344,14 +344,15 @@ cleaner disabling or the allocator's authoritative capacity checks.
 ## Command access paths
 
 Compact Hash/Set point edits, List end edits, single-member Sorted Set writes
-and bounded String range edits can prepare borrowed after-images. Their read
-leases and command operands remain immutable through append allocation waits;
-only framing and changed command data need separate ownership. The append
+and bounded String range edits can prepare borrowed after-images. Checked
+source values detach from the read arena into ordinary memory before retaining
+views across lock or append waits; already-owned values reuse that storage.
+Source images and command operands remain immutable through append allocation
+waits. The append
 funnel consumes each encoder after its final suspension, then publishes the
 same complete checked record format. Published records and commit receipts
-retain no borrowed payload.
-Remote read leases and local read-pool exhaustion use owned output so a queued
-writer does not retain the last read slot needed by an earlier state-lock owner.
+retain no borrowed payload. Detached ownership keeps queued writers from
+retaining the read arena needed by an earlier state-lock owner.
 Ordinary existing compact String writes retain key intent and database
 admission while releasing worker store state for the old-value read and private
 preparation; reacquisition validates logical identity and population, allowing
