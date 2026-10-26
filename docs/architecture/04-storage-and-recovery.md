@@ -763,13 +763,13 @@ non-external records of the expected type whose block owner is also their key
 owner qualify, and the connection worker must have device I/O access. Length
 commands can answer from the same protected index metadata without a block pin
 or payload buffer. Closed admission, unsupported representations, expired
-entries, concurrent admission contention, and an exhausted connection-worker
-read-buffer pool whose temporary allocation also fails return to the normal
-owner route. Failed oversized allocation also takes that route, where the
-record reader can use fixed-slot chunks. Stream and Sorted Set whole-value
-callbacks exceeding the bounded inline workspace also retain the owner's
-scratch-admission path. Index misses use the same transaction and population
-admission checks.
+entries, concurrent admission contention, and an unavailable full-record range
+in the connection worker's read arena return to the normal owner route. The
+connection worker probes the arena without waiting; the owner reader can
+stream smaller arena chunks and wait for capacity. Stream and Sorted Set
+whole-value callbacks exceeding the bounded inline workspace also retain the
+owner's scratch-admission path. Index misses use the same transaction and
+population admission checks.
 
 An admitted payload read submits I/O directly from an awaitable in the
 requesting coroutine. Completion validates the record and population and
@@ -843,8 +843,8 @@ I/O, and validation. Slices validate the entire extent before copying any
 requested bytes. Local extent routing and physical reads need no child task;
 cross-owner dispatch retains the runtime's task bridge. The output buffer
 outlives every extent read, including on error. A move-only
-`ReadBufferLease` may cross to the connection worker; destruction returns a
-registered slot to its storage owner.
+`ReadBufferLease` may cross to the connection worker; destruction returns an
+arena range or frees a heap output on its storage owner.
 
 ### Flush and durability
 
@@ -1347,7 +1347,7 @@ current source code are authoritative for present storage behavior.
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/lavik/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | System-state manifest, catalog COW extents, full-sync fence, population token, promotion base, and one-use shutdown certificate | `src/storage/engine/system_state.cpp`, `include/lavik/storage/engine.h` |
-| Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/lavik/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
+| Aligned buffer ownership, arena range allocation, registered-I/O fallback, chunked reads, and cross-worker lease return | `include/lavik/storage/buffer_pool.h`, `include/lavik/tlsf_range_allocator.h`, `src/storage/buffer_pool.cpp`, `src/storage/engine/read.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
 | Temporary Redis export block allocation, framed command stream, readback, release, and restart discard | `src/storage/engine/redis_export_backlog.cpp`, `src/storage/engine/recovery.cpp` |

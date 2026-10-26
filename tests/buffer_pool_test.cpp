@@ -18,10 +18,12 @@
 
 #include <fcntl.h>
 #include <liburing.h>
+#include <linux/capability.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -267,6 +269,21 @@ class BufferPoolMemlockTest : public ::testing::Test {
     limit_saved_ = rc == 0;
     ASSERT_EQ(rc, 0);
     saved_context_ = bycorf::MutableThisWorker();
+    // io_uring records the memlock exemption when each ring is created.
+    // Temporarily disable only this thread's effective CAP_IPC_LOCK so root
+    // runs exercise the same real registration limits as unprivileged runs.
+    // Keep the permitted set intact so TearDown can restore the caller.
+    ASSERT_EQ(
+        syscall(SYS_capget, &capability_header_, saved_capabilities_.data()),
+        0);
+    auto capabilities = saved_capabilities_;
+    auto& effective = capabilities[CAP_TO_INDEX(CAP_IPC_LOCK)].effective;
+    if ((effective & CAP_TO_MASK(CAP_IPC_LOCK)) != 0) {
+      effective &= ~CAP_TO_MASK(CAP_IPC_LOCK);
+      ASSERT_EQ(syscall(SYS_capset, &capability_header_, capabilities.data()),
+                0);
+      capability_changed_ = true;
+    }
     int fd = mkstemp(path_);
     ASSERT_GE(fd, 0);
     ASSERT_EQ(ftruncate(fd, 8 * kKiB), 0);
@@ -289,6 +306,10 @@ class BufferPoolMemlockTest : public ::testing::Test {
     if (limit_saved_) EXPECT_EQ(setrlimit(RLIMIT_MEMLOCK, &original_limit_), 0);
     if (original_thp_disabled_ >= 0)
       EXPECT_EQ(prctl(PR_SET_THP_DISABLE, original_thp_disabled_, 0, 0, 0), 0);
+    if (capability_changed_)
+      EXPECT_EQ(
+          syscall(SYS_capset, &capability_header_, saved_capabilities_.data()),
+          0);
     bycorf::MutableThisWorker() = std::move(saved_context_);
   }
 
@@ -466,6 +487,11 @@ class BufferPoolMemlockTest : public ::testing::Test {
 
   rlimit original_limit_{};
   bool limit_saved_ = false;
+  __user_cap_header_struct capability_header_{
+      .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+  std::array<__user_cap_data_struct, _LINUX_CAPABILITY_U32S_3>
+      saved_capabilities_{};
+  bool capability_changed_ = false;
   bycorf::CurrentWorker saved_context_;
   std::unique_ptr<bycorf::CrossCore> cross_core_;
   std::unique_ptr<bycorf::Worker> worker_;
