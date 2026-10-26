@@ -162,7 +162,7 @@ class WriteBufferTestPeer {
     }
     if (pool.available_read_buffers() != 0 ||
         pool.available_write_buffers() != 0 ||
-        pool.overflow_read_buffer_count() != 0 ||
+        pool.output_buffer_count() != 0 ||
         WorkerMemoryAccountingBytes(store.worker_->id()) != retained)
       co_return absl::InternalError(
           "device metadata borrowed or grew ordinary pools");
@@ -211,7 +211,7 @@ class WriteBufferTestPeer {
     }
     if (store.buffers_.available_read_buffers() != 0 ||
         store.buffers_.available_write_buffers() != 0 ||
-        store.buffers_.overflow_read_buffer_count() != 0 ||
+        store.buffers_.output_buffer_count() != 0 ||
         WorkerMemoryAccountingBytes(worker.id()) != retained)
       co_return absl::InternalError(
           "recovery allocated or borrowed ordinary buffers");

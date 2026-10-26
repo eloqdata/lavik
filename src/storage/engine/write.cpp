@@ -211,6 +211,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     if (!loaded.ok()) {
       co_return loaded.status();
     }
+    auto owned = loaded->MakeOwned(store.buffers_);
+    if (!owned.ok()) co_return owned;
     auto encoded = EncodeDiskValue(std::move(*loaded));
     if (!encoded.ok()) {
       co_return encoded.status();
@@ -340,6 +342,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   if (!loaded.ok()) {
     co_return loaded.status();
   }
+  auto owned = loaded->MakeOwned(store.buffers_);
+  if (!owned.ok()) co_return owned;
   const std::span<const std::byte> value_bytes = loaded->value();
   std::string_view value(reinterpret_cast<const char*>(value_bytes.data()),
                          value_bytes.size());
@@ -1119,6 +1123,11 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         if (!loaded.ok()) {
           LatchRuntimeFailure(store);
           co_return loaded.status();
+        }
+        auto owned = loaded->MakeOwned(store.buffers_);
+        if (!owned.ok()) {
+          LatchRuntimeFailure(store);
+          co_return owned;
         }
         restored.emplace(std::move(*loaded));
         const auto bytes = restored->value();

@@ -354,6 +354,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       if (!read_epoch_changed()) co_return value.status();
     } else {
       loaded.emplace(std::move(*value));
+      if (!read_only) {
+        auto owned = loaded->MakeOwned(store.buffers_);
+        if (!owned.ok()) co_return owned;
+      }
       const auto bytes = loaded->value();
       view = CompactValueView{
           .encoded_ = std::string_view(
@@ -372,18 +376,6 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
        value_type != ValueType::kSortedSet ||
        update->inline_payload_->encoded_bytes() >= kCollectionPromotionBytes))
     co_return absl::InternalError("invalid compact callback encoder");
-  if (update->inline_payload_ && loaded->lease_.buffer_id() != 0 &&
-      (loaded->lease_.owner_worker() != store.worker_->id() ||
-       store.buffers_.available_read_buffers() == 0)) {
-    // A queued writer must not pin the last read slot needed by a state-lock
-    // owner ahead of it. Materialize under the callback's existing admission
-    // before reacquiring state; remote pools cannot be queried on this worker.
-    update->encoded_.resize(update->inline_payload_->encoded_bytes());
-    auto encoded = update->inline_payload_->WriteTo(
-        std::as_writable_bytes(std::span(update->encoded_)));
-    if (!encoded.ok()) co_return encoded;
-    update->inline_payload_ = nullptr;
-  }
   if (!grouped && !update->inline_payload_ && !update->reuse_encoded_) {
     // Owned callback output (or a no-op) no longer needs the read slot while
     // waiting for publication state. Grouped/reuse paths still borrow it.

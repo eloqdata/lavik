@@ -3562,6 +3562,10 @@ class StorageEngine::Impl {
     // relocation-only read.
     std::uint64_t txid_ = 0;
 
+    // Detach checked value bytes before an awaited write/lock can require
+    // another read. A fixed arena cannot grow to break a hold-and-wait cycle.
+    absl::Status MakeOwned(RegisteredBufferPool& pool);
+
     std::span<const std::byte> value() const noexcept {
       const std::span<std::byte> buffer = lease_.bytes();
       if (value_offset_ > buffer.size() ||
@@ -3645,10 +3649,9 @@ class StorageEngine::Impl {
 
   // One physical extent read, including buffer waiting and slice validation,
   // embedded in the caller. Routing adds a runtime task bridge only when the
-  // block belongs to another worker. If an oversized DMA allocation fails, a
-  // lazy child reads the extent in slot-sized chunks without dropping its pin.
-  class ReadExtentAwaitable final : public bycorf::OneShotIoAwaitable,
-                                    private bycorf::RemoteWork {
+  // block belongs to another worker. If an arena range is unavailable, a
+  // lazy child streams smaller chunks without dropping its pin.
+  class ReadExtentAwaitable final : public bycorf::OneShotIoAwaitable {
    public:
     ReadExtentAwaitable(Impl& engine, WorkerStore& store, ExtentRef ref,
                         std::uint32_t extent_index, std::size_t source_offset,
@@ -3669,8 +3672,7 @@ class StorageEngine::Impl {
       std::span<std::byte> destination_;
       Task<absl::Status> operator()();
     };
-    void FinishBufferWait();
-    static void BufferReady(bycorf::RemoteWork* work);
+    void PrepareBuffer();
     std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
     bool SubmitRead(std::coroutine_handle<> awaiting);
     bool DecodeHeader(std::span<const std::byte, kBlockHeaderBytes> bytes,
@@ -3687,7 +3689,6 @@ class StorageEngine::Impl {
     BlockState* pinned_ = nullptr;
     std::optional<absl::Status> ready_;
     ReadBufferLease lease_;
-    std::optional<RegisteredBufferPool::AcquireReadAwaiter> buffer_wait_;
     std::optional<bycorf::SubmitTaskAwaiter<RemoteRead>> remote_;
     Task<absl::Status> chunked_;
   };

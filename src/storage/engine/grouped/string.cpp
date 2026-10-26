@@ -257,20 +257,18 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
                                       location, extents);
       if (!value.ok()) co_return value.status();
       loaded.emplace(std::move(*value));
+      if (!read_only) {
+        auto owned = loaded->MakeOwned(store.buffers_);
+        if (!owned.ok()) co_return owned;
+      }
       const auto data = loaded->value();
       before = {reinterpret_cast<const char*>(data.data()), data.size()};
     }
     std::string bytes;
     CompactPayload plan;
     std::optional<InlineRecordPayload> inline_payload;
-    // Waiting for state while holding the last read slot could block an
-    // earlier lock owner. Remote pool state is likewise not ours to inspect.
-    const bool borrow_source =
-        !loaded || loaded->lease_.buffer_id() == 0 ||
-        (loaded->lease_.owner_worker() == store.worker_->id() &&
-         store.buffers_.available_read_buffers() != 0);
     if (!read_only && !bit && start <= before.size() &&
-        new_size < kCollectionPromotionBytes && borrow_source) {
+        new_size < kCollectionPromotionBytes) {
       plan.AppendBytes(before.substr(0, start));
       plan.AppendBytes(operation.value_);
       plan.AppendBytes(

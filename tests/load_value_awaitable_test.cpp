@@ -27,7 +27,9 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   using ExtentRead = StorageEngine::Impl::ReadExtentAwaitable;
 
   virtual std::size_t ReadBufferCount() const { return 1; }
-  virtual std::size_t ReadSlotBytes() const { return 32 * kKiB; }
+  // One minimum-size record must consume the entire single-read fixture.
+  // Wider fixtures keep byte-based assertions because range lengths vary.
+  virtual std::size_t ReadSlotBytes() const { return 12 * kKiB; }
   virtual unsigned WorkerCount() const { return 1; }
 
   void SetUp() override {
@@ -1030,22 +1032,45 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   std::vector<std::string> stream_messages_;
 };
 
-TEST_F(LoadValueAwaitableTestPeer, ExhaustedPoolReadsThroughTemporaryBuffer) {
+TEST_F(LoadValueAwaitableTestPeer, ExhaustedPoolWaitsWithoutGrowingDmaMemory) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
+  const auto retained = RetainedBytes();
   {
     auto read = Read();
-    EXPECT_EQ(Pool().overflow_read_buffer_count(), 1);
     auto task = AwaitExisting(read);
     Start(task);
+    EXPECT_FALSE(task.done());
+    EXPECT_EQ(Pool().output_buffer_count(), 0);
+    EXPECT_EQ(RetainedBytes(), retained);
+    held->Reset();
     ASSERT_NO_FATAL_FAILURE(Drain(task));
     ExpectValue(std::move(task).TakeResult());
     EXPECT_FALSE(HasHelper(read));
   }
-  EXPECT_EQ(block_.pin_count(), 0);
-  EXPECT_EQ(Pool().available_read_buffers(), 0);
-  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
+  ExpectNoPageLeases();
+}
+
+TEST_F(LoadValueAwaitableTestPeer, OwnedWriteSourceReleasesTheReadArena) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto read = ReadLocal();
+  auto task = AwaitExisting(read);
+  Start(task);
+  ASSERT_NO_FATAL_FAILURE(Drain(task));
+  auto result = std::move(task).TakeResult();
+  ASSERT_TRUE(result.ok());
+  ASSERT_NE(result->lease_.buffer_id(), 0);
+  ASSERT_EQ(Pool().available_read_bytes(), 0);
+  const auto txid = result->txid_;
+  ASSERT_TRUE(result->MakeOwned(Pool()).ok());
+  EXPECT_EQ(result->txid_, txid);
+  EXPECT_EQ(result->lease_.buffer_id(), 0);
+  EXPECT_EQ(Pool().available_read_bytes(), Pool().read_capacity_bytes());
+  // A prepared writer can keep its value while an earlier lock owner reads.
+  auto next = Pool().TryAcquireReadBuffer(4 * kKiB);
+  ASSERT_TRUE(next.ok());
+  ExpectValue(result);
 }
 
 TEST_F(LoadValueAwaitableTestPeer, BufferWaitersPreserveFifoHandoff) {
@@ -1199,7 +1224,7 @@ TEST_F(LoadValueAwaitableTestPeer,
               value_);
   }
   ExpectNoPageLeases();
-  EXPECT_EQ(Pool().overflow_read_buffer_count(), 0);
+  EXPECT_EQ(Pool().output_buffer_count(), 0);
   EXPECT_EQ(WorkerMemoryAccountingBytes(0), baseline);
 }
 
@@ -1400,19 +1425,6 @@ TEST_F(RecordSmallSlotFallbackTest, ReadsWithMinimumConfiguredSlot) {
   ExpectNoPageLeases();
 }
 
-class RecordNoSlotsFallbackTest : public RecordChunkFallbackTest {
- protected:
-  std::size_t ReadBufferCount() const override { return 0; }
-};
-
-TEST_F(RecordNoSlotsFallbackTest, AllocationFailureDoesNotWaitWithoutSlots) {
-  auto read = ReadLocal();
-  ASSERT_TRUE(read.await_ready());
-  EXPECT_FALSE(HasHelper(read));
-  EXPECT_TRUE(absl::IsResourceExhausted(read.await_resume().status()));
-  ExpectNoPageLeases();
-}
-
 class ExtentFaultFallbackTest : public LoadValueAwaitableTestPeer,
                                 public testing::WithParamInterface<bool> {};
 
@@ -1533,29 +1545,6 @@ TEST_F(ExtentRemoteFallbackTest, ChunkFallbackRunsOnPhysicalOwner) {
   }
   ExpectNoPageLeases();
   EXPECT_EQ(RetainedBytes(), baseline);
-}
-
-class ExtentNoSlotsFallbackTest : public LoadValueAwaitableTestPeer {
- protected:
-  std::size_t ReadBufferCount() const override { return 0; }
-};
-
-TEST_F(ExtentNoSlotsFallbackTest,
-       AllocationFailureDoesNotWaitWithoutFixedSlots) {
-#if !LAVIK_FAULTS_ENABLED
-  GTEST_SKIP() << "requires read buffer allocation failure injection";
-#endif
-  ASSERT_NO_FATAL_FAILURE(InstallExtent());
-  lavik::test::ScopedReadBufferAllocationFailure failure;
-  std::array<std::byte, 2> output{};
-  {
-    auto read = ExtentSlice(ExtentReference(), 0, output);
-    auto task = AwaitExtent(read);
-    Start(task);
-    ASSERT_TRUE(task.done());
-    EXPECT_TRUE(absl::IsResourceExhausted(std::move(task).TakeResult()));
-  }
-  ExpectNoPageLeases();
 }
 
 TEST_F(LoadValueAwaitableTestPeer,
@@ -1900,7 +1889,7 @@ TEST_F(GroupedStringParallelReadTest, DiskPagesOverlapWithinTheOwnerWindow) {
   worker_.RunOnce(false);
   EXPECT_FALSE(task.done());
   EXPECT_EQ(block_.pin_count(), 16);
-  EXPECT_EQ(Pool().available_read_buffers(), 16);
+  EXPECT_LT(Pool().available_read_bytes(), Pool().read_capacity_bytes());
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   // Distinct binary contents and a partial tail detect copying in completion
   // order or reusing an output offset across the following windows.
@@ -1932,7 +1921,8 @@ TEST_F(GroupedStringParallelReadTest,
   worker_.RunOnce(false);
   EXPECT_FALSE(task.done());
   EXPECT_EQ(block_.pin_count(), 1);
-  EXPECT_EQ(Pool().available_read_buffers(), ReadBufferCount() - 1);
+  EXPECT_EQ(Pool().available_read_bytes(),
+            Pool().read_capacity_bytes() - 20 * kKiB);
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   ExpectValue(std::move(task).TakeResult());
   EXPECT_EQ(block_.pin_count(), 0);
@@ -2041,8 +2031,8 @@ TEST_F(GroupedStringTwoOwnerReadTest, EachPhysicalOwnerHasItsOwnReadWindow) {
   EXPECT_FALSE(task.done());
   EXPECT_EQ(blocks_[0].pin_count(), 16);
   EXPECT_EQ(blocks_[1].pin_count(), 16);
-  EXPECT_EQ(Pool(0).available_read_buffers(), 16);
-  EXPECT_EQ(Pool(1).available_read_buffers(), 16);
+  EXPECT_LT(Pool(0).available_read_bytes(), Pool(0).read_capacity_bytes());
+  EXPECT_LT(Pool(1).available_read_bytes(), Pool(1).read_capacity_bytes());
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   ExpectValue(std::move(task).TakeResult());
   EXPECT_EQ(blocks_[0].pin_count(), 0);
@@ -2071,7 +2061,7 @@ TEST_F(GroupedStringTwoOwnerReadTest,
   EXPECT_EQ(blocks_[0].pin_count(), 0);
   EXPECT_EQ(blocks_[1].pin_count(), 16);
   EXPECT_EQ(Pool(0).available_read_buffers(), ReadBufferCount());
-  EXPECT_EQ(Pool(1).available_read_buffers(), 16);
+  EXPECT_LT(Pool(1).available_read_bytes(), Pool(1).read_capacity_bytes());
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   ExpectValue(std::move(task).TakeResult());
   EXPECT_EQ(blocks_[1].pin_count(), 0);
@@ -2100,7 +2090,8 @@ TEST_P(GroupedHashParallelReadTest, EachOwnerReadsSixteenLeaves) {
   EXPECT_FALSE(task.done());
   for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
     EXPECT_EQ(blocks_[owner].pin_count(), 16);
-    EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+    EXPECT_LT(Pool(owner).available_read_bytes(),
+              Pool(owner).read_capacity_bytes());
   }
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   {
@@ -2454,7 +2445,8 @@ TEST_P(GroupedZsetParallelReadTest,
   EXPECT_FALSE(task.done());
   for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
     EXPECT_EQ(blocks_[owner].pin_count(), 16);
-    EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+    EXPECT_LT(Pool(owner).available_read_bytes(),
+              Pool(owner).read_capacity_bytes());
   }
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   ExpectZset(std::move(task).TakeResult(), 1, zset_values_.size() - 1,
@@ -2785,7 +2777,8 @@ TEST_F(GroupedCollectionTwoOwnerReadTest,
     EXPECT_FALSE(window.done());
     for (unsigned owner = 0; owner < WorkerCount(); ++owner) {
       EXPECT_EQ(blocks_[owner].pin_count(), pins[owner] + 16);
-      EXPECT_EQ(Pool(owner).available_read_buffers(), 16);
+      EXPECT_LT(Pool(owner).available_read_bytes(),
+                Pool(owner).read_capacity_bytes());
     }
     ASSERT_NO_FATAL_FAILURE(Drain(window));
     auto page = std::move(window).TakeResult();

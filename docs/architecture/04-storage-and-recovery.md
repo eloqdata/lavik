@@ -114,15 +114,17 @@ Active storage paths are existing regular files, Linux raw block devices, or
 Bycorf SPDK storage paths. `Prepare` probes and validates them; it does not
 create, extend, truncate, or preallocate a missing regular file. On the POSIX
 io_uring backend, every worker opens the complete configured path table for
-direct I/O. Its read and write slots share worker-owned allocations;
-multiple slots share a registered region while keeping independent lease and
-release identities. Buffer-pool capacity is independent of registration success.
+direct I/O. Every worker owns one fixed read arena and separate write slots.
+Read leases borrow aligned variable-length ranges, allocated and coalesced by
+an owner-local range allocator; descriptors are preallocated outside DMA memory.
+The read arena is split into registered regions where kernel limits require it.
+Buffer-pool capacity is independent of registration success.
 If full io_uring registration fails, a finite memlock allowance permits a
 best-effort subset registration: per-device metadata workspaces on their owner
-worker first, then ordinary read slots, write slots, and maintenance images.
-The process-wide export image remains unregistered. Each lease retains
-its slot identity and immutable registration status; unregistered slots use
-the same aligned memory with plain asynchronous I/O. On SPDK, a
+worker first, then an aligned prefix of the read arena, write slots, and
+maintenance images. The process-wide export image remains unregistered.
+A lease outside the registered prefix or crossing a registration-region boundary
+uses the same aligned memory with plain asynchronous I/O. On SPDK, a
 worker opens only namespaces whose physical controller assigned it a qpair.
 Weighted home-device assignment controls write placement independently of
 qpair access. Each controller reserves qpairs for its home workers, then
@@ -637,10 +639,12 @@ for metadata and recycled-block headers, serialized by its coroutine mutex.
 [Redis export](05-replication.md#redis-psync-export) owns a separate process-wide
 workspace.
 
-Live overflow read buffers and ordinary-heap assembly outputs are also charged;
-returning a lease frees its allocation when the owner processes the return.
-I/O allocations have no separate retained-admission gate, allowing reads and
-reclamation to progress at the waterline; their charges constrain later growth.
+The read arena's preallocated descriptors and allocator control state are also
+charged. Borrowing or returning arena ranges does not change retained capacity.
+Ordinary-heap assembly outputs remain charged until their owner processes the
+return. Acquiring read ranges and assembly outputs has no additional
+retained-admission gate, allowing reads and reclamation to progress at the
+waterline; live output charges constrain later retained growth.
 Accounting covers owned capacity, excluding allocator overhead and SPDK's full
 hugepage reservation. See the [memory metrics](../operations/metrics.md#memory-metrics)
 for the reported counters.
@@ -730,12 +734,20 @@ without borrowing write slots or allocating fallback scan buffers.
 
 ### Reads and pins
 
-With fixed read slots configured, reads try temporary overflow on exhaustion
-and wait FIFO if allocation fails. Oversized records and extents fall back to
-slot-sized chunks on allocation failure. Block pins survive waiting and all
-chunks, and the same identity, population, checksum, and relocation checks
-apply before exposing data. Assembly outputs use ordinary heap memory, including
-on SPDK, so retaining an output cannot exhaust the DMA slots needed to read it.
+Ordinary disk reads use only the startup read arena on both backends. A full
+record or extent uses an exact aligned range when one is immediately available;
+otherwise it streams through smaller chunks. Chunk acquisition reduces its
+preferred size under pressure and waits FIFO when even its minimum range cannot
+fit. A request larger than the arena fails immediately rather than waiting for
+impossible capacity. Reservations are made before scheduling waiters, so new
+requests cannot steal a handed-off range. Cross-worker lease returns are routed
+to the arena owner before reuse or coalescing. No read expands DMA capacity.
+
+Block pins survive waiting and all chunks, and the same identity, population,
+checksum, and relocation checks apply before exposing data. Assembly outputs use
+ordinary heap memory, including on SPDK. Compact mutation sources detach their
+checked values into ordinary memory before retaining views across lock or append
+waits, so a queued writer cannot hold the arena needed by an earlier writer.
 
 Standalone single-key reads explicitly admitted by the command table can
 read directly on their connection worker after ordinary request, database and
@@ -808,9 +820,9 @@ representation-specific retry loop.
 
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size
-local inline records in waves paced by the fixed read-buffer pool; oversized
-records use aligned overflow leases or fall back to the complete reader if
-allocation fails. One completion barrier covers every I/O in a wave, and all
+local inline records in waves paced by nonblocking arena acquisition. When a
+range cannot fit, an existing wave drains first; a record that cannot fit an
+empty wave falls back to the complete reader and its chunked path. One completion barrier covers every I/O in a wave, and all
 leases are returned before a chunked fallback, relocation retry, or the next
 wave can suspend. Staged, remote, external, indirect-key, and stale-validation
 cases fall back to the complete `GetLocked` state machine, preserving the ordinary

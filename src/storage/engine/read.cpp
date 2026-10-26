@@ -343,20 +343,17 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
                         direct_io_alignment_ - 1) &
                        ~mask;
 
-  // Admission is only an optimization. If neither a local fixed slot nor a
-  // temporary allocation is available, let the owner path wait rather than
-  // retaining a remote pin in a second asynchronous state machine.
+  // Admission is only an optimization. If the local arena cannot fit the
+  // record immediately, let the owner reader stream it or wait for a chunk.
 #if LAVIK_ENABLE_TRACE
   if (result.trace_) {
     result.trace_->hit_ = true;
     result.trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
   }
 #endif
-  auto acquire = local.buffers_.AcquireReadBuffer(result.read_bytes_);
-  if (!acquire.await_ready()) return;
-  auto acquired = acquire.await_resume();
+  auto acquired = local.buffers_.TryAcquireReadBuffer(result.read_bytes_);
   if (!acquired.ok()) {
-    // The owner reader can stream an oversized record through fixed slots.
+    // The owner reader can stream a record through smaller arena ranges.
     // Leave this admission attempt empty so its caller takes that route.
     if (absl::IsResourceExhausted(acquired.status())) return;
     result.ready_.emplace(acquired.status());
@@ -698,21 +695,16 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
           record_headroom + location.total_disk_bytes();
       const std::size_t read_bytes =
           (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
-      const bool ordinary_buffer =
-          read_bytes <= options_.buffers_.read_payload_bytes();
-      if (!wave.empty() && ordinary_buffer &&
-          store.buffers_.available_read_buffers() == 0) {
-        break;
-      }
-
-      auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+      // Never wait while this wave owns unsubmitted ranges. Submit/drain it
+      // first; a record that cannot fit an empty wave uses the chunked reader.
+      auto acquired = store.buffers_.TryAcquireReadBuffer(read_bytes);
       if (!acquired.ok()) {
-        // Drain this wave before a fallback waits for a slot: an unsubmitted
-        // read in the wave may own the only fixed buffer.
-        if (absl::IsResourceExhausted(acquired.status()))
+        if (absl::IsResourceExhausted(acquired.status())) {
+          if (!wave.empty()) break;
           fallbacks.push_back(candidate.result_index_);
-        else
+        } else {
           results[candidate.result_index_] = acquired.status();
+        }
         ++next;
         continue;
       }
@@ -1106,6 +1098,18 @@ std::size_t StorageEngine::Impl::DirectGetValueLimit() const noexcept {
   return options_.buffers_.read_payload_bytes();
 }
 
+absl::Status StorageEngine::Impl::LoadedValue::MakeOwned(
+    RegisteredBufferPool& pool) {
+  if (lease_.buffer_id() == 0) return absl::OkStatus();
+  auto output = pool.AllocateReadOutputBuffer(value_bytes_);
+  if (!output.ok()) return output.status();
+  const auto source = value();
+  std::memcpy(output->io_buffer().data_, source.data(), source.size());
+  value_offset_ = output->headroom_bytes();
+  lease_ = std::move(*output);
+  return absl::OkStatus();
+}
+
 absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
     LoadedValue loaded) {
   return CompactReadValue{
@@ -1302,21 +1306,19 @@ StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
   state->PinLocal();
   pinned_ = state;
   read_bytes_ = AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-  buffer_wait_.emplace(&store.buffers_, read_bytes_);
-  if (buffer_wait_->await_ready()) FinishBufferWait();
+  PrepareBuffer();
 }
 
 StorageEngine::Impl::ReadExtentAwaitable::~ReadExtentAwaitable() {
   if (pinned_) engine_.UnpinBlock(store_, *pinned_, ref_.block_id_);
 }
 
-void StorageEngine::Impl::ReadExtentAwaitable::FinishBufferWait() {
-  auto acquired = buffer_wait_->await_resume();
-  buffer_wait_.reset();
-  // Limit end-to-end injection to dynamic extent buffers: recovery also needs
-  // unrelated record reads, which a process-wide allocator fault would block.
+void StorageEngine::Impl::ReadExtentAwaitable::PrepareBuffer() {
+  auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
+  // Force the extent's full-range probe to fail independently of record reads
+  // so end-to-end recovery tests can exercise streaming without stalling it.
   LAVIK_FAULT_INJECT(
-      if (acquired.ok() && acquired->buffer_id() == 0 &&
+      if (acquired.ok() &&
           LAVIK_FAULT_MATCHES("LAVIK_FAIL_EXTENT_BUFFER_ALLOCATION", "1")) {
         acquired = absl::ResourceExhaustedError(
             "injected extent buffer allocation failure");
@@ -1324,21 +1326,13 @@ void StorageEngine::Impl::ReadExtentAwaitable::FinishBufferWait() {
   if (acquired.ok()) {
     lease_ = std::move(*acquired);
   } else if (absl::IsResourceExhausted(acquired.status()) &&
-             store_.buffers_.read_buffer_count() != 0) {
-    // Large allocations can fail while fixed DMA slots remain usable. Keep
-    // the extent pinned and let ordinary pool acquisition provide backpressure.
+             store_.buffers_.read_capacity_bytes() != 0) {
+    // Stream through a smaller arena range without any dynamic DMA allocation.
+    // Retain the pin while chunk acquisition supplies FIFO backpressure.
     chunked_ = ReadInChunks();
   } else {
     ready_ = acquired.status();
   }
-}
-
-void StorageEngine::Impl::ReadExtentAwaitable::BufferReady(
-    bycorf::RemoteWork* work) {
-  auto& read = *static_cast<ReadExtentAwaitable*>(work);
-  read.FinishBufferWait();
-  auto next = read.SuspendRead(read.awaiting_);
-  if (next != std::noop_coroutine()) read.store_.worker_->Enqueue(next);
 }
 
 std::coroutine_handle<> StorageEngine::Impl::ReadExtentAwaitable::await_suspend(
@@ -1346,15 +1340,6 @@ std::coroutine_handle<> StorageEngine::Impl::ReadExtentAwaitable::await_suspend(
   if (remote_) {
     remote_->await_suspend(awaiting);
     return std::noop_coroutine();
-  }
-  if (buffer_wait_) {
-    awaiting_ = awaiting;
-    run_fn_ = &BufferReady;
-    task_class_ = store_.worker_->IsBackground(awaiting)
-                      ? bycorf::TaskClass::kBackground
-                      : bycorf::CurrentTaskClass();
-    if (buffer_wait_->SuspendWith(*this)) return std::noop_coroutine();
-    FinishBufferWait();
   }
   return SuspendRead(awaiting);
 }
@@ -1426,7 +1411,7 @@ bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
 }
 
 Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
-  auto acquired = co_await store_.buffers_.AcquireReadBuffer();
+  auto acquired = co_await store_.buffers_.AcquireReadChunk();
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   const auto capacity = chunk.io_buffer().size_;
@@ -1788,17 +1773,23 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   bool chunked = false;
   if (!lease_.valid()) {
     if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
-    auto acquire = store_.buffers_.AcquireReadBuffer(read_bytes_);
-    if (!acquire.await_ready()) {
-      buffer_wait_.emplace(std::move(acquire));
-      return;
-    }
-    auto acquired = acquire.await_resume();
+    auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
     if (!acquired.ok() && absl::IsResourceExhausted(acquired.status()) &&
-        store_.buffers_.read_buffer_count() != 0) {
+        read_bytes_ <= engine_.direct_io_alignment_) {
+      // The smallest read cannot benefit from chunking. Wait for an exact
+      // range without first allocating/copying a separate output image.
+      auto acquire = store_.buffers_.AcquireReadBuffer(read_bytes_);
+      if (!acquire.await_ready()) {
+        buffer_wait_.emplace(std::move(acquire));
+        return;
+      }
+      acquired = acquire.await_resume();
+    }
+    if (!acquired.ok() && absl::IsResourceExhausted(acquired.status()) &&
+        store_.buffers_.read_capacity_bytes() != 0) {
       // Oversized records (including KeyRecords and indivisible collection
       // entries) need not fit a DMA allocation. Own the assembled image in
-      // ordinary memory; fixed slots remain available for the actual I/O.
+      // ordinary memory; arena ranges provide the actual I/O.
       acquired = store_.buffers_.AllocateReadOutputBuffer(read_bytes_);
       chunked = true;
     }
@@ -1857,7 +1848,7 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
   // PrepareLocal pins the physical incarnation before this task can wait.
   // Keep the pin across every chunk, and validate the complete private image
   // with the same decoder/checksum rules as a single read before publishing it.
-  auto acquired = co_await store_.buffers_.AcquireReadBuffer();
+  auto acquired = co_await store_.buffers_.AcquireReadChunk();
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   if (PopulationChanged()) co_return absl::NotFoundError("key not found");

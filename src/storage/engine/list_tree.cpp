@@ -636,19 +636,19 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       if (read_epoch_changed()) co_return ListResult{};
       co_return loaded.status();
     }
+    if (!read_only) {
+      auto owned = loaded->MakeOwned(store.buffers_);
+      if (!owned.ok()) co_return owned;
+    }
     const auto bytes = loaded->value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                    bytes.size());
     if (read_only && operation.kind_ == ListOperationKind::kRange &&
         operation.packed_output_)
       co_return ReadPackedListRange(payload, location.logical_size_, operation);
-    // Leave a local read slot for operations ahead of this writer in the
-    // state-lock queue. Remote leases and pool pressure use the owned path.
-    const bool borrow_source =
-        loaded->lease_.buffer_id() == 0 ||
-        (loaded->lease_.owner_worker() == store.worker_->id() &&
-         store.buffers_.available_read_buffers() != 0);
-    if (!read_only && borrow_source) {
+    // Edit views borrow the detached image, so append waits cannot retain
+    // the read arena needed by earlier writers.
+    if (!read_only) {
       auto planned = PlanCompactListEdit(payload, location.logical_size_,
                                          operation, result);
       if (!planned.ok()) co_return planned.status();

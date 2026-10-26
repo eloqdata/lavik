@@ -1383,24 +1383,23 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
     }
+    if (!read_only) {
+      auto owned = loaded->MakeOwned(store.buffers_);
+      if (!owned.ok()) co_return owned;
+    }
     const auto bytes = loaded->value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                    bytes.size());
     if (read_only)
       co_return ReadEncodedHash(payload, location.logical_size_, operation,
                                 value_type);
-    // A prepared write may wait behind a state-lock owner that needs a read
-    // slot. Do not retain the pool's last slot across that wait. Remote pool
-    // availability cannot be inspected here, so those leases use owned edits.
-    const bool borrow_source =
-        loaded->lease_.buffer_id() == 0 ||
-        (loaded->lease_.owner_worker() == store.worker_->id() &&
-         store.buffers_.available_read_buffers() != 0);
-    if (borrow_source && ((value_type == ValueType::kHash &&
-                           operation.kind_ == HashOperationKind::kSet) ||
-                          (value_type == ValueType::kSet &&
-                           (operation.kind_ == HashOperationKind::kSet ||
-                            operation.kind_ == HashOperationKind::kDelete)))) {
+    // The detached source can survive lock/append waits without occupying
+    // the bounded read arena.
+    if ((value_type == ValueType::kHash &&
+         operation.kind_ == HashOperationKind::kSet) ||
+        (value_type == ValueType::kSet &&
+         (operation.kind_ == HashOperationKind::kSet ||
+          operation.kind_ == HashOperationKind::kDelete))) {
       // Only operand views and framing survive preparation; unchanged bytes
       // remain borrowed from compact_source through the awaited append.
       // Publication still uses the existing key intent, snapshot validation and

@@ -57,53 +57,56 @@ CPU instruction-set and glibc requirements remain separate constraints.
 `--registered-buffer-mb-per-worker` sets each data worker's storage-buffer pool
 budget (64 MiB by default). `--storage-write-buffers-per-worker` reserves four
 8 MiB write buffers by default and requires at least two; the remaining budget
-supplies read slots. Shutdown checkpoints reuse two drained write slots.
-`--storage-read-buffer-kb` is the total slot size, including framing space.
-The 32 KiB default contains 4 KiB of headroom, a 24 KiB disk-read area, and
-4 KiB of tailroom. Values must be multiples of 4 KiB and greater than 8 KiB.
-These startup options also work as Redis-style
+supplies a fixed read arena. Shutdown checkpoints reuse two drained write slots.
+`--storage-read-buffer-kb` selects the preferred chunk size, including framing
+space, rather than a fixed slot size or maximum read length. The 32 KiB default
+contains 4 KiB of headroom, a 24 KiB disk-read area, and 4 KiB of tailroom.
+Explicit reads reserve their actual aligned length from the arena. If a full
+range is unavailable, reads use smaller chunks and wait FIFO for capacity;
+neither backend allocates temporary disk-read buffers. Values must be multiples
+of 4 KiB and greater than 8 KiB. The arena must hold at least one payload page
+plus framing or startup fails. These startup options also work as Redis-style
 configuration directives without the leading `--`.
 
-Additional fixed allocations are 24 MiB per data worker for the three
+Additional fixed DMA allocations are 24 MiB per data worker for three
 maintenance readers, 8 MiB per process for Redis export, and 8 KiB per device
-for metadata writes. With defaults, total fixed storage-buffer capacity is
-`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. All count toward
-retained memory, and allocation failure prevents startup. Startup metadata I/O,
-recovery, and shutdown checkpoints reuse these allocations. See
-[storage ownership](../architecture/04-storage-and-recovery.md) for their lifetimes
-and [SPDK sizing](spdk-storage.md) for hugepage headroom.
+for metadata writes. With defaults, fixed storage-buffer capacity is
+`88 MiB × data workers + 8 MiB + 8 KiB × storage devices`. Read-arena metadata
+uses ordinary memory: one 16-byte descriptor per 4 KiB unit plus allocator
+control state (128 KiB of descriptors for the default 32 MiB read arena).
+All count toward retained memory; allocation failure prevents startup.
+Startup metadata I/O, recovery, and shutdown checkpoints reuse these allocations.
+See [storage ownership](../architecture/04-storage-and-recovery.md) and
+[SPDK sizing](spdk-storage.md) for their lifetimes and internal hugepage overhead.
 
-On io_uring, read and write slots share allocations made once at startup, with
-read slots placed first. Large pools span multiple registered regions, split
-at whole-slot boundaries to respect the kernel's 1 GiB per-region limit.
-Registration covers these existing allocations; a retry does not move slots
-or allocate a second pool. The default ordinary pool shares one region across
-1024 read slots and four write slots.
+Both backends allocate a contiguous virtual read arena and separate write
+buffers at startup. The read arena can span multiple registered regions to
+respect io_uring's 1 GiB per-region limit. Registration covers existing
+allocations; retries do not move memory or allocate another pool.
 
 The pool first attempts to register all fixed workspaces. If io_uring rejects
 it, Lavik uses the finite `RLIMIT_MEMLOCK` soft limit (`ulimit -l`, displayed in
 KiB) divided across runtime workers as a starting budget, with this priority:
 
 1. The owner worker's per-device 8 KiB metadata write buffers.
-2. Ordinary read slots.
+2. An aligned prefix of the ordinary read arena.
 3. Ordinary write slots.
 4. The 8 MiB maintenance images, ordered defrag, TxCleaner, then Tomb Raider.
 
-Each class is admitted in complete buffers before considering the next class.
-Failed retries reduce this registration budget; it is only an estimate because
-other locked resources can consume the allowance. Startup logs report counts
-for all four classes or complete fallback. Export and temporary overflow
-buffers are not registered. With defaults, registration requests
-`88 MiB + 8 KiB × owned devices` per data worker, subject to ordinary slot
-rounding. Registration does not allocate another copy or add a second charge.
+Device, write, and maintenance workspaces are admitted whole; the read arena
+prefix is rounded to its allocation alignment. Each class is admitted fully
+before considering the next. Failed retries reduce the budget, which is an
+estimate because other locked resources can consume the allowance. Export and
+ordinary-heap result assembly buffers remain unregistered. With defaults,
+registration requests `88 MiB + 8 KiB × owned devices` per data worker.
+Registration adds no second memory charge.
 
-The allocated pool capacity never shrinks. Slots outside the registered subset
-use ordinary asynchronous direct I/O; slot selection automatically chooses
-fixed or ordinary I/O. No additional setting is required, and Lavik does not
-raise the process's memlock limit. If the limit is unlimited or unavailable,
-registration failure uses the ordinary-I/O fallback without estimating a
-smaller budget. SPDK still requires DMA-addressable memory and has no such
-fallback.
+Allocated capacity never shrinks. A read lease outside the registered prefix
+or crossing a registration-region boundary uses ordinary asynchronous direct
+I/O. Lavik does not raise the process's memlock limit. If the limit is unlimited
+or unavailable, registration failure uses ordinary I/O without estimating a
+smaller budget. SPDK still requires DMA-addressable memory and fails startup if
+registration fails. It also uses only the preallocated arena for disk reads.
 
 ## Local builds
 

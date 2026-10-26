@@ -144,8 +144,7 @@ class RedisExportBufferTestPeer {
         !disk.blocks_.empty() || impl.redis_export_buffer_.in_use_.load() ||
         impl.redis_export_buffer_.data_ != buffer ||
         impl.redis_export_buffer_.charge_.bytes() != kStorageBlockBytes ||
-        pool.overflow_read_buffer_count() != 0 ||
-        pool.available_read_buffers() != 0 ||
+        pool.output_buffer_count() != 0 || pool.available_read_buffers() != 0 ||
         pool.available_write_buffers() != 0)
       co_return absl::InternalError("export cleanup changed fixed capacity");
     co_return absl::OkStatus();
