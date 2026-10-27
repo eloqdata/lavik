@@ -140,6 +140,45 @@ absl::StatusOr<PackedValues> IndexedOrderedReader::CopyRange(
   return result;
 }
 
+absl::Status IndexedOrderedSplice::EditSortedSetMember(
+    std::size_t removed, std::string_view member, std::optional<double> after) {
+  assert(parts_size_ == 0 && phase_ == 0);
+  const auto count = source_.size();
+  if (!source_.sorted_ || removed > count || (removed == count && !after) ||
+      member.size() > kMaxStringBytes || (after && std::isnan(*after)))
+    return absl::InvalidArgumentError("invalid indexed Sorted Set edit");
+  if (removed != count) {
+    auto old = source_.At(removed);
+    if (!old.ok()) return old.status();
+    if (old->value_ != member)
+      return absl::DataLossError("indexed Sorted Set edit source mismatch");
+  }
+  const auto retained =
+      source_.data().size() - (removed != count ? member.size() : 0);
+  if (after && member.size() > UINT32_MAX - retained)
+    return absl::OutOfRangeError("indexed Sorted Set edit size overflow");
+  auto inserted = after ? source_.LowerBound(*after, member)
+                        : absl::StatusOr<std::size_t>(count);
+  if (!inserted.ok()) return inserted.status();
+  // Both positions address the immutable source. Remove before inserting
+  // when moving right; insert before removing when moving left (or staying).
+  // Equal positions also cover replacing the first/last member and score ties.
+  std::size_t first = 0;
+  if (removed < *inserted) {
+    AppendSource(first, removed);
+    first = removed + 1;
+  }
+  AppendSource(first, *inserted - first);
+  if (after) AppendMember(member, *after);
+  first = *inserted;
+  if (removed >= *inserted && removed != count) {
+    AppendSource(first, removed - first);
+    first = removed + 1;
+  }
+  AppendSource(first, count - first);
+  return absl::OkStatus();
+}
+
 std::string_view IndexedOrderedSplice::SourceBytes(
     const Part& part) const noexcept {
   const auto begin = Get(source_.body_, source_.offsets_ + part.first_ * 4, 4);
@@ -204,11 +243,13 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
     return std::string_view(framing_.data(), width);
   };
   if (phase_ == 0) {
-    std::memcpy(framing_.data(), source_.sorted_ ? "LZS2" : "LVL2", 4);
-    for (unsigned i = 0; i < 4; ++i)
-      framing_[4 + i] = static_cast<char>(count_ >> (8 * i));
     phase_ = 1;
-    return std::string_view(framing_.data(), framing_.size());
+    if (compact_) {
+      std::memcpy(framing_.data(), source_.sorted_ ? "LZS2" : "LVL2", 4);
+      for (unsigned i = 0; i < 4; ++i)
+        framing_[4 + i] = static_cast<char>(count_ >> (8 * i));
+      return std::string_view(framing_.data(), framing_.size());
+    }
   }
   if (phase_ == 1) {
     if (part_ < parts_size_) {

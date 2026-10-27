@@ -144,7 +144,8 @@ class EncodedSortedSetEntries {
                             std::string_view member,
                             std::optional<double> before,
                             std::optional<double> after,
-                            std::size_t target_bytes);
+                            std::size_t target_bytes,
+                            bool member_absence_verified);
   EncodedSortedSetEntries(LocalSharedPtr<const std::string> bytes,
                           std::vector<OrderedCollectionEntryView> entries,
                           std::uint32_t version = 1)
@@ -367,10 +368,15 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
 // nullopt for an empty/oversized after-image, leaving topology changes to the
 // ordinary planner. The input is immutable even on failure; score mismatches,
 // duplicate additions and invalid inputs are errors, never silent fallbacks.
+// For v2 insertion, member_absence_verified skips the member-only scan when
+// the caller's member graph and resolved source page already prove absence
+// from this page. Otherwise absence is checked here. Existing members and new
+// positions use binary lookup; full source validation remains mandatory.
 absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     const OrderedGroupSnapshot& page, std::string_view member,
     std::optional<double> before, std::optional<double> after,
-    std::size_t target_bytes = kCollectionGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes,
+    bool member_absence_verified = false);
 
 // Converts a private checked/encoded page into mutable, independently owned
 // entries before split/rebalance planning. Existing mutable pages are

@@ -82,8 +82,17 @@ class IndexedOrderedReader {
 // the destination writer has consumed the complete plan successfully.
 class IndexedOrderedSplice {
  public:
-  explicit IndexedOrderedSplice(IndexedOrderedReader source) noexcept
-      : source_(source) {}
+  // Grouped pages reuse the same body beneath their own envelope.
+  explicit IndexedOrderedSplice(IndexedOrderedReader source,
+                                bool compact = true) noexcept
+      : source_(source), compact_(compact) {}
+  // Plans one edit on a fully validated Sorted Set source. removed == size()
+  // inserts an absent member; otherwise that slot must contain member. The
+  // caller resolves member existence before invoking this method. The new
+  // position is binary-searched without a second member scan or view array.
+  // Call only on an unstarted, empty plan. A missing after score deletes.
+  absl::Status EditSortedSetMember(std::size_t removed, std::string_view member,
+                                   std::optional<double> after);
   void AppendSource(std::size_t first, std::size_t count) noexcept;
   // One insertion per plan: List operand views (optionally reversed), or a
   // Sorted Set member. Neither method copies operand bytes.
@@ -91,7 +100,8 @@ class IndexedOrderedSplice {
                     bool reverse) noexcept;
   void AppendMember(std::string_view member, double score) noexcept;
   std::size_t encoded_bytes() const noexcept {
-    return 12 + data_bytes_ + count_ * (source_.sorted_ ? 12 : 4);
+    return (compact_ ? 12 : 4) + data_bytes_ +
+           count_ * (source_.sorted_ ? 12 : 4);
   }
   std::optional<std::string_view> Next() noexcept;
 
@@ -111,6 +121,7 @@ class IndexedOrderedSplice {
   bool reverse_inputs_ = false;
   bool has_inputs_ = false;
   bool inserted_ = false;
+  bool compact_ = true;
   std::size_t parts_size_ = 0, count_ = 0, data_bytes_ = 0;
   std::size_t part_ = 0, item_ = 0, offset_ = 0;
   unsigned phase_ = 0;

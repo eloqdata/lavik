@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <bit>
 #include <cmath>
 #include <map>
 #include <set>
@@ -770,6 +771,7 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
   if (!reader.ok()) return reader.status();
   auto scan = *reader;
   auto& state = members.at(member);
+  std::size_t removed = reader->size();
   std::optional<OrderedCompactEntryView> previous;
   for (std::size_t i = 0; i < scan.size(); ++i) {
     auto entry = scan.Next();
@@ -783,6 +785,7 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
       if (state.before_)
         return absl::DataLossError("duplicate persisted Sorted Set member");
       state.before_ = state.after_ = entry->score_;
+      removed = i;
     }
   }
   result.key_exists_ = true;
@@ -799,29 +802,11 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
   }
   if (reader->indexed()) {
     auto& output = payload.V2(*reader->indexed());
-    bool inserted = !state.after_;
-    std::size_t first = 0;
-    // Removing and inserting one member splits the immutable source into at
-    // most three surviving ranges. Keep positions, not an O(N) view vector.
-    for (std::size_t i = 0; i < reader->size(); ++i) {
-      const auto entry = reader->indexed()->At(i);
-      assert(entry.ok());  // The complete source was preflighted above.
-      if (entry->value_ == member) {
-        output.AppendSource(first, i - first);
-        first = i + 1;
-        continue;
-      }
-      if (!inserted &&
-          (*state.after_ < entry->score_ ||
-           (*state.after_ == entry->score_ && member < entry->value_))) {
-        output.AppendSource(first, i - first);
-        first = i;
-        output.AppendMember(member, *state.after_);
-        inserted = true;
-      }
-    }
-    output.AppendSource(first, reader->size() - first);
-    if (!inserted) output.AppendMember(member, *state.after_);
+    // Compact values have no member-to-score index, so the validation pass
+    // above also resolves the old slot. Reuse it for deletion and binary-seek
+    // the new position instead of scanning the page again.
+    auto edited = output.EditSortedSetMember(removed, member, state.after_);
+    if (!edited.ok()) return edited;
     return update;
   }
   auto& output = payload.V1();
@@ -2144,9 +2129,46 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   // Pop already knows the exact source pages. Check the member index above
   // against their owned entries, then omit those members from score routing.
   // New point-write probes follow the same path on later planner reads.
-  auto locate_sources = [&](std::size_t i,
-                            const auto& entries) -> absl::StatusOr<bool> {
+  auto locate_sources =
+      [&](std::size_t i, const auto& entries,
+          const IndexedOrderedReader* indexed) -> absl::StatusOr<bool> {
     bool matched = false;
+    // The member graph supplies the complete ordered key. Sparse requests
+    // can binary-search it; dense batches retain one scan instead of doing
+    // M log N probes per page. Neither path allocates lookup scratch, and
+    // every loaded mutation page has already passed full validation.
+    if (members.size() <=
+        entries.size() /
+            std::max<std::size_t>(1, std::bit_width(entries.size()))) {
+      for (auto& [member, state] : members) {
+        if (!state.before_ || *state.before_ < metadata[i].min_score_ ||
+            *state.before_ > metadata[i].max_score_)
+          continue;
+        auto position = [&]() -> absl::StatusOr<std::size_t> {
+          if (indexed) return indexed->LowerBound(*state.before_, member);
+          const auto found = std::lower_bound(
+              entries.begin(), entries.end(),
+              OrderedCollectionEntryView{member, *state.before_},
+              [](const auto& entry, const auto& key) {
+                return entry.score_ < key.score_ ||
+                       (entry.score_ == key.score_ &&
+                        entry.value_ < key.value_);
+              });
+          return found - entries.begin();
+        }();
+        if (!position.ok()) return position.status();
+        if (*position == entries.size() ||
+            entries[*position].score_ != *state.before_ ||
+            entries[*position].value_ != member)
+          continue;
+        if (state.source_ != kNoPage)
+          return absl::DataLossError("duplicate persisted Sorted Set member");
+        state.source_ = i;
+        --remaining_sources;
+        matched = true;
+      }
+      return matched;
+    }
     for (const auto& entry : entries) {
       auto member = members.find(entry.value_);
       if (member == members.end()) continue;
@@ -2161,19 +2183,29 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     return matched;
   };
+  auto locate_page_sources =
+      [&](std::size_t i,
+          const OrderedGroupSnapshot& snapshot) -> absl::StatusOr<bool> {
+    if (!snapshot.encoded_sorted_set_)
+      return locate_sources(i, snapshot.entries_, nullptr);
+    const auto& encoded = *snapshot.encoded_sorted_set_;
+    if (encoded.version() != 2)
+      return locate_sources(i, encoded.entries(), nullptr);
+    auto reader = IndexedOrderedReader::Open(snapshot.kind_, encoded.bytes(),
+                                             encoded.entries().size());
+    if (!reader.ok()) return reader.status();
+    return locate_sources(i, encoded.entries(), &*reader);
+  };
   for (const auto& [i, page] : probed_pages) {
     GroupedScratchBudget budget;
     status = add_page_budget(&budget, i);
     if (!status.ok()) co_return status;
     const auto& snapshot = page.page_.snapshot_;
-    auto located =
-        snapshot.encoded_sorted_set_
-            ? locate_sources(i, snapshot.encoded_sorted_set_->entries())
-            : locate_sources(i, snapshot.entries_);
+    auto located = locate_page_sources(i, snapshot);
     if (!located.ok()) co_return located.status();
   }
   // The two resident doubles bound old-score candidates without reading
-  // unrelated pages. Equal-score runs still scan for exact members. Sort
+  // unrelated pages. Equal-score runs still need candidate page reads. Sort
   // and merge requested intervals so a batch reads an overlapping page only
   // once; interval storage is covered by the per-input reservation.
   std::vector<std::pair<std::size_t, std::size_t>> source_ranges;
@@ -2195,10 +2227,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
       const auto& snapshot = page->page_.snapshot_;
-      auto located =
-          snapshot.encoded_sorted_set_
-              ? locate_sources(i, snapshot.encoded_sorted_set_->entries())
-              : locate_sources(i, snapshot.entries_);
+      auto located = locate_page_sources(i, snapshot);
       if (!located.ok()) co_return located.status();
       // Equal-score scans may touch unrelated pages. Retain only pages with
       // requested members, so a point update never caches the whole set.
@@ -2351,7 +2380,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto edited = EditEncodedSortedSetGroup(
           loaded.at(i), member,
           i == state.source_ ? state.before_ : std::nullopt,
-          i == state.destination_ ? state.after_ : std::nullopt);
+          i == state.destination_ ? state.after_ : std::nullopt,
+          kCollectionGroupTargetBytes,
+          // The member graph either proved global absence or we resolved
+          // this member in a different source page under the same root.
+          /*member_absence_verified=*/true);
       if (!edited.ok()) co_return edited.status();
       if (!*edited) {
         encoded_point = false;
@@ -2381,10 +2414,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       // inputs retain the general path because repeated members apply in order.
       const auto& [member, state] = pending.front();
       auto& source = loaded.at(state->source_).entries_;
-      const auto entry =
-          std::find_if(source.begin(), source.end(),
-                       [&](const auto& at) { return at.value_ == member; });
-      if (entry == source.end())
+      const auto entry = std::lower_bound(
+          source.begin(), source.end(),
+          OrderedCollectionEntryView{member, *state->before_},
+          [](const auto& at, const auto& key) {
+            return at.score_ < key.score_ ||
+                   (at.score_ == key.score_ && at.value_ < key.value_);
+          });
+      if (entry == source.end() || entry->value_ != member ||
+          entry->score_ != *state->before_)
         co_return absl::DataLossError("missing Sorted Set point-update source");
       entry->score_ = *state->after_;
       if (state->source_ == state->destination_) {

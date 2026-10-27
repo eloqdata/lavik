@@ -363,6 +363,12 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointEditsMatchOwnedImages) {
       ASSERT_TRUE(restored.ok());
       ASSERT_TRUE(*restored);
       EXPECT_EQ(*EncodeOrderedGroup(**restored), *wire);
+      auto resolved = EditEncodedSortedSetGroup(
+          **erased, member, std::nullopt, score, kCollectionGroupTargetBytes,
+          /*member_absence_verified=*/true);
+      ASSERT_TRUE(resolved.ok());
+      ASSERT_TRUE(*resolved);
+      EXPECT_EQ(*EncodeOrderedGroup(**resolved), *wire);
     }
     // The immutable predecessor must survive every candidate edit unchanged.
     EXPECT_EQ(*EncodeOrderedGroup(*decoded), *wire);
@@ -379,6 +385,10 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointRejectsBadEditsAndFallsBack) {
       EditEncodedSortedSetGroup(*page, "item-0", std::nullopt, 10).ok());
   EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "item-0", 9, 10).ok());
   EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "missing", 0, 10).ok());
+  EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "missing", 0, 10,
+                                         kCollectionGroupTargetBytes,
+                                         /*member_absence_verified=*/true)
+                   .ok());
   EXPECT_FALSE(
       EditEncodedSortedSetGroup(*page, "missing", std::nullopt, std::nullopt)
           .ok());

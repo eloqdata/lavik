@@ -220,6 +220,72 @@ void ExpectDenseZSet(Client& client, std::string_view key,
   }
 }
 
+TEST(GroupedSortedSetWriteE2e,
+     IndexedPointAndBatchWritesKeepTiesAndBothIndexesAcrossRecovery) {
+  PrivateDisk disk;
+  const std::string key = "indexed-member-writes";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    // Equal-score runs span pages; the member graph resolves old scores,
+    // while binary member order determines the exact source/destination.
+    for (unsigned i = 0; i < 1024; ++i) {
+      const auto member = DenseZSetMember(i);
+      expected[member] = i % 4;
+      seed.insert(seed.end(), {std::to_string(i % 4), member});
+    }
+    ASSERT_EQ(client.Command(seed).text_, "1024");
+    for (unsigned i = 0; i < 16; ++i) {
+      const auto member = DenseZSetMember((i * 37) % 1024);
+      const auto delta = i % 2 == 0 ? 32768 : -32768;
+      const auto increment =
+          client.Command({"ZINCRBY", key, std::to_string(delta), member});
+      ASSERT_EQ(increment.kind_, '$');
+      expected[member] += delta;
+      EXPECT_EQ(std::stod(increment.text_), expected[member]);
+      ASSERT_EQ(
+          client
+              .Command({"ZADD", key, "XX", "CH", std::to_string(i % 4), member})
+              .text_,
+          "1");
+      expected[member] = i % 4;
+      ASSERT_EQ(client.Command({"ZREM", key, member, member}).text_, "1");
+      ASSERT_EQ(client.Command({"ZADD", key, "NX", "2", member}).text_, "1");
+      expected[member] = 2;
+    }
+    const auto a = DenseZSetMember(800), b = DenseZSetMember(801);
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "CH", "-32768", a, "32768", b, "0", a})
+            .text_,
+        "3");
+    expected[a] = 0;
+    expected[b] = 32768;
+    ExpectDenseZSet(client, key, expected);
+    // A dense removal/reinsertion also covers the single-scan batch path.
+    std::vector<std::string> remove{"ZREM", key}, add{"ZADD", key};
+    for (unsigned i = 0; i < 128; ++i) {
+      const auto member = DenseZSetMember(i * 7);
+      remove.push_back(member);
+      add.insert(add.end(), {std::to_string(i % 4), member});
+      expected.erase(member);
+    }
+    ASSERT_EQ(client.Command(remove).text_, "128");
+    ExpectDenseZSet(client, key, expected);
+    ASSERT_EQ(client.Command(add).text_, "128");
+    for (unsigned i = 0; i < 128; ++i) expected[DenseZSetMember(i * 7)] = i % 4;
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped(key), true);
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 std::optional<OrderedGroupSnapshot> FirstDenseOrderedPage(
     const PrivateDisk& disk, std::string_view key) {
   std::optional<OrderedGroupSnapshot> first;

@@ -568,8 +568,64 @@ TEST(IndexedOrderedSpliceTest, SortedSetMovesDeleteAndInsertWithoutViewArrays) {
         i += count;
       }
       CheckIndexedSplice(plan, OrderedCollectionKind::kSortedSet, expected);
+
+      OrderedCompactPayload located;
+      ASSERT_TRUE(located.V2(*reader->indexed())
+                      .EditSortedSetMember(removed, member, score)
+                      .ok());
+      CheckIndexedSplice(located, OrderedCollectionKind::kSortedSet, expected);
+
+      IndexedOrderedSplice body(*reader->indexed(), /*compact=*/false);
+      ASSERT_TRUE(body.EditSortedSetMember(removed, member, score).ok());
+      std::string output;
+      output.reserve(body.encoded_bytes());
+      while (auto part = body.Next()) output.append(*part);
+      const auto encoded = EncodeOrderedCompactValue(
+          OrderedCollectionKind::kSortedSet, expected, 2);
+      ASSERT_TRUE(encoded.ok());
+      EXPECT_EQ(output, encoded->substr(8));
+      EXPECT_EQ(output.size(), body.encoded_bytes());
     }
   }
+}
+
+TEST(IndexedOrderedSpliceTest, PointLookupHandlesDenseTiesAndInvalidSlots) {
+  std::vector<OrderedCollectionEntry> entries;
+  for (std::size_t i = 0; i < 257; ++i)
+    entries.push_back({std::string(i % 17, '\0') + std::to_string(i),
+                       static_cast<double>(i / 32)});
+  std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+  auto bytes =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
+  ASSERT_TRUE(bytes.ok());
+  auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
+                                           *bytes, entries.size());
+  ASSERT_TRUE(reader.ok());
+  for (std::size_t removed = 0; removed < entries.size(); ++removed) {
+    for (double score :
+         {-std::numeric_limits<double>::infinity(), -0.0, 0.0, 4.0, 32768.0,
+          std::numeric_limits<double>::infinity()}) {
+      auto expected = entries;
+      expected[removed].score_ = score;
+      std::sort(expected.begin(), expected.end(), OrderedEntryLess);
+      OrderedCompactPayload plan;
+      ASSERT_TRUE(
+          plan.V2(*reader->indexed())
+              .EditSortedSetMember(removed, entries[removed].value_, score)
+              .ok());
+      CheckIndexedSplice(plan, OrderedCollectionKind::kSortedSet, expected);
+    }
+  }
+  IndexedOrderedSplice invalid(*reader->indexed());
+  EXPECT_FALSE(invalid.EditSortedSetMember(0, "missing", 1).ok());
+  EXPECT_FALSE(invalid.EditSortedSetMember(entries.size() + 1, "new", 1).ok());
+  EXPECT_FALSE(
+      invalid.EditSortedSetMember(entries.size(), "new", std::nullopt).ok());
+  EXPECT_FALSE(
+      invalid
+          .EditSortedSetMember(0, entries.front().value_,
+                               std::numeric_limits<double>::quiet_NaN())
+          .ok());
 }
 
 }  // namespace

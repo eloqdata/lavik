@@ -353,6 +353,11 @@ funnel consumes each encoder after its final suspension, then publishes the
 same complete checked record format. Published records and commit receipts
 retain no borrowed payload. Detached ownership keeps queued writers from
 retaining the read arena needed by an earlier state-lock owner.
+Compact Sorted Sets resolve a requested member and its slot during source
+validation because their physical format has no member-to-score index. V2
+point edits reuse that slot for deletion and binary-search the final score/member
+position; both compact and grouped point encoders borrow the surviving source
+intervals into the final after-image without an intermediate payload buffer.
 Ordinary existing compact String writes retain key intent and database
 admission while releasing worker store state for the old-value read and private
 preparation; reacquisition validates logical identity and population, allowing
@@ -493,7 +498,7 @@ ranges and serial fallbacks seek directly by rank or binary-search score bounds;
 score counts use the bound positions. Random selection accesses selected
 slots directly, and member ranks binary-search `(score, member)` within pages
 selected by the member graph and score directory. Full scans and mutation
-preparation retain complete decoding; ordinary indexed reads check only the
+preparation retain complete validation; ordinary indexed reads check only the
 accessed intervals after the common identity and CRC policy checks.
 Ordinary read-only scans trust the writer's member uniqueness without building
 a temporary hash set; write preparation and strict decoders retain that check.
@@ -525,7 +530,12 @@ checkpoints. Add, increment,
 remove and GEOADD use the member index to resolve old scores
 before locating ordered source pages and routing final scores against old page
 boundaries. Resident score bounds skip unrelated pages; equal-score runs still
-require pagewise exact member comparisons. Batched requests coalesce source
+require candidate page reads. Within checked pages, sparse member requests
+binary-search `(score, member)` while dense batches retain a single scan.
+V2 point editors binary-search old and new positions; insertion absence follows
+the member graph and resolved source page under the same logical root. Standalone
+codec callers without that evidence retain the explicit absence check.
+Batched requests coalesce source
 intervals and share destination boundary reads against the old logical view.
 Only changed pages and structural link neighbours remain decoded during
 publication; a score
