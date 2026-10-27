@@ -252,8 +252,11 @@ restart and RDB export/import. It does not reconstruct those boundaries from
 current settings or accept earlier development layouts without node counts.
 Outer records, roots and Stream payloads retain version 1. List and Sorted Set
 physical payloads independently accept v1 and indexed v2, as described in
-[grouped collections](09-grouped-collections.md); older binaries cannot consume
-v2 payloads. Redis RDB versions follow the external Redis format independently.
+[grouped collections](09-grouped-collections.md). Binaries without v2 support
+must not open media containing v2 payloads. Native replication peers must
+support v2 before exchanging compact v2 after-images; the unchanged v1 outer
+record version does not make these inner payloads compatible with older
+binaries. Redis RDB versions follow the external Redis format independently.
 Grouped Streams
 project their ordered records into the same logical format; the grouped root
 and page identities remain local durable metadata.
