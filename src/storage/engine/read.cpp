@@ -1812,7 +1812,13 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
     ready_.emplace(absl::AbortedError("stale index block epoch"));
     return;
   }
-  if (location_.in_memory() && state->in_memory_) [[unlikely]] {
+  // Locations retained outside the primary index can keep their staged bit
+  // after a flush. A rebound write buffer contains only its new tail.
+  const auto* staging = location_.in_memory() && state->in_memory_
+                            ? engine_.StagingFor(store_, *state)
+                            : nullptr;
+  if (staging != nullptr && location_.record_offset() >= staging->buffer_begin_)
+      [[unlikely]] {
     auto buffer = engine_.StagingBufferFor(store_, *state);
     if (!buffer.data_ ||
         location_.record_offset() + location_.total_disk_bytes() >

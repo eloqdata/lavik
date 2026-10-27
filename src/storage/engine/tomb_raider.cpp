@@ -17,6 +17,7 @@
 #include <ctime>
 #include <optional>
 
+#include "absl/cleanup/cleanup.h"
 #include "impl.h"
 
 namespace lavik::storage {
@@ -528,11 +529,13 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
   struct BlockSnapshot {
     std::uint64_t block_id_ = 0;
     std::uint64_t allocation_epoch_ = 0;
+    std::uint32_t disk_bytes_ = 0;
+    std::uint32_t committed_bytes_ = 0;
   };
-  // Blocks allocated after this snapshot cannot matter: new appends carry
-  // higher sequences, and relocations only move index-current records — for
-  // a key whose entry is a candidate, every older record is dead to the
-  // index and is dropped by salvage, never moved.
+  // Later appends publish an unclaimed=false index entry, withdrawing that
+  // key's candidate. Relocation only moves index-current records and likewise
+  // clears the mark; older, obsolete values are dropped rather than moved.
+  // Thus neither later blocks nor later tails extend this round's proof.
   // A retiring block can already be absent from this runtime walk while
   // recovery still sees its allocated bitmap bit. Wait for its durable
   // retirement before taking the snapshot, without discarding this round's
@@ -552,12 +555,19 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
   }
   if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
   std::vector<BlockSnapshot> blocks;
+  std::vector<std::size_t> staged_blocks;
   ForEachOwnedBlock(store, [&](std::uint64_t block_id, BlockState& state) {
     if (state.kind_ == BlockKind::kRecords &&
         state.committed_bytes_ > kBlockHeaderBytes) {
+      const auto* slot = StagingFor(store, state);
+      const auto durable = slot ? slot->durable_bytes_ : state.committed_bytes_;
+      if (durable < state.committed_bytes_)
+        staged_blocks.push_back(blocks.size());
       blocks.push_back(BlockSnapshot{
           .block_id_ = block_id,
           .allocation_epoch_ = state.allocation_epoch_,
+          .disk_bytes_ = durable,
+          .committed_bytes_ = state.committed_bytes_,
       });
     }
   });
@@ -627,80 +637,18 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         });
   };
 
-  for (const BlockSnapshot& snapshot : blocks) {
-    if (!TombRaiderRoundValid(round, &store)) {
-      co_return absl::OkStatus();  // forfeit the round
-    }
-    bool retired = false;
-    while (!present(snapshot)) {
-      auto available = co_await await_block(snapshot);
-      if (!available.ok()) co_return available.status();
-      if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
-      if (!*available) {
-        retired = true;
-        break;
-      }
-    }
-    if (retired) continue;
-    BlockState* state = FindBlockState(store, snapshot.block_id_);
-    const std::uint32_t committed = state->committed_bytes_;
-    if (committed <= kBlockHeaderBytes) {
-      continue;
-    }
-    StagingSlot* slot = StagingFor(store, *state);
-    if (slot != nullptr) {
-      // Unflushed records exist only in the staging buffer; missing them
-      // would let a still-dangerous key reap its tombstone. The copy runs
-      // without suspending, so the captured prefix is consistent and the
-      // slot cannot be released underneath it.
-      FixedBuffer staged = store.buffers_.write_buffer(slot->write_buffer_id_);
-      if (staged.data_ == nullptr || staged.size_ < committed) {
-        continue;
-      }
-      std::memcpy(sweep.data_, staged.data_, committed);
-    } else {
-      // Slotless blocks are fully flushed and never appended to again, so
-      // the on-disk image below `committed` is final.
-      const auto [file_id, block_offset] = FileOffset(snapshot.block_id_);
-      // Keep only one chunk in flight and assemble the complete block before
-      // decoding: records may cross chunk boundaries. Subranges retain the
-      // original buffer registration and direct-I/O alignment.
-      for (std::size_t read_offset = 0; read_offset < kStorageBlockBytes;
-           read_offset += kSweepReadChunkBytes) {
-        auto part = sweep;
-        part.data_ += read_offset;
-        part.size_ = kSweepReadChunkBytes;
-        auto read = co_await ReadStorageBuffer(
-            *store.worker_, store.files_[file_id], part,
-            store.buffers_.workspace_registered(part),
-            block_offset + read_offset);
-        if (!read.ok()) co_return read.status();
-        if (*read != part.size_) {
-          co_return absl::Status(absl::StatusCode::kInternal,
-                                 "short block read during tomb raider sweep");
-        }
-        if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
-      }
-#if LAVIK_FAULTS_ENABLED
-      if (tomb_raider_test_hook_) {
-        const auto hooked = co_await tomb_raider_test_hook_(
-            TombRaiderTestPoint::kAfterSweepRead);
-        if (!hooked.ok()) co_return hooked;
-      }
-#endif
-      if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
-      // The decode loop below rechecks physical retirement before touching
-      // this copied image, just as it does after every asynchronous claim.
-    }
-
+  auto scan_records = [&](const BlockSnapshot& snapshot, const std::byte* data,
+                          std::uint32_t begin, std::uint32_t end,
+                          bool pinned) -> Task<absl::Status> {
     const std::uint64_t now_ms = UnixTimeMillis();
-    std::uint32_t record_offset = kBlockHeaderBytes;
+    std::uint32_t record_offset = begin;
     std::size_t decoded = 0;
-    while (record_offset < committed) {
+    while (record_offset < end) {
       if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
-      // The copied bytes may outlive their physical block across a claim/key
-      // lookup. Its UUID registry may already be gone after reclamation.
-      if (!present(snapshot)) {
+      // A private disk image can outlive its block across a claim/key lookup.
+      // A staging scan holds a pin instead: waiting for retirement here would
+      // deadlock the freeing task that is itself waiting for that pin.
+      if (!pinned && !present(snapshot)) {
         auto available = co_await await_block(snapshot);
         if (!available.ok()) co_return available.status();
         if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
@@ -711,7 +659,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         continue;  // Re-resolve after the wait before decoding this record.
       }
       const std::optional<std::uint32_t> next =
-          NextRecordOffset(sweep.data_, record_offset, committed);
+          NextRecordOffset(data, record_offset, end);
       if (!next.has_value()) {
         break;  // torn or foreign bytes: nothing decodable remains
       }
@@ -720,13 +668,13 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         continue;
       }
       RecordHeader record{};
-      std::string_view disk_key;
-      std::span<const std::byte> record_bytes(sweep.data_ + record_offset,
-                                              committed - record_offset);
-      if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
+      std::string_view record_key;
+      std::span<const std::byte> record_bytes(data + record_offset,
+                                              end - record_offset);
+      if (!DecodeRecordHeader(record_bytes, &record, &record_key) ||
           record.allocation_epoch_ != snapshot.allocation_epoch_ ||
           record.total_disk_bytes_ == 0 ||
-          record_offset + record.total_disk_bytes_ > committed) {
+          record_offset + record.total_disk_bytes_ > end) {
         break;
       }
       record_offset += record.total_disk_bytes_;
@@ -764,15 +712,15 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
           loaded_key = std::move(*original);
           if (loaded_key.size() != record.key_bytes_)
             co_return absl::DataLossError("indirect key length mismatch");
-          disk_key = loaded_key;
+          record_key = loaded_key;
         }
 
-        const unsigned key_owner = OwnerForKey(disk_key);
+        const unsigned key_owner = OwnerForKey(record_key);
         pending[key_owner].push_back(TombClaim{
             .mutation_sequence_ = record.mutation_sequence_,
             .replication_epoch_ = record.replication_epoch_,
-            .digest_ = ComputeDigest(disk_key),
-            .key_ = std::string(disk_key),
+            .digest_ = ComputeDigest(record_key),
+            .key_ = std::string(record_key),
             .db_id_ = record.db_id_,
         });
         if (pending[key_owner].size() >= 512) {
@@ -789,9 +737,132 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store,
         co_await bycorf::Yield(*store.worker_);
       }
     }
-    // Pace the average scan rate once per complete block. Chunked reads above
-    // bound the I/O burst; this sleep alone does not protect foreground
-    // latency.
+    co_return absl::OkStatus();
+  };
+
+  // Capture both ranges before any scan can yield. A write buffer may already
+  // have been rebound, so only [durable, committed) belongs to staging; older
+  // pages remain on disk. Pin one buffer at a time across key loads and claim
+  // batches, then release it before disk-prefix reads, pacing, or retirement
+  // waits.
+#if LAVIK_FAULTS_ENABLED
+  if (!staged_blocks.empty() && tomb_raider_test_hook_) {
+    auto hooked = co_await tomb_raider_test_hook_(
+        TombRaiderTestPoint::kAfterSweepSnapshot);
+    if (!hooked.ok()) co_return hooked;
+  }
+#endif
+  for (const auto index : staged_blocks) {
+    auto& snapshot = blocks[index];
+    auto available = co_await await_block(snapshot);
+    if (!available.ok()) co_return available.status();
+    if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+    if (!*available) {
+      snapshot.disk_bytes_ = 0;
+      continue;
+    }
+    auto* state = FindBlockState(store, snapshot.block_id_);
+    auto* slot = StagingFor(store, *state);
+    if (slot == nullptr || slot->write_buffer_id_ == 0 ||
+        slot->buffer_begin_ > snapshot.disk_bytes_) {
+      // This tail was flushed and its slot returned while an earlier scan
+      // yielded. Returning a slot requires its whole dirty tail to be durable;
+      // scan the captured range on disk, never the replacement buffer's bytes.
+      const auto durable =
+          slot ? slot->durable_bytes_ : state->committed_bytes_;
+      if (durable < snapshot.committed_bytes_)
+        co_return absl::InternalError(
+            "tomb sweep lost an unflushed staging tail");
+      snapshot.disk_bytes_ = snapshot.committed_bytes_;
+      continue;
+    }
+    const auto buffer = StagingBufferFor(store, *state);
+    if (!buffer.data_ || buffer.size_ < snapshot.committed_bytes_)
+      co_return absl::InternalError("invalid tomb sweep staging buffer");
+    state->PinLocal();
+    absl::Cleanup unpin = [&] {
+      UnpinBlock(store, *state, snapshot.block_id_);
+    };
+#if LAVIK_FAULTS_ENABLED
+    if (tomb_raider_test_hook_) {
+      auto hooked = co_await tomb_raider_test_hook_(
+          TombRaiderTestPoint::kAfterStagingPin);
+      if (!hooked.ok()) co_return hooked;
+    }
+#endif
+    auto scanned =
+        co_await scan_records(snapshot, buffer.data_, snapshot.disk_bytes_,
+                              snapshot.committed_bytes_, true);
+    if (!scanned.ok()) co_return scanned;
+  }
+  if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+  for (unsigned owner = 0; owner < worker_count_; ++owner) {
+    auto flushed = co_await flush_claims(owner);
+    if (!flushed.ok()) co_return flushed;
+  }
+#if LAVIK_FAULTS_ENABLED
+  if (!staged_blocks.empty() && tomb_raider_test_hook_) {
+    auto hooked = co_await tomb_raider_test_hook_(
+        TombRaiderTestPoint::kAfterStagingSweep);
+    if (!hooked.ok()) co_return hooked;
+  }
+#endif
+
+  for (const BlockSnapshot& snapshot : blocks) {
+    if (!TombRaiderRoundValid(round, &store)) {
+      co_return absl::OkStatus();  // forfeit the round
+    }
+    bool retired = false;
+    while (!present(snapshot)) {
+      auto available = co_await await_block(snapshot);
+      if (!available.ok()) co_return available.status();
+      if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+      if (!*available) {
+        retired = true;
+        break;
+      }
+    }
+    if (retired) continue;
+    const auto committed = snapshot.disk_bytes_;
+    if (committed > kBlockHeaderBytes) {
+      const auto [file_id, block_offset] = FileOffset(snapshot.block_id_);
+      // Keep only one chunk in flight and assemble the complete block before
+      // decoding: records may cross chunk boundaries. Subranges retain the
+      // original buffer registration and direct-I/O alignment.
+      const auto read_bytes = AlignDirect(committed);
+      for (std::size_t read_offset = 0; read_offset < read_bytes;
+           read_offset += kSweepReadChunkBytes) {
+        auto part = sweep;
+        part.data_ += read_offset;
+        part.size_ = std::min(kSweepReadChunkBytes, read_bytes - read_offset);
+        auto read = co_await ReadStorageBuffer(
+            *store.worker_, store.files_[file_id], part,
+            store.buffers_.workspace_registered(part),
+            block_offset + read_offset);
+        if (!read.ok()) co_return read.status();
+        if (*read != part.size_) {
+          co_return absl::Status(absl::StatusCode::kInternal,
+                                 "short block read during tomb raider sweep");
+        }
+        if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+      }
+#if LAVIK_FAULTS_ENABLED
+      if (tomb_raider_test_hook_) {
+        const auto hooked = co_await tomb_raider_test_hook_(
+            TombRaiderTestPoint::kAfterSweepRead);
+        if (!hooked.ok()) co_return hooked;
+      }
+#endif
+      if (!TombRaiderRoundValid(round, &store)) co_return absl::OkStatus();
+      // The decode loop below rechecks physical retirement before touching
+      // this copied image, just as it does after every asynchronous claim.
+      auto scanned = co_await scan_records(snapshot, sweep.data_,
+                                           kBlockHeaderBytes, committed, false);
+      if (!scanned.ok()) co_return scanned;
+    }
+    // Preserve the per-block pause, including blocks scanned entirely from
+    // staging, without retaining a write buffer during that pause. Chunked
+    // reads above independently bound the I/O burst.
     const std::uint32_t block_sleep_ms =
         tomb_raider_config_.block_sleep_ms_.load(std::memory_order_relaxed);
     auto sleep_remaining = std::chrono::milliseconds(block_sleep_ms);

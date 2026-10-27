@@ -427,9 +427,7 @@ void StorageEngine::Impl::SealIdleTxBlocksLocal(WorkerStore& store) {
       found->second.last_append_ms_ == 0 ||
       now - found->second.last_append_ms_ < kIdleSealMs)
     return;
-  RequestFlush(store, active->block_id_);
-  NoteTxBlockSealedLocal(store, active->block_id_);
-  active.reset();
+  SealAppendStream(store, active);
   // The timer closes only this physical stream. A live transaction keeps
   // its lease and may append a commit in the successor block.
   tx_cleaner_dirty_.store(true, std::memory_order_release);
@@ -542,9 +540,7 @@ StorageEngine::Impl::InspectTxBlocksLocal(WorkerStore& store, bool seal) {
         store.active_tx_block_->committed_bytes_ >=
             kStorageBlockBytes - 2 * kDirectIoAlignment) {
       const ActiveBlock block = *store.active_tx_block_;
-      RequestFlush(store, block.block_id_);
-      NoteTxBlockSealedLocal(store, block.block_id_);
-      store.active_tx_block_.reset();
+      SealAppendStream(store, store.active_tx_block_);
       fence = RelocationDurabilityFence{
           .block_id_ = block.block_id_,
           .allocation_epoch_ = block.allocation_epoch_,

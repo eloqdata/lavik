@@ -276,10 +276,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         // Nothing new since the last flush. Rewriting the header would only
         // burn a slot and two fdatasyncs.
         state->flush_queued_ = false;
-        if (!IsActiveBlock(*store, block_id)) {
-          // A pressure seal can retire an already-durable active tail while
+        if (!IsActiveBlock(*store, block_id) ||
+            staging_state.yield_requested_) {
+          // Yielding can retire an already-durable active buffer while
           // readers still hold its staging memory. Match normal flush
-          // completion: the last pin, not the seal, returns that buffer.
+          // completion: only the last pin can return that buffer.
           state->in_memory_ = false;
           // Sealing changes cleaner eligibility even without new disk I/O.
           // A prior cleaner pass may have consumed the append notification.
@@ -596,12 +597,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     store->durability_progress_.NotifyAll(*store->worker_);
 
     // RequestFlush coalesces requests while an earlier snapshot is in
-    // flight. If rollover or shutdown sealed the block during that write,
-    // records may have been appended above the committed boundary before
-    // active_block was cleared. Queue that tail now, before releasing the
-    // staging buffer; otherwise shutdown can observe an empty queue and
-    // report success while acknowledged records remain only in memory.
-    if (!IsActiveBlock(*store, pending->block_id_) &&
+    // flight. A seal or yield can freeze a tail appended above that snapshot.
+    // Queue it before returning the buffer: otherwise reuse would destroy
+    // acknowledged records that still exist only in memory.
+    const bool yielding = StagingFor(*store, *state)->yield_requested_;
+    if ((!IsActiveBlock(*store, pending->block_id_) || yielding) &&
         state->committed_bytes_ > pending->committed_bytes_) {
       // This tail contains records appended while the older snapshot was in
       // flight. It necessarily precedes every block already queued by that
@@ -612,11 +612,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       continue;
     }
 
-    // A block that is still the append stream's active block keeps its
-    // staging buffer and stays in memory: the periodic flush only makes the
-    // tail durable, it no longer retires the block. Sealing is what frees
-    // the buffer, and sealing already cleared active_block by this point.
-    if (IsActiveBlock(*store, pending->block_id_)) {
+    // Periodic flush keeps an appendable buffer. Pressure instead freezes
+    // its tail and returns the buffer while preserving the active block.
+    if (IsActiveBlock(*store, pending->block_id_) && !yielding) {
       // Appends during this snapshot could only coalesce their RequestFlush
       // calls. Recheck the remaining prefix now so a threshold-sized tail does
       // not wait for another append or the age timer. Active streams rejoin
@@ -652,7 +650,7 @@ void StorageEngine::Impl::ReleaseFlushedStagingBuffer(WorkerStore& store,
     state.release_pending_ = true;
     return;
   }
-  ReleaseStagingBuffer(store, state);
+  ReleaseStagingBuffer(store, state, block_id);
   MaybeQueueDefrag(store, block_id);
 }
 

@@ -150,7 +150,7 @@ void StorageEngine::Impl::UnpinBlock(WorkerStore& store, BlockState& state,
   if ((old & BlockState::kPinMask) != 1) return;
   if (old & BlockState::kRemoteClosed)
     store.block_pin_progress_.NotifyAll(*store.worker_);
-  if (state.release_pending_) ReleaseStagingBuffer(store, state);
+  if (state.release_pending_) ReleaseStagingBuffer(store, state, block_id);
   MaybeQueueDefrag(store, block_id);
 }
 
@@ -172,7 +172,7 @@ void StorageEngine::Impl::UnpinRemoteBlock(BlockState& state, unsigned owner,
          store.block_pin_progress_.NotifyAll(*store.worker_);
          auto* state = engine.FindBlockState(store, id);
          if (!state || state->pin_count() != 0) return;
-         if (state->release_pending_) ReleaseStagingBuffer(store, *state);
+         if (state->release_pending_) ReleaseStagingBuffer(store, *state, id);
          engine.MaybeQueueDefrag(store, id);
        }});
 }

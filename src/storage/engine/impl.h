@@ -289,19 +289,22 @@ struct ActiveBlock {
   std::uint32_t committed_bytes_ = kBlockHeaderBytes;
   std::uint32_t record_count_ = 0;
   std::uint64_t max_lsn_ = 0;
+  // Zero pauses appends while the buffer drains or waits to be reacquired.
   std::uint16_t write_buffer_id_ = 0;
   BlockKind kind_ = BlockKind::kRecords;
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
 };
 
-// State that exists only while a block is held in memory behind a staging
-// buffer: the buffer itself and the bookkeeping the flusher needs. At most a
-// handful of blocks per worker are in that state at once, while every
-// allocated block carries a BlockState, so this lives in a side table instead
-// of charging staging-only state to every block.
+// Append/flush metadata survives a temporary return of an active block's
+// write buffer. Only active or still-staged blocks need it; keeping it in a
+// side table avoids charging every allocated block for this state.
 struct StagingSlot {
   std::uint16_t write_buffer_id_ = 0;
+  // A rebound buffer contains only this tail, not the durable prefix on disk.
+  std::uint32_t buffer_begin_ = kBlockHeaderBytes;
+  // Stop appending until all dirty bytes and existing readers have drained.
+  bool yield_requested_ = false;
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
   std::uint32_t durable_bytes_ = kBlockHeaderBytes;
@@ -366,8 +369,8 @@ struct alignas(32) BlockState {
   std::atomic<std::uint16_t> owner_{kUnownedBlock};
   std::uint16_t writer_id_ = 0;
   std::uint16_t layout_worker_count_ = 0;
-  // Index into WorkerStore::staging_slots, or 0 when the block has no staging
-  // buffer. Ids are 1-based so zero can mean "none".
+  // Append/flush metadata, retained even if an active block yields its buffer.
+  // Zero means no append metadata; ids are 1-based.
   std::uint16_t staging_slot_ = 0;
   // Bitfields rather than bools: eight of these would otherwise cost a byte
   // each and push the struct past a cache line.
@@ -3547,8 +3550,9 @@ class StorageEngine::Impl {
   FixedBuffer StagingBufferFor(WorkerStore& store,
                                const BlockState& state) const;
 
-  static void ReleaseStagingBuffer(WorkerStore& store, BlockState& state);
-  // Retires a sealed, durable staging buffer after draining remote pins.
+  static void ReleaseStagingBuffer(WorkerStore& store, BlockState& state,
+                                   std::uint64_t block_id);
+  // Returns a durable buffer after draining pins, preserving active metadata.
   void ReleaseFlushedStagingBuffer(WorkerStore& store, BlockState& state,
                                    std::uint64_t block_id);
 
@@ -4635,6 +4639,9 @@ class StorageEngine::Impl {
       const Digest& digest, const RecordLocation& location,
       TxUndoLog* tx_undo = nullptr);
 
+  void SealAppendStream(WorkerStore& store, std::optional<ActiveBlock>& active);
+  // Flush and yield buffers without ending their physical append streams.
+  void YieldActiveWriteBuffers(WorkerStore& store);
   void SealActiveBlocks(WorkerStore& store);
 
   // Make the active block's tail durable without retiring it. The block stays
@@ -4715,6 +4722,9 @@ class StorageEngine::Impl {
     kBeforeReapKeyLoad,
     kAfterReapKeyLoad,
     kBeforeReapLock,
+    kAfterSweepSnapshot,
+    kAfterStagingPin,
+    kAfterStagingSweep,
     kAfterSweepRead,
     kBeforeRetirementWait,
   };
