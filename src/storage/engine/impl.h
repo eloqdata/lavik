@@ -842,32 +842,35 @@ struct RecordIdentity {
   // The address is converted back to Entry* only when FindAddress proves a
   // live bucket slot still owns it.
   std::uintptr_t entry_address_ = 0;
-  std::shared_ptr<const std::vector<ExtentRef>> retired_extents_;
-  // The version this record superseded. Retired only when this record's
-  // flush completes: until the replacement is durable, the old copy is the
-  // only durable version of the key, and subtracting it from live_bytes any
-  // earlier lets the block reach zero and be durably freed — a crash before
-  // the flush then loses a value that had already been made durable.
-  StagedRetiredRecord retired_record_;
-  // A kTxCommit record additionally carries every retirement of its
-  // transaction: the superseded versions may only leave their blocks'
-  // accounting once the commit itself is durable, since without the commit
-  // recovery drops the replacements and must still find the old copies.
-  std::unique_ptr<std::vector<RetiredRecord>> tx_retirements_;
   std::uint64_t index_generation_ = 0;
   // The flush uses the cached bucket hash and owner partition to prove the
-  // address is still a member of the live index. These fields occupy the
-  // former tail padding, so validation does not enlarge per-staged-record
-  // memory.
+  // address is still a member of the live index.
   std::uint32_t entry_hash_ = 0;
   std::uint16_t partition_id_ = 0;
   std::uint8_t db_id_ = 0;
-  // Use the remaining padding byte to reject unrelated bucket slots without
-  // resolving their arena handles. The key digest is immutable across flush.
+  // Reject unrelated bucket slots without resolving their arena handles.
+  // The key digest is immutable across flush.
   std::uint8_t entry_tag_ = 0;
 };
 
-static_assert(sizeof(RecordIdentity) == 96);
+static_assert(sizeof(RecordIdentity) == 24);
+
+// One block's append tail since the last flush snapshot. The flusher moves
+// this whole batch into its immutable snapshot before writers can append a
+// new tail. Sparse retirement arrays share that durability boundary; they
+// need no per-record back-reference, and fresh inserts pay only for identity.
+struct StagedRecordBatch {
+  std::vector<RecordIdentity> identities_;
+  // Until the replacement is durable, the superseded version remains the
+  // recoverable copy. Retiring it earlier could free its block and lose data.
+  std::vector<StagedRetiredRecord> retired_records_;
+  std::vector<ExtentManifest> retired_extents_;
+  // Transaction retirements enter the batch with kTxCommit, never with the
+  // tagged data records. Grouped child retirements similarly follow the root
+  // publishing their replacement. These retain the richer ownership forms
+  // that ordinary single-record replacements do not need.
+  std::vector<RetiredRecord> publication_retirements_;
+};
 
 // One journaled write of an in-flight multi-key transaction, enough to put
 // the index back exactly as it was. Multiple writes to one key share a stable
@@ -2078,8 +2081,7 @@ class StorageEngine::Impl {
     ReplicationPublisherWaiter* replication_publisher_waiters_head_ = nullptr;
     ReplicationPublisherWaiter* replication_publisher_waiters_tail_ = nullptr;
     AsyncNotification replication_publisher_admission_ready_;
-    absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
-        staged_records_;
+    absl::flat_hash_map<std::uint64_t, StagedRecordBatch> staged_records_;
     // External manifests are exceptional and relatively large. Keeping them
     // here, keyed by the index entry (and migrated on a TTL type change),
     // avoids a shared_ptr in every ordinary key while preserving O(1) FLUSHDB
