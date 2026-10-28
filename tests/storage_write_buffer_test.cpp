@@ -334,6 +334,13 @@ class WriteBufferTestPeer {
   }
 
   static Task<absl::Status> RunRetirementSnapshots(StorageEngine& storage) {
+    const char* gate = std::getenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE");
+    if (gate == nullptr)
+      co_return absl::InternalError("flush snapshot gate is not configured");
+    const std::string gate_path(gate);
+    // Release a paused flush before worker shutdown on every error path;
+    // the outer fixture's cleanup runs only after the worker has stopped.
+    absl::Cleanup release_gate = [&] { ::unlink(gate_path.c_str()); };
     auto& impl = *storage.impl_;
     auto& store = impl.CurrentStore();
     auto& worker = *store.worker_;
@@ -374,8 +381,7 @@ class WriteBufferTestPeer {
                                   third.total_disk_bytes())
       co_return absl::InternalError(
           "retired a version before snapshot durability");
-    const char* gate = std::getenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE");
-    if (gate == nullptr || ::unlink(gate) != 0)
+    if (::unlink(gate_path.c_str()) != 0)
       co_return absl::InternalError("could not release the flush snapshot");
     const auto drain = [&]() -> Task<absl::Status> {
       const auto until =
