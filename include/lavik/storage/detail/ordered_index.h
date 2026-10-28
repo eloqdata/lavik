@@ -50,6 +50,12 @@ class IndexedOrderedReader {
   // as At(). Checks offsets, item sizes and numeric scores; callers still
   // validate collection ordering and member uniqueness under their policy.
   absl::StatusOr<std::vector<OrderedCollectionEntryView>> DecodeAll() const;
+  // Compact point writes have no member index. Resolve the member's old slot
+  // while checking every interval/score and nondecreasing (score, member)
+  // order, without allocating views. Reject repeated occurrences of this
+  // member; this is not a whole-set uniqueness check. Returns size() if absent.
+  absl::StatusOr<std::size_t> FindSortedSetMember(
+      std::string_view member) const;
   // exclusive=false returns the first score >= value; true returns > value.
   absl::StatusOr<std::size_t> LowerBoundScore(double value,
                                               bool exclusive = false) const;
@@ -62,6 +68,8 @@ class IndexedOrderedReader {
 
  private:
   friend class IndexedOrderedSplice;
+  template <typename Visitor>
+  absl::Status VisitAll(Visitor&& visitor) const;
   IndexedOrderedReader(std::string_view body, std::size_t count,
                        std::size_t data_bytes, std::size_t offsets, bool sorted)
       : body_(body),

@@ -85,10 +85,8 @@ absl::StatusOr<OrderedCollectionEntryView> IndexedOrderedReader::At(
   return OrderedCollectionEntryView{body_.substr(begin, end - begin), *score};
 }
 
-absl::StatusOr<std::vector<OrderedCollectionEntryView>>
-IndexedOrderedReader::DecodeAll() const {
-  std::vector<OrderedCollectionEntryView> entries;
-  entries.reserve(count_);
+template <typename Visitor>
+absl::Status IndexedOrderedReader::VisitAll(Visitor&& visitor) const {
   // Open certified both array bounds and the first/last offsets. Carry the
   // previous end forward so each interior offset is loaded only once. Keep
   // this loop independent of At/Score: full-page consumers need neither
@@ -103,11 +101,48 @@ IndexedOrderedReader::DecodeAll() const {
                 : 0.0;
     if (std::isnan(score))
       return absl::DataLossError("NaN indexed ordered score");
-    entries.push_back(
-        {std::string_view(body_.data() + begin, end - begin), score});
+    auto status = visitor(
+        i, OrderedCollectionEntryView{
+               std::string_view(body_.data() + begin, end - begin), score});
+    if (!status.ok()) return status;
     begin = end;
   }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::vector<OrderedCollectionEntryView>>
+IndexedOrderedReader::DecodeAll() const {
+  std::vector<OrderedCollectionEntryView> entries;
+  entries.reserve(count_);
+  auto status = VisitAll([&](std::size_t, OrderedCollectionEntryView entry) {
+    entries.push_back(entry);
+    return absl::OkStatus();
+  });
+  if (!status.ok()) return status;
   return entries;
+}
+
+absl::StatusOr<std::size_t> IndexedOrderedReader::FindSortedSetMember(
+    std::string_view member) const {
+  if (!sorted_)
+    return absl::InvalidArgumentError("member lookup requires Sorted Set");
+  std::size_t found = count_;
+  OrderedCollectionEntryView previous;
+  auto status = VisitAll([&](std::size_t i, OrderedCollectionEntryView entry) {
+    if (i != 0 &&
+        (previous.score_ > entry.score_ ||
+         (previous.score_ == entry.score_ && previous.value_ > entry.value_)))
+      return absl::DataLossError("unsorted compact Sorted Set");
+    previous = entry;
+    if (entry.value_ == member) {
+      if (found != count_)
+        return absl::DataLossError("duplicate persisted Sorted Set member");
+      found = i;
+    }
+    return absl::OkStatus();
+  });
+  if (!status.ok()) return status;
+  return found;
 }
 
 absl::StatusOr<std::size_t> IndexedOrderedReader::LowerBoundScore(

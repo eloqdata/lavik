@@ -769,23 +769,36 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
   auto reader = OrderedCompactReader::Open(
       OrderedCollectionKind::kSortedSet, value->encoded_, value->logical_size_);
   if (!reader.ok()) return reader.status();
-  auto scan = *reader;
   auto& state = members.at(member);
   std::size_t removed = reader->size();
-  std::optional<OrderedCompactEntryView> previous;
-  for (std::size_t i = 0; i < scan.size(); ++i) {
-    auto entry = scan.Next();
-    if (!entry.ok()) return entry.status();
-    if (previous && (previous->score_ > entry->score_ ||
-                     (previous->score_ == entry->score_ &&
-                      previous->value_ > entry->value_)))
-      return absl::DataLossError("unsorted compact Sorted Set");
-    previous = *entry;
-    if (entry->value_ == member) {
+  if (reader->indexed()) {
+    auto slot = reader->indexed()->FindSortedSetMember(member);
+    if (!slot.ok()) return slot.status();
+    removed = *slot;
+    if (removed != reader->size()) {
       if (state.before_)
         return absl::DataLossError("duplicate persisted Sorted Set member");
-      state.before_ = state.after_ = entry->score_;
-      removed = i;
+      auto score = reader->indexed()->Score(removed);
+      if (!score.ok()) return score.status();
+      state.before_ = state.after_ = *score;
+    }
+  } else {
+    auto scan = *reader;
+    std::optional<OrderedCompactEntryView> previous;
+    for (std::size_t i = 0; i < scan.size(); ++i) {
+      auto entry = scan.Next();
+      if (!entry.ok()) return entry.status();
+      if (previous && (previous->score_ > entry->score_ ||
+                       (previous->score_ == entry->score_ &&
+                        previous->value_ > entry->value_)))
+        return absl::DataLossError("unsorted compact Sorted Set");
+      previous = *entry;
+      if (entry->value_ == member) {
+        if (state.before_)
+          return absl::DataLossError("duplicate persisted Sorted Set member");
+        state.before_ = state.after_ = entry->score_;
+        removed = i;
+      }
     }
   }
   result.key_exists_ = true;

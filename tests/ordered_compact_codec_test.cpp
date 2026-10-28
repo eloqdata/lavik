@@ -304,13 +304,39 @@ TEST(IndexedOrderedTest, BulkDecodeMatchesCheckedSlotsIncludingCorruption) {
         slots.push_back(*slot);
       }
       ASSERT_EQ(bulk.ok(), valid);
-      if (!valid) return;
+      if (!valid) {
+        EXPECT_FALSE(reader->FindSortedSetMember("missing").ok());
+        return;
+      }
       ASSERT_EQ(bulk->size(), slots.size());
       for (std::size_t i = 0; i < slots.size(); ++i) {
         EXPECT_EQ((*bulk)[i].value_, slots[i].value_);
         EXPECT_EQ((*bulk)[i].value_.data(), slots[i].value_.data());
         EXPECT_EQ(std::bit_cast<std::uint64_t>((*bulk)[i].score_),
                   std::bit_cast<std::uint64_t>(slots[i].score_));
+      }
+      if (kind == OrderedCollectionKind::kList) {
+        EXPECT_TRUE(absl::IsInvalidArgument(
+            reader->FindSortedSetMember("missing").status()));
+        return;
+      }
+      for (const auto& target : {std::string{}, std::string("a\0b", 3),
+                                 std::string("tail"), std::string("missing")}) {
+        bool ordered = true;
+        std::size_t found = count;
+        for (std::size_t i = 0; i < slots.size(); ++i) {
+          if (i != 0 && (slots[i - 1].score_ > slots[i].score_ ||
+                         (slots[i - 1].score_ == slots[i].score_ &&
+                          slots[i - 1].value_ > slots[i].value_)))
+            ordered = false;
+          if (slots[i].value_ == target) {
+            if (found != count) ordered = false;
+            found = i;
+          }
+        }
+        auto actual = reader->FindSortedSetMember(target);
+        ASSERT_EQ(actual.ok(), ordered);
+        if (actual.ok()) EXPECT_EQ(*actual, found);
       }
     };
     check(std::string(4, '\0'), 0);
@@ -337,6 +363,34 @@ TEST(IndexedOrderedTest, BulkDecodeMatchesCheckedSlotsIncludingCorruption) {
       }
     }
   }
+}
+
+TEST(IndexedOrderedTest, CompactMemberScanChecksTailAndTargetDuplicates) {
+  std::vector<OrderedCollectionEntry> entries{
+      {"dup", 0}, {"middle", 1}, {"dup", 2}};
+  auto encoded =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
+  ASSERT_TRUE(encoded.ok());
+  auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kSortedSet,
+                                           std::string_view(*encoded).substr(8),
+                                           entries.size());
+  ASSERT_TRUE(reader.ok());
+  EXPECT_TRUE(absl::IsDataLoss(reader->FindSortedSetMember("dup").status()));
+  EXPECT_EQ(*reader->FindSortedSetMember("middle"), 1);
+  EXPECT_EQ(*reader->FindSortedSetMember("missing"), entries.size());
+  // Finding the first member cannot bypass validation of a later score.
+  const auto scores = encoded->size() - (entries.size() * 12 + 4);
+  auto bad = *encoded;
+  IndexPut(
+      bad, scores + 2 * 8,
+      std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN()),
+      8);
+  auto corrupt = IndexedOrderedReader::Open(OrderedCollectionKind::kSortedSet,
+                                            std::string_view(bad).substr(8),
+                                            entries.size());
+  ASSERT_TRUE(corrupt.ok());
+  EXPECT_TRUE(
+      absl::IsDataLoss(corrupt->FindSortedSetMember("middle").status()));
 }
 
 TEST(IndexedOrderedTest,

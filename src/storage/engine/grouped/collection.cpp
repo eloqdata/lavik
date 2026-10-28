@@ -630,13 +630,8 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     while (auto part = splice.Next()) output->append(*part);
     auto final = IndexedOrderedReader::Open(page.kind_, *output, count);
     if (!final.ok()) return final.status();
-    std::vector<OrderedCollectionEntryView> views;
-    views.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-      auto entry = final->At(i);
-      if (!entry.ok()) return entry.status();
-      views.push_back(*entry);
-    }
+    auto views = final->DecodeAll();
+    if (!views.ok()) return views.status();
     OrderedGroupSnapshot result{.kind_ = page.kind_,
                                 .incarnation_ = page.incarnation_,
                                 .id_ = page.id_,
@@ -644,7 +639,7 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
                                 .next_ = page.next_,
                                 .entries_ = {}};
     result.encoded_sorted_set_ =
-        EncodedSortedSetEntries(std::move(output), std::move(views), 2);
+        EncodedSortedSetEntries(std::move(output), std::move(*views), 2);
     return result;
   }
   for (std::size_t i = 0; i < entries.size(); ++i) {
