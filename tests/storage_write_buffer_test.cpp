@@ -38,6 +38,7 @@ class WriteBufferTestPeer {
     kDeviceMetadata,
     kStartupCatalog,
     kResumeActiveStreams,
+    kRetirementSnapshots,
     kTombStagingSweep,
     kTombStagingRebind,
     kTombStagingYield,
@@ -329,6 +330,84 @@ class WriteBufferTestPeer {
         store.flush_running_ || !store.flush_queue_.empty() ||
         impl.active_flushes_.load(std::memory_order_acquire) != 0)
       co_return absl::InternalError("frame teardown scheduled a storage flush");
+    co_return absl::OkStatus();
+  }
+
+  static Task<absl::Status> RunRetirementSnapshots(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& worker = *store.worker_;
+    auto status = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!status.ok()) co_return status;
+    constexpr std::string_view key = "retirement-snapshot";
+    auto& index = impl.PartitionForKey(store, key).indexes_[0];
+    const auto digest = ComputeDigest(key);
+    auto wrote = co_await storage.Set(0, key, "first");
+    if (!wrote.ok()) co_return wrote.status();
+    const auto first = impl.MaterializeIndexLocation(*index.Find(digest, key));
+    wrote = co_await storage.Set(0, key, "second");
+    if (!wrote.ok()) co_return wrote.status();
+    const auto second = impl.MaterializeIndexLocation(*index.Find(digest, key));
+    auto* state = impl.FindBlockState(store, second.block_id());
+    impl.RequestFlush(store, second.block_id());
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!state->flush_in_progress_ &&
+           std::chrono::steady_clock::now() < deadline)
+      co_await bycorf::Yield(worker);
+    if (!state->flush_in_progress_)
+      co_return absl::DeadlineExceededError("flush snapshot did not start");
+
+    // The first snapshot owns the first version's retirement. This TTL
+    // transition invalidates both saved entry addresses and adds a second
+    // retirement to the same block, beyond that snapshot's durable boundary.
+    wrote = co_await storage.Set(0, key, "third",
+                                 {.expire_at_ms_ = UnixTimeMillis() + 60'000});
+    if (!wrote.ok()) co_return wrote.status();
+    const auto third = impl.MaterializeIndexLocation(*index.Find(digest, key));
+    if (first.block_id() != second.block_id() ||
+        second.block_id() != third.block_id())
+      co_return absl::InternalError("fixture did not reuse the active block");
+    if (state->live_bytes_ != first.total_disk_bytes() +
+                                  second.total_disk_bytes() +
+                                  third.total_disk_bytes())
+      co_return absl::InternalError(
+          "retired a version before snapshot durability");
+    const char* gate = std::getenv("LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE");
+    if (gate == nullptr || ::unlink(gate) != 0)
+      co_return absl::InternalError("could not release the flush snapshot");
+    const auto drain = [&]() -> Task<absl::Status> {
+      const auto until =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while ((store.flush_running_ ||
+              impl.active_settlements_.load(std::memory_order_acquire) != 0) &&
+             std::chrono::steady_clock::now() < until)
+        co_await bycorf::Yield(worker);
+      if (store.flush_running_ ||
+          impl.active_settlements_.load(std::memory_order_acquire) != 0)
+        co_return absl::DeadlineExceededError("flush retirement did not drain");
+      if (impl.RuntimeFailureLatched())
+        co_return absl::InternalError("flush retirement failed");
+      co_return absl::OkStatus();
+    };
+    status = co_await drain();
+    if (!status.ok()) co_return status;
+    if (state->live_bytes_ !=
+        second.total_disk_bytes() + third.total_disk_bytes())
+      co_return absl::InternalError(
+          "first snapshot settled the wrong retirement batch");
+    if (!index.Find(digest, key)->value_.in_memory())
+      co_return absl::InternalError(
+          "first snapshot published an unflushed tail");
+
+    impl.RequestFlush(store, third.block_id());
+    status = co_await drain();
+    if (!status.ok()) co_return status;
+    if (state->live_bytes_ != third.total_disk_bytes() ||
+        index.Find(digest, key)->value_.in_memory())
+      co_return absl::InternalError(
+          "tail snapshot did not settle its replacement");
     co_return absl::OkStatus();
   }
 
@@ -636,6 +715,8 @@ class WriteBufferTestPeer {
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
     if (scenario == Scenario::kResumeActiveStreams)
       co_return co_await RunResumeActiveStreams(storage);
+    if (scenario == Scenario::kRetirementSnapshots)
+      co_return co_await RunRetirementSnapshots(storage);
     if (scenario == Scenario::kTombStagingSweep ||
         scenario == Scenario::kTombStagingRebind ||
         scenario == Scenario::kTombStagingYield ||
@@ -861,6 +942,27 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
   } else {
     ASSERT_EQ(::unsetenv(fault), 0);
   }
+  constexpr const char* snapshot_gate = "LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE";
+  const bool pause_snapshot =
+      scenario == WriteBufferTestPeer::Scenario::kRetirementSnapshots;
+  const auto gate_path = test::TestDataPath(
+      "lavik-write-fifo-" + std::to_string(getpid()) + ".flush-gate");
+  std::optional<std::string> previous_gate;
+  if (const char* value = std::getenv(snapshot_gate)) previous_gate = value;
+  absl::Cleanup restore_gate = [&] {
+    if (!pause_snapshot) return;
+    ::unlink(gate_path.c_str());
+    if (previous_gate)
+      ::setenv(snapshot_gate, previous_gate->c_str(), 1);
+    else
+      ::unsetenv(snapshot_gate);
+  };
+  if (pause_snapshot) {
+    const int fd = open(gate_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    ASSERT_GE(fd, 0);
+    close(fd);
+    ASSERT_EQ(::setenv(snapshot_gate, gate_path.c_str(), 1), 0);
+  }
   std::vector<std::string> paths;
   absl::Cleanup remove = [&] {
     for (const auto& path : paths) unlink(path.c_str());
@@ -890,12 +992,13 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
   if (scenario == WriteBufferTestPeer::Scenario::kShutdownProgress ||
       scenario == WriteBufferTestPeer::Scenario::kStoppedFrame ||
       scenario == WriteBufferTestPeer::Scenario::kResumeActiveStreams ||
+      scenario == WriteBufferTestPeer::Scenario::kRetirementSnapshots ||
       scenario == WriteBufferTestPeer::Scenario::kTombStagingSweep ||
       scenario == WriteBufferTestPeer::Scenario::kTombStagingRebind ||
       scenario == WriteBufferTestPeer::Scenario::kTombStagingYield ||
       scenario == WriteBufferTestPeer::Scenario::kTombStagingCancel) {
-    // Exercise only waiter-triggered flushing; the periodic loop must not
-    // advance the fixture or consume its synthetic shutdown request.
+    // Let the fixture or a waiting writer request each flush; the periodic
+    // loop must not advance it or consume its synthetic shutdown request.
     options.flush_max_ms_ = 60 * 60 * 1000;
     options.flush_size_bytes_ = kStorageBlockBytes;
   }
@@ -929,6 +1032,13 @@ TEST_P(StorageWriteBufferTest,
 
 TEST(StorageWriteBufferResumeTest, ThreeStreamsReuseTwoBuffersWithoutSealing) {
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kResumeActiveStreams);
+}
+
+TEST(StorageWriteBufferResumeTest, RetirementsFollowTheirOwnFlushSnapshot) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires a deterministic snapshot pause";
+#endif
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kRetirementSnapshots);
 }
 
 TEST(StorageWriteBufferResumeTest, TombSweepScansStagingThenDiskWithoutFlush) {

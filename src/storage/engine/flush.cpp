@@ -216,7 +216,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     std::uint64_t allocation_epoch_ = 0;
     std::uint16_t write_buffer_id_ = 0;
     std::uint8_t slot_ = 0;
-    std::vector<RecordIdentity> staged_records_;
+    StagedRecordBatch staged_records_;
   };
 
   while (true) {
@@ -340,6 +340,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       });
       if (auto found = store->staged_records_.find(block_id);
           found != store->staged_records_.end()) {
+        // Detach identities and retirements together. Appends during this
+        // I/O belong to a later snapshot, even when they reuse this block.
         pending->staged_records_ = std::move(found->second);
         store->staged_records_.erase(found);
       }
@@ -489,10 +491,24 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // Every staged record in this snapshot is durable now (data pages and
     // header both fdatasync'd above), so the versions they superseded are no
     // longer anyone's durable copy and can leave their blocks' accounting.
-    std::vector<RetiredRecord> retired_records;
+    auto& staged = pending->staged_records_;
+    // Retirement depends on this durable snapshot, not on whether its saved
+    // index entries survive overwrites or a population detach. All receipts
+    // here have crossed their publication boundary, so gather them separately
+    // from the index validation below.
+    for (const auto& extents : staged.retired_extents_) {
+      SpawnExtentReclaim(*store, extents);
+    }
+    auto retired_records = std::move(staged.publication_retirements_);
+    retired_records.reserve(retired_records.size() +
+                            staged.retired_records_.size());
+    for (const auto& retired : staged.retired_records_) {
+      retired_records.push_back(retired.Materialize());
+    }
+    const auto& identities = staged.identities_;
     const auto prefetch_index = [&](std::size_t position, bool bucket) {
-      if (position >= pending->staged_records_.size()) return;
-      const auto& future = pending->staged_records_[position];
+      if (position >= identities.size()) return;
+      const auto& future = identities[position];
       if (future.entry_address_ == 0 ||
           future.index_generation_ != store->index_generations_[future.db_id_])
         return;
@@ -503,8 +519,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       else
         index.PrefetchAddressMetadata();
     };
-    for (std::size_t position = 0; position < pending->staged_records_.size();
-         ++position) {
+    for (std::size_t position = 0; position < identities.size(); ++position) {
       // Batch receipts expose independent random lookups. Warm fixed map
       // metadata first, then its bucket while processing
       // earlier receipts. All hints stay on the owning worker and retain no
@@ -512,21 +527,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // checks still follow.
       prefetch_index(position + 16, false);
       prefetch_index(position + 8, true);
-      const RecordIdentity& identity = pending->staged_records_[position];
-      if (identity.retired_extents_ != nullptr) {
-        SpawnExtentReclaim(*store, identity.retired_extents_);
-      }
-      if (identity.retired_record_.present_) {
-        retired_records.push_back(identity.retired_record_.Materialize());
-      }
-      if (identity.tx_retirements_ != nullptr) {
-        // The publication boundary is durable: either a transaction's commit
-        // record or an ordinary root replacing a grouped graph. Its retained
-        // child receipts can now leave physical accounting with that boundary.
-        retired_records.insert(retired_records.end(),
-                               identity.tx_retirements_->begin(),
-                               identity.tx_retirements_->end());
-      }
+      const RecordIdentity& identity = identities[position];
       if (identity.entry_address_ == 0) {
         continue;
       }

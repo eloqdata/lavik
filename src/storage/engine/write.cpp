@@ -15,6 +15,7 @@
  */
 
 #include <exception>
+#include <iterator>
 
 #include "absl/strings/str_cat.h"
 #include "flush_policy.h"
@@ -3741,19 +3742,27 @@ acquire_active_stream:
       }
     }
   }
-  store.staged_records_[updated.block_id_].push_back(RecordIdentity{
+  auto& staged = store.staged_records_[updated.block_id_];
+  if ((!request.for_defrag_ || defer_defrag_retirement) && !route_to_commit &&
+      previous.has_value()) {
+    staged.retired_records_.push_back(
+        StagedRetiredRecordOf(*previous, previous_dependent_extents));
+    if (previous->external() && retired_value_extents != nullptr) {
+      staged.retired_extents_.push_back(retired_value_extents);
+    }
+  }
+  if (commit_retirements != nullptr) {
+    if (staged.publication_retirements_.empty()) {
+      staged.publication_retirements_ = std::move(*commit_retirements);
+    } else {
+      staged.publication_retirements_.insert(
+          staged.publication_retirements_.end(),
+          std::make_move_iterator(commit_retirements->begin()),
+          std::make_move_iterator(commit_retirements->end()));
+    }
+  }
+  staged.identities_.push_back(RecordIdentity{
       .entry_address_ = reinterpret_cast<std::uintptr_t>(inserted_entry),
-      .retired_extents_ = (!request.for_defrag_ || defer_defrag_retirement) &&
-                                  !route_to_commit && previous.has_value() &&
-                                  previous->external()
-                              ? retired_value_extents
-                              : nullptr,
-      .retired_record_ =
-          (!request.for_defrag_ || defer_defrag_retirement) &&
-                  !route_to_commit && previous.has_value()
-              ? StagedRetiredRecordOf(*previous, previous_dependent_extents)
-              : StagedRetiredRecord{},
-      .tx_retirements_ = std::move(commit_retirements),
       .index_generation_ = store.index_generations_[request.db_id_],
       .entry_hash_ = inserted_entry == nullptr
                          ? 0
@@ -3875,7 +3884,7 @@ acquire_active_stream:
     RequestFlush(store, updated.block_id_);
   }
   // A superseded record stays in its block's live_bytes until this record's
-  // flush completes (the RecordIdentity above carries it there): the old copy
+  // flush completes (the staged batch above carries it there): the old copy
   // is the key's only durable version until then, and retiring it now lets
   // its block reach zero and be durably freed ahead of the replacement — a
   // crash in that window destroys data that had already been made durable.
