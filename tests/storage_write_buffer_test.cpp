@@ -37,6 +37,11 @@ class WriteBufferTestPeer {
     kRecoveryRead,
     kDeviceMetadata,
     kStartupCatalog,
+    kResumeActiveStreams,
+    kTombStagingSweep,
+    kTombStagingRebind,
+    kTombStagingYield,
+    kTombStagingCancel,
   };
 
   static std::string StartupCatalog() {
@@ -327,7 +332,315 @@ class WriteBufferTestPeer {
     co_return absl::OkStatus();
   }
 
+  static Task<absl::Status> RunResumeActiveStreams(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& pool = store.buffers_;
+    auto status = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!status.ok()) co_return status;
+    TxShardWrites tx;
+    storage.InitializeTxWrites(StorageEngine::AllocateWriteTxid(),
+                               std::span(&tx, 1));
+    std::array<RecordLocation, 3> first{}, last{};
+    std::array<std::uint32_t, 3> header_sequences{};
+    const std::array<std::string, 3> keys{
+        "ordinary-record", "transaction-record", "0123456789abcdef"};
+    const auto active = [&](unsigned stream) -> std::optional<ActiveBlock>& {
+      if (stream == 0) return store.active_block_;
+      if (stream == 1) return store.active_tx_block_;
+      return store.active_indirect_key_block_;
+    };
+    for (unsigned round = 0; round != 12; ++round) {
+      for (unsigned stream = 0; stream != 3; ++stream) {
+        const std::string value = "value-" + std::to_string(round);
+        RecordLocation location;
+        const StorageEngine::Impl::RecordWriteRequest request{
+            .key_ = keys[stream],
+            .value_ = value,
+            .digest_ = ComputeDigest(keys[stream]),
+            .mutation_sequence_ = round + 1,
+            .written_location_ = &location,
+            .tx_ = stream == 1 ? &tx : nullptr,
+            .value_type_ = ValueType::kString,
+            .indirect_key_record_ = stream == 2,
+        };
+        co_await store.store_state_mutex_.Lock();
+        status = co_await impl.WriteRecordLocked(store, request);
+        store.store_state_mutex_.Unlock(*store.worker_);
+        if (!status.ok()) co_return status;
+        if (round == 0)
+          first[stream] = location;
+        else if (location.block_id() != first[stream].block_id() ||
+                 location.allocation_epoch() !=
+                     first[stream].allocation_epoch() ||
+                 location.record_offset() <= last[stream].record_offset())
+          co_return absl::InternalError(
+              "slot pressure discarded an append tail");
+        last[stream] = location;
+        // Keep the original staged bit, like an indirect-key handle or a
+        // grouped record. Reused buffers were poisoned below, so this prefix
+        // must come from disk even while the new tail remains in memory.
+        for (const auto& saved : {first[stream], location}) {
+          auto loaded =
+              co_await impl.LoadValueLocal(store, 0, keys[stream], saved, 1);
+          if (!loaded.ok()) co_return loaded.status();
+          const std::string_view actual(
+              reinterpret_cast<const char*>(loaded->value().data()),
+              loaded->value().size());
+          const std::string expected =
+              "value-" + std::to_string(saved.mutation_sequence_ - 1);
+          if (actual != expected)
+            co_return absl::DataLossError(
+                "rebound stream read a stale buffer prefix");
+        }
+      }
+      // An active allocation must survive returning its buffer. Pin the last
+      // stream once to also exercise the deferred release path.
+      auto* pinned = impl.FindBlockState(store, last[2].block_id());
+      if (round == 0) pinned->PinLocal();
+      impl.YieldActiveWriteBuffers(store);
+      while (store.flush_running_) co_await bycorf::Yield(*store.worker_);
+      if (round == 0) {
+        if (!pinned->release_pending_ || pool.available_write_buffers() != 1)
+          co_return absl::InternalError(
+              "yield did not retain the reader's slot");
+        impl.UnpinBlock(store, *pinned, last[2].block_id());
+      }
+      if (pool.available_write_buffers() != 2)
+        co_return absl::InternalError(
+            "yield did not return both fixed buffers");
+      for (unsigned stream = 0; stream != 3; ++stream) {
+        auto* state = impl.FindBlockState(store, last[stream].block_id());
+        auto* slot = impl.StagingFor(store, *state);
+        if (!active(stream) || active(stream)->write_buffer_id_ != 0 || !slot ||
+            slot->write_buffer_id_ != 0 || state->in_memory_ ||
+            slot->durable_bytes_ != active(stream)->committed_bytes_ ||
+            slot->record_count_ != round + 1 ||
+            slot->header_sequence_ <= header_sequences[stream])
+          co_return absl::InternalError("yield lost cumulative block metadata");
+        header_sequences[stream] = slot->header_sequence_;
+        impl.MaybeQueueDefrag(store, last[stream].block_id());
+        if (state->defrag_queued_)
+          co_return absl::InternalError(
+              "bufferless active block became reclaimable");
+        std::array<std::byte, kBlockHeaderBytes> pages;
+        const auto [file, offset] = impl.FileOffset(last[stream].block_id());
+        status = ReadExactlyAt(impl.devices_[file].path_, pages, offset);
+        if (!status.ok()) co_return status;
+        BlockHeader header;
+        if (!DecodeBlockHeaderPages(pages, &header) ||
+            header.record_count_ != round + 1 ||
+            header.max_lsn_ != slot->max_lsn_ ||
+            header.committed_bytes_ != slot->durable_bytes_)
+          co_return absl::DataLossError(
+              "resumed block header lost earlier records");
+      }
+      // Ensure neither a warm slot nor a previous owner's bytes can disguise
+      // a missing disk read after rebinding.
+      std::array<std::uint16_t, 2> ids{};
+      for (auto& id : ids) {
+        if (!pool.TryAcquireWriteBuffer(&id))
+          co_return absl::InternalError("fixed buffer remained attached");
+        auto buffer = pool.write_buffer(id);
+        std::fill_n(buffer.data_, buffer.size_, std::byte{0xa5});
+      }
+      for (auto id : ids) pool.ReleaseWriteBuffer(id);
+    }
+    impl.SealActiveBlocks(store);
+    for (const auto& location : last) {
+      auto* state = impl.FindBlockState(store, location.block_id());
+      if (state->staging_slot_ != 0)
+        co_return absl::InternalError(
+            "sealed bufferless block retained append metadata");
+    }
+    co_return absl::OkStatus();
+  }
+
+  static Task<absl::Status> RunTombStagingSweep(StorageEngine& storage,
+                                                Scenario scenario) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    auto& pool = store.buffers_;
+    auto status = co_await storage.ConfigureDefrag(
+        {.action_ = DefragConfigAction::kPause});
+    if (!status.ok()) co_return status;
+    status = co_await storage.CompleteStorageStartup();
+    if (!status.ok()) co_return status;
+    auto poison_free_buffers = [&]() -> absl::Status {
+      std::array<std::uint16_t, 2> ids{};
+      absl::Cleanup release = [&] {
+        for (auto id : ids)
+          if (id != 0) pool.ReleaseWriteBuffer(id);
+      };
+      for (auto& id : ids) {
+        if (!pool.TryAcquireWriteBuffer(&id))
+          return absl::InternalError("tomb sweep retained a write buffer");
+        auto buffer = pool.write_buffer(id);
+        std::fill_n(buffer.data_, buffer.size_, std::byte{0xa5});
+      }
+      return absl::OkStatus();
+    };
+    const std::array<std::string, 3> keys{"disk-tomb", "staged-tomb",
+                                          std::string(3072, 'k')};
+    // The first pair is only on disk after rebinding; the remaining pairs
+    // exist only in the new staging tail. Neither range can replace the other.
+    for (unsigned i = 0; i != keys.size(); ++i) {
+      auto wrote = co_await storage.Set(0, keys[i], "older-value");
+      if (!wrote.ok()) co_return wrote.status();
+      auto removed = co_await storage.Delete(0, keys[i]);
+      if (!removed.ok()) co_return removed.status();
+      if (i == 0) {
+        if (scenario == Scenario::kTombStagingSweep) {
+          // An entirely staged block has no disk prefix to scan or flush.
+          status = co_await impl.RunTombRaider();
+          if (!status.ok()) co_return status;
+          auto* staged =
+              impl.FindBlockState(store, store.active_block_->block_id_);
+          if (impl.StagingFor(store, *staged)->durable_bytes_ !=
+                  kBlockHeaderBytes ||
+              staged->pin_count() != 0 || store.flush_running_)
+            co_return absl::InternalError(
+                "staged-only sweep flushed or retained its buffer");
+          auto& partition = impl.PartitionForKey(store, keys[i]);
+          auto* tomb =
+              partition.indexes_[0].Find(ComputeDigest(keys[i]), keys[i]);
+          if (!tomb || tomb->value_.kind() != RecordKind::kTombstone ||
+              tomb->value_.unclaimed())
+            co_return absl::InternalError(
+                "staged-only sweep lost its tombstone");
+        }
+        impl.YieldActiveWriteBuffers(store);
+        while (store.flush_running_) co_await bycorf::Yield(*store.worker_);
+        status = poison_free_buffers();
+        if (!status.ok()) co_return status;
+      }
+    }
+    // Force the staged long-key lookup to perform an async disk read. The
+    // ordinary tail stays dirty, and scanning it must hold its buffer pin.
+    impl.SealAppendStream(store, store.active_indirect_key_block_);
+    while (store.flush_running_) co_await bycorf::Yield(*store.worker_);
+    if (!store.active_block_)
+      co_return absl::InternalError("fixture lost its active record block");
+    const auto block_id = store.active_block_->block_id_;
+    auto* state = impl.FindBlockState(store, block_id);
+    auto* slot = impl.StagingFor(store, *state);
+    const auto disk_boundary = slot->durable_bytes_;
+    const auto append_boundary = state->committed_bytes_;
+    if (disk_boundary <= kBlockHeaderBytes ||
+        disk_boundary >= append_boundary ||
+        slot->buffer_begin_ != disk_boundary)
+      co_return absl::InternalError(
+          "fixture needs a disk prefix and a dirty rebound tail");
+    const auto rounds = storage.TombRaiderStats().rounds_;
+#if LAVIK_FAULTS_ENABLED
+    using Point = StorageEngine::Impl::TombRaiderTestPoint;
+    bool injected = false;
+    bool saw_pin = false;
+    bool saw_disk = false;
+    auto rebind = [&]() -> Task<absl::Status> {
+      auto poisoned = poison_free_buffers();
+      if (!poisoned.ok()) co_return poisoned;
+      auto wrote =
+          co_await storage.Set(0, "after-sweep-boundary", "later-value");
+      if (!wrote.ok()) co_return wrote.status();
+      auto* current = impl.StagingFor(store, *state);
+      if (!store.active_block_ || store.active_block_->block_id_ != block_id ||
+          !current || current->buffer_begin_ < append_boundary)
+        co_return absl::InternalError(
+            "sweep fixture did not rebind its original block");
+      co_return absl::OkStatus();
+    };
+    impl.tomb_raider_test_hook_ = [&](Point point) -> Task<absl::Status> {
+      if (point == Point::kAfterStagingPin) {
+        saw_pin = true;
+        if (state->pin_count() != 1)
+          co_return absl::InternalError("staging scan did not pin its source");
+      }
+      if (point == Point::kAfterSweepRead) {
+        saw_disk = true;
+        if (state->pin_count() != 0)
+          co_return absl::InternalError(
+              "staging pin survived into disk scanning");
+      }
+      const bool fallback = scenario == Scenario::kTombStagingRebind &&
+                            point == Point::kAfterSweepSnapshot;
+      const bool yielding = (scenario == Scenario::kTombStagingYield ||
+                             scenario == Scenario::kTombStagingCancel) &&
+                            point == Point::kAfterStagingPin;
+      if (fallback || yielding) {
+        injected = true;
+        impl.YieldActiveWriteBuffers(store);
+        while (store.flush_running_) co_await bycorf::Yield(*store.worker_);
+        if (fallback) co_return co_await rebind();
+        if (!state->release_pending_ || slot->write_buffer_id_ == 0 ||
+            pool.available_write_buffers() != 1)
+          co_return absl::InternalError(
+              "flush recycled a pinned staging buffer");
+        if (scenario == Scenario::kTombStagingCancel)
+          co_return absl::CancelledError("injected staging scan cancellation");
+      }
+      if (scenario == Scenario::kTombStagingYield &&
+          point == Point::kAfterStagingSweep) {
+        if (state->pin_count() != 0 || state->release_pending_)
+          co_return absl::InternalError("staging scan did not release its pin");
+        co_return co_await rebind();
+      }
+      co_return absl::OkStatus();
+    };
+    absl::Cleanup reset_hook = [&] { impl.tomb_raider_test_hook_ = {}; };
+#endif
+    status = co_await impl.RunTombRaider();
+#if LAVIK_FAULTS_ENABLED
+    if (scenario == Scenario::kTombStagingCancel) {
+      if (!absl::IsCancelled(status) || state->pin_count() != 0 ||
+          state->release_pending_ || pool.available_write_buffers() != 2 ||
+          storage.TombRaiderStats().rounds_ != rounds)
+        co_return absl::InternalError(
+            "aborted staging sweep leaked pins or reaped candidates");
+      impl.tomb_raider_test_hook_ = {};
+      status = co_await impl.RunTombRaider();
+    } else if (!saw_disk ||
+               (scenario == Scenario::kTombStagingRebind ? saw_pin
+                                                         : !saw_pin)) {
+      co_return absl::InternalError(
+          "tomb sweep did not use the expected memory/disk ranges");
+    }
+    if (scenario != Scenario::kTombStagingSweep && !injected)
+      co_return absl::InternalError("staging sweep race was not injected");
+#endif
+    if (!status.ok()) co_return status;
+    slot = impl.StagingFor(store, *state);
+    if (state->pin_count() != 0 || !slot || !store.active_block_ ||
+        store.active_block_->block_id_ != block_id ||
+        storage.TombRaiderStats().rounds_ != rounds + 1)
+      co_return absl::InternalError(
+          "sweep leaked a pin or sealed its source block");
+    if (scenario == Scenario::kTombStagingSweep &&
+        (slot->durable_bytes_ != disk_boundary || store.flush_running_ ||
+         !store.flush_queue_.empty()))
+      co_return absl::InternalError("staging sweep forced a flush");
+    for (const auto& key : keys) {
+      auto& partition = impl.PartitionForKey(store, key);
+      auto found = co_await impl.FindVerifiedEntry(store, partition.indexes_[0],
+                                                   ComputeDigest(key), key);
+      if (!found.ok()) co_return found.status();
+      if (!*found || (*found)->value_.kind() != RecordKind::kTombstone ||
+          (*found)->value_.unclaimed())
+        co_return absl::InternalError(
+            "tomb sweep missed an older staged or disk value");
+    }
+    co_return absl::OkStatus();
+  }
+
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kResumeActiveStreams)
+      co_return co_await RunResumeActiveStreams(storage);
+    if (scenario == Scenario::kTombStagingSweep ||
+        scenario == Scenario::kTombStagingRebind ||
+        scenario == Scenario::kTombStagingYield ||
+        scenario == Scenario::kTombStagingCancel)
+      co_return co_await RunTombStagingSweep(storage, scenario);
     if (scenario == Scenario::kStoppedFrame)
       co_return co_await RunStoppedFrame(storage);
     if (scenario == Scenario::kStartupCatalog) {
@@ -437,7 +750,7 @@ class WriteBufferTestPeer {
     }
     store.store_state_mutex_.Unlock(worker);
 
-    // This trailing borrower only progresses if relocation seals its newly
+    // This trailing borrower only progresses if relocation yields its newly
     // installed stream even on stale-source exits. It cannot steal the first
     // flush's slot from the already queued relocation.
     auto acquire_after = [&]() -> Task<absl::Status> {
@@ -575,7 +888,12 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
   options.tx_cleaner_cooldown_ms_ = 0;
   options.buffers_.storage_write_buffer_count_ = 2;
   if (scenario == WriteBufferTestPeer::Scenario::kShutdownProgress ||
-      scenario == WriteBufferTestPeer::Scenario::kStoppedFrame) {
+      scenario == WriteBufferTestPeer::Scenario::kStoppedFrame ||
+      scenario == WriteBufferTestPeer::Scenario::kResumeActiveStreams ||
+      scenario == WriteBufferTestPeer::Scenario::kTombStagingSweep ||
+      scenario == WriteBufferTestPeer::Scenario::kTombStagingRebind ||
+      scenario == WriteBufferTestPeer::Scenario::kTombStagingYield ||
+      scenario == WriteBufferTestPeer::Scenario::kTombStagingCancel) {
     // Exercise only waiter-triggered flushing; the periodic loop must not
     // advance the fixture or consume its synthetic shutdown request.
     options.flush_max_ms_ = 60 * 60 * 1000;
@@ -607,6 +925,35 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
 TEST_P(StorageWriteBufferTest,
        RelocationWaitsWithoutHoldingStoreOrAllocationGate) {
   RunWriteBufferScenario(GetParam());
+}
+
+TEST(StorageWriteBufferResumeTest, ThreeStreamsReuseTwoBuffersWithoutSealing) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kResumeActiveStreams);
+}
+
+TEST(StorageWriteBufferResumeTest, TombSweepScansStagingThenDiskWithoutFlush) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kTombStagingSweep);
+}
+
+TEST(StorageWriteBufferResumeTest, TombSweepReadsDiskIfCapturedSlotWasRebound) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires staging sweep interleaving hooks";
+#endif
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kTombStagingRebind);
+}
+
+TEST(StorageWriteBufferResumeTest, TombSweepPinsTailThroughFlushAndRebind) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires staging sweep interleaving hooks";
+#endif
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kTombStagingYield);
+}
+
+TEST(StorageWriteBufferResumeTest, TombSweepCancellationReleasesStagingPin) {
+#if !LAVIK_FAULTS_ENABLED
+  GTEST_SKIP() << "requires staging sweep interleaving hooks";
+#endif
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kTombStagingCancel);
 }
 
 TEST(StorageWriteBufferShutdownTest, StoppedFrameDoesNotSealActiveStream) {

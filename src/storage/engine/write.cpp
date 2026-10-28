@@ -485,16 +485,22 @@ FixedBuffer StorageEngine::Impl::StagingBufferFor(
 }
 
 void StorageEngine::Impl::ReleaseStagingBuffer(WorkerStore& store,
-                                               BlockState& state) {
+                                               BlockState& state,
+                                               std::uint64_t block_id) {
   if (StagingSlot* slot = StagingFor(store, state); slot != nullptr) {
-    store.buffers_.ReleaseWriteBuffer(slot->write_buffer_id_);
-    *slot = StagingSlot{};
-    slot->next_free_ = store.free_staging_slot_;
-    store.free_staging_slot_ = state.staging_slot_;
-    state.staging_slot_ = 0;
+    if (slot->write_buffer_id_ != 0)
+      store.buffers_.ReleaseWriteBuffer(slot->write_buffer_id_);
+    slot->write_buffer_id_ = 0;
+    if (!store.engine_->IsActiveBlock(store, block_id)) {
+      *slot = StagingSlot{};
+      slot->next_free_ = store.free_staging_slot_;
+      store.free_staging_slot_ = state.staging_slot_;
+      state.staging_slot_ = 0;
+    }
   }
   state.release_pending_ = false;
   state.in_memory_ = false;
+  store.durability_progress_.NotifyAll(*store.worker_);
 }
 
 absl::Status StorageEngine::Impl::MarkRecordDeadLocal(
@@ -1765,10 +1771,8 @@ StorageEngine::Impl::WriteExtentValueLocked(
     });
     std::uint16_t write_buffer_id = 0;
     if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-      // Active append streams retain their buffers even after a flush; seal
-      // them before waiting so capacity can actually be returned.
-      // A live transaction may open a new Tx stream after this seal.
-      SealActiveBlocks(store);
+      // Flush and return active buffers without discarding their append tails.
+      YieldActiveWriteBuffers(store);
       store.store_state_mutex_.Unlock(*store.worker_);
       auto acquired = co_await store.buffers_.AcquireWriteBuffer();
       co_await store.store_state_mutex_.Lock();
@@ -2649,8 +2653,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     SetLatencyTrace* trace
 #endif
 ) {
-  // Direct FIFO handoff does not wake the remaining writers to reseal a new
-  // active stream. A writer ahead of them must make its staging slot flushable
+  // Direct FIFO handoff does not wake the remaining writers to yield a new
+  // active buffer. A writer ahead of them must make its staging slot returnable
   // on every exit, including stale-relocation/validation failures after an
   // empty stream was installed. Executing returns hold store state, but forced
   // teardown can destroy a frame suspended without that lock. Never schedule
@@ -2662,7 +2666,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     ~FlushForWaitingWriters() {
       if (store_.worker_->stop_requested()) [[unlikely]]
         return;
-      if (store_.buffers_.has_write_waiters()) engine_.SealActiveBlocks(store_);
+      if (store_.buffers_.has_write_waiters())
+        engine_.YieldActiveWriteBuffers(store_);
     }
   } flush_for_waiters{*this, store};
   const std::size_t payload_bytes =
@@ -2877,30 +2882,85 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   assert(request.known_partition_ == nullptr || !indirect_key ||
          request.known_partition_->id_ == (indirect_key->id_[0] & 0x3fff));
   std::unique_ptr<GroupedRetirementPins> grouped_dependency_pins;
+  const auto fits = [&] {
+    return active_stream() &&
+           active_stream()->committed_bytes_ + total_disk_bytes <= append_limit;
+  };
+  const auto append_ready = [&] {
+    return fits() && active_stream()->write_buffer_id_ != 0;
+  };
 acquire_active_stream:
 #if LAVIK_ENABLE_TRACE
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
 #endif
-  while (!active_stream().has_value() ||
-         active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
-    // Waiting for a physical block must not hold store_state_mutex_: the
-    // allocator, flush completion, and the elected writer may all need this
-    // worker's state before the new stream can be published. The gate is per
-    // append stream, so ordinary and transaction allocation remain concurrent.
+  while (!append_ready()) {
+    // The gate elects one normal writer per stream. Maintenance can bypass it
+    // to unblock physical allocation; recheck identity after every wait.
     std::optional<UnlockGuard> allocation_unlock;
     if (request.unlock_writer_while_waiting_) {
       store.store_state_mutex_.Unlock(*store.worker_);
       co_await allocation_mutex->Lock();
       allocation_unlock.emplace(allocation_mutex, store.worker_);
       co_await store.store_state_mutex_.Lock();
-
-      // The elected allocator may have installed a stream before this waiter
-      // reached the front. Reuse it instead of allocating a spare block.
-      if (active_stream().has_value() &&
-          active_stream()->committed_bytes_ + total_disk_bytes <=
-              append_limit) {
+      if (append_ready()) continue;
+    }
+    if (store.write_failed_ || RuntimeFailureLatched())
+      co_return absl::FailedPreconditionError(
+          "storage writer is stopped after an IO failure");
+    if (fits()) {
+      const auto block_id = active_stream()->block_id_;
+      const auto allocation_epoch = active_stream()->allocation_epoch_;
+      auto* state = FindBlockState(store, block_id);
+      auto* slot = state == nullptr ? nullptr : StagingFor(store, *state);
+      if (slot == nullptr)
+        co_return absl::InternalError("active append metadata is missing");
+      if (slot->write_buffer_id_ != 0) {
+        // Yielding closes appends before flushing. The old slot may still be
+        // in I/O or pinned by a reader; never bind a replacement over it.
+        store.store_state_mutex_.Unlock(*store.worker_);
+        co_await store.durability_progress_.Wait();
+        co_await store.store_state_mutex_.Lock();
         continue;
       }
+      std::uint16_t write_buffer_id = 0;
+      if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
+        YieldActiveWriteBuffers(store);
+        store.store_state_mutex_.Unlock(*store.worker_);
+        auto acquired = co_await store.buffers_.AcquireWriteBuffer();
+        co_await store.store_state_mutex_.Lock();
+        if (!acquired.ok()) co_return acquired.status();
+        write_buffer_id = *acquired;
+      }
+      if (store.write_failed_ || RuntimeFailureLatched()) {
+        store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+        co_return absl::FailedPreconditionError(
+            "storage writer is stopped after an IO failure");
+      }
+      // Another writer can seal or bind this stream while the lock is released.
+      if (!fits() || active_stream()->block_id_ != block_id ||
+          active_stream()->allocation_epoch_ != allocation_epoch ||
+          active_stream()->write_buffer_id_ != 0) {
+        store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+        continue;
+      }
+      state = FindBlockState(store, block_id);
+      slot = StagingFor(store, *state);
+      if (slot->write_buffer_id_ != 0) {
+        store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+        continue;
+      }
+      auto buffer = store.buffers_.write_buffer(write_buffer_id);
+      assert(buffer.data_ && buffer.size_ >= kStorageBlockBytes);
+      assert(slot->durable_bytes_ == active_stream()->committed_bytes_);
+      // Header sequence and cumulative counters survive the old buffer. Only
+      // the new tail is resident; never copy or read back the durable prefix.
+      std::fill_n(buffer.data_, kBlockHeaderBytes, std::byte{0});
+      slot->buffer_begin_ = slot->durable_bytes_;
+      slot->yield_requested_ = false;
+      slot->write_buffer_id_ = write_buffer_id;
+      active_stream()->write_buffer_id_ = write_buffer_id;
+      state->in_memory_ = true;
+      continue;
     }
     if (active_stream().has_value()) {
       RequestFlush(store, active_stream()->block_id_);
@@ -2908,7 +2968,7 @@ acquire_active_stream:
       // succeeds. A failed segmented write still needs an outer commit to
       // retire abandoned auxiliaries. Ordinary streams may seal immediately
       // so allocation pressure can reclaim their old block as before.
-      if (!transaction_append) active_stream().reset();
+      if (!transaction_append) SealAppendStream(store, active_stream());
     }
     absl::StatusOr<ReservedBlock> allocated{
         absl::UnavailableError("no standby block is available")};
@@ -2938,10 +2998,7 @@ acquire_active_stream:
       continue;
     }
     if (active_stream().has_value()) {
-      RequestFlush(store, active_stream()->block_id_);
-      if (transaction_append)
-        NoteTxBlockSealedLocal(store, active_stream()->block_id_);
-      active_stream().reset();
+      SealAppendStream(store, active_stream());
       if (transaction_append) {
         // A full Tx block can be considered for promotion as soon as its
         // writers settle; do not wait for the periodic cleaner cooldown.
@@ -2950,58 +3007,7 @@ acquire_active_stream:
       }
     }
     {
-      std::uint16_t write_buffer_id = 0;
-      if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-        // Active append streams can occupy every staging buffer.
-        // Transactions waiting to commit may still need a buffer, so seal
-        // the streams before waiting. Tagged records and transaction leases
-        // survive the seal, and flush returns their buffers.
-        SealActiveBlocks(store);
-        store.store_state_mutex_.Unlock(*store.worker_);
-        auto acquired = co_await store.buffers_.AcquireWriteBuffer();
-        co_await store.store_state_mutex_.Lock();
-        if (!acquired.ok()) {
-          absl::Status returned = co_await return_reserved(*allocated);
-          if (!returned.ok()) co_return returned;
-          co_return acquired.status();
-        }
-        write_buffer_id = *acquired;
-
-        if (store.write_failed_ || RuntimeFailureLatched()) {
-          store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-          absl::Status returned = co_await return_reserved(*allocated);
-          if (!returned.ok()) co_return returned;
-          co_return absl::FailedPreconditionError(
-              "storage writer is stopped after an IO failure");
-        }
-
-        // Another writer may have installed this append stream while this
-        // coroutine was waiting without the store lock. It owns the stream;
-        // return both resources and let the outer loop append to it.
-        if (active_stream().has_value()) {
-          store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-          absl::Status returned = co_await return_reserved(*allocated);
-          if (!returned.ok()) co_return returned;
-          continue;
-        }
-      }
-      FixedBuffer staging_buffer = store.buffers_.write_buffer(write_buffer_id);
-      if (staging_buffer.data_ == nullptr ||
-          staging_buffer.size_ < kBlockHeaderBytes) {
-        store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-        absl::Status returned = co_await return_reserved(*allocated);
-        if (!returned.ok()) co_return returned;
-        co_return absl::Status(absl::StatusCode::kInternal,
-                               "active write staging allocation is invalid");
-      }
       const std::uint64_t block_id = allocated->block_id_;
-      // A recycled buffer may contain valid headers from another block. Both
-      // slots must start zero for the first flush's stale-header protection.
-      // Appends initialize every record byte (including alignment padding),
-      // and flush initializes its page tail before writing only the committed
-      // prefix. Clearing the rest of the buffer would rewrite those bytes
-      // twice.
-      std::fill_n(staging_buffer.data_, kBlockHeaderBytes, std::byte{0});
       active_stream() = ActiveBlock{
           .block_id_ = block_id,
           .writer_id_ = writer_id,
@@ -3010,7 +3016,7 @@ acquire_active_stream:
           .committed_bytes_ = kBlockHeaderBytes,
           .record_count_ = 0,
           .max_lsn_ = 0,
-          .write_buffer_id_ = write_buffer_id,
+          .write_buffer_id_ = 0,
           .kind_ = append_block_kind,
       };
       if (!transaction_append && !request.indirect_key_record_) {
@@ -3025,7 +3031,7 @@ acquire_active_stream:
       state.pins_ = 0;
       state.allocated_ = true;
       state.defragging_ = false;
-      state.in_memory_ = true;
+      state.in_memory_ = false;
       state.flush_queued_ = false;
       state.flush_in_progress_ = false;
       state.kind_ = append_block_kind;
@@ -3039,7 +3045,7 @@ acquire_active_stream:
       }
       state.staging_slot_ = AcquireStagingSlot(store);
       StagingSlot& staging_state = store.staging_slots_[state.staging_slot_];
-      staging_state.write_buffer_id_ = write_buffer_id;
+      staging_state.write_buffer_id_ = 0;
       staging_state.committed_bytes_ = kBlockHeaderBytes;
       store.staged_records_.erase(block_id);
 
@@ -3194,8 +3200,7 @@ acquire_active_stream:
   // mutex. Another writer can fill and seal this worker's append stream while
   // this coroutine is suspended. Re-enter allocation before dereferencing the
   // optional or appending to a replacement block that no longer has room.
-  if (!active_stream().has_value() ||
-      active_stream()->committed_bytes_ + total_disk_bytes > append_limit) {
+  if (!append_ready()) {
     goto acquire_active_stream;
   }
   // Earlier captures may have yielded and changed shared overflow capacity.
@@ -3546,11 +3551,13 @@ acquire_active_stream:
   if (trace != nullptr) trace->encode_done_ns_ = SetTraceNowNanos();
 #endif
 
-  // The staging slot already holds this block's buffer; it is fixed for the
-  // life of the allocation, so only the flush counters need syncing below.
+  // No suspension separates append validation from publication. The buffer
+  // remains attached until its full dirty tail and outstanding readers drain.
   if (updated.committed_bytes_ == kStorageBlockBytes) {
     state.in_memory_ = true;
     RequestFlush(store, updated.block_id_);
+    // This append still owns its buffer. Publish the final byte count below
+    // before charging the sealed Tx backlog; flush handles buffer retirement.
     active_stream().reset();
   } else {
     active_stream() = updated;
@@ -3895,8 +3902,7 @@ acquire_active_stream:
     RequestFlush(store, updated.block_id_);
     if (active_stream().has_value() &&
         active_stream()->block_id_ == updated.block_id_) {
-      if (transaction_append) NoteTxBlockSealedLocal(store, updated.block_id_);
-      active_stream().reset();
+      SealAppendStream(store, active_stream());
     }
   }
   if (request.written_location_ != nullptr) {
@@ -3909,21 +3915,46 @@ acquire_active_stream:
   co_return absl::OkStatus();
 }
 
-void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
-  auto seal = [&](std::optional<ActiveBlock>& active) {
-    if (!active.has_value()) return;
-    // An allocation can install an empty stream and then lose revalidation
-    // before its first append. It still has to be detached at a freeze
-    // boundary: leaving it active lets a stale replication/apply coroutine
-    // reuse the allocation after shutdown has closed AcquireWriteBlock.
+void StorageEngine::Impl::SealAppendStream(WorkerStore& store,
+                                           std::optional<ActiveBlock>& active) {
+  if (!active) return;
+  const auto block_id = active->block_id_;
+  if (active->kind_ == BlockKind::kTransaction)
+    NoteTxBlockSealedLocal(store, block_id);
+  active.reset();
+  auto* state = FindBlockState(store, block_id);
+  if (state == nullptr) return;
+  const auto* slot = StagingFor(store, *state);
+  if (slot != nullptr && slot->write_buffer_id_ == 0) {
+    // A bufferless active block is already durable. Sealing must release its
+    // remaining metadata and re-evaluate reclamation without another I/O.
+    ReleaseStagingBuffer(store, *state, block_id);
+    MaybeQueueDefrag(store, block_id);
+  } else {
+    RequestFlush(store, block_id);
+  }
+}
+
+void StorageEngine::Impl::YieldActiveWriteBuffers(WorkerStore& store) {
+  auto yield = [&](std::optional<ActiveBlock>& active) {
+    if (!active || active->write_buffer_id_ == 0) return;
+    auto* state = FindBlockState(store, active->block_id_);
+    auto* slot = StagingFor(store, *state);
+    slot->yield_requested_ = true;
+    active->write_buffer_id_ = 0;
     RequestFlush(store, active->block_id_);
-    active.reset();
   };
-  seal(store.active_block_);
-  seal(store.active_indirect_key_block_);
-  if (store.active_tx_block_)
-    NoteTxBlockSealedLocal(store, store.active_tx_block_->block_id_);
-  seal(store.active_tx_block_);
+  yield(store.active_block_);
+  yield(store.active_tx_block_);
+  yield(store.active_indirect_key_block_);
+}
+
+void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
+  // Freeze boundaries detach even an empty stream installed by a writer that
+  // subsequently failed revalidation. No stale writer may resume it later.
+  SealAppendStream(store, store.active_block_);
+  SealAppendStream(store, store.active_indirect_key_block_);
+  SealAppendStream(store, store.active_tx_block_);
 }
 
 void StorageEngine::Impl::FlushActiveBlock(WorkerStore& store) {
@@ -3945,8 +3976,7 @@ void StorageEngine::Impl::SealDeadActiveBlock(WorkerStore& store) {
   if (state == nullptr || state->live_bytes_ != 0) {
     return;
   }
-  RequestFlush(store, store.active_block_->block_id_);
-  store.active_block_.reset();
+  SealAppendStream(store, store.active_block_);
 }
 
 }  // namespace lavik::storage

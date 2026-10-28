@@ -338,8 +338,7 @@ Task<absl::Status> StorageEngine::Impl::CleanIndirectKeys(WorkerStore* store) {
     const auto used = state->committed_bytes_ - kBlockHeaderBytes;
     if (used != 0 &&
         std::uint64_t{state->live_bytes_} * 1000 < std::uint64_t{used} * 501) {
-      RequestFlush(*store, store->active_indirect_key_block_->block_id_);
-      store->active_indirect_key_block_.reset();
+      SealAppendStream(*store, store->active_indirect_key_block_);
     }
   }
   co_return absl::OkStatus();

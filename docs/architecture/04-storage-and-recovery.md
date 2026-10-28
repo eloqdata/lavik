@@ -711,17 +711,21 @@ as SORT STORE and list-move operations still wait through tagged-record fences
 and commit-record append. Even an awaited `CommitTxWrites` only requests the
 commit-record flush; it is not a synchronous crash-durability fence.
 
-Record and extent writes use only the fixed write pool. Staging-buffer
-pressure seals physical append streams before a writer waits for capacity.
-Foreground and relocation writers release worker store state
-and join the same owner-local FIFO; a returned fixed slot transfers directly
-to its oldest waiter, so new borrowers cannot overtake it. Queued writers
-keep new append streams flushable. Live transaction leases and tagged
-records survive a pressure seal; later writes or commit decisions may open
-another transaction block. Flush completion returns sealed buffers after
-their last reader pin drains, including tails that were already durable.
-Capacity therefore does not depend on completing transactions that themselves
-need a staging buffer to commit. A failed storage writer fails pending slot
+Record and extent writes use only the fixed write pool. Under buffer pressure,
+active streams stop appending, flush their dirty tails, and return buffers after
+the last reader pin drains. Their physical blocks remain active and protected
+from reclamation. Block identity, append position, cumulative record counts,
+and header sequence survive independently of buffer ownership. A stream can
+borrow any returned buffer and resume beyond its durable prefix; old pages
+stay on disk and are neither copied nor rewritten. Reads use staging only for
+the tail present in the currently attached buffer.
+
+Foreground and relocation writers release worker store state and join the same
+owner-local FIFO; a returned slot transfers directly to its oldest waiter.
+Writers yield their buffers when other borrowers remain queued. Capacity does
+not depend on completing transactions that themselves need a buffer to commit.
+Rollover, lifecycle freezes, and maintenance sealing end the physical stream;
+buffer pressure alone does not. A failed storage writer fails pending slot
 acquisitions without recycling its still-referenced staging memory.
 
 Relocation bypasses the foreground physical-allocation gate and retains access
@@ -893,8 +897,8 @@ The first flush durably clears the header slot not selected for the new
 allocation before committing the selected slot. Later header writes alternate
 slots. A dirty tail appended while a snapshot is in flight is requeued when it
 reaches the trigger threshold, without waiting for the periodic timer. A sealed
-stream's remaining tail is requeued at the front regardless of size, preserving
-append and copy-on-write child-before-root ordering.
+or yielding stream's remaining tail is requeued at the front regardless of size,
+preserving append and copy-on-write child-before-root ordering.
 
 An ordinary successful command is therefore not necessarily crash-durable at
 reply time. `StorageDurabilityStats` reports dirty staging bytes, pending
@@ -1060,12 +1064,18 @@ round. Complete, usable populations are eligible on standalone and Meta-managed
 nodes, including replicas disconnected from their source. Owner leases,
 physical roles, and transport connectivity do not grant or revoke this local
 maintenance capability. Tomb Raider marks tombstones and shielding values as
-initially unclaimed, sweeps all ordinary record blocks
-including staged prefixes, claims candidates for which an older unexpired
-value still exists, and only then clears stale shielding or erases unclaimed
-tombstones. Runtime block removal can precede durable allocation-bitmap
-retirement, so an absent runtime block alone never proves that its old values
-are unrecoverable. Before capturing its local block set, a sweep waits for
+initially unclaimed, sweeps all ordinary record blocks, claims candidates for
+which an older unexpired value still exists, and only then clears stale
+shielding or erases unclaimed tombstones. Each worker captures its blocks'
+durable and append boundaries, scans their unflushed staging tails, and then
+reads the corresponding disk prefixes. A staging scan pins one buffer across
+key lookups and claim batches, releasing it before disk-prefix scanning or
+retirement waits. A captured tail whose buffer was already returned is durable
+and is scanned from disk instead. The sweep neither forces a flush nor seals
+streams; its two ranges cover older values that could otherwise survive
+premature tombstone removal. Runtime block removal can precede durable
+allocation-bitmap retirement, so an absent runtime block alone never proves
+that its old values are unrecoverable. Before capturing its local block set, a sweep waits for
 pending record-block retirements to become durable. If a captured block is
 being retired, the sweep waits for that retirement, then skips the obsolete
 allocation and continues the same round. Claims already made from that block
