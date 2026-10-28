@@ -722,29 +722,31 @@ CommandReply BuildClusterSlotsReply(const ReplicationStatus& replication,
   return BuiltReply(reply_builder.View());
 }
 
-Task<std::optional<std::string>> ReplicaMovedError(
-    const ConnectionContext& ctx, const CommandRequest& request) {
+// This gate only reads published replica state and formats a possible error.
+// It has no asynchronous work, so ordinary requests need no coroutine frame.
+std::optional<std::string> ReplicaMovedError(const ConnectionContext& ctx,
+                                             const CommandRequest& request) {
   if (g_replication == nullptr || !g_replication->is_replica() ||
       !g_replication->redirects_clients_to_upstream() ||
       request.spec_ == nullptr || (request.spec_->flags_ & kCmdNoKeys) != 0) {
-    co_return std::nullopt;
+    return std::nullopt;
   }
   const bool write = (request.spec_->flags_ & kCmdWrite) != 0;
   if (!write && ctx.cluster_readonly_) {
-    co_return std::nullopt;
+    return std::nullopt;
   }
   absl::StatusOr<KeyIndexView> keys =
       DetermineKeys(*request.spec_, request.args_);
   if (!keys.ok() || keys->empty()) {
-    co_return std::nullopt;
+    return std::nullopt;
   }
   const std::optional<ReplicaOfConfig> upstream = g_replication->upstream();
   if (!upstream.has_value()) {
-    co_return std::nullopt;
+    return std::nullopt;
   }
   const std::uint16_t slot = storage::RedisSlot(request.args_[keys->first_]);
-  co_return absl::StrCat("MOVED ", slot, " ", upstream->host_, ":",
-                         upstream->port_);
+  return absl::StrCat("MOVED ", slot, " ", upstream->host_, ":",
+                      upstream->port_);
 }
 
 // ---- Redis Cluster data-plane gate ----
@@ -12344,8 +12346,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       if (ctx.in_multi_) ctx.multi_dirty_ = true;
       co_return cluster_reply;
     }
-  } else if (std::optional<std::string> moved =
-                 co_await ReplicaMovedError(ctx, request);
+  } else if (std::optional<std::string> moved = ReplicaMovedError(ctx, request);
              moved.has_value()) {
     if (ctx.in_multi_) ctx.multi_dirty_ = true;
     co_return BuiltReply(reply_builder.AppendError(*moved));
@@ -13362,10 +13363,13 @@ Task<CommandReply> ExecuteCommandOnOwner(unsigned owner,
                                          ReplyBuilder& reply_builder,
                                          std::uint64_t client_id,
                                          ConnectionContext* connection) {
+  // SubmitTaskTo already owns the callback and awaits its returned task. The
+  // callback can forward that task directly instead of allocating another
+  // coroutine around every cross-worker command.
   co_return co_await SubmitTaskTo(owner,
                                   [&request, &reply_builder, client_id,
                                    connection]() -> Task<CommandReply> {
-                                    co_return co_await ExecuteAdmittedCommand(
+                                    return ExecuteAdmittedCommand(
                                         request, reply_builder, client_id,
                                         connection);
                                   });

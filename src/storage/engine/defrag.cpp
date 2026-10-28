@@ -612,6 +612,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   // first matching record instead of allocating/materializing all candidates.
   RecordIndex::Entry* current = index.FindCandidateIf(
       digest, key, [&](const RecordIndex::Entry& candidate) {
+        // Most scanned versions were overwritten into another block or slot.
+        // Reject those using the entry itself before materialization follows
+        // the current block's metadata and performs its acquire owner load.
+        // A matching address still needs the allocation epoch check below:
+        // block IDs and offsets may be reused after reclamation.
+        if (candidate.value_.block_id() != source_location.block_id() ||
+            candidate.value_.record_offset() != source_location.record_offset())
+          return false;
         return MaterializeIndexLocation(candidate).SamePhysicalRecord(
             source_location);
       });

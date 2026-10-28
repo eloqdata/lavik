@@ -287,6 +287,50 @@ TEST(IndexReadersTest, SharedOverflowGrowthAndDetachRequireAllReadersToDrain) {
   old.Clear();
 }
 
+TEST(IndexReadersTest, FullBucketUpdateDefersGlobalInsertionAdmission) {
+  ConcurrentIndex map(ConcurrentArena());
+  for (unsigned i = 0; i < 12; ++i)
+    ASSERT_NE(map.InsertNew(Digest{i * 32}, "external", i, false), nullptr);
+  ASSERT_NE(map.InsertNew(Digest{1}, "external", 1, false), nullptr);
+  map.EnableConcurrentReads();
+  auto other_reader = map.TryRead(Digest{1});
+  ASSERT_TRUE(other_reader);
+  auto update = map.CloseForLookupOrUpdate(Digest{0});
+  ASSERT_TRUE(update.ready());
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  ASSERT_NE(map.Find(Digest{0}, "external"), nullptr);
+  map.Find(Digest{0}, "external")->value_ = 99;
+  EXPECT_TRUE(map.TryRead(Digest{2}));
+  EXPECT_EQ(map.Find(Digest{12 * 32}, "external"), nullptr);
+  ASSERT_TRUE(map.NeedsStructuralWrite(Digest{12 * 32}));
+  auto insertion = map.CloseAllReaders();
+  EXPECT_FALSE(insertion.ready());
+  other_reader.Reset();
+  ASSERT_TRUE(insertion.ready());
+  ASSERT_NE(map.InsertNew(Digest{12 * 32}, "external", 12, false), nullptr);
+  insertion.Reset();
+  EXPECT_FALSE(map.TryRead(Digest{0}));
+  update.Reset();
+  EXPECT_TRUE(map.TryRead(Digest{0}));
+  EXPECT_EQ(map.Find(Digest{0}, "external")->value_, 99);
+}
+
+TEST(IndexReadersTest, LookupUpdateRetainsGlobalClosureThroughRehash) {
+  ConcurrentIndex map(ConcurrentArena());
+  for (unsigned i = 0; i < 289; ++i)
+    ASSERT_NE(map.InsertNew(Digest{i}, "external", i, false), nullptr);
+  ASSERT_TRUE(map.rehashing());
+  map.EnableConcurrentReads();
+  for (unsigned step = 0; step < 64 && map.rehashing(); ++step) {
+    auto update = map.CloseForLookupOrUpdate(Digest{0});
+    ASSERT_TRUE(update.ready());
+    ASSERT_NE(map.Find(Digest{0}, "external"), nullptr);
+    EXPECT_FALSE(map.TryRead(Digest{1}));
+  }
+  EXPECT_FALSE(map.rehashing());
+  EXPECT_TRUE(map.TryRead(Digest{1}));
+}
+
 TEST(IndexReadersTest, ConcurrentReadersNeverObservePartialEntryReplacement) {
   auto arena = ConcurrentArena();
   RecordIndex map(arena);

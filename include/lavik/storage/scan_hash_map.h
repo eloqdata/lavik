@@ -1394,6 +1394,16 @@ class ScanHashMap {
     return NeedsStructuralWrite(digest) ? read_states_.WriteAll()
                                         : read_states_.Write(Hash(digest));
   }
+  // Owner-only lookup followed by replacement of an existing entry. Find may
+  // advance maintenance, so retain a global closure across rehash completion.
+  // A missing key must still pass NeedsStructuralWrite and drain all readers
+  // when necessary before insertion. Deferring that capacity walk avoids
+  // scanning bucket handles on every overwrite, including full bucket chains.
+  WriteGuard CloseForLookupOrUpdate(const Digest& digest) noexcept {
+    return Rehashing() || resize_pending_ || shrink_pending_
+               ? read_states_.WriteAll()
+               : read_states_.Write(Hash(digest));
+  }
   WriteGuard CloseForValueUpdate(std::uint64_t hash) noexcept {
     return read_states_.Write(hash);
   }

@@ -4187,8 +4187,11 @@ class StorageEngine::Impl {
 
   Task<absl::Status> MarkRecordDead(const RetiredRecord& record);
 
-  Task<absl::Status> MarkRetiredRecordsDead(WorkerStore* store,
-                                            std::vector<RetiredRecord> records);
+  // Own both receipt arrays until this durable snapshot has settled. Ordinary
+  // receipts stay compact; only the record currently being consumed expands.
+  Task<absl::Status> MarkRetiredRecordsDead(
+      WorkerStore* store, std::vector<StagedRetiredRecord> staged_records,
+      std::vector<RetiredRecord> publication_records);
 
   // Captures child physical epochs synchronously while old/replacement views
   // are current or protected by pending transaction retirement. The root's

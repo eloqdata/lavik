@@ -147,26 +147,26 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   if (acquire_key_lock && trace != nullptr) {
     trace->key_lock_start_ns_ = SetTraceNowNanos();
   }
+  // Routing already computed this slot from the same immutable key. Reuse it
+  // for both transaction admission and partition selection; internal callers
+  // without a route compute it once here. Do not use value_or(RedisSlot(key)),
+  // whose eager argument evaluation would repeat the CRC even on routed SETs.
+  assert(!routed_partition_id.has_value() ||
+         *routed_partition_id == RedisSlot(key));
+  const std::uint16_t slot =
+      routed_partition_id.has_value() ? *routed_partition_id : RedisSlot(key);
   // Keep the key guard in the writer's frame, before its store-state guard,
   // so it still outlives every append wait and the final store-state unlock.
   // Transaction callers already own this guard and must not reacquire it.
   auto key_lock = acquire_key_lock ? co_await tx::CurrentTxShard().AcquireKey(
                                          db_id, tx::FingerprintOf(digest),
-                                         tx::LockMode::kExclusive,
-                                         lavik::storage::RedisSlot(key))
+                                         tx::LockMode::kExclusive, slot)
                                    : tx::TxShard::Guard{};
   if (acquire_key_lock && trace != nullptr) {
     trace->key_lock_acquired_ns_ = SetTraceNowNanos();
   }
   WorkerStore& store = CurrentStore();
-  // The route hint is produced from this exact key immediately before the
-  // cross-core handoff. Debug builds recheck that contract; optimized builds
-  // avoid another Redis CRC16 calculation on every source SET.
-  assert(!routed_partition_id.has_value() ||
-         *routed_partition_id == RedisSlot(key));
-  auto& partition = routed_partition_id.has_value()
-                        ? PartitionFor(store, *routed_partition_id)
-                        : PartitionForKey(store, key);
+  auto& partition = PartitionFor(store, slot);
   if (trace != nullptr) trace->store_lock_start_ns_ = SetTraceNowNanos();
   co_await store.store_state_mutex_.Lock();
   if (trace != nullptr) trace->store_lock_acquired_ns_ = SetTraceNowNanos();
@@ -1442,7 +1442,8 @@ Task<absl::Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
 }
 
 Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
-    WorkerStore* store, std::vector<RetiredRecord> records) {
+    WorkerStore* store, std::vector<StagedRetiredRecord> staged_records,
+    std::vector<RetiredRecord> publication_records) {
   struct SettlementGuard {
     std::atomic<std::uint32_t>* active_;
     ~SettlementGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
@@ -1451,7 +1452,19 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
   // retired record. Local records settle synchronously after the flush lock
   // has been released; the exceptional remote records use SubmitTo directly
   // and retain their original order.
-  for (const RetiredRecord& record : records) {
+  // Preserve publication-before-ordinary order and keep the rich receipts'
+  // ownership intact until the batch finishes. The optional occupies this
+  // coroutine's frame, so a remote submission can suspend without borrowing
+  // a temporary or allocating a child coroutine for each compact receipt.
+  const std::size_t count = publication_records.size() + staged_records.size();
+  for (std::size_t position = 0; position < count; ++position) {
+    std::optional<RetiredRecord> materialized;
+    const RetiredRecord& record =
+        position < publication_records.size()
+            ? publication_records[position]
+            : materialized.emplace(
+                  staged_records[position - publication_records.size()]
+                      .Materialize());
     assert(record.block_owner_ < worker_count_);
     const unsigned owner = record.block_owner_;
     absl::Status dead;
@@ -3072,7 +3085,10 @@ acquire_active_stream:
   // after the append stream is locked again and an active block is available.
   RecordIndex::WriteGuard index_write;
   if (index_ptr != nullptr) {
-    index_write = index_ptr->CloseForWrite(request.digest_);
+    // A lookup/update needs no spare bucket slot. The insertion admission
+    // below still checks shared capacity after all potentially yielding old-
+    // value captures and before publishing any bytes.
+    index_write = index_ptr->CloseForLookupOrUpdate(request.digest_);
     if (!index_write.ready()) [[unlikely]] {
       // Retain the outer closure while the slow path drains readers and
       // rechecks capacity. Ordinary writes need no extra coroutine frame.
