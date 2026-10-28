@@ -825,24 +825,21 @@ DecodeSortedSetGroupViews(std::string_view bytes,
       metadata->retired_)
     return absl::DataLossError(
         "Sorted Set scan requires a live Sorted Set page");
-  std::vector<OrderedCollectionEntryView> entries;
-  entries.reserve(metadata->item_count_);
   if (metadata->version_ == 2) {
     auto reader = IndexedOrderedReader::Open(
         metadata->kind_, bytes.substr(kOrderedGroupHeaderBytes),
         metadata->item_count_);
     if (!reader.ok()) return reader.status();
-    for (std::size_t i = 0; i < reader->size(); ++i) {
-      auto entry = reader->At(i);
-      if (!entry.ok()) return entry.status();
-      entries.push_back(*entry);
-    }
+    auto entries = reader->DecodeAll();
+    if (!entries.ok()) return entries.status();
     auto valid = ValidateEntrySpan(
         OrderedCollectionKind::kSortedSet,
-        std::span<const OrderedCollectionEntryView>(entries), validation);
+        std::span<const OrderedCollectionEntryView>(*entries), validation);
     if (!valid.ok()) return absl::DataLossError(valid.message());
     return entries;
   }
+  std::vector<OrderedCollectionEntryView> entries;
+  entries.reserve(metadata->item_count_);
   std::size_t offset = kOrderedGroupHeaderBytes;
   for (std::size_t i = 0; i < metadata->item_count_; ++i) {
     if (bytes.size() - offset < kEntryHeaderBytes)

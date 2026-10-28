@@ -257,9 +257,12 @@ TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
     for (const unsigned mask : {1u, 0x80u, 0xffu}) {
       auto bad = *encoded;
       bad[i] ^= static_cast<char>(mask);
-      auto owned = DecodeOrderedGroup(bad);
-      auto views = DecodeSortedSetGroupViews(bad);
-      EXPECT_EQ(owned.ok(), views.ok()) << i << ":" << mask;
+      for (auto validation : {SortedSetMemberValidation::kVerifyUnique,
+                              SortedSetMemberValidation::kTrustStored}) {
+        auto owned = DecodeOrderedGroup(bad, validation);
+        auto views = DecodeSortedSetGroupViews(bad, validation);
+        EXPECT_EQ(owned.ok(), views.ok()) << i << ":" << mask;
+      }
     }
     EXPECT_FALSE(DecodeSortedSetGroupViews(encoded->substr(0, i)).ok());
   }

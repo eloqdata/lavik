@@ -46,6 +46,10 @@ class IndexedOrderedReader {
   }
   absl::StatusOr<OrderedCollectionEntryView> At(std::size_t index) const;
   absl::StatusOr<double> Score(std::size_t index) const;
+  // Decode every interval in one sequential pass, borrowing the same source
+  // as At(). Checks offsets, item sizes and numeric scores; callers still
+  // validate collection ordering and member uniqueness under their policy.
+  absl::StatusOr<std::vector<OrderedCollectionEntryView>> DecodeAll() const;
   // exclusive=false returns the first score >= value; true returns > value.
   absl::StatusOr<std::size_t> LowerBoundScore(double value,
                                               bool exclusive = false) const;

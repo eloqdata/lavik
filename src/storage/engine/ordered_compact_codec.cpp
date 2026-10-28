@@ -85,6 +85,31 @@ absl::StatusOr<OrderedCollectionEntryView> IndexedOrderedReader::At(
   return OrderedCollectionEntryView{body_.substr(begin, end - begin), *score};
 }
 
+absl::StatusOr<std::vector<OrderedCollectionEntryView>>
+IndexedOrderedReader::DecodeAll() const {
+  std::vector<OrderedCollectionEntryView> entries;
+  entries.reserve(count_);
+  // Open certified both array bounds and the first/last offsets. Carry the
+  // previous end forward so each interior offset is loaded only once. Keep
+  // this loop independent of At/Score: full-page consumers need neither
+  // repeated slot checks nor a StatusOr result for every member and score.
+  std::size_t begin = 0;
+  for (std::size_t i = 0; i < count_; ++i) {
+    const auto end = Get(body_, offsets_ + (i + 1) * 4, 4);
+    if (begin > end || end > data_bytes_ || end - begin > kMaxStringBytes)
+      return absl::DataLossError("invalid indexed ordered interval");
+    const auto score =
+        sorted_ ? std::bit_cast<double>(Get(body_, data_bytes_ + i * 8, 8))
+                : 0.0;
+    if (std::isnan(score))
+      return absl::DataLossError("NaN indexed ordered score");
+    entries.push_back(
+        {std::string_view(body_.data() + begin, end - begin), score});
+    begin = end;
+  }
+  return entries;
+}
+
 absl::StatusOr<std::size_t> IndexedOrderedReader::LowerBoundScore(
     double value, bool exclusive) const {
   if (!sorted_ || std::isnan(value))

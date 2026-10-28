@@ -286,6 +286,59 @@ TEST(IndexedOrderedTest, CompactAndGroupedShareBodyAndPreserveV1) {
   }
 }
 
+TEST(IndexedOrderedTest, BulkDecodeMatchesCheckedSlotsIncludingCorruption) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    const auto check = [&](std::string_view body, std::size_t count) {
+      auto reader = IndexedOrderedReader::Open(kind, body, count);
+      if (!reader.ok()) return;
+      auto bulk = reader->DecodeAll();
+      std::vector<OrderedCollectionEntryView> slots;
+      bool valid = true;
+      for (std::size_t i = 0; i < count; ++i) {
+        auto slot = reader->At(i);
+        if (!slot.ok()) {
+          valid = false;
+          break;
+        }
+        slots.push_back(*slot);
+      }
+      ASSERT_EQ(bulk.ok(), valid);
+      if (!valid) return;
+      ASSERT_EQ(bulk->size(), slots.size());
+      for (std::size_t i = 0; i < slots.size(); ++i) {
+        EXPECT_EQ((*bulk)[i].value_, slots[i].value_);
+        EXPECT_EQ((*bulk)[i].value_.data(), slots[i].value_.data());
+        EXPECT_EQ(std::bit_cast<std::uint64_t>((*bulk)[i].score_),
+                  std::bit_cast<std::uint64_t>(slots[i].score_));
+      }
+    };
+    check(std::string(4, '\0'), 0);
+    const auto infinity = std::numeric_limits<double>::infinity();
+    std::vector<OrderedCollectionEntry> entries{{"", -infinity},
+                                                {std::string("a\0b", 3), -0.0},
+                                                {"c", 0.0},
+                                                {"tail", infinity}};
+    if (kind == OrderedCollectionKind::kList)
+      for (auto& entry : entries) entry.score_ = 0;
+    auto encoded = EncodeOrderedCompactValue(kind, entries, 2);
+    ASSERT_TRUE(encoded.ok());
+    const auto body = encoded->substr(8);
+    check(body, entries.size());
+    // Negative infinity with a nonzero mantissa also covers a NaN score.
+    // Mutating the offset array exercises descending and out-of-body spans.
+    for (std::size_t i = 0; i < body.size(); ++i) {
+      for (const unsigned mask : {1u, 0x80u, 0xffu}) {
+        auto bad = body;
+        bad[i] ^= static_cast<char>(mask);
+        SCOPED_TRACE(i);
+        SCOPED_TRACE(mask);
+        check(bad, entries.size());
+      }
+    }
+  }
+}
+
 TEST(IndexedOrderedTest,
      BinaryBoundsMatchLinearReferenceIncludingTiesAndInfinities) {
   const auto infinity = std::numeric_limits<double>::infinity();
