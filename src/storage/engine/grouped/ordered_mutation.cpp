@@ -322,7 +322,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             (plan.root_.kind_ != OrderedCollectionKind::kString &&
              compact.size() != plan.root_.item_count_))
           co_return absl::DataLossError("ordered demotion count mismatch");
-        auto encoded = EncodeOrderedCompactValue(plan.root_.kind_, compact);
+        auto encoded = EncodeOrderedCompactValue(
+            plan.root_.kind_, compact,
+            HasOrderedIndex(plan.root_.kind_) ? 2 : 1);
         if (!encoded.ok()) co_return encoded.status();
         if (encoded->size() >= kCollectionGroupTargetBytes)
           co_return absl::InternalError("ordered demotion byte bound failed");

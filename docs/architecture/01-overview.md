@@ -302,9 +302,13 @@ cleanup as another durable phase.
   interrupted replacement is sufficient to reopen service.
 - Readiness follows recovery and optional import; shutdown drains admitted
   requests and every replication storage mutator before the final flush.
-- Before the first stable release, Lavik-owned durable and control formats
-  use v1 with in-place schema replacement and no compatibility promise for
-  earlier development layouts. Incompatible data directories must be recreated.
+- Outer record/root formats and type-specific payloads are independently
+  versioned. Storage readers and native replication peers must support the
+  payload encodings they consume; see
+  [grouped collections](09-grouped-collections.md) for List and Sorted Set
+  formats and compatibility. Before the first stable release, compatibility
+  with earlier development layouts is not guaranteed; incompatible data
+  directories must be recreated.
   Lavik uses its own format signatures, `LAVIK.*` native commands and
   `lavik://` principal URIs; obsolete development identifiers are not
   accepted as aliases. External standards such as Redis RESP/RDB retain their

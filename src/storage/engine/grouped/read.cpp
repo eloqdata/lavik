@@ -463,7 +463,8 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
                                       std::uint8_t db_id, std::string_view key,
                                       const Digest& digest,
                                       RecordLocation location,
-                                      GroupedObject::Handle snapshot) {
+                                      GroupedObject::Handle snapshot,
+                                      GroupedValueEncoding encoding) {
   const bool pinned = snapshot != nullptr;
   if (!pinned) {
     auto found = partition.grouped_objects_[db_id].Lookup(
@@ -514,8 +515,13 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     auto value = co_await LoadGroupedOrderedValue(store, partition, db_id, key,
                                                   digest, snapshot, pinned);
     if (!value.ok()) co_return value.status();
+    const auto kind = snapshot->ordered_directory().root().kind_;
     encoded = EncodeOrderedCompactValue(
-        snapshot->ordered_directory().root().kind_, *value);
+        kind, *value,
+        encoding == GroupedValueEncoding::kPhysicalStorage &&
+                HasOrderedIndex(kind)
+            ? 2
+            : 1);
   } else {
     auto value = co_await LoadGroupedHashValue(store, partition, db_id, key,
                                                digest, snapshot, pinned);

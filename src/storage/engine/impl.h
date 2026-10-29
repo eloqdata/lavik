@@ -66,6 +66,7 @@
 #include "lavik/storage/detail/compact_write.h"
 #include "lavik/storage/detail/grouped/object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
+#include "lavik/storage/detail/ordered_index.h"
 #include "lavik/storage/detail/record_index.h"
 #include "lavik/storage/detail/record_payload_cursor.h"
 #include "lavik/storage/detail/replica_collection_stage.h"
@@ -3712,6 +3713,9 @@ class StorageEngine::Impl {
   struct LoadedSortedSetPage {
     LoadedValue loaded_;
     std::vector<OrderedCollectionEntryView> entries_;
+    // Only opt-in point/range callers use this borrowed index. Full scans and
+    // mutation preparation retain their checked, materialized entry vectors.
+    std::optional<IndexedOrderedReader> indexed_;
   };
 
   std::size_t DirectGetValueLimit() const noexcept;
@@ -4135,10 +4139,15 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, bool pinned = false);
+  enum class GroupedValueEncoding : bool { kLogicalStream, kPhysicalStorage };
+  // Logical consumers retain the streaming-compatible v1 image. Physical
+  // demotion requests the current List/Sorted Set format directly, avoiding
+  // an intermediate logical image and a second conversion allocation.
   Task<absl::StatusOr<LoadedValue>> LoadGroupedValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      RecordLocation location, GroupedObject::Handle snapshot);
+      RecordLocation location, GroupedObject::Handle snapshot,
+      GroupedValueEncoding encoding);
 
   // Reads an entire extent on its physical owner into caller-owned storage.
   // Local routing returns the physical awaitable without a wrapper task.
@@ -4520,14 +4529,21 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       GroupReadLimiter* limiter = nullptr);
+  enum class SortedSetPageReadMode : bool { kFullDecode, kIndexedProjection };
+  // Indexed projection applies only to v2 pages with kTrustStored; v1 and
+  // kVerifyUnique retain full decoding. Both modes check identity/CRC and
+  // directory score bounds before returning views that borrow the read lease.
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       SortedSetMemberValidation validation =
-          SortedSetMemberValidation::kVerifyUnique);
+          SortedSetMemberValidation::kVerifyUnique,
+      SortedSetPageReadMode mode = SortedSetPageReadMode::kFullDecode);
   // Copies one checked page into a contiguous member block before releasing
   // its lease. The caller admits page scratch/output before launch.
+  static absl::StatusOr<PackedSortedSetValues> PackSortedSetPage(
+      std::span<const OrderedCollectionEntryView> entries);
   Task<absl::StatusOr<PackedSortedSetValues>> LoadPackedSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,

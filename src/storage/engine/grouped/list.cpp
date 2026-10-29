@@ -288,7 +288,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       std::uint64_t bytes = directory.groups()[begin_page].encoded_bytes_;
       fits = bytes <= kCollectionGroupTargetBytes;
       for (const auto& entry : insertions) {
-        const auto extra = kOrderedEntryHeaderBytes + entry.value_.size();
+        const auto extra = OrderedEntryOverhead(OrderedCollectionKind::kList) +
+                           entry.value_.size();
         if (!fits || extra > kCollectionGroupTargetBytes - bytes) {
           fits = false;
           break;

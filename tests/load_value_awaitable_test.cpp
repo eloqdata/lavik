@@ -142,9 +142,10 @@ class LoadValueAwaitableTestPeer : public testing::Test {
         Store(), location, std::move(manifest), nullptr, true);
   }
   auto ReadGrouped(bool pinned = false) {
-    return storage_.impl_->LoadGroupedValue(Store(), Store().partitions_[0], 0,
-                                            key_, digest_, location_,
-                                            pinned ? grouped_ : nullptr);
+    return storage_.impl_->LoadGroupedValue(
+        Store(), Store().partitions_[0], 0, key_, digest_, location_,
+        pinned ? grouped_ : nullptr,
+        StorageEngine::Impl::GroupedValueEncoding::kLogicalStream);
   }
   auto ReadGroupedHash(bool packed = false) {
     return storage_.impl_->ReadGroupedHashResult(

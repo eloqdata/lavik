@@ -80,6 +80,19 @@ replica_get() {
 
 [[ $("${redis_cli}" -p "${source_port}" set baseline before) == OK ]]
 [[ $("${redis_cli}" -p "${source_port}" -n 1 set other-db initial) == OK ]]
+# Compact snapshots transfer their physical encoding; grouped snapshots emit
+# the logical collection stream. Exercise both with indexed List/Zset values.
+for ordered_count in 4 128; do
+  ordered_list=(RPUSH "ordered-list-${ordered_count}")
+  ordered_zset=(ZADD "ordered-zset-${ordered_count}")
+  for ((ordered_i = 0; ordered_i < ordered_count; ++ordered_i)); do
+    printf -v ordered_member '%0256d' "${ordered_i}"
+    ordered_list+=("${ordered_member}")
+    ordered_zset+=("${ordered_i}" "${ordered_member}")
+  done
+  [[ $("${redis_cli}" -p "${source_port}" "${ordered_list[@]}") == "${ordered_count}" ]]
+  [[ $("${redis_cli}" -p "${source_port}" "${ordered_zset[@]}") == "${ordered_count}" ]]
+done
 [[ $("${redis_cli}" -p "${replica_port}" LAVIK.REPLICAOF 127.0.0.1 "${source_port}") == OK ]]
 
 for _ in {1..600}; do
@@ -89,6 +102,24 @@ for _ in {1..600}; do
 done
 [[ $(replica_get "${replica_port}" baseline) == before ]]
 [[ $(replica_get "${replica_port}" other-db 1) == initial ]]
+check_ordered_replica() {
+  local count=$1 expected=$2 reply matches=0
+  if ((count == 128)); then matches=41; fi
+  for _ in {1..600}; do
+    reply=$(printf 'READONLY\nLINDEX ordered-list-%s -1\nZRANGE ordered-zset-%s -1 -1\nZCOUNT ordered-zset-%s 20 60\n' "${count}" "${count}" "${count}" |
+      "${redis_cli}" --raw -p "${replica_port}" | tail -n 3)
+    [[ ${reply} == "${expected}"$'\n'"${expected}"$'\n'"${matches}" ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+for ordered_count in 4 128; do
+  printf -v ordered_member '%0256d' "$((ordered_count - 1))"
+  check_ordered_replica "${ordered_count}" "${ordered_member}"
+  [[ $("${redis_cli}" -p "${source_port}" RPUSH "ordered-list-${ordered_count}" tail) == "$((ordered_count + 1))" ]]
+  [[ $("${redis_cli}" -p "${source_port}" ZADD "ordered-zset-${ordered_count}" 200 tail) == 1 ]]
+  check_ordered_replica "${ordered_count}" tail
+done
 rewrite_reply=$("${redis_cli}" -p "${replica_port}" CONFIG REWRITE 2>&1)
 [[ ${rewrite_reply} == *'cannot persist a LAVIK.REPLICAOF upstream'* ]]
 [[ $(<"${case_dir}/replica.conf") == '# Native replication runtime test' ]]

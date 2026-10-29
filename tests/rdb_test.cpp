@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "lavik/storage/detail/ordered_compact_codec.h"
 #include "support/test_data_path.h"
 
 namespace lavik::rdb {
@@ -775,6 +776,32 @@ TEST(RdbTest, RejectsChecksumAndMalformedObjects) {
   auto malformed = DecodeDump(Dump(Hex("7f")));
   ASSERT_FALSE(malformed.ok());
   EXPECT_TRUE(malformed.status().message().starts_with("Bad data format"));
+}
+
+TEST(RdbTest, IndexedListAndSortedSetExportThroughTheV1LogicalBridge) {
+  using namespace storage;
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    const std::vector<OrderedCollectionEntry> entries{
+        {"", 0},
+        {std::string("a\0b", 3),
+         kind == OrderedCollectionKind::kSortedSet ? 1.25 : 0}};
+    auto encoded = EncodeOrderedCompactValue(kind, entries, 2);
+    ASSERT_TRUE(encoded.ok());
+    RawValue raw{.encoded_ = *encoded,
+                 .logical_size_ = entries.size(),
+                 .value_type_ = OrderedValueType(kind)};
+    auto dump = EncodeDump(raw);
+    ASSERT_TRUE(dump.ok()) << dump.status();
+    auto restored = DecodeDump(*dump);
+    ASSERT_TRUE(restored.ok()) << restored.status();
+    EXPECT_EQ(restored->encoded_.substr(0, 4),
+              kind == OrderedCollectionKind::kList ? "LVL1" : "LZS1");
+    auto decoded = DecodeOrderedCompactValue(kind, restored->encoded_,
+                                             restored->logical_size_);
+    ASSERT_TRUE(decoded.ok());
+    EXPECT_EQ(*decoded, entries);
+  }
 }
 
 }  // namespace

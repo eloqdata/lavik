@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <bit>
 #include <cmath>
 #include <map>
 #include <set>
@@ -433,6 +434,121 @@ struct ReadCursor {
   }
 };
 
+// Locate only the selected rank/score interval in an indexed page. LIMIT
+// offsets skip metadata positions rather than decoding skipped members. Full
+// scans and BYLEX retain their existing paths because score order is not
+// arbitrary member order.
+absl::Status ReadIndexedRange(const IndexedOrderedReader& reader,
+                              std::uint64_t base_rank, ReadCursor& cursor) {
+  if (cursor.done_) return absl::OkStatus();
+  const auto& operation = cursor.operation_;
+  auto& result = *cursor.result_;
+  std::size_t first = 0, end = reader.size();
+  if (operation.range_mode_ == SortedSetRangeMode::kRank) {
+    const auto low =
+        operation.reverse_ ? result.length_ - cursor.end_ : cursor.first_;
+    const auto high =
+        operation.reverse_ ? result.length_ - cursor.first_ : cursor.end_;
+    first = low <= base_rank
+                ? 0
+                : std::min<std::uint64_t>(low - base_rank, reader.size());
+    end = high <= base_rank
+              ? 0
+              : std::min<std::uint64_t>(high - base_rank, reader.size());
+  } else {
+    auto low = reader.LowerBoundScore(operation.minimum_score_.value_,
+                                      operation.minimum_score_.exclusive_);
+    auto high = reader.LowerBoundScore(operation.maximum_score_.value_,
+                                       !operation.maximum_score_.exclusive_);
+    if (!low.ok()) return low.status();
+    if (!high.ok()) return high.status();
+    first = *low;
+    end = *high;
+  }
+  if (first >= end) return absl::OkStatus();
+  if (operation.kind_ == SortedSetOperationKind::kCount) {
+    result.count_ += end - first;
+    return absl::OkStatus();
+  }
+  if (operation.limit_ &&
+      cursor.skipped_ < static_cast<std::uint64_t>(operation.offset_)) {
+    const auto skip = std::min<std::uint64_t>(
+        end - first, operation.offset_ - cursor.skipped_);
+    cursor.skipped_ += skip;
+    if (operation.reverse_)
+      end -= skip;
+    else
+      first += skip;
+  }
+  if (operation.limit_ && operation.count_ >= 0) {
+    const auto count = std::min<std::uint64_t>(
+        end - first, operation.count_ - result.member_count());
+    if (operation.reverse_)
+      first = end - count;
+    else
+      end = first + count;
+  }
+  if (first == end) return absl::OkStatus();
+  if (operation.packed_output_) {
+    auto begin = reader.At(first), last = reader.At(end - 1);
+    if (!begin.ok()) return begin.status();
+    if (!last.ok()) return last.status();
+    const auto start = begin->value_.data();
+    const auto stop = last->value_.data() + last->value_.size();
+    if (stop < start)
+      return absl::DataLossError("invalid indexed Sorted Set range offsets");
+    const auto bytes = static_cast<std::size_t>(stop - start);
+    auto reserved = ReservePackedOutput(&result, end - first, 1);
+    if (!reserved.ok()) return reserved;
+    const auto capacity = std::max(bytes, std::string{}.capacity());
+    if (capacity == SIZE_MAX ||
+        capacity + 1 > SIZE_MAX - result.retained_charge_.bytes())
+      return absl::ResourceExhaustedError("Sorted Set packed output overflow");
+    auto admission = TryReserveMemory(capacity + 1);
+    if (!admission) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError("OOM indexed Sorted Set reply");
+    }
+    auto& output = *result.packed_members_;
+    const auto block = output.members_.blocks_.size();
+    // One exact selected block, regardless of member count or reply direction.
+    // Reversing descriptors preserves the single copy of contiguous bytes.
+    output.members_.blocks_.emplace_back(start, bytes);
+    if (output.members_.blocks_.back().capacity() > capacity)
+      return absl::ResourceExhaustedError(
+          "OOM Sorted Set packed capacity exceeds admission");
+    result.retained_charge_.Account(
+        CurrentMemoryAccountingShard(),
+        result.retained_charge_.bytes() +
+            output.members_.blocks_.back().capacity() + 1);
+    for (std::size_t i = 0; i < end - first && !cursor.done_; ++i) {
+      const auto index = operation.reverse_ ? end - 1 - i : first + i;
+      auto entry = reader.At(index);
+      if (!entry.ok()) return entry.status();
+      if (entry->value_.data() < start ||
+          entry->value_.data() + entry->value_.size() > stop)
+        return absl::DataLossError("invalid indexed Sorted Set reply interval");
+      auto visited = cursor.VisitWithOutput(*entry, base_rank + index, [&] {
+        output.members_.values_.push_back(
+            {block, static_cast<std::size_t>(entry->value_.data() - start),
+             entry->value_.size()});
+        output.scores_.push_back(entry->score_);
+        return absl::OkStatus();
+      });
+      if (!visited.ok()) return visited;
+    }
+    return absl::OkStatus();
+  }
+  for (std::size_t i = 0; i < end - first && !cursor.done_; ++i) {
+    const auto index = operation.reverse_ ? end - 1 - i : first + i;
+    auto entry = reader.At(index);
+    if (!entry.ok()) return entry.status();
+    auto visited = cursor.Visit(*entry, base_rank + index);
+    if (!visited.ok()) return visited;
+  }
+  return absl::OkStatus();
+}
+
 bool BetterLexCandidate(const auto& entry, const SortedSetOperation& operation,
                         std::optional<std::string_view> after,
                         const std::optional<SortedSetMember>& candidate) {
@@ -636,7 +752,7 @@ absl::StatusOr<MemoryReservation> ReserveInputs(
 
 absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
     std::optional<CompactValueView> value, const SortedSetOperation& operation,
-    Members& members, SortedSetResult& result, CompactPayload& output) {
+    Members& members, SortedSetResult& result, OrderedCompactPayload& payload) {
   const bool add = operation.kind_ == SortedSetOperationKind::kAdd;
   if (!value || (add ? operation.entries_.size() != 1
                      : operation.kind_ != SortedSetOperationKind::kRemove ||
@@ -653,22 +769,34 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
   auto reader = OrderedCompactReader::Open(
       OrderedCollectionKind::kSortedSet, value->encoded_, value->logical_size_);
   if (!reader.ok()) return reader.status();
-  auto scan = *reader;
-  auto& state = members.at(member);
-  std::optional<OrderedCompactEntryView> previous;
-  for (std::size_t i = 0; i < scan.size(); ++i) {
-    auto entry = scan.Next();
-    if (!entry.ok()) return entry.status();
-    if (previous && (previous->score_ > entry->score_ ||
-                     (previous->score_ == entry->score_ &&
-                      previous->value_ > entry->value_)))
-      return absl::DataLossError("unsorted compact Sorted Set");
-    previous = *entry;
-    if (entry->value_ == member) {
-      if (state.before_)
-        return absl::DataLossError("duplicate persisted Sorted Set member");
-      state.before_ = state.after_ = entry->score_;
+  // The owned mutation builder upgrades changed v1 values to v2. Decide
+  // before applying command semantics so fallback cannot apply inputs twice.
+  if (!reader->indexed()) [[unlikely]] {
+    // Preserve the point path's complete framing/order validation before
+    // the generic builder sorts the after-image. Migration must not repair
+    // an invalid source silently.
+    OrderedCompactEntryView previous;
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return entry.status();
+      if (i != 0 && (previous.score_ > entry->score_ ||
+                     (previous.score_ == entry->score_ &&
+                      previous.value_ > entry->value_)))
+        return absl::DataLossError("unsorted compact Sorted Set");
+      previous = *entry;
     }
+    return std::nullopt;
+  }
+  auto& state = members.at(member);
+  auto slot = reader->indexed()->FindSortedSetMember(member);
+  if (!slot.ok()) return slot.status();
+  const auto removed = *slot;
+  if (removed != reader->size()) {
+    if (state.before_)
+      return absl::DataLossError("duplicate persisted Sorted Set member");
+    auto score = reader->indexed()->Score(removed);
+    if (!score.ok()) return score.status();
+    state.before_ = state.after_ = *score;
   }
   result.key_exists_ = true;
   result.length_ = value->logical_size_;
@@ -682,40 +810,12 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
     update.erase_ = true;
     return update;
   }
-  output.AppendBytes("LZS1");
-  output.AppendUnsigned(result.length_, 4);
-  auto append = [&] {
-    output.AppendUnsigned(std::bit_cast<std::uint64_t>(*state.after_), 8);
-    output.AppendUnsigned(member.size(), 4);
-    output.AppendBytes(member);
-  };
-  bool inserted = !state.after_.has_value();
-  // Only the removed and inserted positions split the borrowed old image.
-  // Keep whole intervals rather than one descriptor per unchanged member.
-  std::size_t kept_begin = 8;
-  for (std::size_t i = 0; i < reader->size(); ++i) {
-    auto entry = reader->Next();
-    if (!entry.ok()) return entry.status();
-    const auto entry_begin = static_cast<std::size_t>(entry->encoded_.data() -
-                                                      value->encoded_.data());
-    if (entry->value_ == member) {
-      output.AppendBytes(
-          value->encoded_.substr(kept_begin, entry_begin - kept_begin));
-      kept_begin = entry_begin + entry->encoded_.size();
-      continue;
-    }
-    if (!inserted &&
-        (*state.after_ < entry->score_ ||
-         (*state.after_ == entry->score_ && member < entry->value_))) {
-      output.AppendBytes(
-          value->encoded_.substr(kept_begin, entry_begin - kept_begin));
-      append();
-      kept_begin = entry_begin;
-      inserted = true;
-    }
-  }
-  output.AppendBytes(value->encoded_.substr(kept_begin));
-  if (!inserted) append();
+  auto& output = payload.V2(*reader->indexed());
+  // Compact values have no member-to-score index, so the validation pass
+  // above also resolves the old slot. Reuse it for deletion and binary-seek
+  // the new position instead of scanning the page again.
+  auto edited = output.EditSortedSetMember(removed, member, state.after_);
+  if (!edited.ok()) return edited;
   return update;
 }
 
@@ -723,7 +823,39 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     std::optional<CompactValueView> value, const SortedSetOperation& operation,
     Members& members, SortedSetResult& result,
     std::optional<MemoryReservation>& compact_admission,
-    CompactPayload* point_payload = nullptr) {
+    OrderedCompactPayload* point_payload = nullptr) {
+  if (value && value->encoded_.starts_with(kSortedSetMagicV2) &&
+      ReadOnly(operation) &&
+      (operation.kind_ == SortedSetOperationKind::kRandom ||
+       ((operation.kind_ == SortedSetOperationKind::kRange ||
+         operation.kind_ == SortedSetOperationKind::kCount) &&
+        operation.range_mode_ != SortedSetRangeMode::kLex))) {
+    auto source =
+        OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
+                                   value->encoded_, value->logical_size_);
+    if (!source.ok()) return source.status();
+    assert(source->indexed());
+    result.key_exists_ = true;
+    result.length_ = source->size();
+    if (operation.kind_ == SortedSetOperationKind::kRandom) {
+      RandomSelection selection;
+      auto status =
+          selection.Prepare(result.length_, operation.count_, true, &result);
+      if (!status.ok()) return status;
+      for (const auto& [rank, slot] : selection.draws_) {
+        auto entry = source->indexed()->At(rank);
+        if (!entry.ok()) return entry.status();
+        auto copied = MakeOutput(*entry);
+        if (!copied.ok()) return copied.status();
+        result.members_[slot] = std::move(*copied);
+      }
+    } else {
+      ReadCursor cursor(operation, &result);
+      auto status = ReadIndexedRange(*source->indexed(), 0, cursor);
+      if (!status.ok()) return status;
+    }
+    return CompactValueUpdate{};
+  }
   // ExecuteCompactLocked owns decode/re-encode admission, including the
   // bounded inline workspace that lets shrinking commands run at
   // maxmemory. Range removal adds no input members or retained reply;
@@ -805,8 +937,8 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
       erased.changed_ = erased.erase_ = true;
       return erased;
     }
-    auto encoded =
-        EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+    auto encoded = EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
+                                             entries, 2);
     if (!encoded.ok()) return encoded.status();
     return CompactValueUpdate{
         .changed_ = true,
@@ -840,8 +972,8 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
       erased.changed_ = erased.erase_ = true;
       return erased;
     }
-    auto encoded =
-        EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+    auto encoded = EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
+                                             entries, 2);
     if (!encoded.ok()) return encoded.status();
     return CompactValueUpdate{
         .changed_ = true,
@@ -884,7 +1016,7 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     return erased;
   }
   auto encoded =
-      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
   if (!encoded.ok()) return encoded.status();
   return CompactValueUpdate{
       .changed_ = true,
@@ -1043,7 +1175,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   // The encoded callback result survives until the compact writer returns.
   // Keep its admission outside the synchronous callback's stack frame.
   std::optional<MemoryReservation> compact_admission;
-  CompactPayload point_payload;
+  OrderedCompactPayload point_payload;
   std::optional<InlineRecordPayload> inline_payload;
   auto callback = [&](std::optional<CompactValueView> value)
       -> absl::StatusOr<CompactValueUpdate> {
@@ -1193,8 +1325,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     return budget.Reserve(copies);
   };
   SortedSetPageWorkBudget page_work;
-  auto read_page_impl = [&]<typename Page>(std::size_t i,
-                                           GroupReadLimiter* limiter = nullptr)
+  auto read_page_impl = [&]<typename Page>(
+                            std::size_t i, GroupReadLimiter* limiter = nullptr,
+                            SortedSetPageReadMode mode =
+                                SortedSetPageReadMode::kFullDecode)
       -> Task<absl::StatusOr<
           std::conditional_t<std::is_same_v<Page, LoadedOrderedGroup>,
                              OwnedScanPage, AdmittedScanPage<Page>>>> {
@@ -1247,7 +1381,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                                   : SortedSetMemberValidation::kVerifyUnique;
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
-                                 metadata[i].id_, validation);
+                                 metadata[i].id_, validation, mode);
       else if constexpr (std::is_same_v<Page, PackedSortedSetValues>)
         return LoadPackedSortedSetPage(store, partition, db_id, key, digest,
                                        object, metadata[i].id_, limiter);
@@ -1265,8 +1399,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!page.ok()) co_return page.status();
     co_return ResultPage{std::move(admission), std::move(*page)};
   };
-  auto read_page = [&](std::size_t i) {
-    return read_page_impl.template operator()<LoadedSortedSetPage>(i);
+  auto read_page = [&](std::size_t i, SortedSetPageReadMode mode) {
+    return read_page_impl.template operator()<LoadedSortedSetPage>(i, nullptr,
+                                                                   mode);
   };
   // Mutation probes own their payloads, releasing physical leases before
   // routing. Both wrappers return the loader task without another coroutine.
@@ -1315,17 +1450,25 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!position)
         co_return absl::DataLossError("Sorted Set random rank missing");
       const auto i = position->group_index_;
-      auto page = co_await read_page(i);
+      auto page =
+          co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
       if (!page.ok()) co_return page.status();
       const auto& entries = page->page_.entries_;
       do {
         const auto [rank, slot] = selection.draws_[draw];
         const auto at = directory.FindRank(rank);
         if (!at || at->group_index_ != i) break;
-        if (at->offset_ >= entries.size())
+        const auto size = page->page_.indexed_ ? page->page_.indexed_->size()
+                                               : entries.size();
+        if (at->offset_ >= size)
           co_return absl::DataLossError(
               "Sorted Set random page cardinality mismatch");
-        auto copied = MakeOutput(entries[at->offset_]);
+        auto entry = page->page_.indexed_
+                         ? page->page_.indexed_->At(at->offset_)
+                         : absl::StatusOr<OrderedCollectionEntryView>(
+                               entries[at->offset_]);
+        if (!entry.ok()) co_return entry.status();
+        auto copied = MakeOutput(*entry);
         if (!copied.ok()) co_return copied.status();
         result.members_[slot] = std::move(*copied);
         ++draw;
@@ -1338,14 +1481,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto prepared = boundary.Prepare(operation, result.length_);
     if (!prepared.ok()) co_return prepared;
     for (std::size_t i = 0; i < metadata.size(); ++i) {
-      auto page = co_await read_page(i);
+      auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);
       if (!page.ok()) co_return page.status();
       for (const auto& entry : page->page_.entries_)
         boundary.Observe(entry, operation.scan_cursor_);
     }
     if (boundary.prefixes_.empty()) co_return result;
     for (std::size_t i = 0; i < metadata.size(); ++i) {
-      auto page = co_await read_page(i);
+      auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);
       if (!page.ok()) co_return page.status();
       for (const auto& entry : page->page_.entries_) {
         auto emitted = boundary.Emit(entry, operation, &result);
@@ -1404,7 +1547,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                       : std::nullopt;
         std::optional<SortedSetMember> candidate;
         for (std::size_t i = 0; i < metadata.size(); ++i) {
-          auto page = co_await read_page(i);
+          auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);
           if (!page.ok()) co_return page.status();
           for (const auto& entry : page->page_.entries_) {
             if (!BetterLexCandidate(entry, operation, after, candidate))
@@ -1679,8 +1822,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     };
     for (std::size_t ordinal = 0;
          !cursor.done_ && ordinal < end_page - first_page;) {
-      // Mutating range selection and the other scan modes retain their
-      // original borrowed-page lifecycle and memory floor.
+      // Preserve the existing overlapped I/O for multi-page ranges. Indexed
+      // projection serves single-page requests and the serial fallback after
+      // the bounded window declines admission or stops at a LIMIT boundary.
       if (operation.kind_ == SortedSetOperationKind::kRange &&
           (operation.range_mode_ == SortedSetRangeMode::kRank ||
            operation.range_mode_ == SortedSetRangeMode::kScore) &&
@@ -1699,6 +1843,32 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           continue;
         }
       }
+      if (ReadOnly(operation) &&
+          operation.range_mode_ != SortedSetRangeMode::kLex) {
+        const auto i = page_index(ordinal);
+        const auto base = directory.CountBefore(i);
+        auto page =
+            co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
+        if (!page.ok()) co_return page.status();
+        if (page->page_.indexed_) {
+          auto visited = ReadIndexedRange(*page->page_.indexed_, base, cursor);
+          if (!visited.ok()) co_return visited;
+          rank = reverse ? base : base + metadata[i].item_count_;
+        } else if (operation.packed_output_ &&
+                   operation.kind_ == SortedSetOperationKind::kRange) {
+          // Keep v1's single packed page block and transfer path. Falling
+          // back from an indexed probe must not introduce 4 KiB reply blocks.
+          auto packed = PackSortedSetPage(page->page_.entries_);
+          if (!packed.ok()) co_return packed.status();
+          auto visited = consume_packed_page(*packed, false);
+          if (!visited.ok()) co_return visited;
+        } else {
+          auto visited = consume_page(page->page_.entries_, false);
+          if (!visited.ok()) co_return visited;
+        }
+        ++ordinal;
+        continue;
+      }
       if (operation.packed_output_ &&
           operation.kind_ == SortedSetOperationKind::kRange) {
         auto page =
@@ -1708,7 +1878,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         auto visited = consume_packed_page(page->page_, false);
         if (!visited.ok()) co_return visited;
       } else {
-        auto page = co_await read_page(page_index(ordinal));
+        auto page = co_await read_page(page_index(ordinal),
+                                       SortedSetPageReadMode::kFullDecode);
         if (!page.ok()) co_return page.status();
         auto visited = consume_page(page->page_.entries_, false);
         if (!visited.ok()) co_return visited;
@@ -1902,8 +2073,22 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     const auto first = directory.LowerBoundScore(*score);
     const auto end = directory.UpperBoundScore(*score);
     for (std::size_t i = first; i < end; ++i) {
-      auto page = co_await read_page(i);
+      auto page =
+          co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
       if (!page.ok()) co_return page.status();
+      if (page->page_.indexed_) {
+        const auto& reader = *page->page_.indexed_;
+        auto slot = reader.LowerBound(*score, member);
+        if (!slot.ok()) co_return slot.status();
+        if (*slot == reader.size()) continue;
+        auto entry = reader.At(*slot);
+        if (!entry.ok()) co_return entry.status();
+        if (entry->score_ != *score || entry->value_ != member) continue;
+        const auto rank = directory.CountBefore(i) + *slot;
+        result.rank_ = operation.reverse_ ? result.length_ - 1 - rank : rank;
+        result.rank_score_ = *score;
+        co_return result;
+      }
       const auto& entries = page->page_.entries_;
       for (std::size_t j = 0; j < entries.size(); ++j) {
         if (entries[j].value_ != member) continue;
@@ -1922,9 +2107,46 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   // Pop already knows the exact source pages. Check the member index above
   // against their owned entries, then omit those members from score routing.
   // New point-write probes follow the same path on later planner reads.
-  auto locate_sources = [&](std::size_t i,
-                            const auto& entries) -> absl::StatusOr<bool> {
+  auto locate_sources =
+      [&](std::size_t i, const auto& entries,
+          const IndexedOrderedReader* indexed) -> absl::StatusOr<bool> {
     bool matched = false;
+    // The member graph supplies the complete ordered key. Sparse requests
+    // can binary-search it; dense batches retain one scan instead of doing
+    // M log N probes per page. Neither path allocates lookup scratch, and
+    // every loaded mutation page has already passed full validation.
+    if (members.size() <=
+        entries.size() /
+            std::max<std::size_t>(1, std::bit_width(entries.size()))) {
+      for (auto& [member, state] : members) {
+        if (!state.before_ || *state.before_ < metadata[i].min_score_ ||
+            *state.before_ > metadata[i].max_score_)
+          continue;
+        auto position = [&]() -> absl::StatusOr<std::size_t> {
+          if (indexed) return indexed->LowerBound(*state.before_, member);
+          const auto found = std::lower_bound(
+              entries.begin(), entries.end(),
+              OrderedCollectionEntryView{member, *state.before_},
+              [](const auto& entry, const auto& key) {
+                return entry.score_ < key.score_ ||
+                       (entry.score_ == key.score_ &&
+                        entry.value_ < key.value_);
+              });
+          return found - entries.begin();
+        }();
+        if (!position.ok()) return position.status();
+        if (*position == entries.size() ||
+            entries[*position].score_ != *state.before_ ||
+            entries[*position].value_ != member)
+          continue;
+        if (state.source_ != kNoPage)
+          return absl::DataLossError("duplicate persisted Sorted Set member");
+        state.source_ = i;
+        --remaining_sources;
+        matched = true;
+      }
+      return matched;
+    }
     for (const auto& entry : entries) {
       auto member = members.find(entry.value_);
       if (member == members.end()) continue;
@@ -1939,19 +2161,29 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     }
     return matched;
   };
+  auto locate_page_sources =
+      [&](std::size_t i,
+          const OrderedGroupSnapshot& snapshot) -> absl::StatusOr<bool> {
+    if (!snapshot.encoded_sorted_set_)
+      return locate_sources(i, snapshot.entries_, nullptr);
+    const auto& encoded = *snapshot.encoded_sorted_set_;
+    if (encoded.version() != 2)
+      return locate_sources(i, encoded.entries(), nullptr);
+    auto reader = IndexedOrderedReader::Open(snapshot.kind_, encoded.bytes(),
+                                             encoded.entries().size());
+    if (!reader.ok()) return reader.status();
+    return locate_sources(i, encoded.entries(), &*reader);
+  };
   for (const auto& [i, page] : probed_pages) {
     GroupedScratchBudget budget;
     status = add_page_budget(&budget, i);
     if (!status.ok()) co_return status;
     const auto& snapshot = page.page_.snapshot_;
-    auto located =
-        snapshot.encoded_sorted_set_
-            ? locate_sources(i, snapshot.encoded_sorted_set_->entries())
-            : locate_sources(i, snapshot.entries_);
+    auto located = locate_page_sources(i, snapshot);
     if (!located.ok()) co_return located.status();
   }
   // The two resident doubles bound old-score candidates without reading
-  // unrelated pages. Equal-score runs still scan for exact members. Sort
+  // unrelated pages. Equal-score runs still need candidate page reads. Sort
   // and merge requested intervals so a batch reads an overlapping page only
   // once; interval storage is covered by the per-input reservation.
   std::vector<std::pair<std::size_t, std::size_t>> source_ranges;
@@ -1973,10 +2205,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
       const auto& snapshot = page->page_.snapshot_;
-      auto located =
-          snapshot.encoded_sorted_set_
-              ? locate_sources(i, snapshot.encoded_sorted_set_->entries())
-              : locate_sources(i, snapshot.entries_);
+      auto located = locate_page_sources(i, snapshot);
       if (!located.ok()) co_return located.status();
       // Equal-score scans may touch unrelated pages. Retain only pages with
       // requested members, so a point update never caches the whole set.
@@ -2129,7 +2358,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       auto edited = EditEncodedSortedSetGroup(
           loaded.at(i), member,
           i == state.source_ ? state.before_ : std::nullopt,
-          i == state.destination_ ? state.after_ : std::nullopt);
+          i == state.destination_ ? state.after_ : std::nullopt,
+          kCollectionGroupTargetBytes,
+          // The member graph either proved global absence or we resolved
+          // this member in a different source page under the same root.
+          SortedSetMemberAbsence::kVerified);
       if (!edited.ok()) co_return edited.status();
       if (!*edited) {
         encoded_point = false;
@@ -2159,10 +2392,15 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       // inputs retain the general path because repeated members apply in order.
       const auto& [member, state] = pending.front();
       auto& source = loaded.at(state->source_).entries_;
-      const auto entry =
-          std::find_if(source.begin(), source.end(),
-                       [&](const auto& at) { return at.value_ == member; });
-      if (entry == source.end())
+      const auto entry = std::lower_bound(
+          source.begin(), source.end(),
+          OrderedCollectionEntryView{member, *state->before_},
+          [](const auto& at, const auto& key) {
+            return at.score_ < key.score_ ||
+                   (at.score_ == key.score_ && at.value_ < key.value_);
+          });
+      if (entry == source.end() || entry->value_ != member ||
+          entry->score_ != *state->before_)
         co_return absl::DataLossError("missing Sorted Set point-update source");
       entry->score_ = *state->after_;
       if (state->source_ == state->destination_) {
@@ -2233,7 +2471,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // successful pair keeps its links and IDs, so it needs neither a wider
     // interval nor more admission.
     constexpr auto kPagePayloadBytes =
-        kCollectionGroupTargetBytes - kOrderedGroupHeaderBytes;
+        kCollectionGroupTargetBytes -
+        OrderedGroupFixedBytes(OrderedCollectionKind::kSortedSet);
     constexpr auto kPairPayloadBytes = 2 * kPagePayloadBytes;
     auto bounded_payload_bytes = [](const OrderedGroupSnapshot& page) {
       std::size_t bytes = 0;

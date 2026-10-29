@@ -26,6 +26,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
+#include "lavik/storage/detail/ordered_index.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -171,8 +172,16 @@ absl::StatusOr<std::size_t> ValidateGroup(
   // The encoded owner is immutable and was fully checked on decode. Its
   // point editor preserves framing/order and rejects duplicates; link/identity
   // checks above still apply to the independently mutable envelope.
-  if (group.encoded_sorted_set_)
-    return kOrderedGroupHeaderBytes + group.encoded_sorted_set_->bytes().size();
+  if (group.encoded_sorted_set_) {
+    // A v1 body is rewritten as v2 on output. Both layouts use 12 bytes per
+    // member; v2 additionally needs the final offset sentinel. Account for
+    // that growth before admitting or staging the replacement page.
+    const auto extra = group.encoded_sorted_set_->version() == 1 ? 4 : 0;
+    const auto size = group.encoded_sorted_set_->bytes().size();
+    if (size > kMaxRecordPayloadBytes - kOrderedGroupHeaderBytes - extra)
+      return absl::OutOfRangeError("ordered page exceeds payload limit");
+    return kOrderedGroupHeaderBytes + size + extra;
+  }
   // Only the checked splitter can create this immutable owner, after full
   // after-image validation. It cannot become stale through a member edit.
   // All structural and order checks still run after callers finish links.
@@ -191,14 +200,15 @@ absl::StatusOr<std::size_t> ValidateGroup(
       return absl::InvalidArgumentError("invalid fixed String segment");
     return kOrderedGroupHeaderBytes + size;
   }
-  std::size_t bytes = kOrderedGroupHeaderBytes;
+  std::size_t bytes = group.retired_ ? kOrderedGroupHeaderBytes
+                                     : OrderedGroupFixedBytes(group.kind_);
+  const auto overhead = OrderedEntryOverhead(group.kind_);
   for (const auto& entry : entries) {
-    if (bytes > kMaxRecordPayloadBytes - kEntryHeaderBytes ||
-        entry.value_.size() >
-            kMaxRecordPayloadBytes - kEntryHeaderBytes - bytes) {
+    if (bytes > kMaxRecordPayloadBytes - overhead ||
+        entry.value_.size() > kMaxRecordPayloadBytes - overhead - bytes) {
       return absl::OutOfRangeError("ordered page exceeds payload limit");
     }
-    bytes += kEntryHeaderBytes + entry.value_.size();
+    bytes += overhead + entry.value_.size();
   }
   return bytes;
 }
@@ -418,7 +428,7 @@ absl::StatusOr<OrderedGroupEncoder> OrderedGroupEncoder::Create(
   encoder.encoded_bytes_ = *size;
   auto& bytes = encoder.header_;
   std::copy(kGroupMagic.begin(), kGroupMagic.end(), bytes.begin());
-  Store(bytes, 8, 1, 4);
+  Store(bytes, 8, !group.retired_ && HasOrderedIndex(group.kind_) ? 2 : 1, 4);
   Store(bytes, 12, static_cast<unsigned>(group.kind_), 1);
   Store(bytes, 13, group.retired_, 1);
   Store(bytes, 16, group.incarnation_, 8);
@@ -441,10 +451,42 @@ std::optional<std::string_view> OrderedGroupEncoder::Next() noexcept {
     ++entry_;
     return OrderedStringBytes(*group_);
   }
-  if (group_->encoded_sorted_set_) {
+  if (group_->retired_) return std::nullopt;
+  if (group_->encoded_sorted_set_ &&
+      group_->encoded_sorted_set_->version() == 2) {
     if (entry_ != 0) return std::nullopt;
     ++entry_;
     return group_->encoded_sorted_set_->bytes();
+  }
+  if (HasOrderedIndex(group_->kind_)) {
+    // Emit values and fixed arrays in separate passes, keeping extent-backed
+    // pages streaming. Checked v1 views borrow their old owner while we emit
+    // v2 directly, without a temporary body or per-member string allocation.
+    auto emit = [&](auto entries) -> std::optional<std::string_view> {
+      if (phase_ == 1) {
+        if (entry_ < entries.size()) return entries[entry_++].value_;
+        phase_ = group_->kind_ == OrderedCollectionKind::kSortedSet ? 2 : 3;
+        entry_ = 0;
+      }
+      if (phase_ == 2) {
+        if (entry_ < entries.size()) {
+          Store(entry_header_, 0,
+                std::bit_cast<std::uint64_t>(entries[entry_++].score_), 8);
+          return std::string_view(entry_header_.data(), 8);
+        }
+        phase_ = 3;
+        entry_ = 0;
+      }
+      if (entry_ > entries.size()) return std::nullopt;
+      Store(entry_header_, 0, value_offset_, 4);
+      if (entry_ < entries.size())
+        value_offset_ += entries[entry_].value_.size();
+      ++entry_;
+      return std::string_view(entry_header_.data(), 4);
+    };
+    if (group_->encoded_sorted_set_)
+      return emit(group_->encoded_sorted_set_->entries());
+    return emit(OrderedGroupEntries(*group_));
   }
   const auto entries = OrderedGroupEntries(*group_);
   if (entry_ == entries.size()) return std::nullopt;
@@ -472,13 +514,8 @@ absl::StatusOr<std::string> EncodeOrderedGroup(
 
 absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
     std::string_view bytes, SortedSetMemberValidation validation) {
-  if (bytes.size() < kOrderedGroupHeaderBytes ||
-      bytes.size() > kMaxRecordPayloadBytes ||
-      !bytes.starts_with(kGroupMagic) || Load(bytes, 8, 4) != 1 ||
-      Load(bytes, 13, 1) > 1 || Load(bytes, 14, 2) != 0 ||
-      Load(bytes, 52, 4) != bytes.size() || Load(bytes, 56, 8) != 0) {
-    return absl::DataLossError("invalid ordered page encoding");
-  }
+  auto metadata = DecodeOrderedGroupMetadata(bytes, bytes.size());
+  if (!metadata.ok()) return metadata.status();
   OrderedGroupSnapshot group{
       .kind_ = static_cast<OrderedCollectionKind>(Load(bytes, 12, 1)),
       .incarnation_ = Load(bytes, 16, 8),
@@ -494,6 +531,20 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeOrderedGroup(
     if (!group.retired_)
       group.entries_.push_back(
           {.value_ = std::string(bytes.substr(kOrderedGroupHeaderBytes))});
+    auto valid = ValidateGroup(group, validation);
+    if (!valid.ok()) return absl::DataLossError(valid.status().message());
+    return group;
+  }
+  if (metadata->version_ == 2) {
+    auto reader = IndexedOrderedReader::Open(
+        group.kind_, bytes.substr(kOrderedGroupHeaderBytes), count);
+    if (!reader.ok()) return reader.status();
+    group.entries_.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto entry = reader->At(i);
+      if (!entry.ok()) return entry.status();
+      group.entries_.push_back({std::string(entry->value_), entry->score_});
+    }
     auto valid = ValidateGroup(group, validation);
     if (!valid.ok()) return absl::DataLossError(valid.status().message());
     return group;
@@ -540,15 +591,15 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
                             .previous_ = metadata->previous_,
                             .next_ = metadata->next_,
                             .entries_ = {}};
-  page.encoded_sorted_set_ =
-      EncodedSortedSetEntries(std::move(owned), std::move(*entries));
+  page.encoded_sorted_set_ = EncodedSortedSetEntries(
+      std::move(owned), std::move(*entries), metadata->version_);
   return page;
 }
 
 absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     const OrderedGroupSnapshot& page, std::string_view member,
     std::optional<double> before, std::optional<double> after,
-    std::size_t target_bytes) {
+    std::size_t target_bytes, SortedSetMemberAbsence absence) {
   if ((!before && !after) || member.size() > kMaxStringBytes ||
       (before && std::isnan(*before)) || (after && std::isnan(*after)))
     return absl::InvalidArgumentError("invalid encoded Sorted Set point edit");
@@ -559,6 +610,57 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
   const auto bytes = page.encoded_sorted_set_->bytes();
   const auto missing = entries.size();
   std::size_t removed = missing;
+  const auto count = entries.size() - bool(before) + bool(after);
+  target_bytes = std::min<std::size_t>(target_bytes, kMaxRecordPayloadBytes);
+  // Views borrow the completed output, whose owner moves into the snapshot.
+  auto finish = [&page, count](LocalSharedPtr<std::string>&& output)
+      -> absl::StatusOr<std::optional<OrderedGroupSnapshot>> {
+    auto final = IndexedOrderedReader::Open(page.kind_, *output, count);
+    if (!final.ok()) return final.status();
+    auto views = final->DecodeAll();
+    if (!views.ok()) return views.status();
+    OrderedGroupSnapshot result{.kind_ = page.kind_,
+                                .incarnation_ = page.incarnation_,
+                                .id_ = page.id_,
+                                .previous_ = page.previous_,
+                                .next_ = page.next_,
+                                .entries_ = {}};
+    result.encoded_sorted_set_ =
+        EncodedSortedSetEntries(std::move(output), std::move(*views), 2);
+    return result;
+  };
+  if (page.encoded_sorted_set_->version() == 2) {
+    const auto reader =
+        IndexedOrderedReader::Open(page.kind_, bytes, entries.size());
+    if (!reader.ok()) return reader.status();
+    if (before) {
+      auto position = reader->LowerBound(*before, member);
+      if (!position.ok()) return position.status();
+      removed = *position;
+      if (removed == missing || entries[removed].score_ != *before ||
+          entries[removed].value_ != member)
+        return absl::DataLossError("encoded Sorted Set point source missing");
+    } else if (absence == SortedSetMemberAbsence::kCheckSource &&
+               std::any_of(
+                   entries.begin(), entries.end(),
+                   [&](const auto& entry) { return entry.value_ == member; })) {
+      return absl::DataLossError("encoded Sorted Set member already exists");
+    }
+    IndexedOrderedSplice splice(*reader,
+                                IndexedOrderedSplice::Envelope::kGroupedBody);
+    const auto edited = splice.EditSortedSetMember(removed, member, after);
+    if (!edited.ok()) return edited;
+    const auto size = splice.encoded_bytes();
+    if (count == 0 || target_bytes < kOrderedGroupHeaderBytes ||
+        size > target_bytes - kOrderedGroupHeaderBytes)
+      return std::nullopt;
+    auto output = MakeLocalShared<std::string>();
+    output->reserve(size);
+    // The same bounded plan as compact writes copies surviving data/score
+    // runs directly into the final owner. Only shifted offsets are rebuilt.
+    while (auto part = splice.Next()) output->append(*part);
+    return finish(std::move(output));
+  }
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].value_ != member) continue;
     if (!before || entries[i].score_ != *before)
@@ -567,10 +669,8 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
   }
   if (before && removed == missing)
     return absl::DataLossError("encoded Sorted Set point source missing");
-  const auto count = entries.size() - bool(before) + bool(after);
-  target_bytes = std::min<std::size_t>(target_bytes, kMaxRecordPayloadBytes);
   const auto frame_bytes = kEntryHeaderBytes + member.size();
-  const auto retained_bytes = bytes.size() - (before ? frame_bytes : 0);
+  const auto retained_bytes = bytes.size() + 4 - (before ? frame_bytes : 0);
   if (count == 0 || target_bytes < kOrderedGroupHeaderBytes ||
       retained_bytes > target_bytes - kOrderedGroupHeaderBytes ||
       (after &&
@@ -579,55 +679,38 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
   const auto size = retained_bytes + (after ? frame_bytes : 0);
   auto output = MakeLocalShared<std::string>();
   output->reserve(size);
-  auto append_member = [&] {
-    std::array<char, kEntryHeaderBytes> header{};
-    Store(header, 0, member.size(), 4);
-    Store(header, 4, std::bit_cast<std::uint64_t>(*after), 8);
-    output->append(header.data(), header.size());
-    output->append(member);
+  // Upgrade the v1 source directly into the final v2 owner. Revisit borrowed
+  // views for each array instead of allocating an intermediate page or owned
+  // strings. Subsequent edits use the indexed splice above.
+  auto visit = [&](auto emit) {
+    bool inserted = !after;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      if (i == removed) continue;
+      if (!inserted &&
+          EntryLess(OrderedCollectionEntryView{member, *after}, entries[i])) {
+        emit(OrderedCollectionEntryView{member, *after});
+        inserted = true;
+      }
+      emit(entries[i]);
+    }
+    if (!inserted) emit(OrderedCollectionEntryView{member, *after});
   };
-  bool inserted = !after;
-  std::size_t start = 0;
-  // Every unchanged framed byte is copied once, in at most three runs split
-  // by the old and new positions. Numeric order treats -0/+0 as equal and
-  // binary member order breaks ties, exactly as the ordinary page planner.
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const auto offset =
-        entries[i].value_.data() - bytes.data() - kEntryHeaderBytes;
-    if (i == removed) {
-      output->append(bytes.substr(start, offset - start));
-      start = offset + frame_bytes;
-      continue;
-    }
-    if (!inserted &&
-        EntryLess(OrderedCollectionEntryView{member, *after}, entries[i])) {
-      output->append(bytes.substr(start, offset - start));
-      start = offset;
-      append_member();
-      inserted = true;
-    }
-  }
-  output->append(bytes.substr(start));
-  if (!inserted) append_member();
-  std::vector<OrderedCollectionEntryView> views;
-  views.reserve(count);
-  std::string_view encoded(*output);
-  for (std::size_t offset = 0; offset != encoded.size();) {
-    const auto length = Load(encoded, offset, 4);
-    const auto score = std::bit_cast<double>(Load(encoded, offset + 4, 8));
-    offset += kEntryHeaderBytes;
-    views.push_back({encoded.substr(offset, length), score});
-    offset += length;
-  }
-  OrderedGroupSnapshot result{.kind_ = page.kind_,
-                              .incarnation_ = page.incarnation_,
-                              .id_ = page.id_,
-                              .previous_ = page.previous_,
-                              .next_ = page.next_,
-                              .entries_ = {}};
-  result.encoded_sorted_set_ =
-      EncodedSortedSetEntries(std::move(output), std::move(views));
-  return result;
+  visit([&](const auto& entry) { output->append(entry.value_); });
+  auto append_number = [&](std::uint64_t value, unsigned width) {
+    std::array<char, 8> buffer{};
+    Store(buffer, 0, value, width);
+    output->append(buffer.data(), width);
+  };
+  visit([&](const auto& entry) {
+    append_number(std::bit_cast<std::uint64_t>(entry.score_), 8);
+  });
+  std::size_t offset = 0;
+  append_number(0, 4);
+  visit([&](const auto& entry) {
+    offset += entry.value_.size();
+    append_number(offset, 4);
+  });
+  return finish(std::move(output));
 }
 
 void MaterializeOrderedGroupEntries(OrderedGroupSnapshot& page) {
@@ -654,6 +737,18 @@ absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
     return absl::OutOfRangeError("List range exceeds page");
   std::vector<std::string> values;
   values.reserve(count);
+  if (metadata->version_ == 2) {
+    auto reader = IndexedOrderedReader::Open(
+        metadata->kind_, bytes.substr(kOrderedGroupHeaderBytes),
+        metadata->item_count_);
+    if (!reader.ok()) return reader.status();
+    for (std::size_t i = 0; i < count; ++i) {
+      auto entry = reader->At(first + i);
+      if (!entry.ok()) return entry.status();
+      values.emplace_back(entry->value_);
+    }
+    return values;
+  }
   std::size_t offset = kOrderedGroupHeaderBytes;
   for (std::size_t i = 0; i < metadata->item_count_; ++i) {
     if (bytes.size() - offset < kEntryHeaderBytes)
@@ -682,6 +777,13 @@ absl::StatusOr<PackedValues> DecodePackedOrderedListRange(
     return absl::DataLossError("List range requires a live List page");
   if (first > metadata->item_count_ || count > metadata->item_count_ - first)
     return absl::OutOfRangeError("List range exceeds page");
+  if (metadata->version_ == 2) {
+    auto reader = IndexedOrderedReader::Open(
+        metadata->kind_, bytes.substr(kOrderedGroupHeaderBytes),
+        metadata->item_count_);
+    if (!reader.ok()) return reader.status();
+    return reader->CopyRange(first, count);
+  }
   PackedValues result;
   result.values_.reserve(count);
   std::size_t begin = 0, end = 0;
@@ -720,6 +822,19 @@ DecodeSortedSetGroupViews(std::string_view bytes,
       metadata->retired_)
     return absl::DataLossError(
         "Sorted Set scan requires a live Sorted Set page");
+  if (metadata->version_ == 2) {
+    auto reader = IndexedOrderedReader::Open(
+        metadata->kind_, bytes.substr(kOrderedGroupHeaderBytes),
+        metadata->item_count_);
+    if (!reader.ok()) return reader.status();
+    auto entries = reader->DecodeAll();
+    if (!entries.ok()) return entries.status();
+    auto valid = ValidateEntrySpan(
+        OrderedCollectionKind::kSortedSet,
+        std::span<const OrderedCollectionEntryView>(*entries), validation);
+    if (!valid.ok()) return absl::DataLossError(valid.message());
+    return entries;
+  }
   std::vector<OrderedCollectionEntryView> entries;
   entries.reserve(metadata->item_count_);
   std::size_t offset = kOrderedGroupHeaderBytes;
@@ -748,7 +863,8 @@ absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
   if (prefix.size() < kOrderedGroupHeaderBytes ||
       encoded_bytes < kOrderedGroupHeaderBytes ||
       encoded_bytes > kMaxRecordPayloadBytes ||
-      !prefix.starts_with(kGroupMagic) || Load(prefix, 8, 4) != 1 ||
+      !prefix.starts_with(kGroupMagic) ||
+      (Load(prefix, 8, 4) != 1 && Load(prefix, 8, 4) != 2) ||
       Load(prefix, 13, 1) > 1 || Load(prefix, 14, 2) != 0 ||
       Load(prefix, 52, 4) != encoded_bytes || Load(prefix, 56, 8) != 0) {
     return absl::DataLossError("invalid ordered page envelope");
@@ -760,7 +876,8 @@ absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
       .previous_ = Load(prefix, 32, 8),
       .next_ = Load(prefix, 40, 8),
       .item_count_ = static_cast<std::uint32_t>(Load(prefix, 48, 4)),
-      .retired_ = Load(prefix, 13, 1) != 0};
+      .retired_ = Load(prefix, 13, 1) != 0,
+      .version_ = static_cast<std::uint32_t>(Load(prefix, 8, 4))};
   if (!ValidKind(result.kind_) || result.incarnation_ == 0 || result.id_ == 0 ||
       result.previous_ == result.id_ || result.next_ == result.id_ ||
       (result.previous_ != 0 && result.previous_ == result.next_) ||
@@ -768,9 +885,15 @@ absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
            ? (result.item_count_ != 0 || result.previous_ != 0 ||
               result.next_ != 0 || encoded_bytes != kOrderedGroupHeaderBytes)
            : result.item_count_ == 0) ||
-      (result.kind_ != OrderedCollectionKind::kString &&
+      (result.version_ == 1 && result.kind_ != OrderedCollectionKind::kString &&
        result.item_count_ >
-           (encoded_bytes - kOrderedGroupHeaderBytes) / kEntryHeaderBytes)) {
+           (encoded_bytes - kOrderedGroupHeaderBytes) / kEntryHeaderBytes) ||
+      (result.version_ == 2 &&
+       (!HasOrderedIndex(result.kind_) || result.retired_ ||
+        encoded_bytes < OrderedGroupFixedBytes(result.kind_) ||
+        result.item_count_ >
+            (encoded_bytes - OrderedGroupFixedBytes(result.kind_)) /
+                OrderedEntryOverhead(result.kind_)))) {
     return absl::DataLossError("invalid ordered page envelope identity/count");
   }
   if (result.kind_ == OrderedCollectionKind::kString &&
@@ -801,10 +924,16 @@ absl::Status OrderedGroupMetadataDecoder::Read(std::string_view bytes) {
       bytes.remove_prefix(skipped);
       continue;
     }
-    if (envelope_ready_ && entries_ == metadata_.item_count_)
+    const bool indexed = envelope_ready_ && metadata_.version_ == 2;
+    if (envelope_ready_ &&
+        entries_ == metadata_.item_count_ + (indexed ? 1u : 0u))
       return fail("ordered metadata stream has trailing bytes");
-    const auto header_bytes =
-        envelope_ready_ ? kEntryHeaderBytes : kOrderedGroupHeaderBytes;
+    const bool reading_score =
+        indexed && metadata_.kind_ == OrderedCollectionKind::kSortedSet &&
+        scores_ < metadata_.item_count_;
+    const auto header_bytes = !envelope_ready_ ? kOrderedGroupHeaderBytes
+                              : indexed        ? (reading_score ? 8u : 4u)
+                                               : kEntryHeaderBytes;
     const auto copied = std::min(header_bytes - header_used_, bytes.size());
     std::copy_n(bytes.data(), copied, header_.data() + header_used_);
     header_used_ += copied;
@@ -820,9 +949,34 @@ absl::Status OrderedGroupMetadataDecoder::Read(std::string_view bytes) {
       }
       metadata_ = *metadata;
       envelope_ready_ = true;
+      if (metadata_.version_ == 2) {
+        data_bytes_ =
+            encoded_bytes_ - OrderedGroupFixedBytes(metadata_.kind_) -
+            metadata_.item_count_ * OrderedEntryOverhead(metadata_.kind_);
+        member_remaining_ = data_bytes_;
+      }
       if (metadata_.kind_ == OrderedCollectionKind::kString) {
         entries_ = metadata_.item_count_;
         member_remaining_ = metadata_.item_count_;
+      }
+      continue;
+    }
+    if (indexed) {
+      if (reading_score) {
+        const auto value = std::bit_cast<double>(Load(header, 0, 8));
+        if (std::isnan(value) || (scores_ != 0 && value < metadata_.max_score_))
+          return fail("invalid indexed metadata score order");
+        if (scores_++ == 0) metadata_.min_score_ = value;
+        metadata_.max_score_ = value;
+      } else {
+        const auto offset = Load(header, 0, 4);
+        if ((entries_ == 0 && offset != 0) || offset < previous_offset_ ||
+            offset > data_bytes_ ||
+            offset - previous_offset_ > kMaxStringBytes ||
+            (entries_ == metadata_.item_count_ && offset != data_bytes_))
+          return fail("invalid indexed metadata offsets");
+        previous_offset_ = offset;
+        ++entries_;
       }
       continue;
     }
@@ -846,7 +1000,7 @@ absl::StatusOr<OrderedGroupMetadata> OrderedGroupMetadataDecoder::Finish()
     const {
   if (failed_ || !envelope_ready_ || consumed_ != encoded_bytes_ ||
       header_used_ != 0 || member_remaining_ != 0 ||
-      entries_ != metadata_.item_count_)
+      entries_ != metadata_.item_count_ + (metadata_.version_ == 2 ? 1u : 0u))
     return absl::DataLossError("unfinished ordered metadata stream");
   return metadata_;
 }
@@ -1812,7 +1966,9 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(OrderedGroupSnapshot& left,
       target_bytes > kMaxRecordPayloadBytes) {
     return absl::InvalidArgumentError("invalid Sorted Set rebalance pair");
   }
-  const auto capacity = target_bytes - kOrderedGroupHeaderBytes;
+  const auto capacity = target_bytes > OrderedGroupFixedBytes(left.kind_)
+                            ? target_bytes - OrderedGroupFixedBytes(left.kind_)
+                            : 0;
   auto payload_bytes = [](const auto& entries) -> absl::StatusOr<std::size_t> {
     std::size_t bytes = 0;
     for (const auto& entry : entries) {
@@ -1915,10 +2071,10 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
     for (std::size_t end = group.entries_.size(); end != 0;) {
       ends.push_back(end);
       std::size_t begin = end;
-      std::size_t bytes = kOrderedGroupHeaderBytes;
+      std::size_t bytes = OrderedGroupFixedBytes(group.kind_);
       while (begin != 0) {
-        const auto item_bytes =
-            kEntryHeaderBytes + group.entries_[begin - 1].value_.size();
+        const auto item_bytes = OrderedEntryOverhead(group.kind_) +
+                                group.entries_[begin - 1].value_.size();
         if (begin != end &&
             (bytes > target_bytes || item_bytes > target_bytes - bytes))
           break;
@@ -1936,10 +2092,10 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
     if (pack_from_back) {
       end = ends[result.groups_.size()];
     } else {
-      std::size_t bytes = kOrderedGroupHeaderBytes;
+      std::size_t bytes = OrderedGroupFixedBytes(group.kind_);
       while (end != group.entries_.size()) {
-        const auto item_bytes =
-            kEntryHeaderBytes + group.entries_[end].value_.size();
+        const auto item_bytes = OrderedEntryOverhead(group.kind_) +
+                                group.entries_[end].value_.size();
         if (end != begin &&
             (bytes > target_bytes || item_bytes > target_bytes - bytes))
           break;
