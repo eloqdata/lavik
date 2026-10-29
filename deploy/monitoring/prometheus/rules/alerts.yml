@@ -400,3 +400,72 @@ groups:
             "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
             | urlquery }}&viewPanel=1"
           runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics
+  - name: lavik.native-replication
+    rules:
+      - alert: LavikReplicationStalled
+        expr: lavik:native_replication_stall_seconds >= 300
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: replication
+        annotations:
+          summary: Native replication has pending work without progress
+          description: "{{ $labels.instance }} {{ $labels.side }} worker {{ $labels.worker }} flow {{ $labels.flow }} step {{ $labels.step }} has made no effective progress for at least 5 minutes. Idle, disconnected and unavailable flows do not satisfy this condition."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance | urlquery }}&viewPanel=46"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#native-replication-stalled
+      - alert: LavikReplicationStalled
+        expr: lavik:native_replication_stall_seconds >= 480
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+          signal: replication
+        annotations:
+          summary: Native replication has pending work without progress
+          description: "{{ $labels.instance }} {{ $labels.side }} worker {{ $labels.worker }} flow {{ $labels.flow }} step {{ $labels.step }} has made no effective progress for at least 8 minutes. Inspect the local stage and original failure before changing the relationship."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance | urlquery }}&viewPanel=46"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#native-replication-stalled
+      - alert: LavikFullSyncFailures
+        expr: |
+          (sum by (cluster, job, instance, side) (increase(lavik_replication_fullsync_results_total{job="lavik",result="failure"}[15m])) >= 3)
+          and on (cluster, job, instance) lavik:ready
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: replication
+        annotations:
+          summary: Native FULL recovery repeatedly failed
+          description: "{{ $labels.instance }} {{ $labels.side }} completed at least 3 failed FULL attempts in 15 minutes. Normal cancellation, FULL admission busy and authority waits are excluded. Read the last result and correlate session/history in logs."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance | urlquery }}&viewPanel=49"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#native-full-failures
+      - alert: LavikPopulationRecoveryStalled
+        expr: |
+          (lavik_replication_loading_no_progress_seconds{job="lavik"} >= 900)
+          and on (cluster, job, instance) (lavik_replication_loading{job="lavik"} == 1)
+          and on (cluster, job, instance) (lavik_replication_population_ready{job="lavik"} == 0)
+          and on (cluster, job, instance) (lavik_replication_waiting{job="lavik"} == 0)
+          and on (cluster, job, instance) (lavik_replication_observation_available{job="lavik"} == 1)
+          and on (cluster, job, instance) lavik:ready
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+          signal: replication
+        annotations:
+          summary: Native population recovery stopped progressing
+          description: "{{ $labels.instance }} requires population recovery and has made no effective recovery progress for 15 minutes. A long FULL that continues transferring data does not fire. Check failed-stopped, catalog, promotion and activation separately."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance | urlquery }}&viewPanel=50"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#native-population-recovery
+      - alert: LavikMetricsMissing
+        expr: |
+          ((lavik:ready unless on (cluster, job, instance) lavik_replication_observation_available{job="lavik"})
+          or (lavik_replication_observation_available{job="lavik"} == 0))
+          and on (cluster, job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: native_replication
+        annotations:
+          summary: Required Lavik telemetry is missing
+          description: "{{ $labels.instance }} has no coherent native replication observation for 5 minutes. Missing progress is unknown, not a healthy zero or a confirmed replication stall."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics

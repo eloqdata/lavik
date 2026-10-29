@@ -11,6 +11,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
@@ -72,6 +74,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
@@ -123,6 +127,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
@@ -174,6 +180,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
@@ -230,6 +238,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
@@ -281,6 +291,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
@@ -332,6 +344,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
@@ -388,6 +402,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
@@ -439,6 +455,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
@@ -495,6 +513,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
@@ -551,6 +571,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
@@ -602,6 +624,8 @@ tests:
         values: 1x200
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x200
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x500
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x200"
       - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}

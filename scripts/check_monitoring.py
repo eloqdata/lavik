@@ -71,6 +71,42 @@ def main():
         (MONITORING / "grafana/dashboards/lavik-overview.json").read_text()
     )
 
+    # Grafana stores PromQL as strings; JSON/navigation checks alone cannot
+    # catch a malformed label_replace chain or new panel expression.
+    def dashboard_queries(panels):
+        for panel in panels:
+            for target in panel.get("targets", []):
+                if "expr" not in target:
+                    continue
+                expression = (
+                    target["expr"]
+                    .replace("$instance", ".*")
+                    .replace("$__rate_interval", "1m")
+                    .replace("$__range", "1h")
+                    .replace("@ end()", "@ 1700000000")
+                )
+                yield {
+                    "record": f"dashboard_panel_{panel['id']}_{target['refId']}",
+                    "expr": expression,
+                }
+            yield from dashboard_queries(panel.get("panels", []))
+
+    with tempfile.TemporaryDirectory() as directory:
+        queries = Path(directory) / "dashboard-queries.yml"
+        queries.write_text(
+            yaml.safe_dump(
+                {
+                    "groups": [
+                        {
+                            "name": "dashboard-syntax",
+                            "rules": list(dashboard_queries(dashboard["panels"])),
+                        }
+                    ]
+                }
+            )
+        )
+        run("promtool", "check", "rules", queries)
+
     def panel_ids(panels):
         return {p["id"] for p in panels} | {
             i for p in panels for i in panel_ids(p.get("panels", []))

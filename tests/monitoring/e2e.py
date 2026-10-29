@@ -170,6 +170,8 @@ def main():
             for rule in group["rules"]:
                 rule["for"] = "3s"
                 rule["keep_firing_for"] = "6s"
+                # The full 15-minute failure window is checked by promtool.
+                rule["expr"] = rule["expr"].replace("[15m]", "[15s]")
         write_yaml(args.output / "alerts.yml", rules)
         recordings = yaml.safe_load(
             (MONITORING / "prometheus/rules/recording.yml").read_text()
@@ -374,6 +376,67 @@ def main():
             lambda: fixture.matching(
                 "LavikFullSyncQueuePressure", "resolved", "warning"
             ),
+        )
+        # Exercise the production progress predicate with synthetic ages; the
+        # sampler's wall-clock behavior is covered by native process tests.
+        stalled = healthy + "\n".join(
+            [
+                'lavik_replication_native_flow_connections{side="target",worker="0",flow="0"} 1',
+                'lavik_replication_pending_work{side="target",worker="0",flow="0",step="apply"} 1',
+                'lavik_replication_no_progress_seconds{side="target",worker="0",flow="0",step="apply"} 500',
+                "",
+            ]
+        )
+        fixture.set(stalled)
+        wait_for(
+            "native stall critical notification",
+            lambda: fixture.matching("LavikReplicationStalled", receiver="critical"),
+        )
+        fixture.set(healthy)
+        wait_for(
+            "native stall resolved notification",
+            lambda: fixture.matching("LavikReplicationStalled", "resolved", "critical"),
+        )
+        loading = healthy + "\n".join(
+            [
+                "lavik_replication_loading_no_progress_seconds 901",
+                "lavik_replication_loading 1",
+                "lavik_replication_population_ready 0",
+                "lavik_replication_waiting 0",
+                "",
+            ]
+        )
+        fixture.set(loading)
+        wait_for(
+            "population recovery critical notification",
+            lambda: fixture.matching(
+                "LavikPopulationRecoveryStalled", receiver="critical"
+            ),
+        )
+        fixture.set(healthy)
+        wait_for(
+            "population recovery resolved notification",
+            lambda: fixture.matching(
+                "LavikPopulationRecoveryStalled", "resolved", "critical"
+            ),
+        )
+        fixture.set(
+            healthy
+            + 'lavik_replication_fullsync_results_total{side="target",result="failure"} 0\n'
+        )
+        time.sleep(3)
+        fixture.set(
+            healthy
+            + 'lavik_replication_fullsync_results_total{side="target",result="failure"} 4\n'
+        )
+        wait_for(
+            "FULL failures warning notification",
+            lambda: fixture.matching("LavikFullSyncFailures", receiver="warning"),
+        )
+        fixture.set(healthy)
+        wait_for(
+            "FULL failures resolved notification",
+            lambda: fixture.matching("LavikFullSyncFailures", "resolved", "warning"),
         )
         assert not fixture.matching("LavikMetaDisconnected")
         if lavik:
