@@ -186,44 +186,6 @@ TEST(GroupedCollectionTest, ListRangeOwnsOnlySelectedValues) {
   EXPECT_EQ(values->front(), page.entries_[1].value_);
 }
 
-TEST(GroupedCollectionTest, ListRangeValidatesUnselectedEntriesAndEnvelopeV1) {
-  auto page = Page();
-  auto encoded = test::EncodeOrderedGroupV1(page);
-  ASSERT_TRUE(encoded.ok());
-  // Corruption before and after the selected middle item must still fail.
-  for (const std::size_t entry : {0, 2}) {
-    const auto offset = kOrderedGroupHeaderBytes + entry * (12 + 6);
-    auto bad = *encoded;
-    bad[offset + 11] = '\x80';  // -0 is forbidden even though it equals +0.
-    EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 1, 1).status()));
-    bad = *encoded;
-    for (int i = 0; i < 4; ++i) bad[offset + i] = '\xff';
-    EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 1, 1).status()));
-  }
-  auto bad = *encoded;
-  bad[48] = 2;  // Correct framing for two entries still leaves trailing bytes.
-  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 0, 1).status()));
-  bad = *encoded;
-  bad[56] = 1;  // Reserved envelope bytes remain checked.
-  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 0, 1).status()));
-  for (std::size_t length = 0; length < encoded->size(); ++length)
-    EXPECT_FALSE(DecodeOrderedListRange(encoded->substr(0, length), 0, 0).ok());
-  EXPECT_TRUE(
-      absl::IsOutOfRange(DecodeOrderedListRange(*encoded, 4, 0).status()));
-  EXPECT_TRUE(absl::IsOutOfRange(
-      DecodeOrderedListRange(*encoded, 1, SIZE_MAX).status()));
-  auto sorted =
-      test::EncodeOrderedGroupV1(Page(1, 3, OrderedCollectionKind::kSortedSet));
-  ASSERT_TRUE(sorted.ok());
-  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(*sorted, 0, 1).status()));
-  page.entries_.clear();
-  page.retired_ = true;
-  auto retired = test::EncodeOrderedGroupV1(page);
-  ASSERT_TRUE(retired.ok());
-  EXPECT_TRUE(
-      absl::IsDataLoss(DecodeOrderedListRange(*retired, 0, 0).status()));
-}
-
 TEST(GroupedCollectionTest, SortedSetViewsBorrowBinaryMembersAndKeepScores) {
   auto page = Page(1, 0, OrderedCollectionKind::kSortedSet);
   page.entries_ = {
@@ -246,31 +208,38 @@ TEST(GroupedCollectionTest, SortedSetViewsBorrowBinaryMembersAndKeepScores) {
   }
 }
 
-TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
+TEST(GroupedCollectionTest, SortedSetDecodersShareCorruptionChecks) {
   auto page = Page(1, 3, OrderedCollectionKind::kSortedSet);
   auto encoded = EncodeOrderedGroup(page);
   ASSERT_TRUE(encoded.ok());
-  // Differential corruption checks cover every header, length, score and
-  // member byte. A borrowing decoder must not weaken the owning decoder's
-  // validation just because the caller may only consume the first member.
+  // All three entry points share corrupt inputs; the encoded owner always
+  // verifies uniqueness, while full decode and borrowed views offer both
+  // policies.
   for (std::size_t i = 0; i < encoded->size(); ++i) {
     for (const unsigned mask : {1u, 0x80u, 0xffu}) {
       auto bad = *encoded;
       bad[i] ^= static_cast<char>(mask);
+      SCOPED_TRACE(testing::Message() << i << ":" << mask);
+      const auto encoded_page = DecodeEncodedSortedSetGroup(bad);
       for (auto validation : {SortedSetMemberValidation::kVerifyUnique,
                               SortedSetMemberValidation::kTrustStored}) {
         auto owned = DecodeOrderedGroup(bad, validation);
         auto views = DecodeSortedSetGroupViews(bad, validation);
-        EXPECT_EQ(owned.ok(), views.ok()) << i << ":" << mask;
+        EXPECT_EQ(owned.ok(), views.ok());
+        if (validation == SortedSetMemberValidation::kVerifyUnique)
+          EXPECT_EQ(owned.ok(), encoded_page.ok());
       }
     }
     EXPECT_FALSE(DecodeSortedSetGroupViews(encoded->substr(0, i)).ok());
+    EXPECT_FALSE(DecodeEncodedSortedSetGroup(encoded->substr(0, i)).ok());
   }
   auto duplicate = *encoded;
   // Different scores can order duplicate member names correctly; uniqueness
   // must still reject a repeated, non-adjacent member.
   duplicate.replace(duplicate.find("item-2"), 6, "item-0");
   EXPECT_TRUE(absl::IsDataLoss(DecodeSortedSetGroupViews(duplicate).status()));
+  EXPECT_TRUE(
+      absl::IsDataLoss(DecodeEncodedSortedSetGroup(duplicate).status()));
   auto nan = *encoded;
   const auto bits =
       std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN());
@@ -286,6 +255,7 @@ TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
   auto list = EncodeOrderedGroup(Page());
   ASSERT_TRUE(list.ok());
   EXPECT_FALSE(DecodeSortedSetGroupViews(*list).ok());
+  EXPECT_FALSE(DecodeEncodedSortedSetGroup(*list).ok());
 }
 
 TEST(GroupedCollectionTest, EncodedSortedSetPageOwnsBytesAcrossCopyAndMove) {
@@ -488,26 +458,6 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointRejectsBadEditsAndFallsBack) {
   invalid.next_ = invalid.id_;
   EXPECT_FALSE(OrderedGroupEncoder::Create(invalid).ok());
   EXPECT_EQ(*EncodeOrderedGroup(*page), *wire);
-}
-
-TEST(GroupedCollectionTest, EncodedSortedSetDecoderKeepsFullValidation) {
-  auto wire = EncodeOrderedGroup(Page(1, 3, OrderedCollectionKind::kSortedSet));
-  ASSERT_TRUE(wire.ok());
-  for (std::size_t offset = 0; offset < wire->size(); ++offset) {
-    for (const unsigned mask : {1u, 0x80u, 0xffu}) {
-      auto bad = *wire;
-      bad[offset] ^= static_cast<char>(mask);
-      EXPECT_EQ(DecodeOrderedGroup(bad).ok(),
-                DecodeEncodedSortedSetGroup(bad).ok())
-          << offset;
-    }
-    EXPECT_FALSE(DecodeEncodedSortedSetGroup(wire->substr(0, offset)).ok());
-  }
-  wire->replace(wire->find("item-2"), 6, "item-0");
-  EXPECT_TRUE(absl::IsDataLoss(DecodeEncodedSortedSetGroup(*wire).status()));
-  const auto list = EncodeOrderedGroup(Page());
-  ASSERT_TRUE(list.ok());
-  EXPECT_FALSE(DecodeEncodedSortedSetGroup(*list).ok());
 }
 
 TEST(GroupedCollectionTest, SortedSetStoredReadsTrustMemberUniqueness) {

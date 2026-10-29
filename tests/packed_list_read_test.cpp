@@ -66,7 +66,17 @@ TEST(PackedListPageTest, ProjectsEveryIntervalWithoutBorrowingTheSource) {
   EXPECT_EQ(selected->blocks_[0].size(), 3);
 }
 
-TEST(PackedListPageTest, V1ValidatesSkippedEntriesAndEnvelope) {
+class ListPageCorruptionTest : public testing::TestWithParam<bool> {
+ protected:
+  absl::Status Decode(std::string_view bytes, std::size_t first,
+                      std::size_t count) {
+    return GetParam()
+               ? DecodePackedOrderedListRange(bytes, first, count).status()
+               : DecodeOrderedListRange(bytes, first, count).status();
+  }
+};
+
+TEST_P(ListPageCorruptionTest, V1ValidatesSkippedEntriesAndEnvelope) {
   auto page = ListPage({"item-0", "item-1", "item-2"});
   auto encoded = test::EncodeOrderedGroupV1(page);
   ASSERT_TRUE(encoded.ok());
@@ -74,35 +84,38 @@ TEST(PackedListPageTest, V1ValidatesSkippedEntriesAndEnvelope) {
     const auto offset = kOrderedGroupHeaderBytes + index * (12 + 6);
     auto bad = *encoded;
     bad[offset + 11] = '\x80';  // Even skipped -0 scores are invalid.
-    EXPECT_TRUE(
-        absl::IsDataLoss(DecodePackedOrderedListRange(bad, 1, 1).status()));
+    EXPECT_TRUE(absl::IsDataLoss(Decode(bad, 1, 1)));
     bad = *encoded;
     for (int byte = 0; byte < 4; ++byte) bad[offset + byte] = '\xff';
-    EXPECT_TRUE(
-        absl::IsDataLoss(DecodePackedOrderedListRange(bad, 1, 1).status()));
+    EXPECT_TRUE(absl::IsDataLoss(Decode(bad, 1, 1)));
   }
   auto bad = *encoded;
-  bad[48] = 2;
-  EXPECT_TRUE(
-      absl::IsDataLoss(DecodePackedOrderedListRange(bad, 0, 1).status()));
+  bad[48] = 2;  // A smaller count cannot leave trailing entries.
+  EXPECT_TRUE(absl::IsDataLoss(Decode(bad, 0, 1)));
   bad = *encoded;
-  bad[56] = 1;
-  EXPECT_TRUE(
-      absl::IsDataLoss(DecodePackedOrderedListRange(bad, 0, 1).status()));
+  bad[56] = 1;  // Reserved envelope bytes remain checked.
+  EXPECT_TRUE(absl::IsDataLoss(Decode(bad, 0, 1)));
   for (std::size_t length = 0; length < encoded->size(); ++length)
-    EXPECT_FALSE(
-        DecodePackedOrderedListRange(encoded->substr(0, length), 0, 0).ok());
-  EXPECT_TRUE(absl::IsOutOfRange(
-      DecodePackedOrderedListRange(*encoded, 4, 0).status()));
-  EXPECT_TRUE(absl::IsOutOfRange(
-      DecodePackedOrderedListRange(*encoded, 1, SIZE_MAX).status()));
+    EXPECT_FALSE(Decode(encoded->substr(0, length), 0, 0).ok());
+  EXPECT_TRUE(absl::IsOutOfRange(Decode(*encoded, 4, 0)));
+  EXPECT_TRUE(absl::IsOutOfRange(Decode(*encoded, 1, SIZE_MAX)));
+  auto sorted = page;
+  sorted.kind_ = OrderedCollectionKind::kSortedSet;
+  auto sorted_bytes = test::EncodeOrderedGroupV1(sorted);
+  ASSERT_TRUE(sorted_bytes.ok());
+  EXPECT_TRUE(absl::IsDataLoss(Decode(*sorted_bytes, 0, 1)));
   page.entries_.clear();
   page.retired_ = true;
   auto retired = test::EncodeOrderedGroupV1(page);
   ASSERT_TRUE(retired.ok());
-  EXPECT_TRUE(
-      absl::IsDataLoss(DecodePackedOrderedListRange(*retired, 0, 0).status()));
+  EXPECT_TRUE(absl::IsDataLoss(Decode(*retired, 0, 0)));
 }
+
+INSTANTIATE_TEST_SUITE_P(OwnedAndPacked, ListPageCorruptionTest,
+                         testing::Bool(),
+                         [](const testing::TestParamInfo<bool>& info) {
+                           return info.param ? "Packed" : "Owned";
+                         });
 
 class PackedCompactListTest : public testing::Test {
  protected:
@@ -356,11 +369,29 @@ TEST_F(PackedCompactListTest,
                 op.count_ = count;
                 compare(op);
               }
-            op.kind_ = SortedSetOperationKind::kCount;
-            op.limit_ = false;
-            compare(op);
           }
     }
+  for (double low : {-infinity, -2.0, -0.0, 1.25, infinity})
+    for (double high : {-2.0, 0.0, 1.25, infinity})
+      for (bool exclusive : {false, true})
+        compare(SortedSetOperation{.kind_ = SortedSetOperationKind::kCount,
+                                   .range_mode_ = SortedSetRangeMode::kScore,
+                                   .minimum_score_ = {low, exclusive},
+                                   .maximum_score_ = {high, !exclusive}});
+  // One boundary pair is enough to check that reply flags do not affect count.
+  for (const auto* bytes : {&*legacy, &*indexed}) {
+    auto count = ReadCompactSortedSet(
+        CompactView(*bytes, entries.size()),
+        SortedSetOperation{.kind_ = SortedSetOperationKind::kCount,
+                           .range_mode_ = SortedSetRangeMode::kScore,
+                           .reverse_ = true,
+                           .minimum_score_ = {0, false},
+                           .maximum_score_ = {1.25, false},
+                           .packed_output_ = true});
+    ASSERT_TRUE(count.ok());
+    EXPECT_EQ(count->count_, 4);
+    EXPECT_EQ(count->member_count(), 0);
+  }
 }
 
 TEST_F(PackedCompactListTest, IndexedSortedSetReplyOwnsOneSelectedBlock) {

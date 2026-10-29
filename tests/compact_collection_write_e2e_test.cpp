@@ -391,10 +391,18 @@ TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
-TEST(CompactPointWriteE2e,
-     RestoredListsAndSortedSetsSurviveSplicesRebuildAndRecovery) {
+TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2SurviveEditsAndRecover) {
   PrivateDisk disk;
   const std::string binary("b\0x", 3);
+  const std::vector<std::vector<std::string>> writes{
+      {"LPUSH", "upgrade-lpush", "head"},
+      {"RPUSH", "upgrade-rpush", "tail"},
+      {"LPOP", "upgrade-lpop"},
+      {"RPOP", "upgrade-rpop"},
+      {"ZADD", "upgrade-zadd", "3", "new"},
+      {"ZREM", "upgrade-zrem", "a"},
+      {"ZINCRBY", "upgrade-zincrby", "32768", "a"}};
+  std::map<std::string, std::string> expected_dumps;
   auto verify = [&](Client& client) {
     const auto list = client.Command({"LRANGE", "old-list", "0", "-1"});
     const std::vector<std::string> expected{binary, "updated", "tail", "more"};
@@ -433,15 +441,14 @@ TEST(CompactPointWriteE2e,
                             "+inf", "tail"})
                   .text_,
               "4");
-    for (const auto key : {"list", "zset"}) {
-      const auto dump = client.Command({"DUMP", key});
-      ASSERT_EQ(dump.kind_, '$');
-      ASSERT_EQ(
-          client
-              .Command({"RESTORE", std::string("old-") + key, "0", dump.text_})
-              .text_,
-          "OK");
-    }
+    const auto list = client.Command({"DUMP", "list"});
+    const auto zset = client.Command({"DUMP", "zset"});
+    ASSERT_EQ(list.kind_, '$');
+    ASSERT_EQ(zset.kind_, '$');
+    ASSERT_EQ(client.Command({"RESTORE", "old-list", "0", list.text_}).text_,
+              "OK");
+    ASSERT_EQ(client.Command({"RESTORE", "old-zset", "0", zset.text_}).text_,
+              "OK");
     // RESTORE writes the current physical format. Point/general edits,
     // logical RDB export and recovery must all accept that same value.
     ASSERT_EQ(client.Command({"RPUSH", "old-list", "more"}).text_, "5");
@@ -451,36 +458,6 @@ TEST(CompactPointWriteE2e,
     ASSERT_EQ(client.Command({"ZADD", "old-zset", "3", "m3", "4", "m4"}).text_,
               "2");
     verify(client);
-    client.Durable();
-    ASSERT_EQ(server.Wait(true), 0) << server.Log();
-  }
-  Server recovered(disk, 3);
-  Client client(recovered.port());
-  verify(client);
-}
-
-TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2AndRecover) {
-  PrivateDisk disk;
-  const std::vector<std::vector<std::string>> writes{
-      {"LPUSH", "upgrade-lpush", "head"},
-      {"RPUSH", "upgrade-rpush", "tail"},
-      {"LPOP", "upgrade-lpop"},
-      {"RPOP", "upgrade-rpop"},
-      {"ZADD", "upgrade-zadd", "3", "new"},
-      {"ZREM", "upgrade-zrem", "a"},
-      {"ZINCRBY", "upgrade-zincrby", "32768", "a"}};
-  std::map<std::string, std::string> expected_dumps;
-  {
-    Server server(disk, 2);
-    Client client(server.port());
-    ASSERT_EQ(client.Command({"RPUSH", "list", "", "a", "b"}).text_, "3");
-    ASSERT_EQ(
-        client.Command({"ZADD", "zset", "-inf", "", "0", "a", "1", "b"}).text_,
-        "3");
-    const auto list = client.Command({"DUMP", "list"});
-    const auto zset = client.Command({"DUMP", "zset"});
-    ASSERT_EQ(list.kind_, '$');
-    ASSERT_EQ(zset.kind_, '$');
     for (const auto& command : writes) {
       const bool sorted = command.front().front() == 'Z';
       ASSERT_EQ(client
@@ -502,7 +479,8 @@ TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2AndRecover) {
     ASSERT_EQ(client.Command({"RESTORE", "unchanged", "0", zset.text_}).text_,
               "OK");
     ASSERT_EQ(client.Command({"ZADD", "unchanged", "NX", "2", "a"}).text_, "0");
-    ASSERT_EQ(client.Command({"ZSCORE", "unchanged", "a"}).text_, "0");
+    ASSERT_EQ(client.Command({"ZSCORE", "unchanged", "a"}).text_, "1");
+    expected_dumps.emplace("unchanged", zset.text_);
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -531,9 +509,11 @@ TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2AndRecover) {
   EXPECT_EQ(latest.at("restored-list").second, "LVL2");
   Server recovered(disk, 3);
   Client client(recovered.port());
+  verify(client);
   for (const auto& [key, dump] : expected_dumps)
     EXPECT_EQ(client.Command({"DUMP", key}).text_, dump) << key;
-  EXPECT_EQ(client.Command({"ZSCORE", "unchanged", "a"}).text_, "0");
+  EXPECT_EQ(client.Command({"ZSCORE", "unchanged", "a"}).text_, "1");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
 TEST(CompactPointWriteE2e, FailedInlineEncodingKeepsValueAndWatch) {
