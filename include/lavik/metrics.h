@@ -30,6 +30,8 @@
 
 namespace lavik {
 
+class ReplicationManager;
+
 namespace storage {
 class StorageEngine;
 }
@@ -159,9 +161,12 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
 bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
 
+// Collects owner-worker snapshots into Prometheus text. Before readiness only
+// lavik_server_ready is emitted. The optional native observer is borrowed for
+// the duration of this coroutine; no replication decisions depend on a scrape.
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
-    std::string* output);
+    std::string* output, const ReplicationManager* replication = nullptr);
 
 }  // namespace lavik
 
@@ -171,8 +176,11 @@ class Service;
 
 namespace lavik {
 
+// The storage and optional replication manager must outlive the service and
+// its in-flight requests. The HTTP listener runs on data workers.
 std::unique_ptr<bycorf::Service> CreateMetricsService(
     std::uint16_t port, const storage::StorageEngine* storage,
-    std::function<bool()> server_ready);
+    std::function<bool()> server_ready,
+    const ReplicationManager* replication = nullptr);
 
 }  // namespace lavik

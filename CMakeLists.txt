@@ -1909,6 +1909,13 @@ endforeach()
       set_tests_properties(lavik_native_replicaof_e2e
         PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
     endif()
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+      add_test(NAME lavik_replication_observability_e2e
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/replication_observability_e2e.py
+                $<TARGET_FILE:lavik>)
+      set_tests_properties(lavik_replication_observability_e2e
+        PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)
       set(LAVIK_FOLLOWER_META_ARGS
         $<TARGET_FILE:lavik-meta> $<TARGET_FILE:lavik-ctl>)

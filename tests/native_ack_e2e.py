@@ -29,7 +29,8 @@ import sys
 import tempfile
 import uuid
 
-from redis_follower_smoke import process, F
+from redis_follower_smoke import process, F, H
+from replication_observability_e2e import scrape, values, wait
 
 
 def crc32c(payload):
@@ -139,6 +140,7 @@ def publish(client, flow_reader, count=16):
 def main():
     cases = (
         "valid",
+        "lost",
         "reversed",
         "wrong-start",
         "unsent",
@@ -153,13 +155,63 @@ def main():
         for case in cases:
             # Independent sources keep a rejected ACK from affecting another
             # case's source history, session or reconnect-retention lease.
-            with process(sys.argv[1], Path(directory) / case, case, workers=1) as (
+            metrics_port = H.free_port()
+            with process(
+                sys.argv[1],
+                Path(directory) / case,
+                case,
+                workers=1,
+                metrics_port=metrics_port,
+            ) as (
                 client,
                 port,
                 _,
             ):
                 with online_peer(port) as (flow, reader):
                     lsns = publish(client, reader, 128 if case == "valid" else 16)
+                    if case == "lost":
+                        wait(
+                            "missing ACK must have pending work",
+                            lambda: values(
+                                scrape(metrics_port),
+                                "lavik_replication_pending_events",
+                                side="source",
+                            )
+                            == [16],
+                        )
+                        wait(
+                            "missing ACK age must grow",
+                            lambda: max(
+                                values(
+                                    scrape(metrics_port),
+                                    "lavik_replication_no_progress_seconds",
+                                    step="ack",
+                                ),
+                                default=0,
+                            )
+                            >= 2,
+                        )
+                        assert not any(
+                            values(
+                                scrape(metrics_port),
+                                "lavik_replication_pending_work",
+                                step="send",
+                            )
+                        )
+                        flow.sendall(frame(9, struct.pack("<QQ", lsns[0], lsns[-1])))
+                        assert client.call("WAIT", 1, 2000) == 1
+                        wait(
+                            "ACK recovery clears age",
+                            lambda: not any(
+                                values(
+                                    scrape(metrics_port),
+                                    "lavik_replication_no_progress_seconds",
+                                    step="ack",
+                                )
+                            ),
+                        )
+                        print("PASS: lost ACK progress and recovery", flush=True)
+                        continue
                     first, last = lsns[0], lsns[-1]
                     if case == "reversed":
                         first, last = last, first

@@ -354,7 +354,14 @@ def full_session_lifecycle(root):
                 in writer.call("INFO", "replication"),
             )
             if not cancel:
-                assert ",state=online," in writer.call("INFO", "replication")
+                # Completing population allows Meta to replace POPULATION with
+                # Follow Owner. FULL ownership can be zero during that ingress
+                # reconnect; wait for the current connection before asserting.
+                H.wait_until(
+                    "current Follow connection online",
+                    30,
+                    lambda: ",state=online," in writer.call("INFO", "replication"),
+                )
                 reader = Client(target, readonly=True)
                 try:
                     assert reader.call("GET", "{native}seed") == "baseline"
@@ -658,7 +665,7 @@ def explicit_full_limit(root):
                 "explicit loser retries busy beyond lease retry budget",
                 15,
                 lambda: any(
-                    Path(n.log_path).read_text().count("native FULL admission is busy")
+                    n.metric("lavik_replication_retries_total", '{reason="full_busy"}')
                     >= 4
                     for n in (first, second)
                 ),
@@ -666,7 +673,15 @@ def explicit_full_limit(root):
             waiting = next(
                 n
                 for n in (first, second)
-                if "native FULL admission is busy" in Path(n.log_path).read_text()
+                if n.metric("lavik_replication_retries_total", '{reason="full_busy"}')
+                > 0
+            )
+            assert (
+                waiting.metric(
+                    "lavik_replication_fullsync_results_total",
+                    '{side="target",result="failure"}',
+                )
+                == 0
             )
             assert (
                 "durably invalidated system state"
@@ -1110,6 +1125,9 @@ def replay_and_reconnect(root):
                     info.get("master_link_status") == "up"
                     and info.get("lavik_source_workers") == "2"
                     and info.get("lavik_connected_flows") == "2"
+                    and info.get("lavik_replication_observation_available") == "1"
+                    and info.get("lavik_replication_population_ready") == "1"
+                    and info.get("lavik_replication_progress_flows") == "2"
                     and probe.call("GET", "{native}seed") == "baseline"
                 )
             finally:
@@ -1494,6 +1512,17 @@ def population_finalization_failure(root):
         try:
             require_incomplete_population(reader)
             replication = reader.call("INFO", "replication")
+            H.wait_until(
+                "FULL failure observation",
+                10,
+                lambda: "lavik_replication_last_full_result:failure\r\n"
+                in reader.call("INFO", "replication"),
+            )
+            replication = reader.call("INFO", "replication")
+            assert "lavik_replication_population_ready:0\r\n" in replication
+            assert "lavik_replication_catalog_ready:1\r\n" in replication
+            assert "lavik_replication_last_full_phase:promote\r\n" in replication
+            assert "lavik_replication_last_full_reason:storage\r\n" in replication
             assert "lavik_replication_failed_stopped:1\r\n" in replication
             assert "lavik_replication_state:online\r\n" not in replication
             stats = reader.call("INFO", "stats")

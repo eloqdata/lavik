@@ -71,6 +71,7 @@ def process(
     password=None,
     workers=2,
     max_memory="1G",
+    metrics_port=0,
 ):
     port = port or H.free_port()
     directory.mkdir(exist_ok=True)
@@ -110,7 +111,7 @@ def process(
             str(workers),
             "--no-pin-workers",
             "--metrics-port",
-            "0",
+            str(metrics_port),
             "--recv-buffers-per-worker",
             "0",
             "--max-memory",

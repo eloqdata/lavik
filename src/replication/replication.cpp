@@ -5334,6 +5334,7 @@ auto ReplicationManager::ReplicationGroup::QuiesceForShutdown()
         0, [this]() { return QuiesceForShutdown(); });
   }
   RequestShutdown();
+  progress_monitor_timer_.Cancel();
   absl::Status result = absl::OkStatus();
   if (meta_managed_) {
     // The Meta transition additionally retires its Ready proof. It is
@@ -5383,7 +5384,8 @@ auto ReplicationManager::ReplicationGroup::QuiesceForShutdown()
   // The stop bit makes each completion path abstain from retrying or
   // publishing a source; join those coordinator roots too.
   for (;;) {
-    bool running = coordinator_started_ || redis_topology_monitor_started_;
+    bool running = coordinator_started_ || redis_topology_monitor_started_ ||
+                   progress_monitor_started_;
     for (const auto& source : redis_sources_) {
       running = running || source->coordinator_started_;
     }
@@ -5400,6 +5402,7 @@ auto ReplicationManager::ReplicationGroup::QuiesceForShutdown()
   // shutdown path performs its final freeze.
   absl::Status source_retired = co_await RetireSourceHistory();
   if (result.ok() && !source_retired.ok()) result = source_retired;
+  (void)co_await ObserveProgress(true);
   co_return result;
 }
 
@@ -5712,7 +5715,11 @@ auto ReplicationManager::ReplicationGroup::
                          "source authorization fault barrier");
   if (!revocation_signalled.ok()) co_return revocation_signalled;
 #endif
-  for (const auto& session : sessions) session->Cancel();
+  for (const auto& session : sessions) {
+    session->observation_.expected_cancel_.store(true,
+                                                 std::memory_order_release);
+    session->Cancel();
+  }
   auto next_warning =
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (active_unpublished_master_controls_.load(std::memory_order_acquire) !=
@@ -6390,7 +6397,9 @@ auto ReplicationManager::ReplicationGroup::ServeNativeConnection(
         co_await ServeOwnedNativeConnection(stream, std::move(args), client_id);
     UnregisterClientConnection(client_id);
     if (!status.ok()) {
-      spdlog::warn("replication native handshake failed: {}", status.message());
+      if (!IsFullAdmissionBusy(status) && !IsLeaseAdmissionSuspended(status))
+        spdlog::warn("replication native handshake failed: {}",
+                     status.message());
       // A target may observe new membership before this Owner's control
       // update arrives. End a rejected handshake immediately so its native
       // coordinator can retry against the converged relationship. The outer
@@ -6501,6 +6510,8 @@ auto ReplicationManager::ReplicationGroup::SetDesiredUpstream(
   AssertStateOwner();
   if (upstream_ == upstream) return;
   upstream_ = std::move(upstream);
+  last_retry_reason_ = ReplicationFailure::kNone;
+  loading_progress_clock_ = {};
   PublishUpstreamSnapshot();
   if (cluster_source_pause_ != nullptr) PublishHeartbeatObservation();
 }
@@ -6811,7 +6822,10 @@ auto ReplicationManager::ReplicationGroup::WaitUntilStorageReady()
         *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
     if (!slept.ok()) co_return slept;
   }
-  if (!replication_shutdown_requested_) StartCoordinator();
+  if (!replication_shutdown_requested_) {
+    StartProgressMonitor();
+    StartCoordinator();
+  }
   co_return absl::OkStatus();
 }
 
@@ -6939,10 +6953,16 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
         session->cluster_follow_ = cluster_follow_owner_;
       }
       active_replica_session_ = session;
+      observation_targets_.push_back(session);
     }
     StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
     absl::Status connected =
         co_await RunReplicaSession(upstream, role_epoch, session);
+    session->observation_.control_failure_ = connected;
+    session->observation_.expected_cancel_ =
+        replication_shutdown_requested_ || replica_reconfiguration_running_ ||
+        role_epoch_.load(std::memory_order_relaxed) != role_epoch;
+    session->observation_.control_done_ = true;
     {
       AssertStateOwner();
       if (active_replica_session_ != session) {
@@ -7029,6 +7049,10 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
         session->session_id_ != 0) {
       absl::Status discarded =
           co_await storage_->AbortReplicaRoot(session->session_id_);
+      if (!discarded.ok())
+        spdlog::error("native FULL cleanup session={} history={} error={}",
+                      session->session_id_, session->source_history_id_,
+                      discarded.message());
       if (!discarded.ok() && !fail_stop.has_value()) {
         fail_stop = absl::StrCat("replica abort outcome is uncertain: ",
                                  discarded.message());
@@ -7115,8 +7139,23 @@ auto ReplicationManager::ReplicationGroup::Coordinator() -> Task<absl::Status> {
     }
     if (!retry) continue;
     StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
-    spdlog::warn("replication connection to {}:{} ended: {}", upstream.host_,
-                 upstream.port_, connected.message());
+    last_retry_reason_ = IsFullAdmissionBusy(connected)
+                             ? ReplicationFailure::kFullBusy
+                         : IsLeaseAdmissionSuspended(connected)
+                             ? ReplicationFailure::kAuthority
+                             : detail::ClassifyReplicationFailure(connected);
+    ++observation_totals_
+          .retries_[static_cast<std::size_t>(last_retry_reason_)];
+    const auto retry_now = SteadyNanos();
+    const auto retry_index = static_cast<std::size_t>(last_retry_reason_);
+    ++suppressed_retry_logs_[retry_index];
+    if (retry_now >= next_retry_log_nanos_[retry_index]) {
+      spdlog::warn("native replication retry reason={} attempts={} detail={}",
+                   ReplicationFailureName(last_retry_reason_),
+                   suppressed_retry_logs_[retry_index], connected.message());
+      suppressed_retry_logs_[retry_index] = 0;
+      next_retry_log_nanos_[retry_index] = retry_now + 30'000'000'000ULL;
+    }
     // The pre-mutation FULL path has a three-retry budget; preserve its
     // lease-renewal window while ordinary following reconnects promptly.
     const auto delay =
@@ -7638,6 +7677,18 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
   // Cleanup must know the admitted session even if durable invalidation
   // suspends and a role change cancels the handshake before flow creation.
   session->session_id_ = session_id;
+  last_retry_reason_ = ReplicationFailure::kNone;
+  session->source_history_id_ = std::string(words[5]);
+  session->observation_.peer_id_ = std::string(words[2]);
+  session->observation_.flows_ =
+      std::make_shared<std::vector<detail::NativeFlowObservation>>(
+          source_workers);
+  for (unsigned flow = 0; flow < source_workers; ++flow) {
+    auto& observation = (*session->observation_.flows_)[flow];
+    observation.session_id_ = session_id;
+    observation.history_id_ = session->source_history_id_;
+    observation.flow_id_ = flow;
+  }
   if (!local_population_matches_response) {
     // The control coroutine can suspend while draining physical maintenance
     // and persisting the FULL fence before any data flow exists. Include
@@ -7649,10 +7700,17 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
     // reconnect. Persist the destructive fence first, so a disconnect
     // before the first flow cannot turn an empty/old population into a
     // same-context CONTINUE proof.
+    session->observation_.BeginFull(SteadyNanos(), ReplicationSide::kTarget,
+                                    session->session_id_,
+                                    session->source_history_id_);
+    (*session->observation_.flows_)[0].Phase(FullSyncPhase::kReset,
+                                             SteadyNanos());
     session->destructive_root_started_.store(true, std::memory_order_release);
     absl::Status invalidated =
         co_await storage_->BeginReplicaFullSync(session_id);
     if (!invalidated.ok()) {
+      (*session->observation_.flows_)[0].Fail(invalidated,
+                                              ReplicationFailure::kStorage);
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
       co_return invalidated;
@@ -7713,7 +7771,6 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
           co_return absl::CancelledError("native history install superseded");
       }
       session->retained_histories_ = retained_histories_;
-      session->source_history_id_ = std::string(words[5]);
     }
     applied_frontier_ = next_frontier;
     session->applied_frontier_ = std::move(next_frontier);
@@ -7808,6 +7865,10 @@ auto ReplicationManager::ReplicationGroup::RunReplicaSession(
         std::move(*cut)};
   }
   StoreRole(ReplicationRole::kOnline, std::memory_order_release);
+  if (session->observation_.full_started_.load(std::memory_order_acquire) != 0)
+    session->observation_.full_succeeded_.store(SteadyNanos(),
+                                                std::memory_order_release);
+  last_retry_reason_ = ReplicationFailure::kNone;
   spdlog::info(
       "replication session {} online with {}:{} using 1+{} connections",
       session_id, upstream.host_, upstream.port_, source_workers);
@@ -7980,6 +8041,11 @@ auto ReplicationManager::ReplicationGroup::PrepareReplicaFlowMode(
   // flows wait. BeginReplicaFullSync separately drains physical maintenance
   // before the durable invalidation that admits destructive replica apply.
   if (flow_id == 0) {
+    // Mode agreement and admission establish the attempt before preparation
+    // can suspend; a rejected continuation above is only a control retry.
+    session->observation_.BeginFull(SteadyNanos(), ReplicationSide::kTarget,
+                                    session->session_id_,
+                                    session->source_history_id_);
     absl::Status prepared = session->PrepareFullSyncCursors();
     while (prepared.ok() && !CloseAllCommandDbGates()) {
       if (session->cancelled()) {
@@ -8023,6 +8089,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
     ReplicaOfConfig upstream, std::shared_ptr<ReplicaSession> session,
     unsigned flow_id) -> Task<absl::Status> {
   ReplicaFlowActivityGuard activity(&session->active_flows_);
+  auto& observation = (*session->observation_.flows_)[flow_id];
   const auto cursor = session->RequestedCursor(flow_id);
   spdlog::info("replication target session {} flow {} requesting cursor={}:{}",
                session->session_id_, flow_id, cursor.lsn_,
@@ -8040,6 +8107,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
   auto connected = co_await ConnectTcp(upstream.host_, upstream.port_,
                                        tls_context_, &session->sockets_, true);
   if (!connected.ok()) {
+    observation.Fail(connected.status());
     session->Cancel();
     co_return connected.status();
   }
@@ -8051,6 +8119,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
         co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
   }
   if (!configured.ok()) {
+    observation.Fail(configured);
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
@@ -8059,6 +8128,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
   const std::string encoded_flow = EncodeRespCommand(flow_args);
   absl::Status sent = co_await WriteText(stream, encoded_flow);
   if (!sent.ok()) {
+    observation.Fail(sent);
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
@@ -8081,20 +8151,31 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
-    co_return response.ok()
-        ? absl::InvalidArgumentError("invalid LVFLOW response")
-        : response.status();
+    const auto failure =
+        response.ok() ? absl::InvalidArgumentError("invalid LVFLOW response")
+                      : response.status();
+    observation.Fail(failure);
+    co_return failure;
   }
   absl::Status selected = session->SelectFlowMode(flow_id, fullsync);
   if (!selected.ok()) {
+    observation.Fail(selected);
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
     co_return selected;
   }
+  observation.connected_ = true;
+  struct ObservationConnectionGuard {
+    detail::NativeFlowObservation& observation_;
+    ~ObservationConnectionGuard() { observation_.connected_ = false; }
+  } observation_connection{observation};
+  observation.Phase(fullsync ? FullSyncPhase::kReset : FullSyncPhase::kActivate,
+                    SteadyNanos());
   absl::Status mode_ready =
       co_await PrepareReplicaFlowMode(session, flow_id, fullsync);
   if (!mode_ready.ok()) {
+    observation.Fail(mode_ready);
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     session->Cancel();
@@ -8104,10 +8185,14 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
     // Every flow performs this idempotent call before reading its first data
     // frame. The single system-state writer makes all of them wait for the
     // same durable invalidation, so no partition reset can outrun it.
+    session->observation_.BeginFull(SteadyNanos(), ReplicationSide::kTarget,
+                                    session->session_id_,
+                                    session->source_history_id_);
     session->destructive_root_started_.store(true, std::memory_order_release);
     absl::Status invalidated =
         co_await storage_->BeginReplicaFullSync(session->session_id_);
     if (!invalidated.ok()) {
+      observation.Fail(invalidated, ReplicationFailure::kStorage);
       session->sockets_.Remove(fd);
       stream.Close().IgnoreError();
       session->Cancel();
@@ -8125,6 +8210,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlow(
     spdlog::warn("replication target flow {} ended: {}", flow_id,
                  data_status.message());
   }
+  observation.Fail(data_status);
+  observation.connected_ = false;
   session->connected_flows_.fetch_sub(1, std::memory_order_acq_rel);
   session->sockets_.Remove(fd);
   stream.Close().IgnoreError();
@@ -8650,6 +8737,7 @@ auto ReplicationManager::ReplicationGroup::AckReplicaOnlineCommands(
     if (!appended.ok()) co_return appended;
     absl::Status acknowledged = co_await WriteText(stream, frames);
     if (!acknowledged.ok()) co_return acknowledged;
+    (*session->observation_.flows_)[flow_id].ack_sent_ = last_lsn + 1;
   }
 }
 
@@ -8724,6 +8812,8 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
       receiver_status = frame.status();
       break;
     }
+    (*session->observation_.flows_)[flow_id].bytes_ +=
+        frame->second.size() + kDataFrameHeaderBytes;
     if (frame->first != DataFrameKind::kCommand) {
       receiver_status = absl::InvalidArgumentError(
           "replication command frame expected after ONLINE handoff");
@@ -8809,6 +8899,9 @@ auto ReplicationManager::ReplicationGroup::RunReplicaOnlineFlowData(
             ? TryReserveCanonical(session->canonical_receive_bytes_,
                                   staged_command.capacity())
             : nullptr;
+    auto& observation = (*session->observation_.flows_)[flow_id];
+    observation.received_ = lsn + 1;
+    ++observation.events_;
     state->commands_.push_back(ReplicaOnlineCommand{
         .lsn_ = lsn,
         .command_ = std::move(*command),
@@ -8967,10 +9060,12 @@ auto ReplicationManager::ReplicationGroup::TrackReplicaHandoff(
         co_await SendReplicaFullSyncAck(stream, state, partition, sequence);
   }
   if (!result.ok()) {
+    state->observation_->Fail(result);
     if (state->status_.ok()) state->status_ = result;
     session->Cancel();
   } else {
     ++state->completed_;
+    ++state->observation_->partitions_;
     LAVIK_FAULT_INJECT(
         if (std::getenv(
                 "LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK") !=
@@ -8989,6 +9084,7 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlowData(
     TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
     unsigned flow_id) -> Task<absl::Status> {
   auto state = std::make_shared<ReplicaHandoffState>();
+  state->observation_ = &(*session->observation_.flows_)[flow_id];
   absl::Status result =
       co_await ReceiveReplicaFlowData(stream, session, flow_id, state);
   // Preserve the failure that initiated teardown. Joining outstanding handoffs
@@ -8997,6 +9093,10 @@ auto ReplicationManager::ReplicationGroup::RunReplicaFlowData(
   if (!result.ok() && state->status_.ok()) state->status_ = result;
   // No task may retain the stream or mutate this attempt after its owning
   // flow returns to the coordinator's abort/reparent cleanup.
+  state->observation_->Fail(result);
+  if (session->observation_.full_started_.load(std::memory_order_acquire) &&
+      !session->observation_.full_succeeded_.load(std::memory_order_acquire))
+    state->observation_->Phase(FullSyncPhase::kCleanup, SteadyNanos());
   state->stopping_ = true;
   if (!result.ok()) {
     session->Cancel();
@@ -9051,6 +9151,13 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
     if (!state->status_.ok()) co_return state->status_;
     absl::Status phase = session->ValidateDataFramePhase(flow_id, frame->first);
     if (!phase.ok()) co_return phase;
+    auto& observation = (*session->observation_.flows_)[flow_id];
+    if (frame->first != DataFrameKind::kCommand)
+      observation.bytes_ += frame->second.size() + kDataFrameHeaderBytes;
+    if (observation.phase_ != FullSyncPhase::kTransfer &&
+        (frame->first == DataFrameKind::kRecords ||
+         frame->first == DataFrameKind::kFullSyncCommand))
+      observation.Phase(FullSyncPhase::kTransfer, SteadyNanos());
     if (frame->first == DataFrameKind::kReset ||
         frame->first == DataFrameKind::kFullSyncCut ||
         frame->first == DataFrameKind::kCursor ||
@@ -9260,6 +9367,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
         }
         if (!applied.ok()) co_return applied;
         if (!ended.ok()) co_return ended;
+        ++observation.full_items_;
         staged_command_lsn = 0;
         next_command_fragment = 0;
         staged_command.clear();
@@ -9287,6 +9395,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           session->promotion_complete_ == nullptr) {
         co_return absl::InvalidArgumentError("malformed full-sync cut frame");
       }
+      observation.Phase(FullSyncPhase::kCut, SteadyNanos());
       absl::Status recorded =
           session->RecordFullSyncCut(flow_id, stable_next_lsn);
       if (!recorded.ok()) co_return recorded;
@@ -9330,6 +9439,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
             co_return waited;
           }
         }
+        observation.Phase(FullSyncPhase::kPromote, SteadyNanos());
         absl::Status promoted;
         if (ShouldInjectReplicaPromotionFailure()) {
           promoted = absl::InternalError("injected replica promotion failure");
@@ -9338,6 +9448,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
               co_await storage_->PromoteReplicaRoot(session->session_id_);
         }
         if (!promoted.ok()) {
+          observation.Fail(promoted, ReplicationFailure::kStorage);
           if (session->cluster_rebuild_ != nullptr) {
             (void)cluster_group_->FailStop(
                 session->cluster_rebuild_->directive_.identity_);
@@ -9364,6 +9475,8 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           session->promotion_complete_->Abort(promoted);
           co_return promoted;
         }
+        session->observation_.promotion_complete_.store(
+            true, std::memory_order_release);
         bool still_current = false;
         {
           AssertStateOwner();
@@ -9475,6 +9588,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           co_return replaced;
         }
         if (!finalized.ok()) {
+          observation.Fail(finalized, ReplicationFailure::kStorage);
           const std::string reason = absl::StrCat(
               "promoted population finalization failed: ", finalized.message());
           session->RequireFailStop(reason);
@@ -9509,6 +9623,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           session->cluster_rebuild_->completion_->Resolve(absl::OkStatus());
         }
       }
+      observation.Phase(FullSyncPhase::kActivate, SteadyNanos());
       absl::Status finalized = co_await session->promotion_complete_->Wait(
           *bycorf::ThisWorker().self_);
       if (!finalized.ok()) co_return finalized;
@@ -9540,8 +9655,13 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           session->AcceptBacklogCursor(flow_id, lsn, fragment);
       if (!accepted.ok()) co_return accepted;
       online_next_lsn = lsn;
+      observation.online_ = true;
+      observation.received_ = lsn;
+      observation.initial_lsn_ = lsn;
+      observation.Phase(FullSyncPhase::kOnline, SteadyNanos());
       absl::Status acknowledged = co_await send_ack(0, lsn);
       if (!acknowledged.ok()) co_return acknowledged;
+      observation.ack_sent_ = lsn;
     } else if (frame->first == DataFrameKind::kRecords) {
       DataReader sequence_reader(frame->second);
       std::uint64_t sequence = 0;
@@ -9564,6 +9684,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
           co_await WaitReplicaHandoffs(session, state, partition_id);
       if (!waited.ok()) co_return waited;
       const std::uint64_t epoch = found->second;
+      const auto record_count = records->second.size();
       const bool desired_partition =
           session->cluster_rebuild_ == nullptr ||
           session->cluster_rebuild_->manifest_
@@ -9578,6 +9699,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveReplicaFlowData(
             });
       }
       if (!applied.ok()) co_return applied;
+      observation.full_items_ += record_count;
       absl::Status acknowledged = co_await send_ack(records->first, sequence);
       if (!acknowledged.ok()) co_return acknowledged;
       ++expected_fullsync_sequence;
@@ -9945,6 +10067,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveFullSyncAcks(
       }
       state->expected_.erase(expected);
     }
+    if (*handoff) ++state->observation_->partitions_;
     session->TouchProgress(flow);
     state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
   }
@@ -9952,6 +10075,7 @@ auto ReplicationManager::ReplicationGroup::ReceiveFullSyncAcks(
   state->receiver_done_ = true;
   state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
   if (!result.ok()) {
+    state->observation_->Fail(result);
     // The sender may be waiting at a cross-flow cut barrier rather than
     // awaiting this ACK. Abort the whole session to wake both kinds of wait.
     session->Cancel();
@@ -9983,6 +10107,7 @@ auto ReplicationManager::ReplicationGroup::SendFullSyncRequest(
   PutString(payload, body);
   absl::Status sent = co_await WriteDataFrame(stream, kind, payload);
   if (!sent.ok()) co_return sent;
+  state->observation_->bytes_ += payload.size() + kDataFrameHeaderBytes;
   co_return co_await WaitFullSyncRequest(state, sequence);
 }
 
@@ -9991,9 +10116,14 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowData(
     unsigned flow_id) -> Task<absl::Status> {
   auto state =
       std::make_shared<FullSyncAckState>(flow_id, storage_->worker_count());
+  state->observation_ = &(*session->observation_.flows_)[flow_id];
   bycorf::ThisWorker().self_->Spawn(
       ReceiveFullSyncAcks(stream, session, flow_id, state));
   auto cursor = co_await RunMasterFullSync(stream, session, flow_id, state);
+  if (!cursor.ok()) {
+    state->observation_->Fail(cursor.status());
+    state->observation_->Phase(FullSyncPhase::kCleanup, SteadyNanos());
+  }
   // The reader must relinquish the socket before ONLINE starts reading its
   // own ACKs. On failure, unblock any outstanding read before joining it.
   state->stopping_ = true;
@@ -10070,6 +10200,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
           stream, ack_state, DataFrameKind::kRecords, payload, partition_id,
           fullsync_sequence);
       if (!sent.ok()) co_return sent;
+      ack_state->observation_->full_items_ += batch.size();
       session->TouchProgress(flow_id);
       ++fullsync_sequence;
       co_return absl::OkStatus();
@@ -10360,6 +10491,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
         absl::Status sent = co_await stream.WriteAllV(wire_batch);
         if (!sent.ok()) co_return sent;
+        for (const auto& iov : wire_batch)
+          ack_state->observation_->bytes_ += iov.iov_len;
+        ack_state->observation_->full_items_ += pending_acks.size();
         // Sending bytes is protocol progress even when the command's final
         // fragment (and therefore its ACK) is still minutes away.
         session->TouchProgress(flow_id);
@@ -10477,8 +10611,10 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
       absl::Status sent = co_await WriteDataFrame(
           stream, DataFrameKind::kFullSyncCommand, payload);
       if (!sent.ok()) co_return sent;
+      ack_state->observation_->bytes_ += payload.size() + kDataFrameHeaderBytes;
       session->TouchProgress(flow_id);
       if (last) {
+        ++ack_state->observation_->full_items_;
         co_return co_await WaitFullSyncRequest(ack_state, sequence);
       }
       ++fragment;
@@ -10582,6 +10718,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     absl::Status sent = co_await WriteDataFrame(
         stream, DataFrameKind::kPartitionHandoff, payload);
     if (!sent.ok()) co_return sent;
+    ack_state->observation_->bytes_ += payload.size() + kDataFrameHeaderBytes;
     session->TouchProgress(flow_id);
     LAVIK_FAULT_INJECT(
         if (const char* configured =
@@ -10965,6 +11102,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
     }
   } while (true);
 
+  ack_state->observation_->Phase(FullSyncPhase::kCut, SteadyNanos());
   absl::Status cut_ready = co_await session->WaitSnapshotReady();
   if (!cut_ready.ok()) {
     cleanup();
@@ -11149,6 +11287,8 @@ auto ReplicationManager::ReplicationGroup::EnterMasterFlowBacklog(
   absl::Status cursor_sent =
       co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload);
   if (!cursor_sent.ok()) co_return cursor_sent;
+  (*session->observation_.flows_)[flow_id].bytes_ +=
+      cursor_payload.size() + kDataFrameHeaderBytes;
   auto cursor_ack = co_await ReadDataFrame(stream);
   if (!cursor_ack.ok()) co_return cursor_ack.status();
   DataReader ack_reader(cursor_ack->second);
@@ -11395,6 +11535,9 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
       // A successful vectored write is the furthest the peer could possibly
       // have consumed even if its corresponding ACK is lost on disconnect.
       session->SetHighestSentNextLsn(flow_id, batch->next_.lsn_);
+      auto& observation = (*session->observation_.flows_)[flow_id];
+      for (const auto& iov : wire_batch) observation.bytes_ += iov.iov_len;
+      observation.events_ += pending_acks.size();
     }
     // Keep sending independently from the durable cursor. In particular,
     // never stop a source flow at an arbitrary batch boundary waiting for a
@@ -11449,7 +11592,8 @@ auto ReplicationManager::ReplicationGroup::RunAdoptedConnection(
                     : bycorf::CloseMode::kLocalError);
   }
   if (!status.ok()) {
-    spdlog::warn("replication native handshake failed: {}", status.message());
+    if (!IsFullAdmissionBusy(status) && !IsLeaseAdmissionSuspended(status))
+      spdlog::warn("replication native handshake failed: {}", status.message());
   }
   co_return status;
 }
@@ -11476,6 +11620,16 @@ auto ReplicationManager::ReplicationGroup::ServeOwnedNativeConnection(
     absl::Status result =
         co_await ServeMasterControl(stream, std::move(args), client_id);
     if (IsLeaseAdmissionSuspended(result)) {
+      ++source_authority_retries_;
+      const auto now = SteadyNanos();
+      if (now >= source_authority_next_log_nanos_) {
+        spdlog::info(
+            "native replication waiting side=source reason=authority "
+            "history={} attempts={}",
+            history_id_, source_authority_retries_);
+        source_authority_retries_ = 0;
+        source_authority_next_log_nanos_ = now + 30'000'000'000ULL;
+      }
       const std::string reply =
           absl::StrCat(kLeaseAdmissionSuspendedReply, "\r\n");
       const absl::Status sent = co_await WriteText(stream, reply);
@@ -11844,6 +11998,7 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
     // so it either rejects this handshake above or observes and cancels the
     // published session before any awaited setup can export data.
     master_sessions_[session_id] = session;
+    if (!protocol_probe) observation_sources_.push_back(session);
     control_guard.MarkPublished(session);
   }
   for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
@@ -11857,6 +12012,7 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
                                                             flow_capacity);
         });
     if (!enabled.ok()) {
+      session->observation_.control_failure_ = enabled;
       (void)co_await RemoveMasterSession(session);
       co_return enabled;
     }
@@ -11872,6 +12028,7 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
       session->flow_capability_, "\r\n");
   absl::Status sent = co_await WriteText(stream, resync_reply);
   if (!sent.ok()) {
+    session->observation_.control_failure_ = sent;
     (void)co_await RemoveMasterSession(session);
     co_return sent;
   }
@@ -11923,6 +12080,7 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
     absl::Status slept = co_await bycorf::SleepFor(
         *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
     if (!slept.ok()) {
+      session->observation_.control_failure_ = slept;
       (void)co_await RemoveMasterSession(session);
       co_return slept;
     }
@@ -11942,10 +12100,15 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
     }
   }
   if (session->cancelled() || !session->all_flows_ready()) {
-    (void)co_await RemoveMasterSession(session);
-    co_return absl::DeadlineExceededError(
+    const auto failure = absl::DeadlineExceededError(
         stalled ? "replica flow made no full-sync progress for 10 minutes"
                 : "replica flows did not complete full synchronization");
+    // Cleanup closes the control reader too. Preserve the initiating status
+    // before it can be replaced by that secondary disconnect.
+    if (session->observation_.control_failure_.ok())
+      session->observation_.control_failure_ = failure;
+    (void)co_await RemoveMasterSession(session);
+    co_return failure;
   }
   if (meta_managed_ && (session->steady_export_.has_value() ||
                         session->population_export_ != nullptr)) {
@@ -11974,10 +12137,14 @@ auto ReplicationManager::ReplicationGroup::ServeMasterControl(
   }
   sent = co_await WriteText(stream, "+LVONLINE\r\n");
   if (!sent.ok()) {
+    session->observation_.control_failure_ = sent;
     (void)co_await RemoveMasterSession(session);
     co_return sent;
   }
   session->MarkOnline();
+  if (session->observation_.full_started_.load(std::memory_order_acquire) != 0)
+    session->observation_.full_succeeded_.store(SteadyNanos(),
+                                                std::memory_order_release);
   {
     co_await master_mutex_.Lock(*bycorf::ThisWorker().self_);
     bycorf::CrossWorkerMutex::Guard lock(&master_mutex_);
@@ -12024,6 +12191,12 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
     co_return absl::FailedPreconditionError(
         "LVFLOW references an unavailable session");
   }
+  auto& observation = (*session->observation_.flows_)[flow_id];
+  observation.connected_ = true;
+  struct ObservationConnectionGuard {
+    detail::NativeFlowObservation& observation_;
+    ~ObservationConnectionGuard() { observation_.connected_ = false; }
+  } observation_connection{observation};
   const auto log_info = storage_->LocalReplicationLogInfo();
   const bool continue_mode =
       session->allow_continue_ &&
@@ -12122,6 +12295,8 @@ auto ReplicationManager::ReplicationGroup::ServeMasterFlow(
     }
   }
   storage_->ReleaseReplicationLogRetention(session->id_);
+  observation.Fail(waited);
+  observation.connected_ = false;
   session->MarkFailed(flow_id);
   session->ClearFlow(flow_id, stream.NativeFd());
   session->Cancel();
@@ -12138,13 +12313,24 @@ auto ReplicationManager::ReplicationGroup::AdmitMasterFullSessionLocked(
                   [](const auto& full) {
                     return full->population_export_ != nullptr;
                   })) {
-    spdlog::info("native FULL admission busy for group {} target {}",
-                 session->population_export_->directive_.identity_.group_id_,
-                 session->node_id_);
+    ++source_busy_retries_;
+    const auto now = SteadyNanos();
+    if (now >= source_busy_next_log_nanos_) {
+      spdlog::info(
+          "native FULL admission busy for group {} target {} attempts={}",
+          session->population_export_->directive_.identity_.group_id_,
+          session->node_id_, source_busy_retries_);
+      source_busy_retries_ = 0;
+      source_busy_next_log_nanos_ = now + 30'000'000'000ULL;
+    }
     return absl::ResourceExhaustedError(kFullAdmissionBusyStatus);
   }
   absl::Status admitted = session->AdmitFull();
-  if (admitted.ok()) full_sessions_.push_back(session);
+  if (admitted.ok()) {
+    session->observation_.BeginFull(SteadyNanos(), ReplicationSide::kSource,
+                                    session->id_, session->source_history_id_);
+    full_sessions_.push_back(session);
+  }
   return admitted;
 }
 
@@ -12157,6 +12343,8 @@ auto ReplicationManager::ReplicationGroup::WatchMasterControl(
     TcpStream& stream, std::shared_ptr<MasterSession> session)
     -> Task<absl::Status> {
   session->control_reader_status_ = co_await WaitForClose(stream);
+  if (session->observation_.control_failure_.ok())
+    session->observation_.control_failure_ = session->control_reader_status_;
   session->Cancel();
   session->control_reader_done_ = true;
   session->control_closed_.NotifyAll(*bycorf::ThisWorker().self_);
@@ -12212,7 +12400,11 @@ auto ReplicationManager::ReplicationGroup::DrainSourceEgress()
     history_bridge_.reset();
     continuation_proofs_.clear();
   }
-  for (const auto& session : sessions) session->Cancel();
+  for (const auto& session : sessions) {
+    session->observation_.expected_cancel_.store(true,
+                                                 std::memory_order_release);
+    session->Cancel();
+  }
   auto source_flows_active = [&] {
     return std::any_of(sessions.begin(), sessions.end(), [](const auto& item) {
       return item->connected_flows() != 0;

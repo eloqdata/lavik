@@ -35,6 +35,7 @@
 #include "bycorf/runtime/worker.h"
 #include "lavik/command_table.h"
 #include "lavik/memory.h"
+#include "lavik/replication.h"
 #include "lavik/storage/engine.h"
 
 namespace lavik {
@@ -435,7 +436,7 @@ std::string SecondsFromMicroseconds(std::uint64_t microseconds) {
 
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
-    std::string* output_ptr) {
+    std::string* output_ptr, const ReplicationManager* replication) {
   std::string& output = *output_ptr;
   output.clear();
   output.reserve(server_ready ? 32 * 1024 : 256);
@@ -448,6 +449,11 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       server_ready ? 1 : 0, "\n");
   if (!server_ready) {
     co_return absl::OkStatus();
+  }
+
+  if (replication != nullptr) {
+    const auto progress = co_await replication->ObserveProgress();
+    AppendReplicationProgressMetrics(progress, &output);
   }
 
   RefreshMemoryDiagnostics();
@@ -852,16 +858,16 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
 
 std::unique_ptr<bycorf::Service> CreateMetricsService(
     std::uint16_t port, const storage::StorageEngine* storage,
-    std::function<bool()> server_ready) {
+    std::function<bool()> server_ready, const ReplicationManager* replication) {
   auto service = std::make_unique<bycorf::HttpService>(port);
   service->RegisterGet(
       "/metrics",
-      [storage, server_ready = std::move(server_ready)](
+      [storage, replication, server_ready = std::move(server_ready)](
           const bycorf::HttpRequest&,
           bycorf::HttpResponse* response) -> bycorf::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
-        co_return co_await RenderPrometheusMetrics(*storage, server_ready(),
-                                                   &response->body_);
+        co_return co_await RenderPrometheusMetrics(
+            *storage, server_ready(), &response->body_, replication);
       });
   return service;
 }
