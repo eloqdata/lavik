@@ -127,3 +127,137 @@ metrics port so only monitoring hosts can connect. Grafana listens on all host
 interfaces by default; protect its host port with a firewall and a strong admin
 password. Set `GRAFANA_BIND_ADDRESS` to a specific private address when
 appropriate.
+
+## Alerts and target identity
+
+Prometheus loads the plain YAML files in `prometheus/rules/`. They are maintained
+defaults that operators can edit: expressions, thresholds, `for`, `keep_firing_for`,
+severity and annotations. [The alert runbook](../../docs/operations/alerts.md)
+explains every signal, threshold, recovery condition and coverage limitation.
+
+Set target metadata before deployment:
+
+```dotenv
+LAVIK_CLUSTER=orders
+LAVIK_MODE=meta-managed
+GRAFANA_PUBLIC_URL=https://grafana.example.com
+```
+
+`LAVIK_MODE` accepts `standalone` and `meta-managed`; managed Single and Cluster
+both use the latter. Legacy `LAVIK_TARGETS` defaults to standalone. Meta rules
+require the managed label; the zero-valued standalone Meta gauges are not faults.
+Admin supplies managed labels and the deployed Grafana URL automatically.
+
+For mixed clusters or modes, copy `prometheus/targets.example.json`, replace its
+addresses and set `LAVIK_TARGETS_FILE` to the host file path. Each target group
+must supply `cluster` and `lavik_mode` labels, and each endpoint must appear only
+once. `LAVIK_TARGETS` is ignored in this mode. Recreate `target-config` after an
+edit. Prometheus validates the discovery file; inspect Targets for any load error.
+
+`up` is scrape reachability, `lavik_server_ready` is storage startup/runtime
+health, and neither proves serving authority or complete FULL population
+readiness. Target Status displays missing readiness as UNKNOWN.
+
+The **Alerts** section sits immediately below the overview cards. Its compact
+title bar shows Critical/Warning firing counts and a Pending count as badges to
+the right of the heading, using the built-in Grafana Canvas panel. A
+sortable/filterable current-alert table and an **Alert Activity** state timeline
+follow below. The table includes
+scope (worker/device/signal), active duration, and links to the relevant runbook
+and metric panel. **Worker Memory** contains memory-admission rejections;
+**Replication Pressure** contains only replication queues and backlog pressure.
+Additional overview metrics remain available in their own collapsed row.
+
+Counts and the table evaluate at the selected time range's end; the timeline
+covers the whole range. They follow the instance filter, while `LavikNoTargets`
+remains visible without an instance. Empty results mean no active samples, not
+proof of health. See [dashboard semantics](../../docs/operations/alerts.md#dashboard)
+for duration, missing-data and notification-state details.
+
+## Choose notification delivery
+
+Default startup evaluates rules without contacting an Alertmanager or requiring
+notification credentials. Firing alerts remain visible in Prometheus and Grafana.
+It does **not** deliver production notifications until a receiver is configured.
+
+For a local Alertmanager, set this in `.env`:
+
+```dotenv
+COMPOSE_PROFILES=alertmanager
+ALERTMANAGER_TARGETS=alertmanager:9093
+```
+
+Then run `docker compose up -d`. Its web endpoint defaults to the monitoring
+host's loopback port 9093. Notification state and silences persist in the
+`alertmanager-data` volume. The supplied configuration deliberately has empty
+receivers. Copy `alertmanager/alertmanager.yml` to your own file, merge the
+receivers from `alertmanager/receivers.example.yml`, and point
+`ALERTMANAGER_CONFIG` at that file. Mount the referenced URL/credential files
+with a local Compose override; do not commit them or place them in labels.
+Templates in `alertmanager/templates/` can be used by text-capable integrations;
+generic webhooks receive Alertmanager's standard JSON with alert annotations.
+
+For an existing external Alertmanager, leave the local profile disabled and set
+`ALERTMANAGER_TARGETS` to its reachable endpoints, separated by commas. Recreate
+`target-config` after changing endpoints. Configure matching routes/inhibition in
+that external service. For HTTPS/authentication, edit the native Prometheus
+`alerting.alertmanagers` settings and mount credential files read-only. Simple
+endpoint discovery defaults to HTTP and never accepts credentials in addresses.
+
+The supplied routes distinguish warning and critical, group related alerts,
+inhibit dependent alerts while a target is down, and suppress warning only for
+the same critical condition and worker/device. Webhook examples send resolved
+notifications. A resolved event means a condition ended, not proof of health;
+check current telemetry. Use expiring Alertmanager silences for maintenance.
+
+## Validate and reload user changes
+
+Validate using the tools from the same pinned images as deployment:
+
+```sh
+docker compose run --rm --no-deps --entrypoint promtool prometheus \
+  check rules /etc/prometheus/rules/recording.yml /etc/prometheus/rules/alerts.yml
+docker compose run --rm --no-deps --entrypoint promtool prometheus \
+  check config /etc/prometheus/prometheus.yml
+docker compose run --rm --no-deps --entrypoint amtool alertmanager \
+  check-config /etc/alertmanager/alertmanager.yml
+```
+
+After successful validation, use `docker compose kill -s SIGHUP prometheus` to
+reload rules. Reload Alertmanager with `docker compose kill -s SIGHUP alertmanager`.
+Neither requires restarting or recompiling Lavik. If replacing a directly
+bind-mounted configuration file by atomic rename, first recreate the affected
+container so its mount points to the new inode. Inspect configuration reload
+success and rule evaluation errors in the service logs before relying on changes.
+
+Changes to `.env` require `docker compose up -d` and target changes also require
+`docker compose up -d --force-recreate target-config`. Keep your rule overrides
+and receiver files backed up outside release archives. On upgrade, compare and
+merge the shipped defaults with those files, validate, then reload. Admin retains
+its existing ownership and identical-config retry checks: it refuses to overwrite
+changed deployed assets. An existing Admin deployment requires an explicit
+operator-reviewed configuration update before retries with a newer asset set.
+Admin preserves custom notification/image settings in `.env` when updating targets.
+
+## Automated local notification drill
+
+From the repository root, install Python's `PyYAML` in your development environment,
+then install the pinned, checksum-verified Prometheus/Alertmanager tools:
+
+```sh
+scripts/install_monitoring_tools.sh /tmp/lavik-monitoring-tools
+python3 scripts/check_monitoring.py --tools /tmp/lavik-monitoring-tools
+python3 -m unittest discover -s tests -p test_monitoring_config.py
+python3 tests/monitoring/e2e.py --tools /tmp/lavik-monitoring-tools \
+  --output /tmp/lavik-monitoring-drill --lavik-bin ./build_debug/lavik
+```
+
+Use a new output directory for each drill. The script starts isolated loopback
+services and a recording HTTP receiver, drives real rule evaluation and validates
+firing, warning/critical routing, deduplication, inhibition and resolved delivery.
+It also pauses/resumes a temporary Lavik process to exercise actual scrape failure.
+Only test timing is shortened; production rule expressions are reused and their
+full timing is covered by promtool tests. It needs no production receiver secrets.
+Omitting `--lavik-bin` runs the controllable-exporter portion only, which is not the
+complete real-process acceptance test. Logs, notification JSON and a result file
+remain in the output directory for inspection; all started processes are stopped.

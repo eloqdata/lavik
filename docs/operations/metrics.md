@@ -44,6 +44,15 @@ timings, connection state, lease decisions, expirations, reconnects, and
 directive results. The metrics HTTP service runs on the data workers; the
 last runtime worker remains dedicated to Meta control tasks.
 
+## Alerting and readiness
+
+The [alert runbook](alerts.md) documents the maintained rule set and its limits.
+The deployment rules are ordinary user-editable Prometheus YAML. `up` is scrape
+reachability; `lavik_server_ready` means storage startup completed and no runtime
+storage failure is latched. It does not prove serving authority or FULL population
+readiness. Before readiness, the exporter deliberately emits only that gauge;
+other families must not be treated as missing failures during recovery.
+
 ## Memory limit
 
 `--max-memory` (also accepted as `--maxmemory`) sets the process memory limit

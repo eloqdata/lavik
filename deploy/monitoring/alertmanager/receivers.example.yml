@@ -1,0 +1,14 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+# Merge these receivers into a copy of alertmanager.yml, retaining its routes
+# and inhibition rules. Mount URL/credential files separately, outside the repo.
+# Generic webhooks carry Alertmanager's standard JSON body, including annotations.
+receivers:
+  - name: default
+  - name: warning
+    webhook_configs:
+      - url_file: /run/secrets/warning-webhook-url
+        send_resolved: true
+  - name: critical
+    webhook_configs:
+      - url_file: /run/secrets/critical-webhook-url
+        send_resolved: true

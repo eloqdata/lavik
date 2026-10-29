@@ -441,8 +441,8 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   output.reserve(server_ready ? 32 * 1024 : 256);
   absl::StrAppend(
       &output,
-      "# HELP lavik_server_ready Whether storage recovery is complete and "
-      "Redis requests are being accepted.\n"
+      "# HELP lavik_server_ready Whether storage startup completed without "
+      "a latched runtime storage failure; not serving authority.\n"
       "# TYPE lavik_server_ready gauge\n"
       "lavik_server_ready ",
       server_ready ? 1 : 0, "\n");

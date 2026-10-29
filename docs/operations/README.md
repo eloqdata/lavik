@@ -39,6 +39,7 @@ or safety boundaries.
 | [Prometheus metrics](metrics.md) | Integrating metrics, interpreting exported values, or changing monitoring behavior |
 | [Meta control plane](meta-control-plane.md) | Creating the first multi-Group cluster, running and diagnosing controlled failover, starting plaintext or mTLS Meta clusters, changing membership, replacing binaries, handling snapshot/WAL incidents, and exporting audit or operation archives |
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |
+| [Alert runbook](alerts.md) | Interpreting alerts, checking recovery and understanding coverage limits |
 | [Monitoring stack](../../deploy/monitoring/README.md) | Running the repository's Prometheus and Grafana deployment |
 | [Lavik Admin](lavik-admin.md) | Starting the bundled Admin, preparing SSH hosts, deploying releases, managing multiple clusters, resizing followers, and Docker verification |
 | [Lavik Admin 101 on Mac](lavik-admin-mac-101.md) | Start empty Docker SSH hosts, prepare passwordless access in Admin, choose Meta/primary/follower placement, and deploy from the browser |

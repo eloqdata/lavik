@@ -13,57 +13,25 @@
 # limitations under the License.
 
 name: lavik-monitoring
-
 services:
   target-config:
-    image: "${BUSYBOX_IMAGE:-busybox:1.37.0}"
+    image: ${BUSYBOX_IMAGE:-busybox:1.37.0}
     restart: "no"
     environment:
-      LAVIK_TARGETS: "${LAVIK_TARGETS:?Set LAVIK_TARGETS to host:9100}"
+      LAVIK_TARGETS: ${LAVIK_TARGETS:-}
+      LAVIK_MODE: ${LAVIK_MODE:-standalone}
+      LAVIK_CLUSTER: ${LAVIK_CLUSTER:-default}
+      LAVIK_TARGETS_FILE: ${LAVIK_TARGETS_FILE:-}
+      ALERTMANAGER_TARGETS: ${ALERTMANAGER_TARGETS:-}
     volumes:
       - prometheus-targets:/targets
+      - ./configure-targets.sh:/configure-targets.sh:ro
+      - ${LAVIK_TARGETS_FILE:-./prometheus/targets.example.json}:/input/lavik.json:ro
     command:
       - sh
-      - -ec
-      - |
-        old_ifs="$${IFS}"
-        case "$${LAVIK_TARGETS}" in
-          ,*|*,|*,,*)
-            echo "LAVIK_TARGETS contains an empty target" >&2
-            exit 1
-            ;;
-        esac
-        IFS=,
-        set -- $${LAVIK_TARGETS}
-        IFS="$${old_ifs}"
-        targets_json=
-        for target do
-          case "$${target}" in
-            ""|*\"*|*\\*|*/*|*" "*)
-              echo "invalid Lavik target: '$${target}'" >&2
-              exit 1
-              ;;
-            *:*) ;;
-            *)
-              echo "Lavik target must be host:port: '$${target}'" >&2
-              exit 1
-              ;;
-          esac
-          if [ -n "$${targets_json}" ]; then
-            targets_json="$${targets_json},"
-          fi
-          targets_json="$${targets_json}\"$${target}\""
-        done
-        if [ -z "$${targets_json}" ]; then
-          echo "LAVIK_TARGETS must contain at least one target" >&2
-          exit 1
-        fi
-        printf '[{"targets":[%s],"labels":{"service":"lavik"}}]\n' \
-          "$${targets_json}" > /targets/lavik.json.tmp
-        mv /targets/lavik.json.tmp /targets/lavik.json
-
+      - /configure-targets.sh
   prometheus:
-    image: "${PROMETHEUS_IMAGE:-prom/prometheus:v3.11.3}"
+    image: ${PROMETHEUS_IMAGE:-prom/prometheus:v3.11.3}
     restart: unless-stopped
     depends_on:
       target-config:
@@ -71,34 +39,52 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}"
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
     extra_hosts:
       - host.docker.internal:host-gateway
     ports:
-      - "${PROMETHEUS_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+      - ${PROMETHEUS_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-targets:/etc/prometheus/targets:ro
       - prometheus-data:/prometheus
-
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+    environment:
+      GRAFANA_PUBLIC_URL: ${GRAFANA_PUBLIC_URL:-http://localhost:3000}
+      LAVIK_CLUSTER: ${LAVIK_CLUSTER:-default}
   grafana:
-    image: "${GRAFANA_IMAGE:-grafana/grafana:13.1.0}"
+    image: ${GRAFANA_IMAGE:-grafana/grafana:13.1.0}
     restart: unless-stopped
     depends_on:
       - prometheus
     environment:
-      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
-      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
     ports:
-      - "${GRAFANA_BIND_ADDRESS:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
+      - ${GRAFANA_BIND_ADDRESS:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
-
+  alertmanager:
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
+    profiles:
+      - alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    ports:
+      - ${ALERTMANAGER_BIND_ADDRESS:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093
+    volumes:
+      - ${ALERTMANAGER_CONFIG:-./alertmanager/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro
+      - ./alertmanager/templates:/etc/alertmanager/templates:ro
+      - alertmanager-data:/alertmanager
 volumes:
-  prometheus-targets:
-  prometheus-data:
-  grafana-data:
+  prometheus-targets: null
+  prometheus-data: null
+  grafana-data: null
+  alertmanager-data: null

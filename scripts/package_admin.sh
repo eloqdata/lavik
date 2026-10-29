@@ -14,10 +14,11 @@ for module in askpass cli demo deploy fleet hosts meta monitoring releases resp 
   install -m 0644 "$repo/admin/$module.mjs" "$stage/admin/"
 done
 # Only runtime assets: a developer's ignored monitoring .env may contain secrets.
-for asset in compose.yaml prometheus/prometheus.yml grafana/dashboards/lavik-overview.json grafana/provisioning/dashboards/lavik.yaml grafana/provisioning/datasources/prometheus.yaml; do
+while IFS= read -r asset; do
+  case "$asset" in ""|\#*) continue ;; esac
   mkdir -p "$stage/admin/monitoring/$(dirname "$asset")"
   install -m 0644 "$repo/deploy/monitoring/$asset" "$stage/admin/monitoring/$asset"
-done
+done < "$repo/deploy/monitoring/runtime-files.txt"
 # The demo button uses only packaged runtime inputs, never a source checkout.
 mkdir -p "$stage/admin/quickstart"
 for asset in Dockerfile download.sh start.sh cluster.toml client.mjs; do

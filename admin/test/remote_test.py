@@ -2,6 +2,7 @@
 # Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
 """Exercise remote ownership and restart contracts without requiring SSH."""
 
+import io
 import importlib.util
 import json
 from pathlib import Path
@@ -31,6 +32,67 @@ class RemoteSafety(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_monitoring_retries_preserve_receiver_settings_and_target_identity(self):
+        root = remote.owned(self.request, create=True)
+        request = {
+            **self.request,
+            "files": {"rules.yml": "reviewed rules"},
+            "targets": ["data:9100"],
+            "address": "127.0.0.1",
+            "grafanaUrl": "http://127.0.0.1:3000",
+            "mode": "meta-managed",
+        }
+
+        class Response(io.BytesIO):
+            status = 200
+
+        class Http:
+            def open(self, url, timeout):
+                return Response(
+                    json.dumps(
+                        {
+                            "data": {
+                                "activeTargets": [
+                                    {
+                                        "health": "up",
+                                        "labels": {"instance": target},
+                                    }
+                                    for target in request["targets"]
+                                ]
+                            }
+                        }
+                    ).encode()
+                )
+
+        with (
+            patch.object(remote, "checked"),
+            patch.object(remote.urllib.request, "build_opener", return_value=Http()),
+        ):
+            remote.monitoring(request)
+            env = root / "monitoring/.env"
+            original = env.read_text()
+            self.assertIn("LAVIK_MODE=meta-managed\n", original)
+            self.assertIn("LAVIK_CLUSTER=test\n", original)
+            self.assertIn("GRAFANA_PUBLIC_URL=http://127.0.0.1:3000\n", original)
+            env.write_text(
+                original
+                + "ALERTMANAGER_TARGETS=external:9093\nALERTMANAGER_CONFIG=./operator.yml\n"
+                + "LAVIK_TARGETS_FILE=./stale-targets.json\n"
+            )
+            request["targets"].append("follower:9100")
+            remote.monitoring(request)
+            self.assertIn("LAVIK_TARGETS=data:9100,follower:9100\n", env.read_text())
+            self.assertNotIn("LAVIK_TARGETS_FILE=", env.read_text())
+            self.assertIn("ALERTMANAGER_TARGETS=external:9093\n", env.read_text())
+            self.assertIn("ALERTMANAGER_CONFIG=./operator.yml\n", env.read_text())
+            self.assertEqual(env.read_text().count("LAVIK_MODE="), 1)
+            self.assertEqual(env.stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(RuntimeError, "differs"):
+                remote.monitoring({**request, "files": {"rules.yml": "overwrite"}})
+            self.assertEqual(
+                (root / "monitoring/rules.yml").read_text(), "reviewed rules"
+            )
 
     def test_existing_data_is_never_claimed_or_reconfigured(self):
         root = self.base / "test"

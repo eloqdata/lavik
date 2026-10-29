@@ -1,0 +1,9 @@
+{{/* Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0 */}}
+{{ define "lavik.title" }}[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} {{ .CommonLabels.instance }}{{ end }}
+{{ define "lavik.text" }}
+{{ range .Alerts }}{{ .Labels.severity }}: {{ .Annotations.summary }}
+{{ .Annotations.description }}
+Dashboard: {{ .Annotations.dashboard_url }}
+Runbook: {{ .Annotations.runbook_url }}
+{{ end }}
+{{ end }}

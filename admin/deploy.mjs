@@ -1014,6 +1014,11 @@ export class Deployments {
         this.request(plan, "monitoring", {
           files,
           targets,
+          mode: "meta-managed",
+          grafanaUrl: `http://${address(
+            plan.hosts[index].address,
+            plan.grafanaPort,
+          )}`,
           address: plan.hosts[index].address,
           grafanaPort: plan.grafanaPort,
           prometheusPort: plan.prometheusPort,

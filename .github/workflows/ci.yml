@@ -294,24 +294,89 @@ jobs:
     env: *shard-env
     steps: *shard-steps
 
+  monitoring-config:
+    name: Monitoring config and rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install PyYAML==6.0.3
+      - run: scripts/install_monitoring_tools.sh "$RUNNER_TEMP/monitoring-tools"
+      - run: python3 scripts/check_monitoring.py --tools "$RUNNER_TEMP/monitoring-tools"
+      - run: python3 -m unittest discover -s tests -p test_monitoring_config.py
+      - name: Check deployment modes without notification credentials
+        working-directory: deploy/monitoring
+        run: |
+          LAVIK_TARGETS=data:9100 docker compose config --quiet
+          LAVIK_TARGETS=data:9100 ALERTMANAGER_TARGETS=alertmanager:9093 docker compose --profile alertmanager config --quiet
+          LAVIK_TARGETS=data:9100 ALERTMANAGER_TARGETS=external:9093 docker compose config --quiet
+
+  monitoring-e2e:
+    name: Monitoring notification drill (amd64)
+    needs: build-amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install PyYAML==6.0.3
+      - run: scripts/install_monitoring_tools.sh "$RUNNER_TEMP/monitoring-tools"
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd libssl3t64
+          sudo sysctl -w kernel.io_uring_disabled=0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-build-amd64
+          path: ${{ runner.temp }}/ci-build
+      - name: Restore test runtime
+        run: |
+          tar --zstd -xf "$RUNNER_TEMP/ci-build/ci-build.tar.zst"
+          python3 scripts/ci_build_bundle.py validate build_ci
+      - name: Verify real firing and resolved delivery
+        run: python3 tests/monitoring/e2e.py --tools "$RUNNER_TEMP/monitoring-tools" --output "$RUNNER_TEMP/monitoring-drill" --lavik-bin build_ci/lavik
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: monitoring-notification-evidence
+          path: |
+            ${{ runner.temp }}/monitoring-drill/*.log
+            ${{ runner.temp }}/monitoring-drill/*.json
+            ${{ runner.temp }}/monitoring-drill/*.jsonl
+          retention-days: 7
+
   # Preserve branch-protection check names and reject incomplete work within
   # each architecture, without waiting for or inheriting the other's result.
   test-amd64:
     name: Tests (amd64)
     if: ${{ always() }}
-    needs: [build-amd64, test-shard-amd64, admin-amd64]
+    needs: [build-amd64, test-shard-amd64, admin-amd64, monitoring-config, monitoring-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
       BUILD_RESULT: ${{ needs.build-amd64.result }}
       SHARD_RESULT: ${{ needs.test-shard-amd64.result }}
       ADMIN_RESULT: ${{ needs.admin-amd64.result }}
+      MONITORING_CONFIG_RESULT: ${{ needs.monitoring-config.result }}
+      MONITORING_E2E_RESULT: ${{ needs.monitoring-e2e.result }}
     steps: &gate-steps
       - name: Require all architecture tests
         run: |
           test "$BUILD_RESULT" = success
           test "$SHARD_RESULT" = success
           test "$ADMIN_RESULT" = success
+          test "${MONITORING_CONFIG_RESULT:-success}" = success
+          test "${MONITORING_E2E_RESULT:-success}" = success
 
   test-arm64:
     name: Tests (arm64)
