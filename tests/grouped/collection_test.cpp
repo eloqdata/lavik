@@ -322,6 +322,70 @@ TEST(GroupedCollectionTest, EncodedSortedSetPageOwnsBytesAcrossCopyAndMove) {
   EXPECT_FALSE(OrderedGroupEncoder::Create(ambiguous).ok());
 }
 
+TEST(GroupedCollectionTest, EncodedV1SortedSetStreamsV2WithoutMaterializing) {
+  auto original = Page(7, 0, OrderedCollectionKind::kSortedSet);
+  original.previous_ = 3;
+  original.next_ = 9;
+  original.entries_ = {
+      {"", -std::numeric_limits<double>::infinity()},
+      {std::string("a\0", 2), -0.0},
+      {std::string(128 * 1024, 'z'), std::numeric_limits<double>::infinity()}};
+  const auto wire = test::EncodeOrderedGroupV1(original);
+  ASSERT_TRUE(wire.ok());
+  const auto source = DecodeEncodedSortedSetGroup(*wire);
+  ASSERT_TRUE(source.ok());
+  ASSERT_EQ(source->encoded_sorted_set_->version(), 1);
+  const auto expected = EncodeOrderedGroup(original);
+  ASSERT_TRUE(expected.ok());
+  auto created = OrderedGroupEncoder::Create(*source);
+  ASSERT_TRUE(created.ok());
+  EXPECT_EQ(created->encoded_bytes(), wire->size() + 4);
+  auto encoder = std::move(*created);
+  std::string actual;
+  bool borrowed = false;
+  while (auto part = encoder.Next()) {
+    if (part->size() == original.entries_.back().value_.size()) {
+      EXPECT_EQ(part->data(),
+                source->encoded_sorted_set_->entries().back().value_.data());
+      borrowed = true;
+    }
+    actual.append(*part);
+  }
+  EXPECT_TRUE(borrowed);
+  EXPECT_EQ(actual, *expected);
+  EXPECT_EQ(actual.size(), encoder.encoded_bytes());
+  EXPECT_TRUE(source->entries_.empty());
+  EXPECT_EQ(source->encoded_sorted_set_->version(), 1);
+  EXPECT_EQ(source->encoded_sorted_set_->bytes(),
+            std::string_view(*wire).substr(kOrderedGroupHeaderBytes));
+  // A link-only replacement also converts the old body, retaining identity
+  // changes in the regenerated envelope rather than copying its old header.
+  auto relinked = *source;
+  relinked.next_ = original.next_ = 10;
+  EXPECT_EQ(*EncodeOrderedGroup(relinked), *EncodeOrderedGroup(original));
+}
+
+TEST(GroupedCollectionTest, EncodedV1PointUpgradeAccountsForEndOffset) {
+  const auto wire =
+      test::EncodeOrderedGroupV1(Page(1, 1, OrderedCollectionKind::kSortedSet));
+  ASSERT_TRUE(wire.ok());
+  const auto source = DecodeEncodedSortedSetGroup(*wire);
+  ASSERT_TRUE(source.ok());
+  auto too_small =
+      EditEncodedSortedSetGroup(*source, "item-0", 0, 1, wire->size());
+  ASSERT_TRUE(too_small.ok());
+  EXPECT_FALSE(*too_small);
+  auto fits =
+      EditEncodedSortedSetGroup(*source, "item-0", 0, 1, wire->size() + 4);
+  ASSERT_TRUE(fits.ok());
+  ASSERT_TRUE(*fits);
+  ASSERT_EQ((*fits)->encoded_sorted_set_->version(), 2);
+  auto encoded = EncodeOrderedGroup(**fits);
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(encoded->size(), wire->size() + 4);
+  EXPECT_EQ(source->encoded_sorted_set_->version(), 1);
+}
+
 TEST(GroupedCollectionTest, EncodedSortedSetPointEditsMatchOwnedImages) {
   auto original = Page(7, 40, OrderedCollectionKind::kSortedSet);
   original.previous_ = 3;
@@ -350,7 +414,9 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointEditsMatchOwnedImages) {
         ASSERT_TRUE(edited.ok()) << edited.status();
         ASSERT_TRUE(*edited);
         EXPECT_TRUE((*edited)->entries_.empty());
-        EXPECT_EQ(*EncodeOrderedGroup(**edited), *encode(expected));
+        ASSERT_TRUE((*edited)->encoded_sorted_set_);
+        EXPECT_EQ((*edited)->encoded_sorted_set_->version(), 2);
+        EXPECT_EQ(*EncodeOrderedGroup(**edited), *EncodeOrderedGroup(expected));
       }
       auto expected = original;
       const auto member = expected.entries_[index].value_;
@@ -360,21 +426,23 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointEditsMatchOwnedImages) {
           EditEncodedSortedSetGroup(*decoded, member, score, std::nullopt);
       ASSERT_TRUE(erased.ok());
       ASSERT_TRUE(*erased);
-      EXPECT_EQ(*EncodeOrderedGroup(**erased), *encode(expected));
+      EXPECT_EQ(*EncodeOrderedGroup(**erased), *EncodeOrderedGroup(expected));
       auto restored =
           EditEncodedSortedSetGroup(**erased, member, std::nullopt, score);
       ASSERT_TRUE(restored.ok());
       ASSERT_TRUE(*restored);
-      EXPECT_EQ(*EncodeOrderedGroup(**restored), *wire);
+      EXPECT_EQ(*EncodeOrderedGroup(**restored), *EncodeOrderedGroup(original));
       auto resolved = EditEncodedSortedSetGroup(
           **erased, member, std::nullopt, score, kCollectionGroupTargetBytes,
           /*member_absence_verified=*/true);
       ASSERT_TRUE(resolved.ok());
       ASSERT_TRUE(*resolved);
-      EXPECT_EQ(*EncodeOrderedGroup(**resolved), *wire);
+      EXPECT_EQ(*EncodeOrderedGroup(**resolved), *EncodeOrderedGroup(original));
     }
     // The immutable predecessor must survive every candidate edit unchanged.
-    EXPECT_EQ(*EncodeOrderedGroup(*decoded), *wire);
+    EXPECT_EQ(decoded->encoded_sorted_set_->bytes(),
+              std::string_view(*wire).substr(kOrderedGroupHeaderBytes));
+    EXPECT_EQ(*EncodeOrderedGroup(*decoded), *EncodeOrderedGroup(original));
   }
 }
 

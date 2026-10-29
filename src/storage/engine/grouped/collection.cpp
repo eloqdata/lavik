@@ -172,8 +172,16 @@ absl::StatusOr<std::size_t> ValidateGroup(
   // The encoded owner is immutable and was fully checked on decode. Its
   // point editor preserves framing/order and rejects duplicates; link/identity
   // checks above still apply to the independently mutable envelope.
-  if (group.encoded_sorted_set_)
-    return kOrderedGroupHeaderBytes + group.encoded_sorted_set_->bytes().size();
+  if (group.encoded_sorted_set_) {
+    // A v1 body is rewritten as v2 on output. Both layouts use 12 bytes per
+    // member; v2 additionally needs the final offset sentinel. Account for
+    // that growth before admitting or staging the replacement page.
+    const auto extra = group.encoded_sorted_set_->version() == 1 ? 4 : 0;
+    const auto size = group.encoded_sorted_set_->bytes().size();
+    if (size > kMaxRecordPayloadBytes - kOrderedGroupHeaderBytes - extra)
+      return absl::OutOfRangeError("ordered page exceeds payload limit");
+    return kOrderedGroupHeaderBytes + size + extra;
+  }
   // Only the checked splitter can create this immutable owner, after full
   // after-image validation. It cannot become stale through a member edit.
   // All structural and order checks still run after callers finish links.
@@ -420,11 +428,7 @@ absl::StatusOr<OrderedGroupEncoder> OrderedGroupEncoder::Create(
   encoder.encoded_bytes_ = *size;
   auto& bytes = encoder.header_;
   std::copy(kGroupMagic.begin(), kGroupMagic.end(), bytes.begin());
-  encoder.version_ =
-      group.encoded_sorted_set_
-          ? group.encoded_sorted_set_->version()
-          : (!group.retired_ && HasOrderedIndex(group.kind_) ? 2 : 1);
-  Store(bytes, 8, encoder.version_, 4);
+  Store(bytes, 8, !group.retired_ && HasOrderedIndex(group.kind_) ? 2 : 1, 4);
   Store(bytes, 12, static_cast<unsigned>(group.kind_), 1);
   Store(bytes, 13, group.retired_, 1);
   Store(bytes, 16, group.incarnation_, 8);
@@ -447,35 +451,44 @@ std::optional<std::string_view> OrderedGroupEncoder::Next() noexcept {
     ++entry_;
     return OrderedStringBytes(*group_);
   }
-  if (group_->encoded_sorted_set_) {
+  if (group_->retired_) return std::nullopt;
+  if (group_->encoded_sorted_set_ &&
+      group_->encoded_sorted_set_->version() == 2) {
     if (entry_ != 0) return std::nullopt;
     ++entry_;
     return group_->encoded_sorted_set_->bytes();
   }
-  const auto entries = OrderedGroupEntries(*group_);
-  if (version_ == 2) {
+  if (HasOrderedIndex(group_->kind_)) {
     // Emit values and fixed arrays in separate passes, keeping extent-backed
-    // pages streaming and avoiding an additional serialized page allocation.
-    if (phase_ == 1) {
-      if (entry_ < entries.size()) return entries[entry_++].value_;
-      phase_ = group_->kind_ == OrderedCollectionKind::kSortedSet ? 2 : 3;
-      entry_ = 0;
-    }
-    if (phase_ == 2) {
-      if (entry_ < entries.size()) {
-        Store(entry_header_, 0,
-              std::bit_cast<std::uint64_t>(entries[entry_++].score_), 8);
-        return std::string_view(entry_header_.data(), 8);
+    // pages streaming. Checked v1 views borrow their old owner while we emit
+    // v2 directly, without a temporary body or per-member string allocation.
+    auto emit = [&](auto entries) -> std::optional<std::string_view> {
+      if (phase_ == 1) {
+        if (entry_ < entries.size()) return entries[entry_++].value_;
+        phase_ = group_->kind_ == OrderedCollectionKind::kSortedSet ? 2 : 3;
+        entry_ = 0;
       }
-      phase_ = 3;
-      entry_ = 0;
-    }
-    if (entry_ > entries.size()) return std::nullopt;
-    Store(entry_header_, 0, value_offset_, 4);
-    if (entry_ < entries.size()) value_offset_ += entries[entry_].value_.size();
-    ++entry_;
-    return std::string_view(entry_header_.data(), 4);
+      if (phase_ == 2) {
+        if (entry_ < entries.size()) {
+          Store(entry_header_, 0,
+                std::bit_cast<std::uint64_t>(entries[entry_++].score_), 8);
+          return std::string_view(entry_header_.data(), 8);
+        }
+        phase_ = 3;
+        entry_ = 0;
+      }
+      if (entry_ > entries.size()) return std::nullopt;
+      Store(entry_header_, 0, value_offset_, 4);
+      if (entry_ < entries.size())
+        value_offset_ += entries[entry_].value_.size();
+      ++entry_;
+      return std::string_view(entry_header_.data(), 4);
+    };
+    if (group_->encoded_sorted_set_)
+      return emit(group_->encoded_sorted_set_->entries());
+    return emit(OrderedGroupEntries(*group_));
   }
+  const auto entries = OrderedGroupEntries(*group_);
   if (entry_ == entries.size()) return std::nullopt;
   const auto& entry = entries[entry_];
   if (phase_ == 1) {
@@ -651,7 +664,7 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
   if (before && removed == missing)
     return absl::DataLossError("encoded Sorted Set point source missing");
   const auto frame_bytes = kEntryHeaderBytes + member.size();
-  const auto retained_bytes = bytes.size() - (before ? frame_bytes : 0);
+  const auto retained_bytes = bytes.size() + 4 - (before ? frame_bytes : 0);
   if (count == 0 || target_bytes < kOrderedGroupHeaderBytes ||
       retained_bytes > target_bytes - kOrderedGroupHeaderBytes ||
       (after &&
@@ -660,46 +673,41 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
   const auto size = retained_bytes + (after ? frame_bytes : 0);
   auto output = MakeLocalShared<std::string>();
   output->reserve(size);
-  auto append_member = [&] {
-    std::array<char, kEntryHeaderBytes> header{};
-    Store(header, 0, member.size(), 4);
-    Store(header, 4, std::bit_cast<std::uint64_t>(*after), 8);
-    output->append(header.data(), header.size());
-    output->append(member);
+  // Upgrade the v1 source directly into the final v2 owner. Revisit borrowed
+  // views for each array instead of allocating an intermediate page or owned
+  // strings. Subsequent edits use the indexed splice above.
+  auto visit = [&](auto emit) {
+    bool inserted = !after;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      if (i == removed) continue;
+      if (!inserted &&
+          EntryLess(OrderedCollectionEntryView{member, *after}, entries[i])) {
+        emit(OrderedCollectionEntryView{member, *after});
+        inserted = true;
+      }
+      emit(entries[i]);
+    }
+    if (!inserted) emit(OrderedCollectionEntryView{member, *after});
   };
-  bool inserted = !after;
-  std::size_t start = 0;
-  // Every unchanged framed byte is copied once, in at most three runs split
-  // by the old and new positions. Numeric order treats -0/+0 as equal and
-  // binary member order breaks ties, exactly as the ordinary page planner.
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const auto offset =
-        entries[i].value_.data() - bytes.data() - kEntryHeaderBytes;
-    if (i == removed) {
-      output->append(bytes.substr(start, offset - start));
-      start = offset + frame_bytes;
-      continue;
-    }
-    if (!inserted &&
-        EntryLess(OrderedCollectionEntryView{member, *after}, entries[i])) {
-      output->append(bytes.substr(start, offset - start));
-      start = offset;
-      append_member();
-      inserted = true;
-    }
-  }
-  output->append(bytes.substr(start));
-  if (!inserted) append_member();
-  std::vector<OrderedCollectionEntryView> views;
-  views.reserve(count);
-  std::string_view encoded(*output);
-  for (std::size_t offset = 0; offset != encoded.size();) {
-    const auto length = Load(encoded, offset, 4);
-    const auto score = std::bit_cast<double>(Load(encoded, offset + 4, 8));
-    offset += kEntryHeaderBytes;
-    views.push_back({encoded.substr(offset, length), score});
-    offset += length;
-  }
+  visit([&](const auto& entry) { output->append(entry.value_); });
+  auto append_number = [&](std::uint64_t value, unsigned width) {
+    std::array<char, 8> buffer{};
+    Store(buffer, 0, value, width);
+    output->append(buffer.data(), width);
+  };
+  visit([&](const auto& entry) {
+    append_number(std::bit_cast<std::uint64_t>(entry.score_), 8);
+  });
+  std::size_t offset = 0;
+  append_number(0, 4);
+  visit([&](const auto& entry) {
+    offset += entry.value_.size();
+    append_number(offset, 4);
+  });
+  auto final = IndexedOrderedReader::Open(page.kind_, *output, count);
+  if (!final.ok()) return final.status();
+  auto views = final->DecodeAll();
+  if (!views.ok()) return views.status();
   OrderedGroupSnapshot result{.kind_ = page.kind_,
                               .incarnation_ = page.incarnation_,
                               .id_ = page.id_,
@@ -707,7 +715,7 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
                               .next_ = page.next_,
                               .entries_ = {}};
   result.encoded_sorted_set_ =
-      EncodedSortedSetEntries(std::move(output), std::move(views));
+      EncodedSortedSetEntries(std::move(output), std::move(*views), 2);
   return result;
 }
 

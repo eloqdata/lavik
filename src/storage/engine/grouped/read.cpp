@@ -458,12 +458,10 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
-                                      WorkerStore::PartitionStore& partition,
-                                      std::uint8_t db_id, std::string_view key,
-                                      const Digest& digest,
-                                      RecordLocation location,
-                                      GroupedObject::Handle snapshot) {
+StorageEngine::Impl::LoadGroupedValue(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    RecordLocation location, GroupedObject::Handle snapshot, bool physical) {
   const bool pinned = snapshot != nullptr;
   if (!pinned) {
     auto found = partition.grouped_objects_[db_id].Lookup(
@@ -514,8 +512,9 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     auto value = co_await LoadGroupedOrderedValue(store, partition, db_id, key,
                                                   digest, snapshot, pinned);
     if (!value.ok()) co_return value.status();
+    const auto kind = snapshot->ordered_directory().root().kind_;
     encoded = EncodeOrderedCompactValue(
-        snapshot->ordered_directory().root().kind_, *value);
+        kind, *value, physical && HasOrderedIndex(kind) ? 2 : 1);
   } else {
     auto value = co_await LoadGroupedHashValue(store, partition, db_id, key,
                                                digest, snapshot, pinned);

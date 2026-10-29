@@ -121,13 +121,12 @@ absl::StatusOr<std::string> EncodeList(std::span<const std::string> elements) {
 }
 
 struct CompactListEdit {
-  std::optional<MemoryReservation> admission_;
   OrderedCompactPayload payload_;
 };
 
 // Indexed end edits retain one data span and rebuild only numeric offsets.
 // Published bytes remain immutable; the caller holds the source lease through
-// consumption of this borrowed plan, as for the v1 byte-splicing path.
+// consumption of this borrowed plan.
 absl::StatusOr<std::optional<CompactListEdit>> PlanIndexedListEnds(
     const IndexedOrderedReader& reader, const ListOperation& operation,
     ListResult& result) {
@@ -196,69 +195,13 @@ absl::StatusOr<std::optional<CompactListEdit>> PlanCompactListEdit(
       operation.kind_ == Kind::kPopLeft || operation.kind_ == Kind::kPopRight;
   if ((!push && !pop) || payload.size() >= kCollectionPromotionBytes)
     return std::nullopt;
-  const bool left = operation.kind_ == Kind::kPushLeft ||
-                    operation.kind_ == Kind::kPushLeftIfExists ||
-                    operation.kind_ == Kind::kPopLeft;
   auto reader =
       OrderedCompactReader::Open(OrderedCollectionKind::kList, payload, count);
   if (!reader.ok()) return reader.status();
-  if (reader->indexed())
-    return PlanIndexedListEnds(*reader->indexed(), operation, result);
-  std::size_t size = payload.size();
-  if (push) {
-    if (operation.values_.size() > UINT32_MAX - count)
-      return absl::OutOfRangeError("invalid List element count");
-    for (const auto value : operation.values_) {
-      auto next =
-          AppendOrderedEntrySize(OrderedCollectionKind::kList, size,
-                                 value.size(), std::string{}.max_size());
-      if (!next.ok()) return next.status();
-      size = *next;
-    }
-    if (size >= kCollectionPromotionBytes) return std::nullopt;
-  }
-  const auto removed = pop ? std::min(operation.count_, count) : 0;
-  const auto length = push ? count + operation.values_.size() : count - removed;
-  CompactListEdit edit;
-  if (push && operation.values_.size() > 1) {
-    edit.admission_ = TryReserveMemory(operation.values_.size() * 256);
-    if (!edit.admission_) return std::nullopt;
-  }
-  auto& output = edit.payload_.V1();
-  if (length != 0) {
-    output.AppendBytes(kListMagic);
-    output.AppendUnsigned(length, 4);
-  }
-  auto append_inputs = [&] {
-    for (std::size_t i = 0; i < operation.values_.size(); ++i) {
-      const auto value =
-          operation.values_[left ? operation.values_.size() - 1 - i : i];
-      output.AppendUnsigned(value.size(), 4);
-      output.AppendBytes(value);
-    }
-  };
-  if (push && left) append_inputs();
-  std::size_t kept_begin = 0;
-  std::size_t kept_bytes = 0;
-  for (std::size_t i = 0; i < count; ++i) {
-    auto entry = reader->Next();
-    if (!entry.ok()) return entry.status();
-    if (pop && (left ? i < removed : i >= count - removed)) {
-      result.values_.emplace_back(entry->value_);
-    } else {
-      if (kept_bytes == 0) kept_begin = entry->encoded_.data() - payload.data();
-      kept_bytes += entry->encoded_.size();
-    }
-  }
-  // End edits retain one contiguous interval, regardless of cardinality.
-  output.AppendBytes(payload.substr(kept_begin, kept_bytes));
-  if (push && !left) append_inputs();
-  if (pop && !left) std::reverse(result.values_.begin(), result.values_.end());
-  result.changed_ = push ? !operation.values_.empty() : removed != 0;
-  result.length_ = length;
-  // key_exists_ describes the input for POP's nil-vs-array reply, including
-  // a counted pop that consumes the last element and publishes a tombstone.
-  return edit;
+  // A changed v1 value takes the existing owned builder once, which emits
+  // v2. Do not retain the old layout through an end-edit byte splice.
+  if (!reader->indexed()) return std::nullopt;
+  return PlanIndexedListEnds(*reader->indexed(), operation, result);
 }
 
 std::optional<std::uint64_t> NormalizeIndex(std::int64_t index,

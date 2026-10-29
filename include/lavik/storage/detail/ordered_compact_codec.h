@@ -16,9 +16,8 @@
 
 #pragma once
 
-#include <variant>
+#include <optional>
 
-#include "lavik/storage/detail/compact_payload.h"
 #include "lavik/storage/detail/grouped/collection.h"
 #include "lavik/storage/detail/ordered_index.h"
 
@@ -58,26 +57,24 @@ class OrderedCompactReader {
   std::optional<IndexedOrderedReader> indexed_;
 };
 
-// Keeps either the v1 byte-splice plan or the bounded-state v2 encoder inline.
-// Selecting v2 adds no heap allocation. Both alternatives borrow source leases
-// and operands; keep them alive through the consuming writer's append waits.
+// Keeps the bounded-state v2 encoder inline without heap allocation. The
+// encoder borrows source leases and operands; keep them alive through the
+// consuming writer's append waits. An unselected payload emits no bytes.
 class OrderedCompactPayload {
  public:
-  CompactPayload& V1() noexcept { return std::get<CompactPayload>(payload_); }
   IndexedOrderedSplice& V2(IndexedOrderedReader source) noexcept {
-    return payload_.emplace<IndexedOrderedSplice>(source);
+    return payload_.emplace(source);
   }
   std::size_t encoded_bytes() const noexcept {
-    return std::visit(
-        [](const auto& encoder) { return encoder.encoded_bytes(); }, payload_);
+    return payload_ ? payload_->encoded_bytes() : 0;
   }
   bool empty() const noexcept { return encoded_bytes() == 0; }
   std::optional<std::string_view> Next() noexcept {
-    return std::visit([](auto& encoder) { return encoder.Next(); }, payload_);
+    return payload_ ? payload_->Next() : std::nullopt;
   }
 
  private:
-  std::variant<CompactPayload, IndexedOrderedSplice> payload_;
+  std::optional<IndexedOrderedSplice> payload_;
 };
 
 // Logical full-image bridge used by existing callback/RDB integrations.

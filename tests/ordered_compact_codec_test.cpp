@@ -21,6 +21,7 @@
 #include <limits>
 
 #include "gtest/gtest.h"
+#include "lavik/storage/detail/compact_payload.h"
 #include "support/ordered_v1.h"
 
 namespace lavik::storage {

@@ -4137,10 +4137,14 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, bool pinned = false);
+  // Logical consumers retain the streaming-compatible v1 image. Physical
+  // demotion requests the current List/Sorted Set format directly, avoiding
+  // an intermediate logical image and a second conversion allocation.
   Task<absl::StatusOr<LoadedValue>> LoadGroupedValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      RecordLocation location, GroupedObject::Handle snapshot);
+      RecordLocation location, GroupedObject::Handle snapshot,
+      bool physical = false);
 
   // Reads an entire extent on its physical owner into caller-owned storage.
   // Local routing returns the physical awaitable without a wrapper task.

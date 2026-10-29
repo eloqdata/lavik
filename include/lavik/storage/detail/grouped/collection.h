@@ -148,7 +148,7 @@ class EncodedSortedSetEntries {
                             bool member_absence_verified);
   EncodedSortedSetEntries(LocalSharedPtr<const std::string> bytes,
                           std::vector<OrderedCollectionEntryView> entries,
-                          std::uint32_t version = 1)
+                          std::uint32_t version)
       : bytes_(std::move(bytes)),
         entries_(std::move(entries)),
         version_(version) {}
@@ -321,6 +321,8 @@ class OrderedGroupMetadataDecoder {
 // strings or a String segment's borrowed bytes. An extent writer can consume
 // it without a second full-value copy. The input snapshot and any borrowed
 // String source must outlive the cursor and remain unchanged.
+// Live List/Sorted Set pages always emit v2, including encoded v1 inputs;
+// String/Stream pages and retirement markers retain their current v1 format.
 class OrderedGroupEncoder {
  public:
   static absl::StatusOr<OrderedGroupEncoder> Create(
@@ -336,7 +338,6 @@ class OrderedGroupEncoder {
   std::size_t encoded_bytes_ = 0;
   std::size_t entry_ = 0;
   unsigned phase_ = 0;
-  std::uint32_t version_ = 1;
   std::size_t value_offset_ = 0;
 };
 
@@ -368,6 +369,7 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
 // nullopt for an empty/oversized after-image, leaving topology changes to the
 // ordinary planner. The input is immutable even on failure; score mismatches,
 // duplicate additions and invalid inputs are errors, never silent fallbacks.
+// Successful after-images use v2 even when the input page uses v1.
 // For v2 insertion, member_absence_verified skips the member-only scan when
 // the caller's member graph and resolved source page already prove absence
 // from this page. Otherwise absence is checked here. Existing members and new

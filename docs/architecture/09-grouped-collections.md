@@ -237,19 +237,25 @@ bounds each graph by its own root revision.
 
 New keys, compact promotions and streaming imports build both Sorted Set
 graphs before publication. List and Sorted Set physical payloads accept v1 and
-v2 independently of the outer record/root version. Newly built compact values
+v2 independently of the outer record/root version. Typed compact writers
 use `LVL2`/`LZS2`; newly built live ordered pages use envelope version 2.
 String/Stream pages and retired pages retain version 1. Existing v1 data
-remains readable; byte-splicing edits may retain its encoding, while rebuilt
-pages use v2. Older binaries cannot read v2 physical images.
+remains readable. Typed List/Sorted Set mutations encode changed compact
+values and rewritten live pages as v2, including pages whose checked input
+body is v1.
+Unchanged pages and commands that perform no write retain their stored format;
+physical relocation preserves payload bytes. Older binaries cannot read v2
+physical images.
 
 The indexed body concatenates item bytes, followed by a little-endian double
 score array for Sorted Sets and a little-endian u32 offset array with an end
 sentinel. Lists omit scores. Compact and grouped envelopes share this body;
 offsets address only the body data and permit empty items. Grouped full-image
 materialization and bounded collection streams emit v1 independently of the
-physical format; compact native after-images can carry either version. RDB
-export accepts both physical versions. The root/member Hash graph format is
+physical format. Completed collection imports, including RESTORE, directly
+encode v2 when shrinking a List/Sorted Set graph to a compact value. Legacy
+whole-image callbacks and native after-images can still carry either version.
+RDB export accepts both physical versions. The root/member Hash graph format is
 unchanged.
 
 Page score bounds are derived runtime metadata. Writers validate complete

@@ -769,37 +769,34 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
   auto reader = OrderedCompactReader::Open(
       OrderedCollectionKind::kSortedSet, value->encoded_, value->logical_size_);
   if (!reader.ok()) return reader.status();
-  auto& state = members.at(member);
-  std::size_t removed = reader->size();
-  if (reader->indexed()) {
-    auto slot = reader->indexed()->FindSortedSetMember(member);
-    if (!slot.ok()) return slot.status();
-    removed = *slot;
-    if (removed != reader->size()) {
-      if (state.before_)
-        return absl::DataLossError("duplicate persisted Sorted Set member");
-      auto score = reader->indexed()->Score(removed);
-      if (!score.ok()) return score.status();
-      state.before_ = state.after_ = *score;
-    }
-  } else {
-    auto scan = *reader;
-    std::optional<OrderedCompactEntryView> previous;
-    for (std::size_t i = 0; i < scan.size(); ++i) {
-      auto entry = scan.Next();
+  // The owned mutation builder upgrades changed v1 values to v2. Decide
+  // before applying command semantics so fallback cannot apply inputs twice.
+  if (!reader->indexed()) [[unlikely]] {
+    // Preserve the point path's complete framing/order validation before
+    // the generic builder sorts the after-image. Migration must not repair
+    // an invalid source silently.
+    OrderedCompactEntryView previous;
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
       if (!entry.ok()) return entry.status();
-      if (previous && (previous->score_ > entry->score_ ||
-                       (previous->score_ == entry->score_ &&
-                        previous->value_ > entry->value_)))
+      if (i != 0 && (previous.score_ > entry->score_ ||
+                     (previous.score_ == entry->score_ &&
+                      previous.value_ > entry->value_)))
         return absl::DataLossError("unsorted compact Sorted Set");
       previous = *entry;
-      if (entry->value_ == member) {
-        if (state.before_)
-          return absl::DataLossError("duplicate persisted Sorted Set member");
-        state.before_ = state.after_ = entry->score_;
-        removed = i;
-      }
     }
+    return std::nullopt;
+  }
+  auto& state = members.at(member);
+  auto slot = reader->indexed()->FindSortedSetMember(member);
+  if (!slot.ok()) return slot.status();
+  const auto removed = *slot;
+  if (removed != reader->size()) {
+    if (state.before_)
+      return absl::DataLossError("duplicate persisted Sorted Set member");
+    auto score = reader->indexed()->Score(removed);
+    if (!score.ok()) return score.status();
+    state.before_ = state.after_ = *score;
   }
   result.key_exists_ = true;
   result.length_ = value->logical_size_;
@@ -813,50 +810,12 @@ absl::StatusOr<std::optional<CompactValueUpdate>> PlanCompactSortedSetPoint(
     update.erase_ = true;
     return update;
   }
-  if (reader->indexed()) {
-    auto& output = payload.V2(*reader->indexed());
-    // Compact values have no member-to-score index, so the validation pass
-    // above also resolves the old slot. Reuse it for deletion and binary-seek
-    // the new position instead of scanning the page again.
-    auto edited = output.EditSortedSetMember(removed, member, state.after_);
-    if (!edited.ok()) return edited;
-    return update;
-  }
-  auto& output = payload.V1();
-  output.AppendBytes("LZS1");
-  output.AppendUnsigned(result.length_, 4);
-  auto append = [&] {
-    output.AppendUnsigned(std::bit_cast<std::uint64_t>(*state.after_), 8);
-    output.AppendUnsigned(member.size(), 4);
-    output.AppendBytes(member);
-  };
-  bool inserted = !state.after_.has_value();
-  // Only the removed and inserted positions split the borrowed old image.
-  // Keep whole intervals rather than one descriptor per unchanged member.
-  std::size_t kept_begin = 8;
-  for (std::size_t i = 0; i < reader->size(); ++i) {
-    auto entry = reader->Next();
-    if (!entry.ok()) return entry.status();
-    const auto entry_begin = static_cast<std::size_t>(entry->encoded_.data() -
-                                                      value->encoded_.data());
-    if (entry->value_ == member) {
-      output.AppendBytes(
-          value->encoded_.substr(kept_begin, entry_begin - kept_begin));
-      kept_begin = entry_begin + entry->encoded_.size();
-      continue;
-    }
-    if (!inserted &&
-        (*state.after_ < entry->score_ ||
-         (*state.after_ == entry->score_ && member < entry->value_))) {
-      output.AppendBytes(
-          value->encoded_.substr(kept_begin, entry_begin - kept_begin));
-      append();
-      kept_begin = entry_begin;
-      inserted = true;
-    }
-  }
-  output.AppendBytes(value->encoded_.substr(kept_begin));
-  if (!inserted) append();
+  auto& output = payload.V2(*reader->indexed());
+  // Compact values have no member-to-score index, so the validation pass
+  // above also resolves the old slot. Reuse it for deletion and binary-seek
+  // the new position instead of scanning the page again.
+  auto edited = output.EditSortedSetMember(removed, member, state.after_);
+  if (!edited.ok()) return edited;
   return update;
 }
 

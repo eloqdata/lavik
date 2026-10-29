@@ -584,7 +584,8 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     if (total < kCollectionGroupTargetBytes) {
       const auto location = current->version().root_;
       auto compact = co_await LoadGroupedValue(store, partition, db_id, key,
-                                               digest, location, nullptr);
+                                               digest, location, nullptr,
+                                               /*physical=*/true);
       if (!compact.ok()) co_return compact.status();
       const auto bytes = compact->value();
       if (bytes.size() >= kCollectionGroupTargetBytes)
