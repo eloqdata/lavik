@@ -17,11 +17,19 @@
 #pragma once
 
 #include <optional>
+#include <string_view>
 
 #include "lavik/storage/detail/grouped/collection.h"
 #include "lavik/storage/detail/ordered_index.h"
 
 namespace lavik::storage {
+
+// Compact signatures identify both collection kind and payload version.
+// V1 also frames logical full-image streams; v2 carries the indexed body.
+inline constexpr std::string_view kListMagicV1 = "LVL1";
+inline constexpr std::string_view kListMagicV2 = "LVL2";
+inline constexpr std::string_view kSortedSetMagicV1 = "LZS1";
+inline constexpr std::string_view kSortedSetMagicV2 = "LZS2";
 
 struct OrderedCompactEntryView {
   std::string_view value_;

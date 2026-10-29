@@ -305,7 +305,8 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
   if (phase_ == 0) {
     phase_ = 1;
     if (compact_) {
-      std::memcpy(framing_.data(), source_.sorted_ ? "LZS2" : "LVL2", 4);
+      const auto magic = source_.sorted_ ? kSortedSetMagicV2 : kListMagicV2;
+      std::memcpy(framing_.data(), magic.data(), magic.size());
       for (unsigned i = 0; i < 4; ++i)
         framing_[4 + i] = static_cast<char>(count_ >> (8 * i));
       return std::string_view(framing_.data(), framing_.size());
@@ -386,7 +387,7 @@ absl::StatusOr<std::string> EncodeIndexedCompactValue(
   }
   std::string output;
   output.reserve(8 + size);
-  output.append(sorted ? "LZS2" : "LVL2");
+  output.append(sorted ? kSortedSetMagicV2 : kListMagicV2);
   Put(output, entries.size(), 4);
   for (const auto& entry : entries) output.append(entry.value_);
   if (sorted)
@@ -407,7 +408,7 @@ absl::StatusOr<OrderedCompactReader> OrderedCompactReader::Open(
     std::uint64_t expected_count) {
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
   if (ValidKind(kind) && expected_count != 0 && encoded.size() >= 8 &&
-      encoded.starts_with(sorted ? "LZS2" : "LVL2") &&
+      encoded.starts_with(sorted ? kSortedSetMagicV2 : kListMagicV2) &&
       Get(encoded, 4, 4) == expected_count) {
     auto indexed =
         IndexedOrderedReader::Open(kind, encoded.substr(8), expected_count);
@@ -418,7 +419,8 @@ absl::StatusOr<OrderedCompactReader> OrderedCompactReader::Open(
   }
   const std::size_t framing = sorted ? 12 : 4;
   if (!ValidKind(kind) || expected_count == 0 || expected_count > UINT32_MAX ||
-      encoded.size() < 8 || !encoded.starts_with(sorted ? "LZS1" : "LVL1") ||
+      encoded.size() < 8 ||
+      !encoded.starts_with(sorted ? kSortedSetMagicV1 : kListMagicV1) ||
       Get(encoded, 4, 4) != expected_count ||
       expected_count > (encoded.size() - 8) / framing)
     return absl::DataLossError("invalid ordered full-image framing");
@@ -508,7 +510,7 @@ absl::StatusOr<std::string> EncodeOrderedCompactValue(
     size = *next;
   }
   encoded.reserve(size);
-  encoded.append(sorted ? "LZS1" : "LVL1");
+  encoded.append(sorted ? kSortedSetMagicV1 : kListMagicV1);
   Put(encoded, entries.size(), 4);
   for (const auto& entry : entries) {
     if (sorted) Put(encoded, std::bit_cast<std::uint64_t>(entry.score_), 8);
@@ -523,8 +525,9 @@ absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
     std::uint64_t expected_count) {
   if (kind == OrderedCollectionKind::kStream)
     return DecodeStreamRecords(encoded, expected_count);
-  if (encoded.starts_with(kind == OrderedCollectionKind::kSortedSet ? "LZS2"
-                                                                    : "LVL2")) {
+  if (encoded.starts_with(kind == OrderedCollectionKind::kSortedSet
+                              ? kSortedSetMagicV2
+                              : kListMagicV2)) {
     auto reader = OrderedCompactReader::Open(kind, encoded, expected_count);
     if (!reader.ok()) return reader.status();
     std::vector<OrderedCollectionEntry> result;
@@ -543,7 +546,7 @@ absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
   }
   const bool sorted = kind == OrderedCollectionKind::kSortedSet;
   const std::size_t framing = sorted ? 12 : 4;
-  if (!encoded.starts_with(sorted ? "LZS1" : "LVL1") ||
+  if (!encoded.starts_with(sorted ? kSortedSetMagicV1 : kListMagicV1) ||
       Get(encoded, 4, 4) != expected_count ||
       expected_count > (encoded.size() - 8) / framing) {
     return absl::DataLossError("invalid ordered full-image framing");

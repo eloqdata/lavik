@@ -22,7 +22,6 @@ namespace lavik::storage {
 
 namespace {
 
-constexpr std::string_view kListMagic = "LVL1";
 constexpr std::size_t kListHeaderBytes = 8;
 
 void AppendU32(std::string* output, std::uint32_t value) {
@@ -49,7 +48,7 @@ bool ReadU32(std::string_view input, std::size_t* offset,
 
 absl::StatusOr<std::vector<std::string>> DecodeList(
     std::string_view encoded, std::uint64_t expected_count) {
-  if (encoded.starts_with("LVL2")) {
+  if (encoded.starts_with(kListMagicV2)) {
     auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kList,
                                              encoded, expected_count);
     if (!reader.ok()) return reader.status();
@@ -64,10 +63,10 @@ absl::StatusOr<std::vector<std::string>> DecodeList(
   }
   if (expected_count > std::numeric_limits<std::uint32_t>::max() ||
       encoded.size() < kListHeaderBytes ||
-      encoded.substr(0, kListMagic.size()) != kListMagic) {
+      encoded.substr(0, kListMagicV1.size()) != kListMagicV1) {
     return absl::InternalError("invalid persisted List");
   }
-  std::size_t offset = kListMagic.size();
+  std::size_t offset = kListMagicV1.size();
   std::uint32_t count = 0;
   if (!ReadU32(encoded, &offset, &count) || count != expected_count) {
     return absl::InternalError("List count does not match record metadata");
@@ -108,7 +107,7 @@ absl::StatusOr<std::string> EncodeList(std::span<const std::string> elements) {
   if (bytes > UINT32_MAX)
     return absl::OutOfRangeError("List index exceeds offset range");
   output.reserve(bytes);
-  output.append("LVL2");
+  output.append(kListMagicV2);
   AppendU32(&output, static_cast<std::uint32_t>(elements.size()));
   for (const auto& element : elements) output.append(element);
   std::uint32_t offset = 0;
@@ -321,9 +320,9 @@ absl::StatusOr<ListResult> ReadPackedListRange(std::string_view encoded,
                                                const ListOperation& operation) {
   if (expected_count > std::numeric_limits<std::uint32_t>::max() ||
       encoded.size() < kListHeaderBytes ||
-      encoded.substr(0, kListMagic.size()) != kListMagic)
+      encoded.substr(0, kListMagicV1.size()) != kListMagicV1)
     return absl::InternalError("invalid persisted List");
-  std::size_t offset = kListMagic.size();
+  std::size_t offset = kListMagicV1.size();
   std::uint32_t count = 0;
   if (!ReadU32(encoded, &offset, &count) || count != expected_count)
     return absl::InternalError("List count does not match record metadata");
@@ -516,7 +515,7 @@ absl::StatusOr<ListResult> ReadCompactList(const CompactReadResult& value,
   ListResult result;
   result.key_exists_ = value->has_value();
   result.length_ = *value ? (**value).logical_size_ : 0;
-  if (*value && (**value).encoded_.starts_with("LVL2") &&
+  if (*value && (**value).encoded_.starts_with(kListMagicV2) &&
       (operation.kind_ == ListOperationKind::kIndex ||
        operation.kind_ == ListOperationKind::kRange))
     return ReadIndexedList((**value).encoded_, (**value).logical_size_,
@@ -737,7 +736,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     const auto bytes = loaded->value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
                                    bytes.size());
-    if (read_only && payload.starts_with("LVL2") &&
+    if (read_only && payload.starts_with(kListMagicV2) &&
         (operation.kind_ == ListOperationKind::kIndex ||
          operation.kind_ == ListOperationKind::kRange))
       co_return ReadIndexedList(payload, location.logical_size_, operation);

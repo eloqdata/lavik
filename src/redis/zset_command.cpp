@@ -51,7 +51,6 @@
 namespace lavik {
 namespace {
 
-constexpr std::string_view kMagic = "LZS1";
 constexpr double kGeoMinLat = -85.05112878;
 constexpr double kGeoMaxLat = 85.05112878;
 constexpr double kEarthRadiusMeters = 6372797.560856;
@@ -354,7 +353,7 @@ absl::StatusOr<std::string> Encode(const ZSet& set) {
     bytes = *next;
   }
   out.reserve(bytes);
-  out.append(kMagic);
+  out.append(storage::kSortedSetMagicV1);
   Put32(&out, static_cast<std::uint32_t>(set.size()));
   for (const auto& element : set) {
     Put64(&out, std::bit_cast<std::uint64_t>(element.score_));

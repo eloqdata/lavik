@@ -73,9 +73,7 @@ constexpr std::uint8_t kSelectDb = 254;
 constexpr std::uint8_t kEof = 255;
 
 constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
-constexpr std::string_view kListMagic = "LVL1";
 
-constexpr std::string_view kZSetMagic = "LZS1";
 // Lavik's v1 Stream layout includes macro-node counts; it is independent of
 // the standard Redis RDB version and has no legacy development decoder.
 constexpr std::string_view kStreamMagic = "LXS1";
@@ -2209,7 +2207,7 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
       if (!text_size(&bytes, value)) return Bad("value exceeds Lavik limits");
     }
     raw.logical_size_ = values.size();
-    raw.encoded_ = std::string(kListMagic);
+    raw.encoded_ = std::string(storage::kListMagicV1);
     raw.encoded_.reserve(bytes);
     PutLe32(&raw.encoded_, static_cast<std::uint32_t>(values.size()));
     for (const auto& value : values) {
@@ -2259,7 +2257,7 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
         return Bad("value exceeds Lavik limits");
     }
     raw.logical_size_ = values.size();
-    raw.encoded_ = std::string(kZSetMagic);
+    raw.encoded_ = std::string(storage::kSortedSetMagicV1);
     raw.encoded_.reserve(bytes);
     PutLe32(&raw.encoded_, values.size());
     for (const auto& value : values) {

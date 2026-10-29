@@ -824,7 +824,8 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
     Members& members, SortedSetResult& result,
     std::optional<MemoryReservation>& compact_admission,
     OrderedCompactPayload* point_payload = nullptr) {
-  if (value && value->encoded_.starts_with("LZS2") && ReadOnly(operation) &&
+  if (value && value->encoded_.starts_with(kSortedSetMagicV2) &&
+      ReadOnly(operation) &&
       (operation.kind_ == SortedSetOperationKind::kRandom ||
        ((operation.kind_ == SortedSetOperationKind::kRange ||
          operation.kind_ == SortedSetOperationKind::kCount) &&
