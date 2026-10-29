@@ -42,11 +42,15 @@
                 },
                 "1": {
                   "color": "yellow",
-                  "text": "STARTING"
+                  "text": "NOT READY"
                 },
                 "2": {
                   "color": "green",
-                  "text": "UP"
+                  "text": "READY"
+                },
+                "-1": {
+                  "color": "orange",
+                  "text": "UNKNOWN"
                 }
               },
               "type": "value"
@@ -96,7 +100,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "min by (instance) (up{job=\"lavik\",instance=~\"$instance\"}) + min by (instance) (up{job=\"lavik\",instance=~\"$instance\"}) * (min by (instance) (lavik_server_ready{instance=~\"$instance\"}) or on (instance) (min by (instance) (up{job=\"lavik\",instance=~\"$instance\"}) * 0 + 1))",
+          "expr": "(min by (instance) (up{job=\"lavik\",instance=~\"$instance\"}) == 0) or ((min by (instance) (lavik_server_ready{job=\"lavik\",instance=~\"$instance\"}) + 1) and on (instance) (min by (instance) (up{job=\"lavik\",instance=~\"$instance\"}) == 1)) or ((min by (instance) (up{job=\"lavik\",instance=~\"$instance\"}) == 1) * -1)",
           "instant": true,
           "legendFormat": "{{instance}}",
           "range": false,
@@ -104,7 +108,8 @@
         }
       ],
       "title": "Target Status",
-      "type": "stat"
+      "type": "stat",
+      "description": "DOWN means failed scrape; NOT READY means storage startup/runtime health is not ready; READY is not serving authority or FULL population readiness; UNKNOWN means readiness telemetry is missing."
     },
     {
       "datasource": {
@@ -1901,7 +1906,7 @@
           "targets": [
             {
               "editorMode": "code",
-              "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"observation\"}[$__rate_interval])))",
+              "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\",stage=\"observation\"}[$__rate_interval])))",
               "instant": false,
               "legendFormat": "{{instance}} P95",
               "range": true,
@@ -1909,7 +1914,7 @@
             },
             {
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"observation\"}[$__rate_interval])))",
+              "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\",stage=\"observation\"}[$__rate_interval])))",
               "instant": false,
               "legendFormat": "{{instance}} P99",
               "range": true,
@@ -1999,7 +2004,7 @@
           "targets": [
             {
               "editorMode": "code",
-              "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"lease_installation\"}[$__rate_interval])))",
+              "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\",stage=\"lease_installation\"}[$__rate_interval])))",
               "instant": false,
               "legendFormat": "{{instance}} P95",
               "range": true,
@@ -2007,7 +2012,7 @@
             },
             {
               "editorMode": "code",
-              "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"lease_installation\"}[$__rate_interval])))",
+              "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(lavik_cluster_control_wait_seconds_bucket{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\",stage=\"lease_installation\"}[$__rate_interval])))",
               "instant": false,
               "legendFormat": "{{instance}} P99",
               "range": true,
@@ -2098,7 +2103,7 @@
           "targets": [
             {
               "editorMode": "code",
-              "expr": "lavik_cluster_control_connected{job=\"lavik\",instance=~\"$instance\"}",
+              "expr": "lavik_cluster_control_connected{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}",
               "instant": false,
               "legendFormat": "{{instance}}",
               "range": true,
@@ -2188,7 +2193,7 @@
           "targets": [
             {
               "editorMode": "code",
-              "expr": "rate(lavik_cluster_control_lease_decisions_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+              "expr": "rate(lavik_cluster_control_lease_decisions_total{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}[$__rate_interval])",
               "instant": false,
               "legendFormat": "{{instance}} {{decision}}",
               "range": true,
@@ -2278,7 +2283,7 @@
           "targets": [
             {
               "editorMode": "code",
-              "expr": "increase(lavik_cluster_control_lease_expirations_total{job=\"lavik\",instance=~\"$instance\"}[5m])",
+              "expr": "increase(lavik_cluster_control_lease_expirations_total{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}[5m])",
               "instant": false,
               "legendFormat": "{{instance}} lease expired",
               "range": true,
@@ -2286,7 +2291,7 @@
             },
             {
               "editorMode": "code",
-              "expr": "increase(lavik_cluster_control_reconnects_total{job=\"lavik\",instance=~\"$instance\"}[5m])",
+              "expr": "increase(lavik_cluster_control_reconnects_total{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}[5m])",
               "instant": false,
               "legendFormat": "{{instance}} reconnect",
               "range": true,
@@ -2294,7 +2299,7 @@
             },
             {
               "editorMode": "code",
-              "expr": "increase(lavik_cluster_control_protocol_errors_total{job=\"lavik\",instance=~\"$instance\"}[5m])",
+              "expr": "increase(lavik_cluster_control_protocol_errors_total{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}[5m])",
               "instant": false,
               "legendFormat": "{{instance}} protocol error",
               "range": true,
@@ -2384,7 +2389,7 @@
           "targets": [
             {
               "editorMode": "code",
-              "expr": "increase(lavik_cluster_control_full_states_applied_total{job=\"lavik\",instance=~\"$instance\"}[5m])",
+              "expr": "increase(lavik_cluster_control_full_states_applied_total{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}[5m])",
               "instant": false,
               "legendFormat": "{{instance}} full state",
               "range": true,
@@ -2392,7 +2397,7 @@
             },
             {
               "editorMode": "code",
-              "expr": "increase(lavik_cluster_control_directive_results_total{job=\"lavik\",instance=~\"$instance\"}[5m])",
+              "expr": "increase(lavik_cluster_control_directive_results_total{job=\"lavik\",lavik_mode=\"meta-managed\",instance=~\"$instance\"}[5m])",
               "instant": false,
               "legendFormat": "{{instance}} {{result}}",
               "range": true,
@@ -2402,6 +2407,384 @@
           "title": "Meta State and Directive Results (5 min)",
           "type": "timeseries",
           "description": "Complete desired-state applications and Data-side directive outcomes by node over the last 5 minutes."
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "title": "Alerts and Replication Pressure",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "ops",
+              "min": 0
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 71
+          },
+          "id": 34,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(lavik_memory_rejected_commands_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+              "legendFormat": "{{instance}} {{worker}} {{alertname}} {{severity}}",
+              "range": true
+            }
+          ],
+          "title": "Memory Admission Rejections",
+          "type": "timeseries",
+          "description": "Actual rejected growth, including low-traffic incidents. This is not a command error ratio."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "percentunit",
+              "min": 0
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 71
+          },
+          "id": 35,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "lavik:publisher_queue_ratio{job=\"lavik\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} {{worker}} {{alertname}} {{severity}}",
+              "range": true
+            },
+            {
+              "refId": "B",
+              "expr": "lavik_replication_backlog_backpressured{job=\"lavik\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} worker {{worker}} backpressured",
+              "range": true
+            },
+            {
+              "refId": "C",
+              "expr": "lavik_replication_backlog_pinned_cursors{job=\"lavik\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} worker {{worker}} pinned cursors",
+              "range": true
+            }
+          ],
+          "title": "Backlog and Publisher Pressure",
+          "type": "timeseries",
+          "description": "Publisher queue occupancy; compare backlog backpressure and retained replica claims."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "percentunit",
+              "min": 0
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 79
+          },
+          "id": 36,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "lavik:fullsync_queue_ratio{job=\"lavik\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} {{worker}} {{alertname}} {{severity}}",
+              "range": true
+            }
+          ],
+          "title": "FULL Publication Queue Pressure",
+          "type": "timeseries",
+          "description": "Queued plus admitted bytes divided by aggregate active-session capacity. May exceed one for oversized commands; does not prove stalled progress."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "short",
+              "min": 0
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 79
+          },
+          "id": 37,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "ALERTS{alertstate=\"firing\",instance=~\"$instance\"} or ALERTS{alertstate=\"firing\",alertname=\"LavikNoTargets\"}",
+              "legendFormat": "{{instance}} {{worker}} {{alertname}} {{severity}}",
+              "range": true
+            }
+          ],
+          "title": "Current Alerts",
+          "type": "timeseries",
+          "description": "Prometheus firing state. Alertmanager may inhibit or silence notifications; resolved alone is not proof of recovery."
         }
       ]
     }

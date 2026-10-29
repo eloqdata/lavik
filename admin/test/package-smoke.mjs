@@ -42,6 +42,14 @@ try {
     assert.ok(
       (await readFile(join(bundle, "admin", "quickstart", asset))).length,
     );
+  const { monitoringFiles } = await import(
+    new URL(`file://${join(bundle, "admin", "monitoring.mjs")}`)
+  );
+  const monitoring = await monitoringFiles();
+  assert.ok(monitoring["prometheus/rules/alerts.yml"]);
+  assert.ok(monitoring["configure-targets.sh"]);
+  assert.ok(monitoring["alertmanager/alertmanager.yml"]);
+  assert.equal(monitoring[".env"], undefined);
   const login = await fetch(base + "/api/login", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Lavik-Admin": "1" },

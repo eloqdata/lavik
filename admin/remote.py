@@ -545,15 +545,30 @@ def monitoring(request):
             "PROMETHEUS_PORT=" + str(request.get("prometheusPort", 9090)),
             "GRAFANA_PORT=" + str(request.get("grafanaPort", 3000)),
             "LAVIK_TARGETS=" + ",".join(request["targets"]),
+            "LAVIK_MODE=" + request.get("mode", "meta-managed"),
+            "LAVIK_CLUSTER=" + request["cluster"],
+            "GRAFANA_PUBLIC_URL=" + request["grafanaUrl"],
             "",
         ]
     )
+    # Preserve operator-owned notification/image overrides when adding followers.
+    # Admin owns only these generated discovery and listener values.
+    managed_keys = {
+        line.split("=", 1)[0] for line in environment.splitlines() if "=" in line
+    }
+    if env.exists():
+        custom = [
+            line
+            for line in env.read_text().splitlines()
+            if line.split("=", 1)[0].strip() not in managed_keys
+        ]
+        environment += "\n".join(custom) + "\n"
     # Atomic target changes survive a later manual Compose restart too.
     temporary = root / ".env.next"
     temporary.write_text(environment)
     temporary.chmod(0o600)
     temporary.replace(env)
-    # Targets are the only mutable configuration. Pass them to Compose without
+    # Pass target changes to Compose without
     # exposing the generated password in argv, logs, the plan, or the browser.
     argv = [
         "docker",

@@ -544,6 +544,15 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
       "127.0.0.1:9102",
     ]);
     assert.ok(request.files["grafana/dashboards/lavik-overview.json"]);
+    assert.ok(request.files["prometheus/rules/alerts.yml"]);
+    assert.ok(request.files["prometheus/rules/recording.yml"]);
+    assert.ok(request.files["configure-targets.sh"]);
+    assert.ok(request.files["alertmanager/alertmanager.yml"]);
+    assert.equal(request.mode, "meta-managed");
+    assert.equal(
+      request.grafanaUrl,
+      `http://${request.address}:${request.grafanaPort}`,
+    );
     assert.equal(request.password, undefined);
     assert.throws(
       () => topology(settings({ ...input, monitorHosts: [0], dataPort: 3000 })),

@@ -1,0 +1,15 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+# Runtime allowlist shared by Admin uploads and release packaging. No secrets/tests.
+runtime-files.txt
+compose.yaml
+configure-targets.sh
+prometheus/prometheus.yml
+prometheus/targets.example.json
+prometheus/rules/recording.yml
+prometheus/rules/alerts.yml
+alertmanager/alertmanager.yml
+alertmanager/receivers.example.yml
+alertmanager/templates/lavik.tmpl
+grafana/dashboards/lavik-overview.json
+grafana/provisioning/dashboards/lavik.yaml
+grafana/provisioning/datasources/prometheus.yaml
