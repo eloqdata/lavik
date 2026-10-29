@@ -471,7 +471,7 @@ struct RecoveryOrderedMetadata {
   // zero scores (checked by the decoder); only Sorted Set needs score bounds.
   union {
     ScoreBounds scores_{};
-    StreamPageMaxKey stream_max_key_;
+    OrderedPageMaxKey max_key_;
   };
 };
 static_assert(sizeof(RecoveryOrderedMetadata) <= 40);

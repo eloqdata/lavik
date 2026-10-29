@@ -1497,6 +1497,118 @@ TEST(GroupedSortedSetWriteE2e, MemberRanksSkipUnrelatedPagesAfterRecovery) {
   }
 }
 
+TEST(GroupedSortedSetWriteE2e, MemberPrefixesSkipUnneededMidpointReads) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "member-prefix";
+  std::vector<std::string> members;
+  std::vector<std::string> seed{"ZADD", key};
+  for (unsigned i = 0; i < 64; ++i) {
+    // One member per page, distinguishable within the resident prefix.
+    members.push_back(std::to_string(1000 + i) + std::string(20 * 1024, 'x'));
+    seed.insert(seed.end(), {"7", members.back()});
+  }
+  {
+    ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY",
+                                key.c_str());
+    // An uncached binary search of 64 tied pages must read this midpoint.
+    ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "33");
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(seed).text_, "64");
+    EXPECT_EQ(client.Command({"ZRANK", key, members.back()}).text_, "63");
+    EXPECT_EQ(client.Command({"ZRANK", key, members.front()}).text_, "0");
+    EXPECT_EQ(client.Command({"ZINCRBY", key, "1", members.back()}).text_, "8");
+    const auto fresh = members[62] + std::string(1, '\0');
+    EXPECT_EQ(client.Command({"ZADD", key, "7", fresh}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "63");
+    EXPECT_EQ(client.Command({"ZREM", key, members[62]}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "62");
+    // Prefixes only settle routing; the selected page still has to be read.
+    const auto failed = client.Command({"ZRANK", key, members[32]});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZRANK", key, members.back()}).text_, "63");
+  EXPECT_EQ(client.Command({"ZSCORE", key, members.back()}).text_, "8");
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "64");
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     MemberPageSearchStaysBinaryWithUnknownOrLongPrefixes) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  for (const auto [common_prefix, checkpoint] :
+       {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
+    SCOPED_TRACE("common_prefix=" + std::to_string(common_prefix) +
+                 " checkpoint=" + std::to_string(checkpoint));
+    PrivateDisk disk;
+    const std::string key = "member-binary";
+    std::vector<std::string> members;
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 64; ++i) {
+      members.push_back((common_prefix ? std::string(32, '\0') : "") +
+                        std::to_string(1000 + i) + std::string(20 * 1024, 'x'));
+      seed.insert(seed.end(), {"7", members.back()});
+    }
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      ASSERT_EQ(client.Command(seed).text_, "64");
+      if (checkpoint)
+        ASSERT_EQ(
+            client.Command({"CONFIG", "SET", "shutdown-checkpoint", "yes"})
+                .text_,
+            "OK");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+      if (checkpoint)
+        ASSERT_NE(
+            server.Log().find("published shutdown checkpoint generation="),
+            std::string::npos)
+            << server.Log();
+    }
+    ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY",
+                                key.c_str());
+    // Recovery starts without member prefixes. Reading the first tied page
+    // fails a linear candidate scan; a binary search near the tail skips it.
+    // Long common prefixes force exact midpoint reads even after warming.
+    ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "1");
+    const std::array<std::string_view, 1> checkpoint_args{
+        checkpoint ? "--shutdown-checkpoint" : "--no-shutdown-checkpoint"};
+    Server recovered(disk, checkpoint ? 1 : 3, {}, {}, false, 2, "2G", {}, {},
+                     0, 20, checkpoint_args);
+    Client client(recovered.port());
+    if (checkpoint)
+      ASSERT_NE(recovered.Log().find("loaded shutdown checkpoint generation="),
+                std::string::npos)
+          << recovered.Log();
+    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+      EXPECT_EQ(client.Command({"ZRANK", key, members.back()}).text_, "63");
+      EXPECT_EQ(client.Command({"ZREVRANK", key, members.back()}).text_, "0");
+    }
+    EXPECT_EQ(client.Command({"ZINCRBY", key, "1", members.back()}).text_, "8");
+    const auto fresh = members[62] + std::string(1, '\xff');
+    EXPECT_EQ(client.Command({"ZADD", key, "7", fresh}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "63");
+    EXPECT_EQ(client.Command({"ZREM", key, members[62]}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "62");
+    const auto failed = client.Command({"ZRANK", key, members.front()});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+    client.Durable();
+    EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+}
+
 TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires selected ordered-page failure injection";

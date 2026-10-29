@@ -113,7 +113,7 @@ struct StorageEngine::Impl::StreamPageAccess {
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
     if (!max_key.ok()) co_return max_key.status();
     auto remembered =
-        object_->ordered_directory().RememberStreamPageMaxKey(index, *max_key);
+        object_->ordered_directory().RememberPageMaxKey(index, *max_key);
     if (!remembered.ok()) co_return remembered;
     if (index == 0) {
       auto header =
@@ -143,9 +143,9 @@ struct StorageEngine::Impl::StreamPageAccess {
     std::size_t first = 0, last = size;
     while (first < last) {
       const auto middle = first + (last - first) / 2;
-      auto less = object_->ordered_directory()
-                      .groups()[middle]
-                      .stream_max_key_.LessThan(wanted);
+      auto less =
+          object_->ordered_directory().groups()[middle].max_key_.LessThan(
+              wanted);
       if (!less) {
         auto status = co_await Load(middle);
         if (!status.ok()) co_return status;
@@ -1705,7 +1705,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
     if (!max_key.ok()) co_return max_key.status();
     auto remembered =
-        object->ordered_directory().RememberStreamPageMaxKey(index, *max_key);
+        object->ordered_directory().RememberPageMaxKey(index, *max_key);
     if (!remembered.ok()) co_return remembered;
     if (index == 0) {
       auto payload =
@@ -1733,7 +1733,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
   if (range.count_ != 0 && low <= high) {
     while (first < last) {
       const auto middle = first + (last - first) / 2;
-      auto less = groups[middle].stream_max_key_.LessThan(wanted);
+      auto less = groups[middle].max_key_.LessThan(wanted);
       if (!less) {
         auto page = co_await load(middle);
         if (!page.ok()) co_return page.status();

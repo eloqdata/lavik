@@ -305,15 +305,15 @@ OrderedGroupSnapshot Retired(const OrderedCollectionRoot& root,
 
 }  // namespace
 
-void StreamPageMaxKey::Set(std::string_view key) noexcept {
+void OrderedPageMaxKey::Set(std::string_view key) noexcept {
   size_ = static_cast<std::uint8_t>(std::min(key.size(), prefix_.size()));
   exact_ = key.size() <= prefix_.size();
   std::copy_n(key.data(), size_, prefix_.data());
 }
 
-std::optional<bool> StreamPageMaxKey::LessThan(
+std::optional<bool> OrderedPageMaxKey::LessThan(
     std::string_view key) const noexcept {
-  if (size_ == 0) return std::nullopt;
+  if (size_ == 0 && !exact_) return std::nullopt;
   const std::string_view prefix(prefix_.data(), size_);
   if (exact_) return prefix < key;
   const auto common = std::min(prefix.size(), key.size());
@@ -325,9 +325,9 @@ std::optional<bool> StreamPageMaxKey::LessThan(
   return std::nullopt;
 }
 
-std::optional<bool> StreamPageMaxKey::LessThanOrEqual(
+std::optional<bool> OrderedPageMaxKey::LessThanOrEqual(
     std::string_view key) const noexcept {
-  if (size_ == 0) return std::nullopt;
+  if (size_ == 0 && !exact_) return std::nullopt;
   const std::string_view prefix(prefix_.data(), size_);
   if (exact_) return prefix <= key;
   const auto common = std::min(prefix.size(), key.size());
@@ -1229,17 +1229,19 @@ const OrderedGroupEntry* OrderedGroupDirectory::FindRecord(
   return found != retired_.end() && found->id_ == id ? &*found : nullptr;
 }
 
-absl::Status OrderedGroupDirectory::RememberStreamPageMaxKey(
+absl::Status OrderedGroupDirectory::RememberPageMaxKey(
     std::size_t index, std::string_view key) const {
-  if (root_.kind_ != OrderedCollectionKind::kStream ||
-      index >= groups_.size() || key.empty())
-    return absl::InvalidArgumentError("invalid Stream page boundary");
-  auto& bound = groups_[index].stream_max_key_;
-  if (bound.size_ != 0) {
+  if ((root_.kind_ != OrderedCollectionKind::kStream &&
+       root_.kind_ != OrderedCollectionKind::kSortedSet) ||
+      index >= groups_.size() ||
+      (root_.kind_ == OrderedCollectionKind::kStream && key.empty()))
+    return absl::InvalidArgumentError("invalid ordered page boundary");
+  auto& bound = groups_[index].max_key_;
+  if (bound.size_ != 0 || bound.exact_) {
     const std::string_view old(bound.prefix_.data(), bound.size_);
     if (key.size() < old.size() || key.substr(0, old.size()) != old ||
-        (bound.exact_ && key.size() != old.size()))
-      return absl::DataLossError("Stream page boundary changed within view");
+        (bound.exact_ ? key.size() != old.size() : key.size() <= old.size()))
+      return absl::DataLossError("ordered page boundary changed within view");
   }
   bound.Set(key);
   return absl::OkStatus();
