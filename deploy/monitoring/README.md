@@ -158,9 +158,11 @@ edit. Prometheus validates the discovery file; inspect Targets for any load erro
 health, and neither proves serving authority or complete FULL population
 readiness. Target Status displays missing readiness as UNKNOWN.
 
-The expanded **Alerts** section sits immediately below the overview cards. It
-shows Critical/Warning firing counts, a Pending count, a sortable/filterable
-current-alert table, and an **Alert Activity** state timeline. The table includes
+The **Alerts** section sits immediately below the overview cards. Its compact
+title bar shows Critical/Warning firing counts and a Pending count as badges to
+the right of the heading, using the built-in Grafana Canvas panel. A
+sortable/filterable current-alert table and an **Alert Activity** state timeline
+follow below. The table includes
 scope (worker/device/signal), active duration, and links to the relevant runbook
 and metric panel. **Worker Memory** contains memory-admission rejections;
 **Replication Pressure** contains only replication queues and backlog pressure.

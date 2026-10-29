@@ -53,12 +53,14 @@ use bounded Alertmanager silences, with an owner and expiry.
 
 ## Dashboard
 
-The Overview dashboard's expanded **Alerts** section is independent of the
-replication panels. Critical and Warning count firing alert instances; Pending
+The Overview dashboard's **Alerts** section is independent of the replication
+panels. A compact Canvas title bar places live count badges to the right of
+**Alerts**. Critical and Warning count firing alert instances; Pending
 counts conditions still waiting for their `for` duration. Counts and the current
 alert table use the selected range's end, so a historical range is a historical
 snapshot. The instance selector applies to all these panels; `LavikNoTargets`
-remains visible because it has no target instance.
+remains visible because it has no target instance. The badges show `?` when
+their query fields are unavailable; this is distinct from a successful zero.
 
 Each table row is a Prometheus alert instance, including severity and any
 worker/device/signal scope. Warning and critical rules can both appear for the

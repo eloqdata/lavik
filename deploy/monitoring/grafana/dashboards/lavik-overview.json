@@ -345,213 +345,319 @@
     },
     {
       "id": 38,
-      "type": "row",
-      "title": "Alerts",
-      "collapsed": false,
-      "panels": [],
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 4
-      }
-    },
-    {
-      "id": 39,
-      "type": "stat",
-      "title": "Critical",
+      "type": "canvas",
+      "title": "",
+      "transparent": true,
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Prometheus alert instances at the selected range end, filtered by Lavik instance. Firing counts include inhibited or silenced notifications. A query error is not a healthy state.",
+      "description": "Prometheus alert counts at the selected range end, filtered by Lavik instance. Critical/Warning count firing rule instances, including inhibited or silenced notifications; Pending is not yet firing. The Canvas title bar uses right-anchored field values so the summary stays beside Alerts. A missing field/query failure displays ? rather than a healthy zero.",
+      "gridPos": {
+        "h": 2,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
       "targets": [
         {
           "refId": "A",
           "editorMode": "code",
           "expr": "sum((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\",severity=\"critical\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\",severity=\"critical\"})) or vector(0)",
           "instant": true,
-          "range": false
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "noValue": "Unknown",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          }
+          "range": false,
+          "legendFormat": "Critical"
         },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 28,
-          "titleSize": 14
-        }
-      },
-      "gridPos": {
-        "h": 2,
-        "w": 8,
-        "x": 0,
-        "y": 5
-      }
-    },
-    {
-      "id": 40,
-      "type": "stat",
-      "title": "Warning",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Prometheus alert instances at the selected range end, filtered by Lavik instance. Firing counts include inhibited or silenced notifications. A query error is not a healthy state.",
-      "targets": [
         {
-          "refId": "A",
+          "refId": "B",
           "editorMode": "code",
           "expr": "sum((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\",severity=\"warning\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\",severity=\"warning\"})) or vector(0)",
           "instant": true,
-          "range": false
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "noValue": "Unknown",
-          "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              }
-            ]
-          }
+          "range": false,
+          "legendFormat": "Warning"
         },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 28,
-          "titleSize": 14
-        }
-      },
-      "gridPos": {
-        "h": 2,
-        "w": 8,
-        "x": 8,
-        "y": 5
-      }
-    },
-    {
-      "id": 41,
-      "type": "stat",
-      "title": "Pending",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "Prometheus alert instances at the selected range end, filtered by Lavik instance. Firing counts include inhibited or silenced notifications. A query error is not a healthy state.",
-      "targets": [
         {
-          "refId": "A",
+          "refId": "C",
           "editorMode": "code",
           "expr": "sum((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending\"})) or vector(0)",
           "instant": true,
-          "range": false
+          "range": false,
+          "legendFormat": "Pending"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "noValue": "Unknown",
           "decimals": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
+          "noValue": "?",
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Critical"
+            },
+            "properties": [
               {
-                "color": "text",
-                "value": null
+                "id": "unit",
+                "value": "prefix:Critical "
               },
               {
-                "color": "blue",
-                "value": 1
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Warning"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "prefix:Warning "
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pending"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "prefix:Pending "
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "blue",
+                      "value": 1
+                    }
+                  ]
+                }
               }
             ]
           }
-        },
-        "overrides": []
+        ]
       },
       "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": ["lastNotNull"],
-          "fields": "",
-          "values": false
+        "inlineEditing": false,
+        "panZoom": false,
+        "showAdvancedTypes": false,
+        "tooltip": {
+          "mode": "none"
         },
-        "textMode": "value",
-        "wideLayout": true,
-        "text": {
-          "valueSize": 28,
-          "titleSize": 14
+        "root": {
+          "name": "Alert summary",
+          "type": "frame",
+          "elements": [
+            {
+              "name": "Alerts title",
+              "type": "text",
+              "config": {
+                "text": {
+                  "fixed": "Alerts",
+                  "mode": "fixed"
+                },
+                "align": "left",
+                "valign": "middle",
+                "size": 20,
+                "color": {
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "center"
+              },
+              "placement": {
+                "left": 12,
+                "top": 0,
+                "width": 160,
+                "height": 32
+              }
+            },
+            {
+              "name": "Critical badge",
+              "type": "text",
+              "config": {
+                "text": {
+                  "field": "Critical",
+                  "mode": "field",
+                  "fixed": "Critical ?"
+                },
+                "align": "center",
+                "valign": "middle",
+                "size": 16,
+                "color": {
+                  "field": "Critical",
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "right",
+                "vertical": "center"
+              },
+              "placement": {
+                "right": 292,
+                "top": 0,
+                "width": 128,
+                "height": 32
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "field": "Critical",
+                  "fixed": "text"
+                },
+                "width": 1,
+                "radius": 5
+              }
+            },
+            {
+              "name": "Warning badge",
+              "type": "text",
+              "config": {
+                "text": {
+                  "field": "Warning",
+                  "mode": "field",
+                  "fixed": "Warning ?"
+                },
+                "align": "center",
+                "valign": "middle",
+                "size": 16,
+                "color": {
+                  "field": "Warning",
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "right",
+                "vertical": "center"
+              },
+              "placement": {
+                "right": 152,
+                "top": 0,
+                "width": 128,
+                "height": 32
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "field": "Warning",
+                  "fixed": "text"
+                },
+                "width": 1,
+                "radius": 5
+              }
+            },
+            {
+              "name": "Pending badge",
+              "type": "text",
+              "config": {
+                "text": {
+                  "field": "Pending",
+                  "mode": "field",
+                  "fixed": "Pending ?"
+                },
+                "align": "center",
+                "valign": "middle",
+                "size": 16,
+                "color": {
+                  "field": "Pending",
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "right",
+                "vertical": "center"
+              },
+              "placement": {
+                "right": 12,
+                "top": 0,
+                "width": 128,
+                "height": 32
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "field": "Pending",
+                  "fixed": "text"
+                },
+                "width": 1,
+                "radius": 5
+              }
+            }
+          ]
         }
-      },
-      "gridPos": {
-        "h": 2,
-        "w": 8,
-        "x": 16,
-        "y": 5
       }
     },
     {
@@ -910,7 +1016,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 7
+        "y": 6
       }
     },
     {
@@ -993,7 +1099,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 15
+        "y": 14
       }
     },
     {
@@ -1006,7 +1112,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 21
       }
     },
     {
@@ -1068,7 +1174,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 22
       },
       "id": 7,
       "options": {
@@ -1156,7 +1262,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 22
       },
       "id": 8,
       "description": "P99.9 and P99.99 are estimates interpolated from Prometheus histogram buckets. Lavik exports dense boundaries around the 3 ms SLO and progressively wider buckets at higher latency; use longer windows for low-volume traffic.",
@@ -1273,7 +1379,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 31
+        "y": 30
       },
       "id": 18,
       "options": {
@@ -1362,7 +1468,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 31
+        "y": 30
       },
       "id": 19,
       "options": {
@@ -1436,7 +1542,7 @@
             "h": 4,
             "w": 5,
             "x": 0,
-            "y": 40
+            "y": 39
           },
           "id": 14,
           "options": {
@@ -1504,7 +1610,7 @@
             "h": 4,
             "w": 5,
             "x": 5,
-            "y": 40
+            "y": 39
           },
           "id": 15,
           "options": {
@@ -1562,7 +1668,7 @@
             "h": 4,
             "w": 4,
             "x": 10,
-            "y": 40
+            "y": 39
           },
           "id": 5,
           "options": {
@@ -1629,7 +1735,7 @@
             "h": 4,
             "w": 5,
             "x": 14,
-            "y": 40
+            "y": 39
           },
           "id": 6,
           "options": {
@@ -1697,7 +1803,7 @@
             "h": 4,
             "w": 5,
             "x": 19,
-            "y": 40
+            "y": 39
           },
           "id": 17,
           "options": {
@@ -1731,7 +1837,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 38
       }
     },
     {
@@ -1740,7 +1846,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 39
       },
       "id": 20,
       "panels": [
@@ -1893,7 +1999,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 41
+            "y": 40
           },
           "id": 9,
           "options": {
@@ -1959,7 +2065,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 40
       },
       "id": 21,
       "panels": [
@@ -2022,7 +2128,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 42
+            "y": 41
           },
           "id": 10,
           "options": {
@@ -2060,7 +2166,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 41
       },
       "id": 23,
       "panels": [],
@@ -2127,7 +2233,7 @@
         "h": 8,
         "w": 10,
         "x": 0,
-        "y": 43
+        "y": 42
       },
       "id": 11,
       "options": {
@@ -2222,7 +2328,7 @@
         "h": 8,
         "w": 14,
         "x": 10,
-        "y": 43
+        "y": 42
       },
       "id": 12,
       "options": {
@@ -2303,7 +2409,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 50
       },
       "id": 13,
       "options": {
@@ -2341,7 +2447,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 57
+        "y": 56
       },
       "id": 22,
       "panels": [
@@ -2404,7 +2510,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 58
+            "y": 57
           },
           "id": 16,
           "options": {
@@ -2463,7 +2569,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 58
+        "y": 57
       },
       "id": 24,
       "panels": [
@@ -2507,7 +2613,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 59
+            "y": 58
           },
           "id": 25,
           "options": {
@@ -2599,7 +2705,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 69
+            "y": 68
           },
           "id": 34,
           "options": {
@@ -2640,7 +2746,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 58
       },
       "panels": [
         {
@@ -2703,7 +2809,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 60
+            "y": 59
           },
           "id": 27,
           "options": {
@@ -2801,7 +2907,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 60
+            "y": 59
           },
           "id": 28,
           "options": {
@@ -2900,7 +3006,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 69
+            "y": 68
           },
           "id": 29,
           "options": {
@@ -2990,7 +3096,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 69
+            "y": 68
           },
           "id": 30,
           "options": {
@@ -3080,7 +3186,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 78
+            "y": 77
           },
           "id": 31,
           "options": {
@@ -3186,7 +3292,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 78
+            "y": 77
           },
           "id": 32,
           "options": {
@@ -3292,7 +3398,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 61
+            "y": 60
           },
           "id": 35,
           "options": {
@@ -3392,7 +3498,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 61
+            "y": 60
           },
           "id": 36,
           "options": {
@@ -3425,7 +3531,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 59
       }
     }
   ],
@@ -3474,6 +3580,6 @@
   "timezone": "browser",
   "title": "Lavik Overview",
   "uid": "lavik-overview",
-  "version": 8,
+  "version": 9,
   "weekStart": ""
 }
