@@ -1,0 +1,651 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+rule_files:
+  - ../rules/recording.yml
+  - ../rules/alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: backlog pressure escalates only when sustained
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 80x200
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikBacklogPressure",severity="warning"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikBacklogPressure",severity="critical"}) or vector(0)
+        eval_time: 14m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikBacklogPressure",severity="critical"}) or vector(0)
+        eval_time: 15m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: no pinned replica means no backlog alarm
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 80x200
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikBacklogPressure"}) or vector(0)
+        eval_time: 20m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: inactive backlog means no backlog alarm
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 80x200
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikBacklogPressure"}) or vector(0)
+        eval_time: 20m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: full queue includes pending admission
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 70x200
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 1x200
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncQueuePressure"}) or vector(0)
+        eval_time: 9m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncQueuePressure"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: no full sessions means no full alarm
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 70x200
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncQueuePressure"}) or vector(0)
+        eval_time: 20m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: standalone zeros never imply Meta failure
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname=~"LavikMeta.*|LavikLease.*"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: managed disconnection persists beyond elections
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikMetaDisconnected"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikMetaDisconnected"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: short disconnect and isolated protocol error do not fire
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 0x8 1x191
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 0x3 1x196
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname=~"LavikMeta.*"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: repeated protocol errors are actionable
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 0x3 3x196
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikMetaProtocolErrors"}) or vector(0)
+        eval_time: 2m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikMetaProtocolErrors"}) or vector(0)
+        eval_time: 9m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: actual lease expiry warns without requiring command traffic
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 0x3 1x196
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikLeaseExpirations",severity="warning"}) or vector(0)
+        eval_time: 2m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikLeaseExpirations",severity="critical"}) or vector(0)
+        eval_time: 2m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: repeated lease expirations escalate
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 0x3 3x196
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikLeaseExpirations",severity="critical"}) or vector(0)
+        eval_time: 2m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: control counter reset is not an error
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x200"
+      - series: lavik_worker_retained_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 10x200
+      - series: lavik_worker_memory_admission_pending_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_worker_memory_limit_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_storage_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 100x200
+      - series: lavik_storage_available_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",device="0",path="/data"}
+        values: 50x200
+      - series: lavik_replication_backlog_active{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_pinned_cursors{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_backlog_backpressured{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_replication_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: 100x200
+      - series: lavik_fullsync_publish_queue_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_fullsync_sessions{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed",worker="0"}
+        values: "0x200"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x200
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 50x8 0x191
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 50x8 0x191
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname=~"LavikMeta.*|LavikLease.*"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+group_eval_order:
+  - lavik.recording
+  - lavik.alerts

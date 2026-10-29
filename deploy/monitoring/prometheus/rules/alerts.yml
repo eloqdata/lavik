@@ -1,0 +1,397 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+# User-editable alert policy; thresholds are starting points, not measured SLOs.
+groups:
+  - name: lavik.alerts
+    rules:
+      - alert: LavikTargetDown
+        expr: up{job="lavik"} == 0
+        for: 2m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Lavik metrics endpoint is unreachable
+          description:
+            Scraping {{ $labels.instance }} failed. This is endpoint reachability, not a serving-authority
+            check. Resolved means this condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#target-down
+      - alert: LavikWorkerAdmissionHigh
+        expr: (lavik:worker_admission_ratio > 0.90) and on (cluster, job, instance) lavik:ready
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Worker retained admission is near its limit
+          description:
+            Worker {{ $labels.worker }} on {{ $labels.instance }} exceeds 90% of its retained admission share.
+            This is not RSS. Resolved means this condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=25"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#worker-admission
+      - alert: LavikMemoryRejectedCommands
+        expr:
+          (increase(lavik_memory_rejected_commands_total{job="lavik"}[5m]) > 0) and on (cluster, job, instance)
+          lavik:ready
+        for: 1m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Commands were rejected by memory admission
+          description:
+            "{{ $labels.instance }} rejected retained-memory growth in the last five minutes. Resolved means
+            this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=34"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#memory-rejections
+      - alert: LavikMemoryRejectedCommands
+        expr: (rate(lavik_memory_rejected_commands_total{job="lavik"}[5m]) > 1) and on (cluster, job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Sustained memory admission rejections
+          description:
+            "{{ $labels.instance }} is rejecting more than one command per second. Resolved means this condition
+            ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=34"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#memory-rejections
+      - alert: LavikWritableSpaceLow
+        expr: (lavik:writable_space_ratio < 0.10) and on (cluster, job, instance) lavik:ready
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Writable storage space is low
+          description:
+            Device {{ $labels.device }} on {{ $labels.instance }} has less than 10% foreground-writable capacity.
+            Resolved means this condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=13"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#writable-space
+      - alert: LavikWritableSpaceLow
+        expr: (lavik:writable_space_ratio < 0.03) and on (cluster, job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Writable storage space is critically low
+          description:
+            Device {{ $labels.device }} on {{ $labels.instance }} has less than 3% foreground-writable capacity.
+            Resolved means this condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=13"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#writable-space
+      - alert: LavikWritableSpaceExhausted
+        expr: (lavik_storage_available_bytes{job="lavik"} == 0) and on (cluster, job, instance) lavik:ready
+        for: 30s
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: No foreground-writable blocks remain
+          description:
+            Device {{ $labels.device }} on {{ $labels.instance }} has no space available to normal writes.
+            Resolved means this condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=13"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#writable-space
+      - alert: LavikBacklogPressure
+        expr:
+          ((lavik_replication_backlog_active{job="lavik"} == 1) and (lavik_replication_backlog_pinned_cursors{job="lavik"}
+          > 0) and (lavik_replication_backlog_backpressured{job="lavik"} == 1) and (lavik:publisher_queue_ratio >= 0.80))
+          and on (cluster, job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Replication is backpressuring writes
+          description:
+            Worker {{ $labels.worker }} on {{ $labels.instance }} has retained replica claims, backlog backpressure
+            and a publisher queue at least 80% full. Resolved means this condition ended; verify current telemetry before
+            declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=35"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#replication-pressure
+      - alert: LavikBacklogPressure
+        expr:
+          ((lavik_replication_backlog_active{job="lavik"} == 1) and (lavik_replication_backlog_pinned_cursors{job="lavik"}
+          > 0) and (lavik_replication_backlog_backpressured{job="lavik"} == 1) and (lavik:publisher_queue_ratio >= 0.80))
+          and on (cluster, job, instance) lavik:ready
+        for: 15m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Replication is backpressuring writes
+          description:
+            Worker {{ $labels.worker }} on {{ $labels.instance }} has retained replica claims, backlog backpressure
+            and a publisher queue at least 80% full. Resolved means this condition ended; verify current telemetry before
+            declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=35"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#replication-pressure
+      - alert: LavikFullSyncQueuePressure
+        expr:
+          ((lavik:fullsync_queue_ratio >= 0.80) and (lavik_fullsync_sessions{job="lavik"} > 0)) and on (cluster,
+          job, instance) lavik:ready
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: FULL publication queues remain near capacity
+          description:
+            Worker {{ $labels.worker }} on {{ $labels.instance }} has FULL queued plus admitted bytes at
+            least 80% of aggregate capacity. This does not prove stalled progress. Resolved means this condition ended;
+            verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=36"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#full-sync-pressure
+      - alert: LavikMetaDisconnected
+        expr: (lavik_cluster_control_connected{job="lavik"} == 0) and on (cluster, job, instance) lavik:ready{lavik_mode="meta-managed"}
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Managed Data has no accepted Meta session
+          description:
+            "{{ $labels.instance }} has no accepted Meta session. Connection state is not a serving-authority
+            proof. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=29"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#meta-disconnected
+      - alert: LavikMetaProtocolErrors
+        expr:
+          (increase(lavik_cluster_control_protocol_errors_total{job="lavik"}[5m]) >= 3) and on (cluster, job, instance)
+          lavik:ready{lavik_mode="meta-managed"}
+        for: 1m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Repeated Data-to-Meta protocol errors
+          description:
+            "{{ $labels.instance }} closed multiple control sessions for invalid framing or protocol state.
+            Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=31"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#meta-protocol-errors
+      - alert: LavikLeaseExpirations
+        expr:
+          (increase(lavik_cluster_control_lease_expirations_total{job="lavik"}[5m]) > 0) and on (cluster, job, instance)
+          lavik:ready{lavik_mode="meta-managed"}
+        for: 1m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Local finite-authority leases expired
+          description:
+            "{{ $labels.instance }} detected lease expiration and fenced the affected authority. This counter
+            is not current authority state. Resolved means this condition ended; verify current telemetry before declaring
+            recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=31"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#lease-expirations
+      - alert: LavikLeaseExpirations
+        expr:
+          (increase(lavik_cluster_control_lease_expirations_total{job="lavik"}[5m]) >= 3) and on (cluster, job,
+          instance) lavik:ready{lavik_mode="meta-managed"}
+        for: 1m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Local finite-authority leases expired
+          description:
+            "{{ $labels.instance }} detected lease expiration and fenced the affected authority. This counter
+            is not current authority state. Resolved means this condition ended; verify current telemetry before declaring
+            recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=31"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#lease-expirations
+      - alert: LavikServerNotReady
+        expr: (lavik_server_ready{job="lavik"} == 0) and on (cluster, job, instance) (up{job="lavik"} == 1)
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Storage startup or runtime health is not ready
+          description:
+            "{{ $labels.instance }} is reachable but storage readiness remains false. Allow a workload-appropriate
+            recovery window. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#not-ready
+      - alert: LavikServerNotReady
+        expr: (lavik_server_ready{job="lavik"} == 0) and on (cluster, job, instance) (up{job="lavik"} == 1)
+        for: 30m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Storage startup or runtime health is not ready
+          description:
+            "{{ $labels.instance }} is reachable but storage readiness remains false. Allow a workload-appropriate
+            recovery window. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#not-ready
+      - alert: LavikNoTargets
+        expr: absent(up{job="lavik"})
+        for: 2m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: No Lavik scrape targets are visible
+          description:
+            The Lavik job has no target series. Check discovery configuration, not database data. Resolved
+            means this condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#no-targets
+      - alert: LavikMetricsMissing
+        expr: (up{job="lavik"} == 1) unless on (cluster, job, instance) lavik_server_ready{job="lavik"}
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: readiness
+        annotations:
+          summary: Lavik readiness telemetry is missing
+          description:
+            "{{ $labels.instance }} was scraped successfully without the readiness metric. Resolved means
+            this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics
+      - alert: LavikMetricsMissing
+        expr:
+          group by (cluster, job, instance) ((lavik:ready unless on (cluster, job, instance) lavik_memory_rejected_commands_total{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_worker_retained_memory_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_worker_memory_admission_pending_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_worker_fullsync_reserved_memory_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_worker_memory_limit_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_worker_retained_memory_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_worker_memory_admission_pending_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_worker_fullsync_reserved_memory_bytes{job="lavik"})) and
+          on (cluster, job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: memory
+        annotations:
+          summary: Required Lavik telemetry is missing
+          description:
+            "{{ $labels.instance }} is ready but required memory inputs are missing. No missing value is
+            treated as zero. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics
+      - alert: LavikMetricsMissing
+        expr:
+          group by (cluster, job, instance) ((lavik:ready unless on (cluster, job, instance) lavik_storage_capacity_bytes{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_storage_available_bytes{job="lavik"}) or (lavik_storage_capacity_bytes{job="lavik"}
+          unless on (cluster, job, instance, device, path) lavik_storage_available_bytes{job="lavik"})) and on (cluster,
+          job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: storage
+        annotations:
+          summary: Required Lavik telemetry is missing
+          description:
+            "{{ $labels.instance }} is ready but required storage inputs are missing. No missing value is
+            treated as zero. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics
+      - alert: LavikMetricsMissing
+        expr:
+          group by (cluster, job, instance) ((lavik:ready unless on (cluster, job, instance) lavik_replication_backlog_active{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_replication_backlog_pinned_cursors{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_replication_backlog_backpressured{job="lavik"}) or
+          (lavik:ready unless on (cluster, job, instance) lavik_replication_publish_queue_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_replication_publish_queue_capacity_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_fullsync_publish_queue_bytes{job="lavik"}) or (lavik:ready unless
+          on (cluster, job, instance) lavik_fullsync_publish_queue_admitted_bytes{job="lavik"}) or (lavik:ready unless
+          on (cluster, job, instance) lavik_fullsync_publish_queue_capacity_bytes{job="lavik"}) or (lavik:ready unless
+          on (cluster, job, instance) lavik_fullsync_sessions{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_replication_backlog_active{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_replication_backlog_pinned_cursors{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_replication_backlog_backpressured{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_replication_publish_queue_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_replication_publish_queue_capacity_bytes{job="lavik"}) or
+          (lavik_worker_memory_limit_bytes{job="lavik"} unless on (cluster, job, instance, worker) lavik_fullsync_publish_queue_bytes{job="lavik"})
+          or (lavik_worker_memory_limit_bytes{job="lavik"} unless on (cluster, job, instance, worker) lavik_fullsync_publish_queue_admitted_bytes{job="lavik"})
+          or (lavik_worker_memory_limit_bytes{job="lavik"} unless on (cluster, job, instance, worker) lavik_fullsync_publish_queue_capacity_bytes{job="lavik"})
+          or (lavik_worker_memory_limit_bytes{job="lavik"} unless on (cluster, job, instance, worker) lavik_fullsync_sessions{job="lavik"}))
+          and on (cluster, job, instance) lavik:ready
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: replication
+        annotations:
+          summary: Required Lavik telemetry is missing
+          description:
+            "{{ $labels.instance }} is ready but required replication inputs are missing. No missing value
+            is treated as zero. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics
+      - alert: LavikMetricsMissing
+        expr:
+          group by (cluster, job, instance) ((lavik:ready unless on (cluster, job, instance) lavik_cluster_control_connected{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_cluster_control_protocol_errors_total{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_cluster_control_lease_expirations_total{job="lavik"}))
+          and on (cluster, job, instance) lavik:ready{lavik_mode="meta-managed"}
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: meta
+        annotations:
+          summary: Required Lavik telemetry is missing
+          description:
+            "{{ $labels.instance }} is ready but required meta inputs are missing. No missing value is treated
+            as zero. Resolved means this condition ended; verify current telemetry before declaring recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics

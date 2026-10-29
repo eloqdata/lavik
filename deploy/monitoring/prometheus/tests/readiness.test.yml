@@ -1,0 +1,25 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+rule_files:
+  - ../rules/alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: down waits two minutes and retains firing during recovery
+    interval: 15s
+    input_series:
+      - series: up{job="lavik",instance="data:9100",cluster="test",lavik_mode="standalone"}
+        values: 0x8 1x12
+    promql_expr_test:
+      - expr: ALERTS{alertname="LavikTargetDown",alertstate="firing"}
+        eval_time: 1m45s
+        exp_samples: []
+      - expr: ALERTS{alertname="LavikTargetDown",alertstate="firing"}
+        eval_time: 2m
+        exp_samples:
+          - labels: ALERTS{alertname="LavikTargetDown",alertstate="firing",job="lavik",instance="data:9100",cluster="test",lavik_mode="standalone",severity="critical"}
+            value: 1
+      - expr: ALERTS{alertname="LavikTargetDown",alertstate="firing"}
+        eval_time: 4m15s
+        exp_samples: []
+group_eval_order:
+  - lavik.recording
+  - lavik.alerts
