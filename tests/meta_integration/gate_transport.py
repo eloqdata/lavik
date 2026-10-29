@@ -22,7 +22,7 @@ throughout:
    blackholes every byte. The Go transport contract under test: the
    leader's sends to that peer must fail inside bounded RPC timeouts, never
    hang forever. Observable evidence: (a) the quorum keeps committing
-   while the follower's committed index stays frozen, (b) the leader's
+   while the follower cannot commit a post-fault probe, (b) the leader's
    transport-failure counter increases after a bounded handshake or write
    deadline. Each round ends with heal()
    and a bounded (<15s) catch-up.
@@ -81,7 +81,7 @@ def timed_catchup(follower, target_idx, desc):
 
 def fault_round(nodes, mesh, history, mode, window_s, round_name):
     """One inbound-fault round on a follower: cluster must keep committing,
-    the follower must stall, the failure must be observable on the leader,
+    the follower cannot commit a post-fault probe, failures must be observable,
     and heal() must restore the follower within CATCHUP_ASSERT_S."""
     leader = H.find_leader(nodes)
     follower = next(n for n in nodes if n.id != leader.id and n.alive())
@@ -99,33 +99,36 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
     H.log(
         f"{round_name}: {mode} ({detail}) on node {follower.id} inbound for {window_s}s"
     )
-    time.sleep(window_s)
-
     quorum = [n for n in nodes if n.id != follower.id]
-    c1 = H.max_committed(quorum)
-    if c1 <= c0:
-        raise H.Failure(
-            f"{round_name}: quorum stalled during {mode} (committed {c0} -> {c1})"
-        )
+    probe_index = None
 
     # Status and proposal are separate requests. The injected asymmetric
     # partition can elect another leader between them; require a real commit
     # within a fixed deadline rather than treating the status as a lease.
     def commits_during_fault():
+        nonlocal probe_index
         for candidate in quorum:
             if not candidate.is_leader():
                 continue
             _, reply = candidate.propose(f"{round_name}-live")
             if reply.startswith("OK "):
+                probe_index = int(reply[3:])
                 return True
         return False
 
     H.wait_until(f"{round_name}: quorum commits during {mode}", 5, commits_during_fault)
-    f1 = follower.committed()
-    if f1 > f0 + 10:
+
+    # The pre-fault sample is a periodically published status, and queued
+    # traffic may still commit after the proxy cuts its sockets. No fixed
+    # allowance bounds that legitimate progress. A probe first submitted
+    # after the cut gives a causal boundary the isolated node cannot cross.
+    # Observe for the full window after that commit so a leaking connection
+    # cannot pass merely because the follower has not caught up yet.
+    time.sleep(window_s)
+    c1 = H.max_committed(quorum)
+    if c1 <= c0:
         raise H.Failure(
-            f"{round_name}: isolated node {follower.id} kept "
-            f"advancing ({f0} -> {f1}); fault not effective"
+            f"{round_name}: quorum stalled during {mode} (committed {c0} -> {c1})"
         )
     # Network completion and status publication are asynchronous with respect
     # to the control socket. Keep the fault active for a short bounded grace
@@ -137,16 +140,23 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
     while evidence1 <= evidence0 and time.monotonic() < deadline:
         time.sleep(0.05)
         evidence1 = rpc_failure_count(nodes)
-    proxy.heal()
-
     if evidence1 <= evidence0:
         raise H.Failure(
             f"{round_name}: no peer RPC failure evidence in transport counters; "
             f"Raft transport may be hanging instead of timing out"
         )
+    # Keep the isolation assertion active through the counter grace period.
+    f1 = follower.committed()
+    if f1 >= probe_index:
+        raise H.Failure(
+            f"{round_name}: isolated node {follower.id} committed post-fault probe "
+            f"{probe_index} (committed {f0} -> {f1}); fault not effective"
+        )
+    proxy.heal()
     H.log(
         f"{round_name}: quorum committed {c0} -> {c1}, node "
-        f"{follower.id} frozen at {f1}; cluster RPC failure/reconnect "
+        f"{follower.id} committed {f0} -> {f1} below post-fault probe "
+        f"{probe_index}; cluster RPC failure/reconnect "
         f"signals {evidence0} -> {evidence1}"
     )
 

@@ -692,6 +692,7 @@ class Proxy:
         self._mode = self.NORMAL
         self._delay = 0.0
         self._lock = threading.Lock()
+        self._cut_generation = 0
         self._listener = None
         self._pairs = set()
         self._held = set()
@@ -726,8 +727,12 @@ class Proxy:
 
     def heal(self):
         with self._lock:
+            # Accepting a blackholed socket and releasing all such sockets
+            # share this boundary, so an accept cannot miss the heal.
+            self._mode = self.NORMAL
+            self._delay = 0.0
             held = list(self._held)
-        self._set_mode(self.NORMAL)
+            self._held.clear()
         for sock in held:
             self._close_sock(sock)
 
@@ -735,6 +740,10 @@ class Proxy:
         with self._lock:
             self._mode = mode
             self._delay = delay
+            if mode in (self.DROP, self.REFUSE):
+                # Dialing happens outside the lock. Remember every cut even
+                # if it heals before an in-flight dial returns.
+                self._cut_generation += 1
             cut = list(self._pairs) if mode in (self.DROP, self.REFUSE) else []
             listener = None
             if mode == self.REFUSE and self._listener is not None:
@@ -769,7 +778,12 @@ class Proxy:
                     time.sleep(0.05)
                     continue
                 with self._lock:
-                    self._listener = listener
+                    publish = self._running and self._mode != self.REFUSE
+                    if publish:
+                        self._listener = listener
+                if not publish:
+                    self._close_sock(listener)
+                    continue
             try:
                 conn, _ = listener.accept()
             except socket.timeout:
@@ -785,9 +799,14 @@ class Proxy:
     def _on_accept(self, conn):
         with self._lock:
             mode = self._mode
-        if mode == self.DROP:
-            with self._lock:
+            generation = self._cut_generation
+            reject = not self._running or mode == self.REFUSE
+            if not reject and mode == self.DROP:
                 self._held.add(conn)
+        if reject:
+            self._close_sock(conn)
+            return
+        if mode == self.DROP:
             threading.Thread(
                 target=self._discard_loop, args=(conn,), daemon=True
             ).start()
@@ -799,7 +818,15 @@ class Proxy:
             return
         pair = (conn, upstream)
         with self._lock:
-            self._pairs.add(pair)
+            # Register atomically with fault transitions. A cut either owns
+            # this pair or invalidates its dial; it can never miss both.
+            publish = self._running and generation == self._cut_generation
+            if publish:
+                self._pairs.add(pair)
+        if not publish:
+            for sock in pair:
+                self._close_sock(sock)
+            return
         for src, dst in ((conn, upstream), (upstream, conn)):
             threading.Thread(
                 target=self._pump, args=(src, dst, pair), daemon=True
@@ -855,8 +882,9 @@ class Proxy:
             pass
 
     def close(self):
-        self._running = False
         with self._lock:
+            self._running = False
+            self._cut_generation += 1
             listener, self._listener = self._listener, None
             pairs = list(self._pairs)
             held = list(self._held)
