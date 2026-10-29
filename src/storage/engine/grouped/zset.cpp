@@ -1596,6 +1596,20 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto page_index = [&](std::size_t ordinal) {
       return reverse ? end_page - 1 - ordinal : first_page + ordinal;
     };
+    auto whole_score_page = [&](std::size_t i) {
+      const auto low = operation.minimum_score_;
+      const auto high = operation.maximum_score_;
+      return (low.exclusive_ ? metadata[i].min_score_ > low.value_
+                             : metadata[i].min_score_ >= low.value_) &&
+             (high.exclusive_ ? metadata[i].max_score_ < high.value_
+                              : metadata[i].max_score_ <= high.value_);
+    };
+    auto score_offset_pending = [&] {
+      return operation.kind_ == SortedSetOperationKind::kRange &&
+             operation.range_mode_ == SortedSetRangeMode::kScore &&
+             operation.limit_ &&
+             cursor.skipped_ < static_cast<std::uint64_t>(operation.offset_);
+    };
     auto consume_page = [&](auto& entries, bool prepaid) {
       if (reverse) rank -= entries.size();
       for (std::size_t j = 0; !cursor.done_ && j < entries.size(); ++j) {
@@ -1707,18 +1721,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         items += metadata[i].item_count_;
         if (operation.range_mode_ == SortedSetRangeMode::kScore &&
             operation.limit_ && operation.count_ >= 0) {
-          const auto low = operation.minimum_score_;
-          const auto high = operation.maximum_score_;
-          const bool whole_page =
-              (low.exclusive_ ? metadata[i].min_score_ > low.value_
-                              : metadata[i].min_score_ >= low.value_) &&
-              (high.exclusive_ ? metadata[i].max_score_ < high.value_
-                               : metadata[i].max_score_ <= high.value_);
           const auto needed = static_cast<std::uint64_t>(operation.offset_) -
                               cursor.skipped_ +
                               static_cast<std::uint64_t>(operation.count_) -
                               result.member_count();
-          if (!whole_page || items >= needed) {
+          if (!whole_score_page(i) || items >= needed) {
             ++count;
             break;
           }
@@ -1822,13 +1829,38 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     };
     for (std::size_t ordinal = 0;
          !cursor.done_ && ordinal < end_page - first_page;) {
-      // Preserve the existing overlapped I/O for multi-page ranges. Indexed
-      // projection serves single-page requests and the serial fallback after
-      // the bounded window declines admission or stops at a LIMIT boundary.
+      if (score_offset_pending() && whole_score_page(page_index(ordinal))) {
+        // A partial starting page must count its matches first. Once inside
+        // the score interval, all pages before the opposite boundary match
+        // completely, so the rank index can skip their payloads. Leave the
+        // target page's residual offset to its reader, including score
+        // filtering if that page straddles the opposite boundary. Subtract
+        // before adding the offset so even INT64_MAX safely returns an empty
+        // range.
+        const auto remaining =
+            static_cast<std::uint64_t>(operation.offset_) - cursor.skipped_;
+        const auto available = reverse
+                                   ? rank - directory.CountBefore(first_page)
+                                   : directory.CountBefore(end_page) - rank;
+        if (remaining >= available) co_return result;
+        const auto target = directory.FindRank(reverse ? rank - 1 - remaining
+                                                       : rank + remaining);
+        const auto next_rank =
+            directory.CountBefore(target->group_index_ + (reverse ? 1 : 0));
+        cursor.skipped_ += reverse ? rank - next_rank : next_rank - rank;
+        rank = next_rank;
+        ordinal = reverse ? end_page - 1 - target->group_index_
+                          : target->group_index_ - first_page;
+      }
+      // Preserve overlapped I/O once the offset is consumed. Read offset
+      // boundary pages serially so a wave cannot fetch pages we can skip.
+      // Indexed projection also serves single-page requests and the fallback
+      // when the bounded window declines admission or stops at a LIMIT
+      // boundary.
       if (operation.kind_ == SortedSetOperationKind::kRange &&
           (operation.range_mode_ == SortedSetRangeMode::kRank ||
            operation.range_mode_ == SortedSetRangeMode::kScore) &&
-          end_page - first_page - ordinal > 1) {
+          !score_offset_pending() && end_page - first_page - ordinal > 1) {
         absl::StatusOr<std::size_t> consumed;
         if (operation.packed_output_)
           consumed =
