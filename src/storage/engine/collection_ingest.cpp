@@ -583,9 +583,9 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
                            : current->directory().total_group_bytes();
     if (total < kCollectionGroupTargetBytes) {
       const auto location = current->version().root_;
-      auto compact = co_await LoadGroupedValue(store, partition, db_id, key,
-                                               digest, location, nullptr,
-                                               /*physical=*/true);
+      auto compact = co_await LoadGroupedValue(
+          store, partition, db_id, key, digest, location, nullptr,
+          GroupedValueEncoding::kPhysicalStorage);
       if (!compact.ok()) co_return compact.status();
       const auto bytes = compact->value();
       if (bytes.size() >= kCollectionGroupTargetBytes)

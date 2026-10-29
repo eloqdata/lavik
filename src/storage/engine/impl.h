@@ -4137,6 +4137,7 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, bool pinned = false);
+  enum class GroupedValueEncoding : bool { kLogicalStream, kPhysicalStorage };
   // Logical consumers retain the streaming-compatible v1 image. Physical
   // demotion requests the current List/Sorted Set format directly, avoiding
   // an intermediate logical image and a second conversion allocation.
@@ -4144,7 +4145,7 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       RecordLocation location, GroupedObject::Handle snapshot,
-      bool physical = false);
+      GroupedValueEncoding encoding);
 
   // Reads an entire extent on its physical owner into caller-owned storage.
   // Local routing returns the physical awaitable without a wrapper task.
@@ -4523,13 +4524,17 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       GroupReadLimiter* limiter = nullptr);
+  enum class SortedSetPageReadMode : bool { kFullDecode, kIndexedProjection };
+  // Indexed projection applies only to v2 pages with kTrustStored; v1 and
+  // kVerifyUnique retain full decoding. Both modes check identity/CRC and
+  // directory score bounds before returning views that borrow the read lease.
   Task<absl::StatusOr<LoadedSortedSetPage>> LoadSortedSetPage(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       SortedSetMemberValidation validation =
           SortedSetMemberValidation::kVerifyUnique,
-      bool indexed = false);
+      SortedSetPageReadMode mode = SortedSetPageReadMode::kFullDecode);
   // Copies one checked page into a contiguous member block before releasing
   // its lease. The caller admits page scratch/output before launch.
   static absl::StatusOr<PackedSortedSetValues> PackSortedSetPage(

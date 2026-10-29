@@ -599,7 +599,7 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
 absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     const OrderedGroupSnapshot& page, std::string_view member,
     std::optional<double> before, std::optional<double> after,
-    std::size_t target_bytes, bool member_absence_verified) {
+    std::size_t target_bytes, SortedSetMemberAbsence absence) {
   if ((!before && !after) || member.size() > kMaxStringBytes ||
       (before && std::isnan(*before)) || (after && std::isnan(*after)))
     return absl::InvalidArgumentError("invalid encoded Sorted Set point edit");
@@ -612,35 +612,9 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
   std::size_t removed = missing;
   const auto count = entries.size() - bool(before) + bool(after);
   target_bytes = std::min<std::size_t>(target_bytes, kMaxRecordPayloadBytes);
-  if (page.encoded_sorted_set_->version() == 2) {
-    const auto reader =
-        IndexedOrderedReader::Open(page.kind_, bytes, entries.size());
-    if (!reader.ok()) return reader.status();
-    if (before) {
-      auto position = reader->LowerBound(*before, member);
-      if (!position.ok()) return position.status();
-      removed = *position;
-      if (removed == missing || entries[removed].score_ != *before ||
-          entries[removed].value_ != member)
-        return absl::DataLossError("encoded Sorted Set point source missing");
-    } else if (!member_absence_verified &&
-               std::any_of(
-                   entries.begin(), entries.end(),
-                   [&](const auto& entry) { return entry.value_ == member; })) {
-      return absl::DataLossError("encoded Sorted Set member already exists");
-    }
-    IndexedOrderedSplice splice(*reader, /*compact=*/false);
-    const auto edited = splice.EditSortedSetMember(removed, member, after);
-    if (!edited.ok()) return edited;
-    const auto size = splice.encoded_bytes();
-    if (count == 0 || target_bytes < kOrderedGroupHeaderBytes ||
-        size > target_bytes - kOrderedGroupHeaderBytes)
-      return std::nullopt;
-    auto output = MakeLocalShared<std::string>();
-    output->reserve(size);
-    // The same bounded plan as compact writes copies surviving data/score
-    // runs directly into the final owner. Only shifted offsets are rebuilt.
-    while (auto part = splice.Next()) output->append(*part);
+  // Views borrow the completed output, whose owner moves into the snapshot.
+  auto finish = [&page, count](LocalSharedPtr<std::string>&& output)
+      -> absl::StatusOr<std::optional<OrderedGroupSnapshot>> {
     auto final = IndexedOrderedReader::Open(page.kind_, *output, count);
     if (!final.ok()) return final.status();
     auto views = final->DecodeAll();
@@ -654,6 +628,38 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     result.encoded_sorted_set_ =
         EncodedSortedSetEntries(std::move(output), std::move(*views), 2);
     return result;
+  };
+  if (page.encoded_sorted_set_->version() == 2) {
+    const auto reader =
+        IndexedOrderedReader::Open(page.kind_, bytes, entries.size());
+    if (!reader.ok()) return reader.status();
+    if (before) {
+      auto position = reader->LowerBound(*before, member);
+      if (!position.ok()) return position.status();
+      removed = *position;
+      if (removed == missing || entries[removed].score_ != *before ||
+          entries[removed].value_ != member)
+        return absl::DataLossError("encoded Sorted Set point source missing");
+    } else if (absence == SortedSetMemberAbsence::kCheckSource &&
+               std::any_of(
+                   entries.begin(), entries.end(),
+                   [&](const auto& entry) { return entry.value_ == member; })) {
+      return absl::DataLossError("encoded Sorted Set member already exists");
+    }
+    IndexedOrderedSplice splice(*reader,
+                                IndexedOrderedSplice::Envelope::kGroupedBody);
+    const auto edited = splice.EditSortedSetMember(removed, member, after);
+    if (!edited.ok()) return edited;
+    const auto size = splice.encoded_bytes();
+    if (count == 0 || target_bytes < kOrderedGroupHeaderBytes ||
+        size > target_bytes - kOrderedGroupHeaderBytes)
+      return std::nullopt;
+    auto output = MakeLocalShared<std::string>();
+    output->reserve(size);
+    // The same bounded plan as compact writes copies surviving data/score
+    // runs directly into the final owner. Only shifted offsets are rebuilt.
+    while (auto part = splice.Next()) output->append(*part);
+    return finish(std::move(output));
   }
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].value_ != member) continue;
@@ -704,19 +710,7 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     offset += entry.value_.size();
     append_number(offset, 4);
   });
-  auto final = IndexedOrderedReader::Open(page.kind_, *output, count);
-  if (!final.ok()) return final.status();
-  auto views = final->DecodeAll();
-  if (!views.ok()) return views.status();
-  OrderedGroupSnapshot result{.kind_ = page.kind_,
-                              .incarnation_ = page.incarnation_,
-                              .id_ = page.id_,
-                              .previous_ = page.previous_,
-                              .next_ = page.next_,
-                              .entries_ = {}};
-  result.encoded_sorted_set_ =
-      EncodedSortedSetEntries(std::move(output), std::move(*views), 2);
-  return result;
+  return finish(std::move(output));
 }
 
 void MaterializeOrderedGroupEntries(OrderedGroupSnapshot& page) {

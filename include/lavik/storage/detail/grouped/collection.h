@@ -97,6 +97,10 @@ struct OrderedCollectionEntryView {
 struct OrderedGroupSnapshot;
 struct OrderedGroupSplit;
 
+// Skip insertion's member scan only when the caller has already proved
+// absence from this page under the same logical root.
+enum class SortedSetMemberAbsence : bool { kCheckSource, kVerified };
+
 // An owned, immutable member sequence certified by the checked Sorted Set
 // splitter. Moving the original vector preserves its allocations. Only const
 // access escapes: changing an after-image requires a new mutable snapshot and
@@ -145,7 +149,7 @@ class EncodedSortedSetEntries {
                             std::optional<double> before,
                             std::optional<double> after,
                             std::size_t target_bytes,
-                            bool member_absence_verified);
+                            SortedSetMemberAbsence absence);
   EncodedSortedSetEntries(LocalSharedPtr<const std::string> bytes,
                           std::vector<OrderedCollectionEntryView> entries,
                           std::uint32_t version)
@@ -370,7 +374,7 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
 // ordinary planner. The input is immutable even on failure; score mismatches,
 // duplicate additions and invalid inputs are errors, never silent fallbacks.
 // Successful after-images use v2 even when the input page uses v1.
-// For v2 insertion, member_absence_verified skips the member-only scan when
+// For v2 insertion, kVerified skips the member-only scan when
 // the caller's member graph and resolved source page already prove absence
 // from this page. Otherwise absence is checked here. Existing members and new
 // positions use binary lookup; full source validation remains mandatory.
@@ -378,7 +382,7 @@ absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     const OrderedGroupSnapshot& page, std::string_view member,
     std::optional<double> before, std::optional<double> after,
     std::size_t target_bytes = kCollectionGroupTargetBytes,
-    bool member_absence_verified = false);
+    SortedSetMemberAbsence absence = SortedSetMemberAbsence::kCheckSource);
 
 // Converts a private checked/encoded page into mutable, independently owned
 // entries before split/rebalance planning. Existing mutable pages are

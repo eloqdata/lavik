@@ -95,9 +95,10 @@ class IndexedOrderedReader {
 class IndexedOrderedSplice {
  public:
   // Grouped pages reuse the same body beneath their own envelope.
+  enum class Envelope : bool { kGroupedBody, kCompact };
   explicit IndexedOrderedSplice(IndexedOrderedReader source,
-                                bool compact = true) noexcept
-      : source_(source), compact_(compact) {}
+                                Envelope envelope = Envelope::kCompact) noexcept
+      : source_(source), envelope_(envelope) {}
   // Plans one edit on a fully validated Sorted Set source. removed == size()
   // inserts an absent member; otherwise that slot must contain member. The
   // caller resolves member existence before invoking this method. The new
@@ -112,12 +113,13 @@ class IndexedOrderedSplice {
                     bool reverse) noexcept;
   void AppendMember(std::string_view member, double score) noexcept;
   std::size_t encoded_bytes() const noexcept {
-    return (compact_ ? 12 : 4) + data_bytes_ +
+    return (envelope_ == Envelope::kCompact ? 12 : 4) + data_bytes_ +
            count_ * (source_.sorted_ ? 12 : 4);
   }
   std::optional<std::string_view> Next() noexcept;
 
  private:
+  enum class Phase : unsigned { kHeader, kValues, kScores, kOffsets, kDone };
   struct Part {
     std::size_t first_ = 0;
     std::size_t count_ = 0;
@@ -133,10 +135,10 @@ class IndexedOrderedSplice {
   bool reverse_inputs_ = false;
   bool has_inputs_ = false;
   bool inserted_ = false;
-  bool compact_ = true;
+  Envelope envelope_ = Envelope::kCompact;
   std::size_t parts_size_ = 0, count_ = 0, data_bytes_ = 0;
   std::size_t part_ = 0, item_ = 0, offset_ = 0;
-  unsigned phase_ = 0;
+  Phase phase_ = Phase::kHeader;
   std::array<char, 8> framing_{};
 };
 

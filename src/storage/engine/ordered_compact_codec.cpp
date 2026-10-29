@@ -202,7 +202,7 @@ absl::StatusOr<PackedValues> IndexedOrderedReader::CopyRange(
 
 absl::Status IndexedOrderedSplice::EditSortedSetMember(
     std::size_t removed, std::string_view member, std::optional<double> after) {
-  assert(parts_size_ == 0 && phase_ == 0);
+  assert(parts_size_ == 0 && phase_ == Phase::kHeader);
   const auto count = source_.size();
   if (!source_.sorted_ || removed > count || (removed == count && !after) ||
       member.size() > kMaxStringBytes || (after && std::isnan(*after)))
@@ -260,7 +260,7 @@ std::string_view IndexedOrderedSplice::Value(const Part& part,
 }
 
 void IndexedOrderedSplice::Add(Part part, std::size_t bytes) noexcept {
-  assert(phase_ == 0 && parts_size_ < parts_.size());
+  assert(phase_ == Phase::kHeader && parts_size_ < parts_.size());
   assert(part.count_ <= UINT32_MAX - count_ &&
          bytes <= UINT32_MAX - data_bytes_);
   parts_[parts_size_++] = part;
@@ -302,9 +302,9 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
       framing_[i] = static_cast<char>(value >> (8 * i));
     return std::string_view(framing_.data(), width);
   };
-  if (phase_ == 0) {
-    phase_ = 1;
-    if (compact_) {
+  if (phase_ == Phase::kHeader) {
+    phase_ = Phase::kValues;
+    if (envelope_ == Envelope::kCompact) {
       const auto magic = source_.sorted_ ? kSortedSetMagicV2 : kListMagicV2;
       std::memcpy(framing_.data(), magic.data(), magic.size());
       for (unsigned i = 0; i < 4; ++i)
@@ -312,7 +312,7 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
       return std::string_view(framing_.data(), framing_.size());
     }
   }
-  if (phase_ == 1) {
+  if (phase_ == Phase::kValues) {
     if (part_ < parts_size_) {
       const auto& part = parts_[part_];
       if (!part.inserted_) {
@@ -326,10 +326,10 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
       }
       return value;
     }
-    phase_ = source_.sorted_ ? 2 : 3;
+    phase_ = source_.sorted_ ? Phase::kScores : Phase::kOffsets;
     part_ = 0;
   }
-  if (phase_ == 2) {
+  if (phase_ == Phase::kScores) {
     if (part_ < parts_size_) {
       const auto& part = parts_[part_++];
       if (!part.inserted_)
@@ -337,13 +337,13 @@ std::optional<std::string_view> IndexedOrderedSplice::Next() noexcept {
                                     part.count_ * 8);
       return number(std::bit_cast<std::uint64_t>(member_.score_), 8);
     }
-    phase_ = 3;
+    phase_ = Phase::kOffsets;
     part_ = 0;
   }
-  if (phase_ == 3) {
+  if (phase_ == Phase::kOffsets) {
     if (part_ == parts_size_) {
       assert(offset_ == data_bytes_);
-      phase_ = 4;
+      phase_ = Phase::kDone;
       return number(offset_, 4);
     }
     const auto& part = parts_[part_];

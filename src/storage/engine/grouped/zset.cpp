@@ -1325,9 +1325,10 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     return budget.Reserve(copies);
   };
   SortedSetPageWorkBudget page_work;
-  auto read_page_impl = [&]<typename Page>(std::size_t i,
-                                           GroupReadLimiter* limiter = nullptr,
-                                           bool indexed = false)
+  auto read_page_impl = [&]<typename Page>(
+                            std::size_t i, GroupReadLimiter* limiter = nullptr,
+                            SortedSetPageReadMode mode =
+                                SortedSetPageReadMode::kFullDecode)
       -> Task<absl::StatusOr<
           std::conditional_t<std::is_same_v<Page, LoadedOrderedGroup>,
                              OwnedScanPage, AdmittedScanPage<Page>>>> {
@@ -1380,7 +1381,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                                   : SortedSetMemberValidation::kVerifyUnique;
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
-                                 metadata[i].id_, validation, indexed);
+                                 metadata[i].id_, validation, mode);
       else if constexpr (std::is_same_v<Page, PackedSortedSetValues>)
         return LoadPackedSortedSetPage(store, partition, db_id, key, digest,
                                        object, metadata[i].id_, limiter);
@@ -1398,9 +1399,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!page.ok()) co_return page.status();
     co_return ResultPage{std::move(admission), std::move(*page)};
   };
-  auto read_page = [&](std::size_t i, bool indexed = false) {
+  auto read_page = [&](std::size_t i, SortedSetPageReadMode mode) {
     return read_page_impl.template operator()<LoadedSortedSetPage>(i, nullptr,
-                                                                   indexed);
+                                                                   mode);
   };
   // Mutation probes own their payloads, releasing physical leases before
   // routing. Both wrappers return the loader task without another coroutine.
@@ -1449,7 +1450,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if (!position)
         co_return absl::DataLossError("Sorted Set random rank missing");
       const auto i = position->group_index_;
-      auto page = co_await read_page(i, true);
+      auto page =
+          co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
       if (!page.ok()) co_return page.status();
       const auto& entries = page->page_.entries_;
       do {
@@ -1479,14 +1481,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto prepared = boundary.Prepare(operation, result.length_);
     if (!prepared.ok()) co_return prepared;
     for (std::size_t i = 0; i < metadata.size(); ++i) {
-      auto page = co_await read_page(i);
+      auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);
       if (!page.ok()) co_return page.status();
       for (const auto& entry : page->page_.entries_)
         boundary.Observe(entry, operation.scan_cursor_);
     }
     if (boundary.prefixes_.empty()) co_return result;
     for (std::size_t i = 0; i < metadata.size(); ++i) {
-      auto page = co_await read_page(i);
+      auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);
       if (!page.ok()) co_return page.status();
       for (const auto& entry : page->page_.entries_) {
         auto emitted = boundary.Emit(entry, operation, &result);
@@ -1545,7 +1547,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
                       : std::nullopt;
         std::optional<SortedSetMember> candidate;
         for (std::size_t i = 0; i < metadata.size(); ++i) {
-          auto page = co_await read_page(i);
+          auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);
           if (!page.ok()) co_return page.status();
           for (const auto& entry : page->page_.entries_) {
             if (!BetterLexCandidate(entry, operation, after, candidate))
@@ -1845,7 +1847,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           operation.range_mode_ != SortedSetRangeMode::kLex) {
         const auto i = page_index(ordinal);
         const auto base = directory.CountBefore(i);
-        auto page = co_await read_page(i, true);
+        auto page =
+            co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
         if (!page.ok()) co_return page.status();
         if (page->page_.indexed_) {
           auto visited = ReadIndexedRange(*page->page_.indexed_, base, cursor);
@@ -1875,7 +1878,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         auto visited = consume_packed_page(page->page_, false);
         if (!visited.ok()) co_return visited;
       } else {
-        auto page = co_await read_page(page_index(ordinal));
+        auto page = co_await read_page(page_index(ordinal),
+                                       SortedSetPageReadMode::kFullDecode);
         if (!page.ok()) co_return page.status();
         auto visited = consume_page(page->page_.entries_, false);
         if (!visited.ok()) co_return visited;
@@ -2069,7 +2073,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     const auto first = directory.LowerBoundScore(*score);
     const auto end = directory.UpperBoundScore(*score);
     for (std::size_t i = first; i < end; ++i) {
-      auto page = co_await read_page(i, true);
+      auto page =
+          co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
       if (!page.ok()) co_return page.status();
       if (page->page_.indexed_) {
         const auto& reader = *page->page_.indexed_;
@@ -2357,7 +2362,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           kCollectionGroupTargetBytes,
           // The member graph either proved global absence or we resolved
           // this member in a different source page under the same root.
-          /*member_absence_verified=*/true);
+          SortedSetMemberAbsence::kVerified);
       if (!edited.ok()) co_return edited.status();
       if (!*edited) {
         encoded_point = false;

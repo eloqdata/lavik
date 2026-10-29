@@ -434,7 +434,7 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointEditsMatchOwnedImages) {
       EXPECT_EQ(*EncodeOrderedGroup(**restored), *EncodeOrderedGroup(original));
       auto resolved = EditEncodedSortedSetGroup(
           **erased, member, std::nullopt, score, kCollectionGroupTargetBytes,
-          /*member_absence_verified=*/true);
+          SortedSetMemberAbsence::kVerified);
       ASSERT_TRUE(resolved.ok());
       ASSERT_TRUE(*resolved);
       EXPECT_EQ(*EncodeOrderedGroup(**resolved), *EncodeOrderedGroup(original));
@@ -458,7 +458,7 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointRejectsBadEditsAndFallsBack) {
   EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "missing", 0, 10).ok());
   EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "missing", 0, 10,
                                          kCollectionGroupTargetBytes,
-                                         /*member_absence_verified=*/true)
+                                         SortedSetMemberAbsence::kVerified)
                    .ok());
   EXPECT_FALSE(
       EditEncodedSortedSetGroup(*page, "missing", std::nullopt, std::nullopt)

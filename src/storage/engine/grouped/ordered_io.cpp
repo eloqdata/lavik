@@ -223,14 +223,15 @@ StorageEngine::Impl::LoadSortedSetPage(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
-    SortedSetMemberValidation validation, bool indexed) {
+    SortedSetMemberValidation validation, SortedSetPageReadMode mode) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
-      [validation, indexed](
+      [validation, mode](
           std::string_view payload, std::uint64_t,
           const OrderedGroupEntry& route,
           LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
-        if (indexed && validation == SortedSetMemberValidation::kTrustStored) {
+        if (mode == SortedSetPageReadMode::kIndexedProjection &&
+            validation == SortedSetMemberValidation::kTrustStored) {
           auto metadata = DecodeOrderedGroupMetadata(payload, payload.size());
           if (!metadata.ok()) return metadata.status();
           if (metadata->version_ == 2) {
