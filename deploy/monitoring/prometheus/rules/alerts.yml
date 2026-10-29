@@ -1,5 +1,6 @@
 # Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
 # User-editable alert policy; thresholds are starting points, not measured SLOs.
+# Presence checks are bidirectional: losing a denominator must not look healthy.
 groups:
   - name: lavik.alerts
     rules:
@@ -304,8 +305,11 @@ groups:
           unless on (cluster, job, instance) lavik_worker_memory_limit_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
           unless on (cluster, job, instance, worker) lavik_worker_retained_memory_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
           unless on (cluster, job, instance, worker) lavik_worker_memory_admission_pending_bytes{job="lavik"}) or (lavik_worker_memory_limit_bytes{job="lavik"}
-          unless on (cluster, job, instance, worker) lavik_worker_fullsync_reserved_memory_bytes{job="lavik"})) and
-          on (cluster, job, instance) lavik:ready
+          unless on (cluster, job, instance, worker) lavik_worker_fullsync_reserved_memory_bytes{job="lavik"}) or (lavik_worker_retained_memory_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_worker_memory_limit_bytes{job="lavik"}) or (lavik_worker_memory_admission_pending_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_worker_memory_limit_bytes{job="lavik"}) or (lavik_worker_fullsync_reserved_memory_bytes{job="lavik"}
+          unless on (cluster, job, instance, worker) lavik_worker_memory_limit_bytes{job="lavik"})) and on (cluster,
+          job, instance) lavik:ready
         for: 5m
         keep_firing_for: 2m
         labels:
@@ -324,7 +328,8 @@ groups:
         expr:
           group by (cluster, job, instance) ((lavik:ready unless on (cluster, job, instance) lavik_storage_capacity_bytes{job="lavik"})
           or (lavik:ready unless on (cluster, job, instance) lavik_storage_available_bytes{job="lavik"}) or (lavik_storage_capacity_bytes{job="lavik"}
-          unless on (cluster, job, instance, device, path) lavik_storage_available_bytes{job="lavik"})) and on (cluster,
+          unless on (cluster, job, instance, device, path) lavik_storage_available_bytes{job="lavik"}) or (lavik_storage_available_bytes{job="lavik"}
+          unless on (cluster, job, instance, device, path) lavik_storage_capacity_bytes{job="lavik"})) and on (cluster,
           job, instance) lavik:ready
         for: 5m
         keep_firing_for: 2m
