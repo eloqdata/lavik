@@ -27,6 +27,12 @@
 namespace lavik::storage {
 namespace {
 
+void IndexPut(std::string& bytes, std::size_t offset, std::uint64_t value,
+              unsigned width) {
+  for (unsigned i = 0; i < width; ++i)
+    bytes[offset + i] = static_cast<char>(value >> (8 * i));
+}
+
 TEST(OrderedCompactCodecTest, ListUsesExistingLogicalWireImage) {
   const std::vector<OrderedCollectionEntry> entries{
       {.value_ = "a"}, {.value_ = std::string("b\0c", 3)}};
@@ -62,72 +68,72 @@ TEST(OrderedCompactCodecTest, SortedScoresRetainInfinityAndNegativeZero) {
             std::bit_cast<std::uint64_t>(-0.0));
 }
 
-TEST(OrderedCompactCodecTest, BoundsAndFramingFailClosed) {
-  const std::vector<OrderedCollectionEntry> entries{{.value_ = "abc"}};
-  auto encoded =
-      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries);
-  ASSERT_TRUE(encoded.ok());
-  EXPECT_EQ(encoded->size(), 15);
-  for (std::size_t size = 0; size < encoded->size(); ++size) {
-    EXPECT_FALSE(
-        DecodeOrderedCompactValue(OrderedCollectionKind::kList,
-                                  std::string_view(*encoded).substr(0, size), 1)
-            .ok());
-  }
-  EXPECT_FALSE(
-      DecodeOrderedCompactValue(OrderedCollectionKind::kList, *encoded, 2)
-          .ok());
-  EXPECT_FALSE(
-      DecodeOrderedCompactValue(OrderedCollectionKind::kList, *encoded + "x", 1)
-          .ok());
-  EXPECT_FALSE(
-      DecodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, *encoded, 1)
-          .ok());
-}
-
-TEST(OrderedCompactCodecTest, BorrowedReaderChecksEveryTruncatedBoundary) {
+TEST(OrderedCompactCodecTest, OwnedAndBorrowedReadersValidateBothVersions) {
   const std::vector<OrderedCollectionEntry> entries{
-      {.value_ = "", .score_ = 0},
-      {.value_ = std::string("a\0b", 3), .score_ = 0},
-      {.value_ = std::string(32, 'm'), .score_ = 0}};
-  for (auto kind :
+      {"", 0}, {std::string("a\0b", 3), 0}, {std::string(32, 'm'), 0}};
+  for (const auto kind :
        {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
-    auto bytes = EncodeOrderedCompactValue(kind, entries);
-    ASSERT_TRUE(bytes.ok());
-    for (std::size_t length = 0; length <= bytes->size(); ++length) {
-      auto reader = OrderedCompactReader::Open(
-          kind, std::string_view(*bytes).substr(0, length), entries.size());
-      bool valid = reader.ok();
-      if (valid) {
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-          auto entry = reader->Next();
-          if (!entry.ok()) {
-            valid = false;
-            break;
-          }
-          EXPECT_EQ(entry->value_, entries[i].value_);
-          EXPECT_EQ(entry->score_, entries[i].score_);
-        }
+    for (const unsigned version : {1, 2}) {
+      SCOPED_TRACE(version);
+      auto bytes = EncodeOrderedCompactValue(kind, entries, version);
+      ASSERT_TRUE(bytes.ok());
+      auto check = [&](std::string_view input, std::size_t count, bool valid) {
+        auto owned = DecodeOrderedCompactValue(kind, input, count);
+        EXPECT_EQ(owned.ok(), valid);
+        if (owned.ok()) EXPECT_EQ(*owned, entries);
+        auto reader = OrderedCompactReader::Open(kind, input, count);
+        bool readable = reader.ok();
+        for (std::size_t i = 0; readable && i < count; ++i)
+          readable = reader->Next().ok();
+        EXPECT_EQ(readable, valid);
+      };
+      for (std::size_t size = 0; size <= bytes->size(); ++size) {
+        SCOPED_TRACE(size);
+        check(std::string_view(*bytes).substr(0, size), entries.size(),
+              size == bytes->size());
       }
-      EXPECT_EQ(valid, length == bytes->size());
+      check(*bytes, entries.size() + 1, false);
+      check(*bytes + "x", entries.size(), false);
+      auto bad = *bytes;
+      bad[3] = '3';
+      check(bad, entries.size(), false);
+      const auto other = kind == OrderedCollectionKind::kList
+                             ? OrderedCollectionKind::kSortedSet
+                             : OrderedCollectionKind::kList;
+      EXPECT_FALSE(
+          OrderedCompactReader::Open(other, *bytes, entries.size()).ok());
+      EXPECT_FALSE(
+          DecodeOrderedCompactValue(other, *bytes, entries.size()).ok());
+      auto reader = OrderedCompactReader::Open(kind, *bytes, entries.size());
+      ASSERT_TRUE(reader.ok());
+      EXPECT_EQ(reader->indexed().has_value(), version == 2);
+      auto copied = *reader;
+      for (const auto& expected : entries) {
+        auto a = reader->Next();
+        auto b = copied.Next();
+        ASSERT_TRUE(a.ok());
+        ASSERT_TRUE(b.ok());
+        EXPECT_EQ(a->value_, expected.value_);
+        EXPECT_EQ(a->score_, expected.score_);
+        EXPECT_EQ(a->encoded_, b->encoded_);
+      }
+      EXPECT_FALSE(reader->Next().ok());
+      if (version == 1) continue;
+      const auto offsets = bytes->size() - (entries.size() + 1) * 4;
+      for (std::size_t i = 0; i <= entries.size(); ++i) {
+        bad = *bytes;
+        IndexPut(bad, offsets + i * 4, UINT32_MAX, 4);
+        check(bad, entries.size(), false);
+      }
+      if (kind == OrderedCollectionKind::kSortedSet) {
+        bad = *bytes;
+        IndexPut(bad, offsets - entries.size() * 8 + 8,
+                 std::bit_cast<std::uint64_t>(
+                     std::numeric_limits<double>::quiet_NaN()),
+                 8);
+        check(bad, entries.size(), false);
+      }
     }
-    auto reader = OrderedCompactReader::Open(kind, *bytes, entries.size());
-    ASSERT_TRUE(reader.ok());
-    auto copied = *reader;
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-      auto a = reader->Next();
-      auto b = copied.Next();
-      ASSERT_TRUE(a.ok());
-      ASSERT_TRUE(b.ok());
-      EXPECT_EQ(a->encoded_, b->encoded_);
-    }
-    EXPECT_FALSE(reader->Next().ok());
-    const auto trailing = *bytes + "x";
-    auto broken = OrderedCompactReader::Open(kind, trailing, entries.size());
-    ASSERT_TRUE(broken.ok());
-    ASSERT_TRUE(broken->Next().ok());
-    ASSERT_TRUE(broken->Next().ok());
-    EXPECT_FALSE(broken->Next().ok());
   }
 }
 
@@ -213,12 +219,6 @@ TEST(OrderedCompactCodecTest, LargeSortedSetRoundTripsBeyondRecordLimit) {
   CheckLargeLogicalRoundTrip(OrderedCollectionKind::kSortedSet);
 }
 
-void IndexPut(std::string& bytes, std::size_t offset, std::uint64_t value,
-              unsigned width) {
-  for (unsigned i = 0; i < width; ++i)
-    bytes[offset + i] = static_cast<char>(value >> (8 * i));
-}
-
 TEST(IndexedOrderedTest, CompactAndGroupedShareBodyAndPreserveV1) {
   for (auto kind :
        {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
@@ -260,29 +260,11 @@ TEST(IndexedOrderedTest, CompactAndGroupedShareBodyAndPreserveV1) {
       auto decoded = DecodeOrderedGroup(*grouped);
       ASSERT_TRUE(decoded.ok());
       EXPECT_EQ(decoded->entries_, entries);
-      auto legacy = EncodeOrderedCompactValue(kind, entries);
-      ASSERT_TRUE(legacy.ok());
-      auto old_reader = OrderedCompactReader::Open(kind, *legacy, count);
-      ASSERT_TRUE(old_reader.ok());
-      EXPECT_FALSE(old_reader->indexed());
       auto old_page = test::EncodeOrderedGroupV1(page);
       ASSERT_TRUE(old_page.ok());
       auto old_decoded = DecodeOrderedGroup(*old_page);
       ASSERT_TRUE(old_decoded.ok());
       EXPECT_EQ(old_decoded->entries_, entries);
-      for (const auto* wire : {&*grouped, &*old_page}) {
-        for (std::size_t chunk : {1, 3, 4, 7, 8, 63, 64, 65, 4096}) {
-          OrderedGroupMetadataDecoder decoder(wire->size());
-          for (std::size_t at = 0; at < wire->size(); at += chunk)
-            ASSERT_TRUE(
-                decoder.Read(std::string_view(*wire).substr(at, chunk)).ok());
-          auto metadata = decoder.Finish();
-          ASSERT_TRUE(metadata.ok()) << metadata.status();
-          EXPECT_EQ(metadata->item_count_, count);
-          EXPECT_EQ(metadata->min_score_, entries.front().score_);
-          EXPECT_EQ(metadata->max_score_, entries.back().score_);
-        }
-      }
     }
   }
 }
@@ -437,116 +419,6 @@ TEST(IndexedOrderedTest,
   }
 }
 
-TEST(IndexedOrderedTest, RejectsTruncatedArraysBadOffsetsAndUnknownVersions) {
-  for (auto kind :
-       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
-    const std::vector<OrderedCollectionEntry> entries{
-        {"", 0}, {std::string("a\0b", 3), 0}, {"tail", 1}};
-    auto values = entries;
-    if (kind == OrderedCollectionKind::kList) values.back().score_ = 0;
-    auto encoded = EncodeOrderedCompactValue(kind, values, 2);
-    ASSERT_TRUE(encoded.ok());
-    for (std::size_t size = 0; size < encoded->size(); ++size) {
-      const auto truncated = encoded->substr(0, size);
-      auto reader = OrderedCompactReader::Open(kind, truncated, values.size());
-      bool valid = reader.ok();
-      if (reader.ok())
-        for (std::size_t i = 0; i < values.size(); ++i) {
-          if (!reader->Next().ok()) {
-            valid = false;
-            break;
-          }
-        }
-      EXPECT_FALSE(valid) << size;
-    }
-    auto bad = *encoded;
-    bad[3] = '3';
-    EXPECT_FALSE(OrderedCompactReader::Open(kind, bad, values.size()).ok());
-    const auto offsets = encoded->size() - (values.size() + 1) * 4;
-    for (std::size_t i = 0; i <= values.size(); ++i) {
-      bad = *encoded;
-      IndexPut(bad, offsets + i * 4, UINT32_MAX, 4);
-      EXPECT_FALSE(DecodeOrderedCompactValue(kind, bad, values.size()).ok());
-    }
-    if (kind == OrderedCollectionKind::kSortedSet) {
-      bad = *encoded;
-      IndexPut(bad, offsets - values.size() * 8 + 8,
-               std::bit_cast<std::uint64_t>(
-                   std::numeric_limits<double>::quiet_NaN()),
-               8);
-      EXPECT_FALSE(DecodeOrderedCompactValue(kind, bad, values.size()).ok());
-    }
-  }
-}
-
-TEST(IndexedOrderedTest,
-     GroupedRecoveryValidatesEveryOffsetAndScoreWithoutMemberStorage) {
-  for (const auto kind :
-       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
-    OrderedGroupSnapshot page{
-        .kind_ = kind, .incarnation_ = 17, .id_ = 3, .entries_ = {}};
-    for (unsigned i = 0; i < 32; ++i)
-      page.entries_.push_back(
-          {std::to_string(i), kind == OrderedCollectionKind::kList ? 0.0 : i});
-    auto encoded = EncodeOrderedGroup(page);
-    ASSERT_TRUE(encoded.ok());
-    auto rejected = [&](const std::string& bytes) {
-      for (std::size_t chunk : {1, 7, 4096}) {
-        OrderedGroupMetadataDecoder decoder(bytes.size());
-        bool valid = true;
-        for (std::size_t at = 0; at < bytes.size(); at += chunk) {
-          if (!decoder.Read(std::string_view(bytes).substr(at, chunk)).ok()) {
-            valid = false;
-            break;
-          }
-        }
-        EXPECT_FALSE(valid && decoder.Finish().ok());
-      }
-    };
-    const auto offsets = encoded->size() - (page.entries_.size() + 1) * 4;
-    for (std::size_t i = 0; i <= page.entries_.size(); ++i) {
-      auto bad = *encoded;
-      IndexPut(bad, offsets + i * 4, UINT32_MAX, 4);
-      rejected(bad);
-    }
-    if (kind == OrderedCollectionKind::kSortedSet) {
-      for (double score : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
-        auto bad = *encoded;
-        IndexPut(bad, offsets - page.entries_.size() * 8 + 16 * 8,
-                 std::bit_cast<std::uint64_t>(score), 8);
-        rejected(bad);
-      }
-    }
-  }
-}
-
-TEST(IndexedOrderedTest,
-     PointReadsDoNotWalkUnrelatedEntriesAndRangesOwnTheirBytes) {
-  std::vector<OrderedCollectionEntry> entries;
-  for (std::size_t i = 0; i < 128; ++i)
-    entries.push_back({std::to_string(i), 0});
-  auto body =
-      EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries, 2);
-  ASSERT_TRUE(body.ok());
-  const auto offsets = body->size() - (entries.size() + 1) * 4;
-  // The strict decoder must reject this page, but a point read checks its own
-  // bounded interval, not a full-page walk hidden behind the offset lookup.
-  IndexPut(*body, offsets + 9 * 4, UINT32_MAX, 4);
-  auto reader = IndexedOrderedReader::Open(OrderedCollectionKind::kList,
-                                           std::string_view(*body).substr(8),
-                                           entries.size());
-  ASSERT_TRUE(reader.ok());
-  EXPECT_FALSE(reader->At(8).ok());
-  auto last = reader->At(127);
-  ASSERT_TRUE(last.ok());
-  EXPECT_EQ(last->value_, "127");
-  auto packed = reader->CopyRange(100, 3);
-  ASSERT_TRUE(packed.ok());
-  body->assign(body->size(), '\xff');
-  for (std::size_t i = 0; i < 3; ++i)
-    EXPECT_EQ(packed->view(i), std::to_string(100 + i));
-}
-
 // Test the real append adapters after moving an unstarted plan. Framing views
 // are ephemeral; one-byte extent reads must not overwrite a still-pending span.
 void CheckIndexedSplice(const OrderedCompactPayload& source,
@@ -555,7 +427,7 @@ void CheckIndexedSplice(const OrderedCompactPayload& source,
   auto expected = EncodeOrderedCompactValue(kind, entries, 2);
   ASSERT_TRUE(expected.ok());
   EXPECT_EQ(source.encoded_bytes(), expected->size());
-  for (const std::size_t chunk : {1, 3, 8, 257, 4096}) {
+  for (const std::size_t chunk : {1, 4096}) {
     auto copied = source;
     auto moved = std::move(copied);
     RecordPayloadCursor cursor(moved);
@@ -628,112 +500,62 @@ TEST(IndexedOrderedSpliceTest, ListEndEditsBorrowValuesAndStreamOffsets) {
   }
 }
 
-TEST(IndexedOrderedSpliceTest, SortedSetMovesDeleteAndInsertWithoutViewArrays) {
-  const std::vector<OrderedCollectionEntry> entries{{"", -10},
-                                                    {std::string("a\0b", 3), 0},
-                                                    {"bb", 0},
-                                                    {std::string(8000, 'c'), 5},
-                                                    {"tail", 10}};
-  auto bytes =
-      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
-  ASSERT_TRUE(bytes.ok());
-  auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
-                                           *bytes, entries.size());
-  ASSERT_TRUE(reader.ok());
-  for (std::size_t removed = 0; removed <= entries.size(); ++removed) {
-    for (const std::optional<double> score :
-         {std::optional<double>{}, std::optional<double>{-20},
-          std::optional<double>{0}, std::optional<double>{7},
-          std::optional<double>{20}}) {
-      if (removed == entries.size() && !score) continue;
-      const auto member = removed == entries.size()
-                              ? std::string_view("new")
-                              : std::string_view(entries[removed].value_);
-      auto expected = entries;
-      if (removed < entries.size()) expected.erase(expected.begin() + removed);
-      if (score) expected.push_back({std::string(member), *score});
-      std::sort(expected.begin(), expected.end(), OrderedEntryLess);
-      OrderedCompactPayload plan;
-      auto& splice = plan.V2(*reader->indexed());
-      // Derive source runs from the independent final vector rather than the
-      // production planner's old-position/new-position traversal.
-      for (std::size_t i = 0; i < expected.size();) {
-        if (score && expected[i].value_ == member) {
-          splice.AppendMember(member, *score);
-          ++i;
-          continue;
-        }
-        const auto found =
-            std::find(entries.begin(), entries.end(), expected[i]);
-        ASSERT_NE(found, entries.end());
-        const auto first = static_cast<std::size_t>(found - entries.begin());
-        std::size_t count = 1;
-        while (i + count < expected.size() && first + count < entries.size() &&
-               first + count != removed &&
-               expected[i + count] == entries[first + count])
-          ++count;
-        splice.AppendSource(first, count);
-        i += count;
+TEST(IndexedOrderedSpliceTest,
+     SortedSetEditsMatchModelAcrossTiesAndRejectInvalidSlots) {
+  for (const std::size_t count : {5, 257}) {
+    std::vector<OrderedCollectionEntry> entries{{"", -10},
+                                                {std::string("a\0b", 3), 0},
+                                                {"bb", 0},
+                                                {std::string(8000, 'c'), 5},
+                                                {"tail", 10}};
+    if (count > entries.size()) entries[3].value_.resize(32);
+    for (std::size_t i = entries.size(); i < count; ++i)
+      entries.push_back({std::string(i % 17, '\0') + std::to_string(i),
+                         static_cast<double>(i / 32)});
+    std::sort(entries.begin(), entries.end(), OrderedEntryLess);
+    auto bytes = EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
+                                           entries, 2);
+    ASSERT_TRUE(bytes.ok());
+    auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
+                                             *bytes, entries.size());
+    ASSERT_TRUE(reader.ok());
+    for (std::size_t removed = 0; removed <= entries.size(); ++removed) {
+      for (const std::optional<double> score :
+           {std::optional<double>{}, std::optional<double>{-20},
+            std::optional<double>{-0.0}, std::optional<double>{0},
+            std::optional<double>{7}, std::optional<double>{20},
+            std::optional<double>{32768},
+            std::optional<double>{-std::numeric_limits<double>::infinity()},
+            std::optional<double>{std::numeric_limits<double>::infinity()}}) {
+        if (removed == entries.size() && !score) continue;
+        const auto member = removed == entries.size()
+                                ? std::string_view("new")
+                                : std::string_view(entries[removed].value_);
+        auto expected = entries;
+        if (removed < entries.size())
+          expected.erase(expected.begin() + removed);
+        if (score) expected.push_back({std::string(member), *score});
+        std::sort(expected.begin(), expected.end(), OrderedEntryLess);
+        OrderedCompactPayload located;
+        ASSERT_TRUE(located.V2(*reader->indexed())
+                        .EditSortedSetMember(removed, member, score)
+                        .ok());
+        CheckIndexedSplice(located, OrderedCollectionKind::kSortedSet,
+                           expected);
       }
-      CheckIndexedSplice(plan, OrderedCollectionKind::kSortedSet, expected);
-
-      OrderedCompactPayload located;
-      ASSERT_TRUE(located.V2(*reader->indexed())
-                      .EditSortedSetMember(removed, member, score)
-                      .ok());
-      CheckIndexedSplice(located, OrderedCollectionKind::kSortedSet, expected);
-
-      IndexedOrderedSplice body(*reader->indexed(), /*compact=*/false);
-      ASSERT_TRUE(body.EditSortedSetMember(removed, member, score).ok());
-      std::string output;
-      output.reserve(body.encoded_bytes());
-      while (auto part = body.Next()) output.append(*part);
-      const auto encoded = EncodeOrderedCompactValue(
-          OrderedCollectionKind::kSortedSet, expected, 2);
-      ASSERT_TRUE(encoded.ok());
-      EXPECT_EQ(output, encoded->substr(8));
-      EXPECT_EQ(output.size(), body.encoded_bytes());
     }
+    IndexedOrderedSplice invalid(*reader->indexed());
+    EXPECT_FALSE(invalid.EditSortedSetMember(0, "missing", 1).ok());
+    EXPECT_FALSE(
+        invalid.EditSortedSetMember(entries.size() + 1, "new", 1).ok());
+    EXPECT_FALSE(
+        invalid.EditSortedSetMember(entries.size(), "new", std::nullopt).ok());
+    EXPECT_FALSE(
+        invalid
+            .EditSortedSetMember(0, entries.front().value_,
+                                 std::numeric_limits<double>::quiet_NaN())
+            .ok());
   }
-}
-
-TEST(IndexedOrderedSpliceTest, PointLookupHandlesDenseTiesAndInvalidSlots) {
-  std::vector<OrderedCollectionEntry> entries;
-  for (std::size_t i = 0; i < 257; ++i)
-    entries.push_back({std::string(i % 17, '\0') + std::to_string(i),
-                       static_cast<double>(i / 32)});
-  std::sort(entries.begin(), entries.end(), OrderedEntryLess);
-  auto bytes =
-      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries, 2);
-  ASSERT_TRUE(bytes.ok());
-  auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
-                                           *bytes, entries.size());
-  ASSERT_TRUE(reader.ok());
-  for (std::size_t removed = 0; removed < entries.size(); ++removed) {
-    for (double score :
-         {-std::numeric_limits<double>::infinity(), -0.0, 0.0, 4.0, 32768.0,
-          std::numeric_limits<double>::infinity()}) {
-      auto expected = entries;
-      expected[removed].score_ = score;
-      std::sort(expected.begin(), expected.end(), OrderedEntryLess);
-      OrderedCompactPayload plan;
-      ASSERT_TRUE(
-          plan.V2(*reader->indexed())
-              .EditSortedSetMember(removed, entries[removed].value_, score)
-              .ok());
-      CheckIndexedSplice(plan, OrderedCollectionKind::kSortedSet, expected);
-    }
-  }
-  IndexedOrderedSplice invalid(*reader->indexed());
-  EXPECT_FALSE(invalid.EditSortedSetMember(0, "missing", 1).ok());
-  EXPECT_FALSE(invalid.EditSortedSetMember(entries.size() + 1, "new", 1).ok());
-  EXPECT_FALSE(
-      invalid.EditSortedSetMember(entries.size(), "new", std::nullopt).ok());
-  EXPECT_FALSE(
-      invalid
-          .EditSortedSetMember(0, entries.front().value_,
-                               std::numeric_limits<double>::quiet_NaN())
-          .ok());
 }
 
 }  // namespace

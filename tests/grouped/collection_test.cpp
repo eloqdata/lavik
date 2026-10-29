@@ -2654,26 +2654,34 @@ TEST(GroupedCollectionTest, StreamingMetadataRebuildsBoundsAcrossAnyFraming) {
                    {"b", 0.0},
                    {"c", 1.5},
                    {"d", infinity}};
+  // Retain multi-byte counts as well as header/score/offset chunk boundaries.
+  for (unsigned i = 0; i < 252; ++i)
+    page.entries_.insert(page.entries_.end() - 1,
+                         {std::to_string(i), double(i + 2)});
   for (auto kind :
        {OrderedCollectionKind::kSortedSet, OrderedCollectionKind::kList}) {
     page.kind_ = kind;
     if (kind == OrderedCollectionKind::kList)
       for (auto& entry : page.entries_) entry.score_ = 0;
-    const auto encoded = EncodeOrderedGroup(page);
-    ASSERT_TRUE(encoded.ok()) << encoded.status();
-    for (const std::size_t chunk : {1, 7, 12, 63, 64, 65, 4096, 65536}) {
-      OrderedGroupMetadataDecoder decoder(encoded->size());
-      EXPECT_TRUE(decoder.Read({}).ok());
-      for (std::size_t offset = 0; offset < encoded->size(); offset += chunk)
-        ASSERT_TRUE(
-            decoder.Read(std::string_view(*encoded).substr(offset, chunk)).ok())
-            << "chunk=" << chunk << " offset=" << offset;
-      const auto metadata = decoder.Finish();
-      ASSERT_TRUE(metadata.ok()) << metadata.status();
-      EXPECT_EQ(metadata->id_, page.id_);
-      EXPECT_EQ(metadata->item_count_, page.entries_.size());
-      EXPECT_EQ(metadata->min_score_, page.entries_.front().score_);
-      EXPECT_EQ(metadata->max_score_, page.entries_.back().score_);
+    for (const bool v1 : {false, true}) {
+      const auto encoded =
+          v1 ? test::EncodeOrderedGroupV1(page) : EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      for (const std::size_t chunk : {1, 7, 12, 63, 64, 65, 4096, 65536}) {
+        OrderedGroupMetadataDecoder decoder(encoded->size());
+        EXPECT_TRUE(decoder.Read({}).ok());
+        for (std::size_t offset = 0; offset < encoded->size(); offset += chunk)
+          ASSERT_TRUE(
+              decoder.Read(std::string_view(*encoded).substr(offset, chunk))
+                  .ok())
+              << "chunk=" << chunk << " offset=" << offset;
+        const auto metadata = decoder.Finish();
+        ASSERT_TRUE(metadata.ok()) << metadata.status();
+        EXPECT_EQ(metadata->id_, page.id_);
+        EXPECT_EQ(metadata->item_count_, page.entries_.size());
+        EXPECT_EQ(metadata->min_score_, page.entries_.front().score_);
+        EXPECT_EQ(metadata->max_score_, page.entries_.back().score_);
+      }
     }
   }
   page.retired_ = true;
@@ -2690,29 +2698,50 @@ TEST(GroupedCollectionTest, StreamingMetadataRebuildsBoundsAcrossAnyFraming) {
 }
 
 TEST(GroupedCollectionTest,
-     StreamingMetadataRejectsTruncationAndInvalidScores) {
-  auto page = Page(1, 2, OrderedCollectionKind::kSortedSet);
-  const auto encoded = EncodeOrderedGroup(page);
-  ASSERT_TRUE(encoded.ok());
-  for (std::size_t size = 0; size < encoded->size(); ++size) {
-    OrderedGroupMetadataDecoder decoder(encoded->size());
-    ASSERT_TRUE(decoder.Read(std::string_view(*encoded).substr(0, size)).ok());
-    EXPECT_FALSE(decoder.Finish().ok()) << "truncated size=" << size;
-  }
-  OrderedGroupMetadataDecoder extra(encoded->size());
-  ASSERT_TRUE(extra.Read(*encoded).ok());
-  EXPECT_FALSE(extra.Read("x").ok());
-  EXPECT_FALSE(extra.Finish().ok());
-  for (const double score : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
-    auto corrupt = *encoded;
-    const auto second_score =
-        encoded->size() - (page.entries_.size() * 12 + 4) + 8;
-    const auto bits = std::bit_cast<std::uint64_t>(score);
-    for (unsigned byte = 0; byte < 8; ++byte)
-      corrupt[second_score + byte] = static_cast<char>(bits >> (8 * byte));
-    OrderedGroupMetadataDecoder decoder(corrupt.size());
-    EXPECT_FALSE(decoder.Read(corrupt).ok());
-    EXPECT_FALSE(decoder.Finish().ok());
+     StreamingMetadataRejectsTruncationInvalidOffsetsAndScores) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    auto page = Page(1, 32, kind);
+    const auto encoded = EncodeOrderedGroup(page);
+    ASSERT_TRUE(encoded.ok());
+    for (std::size_t size = 0; size < encoded->size(); ++size) {
+      OrderedGroupMetadataDecoder decoder(encoded->size());
+      ASSERT_TRUE(
+          decoder.Read(std::string_view(*encoded).substr(0, size)).ok());
+      EXPECT_FALSE(decoder.Finish().ok()) << "truncated size=" << size;
+    }
+    OrderedGroupMetadataDecoder extra(encoded->size());
+    ASSERT_TRUE(extra.Read(*encoded).ok());
+    EXPECT_FALSE(extra.Read("x").ok());
+    EXPECT_FALSE(extra.Finish().ok());
+    auto reject = [&](const std::string& corrupt) {
+      for (const std::size_t chunk : {1, 7, 4096}) {
+        OrderedGroupMetadataDecoder decoder(corrupt.size());
+        bool valid = true;
+        for (std::size_t offset = 0; valid && offset < corrupt.size();
+             offset += chunk)
+          valid = decoder.Read(std::string_view(corrupt).substr(offset, chunk))
+                      .ok();
+        EXPECT_FALSE(decoder.Finish().ok());
+      }
+    };
+    const auto offsets = encoded->size() - (page.entries_.size() + 1) * 4;
+    for (std::size_t i = 0; i <= page.entries_.size(); ++i) {
+      auto corrupt = *encoded;
+      std::fill_n(corrupt.begin() + offsets + i * 4, 4, '\xff');
+      reject(corrupt);
+    }
+    if (kind != OrderedCollectionKind::kSortedSet) continue;
+    for (const double score :
+         {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
+      auto corrupt = *encoded;
+      const auto second_score =
+          encoded->size() - (page.entries_.size() * 12 + 4) + 8;
+      const auto bits = std::bit_cast<std::uint64_t>(score);
+      for (unsigned byte = 0; byte < 8; ++byte)
+        corrupt[second_score + byte] = static_cast<char>(bits >> (8 * byte));
+      reject(corrupt);
+    }
   }
 }
 

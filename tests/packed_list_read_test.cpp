@@ -265,7 +265,7 @@ TEST_F(PackedCompactListTest, IndexedRangesAndIndexesMatchV1) {
 }
 
 TEST_F(PackedCompactListTest,
-       IndexedProductionPointReadDoesNotDecodeUnselectedEntries) {
+       IndexedProductionReadsDoNotDecodeUnselectedEntries) {
   std::vector<OrderedCollectionEntry> entries;
   for (std::size_t i = 0; i < 128; ++i)
     entries.push_back({std::to_string(i), 0});
@@ -287,6 +287,16 @@ TEST_F(PackedCompactListTest,
                                ListOperation{.kind_ = ListOperationKind::kIndex,
                                              .first_ = 8})
                    .ok());
+  auto range = ReadCompactList(CompactView(*bytes, entries.size()),
+                               ListOperation{.kind_ = ListOperationKind::kRange,
+                                             .first_ = 100,
+                                             .second_ = 102,
+                                             .packed_output_ = true});
+  ASSERT_TRUE(range.ok());
+  ASSERT_EQ(range->value_count(), 3);
+  bytes->assign(bytes->size(), '\xff');
+  for (std::size_t i = 0; i < 3; ++i)
+    EXPECT_EQ(range->value_view(i), std::to_string(100 + i));
 }
 
 TEST_F(PackedCompactListTest,
