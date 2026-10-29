@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+"""Validate shipped config, rule behavior, and alert navigation with pinned tools."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+MONITORING = ROOT / "deploy/monitoring"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tools", type=Path, required=True)
+    args = parser.parse_args()
+
+    def run(tool, *arguments):
+        subprocess.run([str(args.tools / tool), *map(str, arguments)], check=True)
+
+    run(
+        "promtool",
+        "check",
+        "rules",
+        *sorted((MONITORING / "prometheus/rules").glob("*.yml")),
+    )
+    run(
+        "promtool",
+        "test",
+        "rules",
+        *sorted((MONITORING / "prometheus/tests").glob("*.test.yml")),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        stage = Path(directory)
+        shutil.copytree(MONITORING / "prometheus", stage / "prometheus")
+        env = dict(
+            os.environ,
+            LAVIK_TARGETS="data:9100",
+            TARGET_DIR=str(stage / "prometheus/targets"),
+        )
+        subprocess.run(
+            ["sh", str(MONITORING / "configure-targets.sh")], env=env, check=True
+        )
+        run("promtool", "check", "config", stage / "prometheus/prometheus.yml")
+        manager = yaml.safe_load(
+            (MONITORING / "alertmanager/alertmanager.yml").read_text()
+        )
+        manager["templates"] = [str(MONITORING / "alertmanager/templates/*.tmpl")]
+        config = stage / "alertmanager.yml"
+        config.write_text(yaml.safe_dump(manager))
+        run("amtool", "check-config", config)
+        receivers = yaml.safe_load(
+            (MONITORING / "alertmanager/receivers.example.yml").read_text()
+        )
+        secret = stage / "webhook-url"
+        secret.write_text("http://127.0.0.1:1/test")
+        for receiver in receivers["receivers"]:
+            for webhook in receiver.get("webhook_configs", []):
+                webhook["url_file"] = str(secret)
+        manager["receivers"] = receivers["receivers"]
+        config.write_text(yaml.safe_dump(manager))
+        run("amtool", "check-config", config)
+    dashboard = json.loads(
+        (MONITORING / "grafana/dashboards/lavik-overview.json").read_text()
+    )
+
+    def panel_ids(panels):
+        return {p["id"] for p in panels} | {
+            i for p in panels for i in panel_ids(p.get("panels", []))
+        }
+
+    ids = panel_ids(dashboard["panels"])
+    runbook = (ROOT / "docs/operations/alerts.md").read_text()
+    anchors = {
+        line[3:].strip().lower().replace(" ", "-")
+        for line in runbook.splitlines()
+        if line.startswith("## ")
+    }
+    rules = yaml.safe_load((MONITORING / "prometheus/rules/alerts.yml").read_text())
+    for group in rules["groups"]:
+        for rule in group["rules"]:
+            annotations = rule["annotations"]
+            assert (
+                int(re.search(r"viewPanel=(\d+)", annotations["dashboard_url"])[1])
+                in ids
+            ), rule["alert"]
+            assert annotations["runbook_url"].split("#")[1] in anchors, rule["alert"]
+            assert annotations["summary"] and annotations["description"], rule["alert"]
+    print("PASS: monitoring configuration, rules and navigation")
+
+
+if __name__ == "__main__":
+    main()

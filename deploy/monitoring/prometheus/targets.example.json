@@ -1,0 +1,18 @@
+[
+  {
+    "targets": ["192.0.2.10:9100"],
+    "labels": {
+      "service": "lavik",
+      "cluster": "example-standalone",
+      "lavik_mode": "standalone"
+    }
+  },
+  {
+    "targets": ["192.0.2.11:9100"],
+    "labels": {
+      "service": "lavik",
+      "cluster": "example-managed",
+      "lavik_mode": "meta-managed"
+    }
+  }
+]

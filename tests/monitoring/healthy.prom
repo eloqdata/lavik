@@ -1,0 +1,21 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+lavik_server_ready 1
+lavik_memory_rejected_commands_total 0
+lavik_worker_retained_memory_bytes{worker="0"} 10
+lavik_worker_memory_admission_pending_bytes{worker="0"} 0
+lavik_worker_fullsync_reserved_memory_bytes{worker="0"} 0
+lavik_worker_memory_limit_bytes{worker="0"} 100
+lavik_storage_capacity_bytes{device="0",path="/data"} 100
+lavik_storage_available_bytes{device="0",path="/data"} 50
+lavik_replication_backlog_active{worker="0"} 0
+lavik_replication_backlog_pinned_cursors{worker="0"} 0
+lavik_replication_backlog_backpressured{worker="0"} 0
+lavik_replication_publish_queue_bytes{worker="0"} 0
+lavik_replication_publish_queue_capacity_bytes{worker="0"} 100
+lavik_fullsync_publish_queue_bytes{worker="0"} 0
+lavik_fullsync_publish_queue_admitted_bytes{worker="0"} 0
+lavik_fullsync_publish_queue_capacity_bytes{worker="0"} 100
+lavik_fullsync_sessions{worker="0"} 0
+lavik_cluster_control_connected 0
+lavik_cluster_control_protocol_errors_total 0
+lavik_cluster_control_lease_expirations_total 0

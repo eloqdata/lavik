@@ -1,0 +1,27 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+# Receivers intentionally have no integrations. Configure notification channels
+# before relying on delivery; firing alerts remain visible in the web UI.
+route:
+  receiver: default
+  group_by: [cluster, job, instance, alertname]
+  routes:
+    - receiver: critical
+      matchers: ['severity="critical"']
+    - receiver: warning
+      matchers: ['severity="warning"']
+receivers:
+  - name: default
+  - name: critical
+  - name: warning
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+inhibit_rules:
+  - source_matchers: ['alertname="LavikTargetDown"']
+    target_matchers: ['alertname=~"Lavik.*"', 'alertname!="LavikTargetDown"']
+    equal: [cluster, job, instance]
+  - source_matchers: ['severity="critical"']
+    target_matchers: ['severity="warning"']
+    equal: [cluster, job, instance, alertname, worker, device, path, signal]
+  - source_matchers: ['alertname="LavikWritableSpaceExhausted"']
+    target_matchers: ['alertname="LavikWritableSpaceLow"']
+    equal: [cluster, job, instance, device, path]
