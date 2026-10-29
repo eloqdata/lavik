@@ -2397,8 +2397,9 @@
           "editorMode": "code",
           "expr": "lavik_storage_tx_commit_queue_high_watermark{job=\"lavik\",instance=~\"$instance\"}",
           "legendFormat": "{{instance}} watermark / worker",
-          "range": true,
-          "refId": "A"
+          "range": false,
+          "refId": "A",
+          "instant": true
         },
         {
           "datasource": {
@@ -2408,8 +2409,9 @@
           "editorMode": "code",
           "expr": "lavik_storage_expiration_pause_count{job=\"lavik\",instance=~\"$instance\"}",
           "legendFormat": "{{instance}} expiration pause depth",
-          "range": true,
-          "refId": "B"
+          "range": false,
+          "refId": "B",
+          "instant": true
         },
         {
           "datasource": {
@@ -2419,8 +2421,9 @@
           "editorMode": "code",
           "expr": "lavik_storage_tx_cleaner_cooldown_seconds{job=\"lavik\",instance=~\"$instance\"}",
           "legendFormat": "{{instance}} cleaner cooldown",
-          "range": true,
-          "refId": "C"
+          "range": false,
+          "refId": "C",
+          "instant": true
         }
       ],
       "title": "Storage Diagnostic Settings and Pauses",
