@@ -1,0 +1,11 @@
+{
+  "code_commit": "5c70fdb0ccbfe12caf27eae5d5a4ff8f43b4299e",
+  "binary_sha256": "f6d0da004cbb3f3fca79509ba35b114fbc93e95fa730260172b94282d44eeee8",
+  "grafana": "13.1.0",
+  "prometheus": "3.11.3",
+  "scenario": "Equal sustained LPUSH success, WRONGTYPE execution failure, arity rejection; actual local server responses, no synthetic metrics. INFO capture precedes screenshot traffic.",
+  "images": [
+    "grafana-overview.png",
+    "grafana-request-health.png"
+  ]
+}
