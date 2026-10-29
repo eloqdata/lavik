@@ -958,6 +958,13 @@ if (BUILD_TESTING)
       LABELS meta-integration TIMEOUT 15)
 
     add_test(
+      NAME meta_integration.transport_faults
+      COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_transport_faults.py)
+    set_tests_properties(meta_integration.transport_faults PROPERTIES
+      LABELS meta-integration TIMEOUT 30)
+
+    add_test(
       NAME meta_integration.sentinel_recovery_probe
       COMMAND ${LAVIK_PYTHON3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/test_sentinel_recovery_probe.py)
