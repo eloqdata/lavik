@@ -784,7 +784,11 @@ export class Deployments {
               Math.max(
                 plan.metricsPort - 1,
                 ...plan.nodes
-                  .filter((n) => plan.hosts[n.host].address === host.address)
+                  .filter(
+                    (n) =>
+                      n.kind === "data" &&
+                      plan.hosts[n.host].address === host.address,
+                  )
                   .map((n) => n.metrics || 0),
               ) + 1,
           }

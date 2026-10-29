@@ -135,7 +135,7 @@ func (m *laneMetrics) initialize(id uint64, lane string) {
 	labels := prometheus.Labels{"peer_id": strconv.FormatUint(id, 10), "lane": lane}
 	m.rejected = prometheus.NewCounter(prometheus.CounterOpts{Name: "lavik_meta_raft_lane_queue_rejections_total", Help: "Outbound queue count or byte-budget rejections.", ConstLabels: labels})
 	counter := func(stage string) prometheus.Counter {
-		return prometheus.NewCounter(prometheus.CounterOpts{Name: "lavik_meta_raft_lane_errors_total", Help: "Connection or IO failures for a known peer, including EOF and deadlines.", ConstLabels: prometheus.Labels{"peer_id": labels["peer_id"], "lane": lane, "stage": stage}})
+		return prometheus.NewCounter(prometheus.CounterOpts{Name: "lavik_meta_raft_lane_errors_total", Help: "Connection or IO failures for a known peer, including EOF and incomplete-frame deadlines; excludes idle read deadlines.", ConstLabels: prometheus.Labels{"peer_id": labels["peer_id"], "lane": lane, "stage": stage}})
 	}
 	m.dialErrors, m.readErrors, m.writeErrors = counter("connect"), counter("read"), counter("write")
 	// These prebound collectors follow the immutable peer table's lifetime.

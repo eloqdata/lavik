@@ -559,8 +559,12 @@ func (n *Network) receive(raw net.Conn) {
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(deadline))
 		var size [4]byte
-		if _, err := io.ReadFull(conn, size[:]); err != nil {
-			peer.metrics[lane].readErrors.Inc()
+		if received, err := io.ReadFull(conn, size[:]); err != nil {
+			// Idle lanes expire normally between frames. Once a frame starts,
+			// deadline expiry is a transfer failure, including in its body below.
+			if received != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+				peer.metrics[lane].readErrors.Inc()
+			}
 			return
 		}
 		length := binary.BigEndian.Uint32(size[:])

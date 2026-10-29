@@ -143,8 +143,10 @@ Raft fields share one published cut; independent counters and C++ authority do
 not promise a global transaction. Peer series use current member IDs only and
 stop exporting on removal. Terms are values, never labels. Lane counters retain
 reconnect history for the current authorized peer incarnation; an identity or
-endpoint replacement can reset them. Source age is not evidence of fresh
-quorum; combine it with freshness and authority.
+endpoint replacement can reset them. Read errors exclude deadline expiry before
+any frame-header bytes arrive; EOF and incomplete-frame deadlines still count.
+Source age is not evidence of fresh quorum; combine it with freshness and
+authority.
 
 Fault queries and rehearsal examples are in the
 [Meta monitoring runbook](meta-monitoring.md), including the installed Meta alert

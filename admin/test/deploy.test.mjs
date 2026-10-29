@@ -275,6 +275,73 @@ test("a stale follower review cannot replace a changed plan or create an orphan 
   }
 });
 
+test("follower metrics allocation follows Data ports per IP and rejects Meta collisions", async (t) => {
+  for (const scenario of [
+    { name: "colocated Meta and Data", host: input.hosts[0], metrics: 9103 },
+    {
+      name: "another SSH route to the same IP",
+      host: { ...input.hosts[0], port: 2222 },
+      metrics: 9103,
+    },
+    {
+      name: "another IP starts at the Data base",
+      host: { host: "127.0.0.2", user: "ubuntu" },
+      metrics: 9100,
+    },
+    {
+      name: "next Data metrics port collides with Meta",
+      host: input.hosts[0],
+      metaMetricsPort: 9103,
+      collision: true,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const f = await fixture();
+      try {
+        const preview = await f.deployments.preview({
+          ...input,
+          monitorHosts: [0],
+          metaMetricsPort: scenario.metaMetricsPort,
+        });
+        const job = await f.deployments.create({
+          token: preview.token,
+          confirm: "test",
+        });
+        await f.fleet.update(job, "completed", "completed", "ready");
+        const plan = await f.deployments.plan("test");
+        plan.modern = true;
+        await f.deployments.save(plan);
+        f.fleet.view = async () => ({
+          status: { groups: [{ group_id: "group-1" }] },
+        });
+        const followerInput = {
+          group: "group-1",
+          host: scenario.host,
+          dataPort: 16390,
+        };
+        if (scenario.collision) {
+          const probes = f.calls.length;
+          await assert.rejects(
+            f.deployments.previewFollower("test", followerInput),
+            /Follower metrics port conflicts with another listener/,
+          );
+          assert.equal(f.calls.length, probes);
+        } else {
+          const follower = await f.deployments.previewFollower(
+            "test",
+            followerInput,
+          );
+          assert.equal(follower.ready, true);
+          assert.equal(follower.nodes[0].metrics, scenario.metrics);
+          assert.deepEqual(f.calls.at(-1).ports, [16390, scenario.metrics]);
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
 test("only explicit reads may fall back to another SSH host after a transport error", async () => {
   const f = await fixture();
   try {

@@ -5,7 +5,9 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	"net"
 	"strings"
@@ -346,5 +348,104 @@ func TestLaneMetricsSurviveConnectionReplacementAndDropRemovedMembers(t *testing
 	receiver.Update(members[1:])
 	if metricFamilies(t, r)["lavik_meta_raft_lane_connected"] != nil {
 		t.Fatal("removed lane still exported")
+	}
+}
+
+// Observe the receive loop's deadline installation so the test can expire it
+// after writing exactly the desired portion of a frame, without timing sleeps.
+type readDeadlineConn struct {
+	net.Conn
+	deadlines chan struct{}
+}
+
+func (c *readDeadlineConn) SetReadDeadline(deadline time.Time) error {
+	err := c.Conn.SetReadDeadline(deadline)
+	c.deadlines <- struct{}{}
+	return err
+}
+
+func TestLaneReadErrorsExcludeOnlyIdleHeaderDeadlines(t *testing.T) {
+	for lane, name := range laneNames {
+		for _, tc := range []struct {
+			name         string
+			frame        []byte
+			end          string
+			wantFailures float64
+		}{
+			{"idle-deadline", nil, "deadline", 0},
+			{"partial-header-deadline", []byte{0, 0}, "deadline", 1},
+			{"body-deadline", []byte{0, 0, 0, 2}, "deadline", 1},
+			{"partial-body-deadline", []byte{0, 0, 0, 2, 0}, "deadline", 1},
+			{"header-eof", nil, "eof", 1},
+			{"partial-header-eof", []byte{0, 0}, "eof", 1},
+			{"body-eof", []byte{0, 0, 0, 2}, "eof", 1},
+			{"closed-connection", nil, "close", 1},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				members := testMembers()[:2]
+				n, err := NewNetwork(Config{Local: members[1], Listen: "127.0.0.1:0"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(n.Close)
+				n.Update(members)
+				client, server := net.Pipe()
+				conn := &readDeadlineConn{Conn: server, deadlines: make(chan struct{}, 2)}
+				done := make(chan struct{})
+				go func() { n.receive(conn); close(done) }()
+				t.Cleanup(func() { _ = client.Close(); _ = server.Close(); <-done })
+				_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+
+				// Authenticate a current member before testing ordinary frame reads.
+				var hello [40]byte
+				copy(hello[:], "LRT1")
+				hello[4], hello[5] = byte(lane), 1
+				binary.BigEndian.PutUint64(hello[8:16], members[0].ID)
+				binary.BigEndian.PutUint64(hello[16:24], members[1].ID)
+				if err := writeAll(client, append(hello[:], 0, 0, 0, 2, '{', '}')); err != nil {
+					t.Fatal(err)
+				}
+				var ack [1]byte
+				if _, err := io.ReadFull(client, ack[:]); err != nil || ack[0] != 1 {
+					t.Fatalf("handshake: ack=%v err=%v", ack, err)
+				}
+				// Wait for both the handshake and frame deadlines, then advance only
+				// the latter. The production lane-specific timeout stays unchanged.
+				for range 2 {
+					select {
+					case <-conn.deadlines:
+					case <-time.After(5 * time.Second):
+						t.Fatal("receive deadline was not installed")
+					}
+				}
+				if err := writeAll(client, tc.frame); err != nil {
+					t.Fatal(err)
+				}
+				switch tc.end {
+				case "deadline":
+					_ = server.SetReadDeadline(time.Now().Add(-time.Second))
+				case "eof":
+					_ = client.Close()
+				case "close":
+					_ = server.Close()
+				}
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("receive did not retire the connection")
+				}
+				metrics := &n.peers.Load().peers[members[0].ID].metrics[lane]
+				var metric dto.Metric
+				if err := metrics.readErrors.Write(&metric); err != nil {
+					t.Fatal(err)
+				}
+				if got := metric.GetCounter().GetValue(); got != tc.wantFailures {
+					t.Fatalf("read failures=%v, want %v", got, tc.wantFailures)
+				}
+				if metrics.in.Load() {
+					t.Fatal("retired connection remains active")
+				}
+			})
+		}
 	}
 }
