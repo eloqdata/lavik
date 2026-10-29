@@ -431,6 +431,101 @@ std::string SecondsFromMicroseconds(std::uint64_t microseconds) {
   return absl::StrCat(seconds, ".", fraction);
 }
 
+void AppendStorageDiagnostics(
+    const storage::StorageDiagnosticsSnapshot& diagnostics,
+    std::string* output) {
+  // These are process-level observations of existing storage accounting.
+  // In particular, INFO's backlog "total" is a sum, not a counter suffix.
+  const auto append = [output](std::string_view suffix, std::string_view type,
+                               std::string_view help, auto value) {
+    absl::StrAppend(output, "# HELP lavik_storage_", suffix, " ", help);
+    if (type == "counter") {
+      absl::StrAppend(output,
+                      " Reinitialized on process startup; CONFIG RESETSTAT "
+                      "does not reset this counter.");
+    }
+    absl::StrAppend(output, "\n# TYPE lavik_storage_", suffix, " ", type,
+                    "\nlavik_storage_", suffix, " ", value, "\n");
+  };
+  const auto& cleaner = diagnostics.tx_cleaner_;
+  append("tx_backlog_bytes", "gauge",
+         "Occupied record bytes in sealed unreclaimed Tx blocks summed across "
+         "workers; excludes active blocks and extents, not block count, "
+         "metadata memory or an admission threshold.",
+         cleaner.tx_backlog_bytes_total_);
+  append(
+      "tx_backlog_max_bytes", "gauge",
+      "Largest worker's occupied record bytes in sealed unreclaimed Tx "
+      "blocks; excludes active blocks and extents, not an admission threshold.",
+      cleaner.tx_backlog_bytes_max_);
+  append("tx_cleaner_rounds_total", "counter", "Tx cleaner rounds started.",
+         cleaner.rounds_);
+  append("tx_cleaner_failures_total", "counter", "Failed Tx cleaner rounds.",
+         cleaner.failures_);
+  append("tx_cleaner_retired_blocks_total", "counter",
+         "Tx blocks retired by the cleaner.", cleaner.retired_blocks_);
+  append("tx_cleaner_running", "gauge",
+         "Whether a Tx cleaner round is running.", cleaner.running_ ? 1 : 0);
+  append("tx_cleaner_cooldown_seconds", "gauge",
+         "Configured Tx cleaner cooldown; zero disables online cleaning.",
+         static_cast<double>(cleaner.cooldown_ms_) / 1000.0);
+
+  const auto& commits = diagnostics.tx_commit_batches_;
+  append(
+      "tx_commit_batches_total", "counter",
+      "Commit batches dequeued for processing, not successful durable commits.",
+      commits.batches_);
+  append("tx_commit_batch_transactions_total", "counter",
+         "Transactions dequeued into commit batches, not successful durable "
+         "commits.",
+         commits.transactions_);
+  append("tx_commit_input_fences_total", "counter",
+         "Input durability fences in dequeued commit batches.",
+         commits.input_fences_);
+  append("tx_commit_merged_fences_total", "counter",
+         "Durability fences remaining after commit-batch merging.",
+         commits.merged_fences_);
+  append("tx_commit_backpressure_waits_total", "counter",
+         "Enqueues encountering their worker's commit queue watermark; not "
+         "wait duration.",
+         commits.backpressure_waits_);
+  append("tx_commit_queue_depth", "gauge",
+         "Queued commit receipts across workers; excludes dequeued in-flight "
+         "batches.",
+         commits.queue_depth_);
+  append("tx_commit_queue_peak", "gauge",
+         "Historical process-wide commit queue depth maximum since engine "
+         "startup.",
+         commits.queue_peak_);
+  append("tx_commit_queue_high_watermark", "gauge",
+         "Per-worker commit queue watermark; not a denominator for global "
+         "queue depth.",
+         commits.queue_high_watermark_);
+
+  const auto& durability = diagnostics.durability_;
+  append("dirty_staging_bytes", "gauge",
+         "Committed staging bytes not yet durable, including queued and "
+         "in-flight flushes.",
+         durability.dirty_staging_bytes_);
+  append("flushes_pending", "gauge",
+         "Active per-worker flush runners sampled conservatively; not queued "
+         "blocks or I/Os.",
+         durability.flushes_pending_);
+  append("tx_commits_pending", "gauge",
+         "Unfinished transaction commit chains, including dequeued in-flight "
+         "batches.",
+         durability.tx_commits_pending_);
+  append("durability_pending", "gauge",
+         "Whether sampled dirty bytes, flush runners or transaction commits "
+         "remain; "
+         "not an atomic durability barrier during concurrent writes.",
+         durability.pending() ? 1 : 0);
+  append(
+      "expiration_pause_count", "gauge",
+      "Current nesting depth of explicit expiration pauses, not pause events.",
+      diagnostics.expiration_pause_count_);
+}
+
 }  // namespace
 
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
@@ -459,6 +554,7 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   const storage::DefragTotals defrag = storage.DefragStats();
   const MemoryStats memory_metrics = GetMemoryStats();
   const std::uint64_t current_memory = memory_metrics.used_bytes_;
+  AppendStorageDiagnostics(storage_metrics.diagnostics_, &output);
   absl::StrAppend(&output,
                   "# HELP lavik_commands_total Completed Redis commands.\n"
                   "# TYPE lavik_commands_total counter\n"

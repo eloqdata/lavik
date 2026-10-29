@@ -29,8 +29,8 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
       .dirty_staging_bytes_ = 0,
       .flushes_pending_ = active_flushes_.load(std::memory_order_acquire),
       // Sample before visiting workers. A commit chain registered before the
-      // INFO request may finish and append on a worker already visited; the
-      // initial nonzero sample keeps this observation conservative, and the
+      // diagnostic request may finish and append on a worker already visited;
+      // the initial nonzero sample keeps this observation conservative, and the
       // following poll will see the appended record's dirty bytes.
       .tx_commits_pending_ = active_tx_commits_.load(std::memory_order_acquire),
   };
@@ -58,12 +58,23 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
   co_return result;
 }
 
+Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics()
+    const {
+  StorageDiagnosticsSnapshot result;
+  result.tx_cleaner_ = TxCleanerStats();
+  result.tx_commit_batches_ = TxCommitBatchStats();
+  result.durability_ = co_await DurabilityStats();
+  result.expiration_pause_count_ = ExpirationPauseCount();
+  co_return result;
+}
+
 Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
   struct AllocatorMetrics {
     std::uint64_t available_blocks_ = 0;
   };
 
   StorageMetricsSnapshot result;
+  result.diagnostics_ = co_await CollectDiagnostics();
   result.devices_.reserve(devices_.size());
   for (std::size_t index = 0; index < devices_.size(); ++index) {
     const StorageDevice& device = devices_[index];

@@ -400,3 +400,112 @@ groups:
             "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
             | urlquery }}&viewPanel=1"
           runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics
+
+      # Storage diagnostics require the upgraded Data exporter. Progress rules
+      # require a full observation window and present inputs; never fill gaps with zero.
+      - alert: LavikTxBacklogNotDraining
+        expr:
+          (lavik_storage_tx_backlog_bytes{job="lavik"} > 0) and on (cluster, job, instance) (deriv(lavik_storage_tx_backlog_bytes{job="lavik"}[10m])
+          > 0) and on (cluster, job, instance) (increase(lavik_storage_tx_cleaner_retired_blocks_total{job="lavik"}[10m])
+          == 0) and on (cluster, job, instance) (resets(lavik_storage_tx_cleaner_retired_blocks_total{job="lavik"}[10m])
+          == 0) and on (cluster, job, instance) (min_over_time(lavik_storage_tx_cleaner_cooldown_seconds{job="lavik"}[10m])
+          > 0) and on (cluster, job, instance) (max_over_time(lavik_storage_tx_cleaner_cooldown_seconds{job="lavik"}[10m])
+          <= 300) and on (cluster, job, instance) (lavik_storage_tx_cleaner_retired_blocks_total{job="lavik"}) and on
+          (cluster, job, instance) (lavik_storage_tx_cleaner_cooldown_seconds{job="lavik"}) and on (cluster, job, instance)
+          (lavik_storage_tx_backlog_bytes{job="lavik"} offset 10m) and on (cluster, job, instance) (lavik:ready)
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Tx record backlog grows without reclamation
+          description:
+            Sealed Tx record bytes have grown for ten minutes without retired blocks while online cleaning
+            is enabled with cooldown at most 300 seconds. This is not a block-count or metadata-memory limit. Inspect
+            transactions, cleaner failures and durability; unresolved leases can legitimately pin blocks. Resolved means
+            the condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=46"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#tx-backlog
+      - alert: LavikStorageDurabilityNoProgress
+        expr:
+          (lavik_storage_durability_pending{job="lavik"} == 1) and on (cluster, job, instance) (min_over_time(lavik_storage_durability_pending{job="lavik"}[5m])
+          == 1) and on (cluster, job, instance) (lavik_storage_durability_pending{job="lavik"} offset 5m) and on (cluster,
+          job, instance) (increase(lavik_storage_io_operations_total{job="lavik",operation="write"}[5m]) == 0) and on
+          (cluster, job, instance) (resets(lavik_storage_io_operations_total{job="lavik",operation="write"}[5m]) == 0)
+          and on (cluster, job, instance) (increase(lavik_storage_io_operations_total{job="lavik",operation="fdatasync"}[5m])
+          == 0) and on (cluster, job, instance) (resets(lavik_storage_io_operations_total{job="lavik",operation="fdatasync"}[5m])
+          == 0) and on (cluster, job, instance) (lavik_storage_io_operations_total{job="lavik",operation="write"}) and
+          on (cluster, job, instance) (lavik_storage_io_operations_total{job="lavik",operation="fdatasync"}) and on (cluster,
+          job, instance) (lavik:ready)
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pending storage durability has no observed I/O progress
+          description:
+            "Durability has remained pending for five minutes without completed writes or fdatasync calls.
+            I/O counters are only a process-wide progress proxy: other writes can mask a stalled transaction. Inspect
+            storage errors and pending work. Resolved means the condition ended; verify current telemetry before declaring
+            recovery."
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=50"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#storage-durability
+      - alert: LavikTxCommitBackpressure
+        expr:
+          (rate(lavik_storage_tx_commit_backpressure_waits_total{job="lavik"}[5m]) > 1) and on (cluster, job, instance)
+          (lavik_storage_tx_commit_backpressure_waits_total{job="lavik"}) and on (cluster, job, instance) (lavik:ready)
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Sustained transaction commit queue backpressure
+          description:
+            Commit enqueues encounter their worker queue watermark more than once per second over five minutes.
+            The global queue depth cannot be divided by the per-worker watermark. Inspect commit progress, staging and
+            device latency. Resolved means the condition ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=49"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#tx-commit-pressure
+      - alert: LavikMetricsMissing
+        expr:
+          group by (cluster, job, instance) ((lavik:ready unless on (cluster, job, instance) lavik_storage_tx_backlog_bytes{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_storage_tx_backlog_max_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_storage_tx_cleaner_rounds_total{job="lavik"}) or (lavik:ready unless
+          on (cluster, job, instance) lavik_storage_tx_cleaner_failures_total{job="lavik"}) or (lavik:ready unless on
+          (cluster, job, instance) lavik_storage_tx_cleaner_retired_blocks_total{job="lavik"}) or (lavik:ready unless
+          on (cluster, job, instance) lavik_storage_tx_cleaner_running{job="lavik"}) or (lavik:ready unless on (cluster,
+          job, instance) lavik_storage_tx_cleaner_cooldown_seconds{job="lavik"}) or (lavik:ready unless on (cluster, job,
+          instance) lavik_storage_tx_commit_batches_total{job="lavik"}) or (lavik:ready unless on (cluster, job, instance)
+          lavik_storage_tx_commit_batch_transactions_total{job="lavik"}) or (lavik:ready unless on (cluster, job, instance)
+          lavik_storage_tx_commit_input_fences_total{job="lavik"}) or (lavik:ready unless on (cluster, job, instance)
+          lavik_storage_tx_commit_merged_fences_total{job="lavik"}) or (lavik:ready unless on (cluster, job, instance)
+          lavik_storage_tx_commit_backpressure_waits_total{job="lavik"}) or (lavik:ready unless on (cluster, job, instance)
+          lavik_storage_tx_commit_queue_depth{job="lavik"}) or (lavik:ready unless on (cluster, job, instance) lavik_storage_tx_commit_queue_peak{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_storage_tx_commit_queue_high_watermark{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_storage_dirty_staging_bytes{job="lavik"}) or (lavik:ready
+          unless on (cluster, job, instance) lavik_storage_flushes_pending{job="lavik"}) or (lavik:ready unless on (cluster,
+          job, instance) lavik_storage_tx_commits_pending{job="lavik"}) or (lavik:ready unless on (cluster, job, instance)
+          lavik_storage_durability_pending{job="lavik"}) or (lavik:ready unless on (cluster, job, instance) lavik_storage_expiration_pause_count{job="lavik"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_storage_io_operations_total{job="lavik",operation="write"})
+          or (lavik:ready unless on (cluster, job, instance) lavik_storage_io_operations_total{job="lavik",operation="fdatasync"}))
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+          signal: storage_diagnostics
+        annotations:
+          summary: Required storage diagnostics are missing
+          description:
+            A ready target lacks one or more required storage diagnostics or write/fdatasync progress inputs.
+            Missing values are not zero. Upgrade all Data exporters before loading these rules. Resolved means the condition
+            ended; verify current telemetry before declaring recovery.
+          dashboard_url:
+            "{{ $externalLabels.grafana_url }}/d/lavik-overview/lavik-overview?var-instance={{ $labels.instance
+            | urlquery }}&viewPanel=1"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/alerts.md#missing-metrics

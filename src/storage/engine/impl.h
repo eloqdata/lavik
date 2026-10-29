@@ -2857,6 +2857,8 @@ class StorageEngine::Impl {
 
   Task<StorageDurabilityStats> DurabilityStats() const;
 
+  Task<StorageDiagnosticsSnapshot> CollectDiagnostics() const;
+
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   void ResumeExpiration() noexcept {

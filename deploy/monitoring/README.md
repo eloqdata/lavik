@@ -168,6 +168,23 @@ and metric panel. **Worker Memory** contains memory-admission rejections;
 **Replication Pressure** contains only replication queues and backlog pressure.
 Additional overview metrics remain available in their own collapsed row.
 
+The expanded **Storage / Transactions** row correlates sealed Tx record backlog
+with command p99 and shows cleaner rates, commit batches/fences, queue depth and
+historical peak, dirty staging, I/O progress, pending work and diagnostic settings.
+New storage warnings reuse the existing warning receiver, recovery window and
+TargetDown inhibition. Their thresholds are editable starting points, not SLOs;
+see [the runbook](../../docs/operations/alerts.md#tx-backlog).
+
+Upgrade every Data exporter in this Prometheus job before loading the storage
+diagnostic rules. During a rolling upgrade, retain the previous rule files until
+all targets expose the 20 diagnostics documented in
+[metrics](../../docs/operations/metrics.md#transaction-and-durability-diagnostics)
+and both write/fdatasync operation counters. Then validate and reload the new
+rules and provisioned dashboard. An old ready exporter deliberately raises
+`LavikMetricsMissing{signal="storage_diagnostics"}` with the new rules; missing
+data is not a healthy zero. On exporter rollback, restore the previous rules
+first. Existing Admin deployments retain their asset ownership/update checks.
+
 Counts and the table evaluate at the selected time range's end; the timeline
 covers the whole range. They follow the instance filter, while `LavikNoTargets`
 remains visible without an instance. Empty results mean no active samples, not
