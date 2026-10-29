@@ -51,6 +51,41 @@ uses its standard 30s initial grouping, 5m group updates and 4h repeat interval.
 Inhibited alerts remain visible in Alertmanager. Scheduled maintenance should
 use bounded Alertmanager silences, with an owner and expiry.
 
+## Dashboard
+
+The Overview dashboard's expanded **Alerts** section is independent of the
+replication panels. Critical and Warning count firing alert instances; Pending
+counts conditions still waiting for their `for` duration. Counts and the current
+alert table use the selected range's end, so a historical range is a historical
+snapshot. The instance selector applies to all these panels; `LavikNoTargets`
+remains visible because it has no target instance.
+
+Each table row is a Prometheus alert instance, including severity and any
+worker/device/signal scope. Warning and critical rules can both appear for the
+same condition. These are rule states, not a count of delivered notifications:
+Alertmanager inhibition and silences do not hide rows. **Active for** measures
+from the condition's first active evaluation (`ALERTS_FOR_STATE`), including
+pending time and `keep_firing_for`; a missing timestamp displays an unknown
+value instead of removing the alert. Table headers support sorting and filtering.
+
+**Alert Activity** gives each alert instance/severity its own lane. Blue is
+pending, yellow is warning firing, and red is critical firing; custom severities
+use purple when firing. Gaps mean no active sample, not confirmed recovery;
+missing telemetry, inactive conditions,
+and time outside retention cannot be distinguished from `ALERTS` alone. It is
+sampled history, with resolution bounded by evaluation/query intervals, rather
+than an audit log of state transitions or notifications. Check Target Status and
+the missing-metrics rules before concluding that an empty table or zero count
+means healthy; query errors must also be resolved. A neutral gray lane labeled
+**No active alert samples** appears only when the entire selected window has no
+alert samples. It does not assert recovery.
+
+The table's built-in alert-name mapping supplies readable titles, runbook
+anchors, and stable metric-panel IDs without changing the rule metrics. If you
+rename or add rules, they still appear under their own names, with links to this
+policy and Target Status; edit panel 37's mapping when a specific destination is
+needed. Threshold and timing changes do not require a dashboard change.
+
 ## Target down
 
 Confirm the configured endpoint from the monitoring host and inspect Prometheus

@@ -156,8 +156,21 @@ edit. Prometheus validates the discovery file; inspect Targets for any load erro
 
 `up` is scrape reachability, `lavik_server_ready` is storage startup/runtime
 health, and neither proves serving authority or complete FULL population
-readiness. Target Status displays missing readiness as UNKNOWN. The collapsed
-Alerts and Replication Pressure row exposes current firing alerts, OOM and queues.
+readiness. Target Status displays missing readiness as UNKNOWN.
+
+The expanded **Alerts** section sits immediately below the overview cards. It
+shows Critical/Warning firing counts, a Pending count, a sortable/filterable
+current-alert table, and an **Alert Activity** state timeline. The table includes
+scope (worker/device/signal), active duration, and links to the relevant runbook
+and metric panel. **Worker Memory** contains memory-admission rejections;
+**Replication Pressure** contains only replication queues and backlog pressure.
+Additional overview metrics remain available in their own collapsed row.
+
+Counts and the table evaluate at the selected time range's end; the timeline
+covers the whole range. They follow the instance filter, while `LavikNoTargets`
+remains visible without an instance. Empty results mean no active samples, not
+proof of health. See [dashboard semantics](../../docs/operations/alerts.md#dashboard)
+for duration, missing-data and notification-state details.
 
 ## Choose notification delivery
 

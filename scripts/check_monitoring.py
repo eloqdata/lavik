@@ -77,6 +77,16 @@ def main():
         }
 
     ids = panel_ids(dashboard["panels"])
+    current_alerts = next(p for p in dashboard["panels"] if p["id"] == 37)
+    # ALERTS contains labels, not annotations. Keep its dashboard navigation map
+    # aligned with the rule annotations used by notification receivers.
+    alert_routes = {
+        name: (anchor, int(panel))
+        for _, anchor, panel, name in re.findall(
+            r'"detail", "([^"|]+)\|([^"|]+)\|(\d+)", "alertname", "([^"|]+)"',
+            current_alerts["targets"][0]["expr"],
+        )
+    }
     runbook = (ROOT / "docs/operations/alerts.md").read_text()
     anchors = {
         line[3:].strip().lower().replace(" ", "-")
@@ -93,6 +103,10 @@ def main():
             ), rule["alert"]
             assert annotations["runbook_url"].split("#")[1] in anchors, rule["alert"]
             assert annotations["summary"] and annotations["description"], rule["alert"]
+            assert alert_routes[rule["alert"]] == (
+                annotations["runbook_url"].split("#")[1],
+                int(re.search(r"viewPanel=(\d+)", annotations["dashboard_url"])[1]),
+            ), rule["alert"]
     print("PASS: monitoring configuration, rules and navigation")
 
 
