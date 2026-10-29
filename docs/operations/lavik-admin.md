@@ -201,12 +201,13 @@ longer owned by this cluster. Hardware replacement requires a new review.
 ### Monitoring hosts
 
 Select one or more prepared hosts in **Monitoring**. Each runs an independent
-Prometheus/Grafana stack scraping every Data node. Install Docker Engine and
-Compose v2, enable Docker startup at boot, and grant the SSH account Docker
+Prometheus/Grafana stack scraping every Data node and supported Meta node.
+Install Docker Engine and Compose v2, enable Docker startup at boot, and grant the SSH account Docker
 access. Images must be cached or reachable from those hosts. Admin uploads the
-repository’s pinned monitoring Compose configuration and dashboard. Data metrics
-ports start at 9100 on each IP and increment for colocated nodes; the review
-checks for conflicts. **Monitoring ports** lets you change the metrics base port,
+repository’s pinned monitoring Compose configuration and separate **Lavik
+Overview** and **Lavik Meta / Raft** dashboards. Data metrics ports start at 9100 and Meta metrics ports at 9200
+(`metaMetricsPort`), independently on each IP and increment for colocated nodes; the review
+checks for conflicts. **Monitoring ports** lets you change either metrics base port,
 Grafana port, and Prometheus port. Restrict unauthenticated metrics ports to monitoring hosts.
 
 Grafana binds to the selected private IP, defaulting to port 3000. The Dashboard links to
@@ -215,6 +216,13 @@ from `BASE_DIR/CLUSTER/monitoring/grafana-password` on that host. This password
 is not returned to the browser or stored in the fleet database. Prometheus
 defaults to `127.0.0.1:9090` on the monitoring host. For access outside the private
 network, provide your own TLS reverse proxy and access controls.
+
+Admin detects `--metrics-port` and `--metrics-bind` in the installed
+`lavik-meta --help` output before enabling Meta metrics on the private IP.
+Older binaries receive no new flags, and historical deployment plans missing
+the capability/port fields leave Meta metrics disabled. The Dashboard states
+that Meta metrics are unavailable in these deployments. Both Prometheus jobs
+carry the deployment ID as a stable `cluster` label.
 
 Deployment waits for Grafana and Prometheus and verifies all Prometheus scrape
 targets after Meta reports the created cluster ready, because Data listeners

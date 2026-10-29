@@ -1,0 +1,169 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+# User-editable policy. The optional Meta job has no absent() alert: legacy and
+# Data-only deployments intentionally have no Meta exporters in discovery.
+groups:
+  - name: lavik.meta.alerts
+    rules:
+      - alert: LavikTargetDown
+        expr: up{job="lavik-meta"} == 0
+        for: 2m
+        keep_firing_for: 2m
+        labels:
+          job: lavik-meta
+          severity: critical
+        annotations:
+          summary: Meta metrics endpoint is unreachable
+          description: "Scraping {{ $labels.instance }} failed. Check process, listener and network; fail-stop may prevent the final WAL error from being scraped."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=41"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#target-down
+      - alert: LavikMetaNotRunning
+        expr: |
+          (lavik_meta_phase{job="lavik-meta",phase="running"} == 0)
+          and on (cluster, job, instance) (up{job="lavik-meta"} == 1)
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta has not reached its running phase
+          description: "{{ $labels.instance }} remains outside the running phase. Inspect startup/recovery logs and allow a dataset-appropriate recovery window."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=41"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - alert: LavikMetaTelemetryUnavailable
+        expr: |
+          group by (cluster, job, instance) (
+            ((up{job="lavik-meta"} == 1) unless on (cluster, job, instance)
+              (lavik_meta_phase{job="lavik-meta",phase="running"} >= 0))
+            or (lavik_meta:running unless on (cluster, job, instance)
+              ((count by (cluster, job, instance) (lavik_meta_source_available{job="lavik-meta",source=~"raft|proposal|data_control"} == 1)) == 3))
+            or (lavik_meta:running unless on (cluster, job, instance) lavik_meta:authority)
+            or (lavik_meta:running unless on (cluster, job, instance) lavik_meta_data_control_eligible{job="lavik-meta"})
+            or (lavik_meta:running unless on (cluster, job, instance) lavik_meta_raft_commit_index{job="lavik-meta"})
+            or (lavik_meta:running unless on (cluster, job, instance) lavik_meta_raft_applied_index{job="lavik-meta"})
+          )
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta health inputs are unavailable or stale
+          description: "{{ $labels.instance }} is reachable but lacks lifecycle or running health inputs. Check sources, publication age and metric relabeling; missing values are not healthy zeroes."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=41"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - alert: LavikMetaNoLeader
+        expr: |
+          (sum by (cluster, job) (lavik_meta:authority) == 0)
+          and on (cluster, job) lavik_meta:cluster_observed
+        for: 2m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Meta cluster has no observed usable Raft leader
+          description: "Cluster {{ $labels.cluster }} has zero usable leader authorities across all configured, fresh targets. Check quorum, elections and transport; a leader ID is only a hint."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance=All&viewPanel=2"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - alert: LavikMetaControlUnavailable
+        expr: |
+          (sum by (cluster, job) (
+            lavik_meta_data_control_eligible{job="lavik-meta"}
+            and on (cluster, job, instance) lavik_meta:raft_observed
+            and on (cluster, job, instance) (lavik_meta_source_available{job="lavik-meta",source="data_control"} == 1)
+          ) == 0)
+          and on (cluster, job) lavik_meta:cluster_observed
+          and on (cluster, job) (
+            count by (cluster, job) (
+              lavik_meta_data_control_eligible{job="lavik-meta"}
+              and on (cluster, job, instance) lavik_meta:raft_observed
+              and on (cluster, job, instance) (lavik_meta_source_available{job="lavik-meta",source="data_control"} == 1)
+            ) == on (cluster, job) count by (cluster, job) (up{job="lavik-meta"})
+          )
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Meta cluster has no Data-control eligible node
+          description: "Cluster {{ $labels.cluster }} has no observed Data-control eligibility. Inspect usable Raft authority and membership/identity readiness gates; eligibility is distinct from protocol role."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance=All&viewPanel=3"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - alert: LavikMetaVoterUnavailable
+        expr: |
+          (lavik_meta_raft_peer_fresh{job="lavik-meta"} == 0)
+          and on (cluster, job, instance, peer_id) lavik_meta_raft_member{job="lavik-meta",kind="voter"}
+          and on (cluster, job, instance) (lavik_meta:authority == 1)
+        for: 2m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta voter redundancy is reduced
+          description: "Leader {{ $labels.instance }} lacks fresh Lavik heartbeat evidence for voter {{ $labels.peer_id }}. Writes may still succeed; repair connectivity before another voter is lost. Learners are excluded."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=48"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#reduced-voter-redundancy
+      - alert: LavikMetaApplyLag
+        expr: |
+          ((lavik_meta_raft_commit_index{job="lavik-meta"} - lavik_meta_raft_applied_index{job="lavik-meta"}) > 100)
+          and on (cluster, job, instance) lavik_meta:raft_observed
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta application persistently trails commit
+          description: "{{ $labels.instance }} has more than 100 committed entries awaiting actual application for five minutes. Inspect the application executor and snapshot install; calibrate the entry threshold to workload."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=45"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistent-application-or-replication-lag
+      - alert: LavikMetaReplicationLag
+        expr: |
+          ((lavik_meta_raft_commit_index{job="lavik-meta"}
+            - on (cluster, job, instance) group_right lavik_meta_raft_peer_match_index{job="lavik-meta"}) > 100)
+          and on (cluster, job, instance, peer_id) lavik_meta_raft_member{job="lavik-meta",kind="voter"}
+          and on (cluster, job, instance) (lavik_meta:authority == 1)
+        for: 5m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta voter replication persistently trails commit
+          description: "Leader {{ $labels.instance }} observes voter {{ $labels.peer_id }} more than 100 entries behind commit for five minutes. Inspect WAL, transport and snapshot transfer. Match is not peer application; learners are excluded."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=47"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistent-application-or-replication-lag
+      - alert: LavikMetaWALFailure
+        expr: |
+          (increase(lavik_meta_raft_wal_errors_total{job="lavik-meta"}[5m]) > 0)
+          and on (cluster, job, instance) (up{job="lavik-meta"} == 1)
+        keep_firing_for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Meta WAL persistence failed
+          description: "{{ $labels.instance }} recorded a WAL {{ $labels.stage }} failure. Inspect storage and logs immediately; fail-stop can instead surface as target down. Preserve WAL and snapshots during diagnosis."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=51"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistence-and-snapshot-failures
+      - alert: LavikMetaSnapshotFailures
+        expr: |
+          (lavik_meta_raft_snapshot_consecutive_failures{job="lavik-meta"} > 0)
+          and on (cluster, job, instance) lavik_meta:raft_observed
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta snapshot failures have not recovered
+          description: "{{ $labels.instance }} has an uncleared snapshot failure streak for ten minutes. Inspect capture/prepare/publish outcomes and storage. A prepared file is not a published snapshot."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=55"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistence-and-snapshot-failures
+      - alert: LavikMetaGCFailures
+        expr: |
+          (lavik_meta_raft_gc_consecutive_failures{job="lavik-meta"} > 0)
+          and on (cluster, job, instance) lavik_meta:raft_observed
+        for: 10m
+        keep_firing_for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Meta log reclamation failures have not recovered
+          description: "{{ $labels.instance }} has an uncleared reclamation failure streak for ten minutes. Inspect GC errors, retained bytes and filesystem access; do not manually remove recovery files."
+          dashboard_url: "{{ $externalLabels.grafana_url }}/d/lavik-meta/lavik-meta?var-cluster={{ $labels.cluster | urlquery }}&var-instance={{ $labels.instance | urlquery }}&viewPanel=55"
+          runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistence-and-snapshot-failures

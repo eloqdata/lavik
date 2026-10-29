@@ -1,0 +1,3363 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+rule_files:
+  - ../rules/meta-recording.yml
+  - ../rules/meta-alerts.yml
+evaluation_interval: 15s
+group_eval_order:
+  - lavik.meta.recording
+  - lavik.meta.alerts
+tests:
+  - name: optional empty Meta job does not page Data-only deployments
+    interval: 15s
+    input_series: []
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: healthy voters and a lagging stale learner
+    interval: 15s
+    input_series:
+      - &id001
+        series: up{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 1+0x120
+      - &id060
+        series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 1+0x120
+      - &id056
+        series: lavik_meta_data_control_eligible{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 1+0x120
+      - &id002
+        series: lavik_meta_raft_status_age_seconds{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0.1+0x120
+      - &id003
+        series: lavik_meta_raft_leadership_validity_seconds{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 2+0x120
+      - &id004
+        series: lavik_meta_raft_commit_index{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 1000+0x120
+      - &id005
+        series: lavik_meta_raft_applied_index{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 1000+0x120
+      - &id006
+        series: lavik_meta_raft_snapshot_consecutive_failures{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - &id007
+        series: lavik_meta_raft_gc_consecutive_failures{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - &id008
+        series: lavik_meta_phase{cluster="test",job="lavik-meta",instance="m1:9200",phase="running"}
+        values: 1+0x120
+      - &id009
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m1:9200",source="raft"}
+        values: 1+0x120
+      - &id010
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m1:9200",source="proposal"}
+        values: 1+0x120
+      - &id011
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m1:9200",source="data_control"}
+        values: 1+0x120
+      - &id012
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m1:9200",stage="save"}
+        values: 0+0x120
+      - &id013
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m1:9200",stage="sync"}
+        values: 0+0x120
+      - &id014
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m1:9200",stage="snapshot_marker"}
+        values: 0+0x120
+      - &id015
+        series: up{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 1+0x120
+      - &id016
+        series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - &id017
+        series: lavik_meta_data_control_eligible{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - &id018
+        series: lavik_meta_raft_status_age_seconds{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 0.1+0x120
+      - &id019
+        series: lavik_meta_raft_leadership_validity_seconds{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 2+0x120
+      - &id020
+        series: lavik_meta_raft_commit_index{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 1000+0x120
+      - &id021
+        series: lavik_meta_raft_applied_index{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 1000+0x120
+      - &id022
+        series: lavik_meta_raft_snapshot_consecutive_failures{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - &id023
+        series: lavik_meta_raft_gc_consecutive_failures{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - &id024
+        series: lavik_meta_phase{cluster="test",job="lavik-meta",instance="m2:9200",phase="running"}
+        values: 1+0x120
+      - &id025
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m2:9200",source="raft"}
+        values: 1+0x120
+      - &id026
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m2:9200",source="proposal"}
+        values: 1+0x120
+      - &id027
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m2:9200",source="data_control"}
+        values: 1+0x120
+      - &id028
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m2:9200",stage="save"}
+        values: 0+0x120
+      - &id029
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m2:9200",stage="sync"}
+        values: 0+0x120
+      - &id030
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m2:9200",stage="snapshot_marker"}
+        values: 0+0x120
+      - &id031
+        series: up{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 1+0x120
+      - &id032
+        series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - &id033
+        series: lavik_meta_data_control_eligible{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - &id034
+        series: lavik_meta_raft_status_age_seconds{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 0.1+0x120
+      - &id035
+        series: lavik_meta_raft_leadership_validity_seconds{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 2+0x120
+      - &id036
+        series: lavik_meta_raft_commit_index{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 1000+0x120
+      - &id037
+        series: lavik_meta_raft_applied_index{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 1000+0x120
+      - &id038
+        series: lavik_meta_raft_snapshot_consecutive_failures{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - &id039
+        series: lavik_meta_raft_gc_consecutive_failures{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - &id040
+        series: lavik_meta_phase{cluster="test",job="lavik-meta",instance="m3:9200",phase="running"}
+        values: 1+0x120
+      - &id041
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m3:9200",source="raft"}
+        values: 1+0x120
+      - &id042
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m3:9200",source="proposal"}
+        values: 1+0x120
+      - &id043
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m3:9200",source="data_control"}
+        values: 1+0x120
+      - &id044
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m3:9200",stage="save"}
+        values: 0+0x120
+      - &id045
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m3:9200",stage="sync"}
+        values: 0+0x120
+      - &id046
+        series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m3:9200",stage="snapshot_marker"}
+        values: 0+0x120
+      - &id047
+        series: lavik_meta_raft_member{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="2",kind="voter"}
+        values: 1+0x120
+      - &id048
+        series: lavik_meta_raft_peer_fresh{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="2"}
+        values: 1+0x120
+      - &id049
+        series: lavik_meta_raft_peer_match_index{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="2"}
+        values: 1000+0x120
+      - &id050
+        series: lavik_meta_raft_member{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="3",kind="voter"}
+        values: 1+0x120
+      - &id051
+        series: lavik_meta_raft_peer_fresh{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 1+0x120
+      - &id052
+        series: lavik_meta_raft_peer_match_index{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 1000+0x120
+      - &id053
+        series: lavik_meta_raft_member{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="4",kind="learner"}
+        values: 1+0x120
+      - &id054
+        series: lavik_meta_raft_peer_fresh{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="4"}
+        values: 0+0x120
+      - &id055
+        series: lavik_meta_raft_peer_match_index{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="4"}
+        values: 0+0x120
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: sustained no leader and no control eligibility
+    interval: 15s
+    input_series:
+      - *id001
+      - &id057
+        series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - &id058
+        series: lavik_meta_data_control_eligible{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaNoLeader
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no observed usable Raft leader
+              description:
+                Cluster test has zero usable leader authorities across all configured, fresh targets. Check
+                quorum, elections and transport; a leader ID is only a hint.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=2
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 3m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no observed usable Raft leader
+              description:
+                Cluster test has zero usable leader authorities across all configured, fresh targets. Check
+                quorum, elections and transport; a leader ID is only a hint.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=2
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no Data-control eligible node
+              description:
+                Cluster test has no observed Data-control eligibility. Inspect usable Raft authority and membership/identity
+                readiness gates; eligibility is distinct from protocol role.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=3
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: leader recovery retains firing through the recovery hold
+    interval: 15s
+    input_series:
+      - *id001
+      - series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x12 1+0x108
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaNoLeader
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no observed usable Raft leader
+              description:
+                Cluster test has zero usable leader authorities across all configured, fresh targets. Check
+                quorum, elections and transport; a leader ID is only a hint.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=2
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 3m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: short election remains pending only
+    interval: 15s
+    input_series:
+      - *id001
+      - series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x3 1+0x117
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: down target makes cluster absence unknown
+    interval: 15s
+    input_series:
+      - &id059
+        series: up{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - *id057
+      - *id058
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta metrics endpoint is unreachable
+              description:
+                Scraping m1:9200 failed. Check process, listener and network; fail-stop may prevent the final
+                WAL error from being scraped.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#target-down
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: all endpoints down uses target alerts
+    interval: 15s
+    input_series:
+      - *id059
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - series: up{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - series: up{cluster="test",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta metrics endpoint is unreachable
+              description:
+                Scraping m1:9200 failed. Check process, listener and network; fail-stop may prevent the final
+                WAL error from being scraped.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#target-down
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+              instance: m2:9200
+            exp_annotations:
+              summary: Meta metrics endpoint is unreachable
+              description:
+                Scraping m2:9200 failed. Check process, listener and network; fail-stop may prevent the final
+                WAL error from being scraped.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m2%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#target-down
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+              instance: m3:9200
+            exp_annotations:
+              summary: Meta metrics endpoint is unreachable
+              description:
+                Scraping m3:9200 failed. Check process, listener and network; fail-stop may prevent the final
+                WAL error from being scraped.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m3%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#target-down
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: clusters remain isolated
+    interval: 15s
+    input_series:
+      - *id001
+      - *id057
+      - *id058
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+      - series: up{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 1+0x120
+      - series: lavik_meta_raft_leader_authority{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 1+0x120
+      - series: lavik_meta_data_control_eligible{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 1+0x120
+      - series: lavik_meta_raft_status_age_seconds{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 0.1+0x120
+      - series: lavik_meta_raft_leadership_validity_seconds{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 2+0x120
+      - series: lavik_meta_raft_commit_index{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_applied_index{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_snapshot_consecutive_failures{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - series: lavik_meta_raft_gc_consecutive_failures{cluster="other",job="lavik-meta",instance="m1:9200"}
+        values: 0+0x120
+      - series: lavik_meta_phase{cluster="other",job="lavik-meta",instance="m1:9200",phase="running"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m1:9200",source="raft"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m1:9200",source="proposal"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m1:9200",source="data_control"}
+        values: 1+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m1:9200",stage="save"}
+        values: 0+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m1:9200",stage="sync"}
+        values: 0+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m1:9200",stage="snapshot_marker"}
+        values: 0+0x120
+      - series: up{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 1+0x120
+      - series: lavik_meta_raft_leader_authority{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - series: lavik_meta_data_control_eligible{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - series: lavik_meta_raft_status_age_seconds{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 0.1+0x120
+      - series: lavik_meta_raft_leadership_validity_seconds{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 2+0x120
+      - series: lavik_meta_raft_commit_index{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_applied_index{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_snapshot_consecutive_failures{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - series: lavik_meta_raft_gc_consecutive_failures{cluster="other",job="lavik-meta",instance="m2:9200"}
+        values: 0+0x120
+      - series: lavik_meta_phase{cluster="other",job="lavik-meta",instance="m2:9200",phase="running"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m2:9200",source="raft"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m2:9200",source="proposal"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m2:9200",source="data_control"}
+        values: 1+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m2:9200",stage="save"}
+        values: 0+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m2:9200",stage="sync"}
+        values: 0+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m2:9200",stage="snapshot_marker"}
+        values: 0+0x120
+      - series: up{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 1+0x120
+      - series: lavik_meta_raft_leader_authority{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - series: lavik_meta_data_control_eligible{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - series: lavik_meta_raft_status_age_seconds{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 0.1+0x120
+      - series: lavik_meta_raft_leadership_validity_seconds{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 2+0x120
+      - series: lavik_meta_raft_commit_index{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_applied_index{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_snapshot_consecutive_failures{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - series: lavik_meta_raft_gc_consecutive_failures{cluster="other",job="lavik-meta",instance="m3:9200"}
+        values: 0+0x120
+      - series: lavik_meta_phase{cluster="other",job="lavik-meta",instance="m3:9200",phase="running"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m3:9200",source="raft"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m3:9200",source="proposal"}
+        values: 1+0x120
+      - series: lavik_meta_source_available{cluster="other",job="lavik-meta",instance="m3:9200",source="data_control"}
+        values: 1+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m3:9200",stage="save"}
+        values: 0+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m3:9200",stage="sync"}
+        values: 0+0x120
+      - series: lavik_meta_raft_wal_errors_total{cluster="other",job="lavik-meta",instance="m3:9200",stage="snapshot_marker"}
+        values: 0+0x120
+      - series: lavik_meta_raft_member{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="2",kind="voter"}
+        values: 1+0x120
+      - series: lavik_meta_raft_peer_fresh{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="2"}
+        values: 1+0x120
+      - series: lavik_meta_raft_peer_match_index{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="2"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_member{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="3",kind="voter"}
+        values: 1+0x120
+      - series: lavik_meta_raft_peer_fresh{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 1+0x120
+      - series: lavik_meta_raft_peer_match_index{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 1000+0x120
+      - series: lavik_meta_raft_member{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="4",kind="learner"}
+        values: 1+0x120
+      - series: lavik_meta_raft_peer_fresh{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="4"}
+        values: 0+0x120
+      - series: lavik_meta_raft_peer_match_index{cluster="other",job="lavik-meta",instance="m1:9200",peer_id="4"}
+        values: 0+0x120
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no observed usable Raft leader
+              description:
+                Cluster test has zero usable leader authorities across all configured, fresh targets. Check
+                quorum, elections and transport; a leader ID is only a hint.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=2
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no Data-control eligible node
+              description:
+                Cluster test has no observed Data-control eligibility. Inspect usable Raft authority and membership/identity
+                readiness gates; eligibility is distinct from protocol role.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=3
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: recovery waits for recovery window without missing source alarms
+    interval: 15s
+    input_series:
+      - *id001
+      - *id057
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - series: lavik_meta_phase{cluster="test",job="lavik-meta",instance="m1:9200",phase="running"}
+        values: 0+0x120
+      - &id061
+        series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m1:9200",source="raft"}
+        values: 0+0x120
+      - series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m1:9200",source="proposal"}
+        values: 0+0x120
+      - series: lavik_meta_source_available{cluster="test",job="lavik-meta",instance="m1:9200",source="data_control"}
+        values: 0+0x120
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaNotRunning
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              phase: running
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta has not reached its running phase
+              description:
+                m1:9200 remains outside the running phase. Inspect startup/recovery logs and allow a dataset-appropriate
+                recovery window.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 11m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: required input missing lavik_meta_phase
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: required input missing lavik_meta_source_available
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: required input missing lavik_meta_raft_commit_index
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: required input missing lavik_meta_data_control_eligible
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: required input missing lavik_meta_raft_leader_authority
+    interval: 15s
+    input_series:
+      - *id001
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: stale protocol status cannot certify leader or peer health
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - series: lavik_meta_raft_status_age_seconds{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 2+0x120
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: running Raft source unavailable
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id061
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta health inputs are unavailable or stale
+              description:
+                m1:9200 is reachable but lacks lifecycle or running health inputs. Check sources, publication
+                age and metric relabeling; missing values are not healthy zeroes.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=41
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#telemetry-and-recovery
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: Raft authority does not imply Data-control eligibility
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id058
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+            exp_annotations:
+              summary: Meta cluster has no Data-control eligible node
+              description:
+                Cluster test has no observed Data-control eligibility. Inspect usable Raft authority and membership/identity
+                readiness gates; eligibility is distinct from protocol role.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=All&viewPanel=3
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#no-usable-leader
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: isolated voter fires while leader remains usable then recovers
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - series: lavik_meta_raft_peer_fresh{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 0+0x16 1+0x104
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              peer_id: "3"
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta voter redundancy is reduced
+              description:
+                Leader m1:9200 lacks fresh Lavik heartbeat evidence for voter 3. Writes may still succeed;
+                repair connectivity before another voter is lost. Learners are excluded.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=48
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#reduced-voter-redundancy
+      - eval_time: 3m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: removed voter no longer alerts even if old peer series remains
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - &id062
+        series: lavik_meta_raft_peer_fresh{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 0+0x120
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: retired leader peer observations are ignored
+    interval: 15s
+    input_series:
+      - *id001
+      - *id057
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - series: lavik_meta_raft_leader_authority{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 1+0x120
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id062
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: local apply lag waits five minutes and retains recovery hold
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - series: lavik_meta_raft_applied_index{cluster="test",job="lavik-meta",instance="m2:9200"}
+        values: 800+0x24 1000+0x96
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m2:9200
+            exp_annotations:
+              summary: Meta application persistently trails commit
+              description:
+                m2:9200 has more than 100 committed entries awaiting actual application for five minutes. Inspect
+                the application executor and snapshot install; calibrate the entry threshold to workload.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m2%3A9200&viewPanel=45
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistent-application-or-replication-lag
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: voter replication lag excludes learner catchup
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - series: lavik_meta_raft_peer_match_index{cluster="test",job="lavik-meta",instance="m1:9200",peer_id="3"}
+        values: 800+0x120
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaReplicationLag
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              peer_id: "3"
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta voter replication persistently trails commit
+              description:
+                Leader m1:9200 observes voter 3 more than 100 entries behind commit for five minutes. Inspect
+                WAL, transport and snapshot transfer. Match is not peer application; learners are excluded.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=47
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistent-application-or-replication-lag
+      - eval_time: 6m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: WAL failure alerts without traffic and clears after rate and hold windows
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m1:9200",stage="save"}
+        values: 0+0x3 1+0x116
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaWALFailure
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: critical
+              stage: save
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta WAL persistence failed
+              description:
+                m1:9200 recorded a WAL save failure. Inspect storage and logs immediately; fail-stop can instead
+                surface as target down. Preserve WAL and snapshots during diagnosis.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=51
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistence-and-snapshot-failures
+      - eval_time: 2m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: counter reset is not a WAL failure
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - series: lavik_meta_raft_wal_errors_total{cluster="test",job="lavik-meta",instance="m1:9200",stage="save"}
+        values: 5+0x3 0+0x116
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test
+  - name: retry success clears streak alarms without resetting cumulative history
+    interval: 15s
+    input_series:
+      - *id001
+      - *id060
+      - *id056
+      - *id002
+      - *id003
+      - *id004
+      - *id005
+      - series: lavik_meta_raft_snapshot_consecutive_failures{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 2+0x48 0+0x72
+      - series: lavik_meta_raft_gc_consecutive_failures{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 3+0x48 0+0x72
+      - *id008
+      - *id009
+      - *id010
+      - *id011
+      - *id012
+      - *id013
+      - *id014
+      - *id015
+      - *id016
+      - *id017
+      - *id018
+      - *id019
+      - *id020
+      - *id021
+      - *id022
+      - *id023
+      - *id024
+      - *id025
+      - *id026
+      - *id027
+      - *id028
+      - *id029
+      - *id030
+      - *id031
+      - *id032
+      - *id033
+      - *id034
+      - *id035
+      - *id036
+      - *id037
+      - *id038
+      - *id039
+      - *id040
+      - *id041
+      - *id042
+      - *id043
+      - *id044
+      - *id045
+      - *id046
+      - *id047
+      - *id048
+      - *id049
+      - *id050
+      - *id051
+      - *id052
+      - *id053
+      - *id054
+      - *id055
+      - series: lavik_meta_raft_snapshot_errors_total{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 7+0x120
+      - series: lavik_meta_raft_gc_errors_total{cluster="test",job="lavik-meta",instance="m1:9200"}
+        values: 9+0x120
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta snapshot failures have not recovered
+              description:
+                m1:9200 has an uncleared snapshot failure streak for ten minutes. Inspect capture/prepare/publish
+                outcomes and storage. A prepared file is not a published snapshot.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=55
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistence-and-snapshot-failures
+      - eval_time: 11m
+        alertname: LavikMetaGCFailures
+        exp_alerts:
+          - exp_labels:
+              cluster: test
+              job: lavik-meta
+              severity: warning
+              instance: m1:9200
+            exp_annotations:
+              summary: Meta log reclamation failures have not recovered
+              description:
+                m1:9200 has an uncleared reclamation failure streak for ten minutes. Inspect GC errors, retained
+                bytes and filesystem access; do not manually remove recovery files.
+              dashboard_url: http://grafana.test/d/lavik-meta/lavik-meta?var-cluster=test&var-instance=m1%3A9200&viewPanel=55
+              runbook_url: https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#persistence-and-snapshot-failures
+      - eval_time: 15m
+        alertname: LavikTargetDown
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaNotRunning
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaTelemetryUnavailable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaNoLeader
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaControlUnavailable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaVoterUnavailable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaApplyLag
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaReplicationLag
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaWALFailure
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaSnapshotFailures
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: LavikMetaGCFailures
+        exp_alerts: []
+    external_labels:
+      grafana_url: http://grafana.test

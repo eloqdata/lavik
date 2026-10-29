@@ -520,7 +520,7 @@ test("SPDK selects every Data host and requires dedicated placement and explicit
   }
 });
 
-test("monitoring reserves ports, enables each Data exporter, and uploads all targets", async () => {
+test("monitoring separates Data and Meta targets and gates flags by binary capability", async () => {
   const f = await fixture();
   try {
     const preview = await f.deployments.preview({
@@ -529,11 +529,26 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
     });
     assert.equal(f.calls[0].monitoring, true);
     assert.deepEqual(
-      preview.nodes.filter((n) => n.metrics).map((n) => n.metrics),
+      preview.nodes
+        .filter((n) => n.kind === "data" && n.metrics)
+        .map((n) => n.metrics),
       [9100, 9101, 9102],
     );
     assert.ok(
       nodeArguments(preview, preview.nodes[3]).includes("--metrics-port"),
+    );
+    assert.deepEqual(
+      preview.nodes.filter((n) => n.kind === "meta").map((n) => n.metrics),
+      [9200, 9201, 9202],
+    );
+    assert.ok(
+      !nodeArguments(preview, preview.nodes[0]).includes("--metrics-port"),
+    );
+    await f.deployments.configureMonitoring(preview);
+    assert.deepEqual(f.calls.at(-1).metaTargets, []);
+    preview.metaMetricsSupported = true;
+    assert.ok(
+      nodeArguments(preview, preview.nodes[0]).includes("--metrics-bind"),
     );
     await f.deployments.configureMonitoring(preview);
     const request = f.calls.at(-1);
@@ -543,8 +558,15 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
       "127.0.0.1:9101",
       "127.0.0.1:9102",
     ]);
+    assert.deepEqual(request.metaTargets, [
+      "127.0.0.1:9200",
+      "127.0.0.1:9201",
+      "127.0.0.1:9202",
+    ]);
+    assert.ok(request.files["grafana/dashboards/lavik-meta.json"]);
     assert.ok(request.files["grafana/dashboards/lavik-overview.json"]);
     assert.ok(request.files["prometheus/rules/alerts.yml"]);
+    assert.ok(request.files["prometheus/rules/meta-alerts.yml"]);
     assert.ok(request.files["prometheus/rules/recording.yml"]);
     assert.ok(request.files["configure-targets.sh"]);
     assert.ok(request.files["alertmanager/alertmanager.yml"]);
@@ -552,6 +574,13 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
     assert.equal(
       request.grafanaUrl,
       `http://${request.address}:${request.grafanaPort}`,
+    );
+    assert.throws(
+      () =>
+        topology(
+          settings({ ...input, monitorHosts: [0], metaMetricsPort: 7200 }),
+        ),
+      /overlap/,
     );
     assert.equal(request.password, undefined);
     assert.throws(

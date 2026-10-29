@@ -167,6 +167,11 @@ type Role struct {
 // Status is an immutable observation, not a linearizable read certificate.
 type Status struct {
 	Role
+	// Diagnostic fields are published by the same protocol owner as the
+	// consensus cursors. Scraping never visits RawNode directly.
+	Published        time.Time
+	ProtocolRole     string
+	Progress         map[uint64]PeerProgress
 	Commit           uint64
 	Applied          uint64
 	Durable          uint64
@@ -186,6 +191,13 @@ type Status struct {
 	ConfigIndex      uint64
 	Learners         map[uint64]bool
 	Genesis          []uint64
+}
+
+// PeerProgress is the protocol owner's immutable leader-side replication view;
+// it does not attest to the peer's actual application progress.
+type PeerProgress struct {
+	Match, Next, PendingSnapshot uint64
+	State                        string
 }
 
 // Result reports an actually applied proposal, including a domain rejection

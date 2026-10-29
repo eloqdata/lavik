@@ -36,6 +36,7 @@ or safety boundaries.
 | [Multi-device storage](multi-device-storage.md) | Provisioning storage paths, expanding a storage set, or diagnosing membership and capacity constraints |
 | [Tomb Raider scheduling](tomb-raider.md) | Configuring or operating tombstone cleanup schedules |
 | [Active expiration tuning](active-expiration.md) | Inspecting or changing TTL scan and index-maintenance pacing |
+| [Meta monitoring](meta-monitoring.md) | Interpreting Meta/Raft failures and rehearsing exporter diagnostics |
 | [Prometheus metrics](metrics.md) | Integrating metrics, interpreting exported values, or changing monitoring behavior |
 | [Meta control plane](meta-control-plane.md) | Creating the first multi-Group cluster, running and diagnosing controlled failover, starting plaintext or mTLS Meta clusters, changing membership, replacing binaries, handling snapshot/WAL incidents, and exporting audit or operation archives |
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |

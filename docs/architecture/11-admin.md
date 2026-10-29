@@ -140,17 +140,21 @@ never erases media or enables unsafe no-IOMMU mode. Stopping Admin leaves host
 services running.
 
 Optional monitoring placement runs the repository’s Prometheus/Grafana Compose
-stack on prepared hosts with Docker access. Admin assigns Data metrics ports and
-uploads the shared monitoring runtime allowlist, rules and explicit Meta-managed
-target labels. Notification routing remains deployment configuration through an
-optional local or external Alertmanager. Each monitor generates and retains its own Grafana password
+stack on prepared hosts with Docker access. Admin assigns independent Data and
+Meta metrics ports, checks release capability before enabling Meta flags, and
+uploads the shared monitoring runtime allowlist with separate `lavik` and
+`lavik-meta` jobs, a stable cluster label, explicit Meta-managed Data labels,
+separate dashboards and alert rules. Notification routing remains deployment
+configuration through an optional local or external Alertmanager. Each monitor
+generates and retains its own Grafana password
 outside the fleet catalog and browser. Data connectivity and monitoring readiness
 are checked after Meta reports the created cluster ready: Data listeners do not
 open before Genesis. Interrupted verification requires explicit resume and never
 replays cluster creation. Private Grafana listeners, loopback
-Prometheus listeners, and network-restricted Data metrics share the deployment’s
-trusted-network boundary. Monitoring is ready only after its services and all
-scrape targets respond. Follower installation updates the retained target set;
+Prometheus listeners, and network-restricted Data/Meta metrics share the
+deployment’s trusted-network boundary. Monitoring is ready only after its services and all
+scrape targets respond under their expected job and cluster labels. Follower
+installation updates the retained target set;
 membership removal leaves the still-running process observable. Monitoring
 configuration and volumes survive Admin shutdown.
 

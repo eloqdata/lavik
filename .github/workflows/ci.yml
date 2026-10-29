@@ -312,7 +312,7 @@ jobs:
       - name: Check deployment modes without notification credentials
         working-directory: deploy/monitoring
         run: |
-          LAVIK_TARGETS=data:9100 docker compose config --quiet
+          LAVIK_TARGETS=data:9100 LAVIK_META_TARGETS=meta:9200 docker compose config --quiet
           LAVIK_TARGETS=data:9100 ALERTMANAGER_TARGETS=alertmanager:9093 docker compose --profile alertmanager config --quiet
           LAVIK_TARGETS=data:9100 ALERTMANAGER_TARGETS=external:9093 docker compose config --quiet
 
@@ -344,7 +344,7 @@ jobs:
           tar --zstd -xf "$RUNNER_TEMP/ci-build/ci-build.tar.zst"
           python3 scripts/ci_build_bundle.py validate build_ci
       - name: Verify real firing and resolved delivery
-        run: python3 tests/monitoring/e2e.py --tools "$RUNNER_TEMP/monitoring-tools" --output "$RUNNER_TEMP/monitoring-drill" --lavik-bin build_ci/lavik
+        run: python3 tests/monitoring/e2e.py --tools "$RUNNER_TEMP/monitoring-tools" --output "$RUNNER_TEMP/monitoring-drill" --lavik-bin build_ci/lavik --meta-bin build_ci/lavik-meta
       - uses: actions/upload-artifact@v7
         if: always()
         with:

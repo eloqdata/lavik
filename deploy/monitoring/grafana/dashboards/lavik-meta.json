@@ -1,0 +1,3585 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Meta service health, replication lag and storage bottlenecks. Summary cards cover one entire cluster; Node details filters the table and diagnostic charts. Independent from the Data node dashboard.",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "noValue": "Unknown",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "id": 1,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cluster) (1 - up{job=\"lavik-meta\",cluster=~\"$cluster\"})",
+          "instant": true,
+          "range": false,
+          "legendFormat": ""
+        }
+      ],
+      "title": "Targets down",
+      "type": "stat",
+      "description": "Unreachable or failed scrapes among configured Meta targets. Target count is not Raft voter membership."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "noValue": "Unknown",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster) (lavik_meta_raft_leader_authority{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) ((sum by (cluster) (lavik_meta_source_available{job=\"lavik-meta\",cluster=~\"$cluster\",source=\"raft\"}) == on (cluster) count by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) (min by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"}) == 1))",
+          "instant": true,
+          "range": false,
+          "legendFormat": ""
+        }
+      ],
+      "title": "Raft leaders",
+      "type": "stat",
+      "description": "Members reporting usable local Raft authority. Expected: one. Unknown when any target or Raft source is unavailable; this is not a quorum certificate."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "noValue": "Unknown",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "orange",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster) (lavik_meta_data_control_eligible{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) ((sum by (cluster) (lavik_meta_source_available{job=\"lavik-meta\",cluster=~\"$cluster\",source=\"data_control\"}) == on (cluster) count by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) (min by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"}) == 1))",
+          "instant": true,
+          "range": false,
+          "legendFormat": ""
+        }
+      ],
+      "title": "Control eligible",
+      "type": "stat",
+      "description": "Members eligible to serve Data-control. Expected: one after leader readiness. Unknown with incomplete target/source coverage."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "noValue": "Unknown",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "id": 4,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(histogram_quantile(0.99, sum by (cluster, le) (rate(lavik_meta_proposal_duration_seconds_bucket{job=\"lavik-meta\",cluster=~\"$cluster\"}[$__rate_interval])))) and on (cluster) ((sum by (cluster) (lavik_meta_source_available{job=\"lavik-meta\",cluster=~\"$cluster\",source=\"proposal\"}) == on (cluster) count by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) (min by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"}) == 1))",
+          "instant": true,
+          "range": false,
+          "legendFormat": ""
+        }
+      ],
+      "title": "Proposal P99",
+      "type": "stat",
+      "description": "Cluster P99 from merged histogram buckets, not an average of node quantiles. Entry through first caller result, including queueing and all outcomes."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "noValue": "Unknown",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (cluster) (rate(lavik_meta_proposals_total{job=\"lavik-meta\",cluster=~\"$cluster\"}[$__rate_interval]))) and on (cluster) ((sum by (cluster) (lavik_meta_source_available{job=\"lavik-meta\",cluster=~\"$cluster\",source=\"proposal\"}) == on (cluster) count by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) (min by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"}) == 1))",
+          "instant": true,
+          "range": false,
+          "legendFormat": ""
+        }
+      ],
+      "title": "Proposals / s",
+      "type": "stat",
+      "description": "First caller completions across the entire cluster, including rejected and unknown outcomes. Not a Raft log-entry commit rate."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "noValue": "Unknown",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 0,
+        "w": 4,
+        "h": 4
+      },
+      "id": 6,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(max by (cluster) (clamp_min(lavik_meta_raft_commit_index{job=\"lavik-meta\",cluster=~\"$cluster\"} - lavik_meta_raft_applied_index{job=\"lavik-meta\",cluster=~\"$cluster\"}, 0))) and on (cluster) ((sum by (cluster) (lavik_meta_source_available{job=\"lavik-meta\",cluster=~\"$cluster\",source=\"raft\"}) == on (cluster) count by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"})) and on (cluster) (min by (cluster) (up{job=\"lavik-meta\",cluster=~\"$cluster\"}) == 1))",
+          "instant": true,
+          "range": false,
+          "legendFormat": ""
+        }
+      ],
+      "title": "Max apply lag",
+      "type": "stat",
+      "description": "Largest local committed-minus-actually-applied entry gap. Unknown with incomplete target/source coverage. Inspect the trend before interpreting a transient gap."
+    },
+    {
+      "id": 64,
+      "type": "canvas",
+      "title": "",
+      "transparent": true,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Pending and firing rule counts for the selected Meta cluster. Node details does not narrow cluster alerts. These are Prometheus states, including inhibited/silenced notifications, not evidence of delivered notifications. Zero active samples is not proof of health; check reachability and source coverage.",
+      "gridPos": {
+        "h": 2,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "editorMode": "code",
+          "expr": "sum(ALERTS{job=\"lavik-meta\",cluster=~\"$cluster\",alertstate=\"firing\",severity=\"critical\"}) or vector(0)",
+          "instant": true,
+          "range": false,
+          "legendFormat": "Critical"
+        },
+        {
+          "refId": "B",
+          "editorMode": "code",
+          "expr": "sum(ALERTS{job=\"lavik-meta\",cluster=~\"$cluster\",alertstate=\"firing\",severity=\"warning\"}) or vector(0)",
+          "instant": true,
+          "range": false,
+          "legendFormat": "Warning"
+        },
+        {
+          "refId": "C",
+          "editorMode": "code",
+          "expr": "sum(ALERTS{job=\"lavik-meta\",cluster=~\"$cluster\",alertstate=\"pending\"}) or vector(0)",
+          "instant": true,
+          "range": false,
+          "legendFormat": "Pending"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "noValue": "?",
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Critical"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "prefix:Critical "
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "red",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Warning"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "prefix:Warning "
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Pending"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "prefix:Pending "
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "text",
+                      "value": null
+                    },
+                    {
+                      "color": "blue",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "inlineEditing": false,
+        "panZoom": false,
+        "showAdvancedTypes": false,
+        "tooltip": {
+          "mode": "none"
+        },
+        "root": {
+          "name": "Alert summary",
+          "type": "frame",
+          "elements": [
+            {
+              "name": "Alerts title",
+              "type": "text",
+              "config": {
+                "text": {
+                  "fixed": "Alerts",
+                  "mode": "fixed"
+                },
+                "align": "left",
+                "valign": "middle",
+                "size": 20,
+                "color": {
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "left",
+                "vertical": "center"
+              },
+              "placement": {
+                "left": 12,
+                "top": 0,
+                "width": 160,
+                "height": 32
+              }
+            },
+            {
+              "name": "Critical badge",
+              "type": "text",
+              "config": {
+                "text": {
+                  "field": "Critical",
+                  "mode": "field",
+                  "fixed": "Critical ?"
+                },
+                "align": "center",
+                "valign": "middle",
+                "size": 16,
+                "color": {
+                  "field": "Critical",
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "right",
+                "vertical": "center"
+              },
+              "placement": {
+                "right": 292,
+                "top": 0,
+                "width": 128,
+                "height": 32
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "field": "Critical",
+                  "fixed": "text"
+                },
+                "width": 1,
+                "radius": 5
+              }
+            },
+            {
+              "name": "Warning badge",
+              "type": "text",
+              "config": {
+                "text": {
+                  "field": "Warning",
+                  "mode": "field",
+                  "fixed": "Warning ?"
+                },
+                "align": "center",
+                "valign": "middle",
+                "size": 16,
+                "color": {
+                  "field": "Warning",
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "right",
+                "vertical": "center"
+              },
+              "placement": {
+                "right": 152,
+                "top": 0,
+                "width": 128,
+                "height": 32
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "field": "Warning",
+                  "fixed": "text"
+                },
+                "width": 1,
+                "radius": 5
+              }
+            },
+            {
+              "name": "Pending badge",
+              "type": "text",
+              "config": {
+                "text": {
+                  "field": "Pending",
+                  "mode": "field",
+                  "fixed": "Pending ?"
+                },
+                "align": "center",
+                "valign": "middle",
+                "size": 16,
+                "color": {
+                  "field": "Pending",
+                  "fixed": "text"
+                }
+              },
+              "constraint": {
+                "horizontal": "right",
+                "vertical": "center"
+              },
+              "placement": {
+                "right": 12,
+                "top": 0,
+                "width": 128,
+                "height": 32
+              },
+              "background": {
+                "color": {
+                  "fixed": "transparent"
+                }
+              },
+              "border": {
+                "color": {
+                  "field": "Pending",
+                  "fixed": "text"
+                },
+                "width": 1,
+                "radius": 5
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": 65,
+      "type": "table",
+      "title": "Current Alerts",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Pending and firing alerts for the entire selected Meta cluster, with peer/stage scope and links to its runbook and metric panels. Node details does not hide cluster alerts. Active for includes pending time and the recovery hold. Inhibited/silenced notifications remain visible. No data is not proof of health.",
+      "targets": [
+        {
+          "refId": "A",
+          "editorMode": "code",
+          "expr": "label_replace(label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(((ALERTS{job=\"lavik-meta\",cluster=~\"$cluster\",alertstate=~\"pending|firing\"} * ignoring(alertstate) group_left() (time() - ALERTS_FOR_STATE{job=\"lavik-meta\",cluster=~\"$cluster\"})) or (ALERTS{job=\"lavik-meta\",cluster=~\"$cluster\",alertstate=~\"pending|firing\"} * NaN)), \"detail\", \"$1|alert-policy|41\", \"alertname\", \"(.+)\"), \"detail\", \"Meta metrics endpoint is unreachable|target-down|41\", \"alertname\", \"LavikTargetDown\"), \"detail\", \"Meta has not reached its running phase|telemetry-and-recovery|41\", \"alertname\", \"LavikMetaNotRunning\"), \"detail\", \"Meta health inputs are unavailable or stale|telemetry-and-recovery|41\", \"alertname\", \"LavikMetaTelemetryUnavailable\"), \"detail\", \"Meta cluster has no observed usable Raft leader|no-usable-leader|2\", \"alertname\", \"LavikMetaNoLeader\"), \"detail\", \"Meta cluster has no Data-control eligible node|no-usable-leader|3\", \"alertname\", \"LavikMetaControlUnavailable\"), \"detail\", \"Meta voter redundancy is reduced|reduced-voter-redundancy|48\", \"alertname\", \"LavikMetaVoterUnavailable\"), \"detail\", \"Meta application persistently trails commit|persistent-application-or-replication-lag|45\", \"alertname\", \"LavikMetaApplyLag\"), \"detail\", \"Meta voter replication persistently trails commit|persistent-application-or-replication-lag|47\", \"alertname\", \"LavikMetaReplicationLag\"), \"detail\", \"Meta WAL persistence failed|persistence-and-snapshot-failures|51\", \"alertname\", \"LavikMetaWALFailure\"), \"detail\", \"Meta snapshot failures have not recovered|persistence-and-snapshot-failures|55\", \"alertname\", \"LavikMetaSnapshotFailures\"), \"detail\", \"Meta log reclamation failures have not recovered|persistence-and-snapshot-failures|55\", \"alertname\", \"LavikMetaGCFailures\"), \"_peer_id\", \"peer_id $1\", \"peer_id\", \"(.+)\"), \"_stage\", \"stage $1\", \"stage\", \"(.+)\"), \"_phase\", \"phase $1\", \"phase\", \"(.+)\"), \"scope\", \" \", \"_peer_id\", \"_stage\", \"_phase\"), \"instance\", \".*\", \"instance\", \"^$\")",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "detail",
+            "format": "regexp",
+            "regExp": "/^(?<Alert>[^|]+)\\|(?<Runbook>[^|]+)\\|(?<Metrics>[^|]+)$/",
+            "replace": false
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "detail": true,
+              "alertname": true,
+              "job": true,
+              "service": true,
+              "lavik_mode": true,
+              "preview_case": true,
+              "worker": true,
+              "device": true,
+              "signal": true,
+              "path": true,
+              "_worker": true,
+              "_device": true,
+              "_signal": true,
+              "_path": true,
+              "cluster": true,
+              "peer_id": true,
+              "stage": true,
+              "phase": true,
+              "_peer_id": true,
+              "_stage": true,
+              "_phase": true
+            },
+            "indexByName": {
+              "severity": 0,
+              "Alert": 1,
+              "instance": 2,
+              "scope": 3,
+              "alertstate": 4,
+              "Value": 5,
+              "Runbook": 6,
+              "Metrics": 7,
+              "cluster": 8
+            },
+            "renameByName": {
+              "severity": "Severity",
+              "instance": "Instance",
+              "scope": "Scope",
+              "alertstate": "State",
+              "Value": "Active for",
+              "cluster": "Cluster"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "enablePagination": true,
+        "sortBy": [
+          {
+            "displayName": "Severity",
+            "desc": false
+          },
+          {
+            "displayName": "State",
+            "desc": false
+          },
+          {
+            "displayName": "Active for",
+            "desc": true
+          }
+        ]
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": false
+          },
+          "noValue": "No data",
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Severity"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 125
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "text": "Critical",
+                        "color": "red"
+                      },
+                      "warning": {
+                        "text": "Warning",
+                        "color": "yellow"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.filterable",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Alert"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 230
+              },
+              {
+                "id": "custom.filterable",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Instance"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 155
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      ".*": {
+                        "text": "Cluster"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.filterable",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Scope"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "firing": {
+                        "text": "Firing",
+                        "color": "red"
+                      },
+                      "pending": {
+                        "text": "Pending",
+                        "color": "blue"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.filterable",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Active for"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 115
+              },
+              {
+                "id": "unit",
+                "value": "dtdhms"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "noValue",
+                "value": "Unknown"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Runbook"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": ".*",
+                      "result": {
+                        "text": "Runbook"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Runbook",
+                    "targetBlank": true,
+                    "url": "https://github.com/eloqdata/lavik/blob/main/docs/operations/meta-monitoring.md#${__value.raw}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Metrics"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": ".*",
+                      "result": {
+                        "text": "View metrics"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "View metrics",
+                    "targetBlank": false,
+                    "url": "/d/lavik-meta/lavik-meta?var-cluster=${cluster:percentencode}&viewPanel=${__value.raw}&var-instance=${__data.fields.Instance:percentencode}&from=${__from}&to=${__to}"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Cluster"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 180
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 24,
+        "h": 6
+      }
+    },
+    {
+      "id": 41,
+      "title": "Meta nodes",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "One row per configured target. Sort or filter columns, or click a node to focus the charts. Down targets remain visible; their runtime fields are unknown. Protocol role and serving authority are separate. Sources requires all local metric sources.",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "noValue": "Unknown",
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "filterable": true
+          },
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "Unknown",
+                  "color": "gray"
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reachable"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Down",
+                        "color": "red"
+                      },
+                      "1": {
+                        "text": "Up",
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Sources"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unavailable",
+                        "color": "orange"
+                      },
+                      "1": {
+                        "text": "Available",
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Phase"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "Starting",
+                        "color": "blue"
+                      },
+                      "2": {
+                        "text": "Recovering",
+                        "color": "orange"
+                      },
+                      "3": {
+                        "text": "Running",
+                        "color": "green"
+                      },
+                      "4": {
+                        "text": "Stopping",
+                        "color": "orange"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 105
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Role"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "Follower",
+                        "color": "text"
+                      },
+                      "2": {
+                        "text": "Pre-candidate",
+                        "color": "orange"
+                      },
+                      "3": {
+                        "text": "Candidate",
+                        "color": "orange"
+                      },
+                      "4": {
+                        "text": "Leader",
+                        "color": "blue"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Raft authority"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "No",
+                        "color": "text"
+                      },
+                      "1": {
+                        "text": "Yes",
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Control eligible"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "No",
+                        "color": "text"
+                      },
+                      "1": {
+                        "text": "Yes",
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 160
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Node"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Inspect this node",
+                    "url": "/d/lavik-meta/lavik-meta?var-cluster=${cluster:percentencode}&var-instance=${__value.raw}&${__url_time_range}",
+                    "targetBlank": false
+                  }
+                ]
+              },
+              {
+                "id": "custom.width",
+                "value": 195
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Apply lag"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "enablePagination": true,
+        "sortBy": [
+          {
+            "displayName": "Reachable",
+            "desc": false
+          },
+          {
+            "displayName": "Raft authority",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"})",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instance) ((lavik_meta_phase{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",phase=\"starting\"} * 1 or lavik_meta_phase{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",phase=\"recovering\"} * 2 or lavik_meta_phase{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",phase=\"running\"} * 3 or lavik_meta_phase{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",phase=\"stopping\"} * 4) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (instance) ((lavik_meta_raft_role{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",role=\"StateFollower\"} * 1 or lavik_meta_raft_role{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",role=\"StatePreCandidate\"} * 2 or lavik_meta_raft_role{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",role=\"StateCandidate\"} * 3 or lavik_meta_raft_role{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",role=\"StateLeader\"} * 4) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "D",
+          "expr": "min by (instance) ((lavik_meta_source_available{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "E",
+          "expr": "max by (instance) ((lavik_meta_raft_leader_authority{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "F",
+          "expr": "max by (instance) ((lavik_meta_data_control_eligible{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "G",
+          "expr": "max by (instance) ((clamp_min(lavik_meta_raft_commit_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} - lavik_meta_raft_applied_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}, 0)) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        },
+        {
+          "refId": "H",
+          "expr": "max by (instance) ((lavik_meta_raft_status_age_seconds{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}) and on (cluster, instance) (up{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} == 1))",
+          "format": "table",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "instance",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "instance",
+                "Value #A",
+                "Value #B",
+                "Value #C",
+                "Value #D",
+                "Value #E",
+                "Value #F",
+                "Value #G",
+                "Value #H"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "instance": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "Value #E": 5,
+              "Value #F": 6,
+              "Value #G": 7,
+              "Value #H": 8
+            },
+            "renameByName": {
+              "instance": "Node",
+              "Value #A": "Reachable",
+              "Value #B": "Phase",
+              "Value #C": "Role",
+              "Value #D": "Sources",
+              "Value #E": "Raft authority",
+              "Value #F": "Control eligible",
+              "Value #G": "Apply lag",
+              "Value #H": "Status age"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 46,
+      "type": "row",
+      "title": "Write service",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No data"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied_success"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "applied_rejected"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "admission_rejected"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "outcome_unknown"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "id": 42,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(lavik_meta_proposals_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "title": "Proposal outcomes",
+      "type": "timeseries",
+      "description": "First caller results. Unknown outcomes include post-submission timeout, cancellation and demotion. Late commit does not create a second result."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "id": 43,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (cluster, instance, le) (rate(lavik_meta_proposal_duration_seconds_bucket{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))) and on (cluster, instance) (sum by (cluster, instance) (rate(lavik_meta_proposal_duration_seconds_count{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])) > 0)",
+          "legendFormat": "{{instance}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "title": "Proposal latency P99",
+      "type": "timeseries",
+      "description": "End-to-end caller latency, including queueing. This is not isolated Raft commit latency."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "id": 44,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lavik_meta_proposals_inflight{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "title": "Proposals in flight",
+      "type": "timeseries",
+      "description": "Caller proposals still waiting for their first result. Persistent growth indicates stalled progress or admission pressure."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 29,
+        "w": 12,
+        "h": 8
+      },
+      "id": 45,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(lavik_meta_raft_commit_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} - lavik_meta_raft_applied_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}, 0)",
+          "legendFormat": "{{instance}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "title": "Local apply lag",
+      "type": "timeseries",
+      "description": "Committed entries minus completed C++ application. Sustained growth points to application work falling behind; a brief gap is normal."
+    },
+    {
+      "id": 49,
+      "type": "row",
+      "title": "Replication health",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 12,
+        "h": 8
+      },
+      "id": 47,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "clamp_min(lavik_meta_raft_commit_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} - on (cluster, instance) group_right lavik_meta_raft_peer_match_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}, 0)",
+          "legendFormat": "{{instance}} \u2192 {{peer_id}} \u00b7 replication lag",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "expr": "clamp_min(lavik_meta_raft_commit_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} - on (cluster, instance) group_right lavik_meta_raft_peer_applied_index{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}, 0)",
+          "legendFormat": "{{instance}} \u2192 {{peer_id}} \u00b7 apply lag",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "title": "Peer replication and apply lag",
+      "type": "timeseries",
+      "description": "Leader commit index minus peer Match or valid peer applied index. Match is replication progress, not application. Expired peer-applied is absent, never zero."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "noValue": "No data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 38,
+        "w": 12,
+        "h": 8
+      },
+      "id": 48,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lavik_meta_raft_peer_heartbeat_age_seconds{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} \u2192 {{peer_id}}",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        },
+        {
+          "refId": "B",
+          "expr": "lavik_meta_raft_leadership_validity_seconds{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} and on (cluster, instance) (lavik_meta_raft_role{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",role=\"StateLeader\"} == 1)",
+          "legendFormat": "{{instance}} \u00b7 validity window",
+          "instant": false,
+          "range": true,
+          "editorMode": "code"
+        }
+      ],
+      "title": "Peer heartbeat evidence age",
+      "type": "timeseries",
+      "description": "Compare evidence age with the local validity window. This is heartbeat proof age, not network RTT. Missing evidence is unknown."
+    },
+    {
+      "id": 56,
+      "type": "row",
+      "title": "Storage and snapshot diagnostics",
+      "collapsed": true,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "s",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 47,
+            "w": 12,
+            "h": 8
+          },
+          "id": 50,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (cluster, instance, le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])))",
+              "legendFormat": "{{instance}} \u00b7 WAL sync",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "B",
+              "expr": "histogram_quantile(0.99, sum by (cluster, instance, le) (rate(lavik_meta_raft_operation_duration_seconds_bucket{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",stage=\"persist\"}[$__rate_interval])))",
+              "legendFormat": "{{instance}} \u00b7 persistence task",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "WAL and persistence P99",
+          "type": "timeseries",
+          "description": "WAL synchronization and the complete ordered executor task are overlapping timing layers; do not add them. Snapshot file preparation is separate."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "ops",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 47,
+            "w": 12,
+            "h": 8
+          },
+          "id": 51,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "rate(lavik_meta_raft_wal_errors_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])",
+              "legendFormat": "{{instance}} \u00b7 WAL {{stage}}",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "B",
+              "expr": "rate(lavik_meta_raft_snapshot_errors_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])",
+              "legendFormat": "{{instance}} \u00b7 snapshot",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "C",
+              "expr": "rate(lavik_meta_raft_gc_errors_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])",
+              "legendFormat": "{{instance}} \u00b7 GC",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Persistence and snapshot failures",
+          "type": "timeseries",
+          "description": "Cumulative failure counters shown as rates. Fail-stop may prevent the last error scrape; target-down then supplies the evidence."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "bytes",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 55,
+            "w": 12,
+            "h": 8
+          },
+          "id": 52,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "lavik_meta_raft_pending_durability_bytes{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} \u00b7 pending",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "B",
+              "expr": "lavik_meta_raft_retained_log_bytes{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} \u00b7 retained",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Pending durability and retained log",
+          "type": "timeseries",
+          "description": "Pending bytes reveal durability backlog. Retained bytes are logical log size, not filesystem consumption."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "s",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 55,
+            "w": 12,
+            "h": 8
+          },
+          "id": 53,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "lavik_meta_raft_operation_age_seconds{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} \u00b7 {{stage}}",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Persistence and snapshot in-flight age",
+          "type": "timeseries",
+          "description": "Elapsed age of active executor work. Reveals stuck work that has not yet produced a duration sample."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "s",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 63,
+            "w": 12,
+            "h": 8
+          },
+          "id": 54,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "histogram_quantile(0.99, sum by (cluster, instance, stage, le) (rate(lavik_meta_raft_operation_duration_seconds_bucket{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\",stage=~\"capture|install|prepare|publish\"}[$__rate_interval])))",
+              "legendFormat": "{{instance}} \u00b7 {{stage}}",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Snapshot stage P99",
+          "type": "timeseries",
+          "description": "Capture/install cover C++ and encoding/decoding; prepare includes file rename and directory sync; publish completes durable publication."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "short",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 63,
+            "w": 12,
+            "h": 8
+          },
+          "id": 55,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "lavik_meta_raft_snapshot_consecutive_failures{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} \u00b7 snapshot",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "B",
+              "expr": "lavik_meta_raft_gc_consecutive_failures{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}} \u00b7 gc",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Snapshot and GC consecutive failures",
+          "type": "timeseries",
+          "description": "Failure streaks reset after success. The failure-rate panel retains the cumulative history."
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 46,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 59,
+      "type": "row",
+      "title": "Transport diagnostics",
+      "collapsed": true,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "ops",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 48,
+            "w": 12,
+            "h": 8
+          },
+          "id": 57,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance, stage) (rate(lavik_meta_raft_lane_errors_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{instance}} \u00b7 {{stage}}",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "B",
+              "expr": "sum by (instance) (rate(lavik_meta_raft_lane_queue_rejections_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "{{instance}} \u00b7 queue rejection",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Transport failures",
+          "type": "timeseries",
+          "description": "Connect/read/write errors and send-queue rejections. Zero log or snapshot connections alone is normal and is not a health signal."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "percentunit",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 48,
+            "w": 12,
+            "h": 8
+          },
+          "id": 58,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "max by (instance, lane) (lavik_meta_raft_lane_queued_messages{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"} / lavik_meta_raft_lane_queue_capacity{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"})",
+              "legendFormat": "{{instance}} \u00b7 {{lane}}",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Busiest send queue",
+          "type": "timeseries",
+          "description": "Maximum queue occupancy across current peers, per node and lane. Excludes the current socket write. Use the instance filter to investigate a busy node."
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 62,
+      "type": "row",
+      "title": "Data-control service",
+      "collapsed": true,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "short",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 49,
+            "w": 12,
+            "h": 8
+          },
+          "id": 60,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "lavik_meta_data_control_active_sessions{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}",
+              "legendFormat": "{{instance}}",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Active Data-control sessions",
+          "type": "timeseries",
+          "description": "Current sessions on Meta nodes. Compare with Control eligible and expected Data-node connections."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "ops",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 49,
+            "w": 12,
+            "h": 8
+          },
+          "id": 61,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum (rate(lavik_meta_data_control_accepted_sessions_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "accepted sessions",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "B",
+              "expr": "sum (rate(lavik_meta_data_control_redirected_sessions_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "redirected sessions",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "C",
+              "expr": "sum (rate(lavik_meta_data_control_rejected_sessions_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "rejected sessions",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            },
+            {
+              "refId": "D",
+              "expr": "sum (rate(lavik_meta_data_control_protocol_errors_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]))",
+              "legendFormat": "protocol errors",
+              "instant": false,
+              "range": true,
+              "editorMode": "code"
+            }
+          ],
+          "title": "Data-control session outcomes",
+          "type": "timeseries",
+          "description": "Outcomes across selected nodes. Redirects during leader changes are expected; sustained rejection or protocol errors need investigation."
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 48,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 63,
+      "type": "row",
+      "title": "Exporter diagnostics",
+      "collapsed": true,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "s",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 0,
+            "y": 50,
+            "w": 12,
+            "h": 8
+          },
+          "id": 39,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "editorMode": "code",
+              "expr": "rate(lavik_meta_collection_duration_seconds_sum{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval]) / rate(lavik_meta_collection_duration_seconds_count{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])",
+              "instant": false,
+              "range": true,
+              "legendFormat": "{{cluster}} / {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Collection average duration",
+          "type": "timeseries",
+          "description": "Completed prior collections; the current HTTP scrape is excluded from its own observation."
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "ops",
+              "noValue": "No data"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "x": 12,
+            "y": 50,
+            "w": 12,
+            "h": 8
+          },
+          "id": 40,
+          "options": {
+            "legend": {
+              "calcs": ["lastNotNull", "max"],
+              "displayMode": "table",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "editorMode": "code",
+              "expr": "rate(lavik_meta_collection_errors_total{job=\"lavik-meta\",cluster=~\"$cluster\",instance=~\"$instance\"}[$__rate_interval])",
+              "instant": false,
+              "range": true,
+              "legendFormat": "{{cluster}} / {{instance}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Collection failures",
+          "type": "timeseries",
+          "description": "Failed collection returns HTTP 503. Prometheus up=0 also covers deadline, network and fail-stop failures."
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 24,
+        "h": 1
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 41,
+  "tags": ["lavik", "meta", "raft", "prometheus"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(up{job=\"lavik-meta\"}, cluster)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Cluster",
+        "multi": false,
+        "name": "cluster",
+        "options": [],
+        "query": {
+          "query": "label_values(up{job=\"lavik-meta\"}, cluster)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(up{job=\"lavik-meta\",cluster=~\"$cluster\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Node details",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": {
+          "query": "label_values(up{job=\"lavik-meta\",cluster=~\"$cluster\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+  },
+  "timezone": "browser",
+  "title": "Lavik Meta / Raft",
+  "uid": "lavik-meta",
+  "version": 2,
+  "weekStart": ""
+}

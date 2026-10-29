@@ -14,6 +14,7 @@ import (
 
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/tracker"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -146,10 +147,12 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 		return nil, err
 	}
 	if !raft.IsEmptySnap(rec.snapshot) {
+		start := disk.metrics.operations[stageInstall].begin()
 		_, data, err := decodeSnapshot(rec.snapshot.Data)
 		if err == nil {
 			err = app.Install(rec.snapshot.Metadata.GetIndex(), data)
 		}
+		disk.metrics.operations[stageInstall].end(start, err)
 		if err != nil {
 			_ = disk.wal.Close()
 			return nil, err
@@ -187,6 +190,7 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 		return nil, err
 	}
 	r.publish()
+	r.disk.metrics.registry.MustRegister(runtimeCollector{r})
 	r.refreshTransport()
 	r.workers.Add(4)
 	go r.gcLoop()
@@ -207,12 +211,20 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 func (r *Runtime) Status() Status {
 	current := r.status.Load()
 	s := *current
+	if len(current.Progress) != 0 {
+		s.Progress = make(map[uint64]PeerProgress, len(current.Progress))
+		for id, progress := range current.Progress {
+			s.Progress[id] = progress
+		}
+	}
 	s.Members = append([]Member(nil), s.Members...)
 	s.PeerApplied = make(map[uint64]uint64, len(current.PeerApplied))
 	s.PeerAgeMicros = make(map[uint64]uint64, len(current.PeerAgeMicros))
 	for id, index := range current.PeerApplied {
 		s.PeerApplied[id] = index
-		s.PeerAgeMicros[id] = current.PeerAgeMicros[id]
+	}
+	for id, age := range current.PeerAgeMicros {
+		s.PeerAgeMicros[id] = age
 	}
 	s.Learners = make(map[uint64]bool, len(current.Learners))
 	for id, value := range current.Learners {
@@ -341,12 +353,21 @@ func (r *Runtime) stopAdmission() {
 
 func (r *Runtime) publish() {
 	s := r.core.status()
+	s.Published = time.Now()
+	if s.ProtocolRole == "StateLeader" {
+		s.Progress = make(map[uint64]PeerProgress, len(s.Members))
+		r.core.raw.WithProgress(func(id uint64, _ raft.ProgressType, p tracker.Progress) {
+			s.Progress[id] = PeerProgress{p.Match, p.Next, p.PendingSnapshot, p.State.String()}
+		})
+	}
 	s.Role = r.authorityRole(s.Role)
 	s.PeerApplied = map[uint64]uint64{}
 	s.PeerAgeMicros = map[uint64]uint64{}
 	for id, peer := range r.liveness {
 		if r.peerLive(id, time.Now()) {
 			s.PeerApplied[id] = peer.applied
+		}
+		if r.knownPeer(id) && !peer.confirmed.IsZero() {
 			s.PeerAgeMicros[id] = uint64(time.Since(peer.confirmed).Microseconds())
 		}
 	}
@@ -881,6 +902,7 @@ func (r *Runtime) diskLoop() {
 		case <-r.stop:
 			return
 		case tasks := <-r.diskJobs:
+			persistStart := r.disk.metrics.operations[stagePersist].begin()
 			task := tasks[0]
 			if len(tasks) > 1 {
 				// Ordered group commit: persist the final HardState and every
@@ -897,12 +919,19 @@ func (r *Runtime) diskLoop() {
 			}
 			var err error
 			if task.GetType() == pb.MsgSnap {
+				start := r.disk.metrics.operations[stagePublish].begin()
 				err = r.disk.publishSnapshotMarker(task.Snapshot)
+				r.disk.metrics.operations[stagePublish].end(start, err)
 			} else if task.GetType() == pb.MsgProp {
 				err = r.disk.saveJoin(task.Context)
+			} else if !raft.IsEmptySnap(task.Snapshot) {
+				start := r.disk.metrics.operations[stagePublish].begin()
+				err = r.disk.savePrepared(task, true)
+				r.disk.metrics.operations[stagePublish].end(start, err)
 			} else {
 				err = r.disk.savePrepared(task, true)
 			}
+			r.disk.metrics.operations[stagePersist].end(persistStart, err)
 			for _, original := range tasks {
 				done := &diskCompletion{task: original, err: err, ack: make(chan struct{})}
 				select {
@@ -929,20 +958,24 @@ func (r *Runtime) applyLoop() {
 		case job := <-r.applyJobs:
 			done := &applyCompletion{job: job, ack: make(chan struct{})}
 			if job.capture != nil {
+				start := r.disk.metrics.operations[stageCapture].begin()
 				data, err := r.app.Capture(job.capture.metadata.GetIndex())
 				if err == nil {
 					data, err = encodeSnapshot(job.capture.members, data)
 				}
 				done.err = err
+				r.disk.metrics.operations[stageCapture].end(start, err)
 				if err == nil {
 					done.snapshot = &pb.Snapshot{Metadata: job.capture.metadata, Data: data}
 				}
 			} else if job.install != nil {
+				start := r.disk.metrics.operations[stageInstall].begin()
 				_, data, err := decodeSnapshot(job.task.Snapshot.Data)
 				if err == nil {
 					err = r.app.Install(job.task.Snapshot.Metadata.GetIndex(), data)
 				}
 				done.err = err
+				r.disk.metrics.operations[stageInstall].end(start, err)
 			} else {
 				for _, e := range job.task.Entries {
 					result := Result{Index: e.GetIndex()}

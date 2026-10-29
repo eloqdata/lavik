@@ -1,0 +1,19 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+lavik_meta_phase{phase="running"} 1
+lavik_meta_source_available{source="raft"} 1
+lavik_meta_source_available{source="proposal"} 1
+lavik_meta_source_available{source="data_control"} 1
+lavik_meta_raft_leader_authority 1
+lavik_meta_data_control_eligible 1
+lavik_meta_raft_status_age_seconds 0.01
+lavik_meta_raft_leadership_validity_seconds 2
+lavik_meta_raft_commit_index 1000
+lavik_meta_raft_applied_index 1000
+lavik_meta_raft_member{peer_id="2",kind="voter"} 1
+lavik_meta_raft_member{peer_id="3",kind="learner"} 1
+lavik_meta_raft_peer_fresh{peer_id="2"} 1
+lavik_meta_raft_peer_fresh{peer_id="3"} 0
+lavik_meta_raft_peer_match_index{peer_id="2"} 1000
+lavik_meta_raft_peer_match_index{peer_id="3"} 0
+lavik_meta_raft_snapshot_consecutive_failures 0
+lavik_meta_raft_gc_consecutive_failures 0
