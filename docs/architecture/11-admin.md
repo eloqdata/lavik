@@ -141,7 +141,9 @@ services running.
 
 Optional monitoring placement runs the repository’s Prometheus/Grafana Compose
 stack on prepared hosts with Docker access. Admin assigns Data metrics ports and
-uploads configuration; each monitor generates and retains its own Grafana password
+uploads the shared monitoring runtime allowlist, rules and explicit Meta-managed
+target labels. Notification routing remains deployment configuration through an
+optional local or external Alertmanager. Each monitor generates and retains its own Grafana password
 outside the fleet catalog and browser. Data connectivity and monitoring readiness
 are checked after Meta reports the created cluster ready: Data listeners do not
 open before Genesis. Interrupted verification requires explicit resume and never
