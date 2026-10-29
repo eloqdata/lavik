@@ -14,7 +14,7 @@
 
 cmake_minimum_required(VERSION 3.20)
 
-project(lavik VERSION 0.2.0 LANGUAGES C CXX)
+project(lavik VERSION 0.3.0 LANGUAGES C CXX)
 
 set(LAVIK_VERSION_SUFFIX "-dev" CACHE STRING
     "Lavik prerelease suffix, such as -dev or -beta.1 (empty for a release)")
