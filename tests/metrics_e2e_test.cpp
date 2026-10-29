@@ -30,6 +30,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -729,6 +730,62 @@ TEST(MetricsE2eTest, StorageDiagnosticsRemainResponsiveDuringPausedFlush) {
   }));
   EXPECT_EQ(client.Command({"GET", "diagnostic-pause"}), "$5\r\nvalue");
   server.Stop();
+#endif
+}
+
+TEST(MetricsE2eTest, StorageFailureExportsOnlyReadiness) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "Deterministic storage failure requires test fault hooks";
+#else
+  const auto prefix = lavik::test::TestDataPath("lavik-diagnostics-unready-" +
+                                                std::to_string(::getpid()));
+  const auto data = prefix + ".data", log = prefix + ".log",
+             failure = prefix + ".fail";
+  FileCleanup data_cleanup(data), log_cleanup(log, true),
+      failure_cleanup(failure);
+  const int fd =
+      ::open(data.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+  const auto redis = FindFreePort();
+  auto http = FindFreePort();
+  while (http == redis) http = FindFreePort();
+  ServerProcess server(g_lavik_binary, redis, http, data, log, 2,
+                       1024ULL * 1024 * 1024,
+                       {{"LAVIK_EPOCH_IO_FAIL_FILE", failure},
+                        {"LAVIK_EPOCH_IO_FAIL_KIND", "write"},
+                        {"LAVIK_EPOCH_IO_FAIL_DEVICE", "1"}});
+  RespClient client(redis);
+  ASSERT_EQ(client.Command({"SET", "before-failure", "value"}), "+OK");
+  ASSERT_TRUE(WaitUntil([&] {
+    return MetricValue(HttpGet(http, "/metrics"),
+                       "lavik_storage_durability_pending") == 0;
+  }));
+  {
+    std::ofstream marker(failure);
+  }
+  // Fencing may close this connection before the command error is delivered.
+  // The HTTP endpoint must remain available but stop collecting storage.
+  try {
+    EXPECT_TRUE(client.Command({"FLUSHALL"}).starts_with('-'));
+  } catch (const std::runtime_error&) {
+  }
+  ASSERT_TRUE(WaitUntil([&] {
+    return MetricValue(HttpGet(http, "/metrics"), "lavik_server_ready") == 0;
+  }));
+  const auto response = HttpGet(http, "/metrics");
+  EXPECT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  EXPECT_EQ(response.find("lavik_storage_"), std::string::npos);
+  std::istringstream body(response.substr(response.find("\r\n\r\n") + 4));
+  std::string line;
+  unsigned samples = 0;
+  while (std::getline(body, line)) {
+    if (!line.empty() && line.front() != '#') ++samples;
+  }
+  EXPECT_EQ(samples, 1);
+  // The failed durability epoch remains fenced. The process fixture kills it
+  // on scope exit; a graceful successful shutdown is not expected here.
 #endif
 }
 
