@@ -494,16 +494,10 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     auto& staged = pending->staged_records_;
     // Retirement depends on this durable snapshot, not on whether its saved
     // index entries survive overwrites or a population detach. All receipts
-    // here have crossed their publication boundary, so gather them separately
+    // here have crossed their publication boundary, so settle them separately
     // from the index validation below.
     for (const auto& extents : staged.retired_extents_) {
       SpawnExtentReclaim(*store, extents);
-    }
-    auto retired_records = std::move(staged.publication_retirements_);
-    retired_records.reserve(retired_records.size() +
-                            staged.retired_records_.size());
-    for (const auto& retired : staged.retired_records_) {
-      retired_records.push_back(retired.Materialize());
     }
     const auto& identities = staged.identities_;
     const auto prefetch_index = [&](std::size_t position, bool bucket) {
@@ -578,12 +572,16 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       }
     }
 
-    if (!retired_records.empty()) {
+    if (!staged.retired_records_.empty() ||
+        !staged.publication_retirements_.empty()) {
       // Counted before the spawn so the shutdown drain can never observe
       // zero between this completion and the task's first slice.
       active_settlements_.fetch_add(1, std::memory_order_acq_rel);
+      // Transfer the snapshot's compact array instead of allocating and
+      // writing an expanded array that the settlement task would read once.
       store->worker_->Spawn(
-          MarkRetiredRecordsDead(store, std::move(retired_records)));
+          MarkRetiredRecordsDead(store, std::move(staged.retired_records_),
+                                 std::move(staged.publication_retirements_)));
     }
 
     if (StagingSlot* slot = StagingFor(*store, *state); slot != nullptr) {

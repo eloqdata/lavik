@@ -1230,12 +1230,12 @@ Task<absl::Status> FlushReplyBatch(TcpStream& stream,
   co_return status;
 }
 
-Task<absl::Status> WriteOrBatchReply(TcpStream& stream,
-                                     std::string_view encoded,
-                                     bool more_commands,
-                                     PendingReplyBatch* batch,
-                                     ReadLatencyTrace read_trace = {},
-                                     SetLatencyTrace set_trace = {}) {
+Task<absl::Status> WriteOrBatchReplySlow(TcpStream& stream,
+                                         std::string_view encoded,
+                                         bool more_commands,
+                                         PendingReplyBatch* batch,
+                                         ReadLatencyTrace read_trace = {},
+                                         SetLatencyTrace set_trace = {}) {
   if (encoded.size() > kMaximumBatchedReplyBytes) {
     absl::Status flushed = co_await FlushReplyBatch(stream, batch);
     if (!flushed.ok()) co_return flushed;
@@ -1275,6 +1275,26 @@ Task<absl::Status> WriteOrBatchReply(TcpStream& stream,
   }
 #endif
   co_return status;
+}
+
+Task<absl::Status> WriteOrBatchReply(TcpStream& stream,
+                                     std::string_view encoded,
+                                     bool more_commands,
+                                     PendingReplyBatch* batch,
+                                     ReadLatencyTrace read_trace = {},
+                                     SetLatencyTrace set_trace = {}) {
+#if !LAVIK_ENABLE_TRACE
+  // With no pending reply and no following command, batching has no work to
+  // do. Return the socket task directly instead of allocating a forwarding
+  // coroutine frame per command. The serving frame still owns encoded until
+  // the socket task completes, including partial writes and TLS suspension.
+  if (!more_commands && batch->empty()) {
+    return stream.WriteAll(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
+  }
+#endif
+  return WriteOrBatchReplySlow(stream, encoded, more_commands, batch,
+                               std::move(read_trace), std::move(set_trace));
 }
 
 bool ShutdownRequested() {
