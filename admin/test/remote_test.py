@@ -56,8 +56,9 @@ class RemoteSafety(unittest.TestCase):
                                 "activeTargets": [
                                     {
                                         "health": "up",
-                                        "labels": {"instance": "data:9100"},
+                                        "labels": {"instance": target},
                                     }
+                                    for target in request["targets"]
                                 ]
                             }
                         }
@@ -77,8 +78,12 @@ class RemoteSafety(unittest.TestCase):
             env.write_text(
                 original
                 + "ALERTMANAGER_TARGETS=external:9093\nALERTMANAGER_CONFIG=./operator.yml\n"
+                + "LAVIK_TARGETS_FILE=./stale-targets.json\n"
             )
+            request["targets"].append("follower:9100")
             remote.monitoring(request)
+            self.assertIn("LAVIK_TARGETS=data:9100,follower:9100\n", env.read_text())
+            self.assertNotIn("LAVIK_TARGETS_FILE=", env.read_text())
             self.assertIn("ALERTMANAGER_TARGETS=external:9093\n", env.read_text())
             self.assertIn("ALERTMANAGER_CONFIG=./operator.yml\n", env.read_text())
             self.assertEqual(env.read_text().count("LAVIK_MODE="), 1)

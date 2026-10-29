@@ -556,6 +556,9 @@ def monitoring(request):
     managed_keys = {
         line.split("=", 1)[0] for line in environment.splitlines() if "=" in line
     }
+    # File discovery takes precedence over LAVIK_TARGETS in target-config, so a
+    # retained override would hide newly added followers from Admin's target set.
+    managed_keys.add("LAVIK_TARGETS_FILE")
     if env.exists():
         custom = [
             line
