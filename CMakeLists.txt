@@ -451,6 +451,8 @@ add_library(lavik_module
   src/storage/format.cpp
   src/memory.cpp
   src/metrics.cpp
+  src/replication/observability.cpp
+  src/replication/observability_format.cpp
   src/replication/command.cpp
   src/replication/replica_applied_frontier.cpp
   src/replication/replication_group.cpp
@@ -1833,6 +1835,7 @@ if (BUILD_TESTING)
     tests/replication_history_test.cpp
     tests/native_replay_test.cpp
     tests/native_reparent_test.cpp
+    tests/replication_observability_test.cpp
     tests/replica_applied_frontier_test.cpp
     tests/full_sync_handoff_test.cpp
     tests/ring_buffer_test.cpp

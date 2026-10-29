@@ -12590,6 +12590,11 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
   co_return absl::InvalidArgumentError("unknown replication directive");
 }
 
+Task<ReplicationObservabilitySnapshot> ReplicationManager::ObserveProgress()
+    const {
+  co_return co_await group_->ObserveProgress(false, &replica_serve_stale_data_);
+}
+
 Task<ReplicationStatus> ReplicationManager::Observe() const {
   return group_->status();
 }

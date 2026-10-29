@@ -91,6 +91,7 @@
 #include "native_recovery.h"
 #include "native_reparent.h"
 #include "native_replay.h"
+#include "observability.h"
 #include "population_recovery.h"
 #include "replica_applied_frontier.h"
 #include "source_authorization.h"
@@ -1103,6 +1104,7 @@ struct ClusterSteadyExport {
 };
 
 struct ReplicaSession {
+  detail::NativeSessionObservation observation_;
   explicit ReplicaSession(SocketSet* shutdown_sockets)
       : sockets_(shutdown_sockets) {}
 
@@ -1489,6 +1491,7 @@ class ReplicationConnectionMetricGuard {
 };
 
 struct MasterSession {
+  detail::NativeSessionObservation observation_;
   MasterSession(std::uint64_t id, unsigned worker_count, std::string node_id,
                 std::string host, std::uint16_t port,
                 std::string source_history_id, bool allow_continue,
@@ -1511,7 +1514,18 @@ struct MasterSession {
         snapshot_ready_(worker_count),
         snapshot_gate_closed_(worker_count),
         snapshot_fenced_(worker_count),
-        snapshot_capture_stopped_(worker_count) {}
+        snapshot_capture_stopped_(worker_count) {
+    observation_.flows_ =
+        std::make_shared<std::vector<detail::NativeFlowObservation>>(
+            worker_count);
+    for (unsigned flow = 0; flow < worker_count; ++flow) {
+      auto& observation = (*observation_.flows_)[flow];
+      observation.session_id_ = id;
+      observation.history_id_ = source_history_id_;
+      observation.flow_id_ = flow;
+      observation.side_ = ReplicationSide::kSource;
+    }
+  }
 
   bool SetControl(int fd) {
     std::lock_guard lock(mutex_);
@@ -1610,6 +1624,17 @@ struct MasterSession {
         flow_id >= flows_.size()) {
       return;
     }
+    auto& observation = (*observation_.flows_)[flow_id];
+    // Per-partition reset/snapshot interleaving is one transfer stage. Do not
+    // turn each partition into a new attempt phase or emit per-record logs.
+    if (observation.phase_ < FullSyncPhase::kTransfer) {
+      const auto observed_phase = phase == ReplicationPhase::kReset
+                                      ? FullSyncPhase::kReset
+                                      : FullSyncPhase::kTransfer;
+      if (observation.phase_ != observed_phase ||
+          observation.phase_started_ == 0)
+        observation.Phase(observed_phase, SteadyNanos());
+    }
     ReplicaFlowProgress& progress = flows_[flow_id];
     progress.lsn_.store(lsn, std::memory_order_relaxed);
     progress.fragment_index_.store(fragment_index, std::memory_order_relaxed);
@@ -1627,6 +1652,12 @@ struct MasterSession {
       return;
     }
     ReplicaFlowProgress& progress = flows_[flow_id];
+    if (phase == ReplicationPhase::kReady &&
+        !(*observation_.flows_)[flow_id].online_) {
+      auto& observation = (*observation_.flows_)[flow_id];
+      observation.online_ = true;
+      observation.Phase(FullSyncPhase::kOnline, SteadyNanos());
+    }
     if (phase == ReplicationPhase::kReady && cursor.fragment_index_ == 0) {
       std::uint64_t unset = 0;
       (void)progress.proven_origin_lsn_.compare_exchange_strong(
@@ -1637,6 +1668,11 @@ struct MasterSession {
                                    std::memory_order_relaxed);
     progress.phase_.store(phase, std::memory_order_release);
     progress.activity_generation_.fetch_add(1, std::memory_order_release);
+  }
+
+  std::uint64_t HighestSentNextLsn(unsigned flow_id) const {
+    return flows_[flow_id].highest_sent_next_lsn_.load(
+        std::memory_order_acquire);
   }
 
   void SetHighestSentNextLsn(unsigned flow_id, std::uint64_t next_lsn) {
@@ -2309,6 +2345,10 @@ class ReplicationManager::ReplicationGroup {
   std::optional<ReplicaOfConfig> upstream() const;
 
   Task<ReplicationStatus> status() const;
+  Task<ReplicationObservabilitySnapshot> ObserveProgress(
+      bool sample = false, const std::atomic<bool>* serve_stale = nullptr);
+  Task<absl::Status> MonitorProgress();
+  void StartProgressMonitor();
 
   void StoreRole(ReplicationRole next, std::memory_order order) noexcept;
 
@@ -2600,6 +2640,7 @@ class ReplicationManager::ReplicationGroup {
       std::pair<DataFrameKind, std::string> first_frame);
 
   struct ReplicaHandoffState {
+    detail::NativeFlowObservation* observation_ = nullptr;
     // Flow-local lifetime extends until every handoff task has joined. The
     // ACK mutex serializes frame bytes, not partition completion order.
     std::array<bool, storage::kLogicalStorageShards> pending_{};
@@ -2681,6 +2722,7 @@ class ReplicationManager::ReplicationGroup {
   struct FullSyncAckState {
     FullSyncAckState(unsigned flow, unsigned flows)
         : handoffs_(storage::kLogicalStorageShards, flow, flows) {}
+    detail::NativeFlowObservation* observation_ = nullptr;
     detail::FullSyncHandoffProgress handoffs_;
     // Non-handoff ACKs share the same reader. Handoff ownership lives only in
     // the partition ledger; these entries belong to records, commands and cut.
@@ -2800,6 +2842,24 @@ class ReplicationManager::ReplicationGroup {
   void CancelRedisExport() noexcept;
 
   storage::StorageEngine* storage_;
+  // Source registry membership uses the existing coroutine gate; only worker
+  // zero samples these owners and maintains the process-lifetime totals.
+  std::vector<std::shared_ptr<MasterSession>> observation_sources_;
+  std::vector<std::shared_ptr<ReplicaSession>> observation_targets_;
+  ReplicationObservabilitySnapshot observation_totals_;
+  std::uint64_t last_full_finished_at_ = 0;
+  detail::ReplicationProgressClock loading_progress_clock_;
+  bool progress_monitor_started_ = false;
+  bycorf::TimerCancelHandle progress_monitor_timer_;  // worker zero only
+  ReplicationFailure last_retry_reason_ = ReplicationFailure::kNone;
+  std::array<std::uint64_t, kReplicationFailureCount> next_retry_log_nanos_{};
+  std::array<std::uint64_t, kReplicationFailureCount> suppressed_retry_logs_{};
+  // FULL admission already holds master_mutex_; authority waits run on worker
+  // zero. These counters add no new shared synchronization to either path.
+  std::uint64_t source_busy_next_log_nanos_ = 0;
+  std::uint64_t source_busy_retries_ = 0;
+  std::uint64_t source_authority_next_log_nanos_ = 0;
+  std::uint64_t source_authority_retries_ = 0;
   // The packed atomic is owned by the enclosing manager so external commands
   // reach it without following this pImpl. Bit zero is serving-open and the
   // remaining bits are a monotonic dataset generation.
