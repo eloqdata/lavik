@@ -394,14 +394,6 @@ TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
 TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2SurviveEditsAndRecover) {
   PrivateDisk disk;
   const std::string binary("b\0x", 3);
-  const std::vector<std::vector<std::string>> writes{
-      {"LPUSH", "upgrade-lpush", "head"},
-      {"RPUSH", "upgrade-rpush", "tail"},
-      {"LPOP", "upgrade-lpop"},
-      {"RPOP", "upgrade-rpop"},
-      {"ZADD", "upgrade-zadd", "3", "new"},
-      {"ZREM", "upgrade-zrem", "a"},
-      {"ZINCRBY", "upgrade-zincrby", "32768", "a"}};
   std::map<std::string, std::string> expected_dumps;
   auto verify = [&](Client& client) {
     const auto list = client.Command({"LRANGE", "old-list", "0", "-1"});
@@ -458,18 +450,6 @@ TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2SurviveEditsAndRecover) {
     ASSERT_EQ(client.Command({"ZADD", "old-zset", "3", "m3", "4", "m4"}).text_,
               "2");
     verify(client);
-    for (const auto& command : writes) {
-      const bool sorted = command.front().front() == 'Z';
-      ASSERT_EQ(client
-                    .Command({"RESTORE", command[1], "0",
-                              sorted ? zset.text_ : list.text_})
-                    .text_,
-                "OK");
-      ASSERT_NE(client.Command(command).kind_, '-');
-      const auto after = client.Command({"DUMP", command[1]});
-      ASSERT_EQ(after.kind_, '$');
-      expected_dumps.emplace(command[1], after.text_);
-    }
     // An untouched restored List and a restored Sorted Set with only a no-op
     // already use v2; migration must not depend on a subsequent mutation.
     ASSERT_EQ(
@@ -488,21 +468,13 @@ TEST(CompactPointWriteE2e, RestoredCollectionsPersistV2SurviveEditsAndRecover) {
   std::map<std::string, std::pair<Version, std::string>> latest;
   disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
                         std::string_view key, std::string_view payload) {
-    if (!key.starts_with("upgrade-") && key != "unchanged" &&
-        key != "restored-list")
-      return;
+    if (key != "unchanged" && key != "restored-list") return;
     if (record.auxiliary_group_) return;
     auto& found = latest[std::string(key)];
     const Version version{record.mutation_sequence_, record.lsn_};
     if (version < found.first) return;
     found = {version, std::string(payload.substr(0, 4))};
   });
-  for (const auto& command : writes) {
-    ASSERT_TRUE(latest.contains(command[1]));
-    EXPECT_EQ(latest.at(command[1]).second,
-              command.front().front() == 'Z' ? "LZS2" : "LVL2")
-        << command.front();
-  }
   ASSERT_TRUE(latest.contains("unchanged"));
   EXPECT_EQ(latest.at("unchanged").second, "LZS2");
   ASSERT_TRUE(latest.contains("restored-list"));

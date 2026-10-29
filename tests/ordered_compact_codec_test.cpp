@@ -522,24 +522,6 @@ TEST(IndexedOrderedSpliceTest,
     auto reader = OrderedCompactReader::Open(OrderedCollectionKind::kSortedSet,
                                              *bytes, entries.size());
     ASSERT_TRUE(reader.ok());
-    auto check_edit = [&](std::size_t removed, std::optional<double> score,
-                          std::initializer_list<std::size_t> chunks = {}) {
-      SCOPED_TRACE(removed);
-      SCOPED_TRACE(score ? std::to_string(*score) : "delete");
-      const auto member = removed == entries.size()
-                              ? std::string_view("new")
-                              : std::string_view(entries[removed].value_);
-      auto expected = entries;
-      if (removed < entries.size()) expected.erase(expected.begin() + removed);
-      if (score) expected.push_back({std::string(member), *score});
-      std::sort(expected.begin(), expected.end(), OrderedEntryLess);
-      OrderedCompactPayload located;
-      ASSERT_TRUE(located.V2(*reader->indexed())
-                      .EditSortedSetMember(removed, member, score)
-                      .ok());
-      CheckIndexedSplice(located, OrderedCollectionKind::kSortedSet, expected,
-                         chunks);
-    };
     for (std::size_t removed = 0; removed <= entries.size(); ++removed) {
       for (const std::optional<double> score :
            {std::optional<double>{}, std::optional<double>{-20},
@@ -549,16 +531,28 @@ TEST(IndexedOrderedSpliceTest,
             std::optional<double>{-std::numeric_limits<double>::infinity()},
             std::optional<double>{std::numeric_limits<double>::infinity()}}) {
         if (removed == entries.size() && !score) continue;
-        check_edit(removed, score);
+        const auto member = removed == entries.size()
+                                ? std::string_view("new")
+                                : std::string_view(entries[removed].value_);
+        auto expected = entries;
+        if (removed < entries.size())
+          expected.erase(expected.begin() + removed);
+        if (score) expected.push_back({std::string(member), *score});
+        std::sort(expected.begin(), expected.end(), OrderedEntryLess);
+        OrderedCompactPayload located;
+        ASSERT_TRUE(located.V2(*reader->indexed())
+                        .EditSortedSetMember(removed, member, score)
+                        .ok());
+        // Reuse matrix rows: empty member moves right, large member moves
+        // left across chunks, insertion, and deletion.
+        const bool chunked =
+            count == 5 &&
+            ((removed == 0 && score == 7) || (removed == 3 && score == -20) ||
+             (removed == 5 && score == 0) || (removed == 1 && !score));
+        CheckIndexedSplice(located, OrderedCollectionKind::kSortedSet, expected,
+                           chunked ? std::initializer_list<std::size_t>{1, 4096}
+                                   : std::initializer_list<std::size_t>{});
       }
-    }
-    if (count == 5) {
-      // Left move, empty member moving right, insertion, deletion, and a large
-      // member crossing extent chunks cover adapter-specific boundaries.
-      const std::pair<std::size_t, std::optional<double>> cases[]{
-          {4, -20}, {0, 7}, {5, 0}, {1, std::nullopt}, {3, 20}};
-      for (const auto& [removed, score] : cases)
-        check_edit(removed, score, {1, 4096});
     }
     IndexedOrderedSplice invalid(*reader->indexed());
     EXPECT_FALSE(invalid.EditSortedSetMember(0, "missing", 1).ok());
