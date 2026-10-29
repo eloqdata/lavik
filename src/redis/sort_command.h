@@ -22,6 +22,8 @@
 
 namespace lavik {
 
+struct EncodedCommandReply;
+
 class ReplyBuilder;
 
 struct SortExecKey {
@@ -44,7 +46,7 @@ bool SortReadsPatternKeys(const CommandRequest& request);
 // database cut. Scripts supply their complete declared key set instead. Script
 // callers request deterministic ordering for Set input with a constant BY
 // pattern, matching Valkey's replication-safe Lua behavior.
-Task<std::string> ExecuteSortCommandLocked(
+Task<EncodedCommandReply> ExecuteSortCommandLocked(
     const CommandRequest& request, std::span<const SortExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes,
     bool deterministic_set_order);

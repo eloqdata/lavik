@@ -21,6 +21,7 @@
 #include "flush_policy.h"
 #include "grouped/dependency_test_hook.h"
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/replication_command.h"
@@ -3272,7 +3273,7 @@ acquire_active_stream:
       index_memory_reservation = TryReserveMemory(allocation_bytes);
       if (!index_memory_reservation.has_value()) {
         RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
+        co_return MemoryLimitError(
             "OOM record index allocation exceeds this worker's maxmemory "
             "share");
       }

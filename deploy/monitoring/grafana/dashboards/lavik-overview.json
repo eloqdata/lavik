@@ -1518,6 +1518,583 @@
       "type": "timeseries"
     },
     {
+      "id": 53,
+      "title": "Request Health",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "panels": []
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No Data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "id": 54,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, command, context, result) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\"}[$__rate_interval])) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} {{context}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Command Outcomes",
+      "type": "timeseries",
+      "description": "Logical events per context; queued is a client admission event. EXEC/script children are separate events."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No Data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "id": 55,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, command, context, result, reason) (rate(lavik_command_errors_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\"}[$__rate_interval])) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} {{context}} {{result}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Errors by Reason",
+      "type": "timeseries",
+      "description": "An error projection of the outcome counter, not additional requests. Previously unseen reasons have no series."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "noValue": "No Data",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 47
+      },
+      "id": 56,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "((sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=\"failed\"}[$__rate_interval])) or on (instance, command, context) (0 * sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"success|failed|rejected|redirected|cancelled\"}[$__rate_interval])))) / clamp_min(sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"success|failed|rejected|redirected|cancelled\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} {{context}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Execution Failure Ratio",
+      "type": "timeseries",
+      "description": "Failed / terminal attempts. Excludes queued events from the denominator. Zero traffic is 0; a failed or absent scrape is No Data."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "noValue": "No Data",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 47
+      },
+      "id": 57,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "((sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=\"rejected\"}[$__rate_interval])) or on (instance, command, context) (0 * sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"success|failed|rejected|redirected|cancelled\"}[$__rate_interval])))) / clamp_min(sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"success|failed|rejected|redirected|cancelled\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} {{context}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Admission Rejection Ratio",
+      "type": "timeseries",
+      "description": "Rejected / terminal attempts. Redirected outcomes are separate. Zero traffic is 0; a failed or absent scrape is No Data."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "noValue": "No Data",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 55
+      },
+      "id": 58,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "((sum by (instance, command, context) (rate(lavik_command_errors_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"failed|rejected\",reason=~\"oom|loading|authority|clusterdown|busy|tryagain|storage|storage_full|internal|shutdown\"}[$__rate_interval])) or on (instance, command, context) (0 * sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"success|failed|rejected|redirected|cancelled\"}[$__rate_interval])))) / clamp_min(sum by (instance, command, context) (rate(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\",context=~\"${context:regex}\",result=~\"success|failed|rejected|redirected|cancelled\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} {{context}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Service Fault Ratio",
+      "type": "timeseries",
+      "description": "Explicit operational-fault whitelist. Excludes routing, authentication, argument/type errors, script errors and cancellation. Zero traffic is 0; a failed or absent scrape is No Data."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No Data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 55
+      },
+      "id": 59,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, reason) (rate(lavik_request_input_errors_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Request Input Errors",
+      "type": "timeseries",
+      "description": "Malformed protocol, query-buffer limit and client-memory admission failures cannot be attributed to a valid command; command/context filters do not apply."
+    },
+    {
       "id": 45,
       "type": "row",
       "title": "Storage / Transactions",
@@ -1526,7 +2103,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 63
       },
       "panels": []
     },
@@ -1612,7 +2189,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 39
+        "y": 64
       },
       "id": 46,
       "options": {
@@ -1755,7 +2332,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 39
+        "y": 64
       },
       "id": 47,
       "options": {
@@ -1884,7 +2461,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 47
+        "y": 72
       },
       "id": 48,
       "options": {
@@ -2034,7 +2611,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 47
+        "y": 72
       },
       "id": 49,
       "options": {
@@ -2193,7 +2770,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 55
+        "y": 80
       },
       "id": 50,
       "options": {
@@ -2311,7 +2888,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 55
+        "y": 80
       },
       "id": 51,
       "options": {
@@ -2410,7 +2987,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 63
+        "y": 88
       },
       "id": 52,
       "options": {
@@ -2514,7 +3091,7 @@
             "h": 4,
             "w": 5,
             "x": 0,
-            "y": 72
+            "y": 97
           },
           "id": 14,
           "options": {
@@ -2584,7 +3161,7 @@
             "h": 4,
             "w": 5,
             "x": 5,
-            "y": 72
+            "y": 97
           },
           "id": 15,
           "options": {
@@ -2644,7 +3221,7 @@
             "h": 4,
             "w": 4,
             "x": 10,
-            "y": 72
+            "y": 97
           },
           "id": 5,
           "options": {
@@ -2713,7 +3290,7 @@
             "h": 4,
             "w": 5,
             "x": 14,
-            "y": 72
+            "y": 97
           },
           "id": 6,
           "options": {
@@ -2783,7 +3360,7 @@
             "h": 4,
             "w": 5,
             "x": 19,
-            "y": 72
+            "y": 97
           },
           "id": 17,
           "options": {
@@ -2819,7 +3396,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 96
       }
     },
     {
@@ -2828,7 +3405,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 97
       },
       "id": 20,
       "panels": [
@@ -2981,7 +3558,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 73
+            "y": 98
           },
           "id": 9,
           "options": {
@@ -3050,7 +3627,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 73
+        "y": 98
       },
       "id": 21,
       "panels": [
@@ -3113,7 +3690,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 74
+            "y": 99
           },
           "id": 10,
           "options": {
@@ -3153,7 +3730,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 74
+        "y": 99
       },
       "id": 23,
       "panels": [],
@@ -3220,7 +3797,7 @@
         "h": 8,
         "w": 10,
         "x": 0,
-        "y": 75
+        "y": 100
       },
       "id": 11,
       "options": {
@@ -3318,7 +3895,7 @@
         "h": 8,
         "w": 14,
         "x": 10,
-        "y": 75
+        "y": 100
       },
       "id": 12,
       "options": {
@@ -3401,7 +3978,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 108
       },
       "id": 13,
       "options": {
@@ -3441,7 +4018,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 89
+        "y": 114
       },
       "id": 22,
       "panels": [
@@ -3504,7 +4081,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 90
+            "y": 115
           },
           "id": 16,
           "options": {
@@ -3566,7 +4143,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 90
+        "y": 115
       },
       "id": 24,
       "panels": [
@@ -3610,7 +4187,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 91
+            "y": 116
           },
           "id": 25,
           "options": {
@@ -3704,7 +4281,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 101
+            "y": 126
           },
           "id": 34,
           "options": {
@@ -3748,7 +4325,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 116
       },
       "panels": [
         {
@@ -3811,7 +4388,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 92
+            "y": 117
           },
           "id": 27,
           "options": {
@@ -3912,7 +4489,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 92
+            "y": 117
           },
           "id": 28,
           "options": {
@@ -4014,7 +4591,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 101
+            "y": 126
           },
           "id": 29,
           "options": {
@@ -4107,7 +4684,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 101
+            "y": 126
           },
           "id": 30,
           "options": {
@@ -4200,7 +4777,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 110
+            "y": 135
           },
           "id": 31,
           "options": {
@@ -4309,7 +4886,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 110
+            "y": 135
           },
           "id": 32,
           "options": {
@@ -4418,7 +4995,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 93
+            "y": 118
           },
           "id": 35,
           "options": {
@@ -4521,7 +5098,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 93
+            "y": 118
           },
           "id": 36,
           "options": {
@@ -5427,7 +6004,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 117
       }
     }
   ],
@@ -5466,6 +6043,62 @@
         "skipUrlSync": false,
         "sort": 1,
         "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\"}, command)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Command",
+        "multi": true,
+        "name": "command",
+        "options": [],
+        "query": {
+          "query": "label_values(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\"}, command)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "client",
+          "value": "client"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\"}, context)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Execution context",
+        "multi": true,
+        "name": "context",
+        "options": [],
+        "query": {
+          "query": "label_values(lavik_command_results_total{job=\"lavik\",instance=~\"$instance\"}, context)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
       }
     ]
   },
@@ -5485,6 +6118,6 @@
   "timezone": "browser",
   "title": "Lavik Overview",
   "uid": "lavik-overview",
-  "version": 10,
+  "version": 11,
   "weekStart": ""
 }

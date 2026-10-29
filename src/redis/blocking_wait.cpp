@@ -38,6 +38,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/cycle_clock.h"
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "lavik/cluster/authority.h"
@@ -926,8 +927,11 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       if (waiter && deadline && std::chrono::steady_clock::now() >= *deadline) {
         co_return timeout_reply();
       }
+      const auto admission_start = bycorf::ReadCycleCounter();
       absl::Status slept = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+      reply_builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
+                                          admission_start);
       if (!slept.ok()) co_return status_reply(slept);
     }
     AttemptDbGuard gate(request.db_id_);
@@ -938,7 +942,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     if (const char* error = CommandServingGenerationError(request);
         error != nullptr) [[unlikely]] {
       CommandReply reply;
-      reply.encoded_ = reply_builder.AppendError(error);
+      reply.encoded_ = reply_builder.AppendRejectedError(
+          CommandErrorReason::kAuthority, error);
       co_return reply;
     }
 
@@ -975,7 +980,10 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     }
 
     gate.Release();
+    const auto wait_start = bycorf::ReadCycleCounter();
     const BlockingWakeReason woke = co_await WaitForBlockingReady(*waiter);
+    reply_builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
+                                        wait_start);
     if (woke == BlockingWakeReason::kTimeout) co_return timeout_reply();
     if (woke == BlockingWakeReason::kUnblockedError) {
       co_return unblock_error_reply();

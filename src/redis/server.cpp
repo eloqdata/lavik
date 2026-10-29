@@ -61,6 +61,7 @@
 #include "bycorf/net/tcp_service.h"
 #include "bycorf/net/tcp_stream.h"
 #include "bycorf/net/tls.h"
+#include "bycorf/runtime/cycle_clock.h"
 #include "bycorf/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
@@ -239,18 +240,21 @@ std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
     for (std::size_t i = 2; i < args.size();) {
       if (absl::EqualsIgnoreCase(args[i], "AUTH")) {
         if (credentials.has_value() || i + 2 >= args.size()) {
-          return reply.AppendError("ERR syntax error");
+          return reply.AppendError(CommandErrorReason::kSyntax,
+                                   "ERR syntax error");
         }
         credentials.emplace(args[i + 1], args[i + 2]);
         i += 3;
       } else if (absl::EqualsIgnoreCase(args[i], "SETNAME")) {
         if (client_name.has_value() || i + 1 >= args.size()) {
-          return reply.AppendError("ERR syntax error");
+          return reply.AppendError(CommandErrorReason::kSyntax,
+                                   "ERR syntax error");
         }
         client_name = args[i + 1];
         i += 2;
       } else {
-        return reply.AppendError("ERR syntax error");
+        return reply.AppendError(CommandErrorReason::kSyntax,
+                                 "ERR syntax error");
       }
     }
   }
@@ -263,10 +267,12 @@ std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
   if (credentials.has_value() &&
       !authenticator.Authenticate(credentials->first, credentials->second)) {
     return reply.AppendError(
+        CommandErrorReason::kAuth,
         "WRONGPASS invalid username-password pair or user is disabled.");
   }
   if (!ctx.authenticated_ && !credentials.has_value()) {
     return reply.AppendError(
+        CommandErrorReason::kNoAuth,
         "NOAUTH HELLO must be called with the client already authenticated, "
         "otherwise the HELLO AUTH <user> <pass> option can be used to "
         "authenticate the client and select the RESP protocol version at the "
@@ -363,10 +369,12 @@ std::string_view ExecuteAuth(const PasswordAuthenticator& authenticator,
   }
   std::string_view encoded;
   if (args.size() != 2 && args.size() != 3) {
-    encoded = ctx.reply_builder_.AppendError(
+    encoded = ctx.reply_builder_.AppendRejectedError(
+        CommandErrorReason::kArity,
         "ERR wrong number of arguments for 'auth' command");
   } else if (!authenticator.required()) {
     encoded = ctx.reply_builder_.AppendError(
+        CommandErrorReason::kAuth,
         "ERR AUTH called without any password configured for the default "
         "user. Are you sure your configuration is correct?");
   } else {
@@ -378,6 +386,7 @@ std::string_view ExecuteAuth(const PasswordAuthenticator& authenticator,
       encoded = ctx.reply_builder_.AppendSimpleString("OK");
     } else {
       encoded = ctx.reply_builder_.AppendError(
+          CommandErrorReason::kAuth,
           "WRONGPASS invalid username-password pair or user is "
           "disabled.");
     }
@@ -427,6 +436,7 @@ std::optional<std::string_view> PrepareReplicationHandshake(
   if (kind != ReplicationHandshake::kRedisConfig) return std::nullopt;
   if (args.size() < 3 || (args.size() & 1U) == 0) {
     return ctx.reply_builder_.AppendError(
+        CommandErrorReason::kArity,
         "ERR wrong number of arguments for 'replconf' command");
   }
   for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
@@ -1071,6 +1081,9 @@ Task<absl::Status> ReadCommandBatch(
              std::numeric_limits<std::size_t>::max() - *unassigned_input_bytes);
       *unassigned_input_bytes += parsed.consumed_;
       if (parsed.state_ == RespParseState::kError) {
+        RecordRequestInputError(absl::IsResourceExhausted(parsed.status_)
+                                    ? RequestInputError::kQueryBuffer
+                                    : RequestInputError::kProtocol);
         if (!ready->empty()) {
           deferred_error->emplace(std::move(parsed.status_));
           co_return absl::OkStatus();
@@ -1103,6 +1116,7 @@ Task<absl::Status> ReadCommandBatch(
       // unread remainder until teardown; completed commands retain the usual
       // wire-byte charge through execution (or MULTI).
       if (!client_buffers->TryAcquire(bulk_reservation)) [[unlikely]] {
+        RecordRequestInputError(RequestInputError::kClientMemory);
         RecordMemoryRejection();
         co_return absl::ResourceExhaustedError(
             "client request buffers exceed the memory limit");
@@ -1110,6 +1124,7 @@ Task<absl::Status> ReadCommandBatch(
       const auto prepared = parser->PrepareBulkRead(bulk_reservation);
       if (!prepared.ok()) [[unlikely]] {
         client_buffers->Release(bulk_reservation);
+        RecordRequestInputError(RequestInputError::kQueryBuffer);
         co_return prepared;
       }
     }
@@ -1129,8 +1144,10 @@ Task<absl::Status> ReadCommandBatch(
       parser->SetQueryBufferLimit(
           query_buffer_limit->load(std::memory_order_acquire));
       const auto committed = parser->CommitBulkRead(*read_result);
-      if (!committed.ok()) [[unlikely]]
+      if (!committed.ok()) [[unlikely]] {
+        RecordRequestInputError(RequestInputError::kQueryBuffer);
         co_return committed;
+      }
       assert(*read_result <=
              std::numeric_limits<std::size_t>::max() - *unassigned_input_bytes);
       *unassigned_input_bytes += *read_result;
@@ -1156,6 +1173,7 @@ Task<absl::Status> ReadCommandBatch(
     // for the bytes that the parser may retain. This keeps admission out of
     // every string append while bounding stalled and pipelined clients.
     if (!client_buffers->TryAcquire(*read_result)) [[unlikely]] {
+      RecordRequestInputError(RequestInputError::kClientMemory);
       RecordMemoryRejection();
       co_return absl::ResourceExhaustedError(
           "client request buffers exceed the memory limit");
@@ -1627,6 +1645,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
         builder.Reset();
         EnqueuePubSubReply(session,
                            std::string(builder.AppendError(
+                               CommandErrorReasonForStatus(read_status),
                                absl::StrCat("ERR ", read_status.message()))));
         ExitPubSubMode(session);
         co_return read_status;
@@ -1642,17 +1661,19 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     CommandBufferGuard command_memory(client_buffers, buffered.input_bytes_);
     RespCommand command = std::move(buffered.command_);
 
+    CommandRequest request =
+        BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     if (!TryBeginRequest()) [[unlikely]] {
       builder.Reset();
-      EnqueuePubSubReply(
-          session,
-          std::string(builder.AppendError("ERR server is shutting down")));
+      EnqueuePubSubReply(session, std::string(builder.AppendRejectedError(
+                                      CommandErrorReason::kShutdown,
+                                      "ERR server is shutting down")));
+      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+                          builder.outcome(), 0);
       ExitPubSubMode(session);
       co_return absl::OkStatus();
     }
     RequestGuard request_guard(this);
-    CommandRequest request =
-        BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     request.connection_tls_ = stream.IsTls();
     builder.Reset();
     const CommandKind kind = request.kind_;
@@ -1679,10 +1700,12 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       ExitPubSubMode(session);
       co_return absl::OkStatus();
     }
+    const auto execution_start = bycorf::ReadCycleCounter();
     if (kind == CommandKind::kPing && ctx.resp_version() == RespVersion::k2) {
       if (request.args_.size() > 2) {
         EnqueuePubSubReply(
-            session, std::string(builder.AppendError(
+            session, std::string(builder.AppendRejectedError(
+                         CommandErrorReason::kArity,
                          "ERR wrong number of arguments for 'ping' command")));
       } else {
         builder.AppendPushHeader(2);
@@ -1692,6 +1715,9 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
                                      : std::string_view{});
         EnqueuePubSubReply(session, std::string(builder.View()));
       }
+      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+                          builder.outcome(),
+                          bycorf::ReadCycleCounter() - execution_start);
       continue;
     }
 
@@ -1701,18 +1727,23 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
         kind != CommandKind::kPUnsubscribe) {
       if (kind == CommandKind::kUnknown) {
         EnqueuePubSubReply(session,
-                           std::string(builder.AppendError(
+                           std::string(builder.AppendRejectedError(
+                               CommandErrorReason::kUnknownCommand,
                                "ERR unknown command '" +
-                               std::string(request.args_.front()) + "'")));
+                                   std::string(request.args_.front()) + "'")));
       } else {
         std::string name(CommandCanonicalName(kind));
         EnqueuePubSubReply(
             session,
-            std::string(builder.AppendError(
+            std::string(builder.AppendRejectedError(
+                CommandErrorReason::kPermission,
                 "ERR Can't execute '" + name +
-                "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
-                "RESET are allowed in this context")));
+                    "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
+                    "RESET are allowed in this context")));
       }
+      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+                          builder.outcome(),
+                          bycorf::ReadCycleCounter() - execution_start);
       continue;
     }
 
@@ -1849,6 +1880,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         }
 
         const std::string_view encoded = ctx.reply_builder_.AppendError(
+            CommandErrorReasonForStatus(read_status),
             absl::StrCat("ERR ", read_status.message()));
         auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(encoded.data()),
@@ -1870,11 +1902,15 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     if (request.kind_ == CommandKind::kAuth ||
         (request.kind_ == CommandKind::kHello && !ctx.in_multi_)) {
+      const std::uint64_t execution_start = bycorf::ReadCycleCounter();
       const std::string_view encoded =
           request.kind_ == CommandKind::kAuth
               ? ExecuteAuth(authenticator_, ctx, request.args_)
               : ExecuteHello(authenticator_, replication_, ctx, request.args_,
                              ctx.reply_builder_);
+      RecordCommandResult(static_cast<std::size_t>(request.kind_),
+                          CommandContext::kClient, ctx.reply_builder_.outcome(),
+                          bycorf::ReadCycleCounter() - execution_start);
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
@@ -1882,8 +1918,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
 
     if (!ctx.authenticated_) {
-      const std::string_view encoded =
-          ctx.reply_builder_.AppendError("NOAUTH Authentication required.");
+      const std::string_view encoded = ctx.reply_builder_.AppendRejectedError(
+          CommandErrorReason::kNoAuth, "NOAUTH Authentication required.");
+      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+                          ctx.reply_builder_.outcome(), 0);
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
@@ -1910,8 +1948,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
 
     if (!TryBeginRequest()) [[unlikely]] {
-      const std::string_view encoded =
-          ctx.reply_builder_.AppendError("ERR server is shutting down");
+      const std::string_view encoded = ctx.reply_builder_.AppendRejectedError(
+          CommandErrorReason::kShutdown, "ERR server is shutting down");
+      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+                          ctx.reply_builder_.outcome(), 0);
       absl::Status write_status =
           co_await FlushReplyBatch(stream, &pending_replies);
       if (write_status.ok()) {

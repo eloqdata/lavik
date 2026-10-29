@@ -19,6 +19,7 @@
 #include <map>
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "zset_work_budget.h"
 
@@ -40,8 +41,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
   // released without changing the key or an outer EXEC prefix.
   if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_MEMBER_PREPARE_KEY", key)) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "OOM preparing Sorted Set member index");
+    co_return MemoryLimitError("OOM preparing Sorted Set member index");
   }
 
   if (!previous) {
@@ -204,7 +204,7 @@ StorageEngine::Impl::PrepareSortedSetMembers(
           auto admission = TryReserveMemory(entry.value_.capacity() + 1);
           if (!admission) {
             RecordMemoryRejection();
-            co_return absl::ResourceExhaustedError(
+            co_return MemoryLimitError(
                 "OOM grouped operation scratch admission");
           }
           removed.push_back({std::move(*admission), std::move(entry.value_)});

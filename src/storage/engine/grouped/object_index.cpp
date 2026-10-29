@@ -21,6 +21,7 @@
 #include <bit>
 #include <tuple>
 
+#include "lavik/error_detail.h"
 #include "lavik/local_shared_ptr.h"
 
 namespace lavik::storage {
@@ -51,7 +52,7 @@ absl::Status Insert(Map& map, std::string_view key,
   auto reservation = TryReserveMemory(bytes);
   if (!reservation.has_value()) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM grouped index exceeds maxmemory");
+    return MemoryLimitError("OOM grouped index exceeds maxmemory");
   }
   if (map.InsertNew(digest, key, value) == nullptr) {
     return absl::ResourceExhaustedError("grouped index allocation failed");
@@ -81,7 +82,7 @@ absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>> CopyManifest(
                                            sizeof(OwnedGroupManifest) + 1024));
   if (!reservation.has_value()) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM group manifest exceeds maxmemory");
+    return MemoryLimitError("OOM group manifest exceeds maxmemory");
   }
   auto owner = std::allocate_shared<OwnedGroupManifest>(
       RetainedAllocator<OwnedGroupManifest>(domain));
@@ -114,8 +115,7 @@ absl::StatusOr<std::shared_ptr<T>> AllocateObject(
       TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(T) + 1024));
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM grouped metadata exceeds maxmemory");
+    return MemoryLimitError("OOM grouped metadata exceeds maxmemory");
   }
   return std::allocate_shared<T>(
       RetainedAllocator<T>(arena->allocation_domain()));
@@ -128,8 +128,7 @@ absl::StatusOr<LocalSharedPtr<T>> AllocateLocalObject(
       TryReserveMemory(AllocatorUsableSizeForRequest(sizeof(T) + 1024));
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM grouped metadata exceeds maxmemory");
+    return MemoryLimitError("OOM grouped metadata exceeds maxmemory");
   }
   return AllocateLocalShared<T>(
       RetainedAllocator<T>(arena->allocation_domain()));
@@ -368,7 +367,7 @@ absl::StatusOr<NodeHandle> BuildPhysical(
   auto arrays_reservation = TryReserveMemory(arrays_bytes);
   if (!arrays_reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM group page exceeds maxmemory");
+    return MemoryLimitError("OOM group page exceeds maxmemory");
   }
   (*page)->arrays_charge_.Account(arena->allocation_domain().owner_shard_,
                                   arrays_bytes);
@@ -449,8 +448,7 @@ absl::StatusOr<NodeHandle> UpdatePhysical(
         auto reservation = TryReserveMemory(arrays_bytes);
         if (!reservation) {
           RecordMemoryRejection();
-          return absl::ResourceExhaustedError(
-              "OOM group page exceeds maxmemory");
+          return MemoryLimitError("OOM group page exceeds maxmemory");
         }
         (*copied)->arrays_charge_.Account(
             arena->allocation_domain().owner_shard_, arrays_bytes);
@@ -695,7 +693,7 @@ absl::Status BuildStringPhysical(GroupedPhysicalState& output,
   auto admission = TryReserveMemory(bytes);
   if (!admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM String index vector");
+    return MemoryLimitError("OOM String index vector");
   }
   output.string_pages_charge_.Account(
       output.arena_->allocation_domain().owner_shard_, bytes);

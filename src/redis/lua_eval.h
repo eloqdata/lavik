@@ -27,6 +27,7 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/command_args.h"
+#include "lavik/command_outcome.h"
 #include "lavik/resp_version.h"
 
 namespace lavik {
@@ -67,6 +68,7 @@ struct LuaRedisCall {
 struct LuaExecutionStep {
   std::optional<LuaRedisCall> call_;
   std::string reply_;
+  CommandOutcome outcome_{};
   bool scheduler_yield_ = false;
 };
 

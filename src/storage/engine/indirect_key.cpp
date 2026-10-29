@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 
@@ -49,7 +50,7 @@ absl::Status StorageEngine::Impl::InsertIndirectKey(
       index.RequiredAllocationBytes(digest, key, true, false, true));
   if (!admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM indirect key index admission");
+    return MemoryLimitError("OOM indirect key index admission");
   }
   if (index.InsertNew(digest, key, handle) == nullptr)
     return absl::ResourceExhaustedError("indirect key index allocation failed");

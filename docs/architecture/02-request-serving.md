@@ -167,8 +167,10 @@ racing closure is either rejected or remains visible to the drain.
    command table and copies the connection's current database ID into the
    request.
 3. `DispatchCommand` handles connection-level transaction and client state,
-   attaches the connection's reply version, then records command metrics and
-   eligible slow-log entries around the dispatch result.
+   attaches the connection's reply version, then records legacy dispatch metrics
+   and eligible slow-log entries around the dispatch result. Logical command
+   results have a separate lifecycle, ending at execution completion or streamed
+   reply producer completion; immediate session gates observe their own results.
 4. `DispatchCommandImpl` runs the readiness and ownership admission gates.
    The replication LOADING gate rejects non-whitelisted commands while a
    standalone replica syncs or a cluster node rebuilds its Meta-authorized
@@ -482,11 +484,25 @@ SLOWLOG uses one bounded, single-owner ring per worker. Command completion
 records eligible non-blocking commands after dispatch, redacts credentials,
 and bounds copied arguments; `SLOWLOG GET` merges worker snapshots by a global
 entry ID. Its threshold and capacity are runtime-configurable. `CONFIG
-RESETSTAT` visits every worker and clears command counters only; it does not
-alter data or persistence dirty state. The successful `CONFIG` command is
+RESETSTAT` visits every worker and clears command and input-error counters; it
+does not alter data or persistence dirty state. The successful `config|resetstat` command is
 recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
+
+Command results and execution time are owned by the coordinating worker and
+snapshotted on each owner through `SubmitTo`. Static command/subcommand identities,
+execution contexts and result/reason enums bound cardinality. Reply builders and
+owning cross-worker replies carry outcomes, while storage statuses carry typed
+error provenance; metrics never recover categories by parsing RESP text. EXEC
+reduces shard work into one result per logical child, separate from its parent.
+Lua/Function Redis calls have a separate script context. Lazy reply sources retain
+their observation until EOF, failure or abandonment, excluding socket write time.
+INFO commandstats and Prometheus result counters share these snapshots; the legacy
+dispatch counters and histogram preserve their original completion boundary.
+Reset retains exposed error-series identities and permits in-flight completions
+in the current worker epoch. See [metrics](../operations/metrics.md) for the
+external counting and timing contract.
 
 The external replication command surface accepts only Redis/Redis Cluster
 upstreams. `REPLICAOF` and `SLAVEOF host port` complete AUTH/PSYNC before changing

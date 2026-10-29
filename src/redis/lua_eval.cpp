@@ -1242,6 +1242,9 @@ std::string SanitizeRespLine(std::string_view value) {
 
 void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
                     RespVersion script_resp_version, int depth) {
+  // Redis counts returned error elements, including nested ones, against the
+  // outer script. A caught redis.pcall error that is not returned contributes
+  // only to the independently observed inner command.
   if (depth > kMaxReplyDepth) {
     builder->AppendError("ERR Lua reply has too many nested levels");
     return;
@@ -1404,12 +1407,15 @@ LuaExecutionStep RuntimeErrorStep(lua_State* state) {
   if (error.starts_with("ERR Lua redis lib command arguments ") ||
       error.starts_with("ERR Please specify at least one argument ") ||
       error == "ERR Write commands are not allowed from read-only scripts.") {
-    return LuaExecutionStep{.call_ = std::nullopt,
-                            .reply_ = EncodeError(error)};
+    return LuaExecutionStep{
+        .call_ = std::nullopt,
+        .reply_ = EncodeError(error),
+        .outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript}};
   }
   return LuaExecutionStep{
       .call_ = std::nullopt,
       .reply_ = EncodeError(absl::StrCat("ERR Error running script: ", error)),
+      .outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript},
   };
 }
 
@@ -1419,6 +1425,7 @@ LuaExecutionStep KilledStep(bool function) {
       .reply_ = EncodeError(
           function ? "ERR Script killed by user with FUNCTION KILL..."
                    : "ERR Script killed by user with SCRIPT KILL..."),
+      .outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript},
   };
 }
 
@@ -1468,8 +1475,12 @@ struct LuaExecution::Impl {
           builder.AppendNull();
         else
           AppendLuaValue(state_, -1, &builder, run_control_.resp_version_, 0);
+        auto outcome = builder.outcome();
+        if (outcome.result_ == CommandResult::kFailed)
+          outcome.reason_ = CommandErrorReason::kScript;
         return LuaExecutionStep{.call_ = std::nullopt,
-                                .reply_ = std::move(builder).Release()};
+                                .reply_ = std::move(builder).Release(),
+                                .outcome_ = outcome};
       }
       if (status != LUA_YIELD) return RuntimeErrorStep(state_);
 

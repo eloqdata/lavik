@@ -18,6 +18,7 @@
 
 #include "grouped/read_window.h"
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -245,7 +246,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         if (j == 1 &&
             LAVIK_FAULT_MATCHES("LAVIK_FAIL_STREAM_READ_WINDOW_START_KEY",
                                 source.key_)) {
-          status = absl::ResourceExhaustedError("OOM Stream read window start");
+          status = MemoryLimitError("OOM Stream read window start");
           break;
         }
         const auto index = source.range_->reverse_ ? first - j : first + j;
@@ -546,8 +547,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     auto admission = TryReserveMemory(budget);
     if (!admission) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM collection transfer metadata");
+      co_return MemoryLimitError("OOM collection transfer metadata");
     }
     // The callback may die on the destination owner. Its deleter schedules an
     // explicitly tracked release; it never modifies source pin state

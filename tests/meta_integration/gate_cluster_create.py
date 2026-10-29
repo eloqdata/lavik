@@ -1204,13 +1204,54 @@ def assert_redis_topology_and_replication(nodes):
                     "population fenced and fell back to FULL"
                 )
 
-    moved = redis_error(by_id[PRIMARY_1], ["GET", keys["group-2"]])
+    primary = by_id[PRIMARY_1]
+    redirected_labels = '{command="get",context="client",result="redirected"}'
+    rejected_labels = '{command="get",context="client",result="rejected"}'
+    before_redirected = primary.metric("lavik_command_results_total", redirected_labels)
+    before_rejected = primary.metric("lavik_command_results_total", rejected_labels)
+    before_stats = redis_call(primary, ["INFO", "commandstats"])
+    moved = redis_error(primary, ["GET", keys["group-2"]])
     expected_endpoint = endpoint_tuple(by_id[PRIMARY_2])
     if (
         not moved.startswith(f"MOVED {redis_slot(keys['group-2'])} ")
         or f"{expected_endpoint[0]}:{expected_endpoint[1]}" not in moved
     ):
         raise H.Failure(f"wrong-primary request returned {moved!r}")
+    if (
+        primary.metric("lavik_command_results_total", redirected_labels)
+        != before_redirected + 1
+    ):
+        raise H.Failure("MOVED did not record exactly one redirected command")
+    if (
+        primary.metric("lavik_command_results_total", rejected_labels)
+        != before_rejected
+    ):
+        raise H.Failure("MOVED was also counted as an admission rejection")
+    if (
+        primary.metric(
+            "lavik_command_errors_total",
+            '{command="get",context="client",result="redirected",reason="moved"}',
+        )
+        < 1
+    ):
+        raise H.Failure("MOVED reason projection is missing")
+
+    def get_stats(info):
+        line = next(
+            line for line in info.splitlines() if line.startswith("cmdstat_get:")
+        )
+        return dict(field.split("=", 1) for field in line.split(":", 1)[1].split(","))
+
+    before = get_stats(before_stats)
+    after = get_stats(redis_call(primary, ["INFO", "commandstats"]))
+    if (
+        after["calls"] != before["calls"]
+        or int(after["rejected_calls"]) != int(before["rejected_calls"]) + 1
+        or after["failed_calls"] != before["failed_calls"]
+    ):
+        raise H.Failure(
+            f"INFO redirected-command accounting mismatch: {before} -> {after}"
+        )
     crossslot = redis_error(
         by_id[PRIMARY_1], ["MGET", keys["group-1"], keys["group-2"]]
     )

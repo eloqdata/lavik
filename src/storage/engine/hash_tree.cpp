@@ -25,6 +25,7 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/hash/hash.h"
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
 #include "lavik/random_sample.h"
@@ -143,7 +144,7 @@ absl::StatusOr<HashResult> ReadCompactHashFields(
   const auto size = operation.fields_.size();
   GroupedScratchBudget budget;
   if (size > SIZE_MAX / sizeof(HashFieldLookup))
-    return absl::ResourceExhaustedError("OOM Hash lookup plan is too large");
+    return MemoryLimitError("OOM Hash lookup plan is too large");
   auto added = budget.AddBytes(size * sizeof(HashFieldLookup));
   if (!added.ok()) return added;
   auto scratch = budget.Reserve(1);
@@ -160,18 +161,18 @@ absl::StatusOr<HashResult> ReadCompactHashFields(
   auto status = FindCompactHashFields(payload, count, requests);
   if (!status.ok()) return status;
   if (size > (SIZE_MAX - sizeof(HashResult)) / sizeof(result.values_[0]))
-    return absl::ResourceExhaustedError("OOM Hash output is too large");
+    return MemoryLimitError("OOM Hash output is too large");
   auto output =
       TryReserveMemory(sizeof(HashResult) + size * sizeof(result.values_[0]));
   if (!output) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   result.values_.resize(size);
   const auto retained = sizeof(HashResult) +
                         result.values_.capacity() * sizeof(result.values_[0]);
   if (retained > output->bytes())
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   result.retained_charge_.Adopt(&*output, retained);
   status = RetainHashGroupValues(result, requests);
   if (!status.ok()) return status;
@@ -199,11 +200,11 @@ absl::StatusOr<HashResult> ReadHashScanResult(std::string_view payload,
     HashEntryView entry_;
   };
   if (count > SIZE_MAX / sizeof(ScanEntry))
-    return absl::ResourceExhaustedError("OOM Hash scan index is too large");
+    return MemoryLimitError("OOM Hash scan index is too large");
   auto scratch = TryReserveMemory(count * sizeof(ScanEntry));
   if (!scratch) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash scan index");
+    return MemoryLimitError("OOM Hash scan index");
   }
   // The cursor needs digest order, not owned fields. Keep only views under
   // this page's lease and copy the matched reply after selecting its range.
@@ -250,15 +251,14 @@ absl::StatusOr<HashResult> ReadHashScanResult(std::string_view payload,
               ? std::max(entry.value_.size(), std::string{}.capacity()) + 1
               : std::size_t{0}}) {
       if (bytes > SIZE_MAX - retained)
-        return absl::ResourceExhaustedError(
-            "OOM Hash scan output is too large");
+        return MemoryLimitError("OOM Hash scan output is too large");
       retained += bytes;
     }
   }
   auto output = TryReserveMemory(retained);
   if (!output) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash scan output");
+    return MemoryLimitError("OOM Hash scan output");
   }
   result.values_.reserve(matched * width);
   for (auto i = begin; i < begin + matched; ++i) {
@@ -270,7 +270,7 @@ absl::StatusOr<HashResult> ReadHashScanResult(std::string_view payload,
              result.values_.capacity() * sizeof(result.values_[0]);
   for (const auto& value : result.values_) retained += value->capacity() + 1;
   if (retained > output->bytes())
-    return absl::ResourceExhaustedError("OOM Hash scan output");
+    return MemoryLimitError("OOM Hash scan output");
   result.retained_charge_.Adopt(&*output, retained);
   return result;
 }
@@ -291,13 +291,12 @@ absl::StatusOr<HashResult> ReadCompactHashRandom(
   if (!repeat) requested = std::min<std::uint64_t>(requested, count);
   if (requested == 0 || count == 0) return result;
   if (requested > SIZE_MAX / (sizeof(HashRankLookup) + sizeof(std::uint64_t)))
-    return absl::ResourceExhaustedError(
-        "OOM Hash random rank index is too large");
+    return MemoryLimitError("OOM Hash random rank index is too large");
   auto scratch = TryReserveMemory(
       requested * (sizeof(HashRankLookup) + sizeof(std::uint64_t)));
   if (!scratch) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash random rank index");
+    return MemoryLimitError("OOM Hash random rank index");
   }
   std::vector<HashRankLookup> requests;
   requests.reserve(requested);
@@ -318,18 +317,18 @@ absl::StatusOr<HashResult> ReadCompactHashRandom(
   const std::size_t width = operation.with_values_ ? 2 : 1;
   if (requested >
       (SIZE_MAX - sizeof(HashResult)) / (width * sizeof(result.values_[0])))
-    return absl::ResourceExhaustedError("OOM Hash random output is too large");
+    return MemoryLimitError("OOM Hash random output is too large");
   auto output = TryReserveMemory(sizeof(HashResult) +
                                  requested * width * sizeof(result.values_[0]));
   if (!output) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash random output");
+    return MemoryLimitError("OOM Hash random output");
   }
   result.values_.resize(requested * width);
   const auto retained = sizeof(HashResult) +
                         result.values_.capacity() * sizeof(result.values_[0]);
   if (retained > output->bytes())
-    return absl::ResourceExhaustedError("OOM Hash random output");
+    return MemoryLimitError("OOM Hash random output");
   result.retained_charge_.Adopt(&*output, retained);
   status = RetainHashRankValues(result, requests, operation.with_values_);
   if (!status.ok()) return status;
@@ -348,7 +347,7 @@ absl::StatusOr<HashResult> ReadPackedHashResult(HashValueReader reader,
     for (const auto bytes : {fields ? entry->field_.size() : std::size_t{0},
                              values ? entry->value_.size() : std::size_t{0}}) {
       if (bytes > SIZE_MAX - payload_bytes)
-        return absl::ResourceExhaustedError("OOM Hash snapshot is too large");
+        return MemoryLimitError("OOM Hash snapshot is too large");
       payload_bytes += bytes;
     }
   }
@@ -359,12 +358,12 @@ absl::StatusOr<HashResult> ReadPackedHashResult(HashValueReader reader,
   if (block_bytes < payload_bytes || block_bytes > SIZE_MAX - overhead ||
       count > (SIZE_MAX - overhead - block_bytes) /
                   (width * sizeof(HashReadSnapshot::Slice)))
-    return absl::ResourceExhaustedError("OOM Hash snapshot is too large");
+    return MemoryLimitError("OOM Hash snapshot is too large");
   auto output = TryReserveMemory(
       overhead + block_bytes + count * width * sizeof(HashReadSnapshot::Slice));
   if (!output) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash snapshot retention");
+    return MemoryLimitError("OOM Hash snapshot retention");
   }
   HashResult result;
   result.key_exists_ = true;
@@ -397,7 +396,7 @@ absl::StatusOr<HashResult> ReadPackedHashResult(HashValueReader reader,
       snapshot.values_.capacity() * sizeof(HashReadSnapshot::Slice) +
       block.capacity() + 1;
   if (retained > output->bytes())
-    return absl::ResourceExhaustedError("OOM Hash snapshot retention");
+    return MemoryLimitError("OOM Hash snapshot retention");
   result.retained_charge_.Adopt(&*output, retained);
   return result;
 }
@@ -411,19 +410,19 @@ absl::StatusOr<HashResult> ReadMissingHashResult(
     return result;
   if (operation.fields_.size() >
       (SIZE_MAX - sizeof(HashResult)) / sizeof(result.values_[0]))
-    return absl::ResourceExhaustedError("OOM Hash output is too large");
+    return MemoryLimitError("OOM Hash output is too large");
   auto output =
       TryReserveMemory(sizeof(HashResult) +
                        operation.fields_.size() * sizeof(result.values_[0]));
   if (!output) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   result.values_.resize(operation.fields_.size());
   const auto retained = sizeof(HashResult) +
                         result.values_.capacity() * sizeof(result.values_[0]);
   if (retained > output->bytes())
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   result.retained_charge_.Adopt(&*output, retained);
   return result;
 }
@@ -496,13 +495,13 @@ absl::StatusOr<HashResult> ReadHashPayloadResult(std::string_view payload,
         (values &&
          !add_bytes(std::max(entry->value_.size(), inline_capacity) + 1))) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM Hash output is too large");
+      return MemoryLimitError("OOM Hash output is too large");
     }
   }
   auto reservation = TryReserveMemory(retained);
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   HashResult result;
   result.key_exists_ = true;
@@ -519,7 +518,7 @@ absl::StatusOr<HashResult> ReadHashPayloadResult(std::string_view payload,
   for (const auto& value : result.values_) retained += value->capacity() + 1;
   if (retained > reservation->bytes()) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   result.retained_charge_.Adopt(&*reservation, retained);
   return result;
@@ -663,17 +662,17 @@ absl::Status RetainHashRankValues(HashResult& result,
                             1
                       : std::size_t{0}}) {
       if (bytes > SIZE_MAX - retained)
-        return absl::ResourceExhaustedError("OOM Hash output is too large");
+        return MemoryLimitError("OOM Hash output is too large");
       retained += bytes;
     }
   }
   if (retained == 0) return absl::OkStatus();
   if (retained > SIZE_MAX - result.retained_charge_.bytes())
-    return absl::ResourceExhaustedError("OOM Hash output is too large");
+    return MemoryLimitError("OOM Hash output is too large");
   auto output = TryReserveMemory(retained);
   if (!output) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   retained = 0;
   const std::size_t width = with_values ? 2 : 1;
@@ -688,7 +687,7 @@ absl::Status RetainHashRankValues(HashResult& result,
     for (std::size_t i = 0; i < width; ++i) {
       const auto bytes = result.values_[slot + i]->capacity() + 1;
       if (bytes > output->bytes() - retained)
-        return absl::ResourceExhaustedError("OOM Hash output retention");
+        return MemoryLimitError("OOM Hash output retention");
       retained += bytes;
     }
   }
@@ -706,7 +705,7 @@ absl::Status RetainHashGroupValues(HashResult& result,
     if (bytes > std::numeric_limits<std::size_t>::max() - retained)
         [[unlikely]] {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM Hash output is too large");
+      return MemoryLimitError("OOM Hash output is too large");
     }
     retained += bytes;
   }
@@ -714,12 +713,12 @@ absl::Status RetainHashGroupValues(HashResult& result,
   if (retained > std::numeric_limits<std::size_t>::max() -
                      result.retained_charge_.bytes()) [[unlikely]] {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output is too large");
+    return MemoryLimitError("OOM Hash output is too large");
   }
   auto reservation = TryReserveMemory(retained);
   if (!reservation) [[unlikely]] {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   retained = 0;
   for (const auto& request : requests) {
@@ -730,7 +729,7 @@ absl::Status RetainHashGroupValues(HashResult& result,
     const auto bytes = value->capacity() + 1;
     if (bytes > reservation->bytes() - retained) [[unlikely]] {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM Hash output retention");
+      return MemoryLimitError("OOM Hash output retention");
     }
     retained += bytes;
   }
@@ -751,7 +750,7 @@ absl::Status RetainHashLookupValue(HashResult& result,
   auto reservation = TryReserveMemory(retained);
   if (!reservation) [[unlikely]] {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   // Reserve before copying out of the page lease, then check actual capacities
   // before transferring admission to the result. Match other Hash results'
@@ -765,7 +764,7 @@ absl::Status RetainHashLookupValue(HashResult& result,
   if (matched) retained += result.values_[0]->capacity() + 1;
   if (retained > reservation->bytes()) [[unlikely]] {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Hash output retention");
+    return MemoryLimitError("OOM Hash output retention");
   }
   result.retained_charge_.Adopt(&*reservation, retained);
   return absl::OkStatus();
@@ -786,19 +785,19 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
       fields.size() > (max_size - sizeof(HashResult)) /
                           sizeof(std::optional<std::string>)) [[unlikely]] {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash lookup plan is too large");
+    co_return MemoryLimitError("OOM Hash lookup plan is too large");
   }
   auto scratch = TryReserveMemory(fields.size() * sizeof(HashFieldLookup));
   if (!scratch) [[unlikely]] {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
+    co_return MemoryLimitError("OOM Hash lookup plan");
   }
   std::vector<HashFieldLookup> requests;
   requests.reserve(fields.size());
   if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup))
       [[unlikely]] {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash lookup plan");
+    co_return MemoryLimitError("OOM Hash lookup plan");
   }
   for (std::size_t i = 0; i < fields.size(); ++i) {
     const auto* route = object->directory().Find(fields[i]);
@@ -820,7 +819,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
       sizeof(HashResult) + fields.size() * sizeof(std::optional<std::string>));
   if (!output) [[unlikely]] {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash output retention");
+    co_return MemoryLimitError("OOM Hash output retention");
   }
   HashResult result;
   result.key_exists_ = true;
@@ -830,7 +829,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
                         result.values_.capacity() * sizeof(result.values_[0]);
   if (retained > output->bytes()) [[unlikely]] {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash output retention");
+    co_return MemoryLimitError("OOM Hash output retention");
   }
   result.retained_charge_.Adopt(&*output, retained);
   for (std::size_t begin = 0; begin < requests.size();) {
@@ -911,19 +910,17 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!metadata.ok()) co_return metadata.status();
   }
   if (exists && found->value_.value_type() != value_type) {
-    co_return absl::InvalidArgumentError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   }
   if (replace && !exists) co_return HashResult{};
   const bool read_only = !IsWrite(operation);
   // Exercise the command's storage-error reply path independently of the
   // outer maxmemory preflight. No mutation has been staged at this boundary.
-  LAVIK_FAULT_INJECT(
-      if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_HASH_ADMISSION_KEY", key) &&
-          !read_only && value_type == ValueType::kHash) {
-        co_return absl::ResourceExhaustedError(
-            "OOM injected Hash storage admission failure");
-      });
+  LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_HASH_ADMISSION_KEY",
+                                             key) &&
+                         !read_only && value_type == ValueType::kHash) {
+    co_return MemoryLimitError("OOM injected Hash storage admission failure");
+  });
   const auto observed_write =
       CaptureCompactWriteSnapshot(store, partition, db_id);
   const auto observed_index_generation = observed_write.index_generation_;
@@ -1005,8 +1002,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   LAVIK_FAULT_INJECT(if (unlocked_create) {
     if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_COLLECTION_CREATE_PREPARE_KEY", key)) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM preparing collection creation");
+      co_return MemoryLimitError("OOM preparing collection creation");
     }
   });
   LAVIK_FAULT_INJECT(if (unlocked_grouped_write) {
@@ -1406,8 +1402,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       // append boundary.
       GroupedScratchBudget budget;
       if (operation.fields_.size() > SIZE_MAX / 256)
-        co_return absl::ResourceExhaustedError(
-            "OOM Hash edit plan is too large");
+        co_return MemoryLimitError("OOM Hash edit plan is too large");
       auto added = budget.AddBytes(operation.fields_.size() * 256);
       if (!added.ok()) co_return added;
       added = budget.AddBytes(kCollectionPromotionBytes * 2);

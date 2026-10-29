@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 
@@ -52,7 +53,7 @@ absl::Status StorageEngine::Impl::SquashReplicaCollectionUndo(
   auto admission = TryReserveMemory(bytes);
   if (!admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM replica undo squash admission");
+    return MemoryLimitError("OOM replica undo squash admission");
   }
   auto applied = std::make_shared<std::vector<RetiredRecord>>();
   auto pins = std::make_shared<std::vector<RetiredRecord>>();
@@ -136,7 +137,7 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaCollection(
         auto reservation = TryReserveMemory(bytes);
         if (!reservation) {
           RecordMemoryRejection();
-          return absl::ResourceExhaustedError(
+          return MemoryLimitError(
               "OOM replica collection page admission failed");
         }
         owner->decoded_charge_.Resize(owner->decoded_charge_.bytes() + bytes);
@@ -218,7 +219,7 @@ Task<absl::Status> StorageEngine::Impl::ConsumeReplicaCollection(
       auto reservation = TryReserveMemory(bytes);
       if (!reservation) {
         RecordMemoryRejection();
-        return absl::ResourceExhaustedError("OOM replica merge admission");
+        return MemoryLimitError("OOM replica merge admission");
       }
       destination.reserve(capacity);
       // Keep the conservative growth peak until all merged buffers die.
@@ -343,7 +344,7 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
   auto reservation = TryReserveMemory(undo_bytes);
   if (!reservation) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
+    co_return MemoryLimitError(
         "OOM replica collection transaction metadata admission failed");
   }
   state->undo_charge_.Resize(state->undo_charge_.bytes() + undo_bytes);

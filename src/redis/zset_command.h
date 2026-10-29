@@ -22,6 +22,8 @@
 
 namespace lavik {
 
+struct EncodedCommandReply;
+
 void InitZSetCommandStorage(storage::StorageEngine* engine);
 
 struct ZSetExecKey {
@@ -56,10 +58,10 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
 Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
                                               ReplyBuilder& reply_builder,
                                               std::uint64_t client_id = 0);
-Task<std::string> ExecuteZSetMultiKeyLocked(
+Task<EncodedCommandReply> ExecuteZSetMultiKeyLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes);
-Task<std::string> ExecuteZSetMultiPopLocked(
+Task<EncodedCommandReply> ExecuteZSetMultiPopLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes);
 

@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 namespace {
@@ -125,8 +126,7 @@ absl::Status PrepareSnapshotBlockPins(
   auto reservation = TryReserveMemory(overhead + count * sizeof(BlockPin));
   if (!reservation.has_value()) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM RDB snapshot pin list admission failed");
+    return MemoryLimitError("OOM RDB snapshot pin list admission failed");
   }
   auto pins = std::make_shared<BlockPins>();
   pins->blocks_.reserve(count);
@@ -709,8 +709,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
       (void)co_await ReleaseRdbSnapshotValue(&saved->value_);
       if (!token.ok()) co_return token.status();
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM RDB collection stream admission failed");
+      co_return MemoryLimitError("OOM RDB collection stream admission failed");
     }
     auto stream = std::make_unique<Stream>();
     stream->partition_ = &partition;
@@ -1030,8 +1029,7 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
       if (admission) {
         store.rdb_snapshot_->invalidated_ = true;
         RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "OOM RDB collection page admission");
+        co_return MemoryLimitError("OOM RDB collection page admission");
       }
       // A later-page fault leaves an incomplete key in the temporary output.
       // The job must cancel its token and never publish that file over a
@@ -1084,8 +1082,7 @@ Task<absl::StatusOr<CollectionPage>> StorageEngine::Impl::ReadRdbCollectionPage(
   if (!reservation) {
     RecordMemoryRejection();
     store.rdb_snapshot_->invalidated_ = true;
-    co_return absl::ResourceExhaustedError(
-        "OOM RDB collection page retention rejected");
+    co_return MemoryLimitError("OOM RDB collection page retention rejected");
   }
   CollectionPage page;
   page.value_type_ = stream.saved_->location_.value_type();

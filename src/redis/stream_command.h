@@ -25,6 +25,8 @@
 
 namespace lavik {
 
+struct EncodedCommandReply;
+
 void InitStreamCommandStorage(storage::StorageEngine* engine);
 std::uint32_t StreamNodeMaxEntries() noexcept;
 absl::Status SetStreamNodeMaxEntries(std::uint64_t value);
@@ -46,7 +48,7 @@ Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               const storage::Digest& digest,
                                               storage::TxShardWrites* tx,
                                               ReplyBuilder& reply_builder);
-Task<std::string> ExecuteStreamReadLocked(
+Task<EncodedCommandReply> ExecuteStreamReadLocked(
     const CommandRequest& request, std::span<const StreamExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes,
     ReplyChunkSource* chunks = nullptr);

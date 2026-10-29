@@ -26,6 +26,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/ordered_index.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -1276,7 +1277,7 @@ absl::Status OrderedGroupDirectory::BuildListSlots(
       capacity * (sizeof(OrderedGroupEntry) + sizeof(std::uint64_t)) + 1024));
   if (!scratch) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM List ring construction");
+    return MemoryLimitError("OOM List ring construction");
   }
   auto& list = std::get<ListSlots>(ids_);
   list.head_ = 0;
@@ -1335,7 +1336,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
       changed.size() * (sizeof(OrderedGroupEntry) * 2 + 256) + 1024));
   if (!scratch) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM List directory changes");
+    return MemoryLimitError("OOM List directory changes");
   }
   const auto& list = std::get<ListSlots>(ids_);
   auto analysis = AnalyzeChanges(*this, root, revision, changed);
@@ -1401,7 +1402,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
         1024));
     if (!interval_scratch) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM List replacement interval");
+      return MemoryLimitError("OOM List replacement interval");
     }
     const auto right = end == old_groups.size() ? 0 : old_groups[end].id_;
     std::uint64_t previous = begin == 0 ? 0 : old_groups[begin - 1].id_;
@@ -1451,7 +1452,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
           root.group_count_ * sizeof(OrderedGroupEntry) + 1024));
       if (!rebuild_scratch) {
         RecordMemoryRejection();
-        return absl::ResourceExhaustedError("OOM List directory rebuild");
+        return MemoryLimitError("OOM List directory rebuild");
       }
       std::vector<OrderedGroupEntry> rebuilt;
       rebuilt.reserve(root.group_count_);
@@ -1659,7 +1660,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
           1024));
       if (!scratch) {
         RecordMemoryRejection();
-        return absl::ResourceExhaustedError("OOM Stream suffix update scratch");
+        return MemoryLimitError("OOM Stream suffix update scratch");
       }
       std::vector<const OrderedGroupEntry*> suffix;
       std::vector<std::uint64_t> prefixes;
@@ -1761,7 +1762,7 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
       groups_.size() * sizeof(std::size_t) + changed.size() * 32 + 1024));
   if (!ordinal_admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM ordered structural ordinals");
+    return MemoryLimitError("OOM ordered structural ordinals");
   }
   const auto absent = std::numeric_limits<std::size_t>::max();
   std::vector<std::size_t> positions(groups_.size(), absent);

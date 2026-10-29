@@ -28,6 +28,8 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+
+#include "lavik/error_detail.h"
 #ifndef NDEBUG
 #include <thread>
 #endif
@@ -345,8 +347,7 @@ class CowArray {
                            kChunkAlignment);
   }
   static absl::Status Oom() {
-    return absl::ResourceExhaustedError(
-        "OOM copy-on-write array exceeds maxmemory");
+    return MemoryLimitError("OOM copy-on-write array exceeds maxmemory");
   }
   static absl::StatusOr<Link> AllocateChunk(std::size_t capacity,
                                             std::span<const T> values) {

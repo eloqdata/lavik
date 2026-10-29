@@ -2212,7 +2212,7 @@ endforeach()
       NAME lavik_metrics_e2e
       COMMAND lavik_metrics_e2e_test $<TARGET_FILE:lavik>
     )
-    set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 120)
+    set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 180)
 
     add_executable(lavik_extent_recovery_e2e_test
       tests/extent_recovery_e2e_test.cpp

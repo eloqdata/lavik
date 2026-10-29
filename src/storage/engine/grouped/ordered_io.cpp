@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "read_window.h"
 
@@ -478,8 +479,8 @@ StorageEngine::Impl::LoadGroupedStringValue(
           if (window->size() == 1 &&
               LAVIK_FAULT_MATCHES("LAVIK_FAIL_STRING_READ_BATCH_START_KEY",
                                   key)) {
-            start_status = absl::ResourceExhaustedError(
-                "OOM grouped String read batch admission");
+            start_status =
+                MemoryLimitError("OOM grouped String read batch admission");
             break;
           }
           window->Add(read(*i), *i);

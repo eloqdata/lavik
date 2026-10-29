@@ -21,12 +21,97 @@
 #include <optional>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/error_detail.h"
 #include "lavik/redis_parse.h"
 
 namespace lavik {
 
 namespace {
+
+constexpr std::size_t kParentIdentityCount =
+    static_cast<std::size_t>(CommandKind::kCount);
+// Only supported command names enter labels. Keep parent kinds for legacy
+// counters; Redis commandstats and the result counters use these identities.
+struct SubcommandIdentity {
+  CommandKind kind_;
+  std::string_view name_;
+  int arity_;
+};
+constexpr SubcommandIdentity kSubcommandIdentities[] = {
+    {CommandKind::kConfig, "config|get", -3},
+    {CommandKind::kConfig, "config|set", -4},
+    {CommandKind::kConfig, "config|resetstat", 2},
+    {CommandKind::kConfig, "config|rewrite", 2},
+    {CommandKind::kClient, "client|help", 2},
+    {CommandKind::kClient, "client|info", 2},
+    {CommandKind::kClient, "client|setinfo", 4},
+    {CommandKind::kClient, "client|id", 2},
+    {CommandKind::kClient, "client|setname", 3},
+    {CommandKind::kClient, "client|getname", 2},
+    {CommandKind::kClient, "client|list", -2},
+    {CommandKind::kClient, "client|unblock", -3},
+    {CommandKind::kClient, "client|kill", -3},
+    {CommandKind::kCommand, "command|count", 2},
+    {CommandKind::kCommand, "command|getkeys", -3},
+    {CommandKind::kScript, "script|help", 2},
+    {CommandKind::kScript, "script|kill", 2},
+    {CommandKind::kScript, "script|load", 3},
+    {CommandKind::kScript, "script|exists", -3},
+    {CommandKind::kScript, "script|flush", -2},
+    {CommandKind::kFunction, "function|help", 2},
+    {CommandKind::kFunction, "function|load", -3},
+    {CommandKind::kFunction, "function|delete", 3},
+    {CommandKind::kFunction, "function|flush", -2},
+    {CommandKind::kFunction, "function|dump", 2},
+    {CommandKind::kFunction, "function|restore", -3},
+    {CommandKind::kFunction, "function|list", -2},
+    {CommandKind::kFunction, "function|stats", 2},
+    {CommandKind::kFunction, "function|kill", 2},
+    {CommandKind::kXGroup, "xgroup|create", -5},
+    {CommandKind::kXGroup, "xgroup|setid", -5},
+    {CommandKind::kXGroup, "xgroup|destroy", 4},
+    {CommandKind::kXGroup, "xgroup|createconsumer", 5},
+    {CommandKind::kXGroup, "xgroup|delconsumer", 5},
+    {CommandKind::kXGroup, "xgroup|help", 2},
+    {CommandKind::kXInfo, "xinfo|consumers", 4},
+    {CommandKind::kXInfo, "xinfo|groups", 3},
+    {CommandKind::kXInfo, "xinfo|stream", -3},
+    {CommandKind::kXInfo, "xinfo|help", 2},
+    {CommandKind::kPubSub, "pubsub|channels", -2},
+    {CommandKind::kPubSub, "pubsub|numsub", -2},
+    {CommandKind::kPubSub, "pubsub|numpat", 2},
+    {CommandKind::kPubSub, "pubsub|help", 2},
+    {CommandKind::kSlowLog, "slowlog|help", 2},
+    {CommandKind::kSlowLog, "slowlog|len", 2},
+    {CommandKind::kSlowLog, "slowlog|reset", 2},
+    {CommandKind::kSlowLog, "slowlog|get", -2},
+    {CommandKind::kCluster, "cluster|keyslot", 3},
+    {CommandKind::kCluster, "cluster|myid", 2},
+    {CommandKind::kCluster, "cluster|info", 2},
+    {CommandKind::kCluster, "cluster|slots", 2},
+    {CommandKind::kCluster, "cluster|nodes", 2},
+    {CommandKind::kTombRaider, "tombraider|status", 0},
+    {CommandKind::kTombRaider, "tombraider|on", 0},
+    {CommandKind::kTombRaider, "tombraider|off", 0},
+    {CommandKind::kTombRaider, "tombraider|interval", 0},
+    {CommandKind::kTombRaider, "tombraider|block-sleep", 0},
+    {CommandKind::kTombRaider, "tombraider|sleep", 0},
+    {CommandKind::kTombRaider, "tombraider|daily", 0},
+    {CommandKind::kDefrag, "defrag|status", 0},
+    {CommandKind::kDefrag, "defrag|pause", 0},
+    {CommandKind::kDefrag, "defrag|resume", 0},
+    {CommandKind::kDefrag, "defrag|max-active", 0},
+    {CommandKind::kDefrag, "defrag|concurrency", 0},
+    {CommandKind::kDefrag, "defrag|block-sleep-ms", 0},
+    {CommandKind::kDefrag, "defrag|block-sleep", 0},
+    {CommandKind::kDefrag, "defrag|sleep", 0},
+    {CommandKind::kDefrag, "defrag|record-sleep-us", 0},
+    {CommandKind::kDefrag, "defrag|record-sleep", 0},
+};
+constexpr std::size_t kIdentityCount =
+    kParentIdentityCount + std::size(kSubcommandIdentities);
 
 constexpr std::uint32_t kKeyedRead = kCmdReadOnly | kCmdUsesDbGate;
 constexpr std::uint32_t kKeyedWrite = kCmdWrite | kCmdUsesDbGate;
@@ -509,6 +594,43 @@ const CommandSpec* FindCommand(CommandArgsView args) {
   return spec;
 }
 
+CommandIdentity ResolveCommandIdentity(const CommandRequest& request) noexcept {
+  const auto parent = static_cast<std::size_t>(request.kind_);
+  switch (request.kind_) {
+    case CommandKind::kConfig:
+    case CommandKind::kClient:
+    case CommandKind::kCommand:
+    case CommandKind::kScript:
+    case CommandKind::kFunction:
+    case CommandKind::kXGroup:
+    case CommandKind::kXInfo:
+    case CommandKind::kPubSub:
+    case CommandKind::kSlowLog:
+    case CommandKind::kCluster:
+    case CommandKind::kTombRaider:
+    case CommandKind::kDefrag:
+      break;
+    default:
+      return {parent, CommandCanonicalName(request.kind_)};
+  }
+  if (request.args_.size() < 2)
+    return {parent, CommandCanonicalName(request.kind_)};
+  for (std::size_t i = 0; i < std::size(kSubcommandIdentities); ++i) {
+    const auto& entry = kSubcommandIdentities[i];
+    if (entry.kind_ == request.kind_ &&
+        absl::EqualsIgnoreCase(request.args_[1],
+                               entry.name_.substr(entry.name_.find('|') + 1)))
+      return {kParentIdentityCount + i, entry.name_, entry.arity_};
+  }
+  return {static_cast<std::size_t>(CommandKind::kUnknown), "unknown"};
+}
+std::size_t CommandIdentityCount() noexcept { return kIdentityCount; }
+std::string_view CommandIdentityName(std::size_t index) noexcept {
+  if (index < kParentIdentityCount)
+    return CommandCanonicalName(static_cast<CommandKind>(index));
+  return kSubcommandIdentities[index - kParentIdentityCount].name_;
+}
+
 std::span<const CommandSpec> CommandSpecs() noexcept { return kCommandTable; }
 
 std::string_view CommandCanonicalName(CommandKind kind) noexcept {
@@ -677,7 +799,7 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
         static_cast<std::uint64_t>(parsed_key_count);
     if (key_count > args.size() - first ||
         first + key_count - 1 > std::numeric_limits<std::uint16_t>::max()) {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
     return KeyIndexView{
         .first_ = static_cast<std::uint16_t>(first),
@@ -720,11 +842,11 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
   if (sintercard) {
     const std::size_t after_keys = first + count;
     if ((args.size() - after_keys) % 2 != 0) {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
     for (std::size_t option = after_keys; option < args.size(); option += 2) {
       if (!EqualsIgnoreCase(args[option], "limit")) {
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       }
     }
   }

@@ -26,6 +26,7 @@
 
 #include "absl/container/node_hash_map.h"
 #include "absl/strings/str_cat.h"
+#include "lavik/error_detail.h"
 #include "lavik/memory.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 #include "lavik/storage/detail/stream_records.h"
@@ -1032,8 +1033,7 @@ absl::StatusOr<std::vector<Entry>> DecodeStreamNode(
         bytes += name.size();
       }
       auto reservation = TryReserveMemory(bytes * 3);
-      if (!reservation)
-        return absl::ResourceExhaustedError("OOM Stream repeated fields");
+      if (!reservation) return MemoryLimitError("OOM Stream repeated fields");
       repeated_fields->push_back(std::move(*reservation));
     }
     if (!same_fields &&
@@ -1723,7 +1723,7 @@ class StreamInput {
  private:
   static absl::Status Oom() {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM RDB Stream decode admission");
+    return MemoryLimitError("OOM RDB Stream decode admission");
   }
   static absl::StatusOr<std::uint64_t> Number(
       Reader* reader, std::uint64_t maximum = UINT64_MAX) {
@@ -1878,7 +1878,7 @@ class CollectionInput {
         quick_(type == kListQuicklist || type == kListQuicklist2) {}
   static absl::Status Oom() {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM RDB collection decode admission");
+    return MemoryLimitError("OOM RDB collection decode admission");
   }
   absl::Status Remember(std::string_view member, Reader origin) {
     const auto digest = storage::ComputeDigest(member).value_;
@@ -3135,7 +3135,7 @@ absl::Status StreamFileEncoder::OutputBudget(std::size_t bytes) {
   output_admission_ = TryReserveMemory(bytes * 8 + 4096);
   if (!output_admission_) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM RDB Stream output record");
+    return MemoryLimitError("OOM RDB Stream output record");
   }
   return absl::OkStatus();
 }
@@ -3152,8 +3152,7 @@ absl::Status StreamFileEncoder::StartPage(const storage::CollectionPage& page) {
     const auto bytes = key->size() * 12 + 1024;
     if (bytes > state_charge_.bytes()) {
       auto reservation = TryReserveMemory(bytes - state_charge_.bytes());
-      if (!reservation)
-        return absl::ResourceExhaustedError("OOM RDB Stream validator");
+      if (!reservation) return MemoryLimitError("OOM RDB Stream validator");
       if (state_charge_.bytes() == 0)
         state_charge_.Account(CurrentMemoryAccountingShard(), 0);
       state_charge_.Resize(bytes);
@@ -3236,7 +3235,7 @@ absl::StatusOr<std::optional<std::string_view>> StreamFileEncoder::Advance() {
         consumer_admission_.reset();
         consumer_admission_ = TryReserveMemory(record.key_.size() + 64);
         if (!consumer_admission_)
-          return absl::ResourceExhaustedError("OOM Stream consumer cursor");
+          return MemoryLimitError("OOM Stream consumer cursor");
         consumer_prefix_ = record.key_;
         consumer_prefix_.back() = '\1';
         auto count = consumers_->CountPrefix(consumer_prefix_);

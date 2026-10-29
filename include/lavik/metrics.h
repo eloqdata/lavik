@@ -18,15 +18,18 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bycorf/runtime/task.h"
 #include "lavik/command.h"
+#include "lavik/command_outcome.h"
 
 namespace lavik {
 
@@ -54,6 +57,23 @@ struct CommandMetricTotals {
       latency_bins_{};
 };
 
+// Separate from the legacy dispatch histogram: changing its counters would
+// silently change existing QPS and latency dashboards.
+struct CommandResultTotals {
+  std::array<std::uint64_t, kCommandResultNames.size()> results_{};
+  // Only failed/rejected/redirected results have an error projection.
+  std::array<std::array<std::uint64_t, kCommandErrorReasonNames.size()>, 3>
+      errors_{};
+  // Retain exposed series across RESETSTAT, including a zero first sample.
+  std::bitset<3 * kCommandErrorReasonNames.size()> seen_errors_;
+  std::uint64_t execution_ticks_ = 0;
+  [[nodiscard]] std::uint64_t Calls() const noexcept {
+    return results_[0] + results_[1] + results_[5];
+  }
+};
+using CommandContextTotals =
+    std::array<CommandResultTotals, kCommandContextNames.size()>;
+
 struct StorageIoMetricTotals {
   std::uint64_t operations_ = 0;
   std::uint64_t bytes_ = 0;
@@ -61,6 +81,10 @@ struct StorageIoMetricTotals {
 
 struct WorkerMetricsSnapshot {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
+  // Fixed vocabulary, heap-owned so cross-worker snapshots do not enlarge
+  // the coroutine frame by the complete command/context/error matrix.
+  std::vector<CommandContextTotals> command_results_;
+  std::array<std::uint64_t, kRequestInputErrorNames.size()> input_errors_{};
   std::uint64_t connections_ = 0;
   std::uint64_t connected_clients_ = 0;
   std::uint64_t blocked_clients_ = 0;
@@ -122,6 +146,13 @@ ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept;
 void InitWorkerMetrics(unsigned worker_count);
 void RecordCommandMetric(CommandKind kind,
                          std::uint64_t elapsed_ticks) noexcept;
+// Records one terminal logical event on its coordinating worker. Replication
+// and background callers must not enter this client-observation interface.
+// Malformed/unadmitted request bytes have no logical command identity.
+void RecordRequestInputError(RequestInputError reason) noexcept;
+void RecordCommandResult(std::size_t command, CommandContext context,
+                         CommandOutcome outcome,
+                         std::uint64_t execution_ticks) noexcept;
 void RecordConnectionOpened() noexcept;
 void RecordConnectionClosed() noexcept;
 void RecordClientBlocked() noexcept;
@@ -160,6 +191,20 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
 // dataset persistence accounting are deliberately preserved.
 bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
+// Completes a streamed logical command at producer EOF/error, or cancellation
+// when its connection releases the source. Production time excludes writes.
+// Create, invoke, and finally release the source on its coordinating worker:
+// abandonment updates that worker's counters from the source destructor.
+ReplyChunkSource ObserveCommandReplySource(ReplyChunkSource source,
+                                           std::size_t command,
+                                           CommandContext context,
+                                           CommandOutcome outcome,
+                                           std::uint64_t execution_ticks);
+
+// Returns a fixed-vocabulary identity, resolving supported Redis subcommands.
+// Unknown names never become labels. Resolve before MULTI moves the request.
+std::size_t CommandResultId(const CommandRequest& request) noexcept;
+std::string_view CommandResultName(std::size_t command) noexcept;
 
 // Contiguous rendering adapter for callers that need an owned string. The HTTP
 // exporter uses the same renderer with borrowed static text and owned values.

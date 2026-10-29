@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 namespace {
@@ -79,7 +80,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
   auto admission = TryReserveMemory(groups * 512);
   if (!admission) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM preparing String segments");
+    co_return MemoryLimitError("OOM preparing String segments");
   }
   OrderedCollectionMutationPlan plan{
       .root_ = StringRoot(value.size(), previous ? previous->incarnation() : 1),
@@ -155,8 +156,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   const bool exists = found && found->value_.kind() == RecordKind::kValue &&
                       !IsExpiredNow(*found);
   if (exists && found->value_.value_type() != ValueType::kString)
-    co_return absl::InvalidArgumentError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   if (!exists) grouped.reset();
   const auto location =
       exists ? MaterializeIndexLocation(*found) : RecordLocation{};
@@ -211,7 +211,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   auto admission = TryReserveMemory(scratch_bytes);
   if (!admission) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM String segment workspace");
+    co_return MemoryLimitError("OOM String segment workspace");
   }
   auto apply = [&](std::string& bytes, std::uint64_t base) {
     if (bit) {

@@ -27,6 +27,23 @@
 
 namespace lavik {
 
+// A bounded canonical command/subcommand identity. Indexes are process-local
+// counters' slots, never durable or wire IDs. Structural arity validation uses
+// the same identity before execution and MULTI queueing.
+struct CommandIdentity {
+  std::size_t index_;
+  std::string_view name_;
+  int arity_ = 0;  // Redis convention: positive exact, negative minimum.
+  bool AcceptsArity(std::size_t argc) const noexcept {
+    return arity_ == 0 ||
+           (arity_ > 0 ? argc == static_cast<std::size_t>(arity_)
+                       : argc >= static_cast<std::size_t>(-arity_));
+  }
+};
+CommandIdentity ResolveCommandIdentity(const CommandRequest& request) noexcept;
+std::size_t CommandIdentityCount() noexcept;
+std::string_view CommandIdentityName(std::size_t index) noexcept;
+
 // Static command metadata. The canonical table and request-specific specs are
 // the single source of truth for write/read classification, DB-gate
 // participation, and key positions.

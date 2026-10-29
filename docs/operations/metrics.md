@@ -282,9 +282,9 @@ accounting. RSS and allocator diagnostics remain outside command execution.
 
 ## Business metrics
 
-- `lavik_commands_total`: completed Redis commands. QPS is
+- `lavik_commands_total`: completed ordinary dispatches. QPS is
   `rate(lavik_commands_total[1m])`.
-- `lavik_command_calls_total{command}`: completed commands by command name.
+- `lavik_command_calls_total{command}`: the same dispatches by base command name.
 - `lavik_command_duration_seconds`: command execution histogram, from
   dispatch through reply construction; socket response writes are excluded.
 - `lavik_connections`: all current TCP connections, including Redis clients,
@@ -295,6 +295,13 @@ accounting. RSS and allocator diagnostics remain outside command execution.
 - `lavik_connected_clients`: current Redis client connections. This is always
   less than or equal to `lavik_connections`.
 
+These three legacy command metrics retain their published boundary: dispatch
+returns, including dispatch-time rejections and MULTI queue replies. Immediate
+AUTH/HELLO and protocol failures are outside that boundary. EXEC/script children
+are not additional legacy calls. The histogram ends when a streamed reply is
+constructed, before its lazy producer finishes; blocking dispatch includes its
+wait. Use the result metrics below for failure ratios, not these legacy calls.
+
 For example, per-command QPS and aggregate p99 latency are:
 
 ```promql
@@ -304,6 +311,85 @@ histogram_quantile(
   sum by (le) (rate(lavik_command_duration_seconds_bucket[5m]))
 )
 ```
+
+### Command outcomes and INFO commandstats
+
+| Metric | Meaning |
+| --- | --- |
+| `lavik_command_results_total{command,context,result}` | One logical command event in its context. |
+| `lavik_command_errors_total{command,context,result,reason}` | Error projection of failed, rejected and redirected events; do not add it to the result counter. |
+| `lavik_command_execution_seconds_total{command,context}` | Accumulated elapsed execution time, not CPU time or client request latency. |
+| `lavik_request_input_errors_total{reason}` | Input failures without a valid command: `protocol`, `query_buffer`, or `client_memory`. |
+
+`context` is `client`, `exec`, or `script`. `result` is `success`, `failed`,
+`rejected`, `redirected`, `queued`, or `cancelled`. Execution-time errors are
+`failed`; admission and command/arity checks are `rejected`. MOVED/ASK are
+`redirected`. A nil result, unsuccessful conditional write, and normal blocking
+timeout are successful execution. Abandoning an unfinished reply producer is
+`cancelled`, not a successful response or a service fault.
+
+Command identities come from the static command table, including supported
+subcommands such as `config|get`. Unknown commands/subcommands share the fixed
+`unknown` label and have no INFO row. Raw commands, arguments, keys, addresses
+and error messages never become labels. Error reasons are the bounded set:
+`unknown_command`, `arity`, `syntax`, `wrongtype`, `invalid_value`, `noauth`,
+`auth`, `permission`, `oom`, `loading`, `readonly`, `authority`, `clusterdown`,
+`busy`, `tryagain`, `moved`, `ask`, `noscript`, `script`, `execabort`, `storage`,
+`storage_full`, `internal`, `shutdown`, and `client_error`. Error producers carry
+typed provenance through replies and storage statuses; metrics do not parse RESP
+strings. New error series appear on their first event. Result and time series
+are exported at zero even before use, so idle traffic remains distinguishable
+from a missing scrape.
+
+MULTI emits `client/queued` for each accepted queued command. EXEC records each
+executed child once under `exec`, including a command that touches several
+workers; DISCARD, WATCH abort and dirty-transaction abort do not execute children.
+Errors in the EXEC reply array do not fail the parent EXEC; EXECABORT does.
+Lua/Function calls record their Redis children under `script`. A caught
+`redis.pcall` error fails only the child; a propagated or returned error also
+fails the outer EVAL/FCALL, including an error inside a returned Lua array, as in
+Redis. Replication application, recovery and background work do not enter these
+client result counters. Summing contexts counts logical nested commands, not
+network requests.
+
+INFO commandstats uses this same source, summed over contexts:
+
+- `calls = success + failed + cancelled`;
+- `failed_calls = failed`;
+- `rejected_calls = rejected + redirected`;
+- `usec` is execution seconds converted to microseconds;
+  `usec_per_call` is zero when calls is zero.
+
+This corrects the entire INFO commandstats group to Redis command semantics;
+it does not change the legacy Prometheus dispatch counters. Queue replies have
+no INFO call or execution time. A streaming command is finalized when its
+producer completes or fails, so its outcome can appear after the dispatch
+histogram observation. Socket write failure after production completed does not
+retroactively change a completed execution.
+
+Execution timing excludes admission, MULTI residence, dormant blocking waits,
+and socket writes. It includes coroutine execution waits such as storage I/O
+and cross-worker work. EXEC and Lua parent time includes child execution;
+adding parent and child times double-counts that work. It is neither CPU usage
+nor an end-to-end latency histogram.
+
+`CONFIG RESETSTAT` resets command results, execution time, legacy command
+metrics and input-error counters on each owner worker. It preserves the set of
+previously exposed error series, now with zero values. There is no global
+request barrier: in-flight commands are counted when they finish, and the
+successful `config|resetstat` call is recorded after reset. Restart clears all
+counter and seen-series state. Use `rate`/`increase` to handle counter resets;
+an error occurring before its first scrape cannot be reconstructed from a
+counter alone.
+
+The dashboard's **Request Health** row defaults to `context="client"`. Ratios
+divide by terminal attempts (`success|failed|rejected|redirected|cancelled`),
+excluding `queued`; error counters are numerator projections only. Service
+faults use the explicit reason whitelist
+`oom|loading|authority|clusterdown|busy|tryagain|storage|storage_full|internal|shutdown`
+for `failed|rejected` results. Authentication, routing, read-only policy,
+argument/type errors, script errors and cancellation remain separate diagnostics.
+The deployment guide includes the query and alert handoff boundary.
 
 ## Cluster control metrics
 

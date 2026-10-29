@@ -340,3 +340,68 @@ are not dashboard health indicators. Consult the
 [metric contracts](../../docs/operations/metrics.md#meta--raft-metrics) and
 [fault runbook](../../docs/operations/meta-monitoring.md) before interpreting
 leader hints, transient replication gaps or on-demand lane connections.
+
+## Request Health
+
+The **Request Health** row filters by instance, static command/subcommand name,
+and execution context. Context defaults to `client`; `exec` and `script` reveal
+nested work. Selecting all contexts counts logical command events rather than
+network requests. Existing QPS and latency panels keep their legacy dispatch
+semantics and use only the instance filter.
+
+The row shows outcome rates, errors by reason, execution-failure and admission-
+rejection ratios, service-fault ratio, and input errors. Input errors have no
+valid command identity, so command/context filters do not apply to that panel.
+Ratios use terminal attempts as the denominator and omit MULTI `queued` events.
+MOVED/ASK remain visible as `redirected`; they are not service faults. A healthy
+idle target displays zero ratios. Failed or missing scrapes display **No Data**,
+including when old rate-window samples still exist. An unseen error reason has
+no error series until its first occurrence.
+
+The service-fault numerator for one context is:
+
+```promql
+sum by (instance, command, context) (
+  rate(lavik_command_errors_total{
+    job="lavik", context="client", result=~"failed|rejected",
+    reason=~"oom|loading|authority|clusterdown|busy|tryagain|storage|storage_full|internal|shutdown"
+  }[5m])
+)
+```
+
+Its denominator is:
+
+```promql
+sum by (instance, command, context) (
+  rate(lavik_command_results_total{
+    job="lavik", context="client",
+    result=~"success|failed|rejected|redirected|cancelled"
+  }[5m])
+)
+```
+
+For numerator `N` and denominator `D`, the dashboard evaluates
+`(N or on (instance,command,context) (0 * D)) / clamp_min(D, 1e-9)` and gates
+the result with `and on (instance) (up{job="lavik"} == 1)`. This zero-fill is
+anchored to real command metrics; unconditional `or vector(0)` would conceal
+missing telemetry. The dashboard JSON contains the complete queries with filters.
+Validate the actual dashboard expressions with:
+
+```sh
+python3 deploy/monitoring/tests/check_request_health.py
+```
+
+This requires `promtool` on PATH and covers client errors, zero/low traffic,
+counter reset, routing/queueing, failed scrapes and absent telemetry.
+
+### Command-error alerting boundary
+
+The existing alert framework and rules are documented above. Request Health adds
+no command-error alert rules. Such rules, including minimum traffic and sustained
+windows, remain follow-up work. The service-fault query is the starting point; routing, authentication, read-only policy,
+syntax/type/value errors, script errors and cancellation must not be silently
+added to its whitelist. Test prospective rules with retained-memory admission
+OOM, replica LOADING, expired/changed authority, storage read failure and storage
+exhaustion. Also exercise a stopped scrape target separately: missing metrics
+must not resolve a command-fault alert into a healthy zero. Full counting,
+streaming and reset semantics are in [metrics](../../docs/operations/metrics.md).

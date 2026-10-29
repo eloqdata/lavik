@@ -42,12 +42,15 @@ std::string_view AppendStorageError(ReplyBuilder& builder,
   // (disk/index namespace exhaustion must retain its ordinary ERR reply).
   if (absl::IsResourceExhausted(status) &&
       status.message().starts_with("OOM ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
   if (status.message().starts_with("WRONGTYPE ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
-  return builder.AppendError("ERR " + std::string(status.message()));
+  return builder.AppendError(CommandErrorReasonForStatus(status),
+                             "ERR " + std::string(status.message()));
 }
 
 template <typename Integer>
@@ -82,9 +85,10 @@ Task<CommandReply> ExecuteHashCommandImpl(
     case CommandKind::kHMSet:
     case CommandKind::kHReplace:
       if ((args.size() - 2) % 2 != 0) {
-        co_return BuiltReply(
-            reply_builder.AppendError("ERR wrong number of arguments for '" +
-                                      std::string(args.front()) + "' command"));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kArity, "ERR wrong number of arguments for '" +
+                                            std::string(args.front()) +
+                                            "' command"));
       }
       operation.kind_ = request.kind_ == CommandKind::kHReplace
                             ? storage::HashOperationKind::kReplaceOnly
@@ -159,25 +163,27 @@ Task<CommandReply> ExecuteHashCommandImpl(
       if (args.size() >= 3) {
         if (!ParseInteger(args[2], &operation.count_)) {
           co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kInvalidValue,
               "ERR value is not an integer or out of range"));
         }
         operation.count_provided_ = true;
         if (operation.count_ == std::numeric_limits<std::int64_t>::min()) {
-          co_return BuiltReply(
-              reply_builder.AppendError("ERR value is out of range"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kInvalidValue, "ERR value is out of range"));
         }
       }
       if (args.size() == 4) {
         if (!EqualsIgnoreCase(args[3], "withvalues")) {
-          co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kSyntax, "ERR syntax error"));
         }
         const std::uint64_t magnitude = static_cast<std::uint64_t>(
             operation.count_ < 0 ? -operation.count_ : operation.count_);
         if (magnitude > static_cast<std::uint64_t>(
                             std::numeric_limits<std::int64_t>::max()) /
                             2) {
-          co_return BuiltReply(
-              reply_builder.AppendError("ERR value is out of range"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kInvalidValue, "ERR value is out of range"));
         }
         operation.with_values_ = true;
       }
@@ -194,11 +200,13 @@ Task<CommandReply> ExecuteHashCommandImpl(
         } else if (EqualsIgnoreCase(args[i], "count") && i + 1 < args.size()) {
           if (!ParseInteger(args[i + 1], &operation.scan_count_) ||
               operation.scan_count_ == 0) {
-            co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+            co_return BuiltReply(reply_builder.AppendError(
+                CommandErrorReason::kSyntax, "ERR syntax error"));
           }
           i += 2;
         } else {
-          co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kSyntax, "ERR syntax error"));
         }
       }
       break;

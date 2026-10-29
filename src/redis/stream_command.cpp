@@ -31,8 +31,10 @@
 #include "blocking_wait.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/cross_core.h"
+#include "bycorf/runtime/cycle_clock.h"
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
+#include "lavik/error_detail.h"
 #include "lavik/fault_pause.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
@@ -864,8 +866,10 @@ std::string_view StorageError(ReplyBuilder& builder,
   return status.message().starts_with("WRONGTYPE ") ||
                  status.message().starts_with("BUSYGROUP ") ||
                  status.message().starts_with("NOGROUP ")
-             ? builder.AppendError(status.message())
-             : builder.AppendError("ERR " + std::string(status.message()));
+             ? builder.AppendError(CommandErrorReasonForStatus(status),
+                                   status.message())
+             : builder.AppendError(CommandErrorReasonForStatus(status),
+                                   "ERR " + std::string(status.message()));
 }
 
 std::size_t KeyIndex(CommandKind kind) {
@@ -893,7 +897,7 @@ Task<absl::Status> RunCompact(
     }
     append_admission = TryReserveMemory(bytes * 8);
     if (!append_admission)
-      co_return absl::ResourceExhaustedError("OOM Stream append input");
+      co_return MemoryLimitError("OOM Stream append input");
   }
   storage::CompactAccessOptions access;
   access.metadata_only_ = request.kind_ == CommandKind::kXLen;
@@ -1024,7 +1028,7 @@ Task<absl::Status> RunCompact(
       at += 2;
     }
     if (a.size() - at != 3 && a.size() - at != 4)
-      co_return absl::InvalidArgumentError("syntax error");
+      co_return SyntaxError("syntax error");
     std::string_view low = a[at], high = a[at + 1];
     scan.range_.first_exclusive_ = low.starts_with('(');
     scan.range_.last_exclusive_ = high.starts_with('(');
@@ -1061,7 +1065,7 @@ Task<absl::Status> RunCompact(
       } else if (EqualCi(a[at], "justid"))
         ++at;
       else
-        co_return absl::InvalidArgumentError("syntax error");
+        co_return SyntaxError("syntax error");
     }
     // One lookahead row gives the exact continuation cursor when the
     // command exhausts its ten-attempts-per-result scan budget.
@@ -1165,8 +1169,7 @@ struct StreamRangeReplyState {
           // Include the string's small-capacity growth for tiny fragments.
           const auto bytes = 2 * (std::max(limit, std::size_t{64}) + 1);
           auto admission = TryReserveMemory(bytes);
-          if (!admission)
-            co_return absl::ResourceExhaustedError("OOM Stream reply chunk");
+          if (!admission) co_return MemoryLimitError("OOM Stream reply chunk");
           chunk_charge_.Adopt(&*admission, bytes);
           chunk_limit_ = limit;
         }
@@ -1242,8 +1245,7 @@ struct StreamRangeReplyState {
           co_return absl::ResourceExhaustedError(
               "Stream reply entry size overflow");
         auto admission = TryReserveMemory(payload->size() * 12 + 4096);
-        if (!admission)
-          co_return absl::ResourceExhaustedError("OOM Stream reply entry");
+        if (!admission) co_return MemoryLimitError("OOM Stream reply entry");
         entry_charge_.Adopt(&*admission, admission->bytes());
         // The pinned page owns field bytes until serialization finishes.
         // Avoid an owned string per field and geometric reply growth; the
@@ -1298,8 +1300,7 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
         co_await g_storage->ReadValueForTransferLocked(db, key, digest, range);
     if (!source.ok()) co_return source.status();
     if (source->metadata_.value_type_ != storage::ValueType::kStream)
-      co_return absl::InvalidArgumentError(
-          "WRONGTYPE Operation against a key holding the wrong kind of value");
+      co_return WrongTypeError();
     if (!source->reader_)
       compact_view = storage::CompactValueView{
           .encoded_ = source->metadata_.encoded_,
@@ -1311,8 +1312,7 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
         "Stream reply snapshot size overflow");
   const auto bytes = sizeof(StreamRangeReplyState) + compact_bytes * 12 + 4096;
   auto reservation = TryReserveMemory(bytes);
-  if (!reservation)
-    co_return absl::ResourceExhaustedError("OOM Stream reply snapshot");
+  if (!reservation) co_return MemoryLimitError("OOM Stream reply snapshot");
   auto state = std::make_shared<StreamRangeReplyState>();
   state->state_charge_.Adopt(&*reservation, bytes);
   state->range_ = range;
@@ -1363,7 +1363,8 @@ Task<CommandReply> ExecuteStreamRangeReply(
   if (a.size() != 4) {
     std::int64_t count = 0;
     if (a.size() != 6 || !EqualCi(a[4], "count") || !ParseInt(a[5], &count))
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     if (count <= 0) co_return Built(builder.AppendNullArray());
     range.count_ = count;
   }
@@ -1576,7 +1577,7 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     auto selection_charge =
         TryReserveMemory(result.entries_.size() * 128 + 256);
     if (!selection_charge)
-      co_return absl::ResourceExhaustedError("OOM Stream reply selection");
+      co_return MemoryLimitError("OOM Stream reply selection");
     const auto first = result.entries_.front().id_,
                last = result.entries_.back().id_;
     storage::StreamRangeAccess range{.first_ = {first.ms_, first.seq_},
@@ -1621,7 +1622,8 @@ Task<CommandReply> ExecuteRead(
   std::size_t i = 1;
   if (group_read) {
     if (a.size() < 4 || !EqualCi(a[1], "group"))
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     group_name = a[2];
     consumer_name = a[3];
     i = 4;
@@ -1631,7 +1633,8 @@ Task<CommandReply> ExecuteRead(
       std::int64_t parsed_count = 0;
       if (!ParseInt(a[i + 1], &parsed_count))
         co_return Built(
-            builder.AppendError("ERR value is not an integer or out of range"));
+            builder.AppendError(CommandErrorReason::kInvalidValue,
+                                "ERR value is not an integer or out of range"));
       count = parsed_count <= 0 ? UINT64_MAX
                                 : static_cast<std::uint64_t>(parsed_count);
       i += 2;
@@ -1639,6 +1642,7 @@ Task<CommandReply> ExecuteRead(
       std::int64_t parsed_block = 0;
       if (!ParseInt(a[i + 1], &parsed_block)) {
         co_return Built(builder.AppendError(
+            CommandErrorReason::kInvalidValue,
             "ERR timeout is not an integer or out of range"));
       }
       if (parsed_block < 0) {
@@ -1651,10 +1655,13 @@ Task<CommandReply> ExecuteRead(
       noack = true;
       ++i;
     } else {
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     }
   }
-  if (i >= a.size()) co_return Built(builder.AppendError("ERR syntax error"));
+  if (i >= a.size())
+    co_return Built(
+        builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
   const std::size_t first_key = ++i;
   const std::size_t remaining = a.size() - first_key;
   if (remaining < 2 || remaining % 2)
@@ -1687,7 +1694,8 @@ Task<CommandReply> ExecuteRead(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::time_point::max() - started);
     if (block_ms > static_cast<std::uint64_t>(remaining.count())) {
-      co_return Built(builder.AppendError("ERR timeout is out of range"));
+      co_return Built(builder.AppendError(CommandErrorReason::kInvalidValue,
+                                          "ERR timeout is out of range"));
     }
   }
   const std::optional<std::chrono::steady_clock::time_point> deadline =
@@ -1722,7 +1730,8 @@ Task<CommandReply> ExecuteRead(
       }
       if (state == BlockingWakeReason::kCancelled) {
         co_return Built(
-            builder.AppendError("ERR blocking Stream wait cancelled"));
+            builder.AppendError(CommandErrorReason::kCancelled,
+                                "ERR blocking Stream wait cancelled"));
       }
       if (state == BlockingWakeReason::kReady) {
         attempt_cascade = ResetBlockingReady(*wait_handle);
@@ -1751,6 +1760,7 @@ Task<CommandReply> ExecuteRead(
       if (group_read && owns_attempt_gate &&
           !CommandWriteAdmissionIsCurrent(request)) {
         attempt_reply = Built(builder.AppendError(
+            CommandErrorReason::kTryAgain,
             "TRYAGAIN replication role changed; retry command"));
         co_return absl::OkStatus();
       }
@@ -1863,8 +1873,11 @@ Task<CommandReply> ExecuteRead(
         co_return Built(builder.AppendNullArray());
       }
       cascade_completion.Finish();
+      const auto admission_start = bycorf::ReadCycleCounter();
       absl::Status slept = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
+      builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
+                                    admission_start);
       if (!slept.ok()) co_return Built(StorageError(builder, slept));
       continue;
     }
@@ -1891,7 +1904,8 @@ Task<CommandReply> ExecuteRead(
                                               ? result.stream_->remaining_
                                               : result.entries_.size());
                 header_ = false;
-                co_return std::string(builder.View());
+                co_return EncodedCommandReply{std::string(builder.View()),
+                                              builder.outcome()};
               }
               if (result.stream_) {
                 auto chunk = co_await result.stream_->Next();
@@ -1908,7 +1922,8 @@ Task<CommandReply> ExecuteRead(
                   builder.AppendBulkString(FormatId(item.id_));
                   builder.AppendNullArray();
                 }
-                co_return std::string(builder.View());
+                co_return EncodedCommandReply{std::string(builder.View()),
+                                              builder.outcome()};
               }
               result.entries_ = {};
               entry_ = 0;
@@ -1970,7 +1985,9 @@ Task<CommandReply> ExecuteRead(
       // Close the empty-check/register race before suspending.
       continue;
     }
+    const auto wait_start = bycorf::ReadCycleCounter();
     const BlockingWakeReason woke = co_await WaitForBlockingReady(*wait_handle);
+    builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() - wait_start);
     if (woke == BlockingWakeReason::kTimeout) {
       co_return Built(builder.AppendNullArray());
     }
@@ -1980,7 +1997,8 @@ Task<CommandReply> ExecuteRead(
     }
     if (woke == BlockingWakeReason::kCancelled) {
       co_return Built(
-          builder.AppendError("ERR blocking Stream wait cancelled"));
+          builder.AppendError(CommandErrorReason::kCancelled,
+                              "ERR blocking Stream wait cancelled"));
     }
   }
 }
@@ -2063,9 +2081,10 @@ Task<CommandReply> ExecuteImpl(
     if (a.size() < shape->min_args_ || a.size() > shape->max_args_) {
       const std::string command =
           request.kind_ == CommandKind::kXGroup ? "xgroup|" : "xinfo|";
-      co_return Built(
-          builder.AppendError("ERR wrong number of arguments for '" + command +
-                              std::string(shape->name_) + "' command"));
+      co_return Built(builder.AppendError(
+          CommandErrorReason::kArity, "ERR wrong number of arguments for '" +
+                                          command + std::string(shape->name_) +
+                                          "' command"));
     }
   }
   if ((request.kind_ == CommandKind::kXGroup ||
@@ -2166,18 +2185,22 @@ Task<CommandReply> ExecuteImpl(
         std::int64_t parsed_count = 0;
         if (!ParseInt(a[5], &parsed_count))
           co_return Built(builder.AppendError(
+              CommandErrorReason::kInvalidValue,
               "ERR value is not an integer or out of range"));
         xinfo_full = true;
         xinfo_count = parsed_count < 0 ? 10 : parsed_count;
       } else if (a.size() != 3) {
-        co_return Built(builder.AppendError("ERR syntax error"));
+        co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                            "ERR syntax error"));
       }
     } else if (EqualCi(a[1], "groups")) {
       if (a.size() != 3)
-        co_return Built(builder.AppendError("ERR syntax error"));
+        co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                            "ERR syntax error"));
     } else if (EqualCi(a[1], "consumers")) {
       if (a.size() != 4)
-        co_return Built(builder.AppendError("ERR syntax error"));
+        co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                            "ERR syntax error"));
     }
   }
 
@@ -2281,8 +2304,7 @@ Task<CommandReply> ExecuteImpl(
               trim_specifier_arg = i;
               ++i;
             }
-            if (i >= a.size())
-              return absl::InvalidArgumentError("syntax error");
+            if (i >= a.size()) return SyntaxError("syntax error");
             trim_threshold_arg = i;
             if (trim == Trim::kMaxLen) {
               if (!ParseInt(a[i], &maxlen))
@@ -2298,14 +2320,14 @@ Task<CommandReply> ExecuteImpl(
               std::uint64_t parsed_limit = 0;
               if (!trim_approximate || i + 1 >= a.size() ||
                   !ParseInt(a[i + 1], &parsed_limit))
-                return absl::InvalidArgumentError("syntax error");
+                return SyntaxError("syntax error");
               trim_limit = parsed_limit;
               i += 2;
             }
           } else
             break;
         }
-        if (i >= a.size()) return absl::InvalidArgumentError("syntax error");
+        if (i >= a.size()) return SyntaxError("syntax error");
         const std::size_t id_arg = i;
         const std::string_view id_text = a[i++];
         if ((a.size() - i) == 0 || (a.size() - i) % 2)
@@ -2521,7 +2543,7 @@ Task<CommandReply> ExecuteImpl(
           std::int64_t parsed_count = 0;
           if (a.size() != 6 || !EqualCi(a[4], "count") ||
               !ParseInt(a[5], &parsed_count))
-            return absl::InvalidArgumentError("syntax error");
+            return SyntaxError("syntax error");
           if (parsed_count <= 0) {
             null_range = true;
             return NoChange();
@@ -2541,8 +2563,7 @@ Task<CommandReply> ExecuteImpl(
         std::size_t i = 2;
         bool maxlen_mode = EqualCi(a[i], "maxlen");
         bool minid_mode = EqualCi(a[i], "minid");
-        if (!maxlen_mode && !minid_mode)
-          return absl::InvalidArgumentError("syntax error");
+        if (!maxlen_mode && !minid_mode) return SyntaxError("syntax error");
         ++i;
         const bool approximate = i < a.size() && a[i] == "~";
         std::optional<std::size_t> trim_specifier_arg;
@@ -2550,7 +2571,7 @@ Task<CommandReply> ExecuteImpl(
           trim_specifier_arg = i;
           ++i;
         }
-        if (i >= a.size()) return absl::InvalidArgumentError("syntax error");
+        if (i >= a.size()) return SyntaxError("syntax error");
         const std::size_t trim_threshold_arg = i;
         std::uint64_t maxlen = 0;
         Id minid{};
@@ -2569,11 +2590,11 @@ Task<CommandReply> ExecuteImpl(
           std::uint64_t parsed_limit = 0;
           if (!approximate || i + 2 != a.size() || !EqualCi(a[i], "limit") ||
               !ParseInt(a[i + 1], &parsed_limit))
-            return absl::InvalidArgumentError("syntax error");
+            return SyntaxError("syntax error");
           requested_limit = parsed_limit;
           i += 2;
         }
-        if (i != a.size()) return absl::InvalidArgumentError("syntax error");
+        if (i != a.size()) return SyntaxError("syntax error");
         const std::uint64_t limit =
             approximate
                 ? requested_limit.value_or(DefaultApproximateTrimLimit())
@@ -2638,8 +2659,7 @@ Task<CommandReply> ExecuteImpl(
         std::optional<std::uint64_t> entries_added;
         std::optional<Id> max_deleted_id;
         for (std::size_t i = 3; i < a.size(); i += 2) {
-          if (i + 1 >= a.size())
-            return absl::InvalidArgumentError("syntax error");
+          if (i + 1 >= a.size()) return SyntaxError("syntax error");
           if (EqualCi(a[i], "entriesadded")) {
             std::int64_t parsed_entries = 0;
             if (!ParseInt(a[i + 1], &parsed_entries))
@@ -2658,7 +2678,7 @@ Task<CommandReply> ExecuteImpl(
                   "max_deleted_entry_id");
             max_deleted_id = *parsed;
           } else
-            return absl::InvalidArgumentError("syntax error");
+            return SyntaxError("syntax error");
         }
         if (!value) return absl::InvalidArgumentError("no such key");
         if (*id < stream.max_deleted_id_)
@@ -2685,7 +2705,7 @@ Task<CommandReply> ExecuteImpl(
       case CommandKind::kXGroup: {
         const std::string_view sub = a[1];
         if (EqualCi(sub, "create")) {
-          if (a.size() < 5) return absl::InvalidArgumentError("syntax error");
+          if (a.size() < 5) return SyntaxError("syntax error");
           if (FindGroup(&stream, a[3]))
             return absl::AlreadyExistsError(
                 "BUSYGROUP Consumer Group name already exists");
@@ -2699,7 +2719,7 @@ Task<CommandReply> ExecuteImpl(
                        ParseInt(a[i + 1], &entries_read))
               i += 2;
             else
-              return absl::InvalidArgumentError("syntax error");
+              return SyntaxError("syntax error");
           }
           if (!value && !mkstream)
             return absl::NotFoundError(
@@ -2737,7 +2757,7 @@ Task<CommandReply> ExecuteImpl(
         if (!group)
           return absl::NotFoundError("NOGROUP No such consumer group");
         if (EqualCi(sub, "setid")) {
-          if (a.size() < 5) return absl::InvalidArgumentError("syntax error");
+          if (a.size() < 5) return SyntaxError("syntax error");
           if (a[4] == "$")
             group->last_id_ = stream.last_id_;
           else {
@@ -2750,12 +2770,12 @@ Task<CommandReply> ExecuteImpl(
           } else if (a.size() == 5) {
             group->entries_read_ = -1;
           } else
-            return absl::InvalidArgumentError("syntax error");
+            return SyntaxError("syntax error");
           simple = "OK";
           return publish_stream(std::move(stream));
         }
         if (EqualCi(sub, "createconsumer")) {
-          if (a.size() != 5) return absl::InvalidArgumentError("syntax error");
+          if (a.size() != 5) return SyntaxError("syntax error");
           if (FindConsumer(group, a[4])) {
             integer = 0;
             return NoChange();
@@ -2765,7 +2785,7 @@ Task<CommandReply> ExecuteImpl(
           return publish_stream(std::move(stream));
         }
         if (EqualCi(sub, "delconsumer")) {
-          if (a.size() != 5) return absl::InvalidArgumentError("syntax error");
+          if (a.size() != 5) return SyntaxError("syntax error");
           Consumer* consumer = FindConsumer(group, a[4]);
           if (!consumer) {
             integer = 0;
@@ -2819,7 +2839,7 @@ Task<CommandReply> ExecuteImpl(
           option += 2;
         }
         if (a.size() - option != 3 && a.size() - option != 4)
-          return absl::InvalidArgumentError("syntax error");
+          return SyntaxError("syntax error");
         std::string_view start_text = a[option];
         std::string_view end_text = a[option + 1];
         const bool start_exclusive = start_text.starts_with('(');
@@ -2875,7 +2895,7 @@ Task<CommandReply> ExecuteImpl(
             ids.push_back(*id);
             ++i;
           }
-          if (ids.empty()) return absl::InvalidArgumentError("syntax error");
+          if (ids.empty()) return SyntaxError("syntax error");
           for (; i < a.size();) {
             if (EqualCi(a[i], "justid")) {
               justid = true;
@@ -2910,7 +2930,7 @@ Task<CommandReply> ExecuteImpl(
               last_id = *parsed;
               i += 2;
             } else {
-              return absl::InvalidArgumentError("syntax error");
+              return SyntaxError("syntax error");
             }
           }
           if (last_id.has_value() && *last_id > group->last_id_) {
@@ -2944,7 +2964,7 @@ Task<CommandReply> ExecuteImpl(
               justid = true;
               ++i;
             } else
-              return absl::InvalidArgumentError("syntax error");
+              return SyntaxError("syntax error");
           }
           auto pending = std::lower_bound(
               group->pending_.begin(), group->pending_.end(), *start,
@@ -3047,7 +3067,7 @@ Task<CommandReply> ExecuteImpl(
           return NoChange();
         }
         if (EqualCi(a[1], "consumers")) {
-          if (a.size() != 4) return absl::InvalidArgumentError("syntax error");
+          if (a.size() != 4) return SyntaxError("syntax error");
           if (!value) return absl::NotFoundError("no such key");
           Group* group = FindGroup(&stream, a[3]);
           if (!group)
@@ -3406,7 +3426,7 @@ Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
   return ExecuteImpl(request, &digest, tx, reply_builder);
 }
 
-Task<std::string> ExecuteStreamReadLocked(
+Task<EncodedCommandReply> ExecuteStreamReadLocked(
     const CommandRequest& request, std::span<const StreamExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes, ReplyChunkSource* chunks) {
   ReplyBuilder builder(request.resp_version_);
@@ -3421,13 +3441,15 @@ Task<std::string> ExecuteStreamReadLocked(
       for (;;) {
         auto chunk = co_await reply.continuation_->source_();
         if (!chunk.ok())
-          co_return std::string(StorageError(builder, chunk.status()));
+          co_return EncodedCommandReply{
+              std::string(StorageError(builder, chunk.status())),
+              builder.outcome()};
         if (chunk->empty()) break;
         encoded += *chunk;
       }
     }
   }
-  co_return encoded;
+  co_return EncodedCommandReply{std::move(encoded), builder.outcome()};
 }
 
 // Translate the canonical group delta rather than reading the live Stream:

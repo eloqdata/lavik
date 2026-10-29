@@ -686,6 +686,28 @@ TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {
   EXPECT_EQ(builder.View(), "*2\r\n$5\r\nfirst\r\n$-1\r\n");
 }
 
+TEST(ReplyBuilderTest, ReplyReplacementRetainsTimingUntilTheNextRequest) {
+  ReplyBuilder builder(RespVersion::k3);
+  builder.MarkExecutionStart(300);
+  builder.ExcludeExecutionTicks(50);
+  builder.AppendArrayHeader(2);
+  builder.AppendError(CommandErrorReason::kStorage, "ERR stale reply");
+  builder.ResetReply();
+  EXPECT_EQ(builder.outcome().result_, CommandResult::kSuccess);
+  EXPECT_EQ(builder.outcome().reason_, CommandErrorReason::kNone);
+  EXPECT_EQ(builder.AppendError(CommandErrorReason::kOom, "OOM no memory"),
+            "-OOM no memory\r\n");
+  EXPECT_EQ(builder.outcome().result_, CommandResult::kFailed);
+  EXPECT_EQ(builder.outcome().reason_, CommandErrorReason::kOom);
+  EXPECT_EQ(builder.ExecutionTicks(100, 500), 150);
+  EXPECT_EQ(builder.version(), RespVersion::k3);
+
+  builder.Reset();
+  EXPECT_EQ(builder.AppendSimpleString("OK"), "+OK\r\n");
+  EXPECT_EQ(builder.outcome().result_, CommandResult::kSuccess);
+  EXPECT_EQ(builder.ExecutionTicks(600, 650), 50);
+}
+
 TEST(ReplyBuilderTest, ReusesBoundedCapacityAndReleasesOversizedBuffer) {
   ReplyBuilder builder;
   builder.Reserve(4096);
