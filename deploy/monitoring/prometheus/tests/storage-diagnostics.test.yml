@@ -13,6 +13,9 @@ tests:
       - &server_ready
         series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: 1x160
+      - &replication_observation_available
+        series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
       - &memory_rejected_commands_total
         series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x160"
@@ -159,6 +162,8 @@ tests:
     input_series:
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x160
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x160"
       - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
@@ -253,6 +258,8 @@ tests:
     interval: 15s
     input_series:
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x160
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x160"
@@ -349,6 +356,8 @@ tests:
     input_series:
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x160
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x160"
       - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
@@ -444,6 +453,8 @@ tests:
     input_series:
       - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: 1x160
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
       - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
         values: "0x160"
       - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
@@ -536,6 +547,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -590,6 +602,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -644,6 +657,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -698,6 +712,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -757,6 +772,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -816,6 +832,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -869,6 +886,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -935,6 +953,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -990,6 +1009,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1045,6 +1065,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1105,6 +1126,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1159,6 +1181,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1227,6 +1250,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1280,6 +1304,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1333,6 +1358,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1458,6 +1484,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1525,6 +1552,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1577,6 +1605,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1635,6 +1664,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1694,6 +1724,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1753,6 +1784,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1812,6 +1844,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1871,6 +1904,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1930,6 +1964,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -1989,6 +2024,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2048,6 +2084,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2107,6 +2144,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2166,6 +2204,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2225,6 +2264,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2284,6 +2324,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2343,6 +2384,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2402,6 +2444,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2461,6 +2504,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2519,6 +2563,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2578,6 +2623,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2637,6 +2683,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2695,6 +2742,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2754,6 +2802,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2813,6 +2862,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2872,6 +2922,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
@@ -2937,6 +2988,7 @@ tests:
     interval: 15s
     input_series:
       - *server_ready
+      - *replication_observation_available
       - *memory_rejected_commands_total
       - *worker_retained_memory_bytes
       - *worker_memory_admission_pending_bytes
