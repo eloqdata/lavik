@@ -16,6 +16,7 @@
 
 #include "lavik/command_table.h"
 
+#include <array>
 #include <charconv>
 #include <limits>
 #include <optional>
@@ -547,6 +548,18 @@ consteval bool CommandTableCoversEveryKind() {
 
 static_assert(CommandTableCoversEveryKind());
 
+// Preserve the table's first spelling for aliases without scanning it on
+// every dispatch or while rendering each metric identity.
+constexpr auto kCanonicalNames = [] {
+  std::array<std::string_view, kParentIdentityCount> names{};
+  names.fill("unknown");
+  for (const auto& spec : kCommandTable) {
+    auto& name = names[static_cast<std::size_t>(spec.kind_)];
+    if (name == "unknown") name = spec.name_;
+  }
+  return names;
+}();
+
 bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {
   if (name.size() != lower.size()) {
     return false;
@@ -634,10 +647,8 @@ std::string_view CommandIdentityName(std::size_t index) noexcept {
 std::span<const CommandSpec> CommandSpecs() noexcept { return kCommandTable; }
 
 std::string_view CommandCanonicalName(CommandKind kind) noexcept {
-  for (const CommandSpec& spec : kCommandTable) {
-    if (spec.kind_ == kind) return spec.name_;
-  }
-  return "unknown";
+  const auto index = static_cast<std::size_t>(kind);
+  return index < kCanonicalNames.size() ? kCanonicalNames[index] : "unknown";
 }
 
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,

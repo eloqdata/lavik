@@ -46,6 +46,25 @@ using lavik::DetermineKeys;
 using lavik::FindCommand;
 using lavik::KeyIndexView;
 
+TEST(CommandTableTest, CanonicalIdentitiesPreserveAliasesAndUnknown) {
+  for (const auto& spec : lavik::CommandSpecs()) {
+    const auto canonical = CommandCanonicalName(spec.kind_);
+    ASSERT_NE(canonical, "unknown");
+    const auto* resolved = FindCommand(canonical);
+    ASSERT_NE(resolved, nullptr);
+    EXPECT_EQ(resolved->kind_, spec.kind_);
+    lavik::CommandRequest request;
+    request.kind_ = spec.kind_;
+    request.spec_ = &spec;
+    const auto identity = lavik::ResolveCommandIdentity(request);
+    EXPECT_EQ(identity.index_, static_cast<std::size_t>(spec.kind_));
+    EXPECT_EQ(identity.name_, canonical);
+  }
+  EXPECT_EQ(CommandCanonicalName(FindCommand("slaveof")->kind_), "replicaof");
+  EXPECT_EQ(CommandCanonicalName(CommandKind::kUnknown), "unknown");
+  EXPECT_EQ(CommandCanonicalName(CommandKind::kCount), "unknown");
+}
+
 TEST(CommandTableTest, RequestHandoffPreservesHeapOwnedArgumentPayloads) {
   const std::string value(1024, '\0');
   for (const std::size_t pairs : {1, 4}) {

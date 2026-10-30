@@ -498,8 +498,10 @@ error provenance; metrics never recover categories by parsing RESP text. EXEC
 reduces shard work into one result per logical child, separate from its parent.
 Lua/Function Redis calls have a separate script context. Lazy reply sources retain
 their observation until EOF, failure or abandonment, excluding socket write time.
-INFO commandstats and Prometheus result counters share these snapshots; the legacy
-dispatch counters and histogram preserve their original completion boundary.
+INFO commandstats projects its totals from the same owner-local counters that
+Prometheus snapshots in full. INFO sections without commandstats omit outcome
+collection. The legacy dispatch counters and histogram preserve their original
+completion boundary.
 Reset retains exposed error-series identities and permits in-flight completions
 in the current worker epoch. See [metrics](../operations/metrics.md) for the
 external counting and timing contract.

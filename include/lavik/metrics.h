@@ -74,6 +74,14 @@ struct CommandResultTotals {
 using CommandContextTotals =
     std::array<CommandResultTotals, kCommandContextNames.size()>;
 
+// INFO's context-summed projection omits per-reason counters and histograms.
+struct CommandStatsTotals {
+  std::uint64_t calls_ = 0;
+  std::uint64_t failed_calls_ = 0;
+  std::uint64_t rejected_calls_ = 0;
+  std::uint64_t execution_ticks_ = 0;
+};
+
 struct StorageIoMetricTotals {
   std::uint64_t operations_ = 0;
   std::uint64_t bytes_ = 0;
@@ -84,6 +92,7 @@ struct WorkerMetricsSnapshot {
   // Fixed vocabulary, heap-owned so cross-worker snapshots do not enlarge
   // the coroutine frame by the complete command/context/error matrix.
   std::vector<CommandContextTotals> command_results_;
+  std::vector<CommandStatsTotals> command_stats_;
   std::array<std::uint64_t, kRequestInputErrorNames.size()> input_errors_{};
   std::uint64_t connections_ = 0;
   std::uint64_t connected_clients_ = 0;
@@ -186,7 +195,11 @@ enum class DefragMetricResult : std::uint8_t {
 void RecordDefragMetric(DefragMetricResult result) noexcept;
 void SetDefragActive(bool active) noexcept;
 void SetDefragPending(bool pending) noexcept;
-bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
+enum class CommandMetricsDetail { kNone, kCommandStats, kFull };
+// Collect on each owner, selecting only the outcome data the caller consumes.
+// INFO uses kNone or the compact kCommandStats projection; scrapes use kFull.
+bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics(
+    CommandMetricsDetail detail = CommandMetricsDetail::kFull);
 // Clears Redis command counters on their owning workers. Live gauges and
 // dataset persistence accounting are deliberately preserved.
 bycorf::Task<absl::Status> ResetCommandMetrics();

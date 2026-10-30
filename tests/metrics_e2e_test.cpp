@@ -1009,6 +1009,70 @@ TEST_F(CommandResultsE2eTest, SquashedExecCountsCrossShardCommandsOnce) {
   }
 }
 
+TEST_F(CommandResultsE2eTest, SparseExecSpansKeepLogicalCountsAcrossRuns) {
+  // Mix single-owner and cross-owner commands in a long squashed run. Repeated
+  // keys must not create extra logical results, even as owner buffers grow.
+  ASSERT_EQ(client_->Command({"SET", "{a}:key", "text"}), "+OK");
+  ASSERT_EQ(client_->Command({"SET", "{b}:key", "text"}), "+OK");
+  ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
+  ASSERT_EQ(client_->Command({"MULTI"}), "+OK");
+  constexpr unsigned kRounds = 64;
+  for (unsigned i = 0; i < kRounds; ++i) {
+    ASSERT_EQ(client_->Command({"GET", "{a}:key"}), "+QUEUED");
+    ASSERT_EQ(client_->Command({"LPUSH", "{b}:key", "x"}), "+QUEUED");
+    ASSERT_EQ(client_->Command({"EXISTS", "{a}:key", "{b}:key", "{a}:key"}),
+              "+QUEUED");
+  }
+  // A script splits runs, and its routed multi-key child has its own outer
+  // observation; the shard callback must not add EXEC-context observations.
+  ASSERT_EQ(
+      client_->Command({"EVAL", "return redis.call('EXISTS',KEYS[1],KEYS[2])",
+                        "2", "{a}:key", "{b}:key"}),
+      "+QUEUED");
+  ASSERT_EQ(client_->Command({"GET", "{b}:key"}), "+QUEUED");
+  EXPECT_TRUE(client_->RawCommand({"EXEC"}).starts_with("*194\r\n"));
+  EXPECT_EQ(Result("get", "exec", "success"), kRounds + 1);
+  EXPECT_EQ(Result("lpush", "exec", "failed"), kRounds);
+  EXPECT_EQ(Result("exists", "exec", "success"), kRounds);
+  EXPECT_EQ(Result("exists", "script", "success"), 1);
+  EXPECT_EQ(Result("eval", "exec", "success"), 1);
+  EXPECT_EQ(Result("exec", "client", "success"), 1);
+  EXPECT_TRUE(Stats("get").starts_with("cmdstat_get:calls=65,"));
+  EXPECT_TRUE(Stats("lpush").ends_with(",rejected_calls=0,failed_calls=64"));
+  EXPECT_TRUE(Stats("exists").starts_with("cmdstat_exists:calls=65,"));
+  for (const auto* command : {"get", "lpush", "exists", "eval"}) {
+    const auto stats = Stats(command);
+    const auto usec = stats.find(",usec=");
+    ASSERT_NE(usec, std::string::npos);
+    EXPECT_GT(std::stoull(stats.substr(usec + 6)), 0) << stats;
+  }
+}
+
+TEST_F(CommandResultsE2eTest, InfoSectionsPreserveOutcomeProjection) {
+  ASSERT_EQ(client_->Command({"SET", "projection:key", "text"}), "+OK");
+  ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
+  EXPECT_TRUE(client_->Command({"LPUSH", "projection:key", "x"})
+                  .starts_with("-WRONGTYPE"));
+  EXPECT_TRUE(client_->Command({"LPUSH"}).starts_with("-ERR"));
+  const auto expected = Stats("lpush");
+  ASSERT_TRUE(expected.starts_with("cmdstat_lpush:calls=1,"));
+  ASSERT_TRUE(expected.ends_with(",rejected_calls=1,failed_calls=1"));
+  for (const auto* section : {"clients", "stats", "persistence"}) {
+    const auto info = client_->Command({"INFO", section});
+    EXPECT_EQ(info.find("# Commandstats"), std::string::npos);
+    EXPECT_EQ(Stats("lpush"), expected);
+  }
+  for (const auto* section : {"default", "all", "commandstats"}) {
+    EXPECT_NE(client_->Command({"INFO", section}).find(expected),
+              std::string::npos);
+  }
+  EXPECT_EQ(Result("lpush", "client", "failed"), 1);
+  EXPECT_EQ(Result("lpush", "client", "rejected"), 1);
+  ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
+  EXPECT_TRUE(Stats("lpush").empty());
+  EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
+}
+
 TEST_F(CommandResultsE2eTest, ManagementExecCountsItsChildren) {
   ASSERT_EQ(client_->Command({"MULTI"}), "+OK");
   ASSERT_EQ(client_->Command({"CONFIG", "REWRITE"}), "+QUEUED");

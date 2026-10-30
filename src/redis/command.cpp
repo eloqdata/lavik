@@ -4896,7 +4896,9 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
   if (wants("clients") || wants("stats") || wants("persistence") ||
       wants("commandstats")) {
-    runtime_metrics = co_await CollectWorkerMetrics();
+    runtime_metrics = co_await CollectWorkerMetrics(
+        wants("commandstats") ? CommandMetricsDetail::kCommandStats
+                              : CommandMetricsDetail::kNone);
   }
 
   std::string info;
@@ -5079,18 +5081,15 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   }
   if (wants("commandstats")) {
     info += "# Commandstats\r\n";
-    for (std::size_t index = 0;
-         index < runtime_metrics->command_results_.size(); ++index) {
+    for (std::size_t index = 0; index < runtime_metrics->command_stats_.size();
+         ++index) {
       if (index == static_cast<std::size_t>(CommandKind::kUnknown)) continue;
       CommandMetricTotals command;
-      std::uint64_t rejected = 0;
-      std::uint64_t failed = 0;
-      for (const auto& context : runtime_metrics->command_results_[index]) {
-        command.calls_ += context.Calls();
-        command.latency_ticks_ += context.execution_ticks_;
-        rejected += context.results_[2] + context.results_[3];
-        failed += context.results_[1];
-      }
+      const auto& stats = runtime_metrics->command_stats_[index];
+      command.calls_ = stats.calls_;
+      command.latency_ticks_ = stats.execution_ticks_;
+      const auto rejected = stats.rejected_calls_;
+      const auto failed = stats.failed_calls_;
       if (command.calls_ == 0 && rejected == 0 && failed == 0) continue;
       info += "cmdstat_" + std::string(CommandResultName(index)) +
               ":calls=" + std::to_string(command.calls_) + ",usec=" +
@@ -7699,14 +7698,16 @@ struct CommandExecutionSpan {
   }
 };
 struct MeasureCommandExecution {
-  CommandExecutionSpan& span_;
-  explicit MeasureCommandExecution(CommandExecutionSpan& span) : span_(span) {
-    span_.start_ = bycorf::ReadCycleCounter();
+  CommandExecutionSpan* span_;
+  explicit MeasureCommandExecution(CommandExecutionSpan* span) : span_(span) {
+    if (span_) span_->start_ = bycorf::ReadCycleCounter();
   }
-  ~MeasureCommandExecution() { span_.end_ = bycorf::ReadCycleCounter(); }
+  ~MeasureCommandExecution() {
+    if (span_) span_->end_ = bycorf::ReadCycleCounter();
+  }
 };
 Task<EncodedCommandReply> MeasureCommandReply(Task<EncodedCommandReply> task,
-                                              CommandExecutionSpan& span) {
+                                              CommandExecutionSpan* span) {
   MeasureCommandExecution measure(span);
   co_return co_await std::move(task);
 }
@@ -7725,7 +7726,14 @@ struct ExecRunContext {
   std::vector<EncodedCommandReply>* replies_ = nullptr;
   std::vector<ReplyChunkSource>* reply_chunks_ = nullptr;
   std::vector<CommandExecutionSpan>* execution_spans_ = nullptr;
-  std::vector<std::vector<CommandExecutionSpan>> worker_spans_;
+  struct ExecutedSpan {
+    std::size_t command_;
+    CommandExecutionSpan span_;
+  };
+  // Each owner appends only commands it actually executes. The outer vector
+  // stays fixed during the hop, and no two callbacks mutate the same inner
+  // vector. Lua routing and replication replay have no timing consumer.
+  std::vector<std::vector<ExecutedSpan>> worker_spans_;
   std::size_t begin_ = 0;
   std::size_t end_ = 0;
   std::vector<std::vector<std::optional<std::string>>> mget_;
@@ -7740,9 +7748,9 @@ struct ExecRunContext {
 
 void MergeRunExecutionSpans(ExecRunContext& run) {
   if (run.execution_spans_ == nullptr) return;
-  for (std::size_t i = run.begin_; i < run.end_; ++i)
-    for (const auto& worker : run.worker_spans_)
-      (*run.execution_spans_)[i].Merge(worker[i - run.begin_]);
+  for (const auto& worker : run.worker_spans_)
+    for (const auto& executed : worker)
+      (*run.execution_spans_)[executed.command_].Merge(executed.span_);
 }
 
 // Builds the replies of a completed run from its per-command sinks.
@@ -7791,7 +7799,8 @@ void InitExecRun(ExecRunContext& run, std::span<const CommandRequest> queued,
                  const std::vector<std::vector<ExecKey>>& cmd_keys,
                  std::vector<EncodedCommandReply>& replies,
                  std::vector<ReplyChunkSource>& reply_chunks, std::size_t begin,
-                 std::size_t end) {
+                 std::size_t end,
+                 std::vector<CommandExecutionSpan>* execution_spans = nullptr) {
   run.queued_ = queued;
   run.cmd_keys_ = &cmd_keys;
   run.replies_ = &replies;
@@ -7799,8 +7808,9 @@ void InitExecRun(ExecRunContext& run, std::span<const CommandRequest> queued,
   run.begin_ = begin;
   run.end_ = end;
   const std::size_t count = end - begin;
-  run.worker_spans_.resize(g_storage->worker_count());
-  for (auto& worker : run.worker_spans_) worker.resize(count);
+  run.execution_spans_ = execution_spans;
+  if (execution_spans != nullptr)
+    run.worker_spans_.resize(g_storage->worker_count());
   run.counters_ = std::make_unique<std::atomic<long long>[]>(count);
   run.errors_.assign(count, absl::OkStatus());
   run.mget_.resize(count);
@@ -7815,7 +7825,8 @@ void InitExecRun(ExecRunContext& run, std::span<const CommandRequest> queued,
       // aggregate reply is then an error, but those successful effects still
       // belong to the outer transaction's replication envelope.
       command.replication_capture_->MarkHandled();
-      const auto preparation_start = bycorf::ReadCycleCounter();
+      const auto preparation_start =
+          execution_spans != nullptr ? bycorf::ReadCycleCounter() : 0;
       auto& effects = run.delete_effects_[i - begin];
       absl::Status prepared;
       try {
@@ -7832,8 +7843,9 @@ void InitExecRun(ExecRunContext& run, std::span<const CommandRequest> queued,
       if (!prepared.ok()) {
         effects.clear();
         run.preparation_failed_[i - begin] = true;
-        run.worker_spans_[ThisWorker().id_][i - begin] = {
-            preparation_start, bycorf::ReadCycleCounter()};
+        if (execution_spans != nullptr)
+          (*execution_spans)[i] = {preparation_start,
+                                   bycorf::ReadCycleCounter()};
         run.errors_[i - begin] = std::move(prepared);
       }
     }
@@ -9248,7 +9260,12 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
     if (std::none_of(keys.begin(), keys.end(),
                      [self](const ExecKey& key) { return key.owner_ == self; }))
       continue;
-    MeasureCommandExecution measure(ctx->worker_spans_[self][local]);
+    CommandExecutionSpan* span = nullptr;
+    if (ctx->execution_spans_ != nullptr) {
+      auto& spans = ctx->worker_spans_[self];
+      span = &spans.emplace_back(i, CommandExecutionSpan{}).span_;
+    }
+    MeasureCommandExecution measure(span);
     auto record_error = [&](absl::Status status) {
       std::lock_guard<std::mutex> lock(ctx->error_mutex_);
       if (ctx->errors_[local].ok()) {
@@ -10133,7 +10150,12 @@ Task<CommandReply> ExecuteExecBody(
   }
 
   std::vector<EncodedCommandReply> replies(queued.size());
-  std::vector<CommandExecutionSpan> execution_spans(queued.size());
+  const bool observe_children = !queued.front().replication_origin_;
+  std::vector<CommandExecutionSpan> execution_spans(
+      observe_children ? queued.size() : 0);
+  auto execution_span = [&](std::size_t i) -> CommandExecutionSpan* {
+    return observe_children ? &execution_spans[i] : nullptr;
+  };
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   struct RecordExecutedChildren {
     const std::vector<CommandRequest>& commands_;
@@ -10206,7 +10228,8 @@ Task<CommandReply> ExecuteExecBody(
   }
   auto exclude_child_admission = [&](const CommandRequest& cmd,
                                      std::uint64_t ticks) {
-    execution_spans[&cmd - queued.data()].excluded_ticks_ += ticks;
+    if (observe_children)
+      execution_spans[&cmd - queued.data()].excluded_ticks_ += ticks;
     reply_builder.ExcludeExecutionTicks(ticks);
   };
   auto run_keyless =
@@ -10611,14 +10634,14 @@ Task<CommandReply> ExecuteExecBody(
               CommandRequest& cmd = queued[i];
               cmd.resp_version_ = ctx.resp_version();
               if (!key_errors[i].empty()) {
-                MeasureCommandExecution measure(execution_spans[i]);
+                MeasureCommandExecution measure(execution_span(i));
                 replies[i] = key_errors[i];
                 ++i;
                 continue;
               }
               if (cmd_keys[i].empty()) {
                 replies[i] = co_await MeasureCommandReply(run_keyless(cmd),
-                                                          execution_spans[i]);
+                                                          execution_span(i));
                 ++i;
                 continue;
               }
@@ -10629,7 +10652,7 @@ Task<CommandReply> ExecuteExecBody(
                     ExecuteExecSequentialCommand(sequential, cmd, cmd_keys[i],
                                                  tx_writes, false,
                                                  &reply_chunks[i]),
-                    execution_spans[i]);
+                    execution_span(i));
                 ++i;
                 continue;
               }
@@ -10640,9 +10663,9 @@ Task<CommandReply> ExecuteExecBody(
                 ++end;
               }
               ExecRunContext run;
-              InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i, end);
+              InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i, end,
+                          observe_children ? &execution_spans : nullptr);
               run.tx_writes_ = tx_writes.data();
-              run.execution_spans_ = &execution_spans;
               (void)co_await ExecRunShardCallback(&run,
                                                   tx::ShardSlice{.keys_ = {}});
               AssembleRunReplies(run);
@@ -10806,14 +10829,14 @@ Task<CommandReply> ExecuteExecBody(
         CommandRequest& cmd = queued[i];
         cmd.resp_version_ = ctx.resp_version();
         if (!key_errors[i].empty()) {
-          MeasureCommandExecution measure(execution_spans[i]);
+          MeasureCommandExecution measure(execution_span(i));
           replies[i] = key_errors[i];
           ++i;
           continue;
         }
         if (cmd_keys[i].empty()) {
-          replies[i] = co_await MeasureCommandReply(run_keyless(cmd),
-                                                    execution_spans[i]);
+          replies[i] =
+              co_await MeasureCommandReply(run_keyless(cmd), execution_span(i));
           ++i;
           continue;
         }
@@ -10824,7 +10847,7 @@ Task<CommandReply> ExecuteExecBody(
               ExecuteEvalWithTransaction(cmd, &txn, &tx_writes,
                                          blocking_notifications, &effects, &ctx,
                                          &admission_ticks),
-              execution_spans[i]);
+              execution_span(i));
           exclude_child_admission(cmd, admission_ticks);
           StoreEvalReplicationEffects(cmd, std::move(effects));
           ++i;
@@ -10836,7 +10859,7 @@ Task<CommandReply> ExecuteExecBody(
           replies[i] = co_await MeasureCommandReply(
               ExecuteExecSequentialCommand(sequential, cmd, cmd_keys[i],
                                            tx_writes, false, &reply_chunks[i]),
-              execution_spans[i]);
+              execution_span(i));
           ++i;
           continue;
         }
@@ -10848,9 +10871,9 @@ Task<CommandReply> ExecuteExecBody(
           ++end;
         }
         ExecRunContext run;
-        InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i, end);
+        InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i, end,
+                    observe_children ? &execution_spans : nullptr);
         run.tx_writes_ = tx_writes.data();
-        run.execution_spans_ = &execution_spans;
         absl::Status hop = co_await txn.Execute(&ExecRunShardCallback, &run,
                                                 /*release=*/false);
         if (!hop.ok()) {
@@ -10941,11 +10964,11 @@ Task<CommandReply> ExecuteExecBody(
       if (close_after_exec) {
         replies[i] = EncodeCommandError("ERR EXEC interrupted");
       } else if (!key_errors[i].empty()) {
-        MeasureCommandExecution measure(execution_spans[i]);
+        MeasureCommandExecution measure(execution_span(i));
         replies[i] = key_errors[i];
       } else {
         replies[i] = co_await MeasureCommandReply(run_keyless(queued[i]),
-                                                  execution_spans[i]);
+                                                  execution_span(i));
       }
     }
   }
@@ -12756,12 +12779,12 @@ const char* CommandServingGenerationError(
 
 Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
                                        CommandRequest& request,
-                                       ReplyBuilder& reply_builder) {
+                                       ReplyBuilder& reply_builder,
+                                       CommandIdentity identity) {
   const CommandKind kind = request.kind_;
   if (request.spec_ != nullptr) {
     const CommandSpec& spec = *request.spec_;
     const std::size_t argc = request.args_.size();
-    const auto identity = ResolveCommandIdentity(request);
     // A subcommand owns its structural arity. A negative Redis arity admits
     // optional arguments; its handler classifies malformed options as failure.
     if (identity.arity_ != 0
@@ -13061,7 +13084,8 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
     }
   }
   const CommandKind kind = request.kind_;
-  const std::size_t result_id = CommandResultId(request);
+  const auto identity = ResolveCommandIdentity(request);
+  const std::size_t result_id = identity.index_;
   const bool may_advance_replication_watermark = [&] {
     if (request.replication_origin_ || g_replication == nullptr ||
         g_replication->is_replica()) {
@@ -13095,7 +13119,7 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       request.spec_ != nullptr && (request.spec_->flags_ & kCmdMayBlock) != 0;
   const std::uint64_t started = bycorf::ReadCycleCounter();
   CommandReply reply =
-      co_await DispatchCommandImpl(ctx, request, ctx.reply_builder_);
+      co_await DispatchCommandImpl(ctx, request, ctx.reply_builder_, identity);
   if (cascade.has_value() && !cascade->empty()) {
     (void)co_await DrainBlockingWakeCascade(*cascade);
   }

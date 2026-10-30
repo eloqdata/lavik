@@ -51,7 +51,6 @@ constexpr std::size_t ToIndex(CommandKind kind) noexcept {
 // Cache-line isolation belongs to the live shard wrapper, not its snapshots.
 struct WorkerMetricsData {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
-  std::vector<CommandContextTotals> command_results_;
   std::array<std::uint64_t, kRequestInputErrorNames.size()> input_errors_{};
   // Command latencies are strongly clustered under steady load. This is a
   // routing hint only; every miss still performs the exact lower_bound, so
@@ -72,7 +71,15 @@ struct WorkerMetricsData {
 
 // Written only by the owning worker. Keep neighboring live shards on separate
 // cache lines without imposing that alignment on cross-worker return values.
-struct alignas(64) WorkerMetricsShard : WorkerMetricsData {};
+struct alignas(64) WorkerMetricsShard : WorkerMetricsData {
+  std::vector<CommandContextTotals> command_results_;
+};
+
+struct CollectedWorkerMetrics : WorkerMetricsData {
+  bycorf::Worker::StorageIoStats storage_io_;
+  std::vector<CommandContextTotals> command_results_;
+  std::vector<CommandStatsTotals> command_stats_;
+};
 
 static_assert(alignof(WorkerMetricsShard) == 64);
 static_assert(sizeof(WorkerMetricsShard) % 64 == 0);
@@ -427,28 +434,42 @@ ReplyChunkSource ObserveCommandReplySource(ReplyChunkSource source,
   return [state = std::move(state)] { return NextObservedCommandChunk(state); };
 }
 
-bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
-  struct LocalSnapshot {
-    WorkerMetricsData commands;
-    bycorf::Worker::StorageIoStats storage_io;
-  };
+bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics(
+    CommandMetricsDetail detail) {
   WorkerMetricsSnapshot result;
-  result.command_results_.resize(CommandIdentityCount());
+  if (detail == CommandMetricsDetail::kFull)
+    result.command_results_.resize(CommandIdentityCount());
+  if (detail == CommandMetricsDetail::kCommandStats)
+    result.command_stats_.resize(CommandIdentityCount());
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
     // Copy on the owner rather than reading its live cache lines remotely.
     // Slice off the live shard's alignment so it does not over-align the
     // coroutine frame holding the transfer value.
-    // Both sources belong to this worker; collect them in one round trip.
-    const auto snapshot = co_await bycorf::SubmitTo(worker, [worker] {
-      return LocalSnapshot{
-          .commands =
-              static_cast<const WorkerMetricsData&>(g_worker_metrics[worker]),
-          .storage_io = bycorf::ThisWorker().self_->storage_io_stats(),
-      };
+    const auto shard = co_await bycorf::SubmitTo(worker, [worker, detail] {
+      const auto& live = g_worker_metrics[worker];
+      CollectedWorkerMetrics copy;
+      static_cast<WorkerMetricsData&>(copy) = live;
+      if (detail == CommandMetricsDetail::kFull) {
+        copy.command_results_ = live.command_results_;
+      } else if (detail == CommandMetricsDetail::kCommandStats) {
+        // Project on the owner: INFO never transports or reduces the
+        // cold error-reason matrix, nor creates a second live counter set.
+        copy.command_stats_.resize(live.command_results_.size());
+        for (std::size_t i = 0; i < copy.command_stats_.size(); ++i) {
+          auto& stats = copy.command_stats_[i];
+          for (const auto& context : live.command_results_[i]) {
+            stats.calls_ += context.Calls();
+            stats.failed_calls_ += context.results_[1];
+            stats.rejected_calls_ += context.results_[2] + context.results_[3];
+            stats.execution_ticks_ += context.execution_ticks_;
+          }
+        }
+      }
+      copy.storage_io_ = bycorf::ThisWorker().self_->storage_io_stats();
+      return copy;
     });
-    const auto& shard = snapshot.commands;
-    const auto& storage_io = snapshot.storage_io;
+    const auto& storage_io = shard.storage_io_;
     for (std::size_t i = 0; i < result.input_errors_.size(); ++i)
       result.input_errors_[i] += shard.input_errors_[i];
     result.connected_clients_ += shard.connected_clients_;
@@ -469,6 +490,14 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
     result.storage_writes_.bytes_ += storage_io.write_bytes_;
     result.storage_fdatasyncs_.operations_ += storage_io.fdatasync_operations_;
     result.storage_fdatasyncs_.bytes_ += storage_io.fdatasync_bytes_;
+    for (std::size_t i = 0; i < result.command_stats_.size(); ++i) {
+      auto& destination = result.command_stats_[i];
+      const auto& source = shard.command_stats_[i];
+      destination.calls_ += source.calls_;
+      destination.failed_calls_ += source.failed_calls_;
+      destination.rejected_calls_ += source.rejected_calls_;
+      destination.execution_ticks_ += source.execution_ticks_;
+    }
     for (std::size_t command = 0; command < result.command_results_.size();
          ++command) {
       for (std::size_t context = 0; context < kCommandContextNames.size();
