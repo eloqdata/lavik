@@ -38,7 +38,8 @@ void ReplicationFlowMetrics::Add(const ReplicationFlowObservation& flow) {
   if (flow.full_) {
     const auto phase = static_cast<unsigned>(flow.phase_);
     ++phases_[phase];
-    phase_seconds_[phase] = std::max(phase_seconds_[phase], flow.phase_seconds_);
+    phase_seconds_[phase] =
+        std::max(phase_seconds_[phase], flow.phase_seconds_);
     full_seconds_ = std::max(full_seconds_, flow.full_seconds_);
   }
   if (flow.published_next_lsn_) published_ = flow.published_next_lsn_;
@@ -283,7 +284,8 @@ void AppendReplicationProgressMetrics(
   // Diagnostic snapshots remain renderable for tools/tests. HTTP collection
   // already supplies numeric aggregates and needs no per-row map allocation.
   std::map<std::tuple<ReplicationSide, unsigned, unsigned>,
-           ReplicationFlowMetrics> rows;
+           ReplicationFlowMetrics>
+      rows;
   for (const auto& flow : view.flows_) {
     auto& row = rows[{flow.side_, flow.worker_, flow.flow_}];
     row.side_ = flow.side_;

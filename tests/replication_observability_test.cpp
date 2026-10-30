@@ -140,27 +140,31 @@ TEST(ReplicationObservability, SparseTotalsPreserveZeroSeriesAndRetiredWork) {
     EXPECT_EQ(MetricLines(sparse), MetricLines(dense));
     std::string metrics;
     AppendReplicationProgressMetrics(sparse, &metrics);
-    EXPECT_NE(metrics.find("transfer_bytes_total{side=\"source\",worker=\"0\"} 0\n"),
+    EXPECT_NE(
+        metrics.find("transfer_bytes_total{side=\"source\",worker=\"0\"} 0\n"),
+        std::string::npos);
+    EXPECT_NE(metrics.find(
+                  "transfer_bytes_total{side=\"source\",worker=\"1\"} 123\n"),
               std::string::npos);
-    EXPECT_NE(metrics.find("transfer_bytes_total{side=\"source\",worker=\"1\"} 123\n"),
-              std::string::npos);
-    EXPECT_NE(metrics.find("applied_events_total{side=\"target\",worker=\"0\"} 7\n"),
-              std::string::npos);
-    EXPECT_NE(metrics.find("fullsync_partitions_total{side=\"target\",worker=\"2\"} 2\n"),
-              std::string::npos);
+    EXPECT_NE(
+        metrics.find("applied_events_total{side=\"target\",worker=\"0\"} 7\n"),
+        std::string::npos);
+    EXPECT_NE(
+        metrics.find(
+            "fullsync_partitions_total{side=\"target\",worker=\"2\"} 2\n"),
+        std::string::npos);
   }
 }
 
 TEST(ReplicationObservability, CompactMetricsPreserveFullAndOnlineSemantics) {
   ReplicationObservabilitySnapshot detailed, compact;
   detailed.available_ = compact.available_ = true;
-  ReplicationFlowObservation transfer{
-      .side_ = ReplicationSide::kSource,
-      .connected_ = true,
-      .full_ = true,
-      .phase_ = FullSyncPhase::kTransfer,
-      .phase_seconds_ = 10,
-      .full_seconds_ = 12};
+  ReplicationFlowObservation transfer{.side_ = ReplicationSide::kSource,
+                                      .connected_ = true,
+                                      .full_ = true,
+                                      .phase_ = FullSyncPhase::kTransfer,
+                                      .phase_seconds_ = 10,
+                                      .full_seconds_ = 12};
   transfer.pending_[3] = true;
   transfer.no_progress_seconds_[3] = 4;
   auto promote = transfer;
@@ -176,12 +180,11 @@ TEST(ReplicationObservability, CompactMetricsPreserveFullAndOnlineSemantics) {
   // Three source flows distributed over two target owners, with FULL on one
   // flow and applicable ONLINE coordinates only on the others.
   for (unsigned flow = 0; flow != 3; ++flow) {
-    ReplicationFlowObservation target{
-        .worker_ = flow % 2,
-        .flow_ = flow,
-        .connected_ = true,
-        .full_ = flow == 1,
-        .comparable_ = flow != 1};
+    ReplicationFlowObservation target{.worker_ = flow % 2,
+                                      .flow_ = flow,
+                                      .connected_ = true,
+                                      .full_ = flow == 1,
+                                      .comparable_ = flow != 1};
     if (flow != 1) {
       target.received_next_lsn_ = 30 + flow;
       target.applied_next_lsn_ = 29 + flow;
@@ -197,18 +200,28 @@ TEST(ReplicationObservability, CompactMetricsPreserveFullAndOnlineSemantics) {
   EXPECT_EQ(MetricLines(compact), MetricLines(detailed));
   std::string metrics;
   AppendReplicationProgressMetrics(compact, &metrics);
-  EXPECT_NE(metrics.find("fullsync_phase{side=\"source\",worker=\"0\",flow=\"0\","
-                         "phase=\"transfer\"} 1\n"), std::string::npos);
-  EXPECT_NE(metrics.find("fullsync_phase{side=\"source\",worker=\"0\",flow=\"0\","
-                         "phase=\"promote\"} 1\n"), std::string::npos);
-  EXPECT_NE(metrics.find("fullsync_elapsed_seconds{side=\"source\",worker=\"0\","
-                         "flow=\"0\"} 20\n"), std::string::npos);
+  EXPECT_NE(
+      metrics.find("fullsync_phase{side=\"source\",worker=\"0\",flow=\"0\","
+                   "phase=\"transfer\"} 1\n"),
+      std::string::npos);
+  EXPECT_NE(
+      metrics.find("fullsync_phase{side=\"source\",worker=\"0\",flow=\"0\","
+                   "phase=\"promote\"} 1\n"),
+      std::string::npos);
+  EXPECT_NE(
+      metrics.find("fullsync_elapsed_seconds{side=\"source\",worker=\"0\","
+                   "flow=\"0\"} 20\n"),
+      std::string::npos);
   EXPECT_NE(metrics.find("no_progress_seconds{side=\"source\",worker=\"0\","
-                         "flow=\"0\",step=\"full\"} 4\n"), std::string::npos);
-  EXPECT_EQ(metrics.find("cursor_next_lsn{side=\"target\",worker=\"1\",flow=\"1\""),
+                         "flow=\"0\",step=\"full\"} 4\n"),
             std::string::npos);
-  EXPECT_NE(metrics.find("cursor_next_lsn{side=\"target\",worker=\"0\",flow=\"2\","
-                         "cursor=\"ack_sent\"} 30\n"), std::string::npos);
+  EXPECT_EQ(
+      metrics.find("cursor_next_lsn{side=\"target\",worker=\"1\",flow=\"1\""),
+      std::string::npos);
+  EXPECT_NE(
+      metrics.find("cursor_next_lsn{side=\"target\",worker=\"0\",flow=\"2\","
+                   "cursor=\"ack_sent\"} 30\n"),
+      std::string::npos);
   compact.available_ = detailed.available_ = false;
   EXPECT_EQ(MetricLines(compact), MetricLines(detailed));
   metrics.clear();

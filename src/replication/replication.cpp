@@ -12789,7 +12789,7 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
 Task<ReplicationObservabilitySnapshot> ReplicationManager::ObserveProgress(
     ReplicationObservationDetail detail) const {
   co_return co_await group_->ObserveProgress(false, &replica_serve_stale_data_,
-                                            detail);
+                                             detail);
 }
 
 Task<ReplicationStatus> ReplicationManager::Observe() const {

@@ -95,9 +95,10 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     bool sample, const std::atomic<bool>* serve_stale,
     ReplicationObservationDetail detail) {
   if (bycorf::ThisWorker().id_ != 0)
-    co_return co_await bycorf::SubmitTaskTo(0, [this, sample, serve_stale, detail] {
-      return ObserveProgress(sample, serve_stale, detail);
-    });
+    co_return co_await bycorf::SubmitTaskTo(
+        0, [this, sample, serve_stale, detail] {
+          return ObserveProgress(sample, serve_stale, detail);
+        });
   AssertStateOwner();
   const auto epoch = role_epoch_.load(std::memory_order_acquire);
   const auto active = active_replica_session_;
@@ -105,7 +106,8 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
   ReplicationObservabilitySnapshot view;
   view.available_ = true;
   const auto now = SteadyNanos();
-  const bool metrics = !sample && detail == ReplicationObservationDetail::kMetrics;
+  const bool metrics =
+      !sample && detail == ReplicationObservationDetail::kMetrics;
   std::size_t source_metric_rows = 0;
 
   // Only the sampler mutates clocks/totals; scrapes obtain fresh owner-local
@@ -342,9 +344,9 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
   for (const auto& session : observation_sources_) {
     // Only sampling needs retired sessions' final deltas/results. Scrapes and
     // INFO still revalidate selected relationships after collection below.
-    if (!sample && (session->cancelled() ||
-                    session->source_history_id_ != history ||
-                    replication_shutdown_requested_))
+    if (!sample &&
+        (session->cancelled() || session->source_history_id_ != history ||
+         replication_shutdown_requested_))
       continue;
     const auto owners = session->observation_.flows_;
     if (!owners) continue;
@@ -515,8 +517,9 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     // ever done work; the exporter reconstructs the omitted zero series.
     view.worker_count_ = workers;
     const auto& totals = observation_totals_.totals_;
-    const auto count = std::count_if(totals.begin(), totals.end(),
-                                    [](const auto& total) { return !total.empty(); });
+    const auto count =
+        std::count_if(totals.begin(), totals.end(),
+                      [](const auto& total) { return !total.empty(); });
     view.totals_.reserve(count);
     for (const auto& total : totals)
       if (!total.empty()) view.totals_.push_back(total);
