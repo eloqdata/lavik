@@ -19,6 +19,7 @@ lavik_fullsync_sessions{worker="0"} 0
 lavik_cluster_control_connected 0
 lavik_cluster_control_protocol_errors_total 0
 lavik_cluster_control_lease_expirations_total 0
+lavik_replication_observation_available 1
 lavik_storage_tx_backlog_bytes 0
 lavik_storage_tx_backlog_max_bytes 0
 lavik_storage_tx_cleaner_rounds_total 0

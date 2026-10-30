@@ -21,7 +21,20 @@ inhibit_rules:
     equal: [cluster, job, instance]
   - source_matchers: ['severity="critical"']
     target_matchers: ['severity="warning"']
-    equal: [cluster, job, instance, alertname, worker, device, path, signal]
+    equal:
+      [
+        cluster,
+        job,
+        instance,
+        alertname,
+        worker,
+        device,
+        path,
+        signal,
+        side,
+        flow,
+        step,
+      ]
   - source_matchers: ['alertname="LavikWritableSpaceExhausted"']
     target_matchers: ['alertname="LavikWritableSpaceLow"']
     equal: [cluster, job, instance, device, path]

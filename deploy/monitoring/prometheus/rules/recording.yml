@@ -19,3 +19,13 @@ groups:
         expr:
           (lavik_fullsync_publish_queue_bytes{job="lavik"} + lavik_fullsync_publish_queue_admitted_bytes{job="lavik"})
           / (lavik_fullsync_publish_queue_capacity_bytes{job="lavik"} > 0)
+      - record: lavik:native_replication_stall_seconds
+        expr: |
+          (lavik_replication_no_progress_seconds{job="lavik"}
+            and on (cluster, job, instance, side, worker, flow, step)
+              (lavik_replication_pending_work{job="lavik"} > 0))
+            and on (cluster, job, instance, side, worker, flow)
+              (lavik_replication_native_flow_connections{job="lavik"} > 0)
+            and on (cluster, job, instance)
+              (lavik_replication_observation_available{job="lavik"} == 1)
+            and on (cluster, job, instance) lavik:ready

@@ -5047,6 +5047,10 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       info +=
           std::string("lavik_data_readable:") + (readable ? "1\r\n" : "0\r\n");
     }
+    if (g_replication != nullptr) {
+      const auto progress = co_await g_replication->ObserveProgress();
+      AppendReplicationProgressInfo(progress, &info);
+    }
     info += "lavik_replication_state:" +
             std::string(ReplicationRoleName(replication.role_)) + "\r\n";
     info += std::string("lavik_replication_failed_stopped:") +

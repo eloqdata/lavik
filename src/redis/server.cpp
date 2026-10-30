@@ -2540,8 +2540,9 @@ int RunServer(ServerOptions options) {
     server.AddService(meta_control_client.get());
   }
   if (options.metrics_port_ != 0) {
-    metrics = CreateMetricsService(options.metrics_port_, &storage,
-                                   [&redis] { return redis.ready(); });
+    metrics = CreateMetricsService(
+        options.metrics_port_, &storage, [&redis] { return redis.ready(); },
+        &replication);
     // Scraping includes shard fan-out and response rendering. Keep that work
     // with the data services so it cannot occupy the Meta control worker.
     metrics->SetWorkers(data_workers);

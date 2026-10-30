@@ -35,6 +35,7 @@
 #include "lavik/command_args.h"
 #include "lavik/lease_deadline.h"
 #include "lavik/replication_group.h"
+#include "lavik/replication_observability.h"
 
 namespace bycorf {
 class TlsContext;
@@ -597,6 +598,12 @@ class ReplicationManager {
   // worker while another worker updates the native session registry.
   bycorf::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
   bycorf::Task<ReplicationStatus> Observe() const;
+  // Collects native progress on its owning workers. This diagnostic snapshot
+  // neither grants authority nor changes resume, ACK, or timeout decisions.
+  // Metrics omit INFO-only diagnostics and aggregate peers before returning.
+  bycorf::Task<ReplicationObservabilitySnapshot> ObserveProgress(
+      ReplicationObservationDetail detail =
+          ReplicationObservationDetail::kInfo) const;
   // Fence committed publishers and sample the current export session.
   bycorf::Task<RedisExportProgress> ObserveRedisExport() const;
   // Called while control-plane mutation drain is pending. A slow external

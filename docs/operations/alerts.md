@@ -30,6 +30,9 @@ No command-traffic minimum applies to capacity or absolute failure counters.
 | LavikWritableSpaceExhausted | `lavik_storage_available_bytes=0` | critical / 30s | Writable Space by Device |
 | LavikBacklogPressure | active backlog, pinned cursors, `backpressured=1`, publisher queue at least 80% full | warning / 5m; critical / 15m | Backlog and Publisher Pressure |
 | LavikFullSyncQueuePressure | FULL sessions present, `(queued + admitted) / queue capacity >=80%` | warning / 10m | FULL Publication Queue Pressure |
+| LavikReplicationStalled | valid connected flow with pending send/apply/ACK/FULL work and no effective progress | warning at 5m; critical at 8m | Native Replication Without Progress |
+| LavikFullSyncFailures | at least 3 failed native FULL attempts in 15m | warning | Native FULL Results and Retries |
+| LavikPopulationRecoveryStalled | required population unready, no recovery progress for 15m, not waiting for admission/authority | critical | Native Population and Readiness |
 | LavikMetaDisconnected | managed Data `lavik_cluster_control_connected=0` | critical / 5m | Meta Connection State |
 | LavikMetaProtocolErrors | control protocol errors increase by at least 3 in 5m | warning / 1m | Meta Exceptions |
 | LavikLeaseExpirations | locally detected lease expirations increase in 5m; at least 3 for critical | warning or critical / 1m | Meta Exceptions |
@@ -56,7 +59,8 @@ or transaction. Both standalone and Meta-managed Data use the same storage polic
 current target/readiness/missing-data state before declaring recovery.
 
 TargetDown inhibits other Lavik alerts for the same cluster/job/instance.
-Critical inhibits warning only for the same alert and worker/device/signal;
+Critical inhibits warning only for the same alert and worker/device/signal,
+including the same replication side/flow/step;
 WritableSpaceExhausted inhibits WritableSpaceLow for that device. Alertmanager
 uses its standard 30s initial grouping, 5m group updates and 4h repeat interval.
 Inhibited alerts remain visible in Alertmanager. Scheduled maintenance should
@@ -162,6 +166,63 @@ Recovery requires queue pressure to clear or the sessions to finish. A full
 queue does not distinguish slow progress from stalled progress. Confirm successful
 population activation separately; this rule cannot prove it.
 
+## Native replication stalled
+
+Check `INFO replication` through the existing Admin command entry or a Redis
+client. Match `lavik_replication_progressN` side, worker and logical flow with the
+alert; INFO adds session, history and peer identity. Source metrics aggregate the
+maximum distance and age across comparable downstreams, so INFO identifies the
+particular peer. `pending_events` is an event-position difference, never bytes.
+
+For `send`, inspect publisher/backlog pressure and the network; valid fragments
+count as send progress even before a large event finishes. For `apply`, inspect
+target storage, queued complete events and the consistent applied frontier. For
+`ack`, distinguish a blocked target write from a source waiting for an observed
+ACK. An online ACK does not prove a crash-durable checkpoint. For `full`, inspect
+the current locally observed phase and processed data/partitions. Source cannot
+report the target's internal promotion phase.
+
+The server samples progress once per second. The rule fires at 300 or 480 seconds
+of known pending work, plus scrape/evaluation delay; there is no second five- or
+eight-minute `for` window. Idle work has zero age. Disconnected, waiting and
+unavailable states do not establish a replication stall. A reconnect starts new
+flow timers; do not subtract LSNs across histories or nodes. Check the independent
+population recovery alarm if reconnects repeat without useful recovery work.
+
+## Native FULL failures
+
+`lavik_replication_last_full_*` retains the most recent terminal result for this
+process. A new attempt leaves that result intact. Correlate side, session and
+history in `native FULL` start/phase/result logs. The failure phase and original
+reason remain available even when cleanup also fails; inspect cleanup logs too.
+Process restart clears this diagnostic record. Use Prometheus result counters
+and duration histograms for history across restarts, and logs for each attempt.
+
+The default rule uses `increase(...{result="failure"}[15m]) >= 3`, separately for
+source and target, avoiding double counting one attempt seen at both ends.
+Cancellation for local role replacement/shutdown is a separate result. FULL busy
+and authority waits are retry reasons, not failed attempts. A remote source can
+only diagnose the connection outcome it actually observes. Repair the reported
+cause before retrying; respect a failed-stopped node's existing operator recovery
+procedure. Source and target completion counts need not be identical when the
+connection fails around activation.
+
+## Native population recovery
+
+Compare population ready, catalog ready, ONLINE, loading, failed-stopped and data
+readability independently. A committed catalog or a promoted root alone does not
+prove completion of all-flow cut/finalization and online activation. A failure in
+promotion/finalization must not increment success.
+
+This rule requires an unready population that should recover and 15 minutes
+without effective recovery progress. It does not fire merely because a large
+FULL has a long total duration. Retry/heartbeat activity alone does not establish
+recovery progress. Admission/authority waits have their own diagnostic state and
+are excluded from this alarm. Inspect Meta authority and source admission when
+waiting persists. On recovery verify current population readiness, online state,
+read behavior and the terminal result; an alert resolving on missing telemetry
+is not evidence that the population recovered.
+
 ## Meta disconnected
 
 Applies only to `lavik_mode="meta-managed"`. Check seeds, Meta leader availability,
@@ -211,9 +272,11 @@ return and the recovery window; inspect each target's actual health.
 ## Coverage boundaries
 
 The Data and Meta rule sets observe their respective exported metrics; they do
-not prove Data serving authority. Command error ratios, replica stall detection,
-FULL failure history/population loading and latency attribution remain separate
-work under #391, #395 and #396. Tx block counts, age and blocking reasons remain
+not prove Data serving authority. Command error ratios and latency attribution
+remain separate work under #391 and #396. Native replication progress and FULL
+population recovery are covered; Redis PSYNC keeps its existing diagnostics.
+Native snapshots unavailable for five minutes trigger the `LavikMetricsMissing`
+native_replication signal. Tx block counts, age and blocking reasons remain
 outside these diagnostics under #379. No node_exporter or centralized log platform is
 included. Monitoring does not participate in authorization or replication decisions.
 

@@ -152,6 +152,71 @@ Fault queries and rehearsal examples are in the
 [Meta monitoring runbook](meta-monitoring.md), including the installed Meta alert
 policy. The existing optional Alertmanager handles both Data and Meta rules.
 
+## Native replication progress and FULL recovery
+
+Collection remains pull-based: the HTTP request asks each owner worker for its
+metrics. Native replication's asynchronous `ObserveProgress()` is shared with
+`INFO replication`; it copies flow state on its owner and reads the existing
+consistent applied frontier. A worker-zero sampler updates observation clocks
+and cumulative totals once per second. Collection batches all sessions and flows
+on each participating worker into one submission. Sampling skips output rows and
+INFO identity copies; HTTP and INFO still request fresh, validated snapshots.
+HTTP collection aggregates source peers directly into numeric flow rows and
+omits INFO identities and the last FULL diagnostic. It transfers only nonzero
+worker counter rows; the exporter restores omitted rows as zero, preserving the
+series set before replication starts and after sessions retire. INFO retains
+per-peer details. Retired sessions are collected only by the sampler, which
+records their final deltas and results before releasing them.
+The sampler does not control ACKs,
+timeouts, reconnects or authorization, and adds no clock read to each ONLINE
+event. A scrape validates relationship/history generation before exposing active
+progress. Counter and terminal-result updates may lag by one sample interval.
+
+`lavik_replication_observation_available=0` means no coherent current snapshot.
+Active progress is omitted in that case; cumulative counters remain available.
+`lavik_replication_comparable_flows{side,worker,flow}` counts ONLINE connections
+with comparable cursors. FULL before ONLINE has no applicable online cursor or
+pending-event distance. Missing samples are never a healthy zero.
+
+| Metric suffix (all use `lavik_replication_`) | Meaning |
+|---|---|
+| `cursor_next_lsn{side,worker,flow,cursor}` | Published on source; Received, Applied and ACK sent on target. Same history and flow only. |
+| `pending_events{side,worker,flow}` | Source maximum Published minus observed ACK among valid downstreams; target Received minus Applied. Event positions, not bytes. |
+| `native_flow_connections`, `pending_work{step}`, `no_progress_seconds{step}` | Connected flows, known pending work and longest sampled age without progress for send/apply/ack/full. |
+| `transfer_bytes_total`, `transfer_events_total`, `applied_events_total` | Process cumulative data-frame bytes including framing, complete ONLINE events sent/accepted, and ONLINE target applied events. Labels are side and worker. |
+| `fullsync_phase{phase}`, `fullsync_phase_seconds{phase}`, `fullsync_elapsed_seconds` | Current locally visible FULL phase, phase age and attempt age, per side/worker/flow. |
+| `fullsync_items_total`, `fullsync_partitions_total` | Actual snapshot record payloads (including fragments) plus complete incremental commands, and completed partition handoffs across attempts. No estimated percentage. |
+| `fullsync_results_total{side,result}`, `fullsync_failures_total{side,reason}`, `fullsync_duration_seconds{side}` | Exactly one success/failure/cancelled result per FULL attempt, bounded failure classification and terminal-duration histogram including all results. |
+| `retries_total{reason}` | Native reconnect rounds; FULL busy and authority waits are separate from FULL failures. |
+| `native_following`, `native_connected`, `population_ready`, `catalog_ready`, `data_readable`, `loading`, `failed_stopped`, `waiting` | Independent current facts. Data readability describes local dataset readiness; it grants no Meta authority and does not replace command routing/READONLY checks. |
+| `fullsync_promotion_complete` | Target-local durable root switch during an active FULL; absent when inapplicable. This does not prove population finalization or ONLINE. |
+| `wait_reason{reason}` | Current FULL admission or authority wait, separately from disconnected state. |
+| `loading_no_progress_seconds` | Required population recovery without effective progress; waiting for FULL admission or authority is excluded. |
+
+A cursor is the next event position. Received advances only after complete
+reassembly, validation and queue acceptance; Applied uses the shared all-flow
+frontier; ACK sent advances only after a successful write. Source observed ACK
+is identity-validated before computing distance. None is a new durable
+checkpoint. FULL promotion and finalization remain separate completion facts.
+A replica does not know live source Published. Never subtract across nodes in
+PromQL and never use `rate()` on raw LSNs: use the cumulative counters. Prometheus
+floating-point samples may round very large LSNs; INFO preserves exact integers.
+
+Labels contain only side, worker, logical flow and fixed enumerations. Source
+metrics aggregate peers; maximum distance and maximum age may refer to different
+peers. Exact peer/session/history and cursors are in `lavik_replication_progressN`
+INFO fields. `lavik_replication_last_full_*` retains the last terminal result in
+memory; a new attempt does not overwrite it until terminal. Logs record attempt
+start, phase and result with identities; repeated target retry messages are
+summarized at most every 30 seconds with the number of attempts. Credentials and
+flow capabilities are not metric labels or observation log fields.
+
+The [runbook](alerts.md#native-replication-stalled) and Overview's **Replication
+and FULL Recovery** row cover idle, catching-up, disconnected, waiting, stalled,
+FULL phases, rates, readiness and failures. These fields cover standalone and
+Meta-managed native replication. Redis PSYNC import/export retains its existing
+compatibility fields and behavior.
+
 ## Memory limit
 
 `--max-memory` (also accepted as `--maxmemory`) sets the process memory limit

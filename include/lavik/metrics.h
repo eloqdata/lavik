@@ -30,6 +30,8 @@
 
 namespace lavik {
 
+class ReplicationManager;
+
 namespace storage {
 class StorageEngine;
 }
@@ -161,9 +163,12 @@ std::string_view CommandMetricName(CommandKind kind) noexcept;
 
 // Contiguous rendering adapter for callers that need an owned string. The HTTP
 // exporter uses the same renderer with borrowed static text and owned values.
+// Before readiness only lavik_server_ready is emitted. The optional native
+// observer is borrowed for this coroutine; no replication decision uses a
+// scrape.
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
-    std::string* output);
+    std::string* output, const ReplicationManager* replication = nullptr);
 
 }  // namespace lavik
 
@@ -173,8 +178,11 @@ class Service;
 
 namespace lavik {
 
+// The storage and optional replication manager must outlive the service and
+// its in-flight requests. The HTTP listener runs on data workers.
 std::unique_ptr<bycorf::Service> CreateMetricsService(
     std::uint16_t port, const storage::StorageEngine* storage,
-    std::function<bool()> server_ready);
+    std::function<bool()> server_ready,
+    const ReplicationManager* replication = nullptr);
 
 }  // namespace lavik

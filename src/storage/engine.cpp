@@ -115,6 +115,10 @@ Task<absl::Status> StorageEngine::FinalizeReplicaFullSync(
   return impl_->FinalizeReplicaFullSync(session_id);
 }
 
+bool StorageEngine::ReplicaCatalogReady() const noexcept {
+  return impl_->ReplicaCatalogReady();
+}
+
 bool StorageEngine::ReplicaRecoveryFenced() const noexcept {
   return impl_->ReplicaRecoveryFenced();
 }

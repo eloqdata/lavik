@@ -1446,6 +1446,10 @@ class StorageEngine {
   // Success must precede publication of protocol readiness.
   bycorf::Task<absl::Status> FinalizeReplicaFullSync(std::uint64_t session_id);
   bool ReplicaRecoveryFenced() const noexcept;
+
+  // Diagnostic catalog completion for the current native FULL root. Call on
+  // worker zero; this does not imply population readiness or serving authority.
+  bool ReplicaCatalogReady() const noexcept;
   // Irreversibly fences request serving in this process after a durable
   // mutation can no longer be reconciled with its replication history.
   // Recovery is the only authority that may choose the valid durable state.

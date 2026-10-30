@@ -3444,6 +3444,10 @@ class StorageEngine::Impl {
   Task<absl::Status> FinalizeReplicaFullSync(std::uint64_t session_id);
   Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
                                              PopulationToken population);
+  bool ReplicaCatalogReady() const noexcept {
+    assert(bycorf::ThisWorker().id_ == 0);
+    return system_state_.catalog_ready_;
+  }
   bool ReplicaRecoveryFenced() const noexcept {
     return replica_recovery_fenced_.load(std::memory_order_acquire) ||
            request_serving_fenced_until_restart_.load(

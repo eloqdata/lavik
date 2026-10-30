@@ -451,6 +451,8 @@ add_library(lavik_module
   src/storage/format.cpp
   src/memory.cpp
   src/metrics.cpp
+  src/replication/observability.cpp
+  src/replication/observability_format.cpp
   src/replication/command.cpp
   src/replication/replica_applied_frontier.cpp
   src/replication/replication_group.cpp
@@ -1835,6 +1837,7 @@ if (BUILD_TESTING)
     tests/replication_history_test.cpp
     tests/native_replay_test.cpp
     tests/native_reparent_test.cpp
+    tests/replication_observability_test.cpp
     tests/replica_applied_frontier_test.cpp
     tests/full_sync_handoff_test.cpp
     tests/ring_buffer_test.cpp
@@ -1906,6 +1909,13 @@ endforeach()
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/native_replicaof_e2e.sh
                 $<TARGET_FILE:lavik> ${LAVIK_REDIS_CLI_EXECUTABLE})
       set_tests_properties(lavik_native_replicaof_e2e
+        PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+    endif()
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+      add_test(NAME lavik_replication_observability_e2e
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/replication_observability_e2e.py
+                $<TARGET_FILE:lavik>)
+      set_tests_properties(lavik_replication_observability_e2e
         PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
     endif()
     if (LAVIK_REDIS_SERVER_EXECUTABLE AND LAVIK_REDIS_CLI_EXECUTABLE)

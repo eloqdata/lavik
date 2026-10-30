@@ -1,0 +1,311 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+rule_files:
+  - ../rules/recording.yml
+  - ../rules/alerts.yml
+evaluation_interval: 15s
+tests:
+  - name: pending apply fires warning then critical and resolves
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_pending_work{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 1x10 0x20
+      - series: lavik_replication_no_progress_seconds{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 0+60x10 0x20
+      - series: lavik_replication_native_flow_connections{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0"}
+        values: 1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 4m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled",severity="warning"}) or vector(0)
+        eval_time: 5m30s
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled",severity="critical"}) or vector(0)
+        eval_time: 8m30s
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 14m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: idle
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_pending_work{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: "0x30"
+      - series: lavik_replication_no_progress_seconds{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 0+60x10 0x20
+      - series: lavik_replication_native_flow_connections{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0"}
+        values: 1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: disconnected
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_pending_work{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 1x10 0x20
+      - series: lavik_replication_no_progress_seconds{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 0+60x10 0x20
+      - series: lavik_replication_native_flow_connections{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0"}
+        values: "0x30"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: slow but advancing
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_pending_work{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 1x10 0x20
+      - series: lavik_replication_no_progress_seconds{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: "0x30"
+      - series: lavik_replication_native_flow_connections{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0"}
+        values: 1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: incoherent snapshot
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+      - series: lavik_replication_pending_work{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 1x10 0x20
+      - series: lavik_replication_no_progress_seconds{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 0+60x10 0x20
+      - series: lavik_replication_native_flow_connections{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0"}
+        values: 1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: missing cursor
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_pending_work{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 1x10 0x20
+      - series: lavik_replication_no_progress_seconds{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0",step="apply"}
+        values: 0 stale _x29
+      - series: lavik_replication_native_flow_connections{job="lavik",cluster="test",instance="data:9100",side="target",worker="0",flow="0"}
+        values: 1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikReplicationStalled"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: repeated failures
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_fullsync_results_total{job="lavik",cluster="test",instance="data:9100",side="target",result="failure"}
+        values: 0 1 2 3 4x26
+      - series: lavik_replication_fullsync_results_total{job="lavik",cluster="test",instance="data:9100",side="target",result="cancelled"}
+        values: 0+1x30
+      - series: lavik_replication_retries_total{job="lavik",cluster="test",instance="data:9100",reason="full_busy"}
+        values: 0+1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncFailures"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncFailures"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: counter reset does not create failures
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_fullsync_results_total{job="lavik",cluster="test",instance="data:9100",side="target",result="failure"}
+        values: 0 1 2 0x27
+      - series: lavik_replication_fullsync_results_total{job="lavik",cluster="test",instance="data:9100",side="target",result="cancelled"}
+        values: 0+1x30
+      - series: lavik_replication_retries_total{job="lavik",cluster="test",instance="data:9100",reason="full_busy"}
+        values: 0+1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncFailures"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikFullSyncFailures"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: loading without progress
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_loading_no_progress_seconds{job="lavik",cluster="test",instance="data:9100"}
+        values: 0+60x30
+      - series: lavik_replication_loading{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_waiting{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+      - series: lavik_replication_population_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 14m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 16m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: large FULL still progressing
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_loading_no_progress_seconds{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+      - series: lavik_replication_loading{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_waiting{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+      - series: lavik_replication_population_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 14m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 16m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: awaiting authority
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_loading_no_progress_seconds{job="lavik",cluster="test",instance="data:9100"}
+        values: 0+60x30
+      - series: lavik_replication_loading{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_waiting{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_population_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 14m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 16m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: complete population
+    interval: 1m
+    input_series:
+      - series: up{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_observation_available{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_loading_no_progress_seconds{job="lavik",cluster="test",instance="data:9100"}
+        values: 0+60x30
+      - series: lavik_replication_loading{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+      - series: lavik_replication_waiting{job="lavik",cluster="test",instance="data:9100"}
+        values: "0x30"
+      - series: lavik_replication_population_ready{job="lavik",cluster="test",instance="data:9100"}
+        values: 1x30
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 14m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertstate="firing",alertname="LavikPopulationRecoveryStalled"}) or vector(0)
+        eval_time: 16m
+        exp_samples:
+          - labels: "{}"
+            value: 0

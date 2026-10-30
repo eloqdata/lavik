@@ -284,6 +284,30 @@ full timing is covered by promtool tests. It needs no production receiver secret
 Omitting a binary flag skips that real-process portion; controllable-exporter
 checks alone are not complete real-process acceptance. Logs, notification JSON and a result file
 remain in the output directory for inspection; all started processes are stopped.
+
+### Native replication and FULL recovery
+
+The Overview's **Replication and FULL Recovery** row keeps backlog/publisher and
+FULL queue pressure alongside native progress, pending work, state and phase
+history, terminal durations, retries, failures and population readiness. Missing
+or inapplicable cursors remain gaps. Rates use process counters; no panel computes
+lag by subtracting source and target LSNs. Use the existing Admin INFO command for
+peer/session/history detail and the most recent in-process FULL result.
+
+Default editable rules warn after 5 minutes of connected pending work without
+progress, become critical after 8 minutes, warn on at least 3 FULL failures in
+15 minutes, and flag required population recovery with no progress for 15
+minutes. Long FULL duration alone is not an alarm. FULL busy, authority waiting,
+normal cancellation and disconnected flows are not confirmed replication stalls.
+The existing TargetDown inhibition and receiver routes apply; severity inhibition
+matches replication side, flow and step. See the [native replication runbook](../../docs/operations/alerts.md#native-replication-stalled).
+
+The monitoring drill also verifies native stall, repeated FULL failure and
+population recovery notifications from firing through resolved. Rule tests cover
+idle, slow progress, missing snapshots, disconnects and counter resets. Deploy
+the matching exporter with these rules: an older exporter lacks the observation
+availability signal and triggers `LavikMetricsMissing` after five minutes.
+
 ## Meta / Raft dashboard
 
 Start each Meta with `--metrics-port 9200 --metrics-bind <private-IP>` and add

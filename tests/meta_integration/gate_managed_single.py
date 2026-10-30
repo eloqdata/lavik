@@ -819,6 +819,8 @@ def main():
             failed_copy_restores_target(Path(directory))
         keys_holds_population_until_disconnect(Path(directory))
         N.CLIENT_MODE = "single"
+        if C.has_fault(C.DATA, b"LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE"):
+            N.population_finalization_failure(Path(directory))
         if C.has_fault(C.DATA, b"LAVIK_REPLICATION_HOLD_FIRST_HANDOFF_UNTIL_NEXT_ACK"):
             N.handoff_order(Path(directory))
             N.cancelled_handoff(Path(directory))

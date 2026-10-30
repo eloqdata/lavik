@@ -36,6 +36,7 @@
 #include "bycorf/runtime/worker.h"
 #include "lavik/command_table.h"
 #include "lavik/memory.h"
+#include "lavik/replication.h"
 #include "lavik/storage/engine.h"
 
 namespace lavik {
@@ -653,11 +654,20 @@ void AppendStorageDiagnostics(
 
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
-    bycorf::HttpResponse* response) {
+    bycorf::HttpResponse* response, const ReplicationManager* replication) {
   response->body_.clear();
   response->body_parts_.clear();
   response->body_.reserve(server_ready ? 4096 : 16);
   response->body_parts_.reserve(server_ready ? 1024 : 4);
+  if (server_ready && replication != nullptr) {
+    const auto progress = co_await replication->ObserveProgress(
+        ReplicationObservationDetail::kMetrics);
+    // Render directly into owned scratch before adding borrowed parts. The
+    // first borrowed append registers this prefix by offset, avoiding a
+    // temporary body and copy while preserving the segmented response's
+    // lifetime contract.
+    AppendReplicationProgressMetrics(progress, &response->body_);
+  }
   MetricText output(response);
   AppendMetricText(
       &output,
@@ -1060,10 +1070,10 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
 
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
-    std::string* output) {
+    std::string* output, const ReplicationManager* replication) {
   bycorf::HttpResponse response;
-  auto status =
-      co_await RenderPrometheusMetrics(storage, server_ready, &response);
+  auto status = co_await RenderPrometheusMetrics(storage, server_ready,
+                                                 &response, replication);
   output->clear();
   output->reserve(response.BodySize());
   if (response.body_parts_.empty()) {
@@ -1077,16 +1087,16 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
 
 std::unique_ptr<bycorf::Service> CreateMetricsService(
     std::uint16_t port, const storage::StorageEngine* storage,
-    std::function<bool()> server_ready) {
+    std::function<bool()> server_ready, const ReplicationManager* replication) {
   auto service = std::make_unique<bycorf::HttpService>(port);
   service->RegisterGet(
       "/metrics",
-      [storage, server_ready = std::move(server_ready)](
+      [storage, replication, server_ready = std::move(server_ready)](
           const bycorf::HttpRequest&,
           bycorf::HttpResponse* response) -> bycorf::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
         co_return co_await RenderPrometheusMetrics(*storage, server_ready(),
-                                                   response);
+                                                   response, replication);
       });
   return service;
 }
