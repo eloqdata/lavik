@@ -245,12 +245,13 @@ class RespClient {
 
 class ServerProcess {
  public:
-  ServerProcess(std::string_view binary, std::uint16_t redis_port,
-                std::uint16_t metrics_port, std::string_view data_path,
-                std::string_view log_path, unsigned workers = 2,
-                std::uint64_t max_memory = 1024ULL * 1024 * 1024,
-                std::vector<std::string> extra = {},
-                const std::vector<std::pair<std::string, std::string>>& env = {}) {
+  ServerProcess(
+      std::string_view binary, std::uint16_t redis_port,
+      std::uint16_t metrics_port, std::string_view data_path,
+      std::string_view log_path, unsigned workers = 2,
+      std::uint64_t max_memory = 1024ULL * 1024 * 1024,
+      std::vector<std::string> extra = {},
+      const std::vector<std::pair<std::string, std::string>>& env = {}) {
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("fork failed");
@@ -1139,6 +1140,47 @@ TEST_F(CommandResultsE2eTest, InfoSectionsPreserveOutcomeProjection) {
   EXPECT_EQ(Result("lpush", "client", "rejected"), 1);
   ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
   EXPECT_TRUE(Stats("lpush").empty());
+  EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
+}
+
+TEST_F(CommandResultsE2eTest, SparseCollectionPreservesIdleAndResetSamples) {
+  // Unused contexts must still be queryable before their first event, even
+  // though no owner sends them in its sparse snapshot.
+  EXPECT_EQ(Result("get", "exec", "failed"), 0);
+  EXPECT_EQ(Result("zrange", "script", "success"), 0);
+  ASSERT_EQ(client_->Command({"SET", "sparse:key", "text"}), "+OK");
+  for (unsigned cycle = 0; cycle < 3; ++cycle) {
+    ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
+    const auto reset = HttpGet(metrics_port_, "/metrics");
+    EXPECT_EQ(MetricValue(reset,
+                          "lavik_command_results_total{command=\"get\","
+                          "context=\"client\",result=\"success\"}"),
+              0);
+    EXPECT_EQ(reset.find("lavik_command_calls_total{command=\"get\"}"),
+              std::string::npos);
+    EXPECT_EQ(client_->Command({"GET", "sparse:key"}), "$4\r\ntext");
+    EXPECT_TRUE(client_->Command({"LPUSH", "sparse:key", "x"})
+                    .starts_with("-WRONGTYPE"));
+    const auto metrics = HttpGet(metrics_port_, "/metrics");
+    EXPECT_EQ(
+        MetricValue(metrics, "lavik_command_calls_total{command=\"get\"}"), 1);
+    EXPECT_EQ(
+        MetricValue(metrics,
+                    "lavik_command_duration_seconds_count{command=\"get\"}"),
+        1);
+    EXPECT_EQ(
+        MetricValue(metrics,
+                    "lavik_command_duration_seconds_bucket{command=\"get\","
+                    "le=\"+Inf\"}"),
+        1);
+    EXPECT_EQ(Result("get", "client", "success"), 1);
+    EXPECT_EQ(Result("get", "exec", "success"), 0);
+    EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 1);
+    // Taking another snapshot must neither consume counters nor duplicate
+    // entries when an identity was reactivated by RESETSTAT.
+    EXPECT_EQ(Result("get", "client", "success"), 1);
+  }
+  ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
   EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
 }
 

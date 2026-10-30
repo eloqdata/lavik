@@ -686,11 +686,17 @@ and merges the returned copies. Command execution therefore does not contend
 on shared QPS or histogram atomics. HTTP response buffers are retained in a
 bounded per-worker pool and reused by later scrapes.
 
-INFO collects only the outcome detail needed by its requested section.
-`clients`, `stats`, and `persistence` omit command outcomes. `commandstats`
-(also included by default and `all`) projects calls, failures, rejections, and
-execution time on each owner before transferring them, without copying the
-per-context error-reason matrix. Prometheus scrapes retain the full matrix and
-the previously exposed error series, including after RESETSTAT. All of these
-collections run on serving workers; frequent polling and large worker counts
-should be included when measuring application tail latency.
+INFO collects only the command detail needed by its requested section.
+`clients` and `persistence` omit command statistics; `stats` receives only the
+legacy dispatch call total. `commandstats` (also included by default and `all`)
+projects calls, failures, rejections, and execution time on each owner. No INFO
+section copies latency histograms or the per-context error-reason matrix.
+
+Prometheus snapshots carry only observed commands, logical command contexts,
+and error identities. Error identities remain present with zero counters after
+RESETSTAT. The renderer supplies the fixed result/time series for unused
+contexts from immutable zero-valued text, preserving idle-zero and dashboard
+filter semantics. Sparse internal collection therefore does not reduce the
+number of published result/time series. All collections run on serving workers;
+frequent polling and large worker counts should be included when measuring
+application tail latency.

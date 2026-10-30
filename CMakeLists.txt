@@ -1818,6 +1818,7 @@ if (BUILD_TESTING)
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
     tests/memory_test.cpp
+    tests/metrics_snapshot_test.cpp
     tests/meta_control_test.cpp
     tests/meta_client_test.cpp
     tests/node_control_test.cpp

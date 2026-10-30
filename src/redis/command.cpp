@@ -4898,6 +4898,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       wants("commandstats")) {
     runtime_metrics = co_await CollectWorkerMetrics(
         wants("commandstats") ? CommandMetricsDetail::kCommandStats
+        : wants("stats")      ? CommandMetricsDetail::kTotalCalls
                               : CommandMetricsDetail::kNone);
   }
 
@@ -5081,11 +5082,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   }
   if (wants("commandstats")) {
     info += "# Commandstats\r\n";
-    for (std::size_t index = 0; index < runtime_metrics->command_stats_.size();
-         ++index) {
+    for (const auto& entry : runtime_metrics->commands_.stats_) {
+      const auto index = entry.index_;
       if (index == static_cast<std::size_t>(CommandKind::kUnknown)) continue;
       CommandMetricTotals command;
-      const auto& stats = runtime_metrics->command_stats_[index];
+      const auto& stats = entry.totals_;
       command.calls_ = stats.calls_;
       command.latency_ticks_ = stats.execution_ticks_;
       const auto rejected = stats.rejected_calls_;

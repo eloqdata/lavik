@@ -18,7 +18,6 @@
 
 #include <array>
 #include <atomic>
-#include <bitset>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -61,19 +60,11 @@ struct CommandMetricTotals {
 // silently change existing QPS and latency dashboards.
 struct CommandResultTotals {
   std::array<std::uint64_t, kCommandResultNames.size()> results_{};
-  // Only failed/rejected/redirected results have an error projection.
-  std::array<std::array<std::uint64_t, kCommandErrorReasonNames.size()>, 3>
-      errors_{};
-  // Retain exposed series across RESETSTAT, including a zero first sample.
-  std::bitset<3 * kCommandErrorReasonNames.size()> seen_errors_;
   std::uint64_t execution_ticks_ = 0;
   [[nodiscard]] std::uint64_t Calls() const noexcept {
     return results_[0] + results_[1] + results_[5];
   }
 };
-using CommandContextTotals =
-    std::array<CommandResultTotals, kCommandContextNames.size()>;
-
 // INFO's context-summed projection omits per-reason counters and histograms.
 struct CommandStatsTotals {
   std::uint64_t calls_ = 0;
@@ -87,12 +78,26 @@ struct StorageIoMetricTotals {
   std::uint64_t bytes_ = 0;
 };
 
+// Sparse snapshots carry numeric identities; labels are resolved only by the
+// renderer. Entries are sorted and unique after cross-worker aggregation.
+template <typename Totals>
+struct CommandMetricEntry {
+  std::size_t index_ = 0;
+  Totals totals_{};
+};
+
+struct CommandMetricsSnapshot {
+  std::vector<CommandMetricEntry<CommandMetricTotals>> commands_;
+  // Result indices flatten command/context. Error indices further flatten
+  // failed/rejected/redirected and reason, in the fixed enum order.
+  std::vector<CommandMetricEntry<CommandResultTotals>> results_;
+  std::vector<CommandMetricEntry<std::uint64_t>> errors_;
+  std::vector<CommandMetricEntry<CommandStatsTotals>> stats_;
+  std::uint64_t total_calls_ = 0;
+};
+
 struct WorkerMetricsSnapshot {
-  std::array<CommandMetricTotals, kCommandKindCount> commands_{};
-  // Fixed vocabulary, heap-owned so cross-worker snapshots do not enlarge
-  // the coroutine frame by the complete command/context/error matrix.
-  std::vector<CommandContextTotals> command_results_;
-  std::vector<CommandStatsTotals> command_stats_;
+  CommandMetricsSnapshot commands_;
   std::array<std::uint64_t, kRequestInputErrorNames.size()> input_errors_{};
   std::uint64_t connections_ = 0;
   std::uint64_t connected_clients_ = 0;
@@ -195,9 +200,10 @@ enum class DefragMetricResult : std::uint8_t {
 void RecordDefragMetric(DefragMetricResult result) noexcept;
 void SetDefragActive(bool active) noexcept;
 void SetDefragPending(bool pending) noexcept;
-enum class CommandMetricsDetail { kNone, kCommandStats, kFull };
-// Collect on each owner, selecting only the outcome data the caller consumes.
-// INFO uses kNone or the compact kCommandStats projection; scrapes use kFull.
+enum class CommandMetricsDetail { kNone, kTotalCalls, kCommandStats, kFull };
+// Collect only the command data the caller consumes, on its owner. INFO never
+// copies latency histograms; full scrapes transport only observed entries.
+// Published zero-valued result series are reconstructed by the renderer.
 bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics(
     CommandMetricsDetail detail = CommandMetricsDetail::kFull);
 // Clears Redis command counters on their owning workers. Live gauges and
