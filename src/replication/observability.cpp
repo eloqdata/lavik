@@ -92,10 +92,11 @@ Task<absl::Status> ReplicationManager::ReplicationGroup::MonitorProgress() {
 
 Task<ReplicationObservabilitySnapshot>
 ReplicationManager::ReplicationGroup::ObserveProgress(
-    bool sample, const std::atomic<bool>* serve_stale) {
+    bool sample, const std::atomic<bool>* serve_stale,
+    ReplicationObservationDetail detail) {
   if (bycorf::ThisWorker().id_ != 0)
-    co_return co_await bycorf::SubmitTaskTo(0, [this, sample, serve_stale] {
-      return ObserveProgress(sample, serve_stale);
+    co_return co_await bycorf::SubmitTaskTo(0, [this, sample, serve_stale, detail] {
+      return ObserveProgress(sample, serve_stale, detail);
     });
   AssertStateOwner();
   const auto epoch = role_epoch_.load(std::memory_order_acquire);
@@ -104,6 +105,8 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
   ReplicationObservabilitySnapshot view;
   view.available_ = true;
   const auto now = SteadyNanos();
+  const bool metrics = !sample && detail == ReplicationObservationDetail::kMetrics;
+  std::size_t source_metric_rows = 0;
 
   // Only the sampler mutates clocks/totals; scrapes obtain fresh owner-local
   // data while using those sampled ages. No task keeps an owner reference
@@ -177,15 +180,18 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
       return;
     }
     if (!current) return;
-    // The periodic sampler has no output consumer. In particular, do not copy
-    // INFO identities or build output rows merely to update sampled clocks.
-    auto& row = view.flows_.emplace_back();
+    // Metrics merge each numeric row immediately instead of retaining an
+    // INFO row (and two allocated identity strings) for every downstream peer.
+    ReplicationFlowObservation metric_row;
+    auto& row = metrics ? metric_row : view.flows_.emplace_back();
     row.side_ = side;
     row.worker_ = owner;
     row.flow_ = flow;
-    row.session_id_ = session_id;
-    row.history_id_ = session_history;
-    row.peer_id_ = peer;
+    if (!metrics) {
+      row.session_id_ = session_id;
+      row.history_id_ = session_history;
+      row.peer_id_ = peer;
+    }
     row.connected_ = connected;
     row.comparable_ = comparable;
     row.pending_ = pending;
@@ -197,10 +203,12 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
                              ? (now - local.phase_started_) / 1e9
                              : 0;
     row.full_seconds_ = full && now >= started ? (now - started) / 1e9 : 0;
-    row.bytes_ = local.bytes_;
-    row.events_ = local.events_;
-    row.full_items_ = local.full_items_;
-    row.partitions_ = local.partitions_;
+    if (!metrics) {
+      row.bytes_ = local.bytes_;
+      row.events_ = local.events_;
+      row.full_items_ = local.full_items_;
+      row.partitions_ = local.partitions_;
+    }
     if (comparable) {
       if (side == ReplicationSide::kSource) {
         row.published_next_lsn_ = published;
@@ -217,6 +225,19 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     for (unsigned step = 0; step != progress.size(); ++step)
       row.no_progress_seconds_[step] =
           previous.clocks_[step].Age(pending[step], now);
+    if (metrics) {
+      // Sources are processed before the single current target. Each session
+      // has contiguous logical flow IDs; no map or per-peer output is needed.
+      const auto index =
+          (side == ReplicationSide::kSource ? 0 : source_metric_rows) + flow;
+      if (view.metric_flows_.size() <= index)
+        view.metric_flows_.resize(index + 1);
+      auto& aggregate = view.metric_flows_[index];
+      aggregate.side_ = side;
+      aggregate.worker_ = owner;
+      aggregate.flow_ = flow;
+      aggregate.Add(row);
+    }
   };
 
   auto finish = [&](detail::NativeSessionObservation& observation,
@@ -316,20 +337,30 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
   source_cuts.reserve(observation_sources_.size());
   target_cuts.reserve(observation_targets_.size());
   std::size_t flow_count = 0;
+  std::size_t source_flow_count = 0, target_flow_count = 0;
   unsigned owner_count = 0;
   for (const auto& session : observation_sources_) {
+    // Only sampling needs retired sessions' final deltas/results. Scrapes and
+    // INFO still revalidate selected relationships after collection below.
+    if (!sample && (session->cancelled() ||
+                    session->source_history_id_ != history ||
+                    replication_shutdown_requested_))
+      continue;
     const auto owners = session->observation_.flows_;
     if (!owners) continue;
     flow_count += owners->size();
+    source_flow_count = std::max(source_flow_count, owners->size());
     owner_count = std::max(owner_count, static_cast<unsigned>(owners->size()));
     source_cuts.push_back(
         {session, owners, std::vector<FlowCut>(owners->size()),
          !session->control_active() && session->connected_flows() == 0});
   }
   for (const auto& session : observation_targets_) {
+    if (!sample && (session != active || session->cancelled())) continue;
     const auto owners = session->observation_.flows_;
     const auto count = owners ? owners->size() : 0;
     flow_count += count;
+    target_flow_count = std::max(target_flow_count, count);
     owner_count = std::max(owner_count, static_cast<unsigned>(count));
     target_cuts.push_back(
         {session, owners, std::vector<FlowCut>(count),
@@ -338,7 +369,10 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
              session->active_transaction_applies_.load(
                  std::memory_order_acquire) == 0});
   }
-  if (!sample) view.flows_.reserve(flow_count);
+  if (metrics)
+    view.metric_flows_.reserve(source_flow_count + target_flow_count);
+  else if (!sample)
+    view.flows_.reserve(flow_count);
   const unsigned workers = storage_->worker_count();
   owner_count = std::min(owner_count, workers);
   std::vector<std::optional<std::uint64_t>> published(
@@ -394,6 +428,7 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
                observation.expected_cancel_.load(std::memory_order_acquire));
     if (sample) observation.drained_sampled_ = cut.drained_;
   }
+  source_metric_rows = view.metric_flows_.size();
   for (const auto& cut : target_cuts) {
     const auto& session = cut.session_;
     auto& observation = session->observation_;
@@ -450,7 +485,7 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     view.full_promotion_complete_ =
         active->observation_.promotion_complete_.load(
             std::memory_order_acquire);
-  if (!sample) view.failure_detail_ = failure_reason_;
+  if (!sample && !metrics) view.failure_detail_ = failure_reason_;
   if (serve_stale != nullptr)
     view.readable_ =
         dataset_read_state(*serve_stale) == DatasetReadState::kReadable;
@@ -473,11 +508,24 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
       (active && active->cancelled())) {
     view.available_ = false;
     view.flows_.clear();
+    view.metric_flows_.clear();
   }
-  view.totals_ = observation_totals_.totals_;
+  if (metrics) {
+    // Counters are monotonic across relationships. Copy only rows that have
+    // ever done work; the exporter reconstructs the omitted zero series.
+    view.worker_count_ = workers;
+    const auto& totals = observation_totals_.totals_;
+    const auto count = std::count_if(totals.begin(), totals.end(),
+                                    [](const auto& total) { return !total.empty(); });
+    view.totals_.reserve(count);
+    for (const auto& total : totals)
+      if (!total.empty()) view.totals_.push_back(total);
+  } else {
+    view.totals_ = observation_totals_.totals_;
+    view.last_full_ = observation_totals_.last_full_;
+  }
   view.full_totals_ = observation_totals_.full_totals_;
   view.retries_ = observation_totals_.retries_;
-  view.last_full_ = observation_totals_.last_full_;
   co_return view;
 }
 }  // namespace lavik

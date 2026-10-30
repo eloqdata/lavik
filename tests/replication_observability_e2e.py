@@ -79,6 +79,17 @@ def online_progress(binary, root):
         source_port,
         _,
     ):
+        # Compact collection omits untouched counter rows in transit, but the
+        # public exporter must still emit zeros for both sides of every worker.
+        text = scrape(source_metrics)
+        for name in (
+            "transfer_bytes_total",
+            "transfer_events_total",
+            "fullsync_items_total",
+            "fullsync_partitions_total",
+        ):
+            assert values(text, "lavik_replication_" + name) == [0, 0, 0, 0], text
+        assert values(text, "lavik_replication_applied_events_total") == [0, 0], text
         assert source.call("SET", "seed", "snapshot") == "OK"
         with faults(LAVIK_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS="6500"):
             with process(
@@ -119,6 +130,11 @@ def online_progress(binary, root):
                         metrics,
                     )
                     text = scrape(metrics)
+                    inactive_side = "target" if client is source else "source"
+                    inactive_workers = 2 if client is source else 1
+                    assert values(
+                        text, "lavik_replication_transfer_bytes_total", side=inactive_side
+                    ) == [0] * inactive_workers, text
                     assert (
                         sum(
                             values(

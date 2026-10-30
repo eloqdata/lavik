@@ -26,6 +26,29 @@ std::string_view FullSyncResultName(FullSyncResult result) noexcept {
   constexpr std::array names{"success", "failure", "cancelled"};
   return names[static_cast<unsigned>(result)];
 }
+
+void ReplicationFlowMetrics::Add(const ReplicationFlowObservation& flow) {
+  connected_ += flow.connected_;
+  comparable_ += flow.comparable_;
+  pending_events_ = std::max(pending_events_, flow.pending_events_);
+  for (unsigned step = 0; step != pending_.size(); ++step) {
+    pending_[step] += flow.pending_[step];
+    ages_[step] = std::max(ages_[step], flow.no_progress_seconds_[step]);
+  }
+  if (flow.full_) {
+    const auto phase = static_cast<unsigned>(flow.phase_);
+    ++phases_[phase];
+    phase_seconds_[phase] = std::max(phase_seconds_[phase], flow.phase_seconds_);
+    full_seconds_ = std::max(full_seconds_, flow.full_seconds_);
+  }
+  if (flow.published_next_lsn_) published_ = flow.published_next_lsn_;
+  if (flow.side_ == ReplicationSide::kTarget) {
+    received_ = flow.received_next_lsn_;
+    applied_ = flow.applied_next_lsn_;
+    ack_ = flow.ack_next_lsn_;
+  }
+}
+
 namespace {
 std::string InfoText(std::string_view value) {
   std::string result;
@@ -144,7 +167,7 @@ void AppendReplicationProgressMetrics(
        "percentage.");
   type("fullsync_partitions_total", "counter",
        "Completed native FULL partition handoffs across attempts.");
-  for (const auto& total : view.totals_) {
+  auto emit_total = [&](const ReplicationProgressTotals& total) {
     const auto labels =
         absl::StrCat("{side=\"", ReplicationSideName(total.side_),
                      "\",worker=\"", total.worker_, "\"}");
@@ -154,6 +177,25 @@ void AppendReplicationProgressMetrics(
     if (total.side_ == ReplicationSide::kTarget)
       metric("applied_events_total", labels, total.applied_events_);
     metric("fullsync_partitions_total", labels, total.partitions_);
+  };
+  if (view.worker_count_ != 0) {
+    // Collection preserves side/worker order while dropping only all-zero
+    // rows. Reconstruct those rows here, preserving the exporter series set
+    // even before any relationship has existed or after it has retired.
+    auto next = view.totals_.begin();
+    for (unsigned side = 0; side != 2; ++side) {
+      for (unsigned worker = 0; worker != view.worker_count_; ++worker) {
+        const auto current_side = static_cast<ReplicationSide>(side);
+        if (next != view.totals_.end() && next->side_ == current_side &&
+            next->worker_ == worker) {
+          emit_total(*next++);
+        } else {
+          emit_total({.side_ = current_side, .worker_ = worker});
+        }
+      }
+    }
+  } else {
+    for (const auto& total : view.totals_) emit_total(total);
   }
   type("fullsync_results_total", "counter",
        "Terminal native FULL attempts; successful activation is counted once "
@@ -238,43 +280,16 @@ void AppendReplicationProgressMetrics(
        "recovery is required and not awaiting admission.");
   metric("loading_no_progress_seconds", "", view.loading_no_progress_seconds_);
 
-  // Source metrics collapse peers on the source worker. Independent sessions
-  // never become labels and their cursors are never added or subtracted here.
-  struct Aggregate {
-    unsigned connected_ = 0;
-    unsigned comparable_ = 0;
-    std::uint64_t pending_events_ = 0;
-    std::array<unsigned, 4> pending_{};
-    std::array<double, 4> ages_{};
-    std::array<unsigned, 8> phases_{};
-    std::array<double, 8> phase_seconds_{};
-    double full_seconds_ = 0;
-    std::optional<std::uint64_t> published_, received_, applied_, ack_;
-  };
-  std::map<std::tuple<ReplicationSide, unsigned, unsigned>, Aggregate> rows;
+  // Diagnostic snapshots remain renderable for tools/tests. HTTP collection
+  // already supplies numeric aggregates and needs no per-row map allocation.
+  std::map<std::tuple<ReplicationSide, unsigned, unsigned>,
+           ReplicationFlowMetrics> rows;
   for (const auto& flow : view.flows_) {
     auto& row = rows[{flow.side_, flow.worker_, flow.flow_}];
-    row.connected_ += flow.connected_;
-    row.comparable_ += flow.comparable_;
-    row.pending_events_ = std::max(row.pending_events_, flow.pending_events_);
-    for (unsigned step = 0; step != 4; ++step) {
-      row.pending_[step] += flow.pending_[step];
-      row.ages_[step] =
-          std::max(row.ages_[step], flow.no_progress_seconds_[step]);
-    }
-    if (flow.full_) {
-      const auto phase = static_cast<unsigned>(flow.phase_);
-      ++row.phases_[phase];
-      row.phase_seconds_[phase] =
-          std::max(row.phase_seconds_[phase], flow.phase_seconds_);
-      row.full_seconds_ = std::max(row.full_seconds_, flow.full_seconds_);
-    }
-    if (flow.published_next_lsn_) row.published_ = flow.published_next_lsn_;
-    if (flow.side_ == ReplicationSide::kTarget) {
-      row.received_ = flow.received_next_lsn_;
-      row.applied_ = flow.applied_next_lsn_;
-      row.ack_ = flow.ack_next_lsn_;
-    }
+    row.side_ = flow.side_;
+    row.worker_ = flow.worker_;
+    row.flow_ = flow.flow_;
+    row.Add(flow);
   }
   type("native_flow_connections", "gauge",
        "Active native connections per flow; source aggregates peers.");
@@ -300,11 +315,10 @@ void AppendReplicationProgressMetrics(
   type("fullsync_elapsed_seconds", "gauge",
        "Maximum current native FULL attempt duration; not a timeout or "
        "percentage.");
-  for (const auto& [key, row] : rows) {
-    const auto& [side, worker, flow] = key;
+  auto emit_flow = [&](const ReplicationFlowMetrics& row) {
     const auto prefix =
-        absl::StrCat("{side=\"", ReplicationSideName(side), "\",worker=\"",
-                     worker, "\",flow=\"", flow, "\"");
+        absl::StrCat("{side=\"", ReplicationSideName(row.side_), "\",worker=\"",
+                     row.worker_, "\",flow=\"", row.flow_, "\"");
     metric("native_flow_connections", prefix + "}", row.connected_);
     metric("comparable_flows", prefix + "}", row.comparable_);
     if (row.comparable_ != 0)
@@ -336,6 +350,8 @@ void AppendReplicationProgressMetrics(
     if (std::any_of(row.phases_.begin(), row.phases_.end(),
                     [](unsigned count) { return count != 0; }))
       metric("fullsync_elapsed_seconds", prefix + "}", row.full_seconds_);
-  }
+  };
+  for (const auto& row : view.metric_flows_) emit_flow(row);
+  for (const auto& [key, row] : rows) emit_flow(row);
 }
 }  // namespace lavik

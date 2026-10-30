@@ -38,6 +38,9 @@ enum class ReplicationFailure {
   kCount,
 };
 enum class FullSyncResult { kSuccess, kFailure, kCancelled };
+// Metrics retain numeric aggregates, while INFO also needs per-peer identities
+// and the most recent terminal diagnostic. Both use the same validated cut.
+enum class ReplicationObservationDetail { kInfo, kMetrics };
 inline constexpr std::size_t kReplicationFailureCount =
     static_cast<std::size_t>(ReplicationFailure::kCount);
 inline constexpr std::array<double, 9> kFullSyncDurationBounds{
@@ -100,6 +103,33 @@ struct ReplicationProgressTotals {
   std::uint64_t events_ = 0;
   std::uint64_t full_items_ = 0;
   std::uint64_t partitions_ = 0;
+
+  // True when this worker has never contributed to any progress counter.
+  bool empty() const noexcept {
+    return applied_events_ == 0 && bytes_ == 0 && events_ == 0 &&
+           full_items_ == 0 && partitions_ == 0;
+  }
+};
+
+// Numeric metric row for one side/worker/flow. Source peers merge here only
+// after their individual coordinates have been validated; identities and raw
+// peer cursors never enter the aggregate or become metric labels.
+struct ReplicationFlowMetrics {
+  ReplicationSide side_ = ReplicationSide::kTarget;
+  unsigned worker_ = 0;
+  unsigned flow_ = 0;
+  unsigned connected_ = 0;
+  unsigned comparable_ = 0;
+  std::uint64_t pending_events_ = 0;
+  std::array<unsigned, 4> pending_{};
+  std::array<double, 4> ages_{};
+  std::array<unsigned, 8> phases_{};
+  std::array<double, 8> phase_seconds_{};
+  double full_seconds_ = 0;
+  std::optional<std::uint64_t> published_, received_, applied_, ack_;
+
+  // Adds one validated observation with this row's side/worker/flow.
+  void Add(const ReplicationFlowObservation& flow);
 };
 
 struct FullSyncObservationTotals {
@@ -127,7 +157,14 @@ struct ReplicationObservabilitySnapshot {
   std::optional<bool> full_promotion_complete_;
   double loading_no_progress_seconds_ = 0;
   std::string failure_detail_;
+  // Metrics collect directly into metric_flows_; INFO retains flows_. Never
+  // populate both representations for one observation.
   std::vector<ReplicationFlowObservation> flows_;
+  std::vector<ReplicationFlowMetrics> metric_flows_;
+  // Metrics omit all-zero total rows in transit, retaining side/worker order.
+  // The renderer restores the full series set, so zero and missing remain
+  // distinct. A zero worker_count_ denotes the dense INFO representation.
+  unsigned worker_count_ = 0;
   std::vector<ReplicationProgressTotals> totals_;
   std::array<FullSyncObservationTotals, 2> full_totals_{};
   std::array<std::uint64_t, kReplicationFailureCount> retries_{};

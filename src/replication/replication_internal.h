@@ -2340,7 +2340,8 @@ class ReplicationManager::ReplicationGroup {
 
   Task<ReplicationStatus> status() const;
   Task<ReplicationObservabilitySnapshot> ObserveProgress(
-      bool sample = false, const std::atomic<bool>* serve_stale = nullptr);
+      bool sample = false, const std::atomic<bool>* serve_stale = nullptr,
+      ReplicationObservationDetail detail = ReplicationObservationDetail::kInfo);
   Task<absl::Status> MonitorProgress();
   void StartProgressMonitor();
 

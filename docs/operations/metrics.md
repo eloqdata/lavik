@@ -161,6 +161,12 @@ consistent applied frontier. A worker-zero sampler updates observation clocks
 and cumulative totals once per second. Collection batches all sessions and flows
 on each participating worker into one submission. Sampling skips output rows and
 INFO identity copies; HTTP and INFO still request fresh, validated snapshots.
+HTTP collection aggregates source peers directly into numeric flow rows and
+omits INFO identities and the last FULL diagnostic. It transfers only nonzero
+worker counter rows; the exporter restores omitted rows as zero, preserving the
+series set before replication starts and after sessions retire. INFO retains
+per-peer details. Retired sessions are collected only by the sampler, which
+records their final deltas and results before releasing them.
 The sampler does not control ACKs,
 timeouts, reconnects or authorization, and adds no clock read to each ONLINE
 event. A scrape validates relationship/history generation before exposing active

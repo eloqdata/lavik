@@ -452,7 +452,8 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   }
 
   if (replication != nullptr) {
-    const auto progress = co_await replication->ObserveProgress();
+    const auto progress = co_await replication->ObserveProgress(
+        ReplicationObservationDetail::kMetrics);
     AppendReplicationProgressMetrics(progress, &output);
   }
 
