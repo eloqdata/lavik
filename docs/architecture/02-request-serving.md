@@ -502,8 +502,9 @@ INFO and Prometheus project from the same owner-local counters. Snapshots carry
 observed command, context, and error identities rather than the entire fixed
 vocabulary. INFO omits histograms and collects only its requested command totals;
 Prometheus reconstructs the published zero-valued result series at rendering.
-The legacy dispatch counters and histogram preserve their original completion
-boundary.
+The legacy dispatch counters and histogram end when dispatch returns, including
+dispatch-time rejections and MULTI queue replies, and do not count EXEC/script
+children as separate calls.
 Reset retains exposed error-series identities and permits in-flight completions
 in the current worker epoch. See [metrics](../operations/metrics.md) for the
 external counting and timing contract.

@@ -1184,6 +1184,42 @@ TEST_F(CommandResultsE2eTest, SparseCollectionPreservesIdleAndResetSamples) {
   EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
 }
 
+TEST_F(CommandResultsE2eTest, OutcomeMetricFamiliesAreContiguous) {
+  auto check_groups = [&] {
+    constexpr std::array<std::string_view, 4> families{
+        "lavik_command_results_total", "lavik_command_execution_seconds_total",
+        "lavik_command_errors_total", "lavik_request_input_errors_total"};
+    std::array<unsigned, families.size()> groups{};
+    std::istringstream response(HttpGet(metrics_port_, "/metrics"));
+    std::string line, previous;
+    while (std::getline(response, line)) {
+      std::string_view text = line;
+      if (text.starts_with("# HELP ") || text.starts_with("# TYPE ")) {
+        text.remove_prefix(7);
+      } else if (text.empty() || text.starts_with('#')) {
+        continue;
+      }
+      const auto name = text.substr(0, text.find_first_of("{ \t\r"));
+      if (name == previous) continue;
+      for (std::size_t i = 0; i < families.size(); ++i)
+        if (name == families[i]) ++groups[i];
+      previous = name;
+    }
+    // A permissive Prometheus parser can ingest interleaved families. Check
+    // the wire-format grouping contract, including metadata, independently.
+    for (std::size_t i = 0; i < families.size(); ++i)
+      EXPECT_EQ(groups[i], 1) << families[i];
+  };
+  check_groups();
+  ASSERT_EQ(client_->Command({"SET", "grouping:key", "text"}), "+OK");
+  EXPECT_EQ(client_->Command({"GET", "grouping:key"}), "$4\r\ntext");
+  EXPECT_TRUE(client_->Command({"LPUSH", "grouping:key", "x"})
+                  .starts_with("-WRONGTYPE"));
+  check_groups();
+  ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
+  check_groups();
+}
+
 TEST_F(CommandResultsE2eTest, ManagementExecCountsItsChildren) {
   ASSERT_EQ(client_->Command({"MULTI"}), "+OK");
   ASSERT_EQ(client_->Command({"CONFIG", "REWRITE"}), "+QUEUED");

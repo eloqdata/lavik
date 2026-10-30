@@ -113,13 +113,15 @@ double g_counter_frequency = 1.0;
 
 struct CommandResultText {
   std::string labels_;
-  std::size_t zero_offset_ = 0;
+  std::size_t result_zero_offset_ = 0;
+  std::size_t execution_zero_offset_ = 0;
 };
 // Built before workers start and immutable afterwards. Preserve the published
 // zero-series contract without formatting thousands of unused counters on each
 // scrape. This is shared text, not a cache of mutable counter snapshots.
 std::vector<CommandResultText> g_command_result_text;
 std::string g_command_result_zeros;
+std::string g_command_execution_zeros;
 
 // The response owns only changing text. Literal/immutable views remain shared
 // until HTTP completion; no pointer into growing numeric scratch is retained.
@@ -162,12 +164,17 @@ void AppendMetricText(std::string* output, const Args&... args) {
 
 template <typename Output>
 void AppendResultValues(std::string_view labels,
-                        const CommandResultTotals& totals,
-                        double counter_frequency, Output* output) {
+                        const CommandResultTotals& totals, Output* output) {
   for (std::size_t result = 0; result < kCommandResultNames.size(); ++result)
     AppendMetricText(output, "lavik_command_results_total{", labels,
                      ",result=\"", kCommandResultNames[result], "\"} ",
                      totals.results_[result], "\n");
+}
+
+template <typename Output>
+void AppendExecutionTime(std::string_view labels,
+                         const CommandResultTotals& totals,
+                         double counter_frequency, Output* output) {
   AppendMetricText(
       output, "lavik_command_execution_seconds_total{", labels, "} ",
       static_cast<double>(totals.execution_ticks_) / counter_frequency, "\n");
@@ -307,14 +314,17 @@ void InitWorkerMetrics(unsigned worker_count) {
   g_command_result_text.clear();
   g_command_result_text.resize(contexts);
   g_command_result_zeros.clear();
+  g_command_execution_zeros.clear();
   for (std::size_t i = 0; i < contexts; ++i) {
     auto& text = g_command_result_text[i];
     text.labels_ = absl::StrCat(
         "command=\"", CommandResultName(i / kContextCount), "\",context=\"",
         kCommandContextNames[i % kContextCount], "\"");
-    text.zero_offset_ = g_command_result_zeros.size();
-    AppendResultValues(text.labels_, {}, g_counter_frequency,
-                       &g_command_result_zeros);
+    text.result_zero_offset_ = g_command_result_zeros.size();
+    text.execution_zero_offset_ = g_command_execution_zeros.size();
+    AppendResultValues(text.labels_, {}, &g_command_result_zeros);
+    AppendExecutionTime(text.labels_, {}, g_counter_frequency,
+                        &g_command_execution_zeros);
   }
   for (std::size_t i = 0; i < kCommandLatencyBucketUpperUs.size(); ++i) {
     const long double ticks =
@@ -937,18 +947,51 @@ void AppendStorageDiagnostics(
       diagnostics.expiration_pause_count_);
 }
 
+template <typename AppendActive>
+void AppendSparseResultFamily(const WorkerMetricsSnapshot& snapshot,
+                              std::string_view zeros,
+                              std::size_t CommandResultText::* zero_offset,
+                              AppendActive append_active, MetricText* output) {
+  // Keep each metric family contiguous while borrowing its zero runs between
+  // active identities. A sparse workload needs only a few shared pieces.
+  std::size_t next_zero = 0;
+  for (const auto& active : snapshot.commands_.results_) {
+    const auto& text = g_command_result_text[active.index_];
+    if (next_zero < active.index_) {
+      const auto begin = g_command_result_text[next_zero].*zero_offset;
+      output->append(zeros.substr(begin, text.*zero_offset - begin));
+    }
+    append_active(text.labels_, active.totals_);
+    next_zero = active.index_ + 1;
+  }
+  if (next_zero < g_command_result_text.size())
+    output->append(zeros.substr(g_command_result_text[next_zero].*zero_offset));
+}
+
 void AppendCommandResults(const WorkerMetricsSnapshot& snapshot,
                           MetricText* output) {
   AppendMetricText(output,
                    "# HELP lavik_command_results_total Logical client, EXEC, "
                    "and script command outcomes.\n"
-                   "# TYPE lavik_command_results_total counter\n"
-                   "# HELP lavik_command_errors_total Classified command "
-                   "errors, a projection of command results.\n"
-                   "# TYPE lavik_command_errors_total counter\n"
+                   "# TYPE lavik_command_results_total counter\n");
+  AppendSparseResultFamily(
+      snapshot, g_command_result_zeros, &CommandResultText::result_zero_offset_,
+      [output](std::string_view labels, const CommandResultTotals& totals) {
+        AppendResultValues(labels, totals, output);
+      },
+      output);
+  AppendMetricText(output,
                    "# HELP lavik_command_execution_seconds_total Time spent "
                    "executing logical commands.\n"
                    "# TYPE lavik_command_execution_seconds_total counter\n");
+  AppendSparseResultFamily(
+      snapshot, g_command_execution_zeros,
+      &CommandResultText::execution_zero_offset_,
+      [&](std::string_view labels, const CommandResultTotals& totals) {
+        AppendExecutionTime(labels, totals, snapshot.counter_frequency_,
+                            output);
+      },
+      output);
   AppendMetricText(output,
                    "# HELP lavik_request_input_errors_total Request input "
                    "failures before command dispatch.\n"
@@ -957,22 +1000,10 @@ void AppendCommandResults(const WorkerMetricsSnapshot& snapshot,
     AppendMetricText(output, "lavik_request_input_errors_total{reason=\"",
                      kRequestInputErrorNames[i], "\"} ",
                      snapshot.input_errors_[i], "\n");
-  // Borrow contiguous zero runs between active identities. No unused counter
-  // payload is copied, and a sparse workload needs only a few shared pieces.
-  const std::string_view zeros = g_command_result_zeros;
-  std::size_t next_zero = 0;
-  for (const auto& active : snapshot.commands_.results_) {
-    const auto& text = g_command_result_text[active.index_];
-    if (next_zero < active.index_) {
-      const auto begin = g_command_result_text[next_zero].zero_offset_;
-      output->append(zeros.substr(begin, text.zero_offset_ - begin));
-    }
-    AppendResultValues(text.labels_, active.totals_,
-                       snapshot.counter_frequency_, output);
-    next_zero = active.index_ + 1;
-  }
-  if (next_zero < g_command_result_text.size())
-    output->append(zeros.substr(g_command_result_text[next_zero].zero_offset_));
+  AppendMetricText(output,
+                   "# HELP lavik_command_errors_total Classified command "
+                   "errors, a projection of command results.\n"
+                   "# TYPE lavik_command_errors_total counter\n");
   for (const auto& error : snapshot.commands_.errors_) {
     const auto context = error.index_ / kErrorsPerContext;
     const auto result = error.index_ % kErrorsPerContext / kReasonCount;
