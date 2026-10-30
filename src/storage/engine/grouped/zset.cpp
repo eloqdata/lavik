@@ -298,18 +298,16 @@ struct RandomSelection {
   }
 };
 
-// Pages are score ordered, whereas SCAN cursors are digest prefixes. The first
-// pass keeps only COUNT integer prefixes (not members) to find the examination
-// boundary. The second pass emits that complete bucket and discovers the next
-// cursor. This preserves mutation-tolerant cursor semantics with two bounded
-// page scans, including MATCH misses and collisions at the COUNT boundary.
+// Keep only COUNT integer prefixes to find the examination boundary, then
+// emit whole collision buckets. Member-index scans apply this to one leaf;
+// score-ordered fallback scans apply it across all pages. Both preserve
+// mutation-tolerant digest cursors, including MATCH misses.
 struct ScanBoundary {
   MemoryReservation admission_;
   std::vector<std::uint64_t> prefixes_;
   std::size_t limit_ = 0;
-  absl::Status Prepare(const SortedSetOperation& operation,
-                       std::uint64_t cardinality) {
-    const auto limit = std::min(operation.scan_count_, cardinality);
+  absl::Status Prepare(std::uint64_t count, std::uint64_t cardinality) {
+    const auto limit = std::min(count, cardinality);
     if (limit > std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t))
       return absl::ResourceExhaustedError("Sorted Set scan count overflow");
     auto admission = TryReserveMemory(limit * sizeof(std::uint64_t));
@@ -353,12 +351,66 @@ struct ScanBoundary {
     return AppendOutput(std::move(*copy), result);
   }
   static void Sort(SortedSetResult* result) {
-    std::sort(result->members_.begin(), result->members_.end(),
-              [](const auto& left, const auto& right) {
-                const auto a = ScanCursorPrefix(ComputeDigest(left.member_));
-                const auto b = ScanCursorPrefix(ComputeDigest(right.member_));
-                return a < b || (a == b && left.member_ < right.member_);
+    auto& members = result->members_;
+    if (members.size() < 2) return;
+    const auto without_index = [&] {
+      std::sort(members.begin(), members.end(),
+                [](const auto& left, const auto& right) {
+                  const auto a = ScanCursorPrefix(ComputeDigest(left.member_));
+                  const auto b = ScanCursorPrefix(ComputeDigest(right.member_));
+                  return a < b || (a == b && left.member_ < right.member_);
+                });
+    };
+    struct ScanOrder {
+      std::uint64_t prefix_;
+      std::size_t source_;
+    };
+    // Digest computation is substantially more expensive than comparing two
+    // prefixes. Decorate only this reply, then discard the index before
+    // returning. Admission is optional: retain the allocation-free comparator
+    // when temporary memory is unavailable.
+    if (members.size() > SIZE_MAX / sizeof(ScanOrder) ||
+        members.size() > std::vector<ScanOrder>{}.max_size()) {
+      without_index();
+      return;
+    }
+    auto admission = TryReserveMemory(members.size() * sizeof(ScanOrder));
+    if (!admission) {
+      without_index();
+      return;
+    }
+    std::vector<ScanOrder> order;
+    order.reserve(members.size());
+    if (order.capacity() > admission->bytes() / sizeof(ScanOrder)) {
+      std::vector<ScanOrder>{}.swap(order);
+      without_index();
+      return;
+    }
+    for (std::size_t i = 0; i < members.size(); ++i)
+      order.push_back({ScanCursorPrefix(ComputeDigest(members[i].member_)), i});
+    std::sort(order.begin(), order.end(),
+              [&](const auto& left, const auto& right) {
+                return left.prefix_ < right.prefix_ ||
+                       (left.prefix_ == right.prefix_ &&
+                        members[left.source_].member_ <
+                            members[right.source_].member_);
               });
+    // Apply each permutation cycle in place. Member strings and their retained
+    // charges move together; no second member array or string copies are
+    // needed.
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      if (order[i].source_ == i) continue;
+      auto held = std::move(members[i]);
+      auto destination = i;
+      while (order[destination].source_ != i) {
+        const auto source = order[destination].source_;
+        members[destination] = std::move(members[source]);
+        order[destination].source_ = destination;
+        destination = source;
+      }
+      members[destination] = std::move(held);
+      order[destination].source_ = destination;
+    }
   }
 };
 
@@ -897,7 +949,7 @@ absl::StatusOr<CompactValueUpdate> ApplyCompactSortedSet(
   result.length_ = entries.size();
   if (operation.kind_ == SortedSetOperationKind::kScan) {
     ScanBoundary boundary;
-    auto prepared = boundary.Prepare(operation, entries.size());
+    auto prepared = boundary.Prepare(operation.scan_count_, entries.size());
     if (!prepared.ok()) return prepared;
     for (const auto& entry : entries)
       boundary.Observe(entry, operation.scan_cursor_);
@@ -1203,6 +1255,77 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
 }
 
 Task<absl::StatusOr<SortedSetResult>>
+StorageEngine::Impl::ScanGroupedSortedSetMembers(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object) {
+  SortedSetResult result;
+  result.key_exists_ = true;
+  result.length_ = object->ordered_directory().root().item_count_;
+  const auto& groups = object->directory().groups();
+  const auto* first = groups.Floor(operation.scan_cursor_);
+  if (!first)
+    co_return absl::DataLossError("Sorted Set scan has no member route");
+  auto route = groups.find(first->id_.prefix_);
+  auto remaining = operation.scan_count_;
+  while (route != groups.end() && remaining != 0) {
+    const auto id = route->second.id_;
+    ++route;
+    result.next_cursor_ = route != groups.end() ? route->first : 0;
+    // An old logical directory does not pin physical records across reads.
+    // Resolve the current allocation before scratch admission; the loader
+    // revalidates the same logical root after any suspension.
+    const auto current =
+        partition.grouped_objects_[db_id].CurrentForMutation(key);
+    if (!current || !current->SameLogicalRoot(*object) ||
+        current->version().db_epoch_ != object->version().db_epoch_ ||
+        current->version().replication_epoch_ !=
+            object->version().replication_epoch_ ||
+        current->version().index_generation_ !=
+            object->version().index_generation_)
+      co_return absl::NotFoundError("member-index scan population changed");
+    const auto* physical = current->FindGroup(id);
+    if (!physical) co_return absl::DataLossError("missing member scan page");
+    GroupedScratchBudget budget;
+    auto status = budget.AddGroup(*physical, current->ExtentsFor(id));
+    if (!status.ok()) co_return status;
+    auto admission = budget.Reserve(2);
+    if (!admission.ok()) co_return admission.status();
+    if (shutdown_flush_requested_)
+      co_return absl::CancelledError("member scan cancelled by shutdown");
+    auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                              digest, object, id);
+    if (!leaf.ok()) co_return leaf.status();
+    const auto bytes = leaf->loaded_.value();
+    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                   bytes.size());
+    ScanBoundary boundary;
+    status = boundary.Prepare(remaining, leaf->field_count_);
+    if (!status.ok()) co_return status;
+    status = VisitPersistedHashGroupFields(
+        payload, leaf->field_count_, [&](const HashEntryView& entry) {
+          boundary.Observe(OrderedCollectionEntryView{entry.field_},
+                           operation.scan_cursor_);
+          return absl::OkStatus();
+        });
+    if (!status.ok()) co_return status;
+    status = VisitPersistedHashGroupFields(
+        payload, leaf->field_count_, [&](const HashEntryView& entry) {
+          auto score = DecodeSortedSetMemberScore(entry.value_);
+          if (!score.ok()) return score.status();
+          return boundary.Emit(OrderedCollectionEntryView{entry.field_, *score},
+                               operation, &result);
+        });
+    if (!status.ok()) co_return status;
+    // MATCH misses count as examined entries. When COUNT lands on a digest
+    // collision, Emit includes the entire bucket and returns its successor.
+    remaining -= boundary.prefixes_.size();
+  }
+  ScanBoundary::Sort(&result);
+  co_return result;
+}
+
+Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1214,6 +1337,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
     co_return absl::DataLossError("invalid grouped Sorted Set view");
+  // Public ZSCAN cursors use the process digest seed, including compact
+  // values. A persisted member directory may have a different seed after
+  // cold recovery; keep the score-page fallback so recovered values and
+  // compact values share cursor ordering across promotion and demotion.
+  if (operation.kind_ == SortedSetOperationKind::kScan &&
+      object->directory().root().seed_ == CurrentDigestSeed())
+    co_return co_await ScanGroupedSortedSetMembers(
+        store, partition, db_id, key, digest, operation, std::move(object));
   auto input_admission = ReserveInputs(operation);
   if (!input_admission.ok()) co_return input_admission.status();
   Members members;
@@ -1556,7 +1687,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   }
   if (operation.kind_ == SortedSetOperationKind::kScan) {
     ScanBoundary boundary;
-    auto prepared = boundary.Prepare(operation, result.length_);
+    auto prepared = boundary.Prepare(operation.scan_count_, result.length_);
     if (!prepared.ok()) co_return prepared;
     for (std::size_t i = 0; i < metadata.size(); ++i) {
       auto page = co_await read_page(i, SortedSetPageReadMode::kFullDecode);

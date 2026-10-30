@@ -558,9 +558,12 @@ selected pages and routing metadata; binary-search probes retain at most one
 additional page at a time.
 Repeated input members and conditional updates are evaluated in request order
 before any physical write. Endpoint pops share the typed sparse mutation path across
-single-key, multi-key and blocking commands. ZSCAN uses two pagewise passes and
-a bounded digest-prefix selection heap, retaining whole collision buckets and
-the requested output rather than all members. GEO point reads (`GEOPOS`,
+single-key, multi-key and blocking commands. ZSCAN follows member-prefix routes
+when their persisted seed matches the process cursor seed. It retains one
+checked leaf, a bounded digest-prefix selection heap and owned output, including
+whole collision buckets. After recovery with a different seed it uses two
+score-page passes with the same bounded selection, preserving cursor ordering
+across compact and grouped representations. GEO point reads (`GEOPOS`,
 `GEOHASH`, `GEODIST`) share the member-score lookup; all requested scores are
 read under one key intent, including both endpoints of a distance query.
 Range removal selects members pagewise under an exclusive key intent and
