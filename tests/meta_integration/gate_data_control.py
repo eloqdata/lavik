@@ -231,11 +231,13 @@ class DataProcess:
             raise H.Failure("metrics endpoint did not return HTTP 200")
         return body.decode("utf-8", errors="strict")
 
-    def metric(self, name, labels=""):
+    def metric(self, name, labels="", *, default=None):
         prefix = f"{name}{labels} "
         for line in self.metrics().splitlines():
             if line.startswith(prefix):
                 return int(float(line[len(prefix) :]))
+        if default is not None:
+            return default
         raise H.Failure(f"metric {name}{labels} is missing")
 
     def wait_metric(self, name, predicate, desc, timeout=20, labels=""):
@@ -442,9 +444,24 @@ def assert_authority_challenge_denied(data, leader, minimum_fds=1, prior_denials
 
 
 def assert_keyed_write_fenced(data, label):
+    labels = '{command="set"}'
+    # Unobserved commands have no row. After the fenced SET, require a real
+    # sample so missing instrumentation cannot satisfy the increment check.
+    before = data.metric("lavik_command_rejected_calls_total", labels, default=0)
     reply = data.command_head(["SET", "{gate}key", "value"])
     if not (reply.startswith("-LOADING") or reply.startswith("-CLUSTERDOWN")):
         raise H.Failure(f"{label}: keyed write was not fenced: {reply}")
+    if data.metric("lavik_command_rejected_calls_total", labels) != before + 1:
+        raise H.Failure(f"{label}: fenced SET was not counted once as rejected")
+    reason = "LOADING" if reply.startswith("-LOADING") else "CLUSTERDOWN"
+    if (
+        data.metric(
+            "lavik_errors_total",
+            '{err="' + reason + '"}',
+        )
+        < 1
+    ):
+        raise H.Failure(f"{label}: fenced SET lost its typed reason")
 
 
 class TcpConnectBlackhole:

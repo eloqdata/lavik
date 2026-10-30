@@ -17,6 +17,7 @@
 #include <type_traits>
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/collection_compact_stream.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -94,7 +95,7 @@ absl::Status StorageEngine::Impl::PrepareFullSyncPinnedValueInsert(
   auto reservation = TryReserveMemory(budget);
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM full-sync source map admission");
+    return MemoryLimitError("OOM full-sync source map admission");
   }
   {
     map.reserve(map.size() + 1);
@@ -169,8 +170,7 @@ StorageEngine::Impl::NextFullSyncCollectionPage(
   auto reservation = TryReserveMemory(budget);
   if (!reservation) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "OOM full-sync collection page admission");
+    co_return MemoryLimitError("OOM full-sync collection page admission");
   }
   CollectionPage page{.value_type_ = stream->saved_.location_.value_type()};
   if (object->is_ordered()) {
@@ -267,8 +267,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncCollection(
   auto reservation = TryReserveMemory(budget);
   if (!reservation) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "OOM full-sync source metadata admission");
+    co_return MemoryLimitError("OOM full-sync source metadata admission");
   }
   std::shared_ptr<FullSyncCollection> stream;
   {

@@ -272,13 +272,15 @@ return and the recovery window; inspect each target's actual health.
 ## Coverage boundaries
 
 The Data and Meta rule sets observe their respective exported metrics; they do
-not prove Data serving authority. Command error ratios and latency attribution
-remain separate work under #391 and #396. Native replication progress and FULL
-population recovery are covered; Redis PSYNC keeps its existing diagnostics.
-Native snapshots unavailable for five minutes trigger the `LavikMetricsMissing`
-native_replication signal. Tx block counts, age and blocking reasons remain
-outside these diagnostics under #379. No node_exporter or centralized log platform is
-included. Monitoring does not participate in authorization or replication decisions.
+not prove Data serving authority. Command-error alert rules remain follow-up
+work; the Request Health dashboard uses command outcome metrics without adding
+such rules. Native replication progress and FULL population recovery are
+covered; Redis PSYNC keeps its existing diagnostics. Native snapshots
+unavailable for five minutes trigger the `LavikMetricsMissing`
+native_replication signal. Latency attribution remains separate work under
+#396. Tx block counts, age and blocking reasons remain outside these diagnostics
+under #379. No node_exporter or centralized log platform is included.
+Monitoring does not participate in authorization or replication decisions.
 
 ## Tx backlog
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # Copyright (C) 2026 EloqData Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Startup probes tolerate slow progress while retaining failure deadlines."""
+"""Startup probes and self-fence retries preserve readiness and accounting."""
 
+import io
 import json
 import subprocess
-from types import SimpleNamespace
 import unittest
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import gate_cluster_create as C
@@ -75,6 +77,36 @@ class ClusterStatusProbeTest(unittest.TestCase):
         with patch.object(C.subprocess, "run", return_value=reply):
             with self.assertRaisesRegex(C.H.Failure, "invalid TLS credentials"):
                 C.cluster_status(self.meta)
+
+
+class SelfFenceAccountingTest(unittest.TestCase):
+    def test_error_retry_observes_every_fence_but_not_the_final_moved(self):
+        moved = "MOVED 42 127.0.0.1:6380"
+        sockets = []
+        for reply in [C.TRANSIENT_SELF_FENCE, C.TRANSIENT_SELF_FENCE, moved]:
+            sock = Mock()
+            sock.makefile.return_value = io.BytesIO(f"-{reply}\r\n".encode())
+            sockets.append(nullcontext(sock))
+        fenced = Mock()
+        with (
+            patch.object(C, "redis_connection", side_effect=sockets),
+            patch.object(C.time, "sleep"),
+        ):
+            reply = C.redis_error(
+                SimpleNamespace(node_id="primary"),
+                ["GET", "other-owner"],
+                on_self_fence=fenced,
+            )
+        self.assertEqual(reply, moved)
+        self.assertEqual(fenced.call_count, 2)
+
+    def test_nonretryable_failure_is_not_counted_as_a_fence(self):
+        fenced = Mock()
+        operation = Mock(side_effect=C.H.Failure("connection failed"))
+        with self.assertRaisesRegex(C.H.Failure, "connection failed"):
+            C.retry_clusterdown("GET", operation, on_self_fence=fenced)
+        fenced.assert_not_called()
+        operation.assert_called_once()
 
 
 class LoadReadinessTest(unittest.TestCase):

@@ -35,6 +35,7 @@
 #include "blocking_wait.h"
 #include "cluster_gate.h"
 #include "lavik/cluster/runtime.h"
+#include "lavik/error_detail.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
@@ -141,35 +142,41 @@ absl::StatusOr<SortOptions> ParseSortOptions(const CommandRequest& request) {
     } else if (!read_only && EqualCi(args[i], "store") && i + 1 < args.size()) {
       options.store_arg_ = ++i;
     } else {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
   }
   return options;
 }
 
-std::string EncodeSortError(const absl::Status& status) {
+EncodedCommandReply EncodeSortError(const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
       status.message().starts_with("OOM ")) {
-    return EncodeError(status.message());
+    return EncodeCommandError(status.message(),
+                              CommandErrorReasonForStatus(status));
   }
   if (status.message().starts_with("WRONGTYPE ") ||
       status.message().starts_with("ERR ")) {
-    return EncodeError(status.message());
+    return EncodeCommandError(status.message(),
+                              CommandErrorReasonForStatus(status));
   }
-  return EncodeError(absl::StrCat("ERR ", status.message()));
+  return EncodeCommandError(absl::StrCat("ERR ", status.message()),
+                            CommandErrorReasonForStatus(status));
 }
 
 std::string_view AppendSortError(ReplyBuilder& builder,
                                  const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
       status.message().starts_with("OOM ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
   if (status.message().starts_with("WRONGTYPE ") ||
       status.message().starts_with("ERR ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
-  return builder.AppendError("ERR ", status.message());
+  return builder.AppendError(CommandErrorReasonForStatus(status), "ERR ",
+                             status.message());
 }
 
 const LockedKey* FindLockedKey(std::span<const LockedKey> keys,
@@ -201,13 +208,11 @@ Task<absl::Status> HoldSortLocks(void*, const tx::ShardSlice&) {
 absl::Status AdmitSortWorking(RetainedMemoryCharge* charge, std::size_t extra) {
   if (extra == 0) return absl::OkStatus();
   if (extra > std::numeric_limits<std::size_t>::max() - charge->bytes()) {
-    return absl::ResourceExhaustedError(
-        "OOM SORT working set exceeds maxmemory");
+    return MemoryLimitError("OOM SORT working set exceeds maxmemory");
   }
   auto admitted = TryReserveMemory(extra);
   if (!admitted) {
-    return absl::ResourceExhaustedError(
-        "OOM SORT working set exceeds maxmemory");
+    return MemoryLimitError("OOM SORT working set exceeds maxmemory");
   }
   if (charge->bytes() == 0) {
     charge->Adopt(&*admitted, extra);
@@ -249,8 +254,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       std::size_t vector_bytes = 0;
       if (!AddSetWorkingBytes(&vector_bytes, result->values_.size(),
                               sizeof(std::string))) {
-        co_return absl::ResourceExhaustedError(
-            "OOM SORT working set exceeds maxmemory");
+        co_return MemoryLimitError("OOM SORT working set exceeds maxmemory");
       }
       const auto vector_admitted =
           AdmitSortWorking(&source.vector_charge_, vector_bytes);
@@ -271,8 +275,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       source.elements_ = std::move(*members);
       co_return source;
     }
-    co_return absl::FailedPreconditionError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   };
   if (key.owner_ == ThisWorker().id_) co_return co_await read();
   co_return co_await SubmitTaskTo(key.owner_, read);
@@ -377,8 +380,7 @@ Task<absl::StatusOr<const std::string*>> LookupPatternValue(
          !AddSetWorkingBytes(&bytes, cache_key.second->capacity() + 1)) ||
         (value->has_value() &&
          !AddSetWorkingBytes(&bytes, (*value)->capacity() + 1))) {
-      co_return absl::ResourceExhaustedError(
-          "OOM SORT working set exceeds maxmemory");
+      co_return MemoryLimitError("OOM SORT working set exceeds maxmemory");
     }
     const auto admitted = AdmitSortWorking(charge, bytes);
     if (!admitted.ok()) co_return admitted;
@@ -424,8 +426,7 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
       !AddSetWorkingBytes(&working_bytes, size, sizeof(SortItem)) ||
       !AddSetWorkingBytes(&working_bytes, output_count,
                           sizeof(std::optional<std::string>))) {
-    co_return absl::ResourceExhaustedError(
-        "OOM SORT working set exceeds maxmemory");
+    co_return MemoryLimitError("OOM SORT working set exceeds maxmemory");
   }
   const auto admitted =
       AdmitSortWorking(&product.working_charge_, working_bytes);
@@ -768,7 +769,7 @@ bool SortReadsPatternKeys(const CommandRequest& request) {
                      [](auto p) { return p.contains('*'); });
 }
 
-Task<std::string> ExecuteSortCommandLocked(
+Task<EncodedCommandReply> ExecuteSortCommandLocked(
     const CommandRequest& request, std::span<const SortExecKey> exec_keys,
     std::vector<storage::TxShardWrites>& tx_writes,
     bool deterministic_set_order) {
@@ -792,7 +793,7 @@ Task<std::string> ExecuteSortCommandLocked(
   }
   const LockedKey* source_key = FindLockedKey(keys, request.args_[1]);
   if (source_key == nullptr)
-    co_return EncodeError("ERR SORT source is missing");
+    co_return EncodeCommandError("ERR SORT source is missing");
   auto source = co_await ReadSortSourceLocked(request.db_id_, *source_key);
   if (!source.ok()) co_return EncodeSortError(source.status());
   for (const std::string& pattern_key :
@@ -802,7 +803,7 @@ Task<std::string> ExecuteSortCommandLocked(
           request.exclusive_db_access_) {
         AddLockedKey(&keys, pattern_key, tx::LockMode::kShared);
       } else {
-        co_return EncodeError(
+        co_return EncodeCommandError(
             "ERR SORT BY/GET pattern keys are not supported inside MULTI");
       }
     }
@@ -813,13 +814,14 @@ Task<std::string> ExecuteSortCommandLocked(
   if (!options->store_arg_.has_value()) {
     ReplyBuilder builder(request.resp_version_);
     AppendSortArray(builder, product->reply_values_);
-    co_return std::string(builder.View());
+    co_return EncodedCommandReply{std::string(builder.View()),
+                                  builder.outcome()};
   }
 
   const std::string_view destination_name = request.args_[*options->store_arg_];
   const LockedKey* destination = FindLockedKey(keys, destination_name);
   if (destination == nullptr) {
-    co_return EncodeError("ERR SORT destination is missing");
+    co_return EncodeCommandError("ERR SORT destination is missing");
   }
   auto prior = co_await SubmitTaskTo(
       destination->owner_, [db = request.db_id_, name = destination->name_,

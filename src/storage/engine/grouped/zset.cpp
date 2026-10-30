@@ -23,6 +23,7 @@
 
 #include "../impl.h"
 #include "absl/container/inlined_vector.h"
+#include "lavik/error_detail.h"
 #include "lavik/glob.h"
 #include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped/scratch.h"
@@ -102,8 +103,7 @@ absl::StatusOr<SortedSetMember> MakeOutput(auto&& entry, bool prepaid = false) {
                            : TryReserveMemory(entry.value_.size() + 64);
   if (!prepaid && !admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set output member admission");
+    return MemoryLimitError("OOM Sorted Set output member admission");
   }
   SortedSetMember output;
   output.member_ = std::forward<decltype(entry)>(entry).value_;
@@ -129,8 +129,7 @@ absl::Status AppendOutput(SortedSetMember member, SortedSetResult* result,
                          : TryReserveMemory(capacity * sizeof(SortedSetMember));
     if (!prepaid && !admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set output vector admission");
+      return MemoryLimitError("OOM Sorted Set output vector admission");
     }
     output.reserve(capacity);
     if (prepaid)
@@ -185,8 +184,7 @@ absl::Status ReservePackedOutput(SortedSetResult* result,
                            : TryReserveMemory(allocation);
   if (!prepaid && !admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set packed output admission");
+    return MemoryLimitError("OOM Sorted Set packed output admission");
   }
   packed.members_.values_.reserve(*slots);
   packed.scores_.reserve(*scores);
@@ -194,8 +192,7 @@ absl::Status ReservePackedOutput(SortedSetResult* result,
   if (packed.members_.values_.capacity() > *slots ||
       packed.scores_.capacity() > *scores ||
       packed.members_.blocks_.capacity() > *blocks)
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set packed capacity exceeds admission");
+    return MemoryLimitError("OOM Sorted Set packed capacity exceeds admission");
   result->retained_charge_.Account(CurrentMemoryAccountingShard(),
                                    result->retained_charge_.bytes() + growth);
   return absl::OkStatus();
@@ -219,13 +216,12 @@ absl::Status AppendPackedCopy(std::string_view member, double score,
     auto admission = TryReserveMemory(capacity + 1);
     if (!admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set packed member admission");
+      return MemoryLimitError("OOM Sorted Set packed member admission");
     }
     std::string block;
     block.reserve(capacity);
     if (block.capacity() > capacity)
-      return absl::ResourceExhaustedError(
+      return MemoryLimitError(
           "OOM Sorted Set packed capacity exceeds admission");
     result->retained_charge_.Account(
         CurrentMemoryAccountingShard(),
@@ -269,8 +265,7 @@ struct RandomSelection {
     admission_ = TryReserveMemory(requested * 128);
     if (!admission_) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set random rank admission");
+      return MemoryLimitError("OOM Sorted Set random rank admission");
     }
     draws_.reserve(requested);
     if (count < 0) {
@@ -288,8 +283,7 @@ struct RandomSelection {
     auto output = TryReserveMemory(requested * sizeof(SortedSetMember));
     if (!output) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set random reply admission");
+      return MemoryLimitError("OOM Sorted Set random reply admission");
     }
     result->members_.resize(requested);
     result->retained_charge_.Adopt(
@@ -313,8 +307,7 @@ struct ScanBoundary {
     auto admission = TryReserveMemory(limit * sizeof(std::uint64_t));
     if (!admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set scan boundary admission");
+      return MemoryLimitError("OOM Sorted Set scan boundary admission");
     }
     admission_ = std::move(*admission);
     limit_ = limit;
@@ -559,7 +552,7 @@ absl::Status ReadIndexedRange(const IndexedOrderedReader& reader,
     auto admission = TryReserveMemory(capacity + 1);
     if (!admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM indexed Sorted Set reply");
+      return MemoryLimitError("OOM indexed Sorted Set reply");
     }
     auto& output = *result.packed_members_;
     const auto block = output.members_.blocks_.size();
@@ -567,7 +560,7 @@ absl::Status ReadIndexedRange(const IndexedOrderedReader& reader,
     // Reversing descriptors preserves the single copy of contiguous bytes.
     output.members_.blocks_.emplace_back(start, bytes);
     if (output.members_.blocks_.back().capacity() > capacity)
-      return absl::ResourceExhaustedError(
+      return MemoryLimitError(
           "OOM Sorted Set packed capacity exceeds admission");
     result.retained_charge_.Account(
         CurrentMemoryAccountingShard(),
@@ -720,7 +713,7 @@ absl::Status PrepareScoreReply(std::size_t count, SortedSetResult* result) {
       TryReserveMemory(count * 2 * sizeof(std::optional<double>));
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Sorted Set reply admission");
+    return MemoryLimitError("OOM Sorted Set reply admission");
   }
   result->scores_.resize(count);
   result->retained_charge_.Adopt(
@@ -1138,8 +1131,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     if (!readable.ok()) co_return readable.status();
   }
   if (exists && found->value_.value_type() != ValueType::kSortedSet)
-    co_return absl::InvalidArgumentError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   SortedSetResult result;
   result.key_exists_ = exists;
   result.length_ = exists ? MaterializeIndexLocation(*found).logical_size_ : 0;
@@ -1627,7 +1619,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto admission = TryReserveMemory(count * sizeof(std::string_view));
     if (!admission) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
+      co_return MemoryLimitError(
           "OOM Sorted Set selected removal input admission");
     }
     std::vector<std::string_view> removed;
@@ -1992,8 +1984,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           if (window.size() == 1 &&
               LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_READ_BATCH_START_KEY",
                                   key)) {
-            read_status = absl::ResourceExhaustedError(
-                "OOM grouped Sorted Set read batch admission");
+            read_status =
+                MemoryLimitError("OOM grouped Sorted Set read batch admission");
             break;
           }
           window.Add(read_page_impl.template operator()<Page>(

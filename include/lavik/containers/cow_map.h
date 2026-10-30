@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "absl/status/statusor.h"
+#include "lavik/error_detail.h"
 #include "lavik/local_shared_ptr.h"
 #include "lavik/memory.h"
 #include "lavik/retained_allocator.h"
@@ -320,8 +321,7 @@ class CowMap {
     auto reservation = TryReserveMemory(AllocationBytes<Overlay>());
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM copy-on-write map exceeds maxmemory");
+      return MemoryLimitError("OOM copy-on-write map exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),
@@ -337,8 +337,7 @@ class CowMap {
     auto reservation = TryReserveMemory(AllocationBytes<Node>());
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM copy-on-write map exceeds maxmemory");
+      return MemoryLimitError("OOM copy-on-write map exceeds maxmemory");
     }
     RetainedAllocationDomain domain{
         .owner_shard_ = CurrentMemoryAccountingShard(),

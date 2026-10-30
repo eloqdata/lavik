@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/grouped/sorted_rewrite.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
@@ -138,8 +139,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     if (!readable.ok()) co_return readable.status();
   }
   if (exists && found->value_.value_type() != value_type) {
-    co_return absl::InvalidArgumentError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   }
   const std::uint64_t observed_index_generation =
       store.index_generations_[db_id];
@@ -339,8 +339,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   LAVIK_FAULT_INJECT(if (unlocked_create) {
     if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_COLLECTION_CREATE_PREPARE_KEY", key)) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM preparing collection creation");
+      co_return MemoryLimitError("OOM preparing collection creation");
     }
   });
   LAVIK_FAULT_INJECT(if (unlocked_compact_write) {

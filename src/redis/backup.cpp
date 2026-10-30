@@ -757,7 +757,8 @@ Task<CommandReply> ExecuteRdbBackupCommand(
       request.kind_ == CommandKind::kBgSave && request.args_.size() == 2;
   if (request.args_.size() > 2 ||
       (schedule && !absl::EqualsIgnoreCase(request.args_[1], "SCHEDULE"))) {
-    co_return Reply(reply_builder.AppendError("ERR syntax error"));
+    co_return Reply(reply_builder.AppendError(CommandErrorReason::kSyntax,
+                                              "ERR syntax error"));
   }
   BackupRequestContext context = CaptureRequestContext(request);
   // SCHEDULE in Redis 7.2.14 applies to a non-RDB child (e.g. AOF rewrite),
@@ -791,6 +792,7 @@ Task<CommandReply> ExecuteRdbBackupCommand(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) {
         co_return Reply(reply_builder.AppendError(
+            CommandErrorReasonForStatus(yielded),
             absl::StrCat("ERR RDB cut failed: ", yielded.message())));
       }
     }
@@ -809,6 +811,7 @@ Task<CommandReply> ExecuteRdbBackupCommand(
       co_return Reply(reply_builder.AppendError(job->cut_error()));
     }
     co_return Reply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(status),
         absl::StrCat("ERR RDB save failed: ", status.message())));
   }
   co_return Reply(reply_builder.AppendSimpleString("OK"));

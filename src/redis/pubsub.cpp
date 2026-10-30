@@ -41,6 +41,7 @@
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/sync.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/error_detail.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
@@ -357,8 +358,7 @@ absl::StatusOr<LocalPubSubCapture> CaptureLocal(
   if ((exact_resp2 && !add_encoded_frame(0)) ||
       (exact_resp3 && !add_encoded_frame(0))) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM deferred Pub/Sub snapshot size overflow");
+    return MemoryLimitError("OOM deferred Pub/Sub snapshot size overflow");
   }
   for (const auto& [pattern, sessions] : registry.patterns_) {
     if (!RedisGlobMatch(pattern, channel)) continue;
@@ -378,8 +378,7 @@ absl::StatusOr<LocalPubSubCapture> CaptureLocal(
     if ((pattern_resp2 && !add_encoded_frame(pattern.size())) ||
         (pattern_resp3 && !add_encoded_frame(pattern.size()))) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM deferred Pub/Sub snapshot size overflow");
+      return MemoryLimitError("OOM deferred Pub/Sub snapshot size overflow");
     }
   }
   if (recipient_count == 0) return LocalPubSubCapture{};
@@ -389,14 +388,12 @@ absl::StatusOr<LocalPubSubCapture> CaptureLocal(
           recipient_count * sizeof(CapturedPubSubPublication::Recipient),
           &retained_bytes)) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM deferred Pub/Sub snapshot size overflow");
+    return MemoryLimitError("OOM deferred Pub/Sub snapshot size overflow");
   }
   auto reservation = TryReserveMemory(retained_bytes);
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM preparing deferred Pub/Sub snapshot");
+    return MemoryLimitError("OOM preparing deferred Pub/Sub snapshot");
   }
 
   LocalPubSubCapture capture;

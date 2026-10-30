@@ -28,6 +28,7 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/numeric/int128.h"
 #include "lavik/containers/cow_array.h"
+#include "lavik/error_detail.h"
 
 namespace lavik {
 
@@ -165,7 +166,7 @@ class FenwickTree {
         AllocatorUsableSizeForRequest(updates * sizeof(CountChange) + 1024));
     if (!admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM Fenwick update scratch");
+      return MemoryLimitError("OOM Fenwick update scratch");
     }
     rank_changes.reserve(updates);
     for (const auto& [index, delta] : count_changes) {

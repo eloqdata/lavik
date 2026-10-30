@@ -1061,13 +1061,15 @@ def redis_connection(data):
         raise
 
 
-def retry_clusterdown(description, operation, timeout=2.0):
+def retry_clusterdown(description, operation, timeout=2.0, *, on_self_fence=None):
     """Retry only the finite-lease self-fence admitted by this gate.
 
     Cluster READY can precede causal confirmation of the latest Grant. With
     the deliberately short process-test lease, Data may therefore reject one
     command while it reconnects for a fresh causal sequence. Every other
     transport or Redis error remains an immediate assertion failure.
+    The optional observer accounts for each rejected attempt separately from
+    the eventual reply when a caller verifies command counters.
     """
     deadline = time.monotonic() + timeout
     attempts = 0
@@ -1089,6 +1091,8 @@ def retry_clusterdown(description, operation, timeout=2.0):
                 raise
         if reply != TRANSIENT_SELF_FENCE:
             return reply
+        if on_self_fence is not None:
+            on_self_fence()
         last_reply = reply
     raise H.Failure(
         f"{description} remained self-fenced after {attempts} attempts: {last_reply}"
@@ -1105,7 +1109,7 @@ def redis_call(data, arguments):
     return retry_clusterdown(f"Redis {arguments[0]} on {data.node_id}", call_once)
 
 
-def redis_error(data, arguments):
+def redis_error(data, arguments, *, on_self_fence=None):
     def call_once():
         with redis_connection(data) as sock:
             sock.settimeout(3.0)
@@ -1117,7 +1121,11 @@ def redis_error(data, arguments):
                 )
             return line[1:-2].decode(errors="replace")
 
-    return retry_clusterdown(f"Redis {arguments[0]} error on {data.node_id}", call_once)
+    return retry_clusterdown(
+        f"Redis {arguments[0]} error on {data.node_id}",
+        call_once,
+        on_self_fence=on_self_fence,
+    )
 
 
 def readonly_get(data, key):
@@ -1204,13 +1212,54 @@ def assert_redis_topology_and_replication(nodes):
                     "population fenced and fell back to FULL"
                 )
 
-    moved = redis_error(by_id[PRIMARY_1], ["GET", keys["group-2"]])
+    primary = by_id[PRIMARY_1]
+    rejected_labels = '{command="get"}'
+    before_rejected = primary.metric(
+        "lavik_command_rejected_calls_total", rejected_labels
+    )
+    before_stats = redis_call(primary, ["INFO", "commandstats"])
+    fenced_attempts = 0
+
+    def count_self_fence():
+        nonlocal fenced_attempts
+        fenced_attempts += 1
+
+    moved = redis_error(
+        primary, ["GET", keys["group-2"]], on_self_fence=count_self_fence
+    )
     expected_endpoint = endpoint_tuple(by_id[PRIMARY_2])
     if (
         not moved.startswith(f"MOVED {redis_slot(keys['group-2'])} ")
         or f"{expected_endpoint[0]}:{expected_endpoint[1]}" not in moved
     ):
         raise H.Failure(f"wrong-primary request returned {moved!r}")
+    if (
+        primary.metric("lavik_command_rejected_calls_total", rejected_labels)
+        != before_rejected + fenced_attempts + 1
+    ):
+        raise H.Failure(
+            "MOVED and admission fences were not counted once as rejections"
+        )
+    if primary.metric("lavik_errors_total", '{err="MOVED"}') < 1:
+        raise H.Failure("MOVED error prefix is missing")
+
+    def get_stats(info):
+        line = next(
+            line for line in info.splitlines() if line.startswith("cmdstat_get:")
+        )
+        return dict(field.split("=", 1) for field in line.split(":", 1)[1].split(","))
+
+    before = get_stats(before_stats)
+    after = get_stats(redis_call(primary, ["INFO", "commandstats"]))
+    if (
+        after["calls"] != before["calls"]
+        or int(after["rejected_calls"])
+        != int(before["rejected_calls"]) + fenced_attempts + 1
+        or after["failed_calls"] != before["failed_calls"]
+    ):
+        raise H.Failure(
+            f"INFO redirected-command accounting mismatch: {before} -> {after}"
+        )
     crossslot = redis_error(
         by_id[PRIMARY_1], ["MGET", keys["group-1"], keys["group-2"]]
     )

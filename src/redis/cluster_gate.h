@@ -39,6 +39,7 @@
 #include "lavik/cluster/authority.h"
 #include "lavik/cluster/topology.h"
 #include "lavik/command.h"
+#include "lavik/command_outcome.h"
 #include "lavik/tx/transaction.h"
 
 namespace lavik {
@@ -112,12 +113,13 @@ CommandReply FinalizeClusterMutationReply(const CommandRequest& request,
 // Re-admits `slots` against the current cache and produces the standard wire
 // answer for a write that provably never executed. A serve decision here
 // means the authority flipped back between the failing check and this call;
-// the execution outcome is then genuinely undeterminable, so the connection
-// closes instead of inventing an answer.
-CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
-                                          bool connection_tls,
-                                          ReplyBuilder& reply_builder,
-                                          bool local_group = false);
+// connection closes instead of inventing an answer. The conservative close
+// records a failure unless the caller proves execution never began and passes
+// kRejected; absence of committed mutation alone is not that proof.
+CommandReply ClusterAuthorityChangedReply(
+    std::span<const std::uint16_t> slots, bool connection_tls,
+    ReplyBuilder& reply_builder, bool local_group = false,
+    CommandResult conservative_result = CommandResult::kFailed);
 
 // The status the transaction validator and the bare-hop re-checks use to
 // report a fenced admission; distinct enough that callers never confuse it

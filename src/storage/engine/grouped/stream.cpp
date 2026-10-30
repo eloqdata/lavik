@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -1351,8 +1352,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
               if (entries.size() == *access.read_new_count_)
                 return absl::OutOfRangeError("delivery window complete");
               auto charge = TryReserveMemory(512);
-              if (!charge)
-                return absl::ResourceExhaustedError("OOM Stream delivery IDs");
+              if (!charge) return MemoryLimitError("OOM Stream delivery IDs");
               cache.reservations_.push_back(std::move(*charge));
               std::string value(payload->substr(0, 16));
               value.append(12, '\0');
@@ -1419,9 +1419,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
               if (!payload.ok() || payload->size() < 20)
                 co_return absl::DataLossError("invalid history entry");
               auto charge = TryReserveMemory(512);
-              if (!charge)
-                co_return absl::ResourceExhaustedError(
-                    "OOM Stream history IDs");
+              if (!charge) co_return MemoryLimitError("OOM Stream history IDs");
               cache.reservations_.push_back(std::move(*charge));
               std::string value(payload->substr(0, 16));
               value.append(12, '\0');

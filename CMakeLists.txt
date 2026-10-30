@@ -1818,6 +1818,7 @@ if (BUILD_TESTING)
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
     tests/memory_test.cpp
+    tests/metrics_snapshot_test.cpp
     tests/meta_control_test.cpp
     tests/meta_client_test.cpp
     tests/node_control_test.cpp
@@ -2212,7 +2213,8 @@ endforeach()
       NAME lavik_metrics_e2e
       COMMAND lavik_metrics_e2e_test $<TARGET_FILE:lavik>
     )
-    set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 120)
+    # Cases start fresh servers; allow for startup variance on arm64 runners.
+    set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 240)
 
     add_executable(lavik_extent_recovery_e2e_test
       tests/extent_recovery_e2e_test.cpp

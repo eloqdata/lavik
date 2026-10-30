@@ -18,6 +18,7 @@
 #include <limits>
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/hash_read.h"
@@ -57,7 +58,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
   auto metadata = TryReserveMemory(4096 + requested * 256);
   if (!metadata) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM random sample metadata");
+    co_return MemoryLimitError("OOM random sample metadata");
   }
   std::vector<std::uint64_t> chosen;
   if (repeat) {

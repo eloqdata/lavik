@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 namespace {
@@ -61,8 +62,7 @@ absl::StatusOr<ExtentManifest> UnsharedGroupedExtents(
   auto reservation = TryReserveMemory(overhead + count * sizeof(ExtentRef));
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM grouped retirement manifest admission failed");
+    return MemoryLimitError("OOM grouped retirement manifest admission failed");
   }
   auto owner = std::make_shared<OwnedRetirementManifest>();
   owner->refs_.reserve(count);
@@ -100,8 +100,7 @@ StorageEngine::Impl::CollectGroupedRetirements(
   auto reservation = TryReserveMemory(owner_bytes + records * record_bytes);
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM grouped retirement batch admission failed");
+    return MemoryLimitError("OOM grouped retirement batch admission failed");
   }
   std::vector<RetiredExtentIdentity> replacement_extents;
   result.reserve(records);
@@ -214,7 +213,7 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
     auto reservation = TryReserveMemory(bytes);
     if (!reservation) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
+      co_return MemoryLimitError(
           "OOM grouped root dependency admission failed");
     }
     auto owner = std::make_shared<GroupedRetirementCharge>();
@@ -230,8 +229,7 @@ Task<absl::Status> StorageEngine::Impl::PrepinGroupedRetirementsLocked(
     auto reservation = TryReserveMemory(sizeof(GroupedRetirementPins) + 32);
     if (!reservation) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM group dependency guard admission failed");
+      co_return MemoryLimitError("OOM group dependency guard admission failed");
     }
     *pins = std::make_unique<GroupedRetirementPins>(this, &store);
     (*pins)->charge_.Adopt(&*reservation, sizeof(GroupedRetirementPins) + 32);

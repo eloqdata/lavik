@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "read_window.h"
 
@@ -61,7 +62,7 @@ absl::Status AppendPosition(std::uint64_t position, ListResult* result) {
     auto admission = TryReserveMemory(capacity * sizeof(std::int64_t));
     if (!admission) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError("OOM List position output");
+      return MemoryLimitError("OOM List position output");
     }
     output.reserve(capacity);
     result->retained_charge_.Adopt(&*admission,
@@ -451,8 +452,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
             if (window.size() == 1 &&
                 LAVIK_FAULT_MATCHES("LAVIK_FAIL_LIST_READ_BATCH_START_KEY",
                                     key)) {
-              read_status = absl::ResourceExhaustedError(
-                  "OOM grouped List read batch admission");
+              read_status =
+                  MemoryLimitError("OOM grouped List read batch admission");
               break;
             }
             const auto range = page_range(*ordinal);

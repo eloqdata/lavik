@@ -24,9 +24,11 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "bycorf/runtime/task.h"
 #include "lavik/command.h"
+#include "lavik/command_outcome.h"
 
 namespace lavik {
 
@@ -54,13 +56,39 @@ struct CommandMetricTotals {
       latency_bins_{};
 };
 
+// Separate from the legacy dispatch histogram: changing its counters would
+// silently change existing QPS and latency dashboards.
+struct CommandStatsTotals {
+  std::uint64_t calls_ = 0;
+  std::uint64_t failed_calls_ = 0;
+  std::uint64_t rejected_calls_ = 0;
+  std::uint64_t execution_ticks_ = 0;
+};
+
 struct StorageIoMetricTotals {
   std::uint64_t operations_ = 0;
   std::uint64_t bytes_ = 0;
 };
 
+// Sparse snapshots carry numeric identities; labels are resolved only by the
+// renderer. Entries are sorted and unique after cross-worker aggregation.
+template <typename Totals>
+struct CommandMetricEntry {
+  std::size_t index_ = 0;
+  Totals totals_{};
+};
+
+struct CommandMetricsSnapshot {
+  std::vector<CommandMetricEntry<CommandMetricTotals>> commands_;
+  // Global RESP prefixes and per-command counters have separate identities.
+  std::vector<CommandMetricEntry<std::uint64_t>> errors_;
+  std::vector<CommandMetricEntry<CommandStatsTotals>> stats_;
+  std::uint64_t total_calls_ = 0;
+};
+
 struct WorkerMetricsSnapshot {
-  std::array<CommandMetricTotals, kCommandKindCount> commands_{};
+  CommandMetricsSnapshot commands_;
+  std::array<std::uint64_t, kRequestInputErrorNames.size()> input_errors_{};
   std::uint64_t connections_ = 0;
   std::uint64_t connected_clients_ = 0;
   std::uint64_t blocked_clients_ = 0;
@@ -122,6 +150,20 @@ ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept;
 void InitWorkerMetrics(unsigned worker_count);
 void RecordCommandMetric(CommandKind kind,
                          std::uint64_t elapsed_ticks) noexcept;
+// Malformed/unadmitted request bytes have no logical command identity.
+void RecordRequestInputError(RequestInputError reason) noexcept;
+// Records a newly constructed error, including a caught script error.
+// Forwarding that same error through an outer script must not record it a
+// second time.
+void RecordCommandError(CommandErrorPrefix prefix,
+                        std::uint64_t count = 1) noexcept;
+// Records a terminal logical command on its coordinating worker and consumes
+// outcome.prefix_ as a newly constructed global error.
+// Forwarded/already-counted errors must leave prefix_ empty. Queueing and
+// cancellation add no completed call. Replication and background work must not
+// enter this client interface.
+void RecordCommandResult(std::size_t command, CommandOutcome outcome,
+                         std::uint64_t execution_ticks) noexcept;
 void RecordConnectionOpened() noexcept;
 void RecordConnectionClosed() noexcept;
 void RecordClientBlocked() noexcept;
@@ -155,11 +197,36 @@ enum class DefragMetricResult : std::uint8_t {
 void RecordDefragMetric(DefragMetricResult result) noexcept;
 void SetDefragActive(bool active) noexcept;
 void SetDefragPending(bool pending) noexcept;
-bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
+enum class CommandMetricsDetail {
+  kNone,
+  kTotalCalls,
+  kCommandStats,
+  kErrorStats,
+  kCommandAndErrorStats,
+  kFull
+};
+// Collect only the command data the caller consumes, on its owner. INFO never
+// copies latency histograms; full scrapes transport only observed entries.
+// INFO and Prometheus share the same Redis commandstats/errorstats counters.
+bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics(
+    CommandMetricsDetail detail = CommandMetricsDetail::kFull);
 // Clears Redis command counters on their owning workers. Live gauges and
 // dataset persistence accounting are deliberately preserved.
 bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
+// Completes a streamed logical command at producer EOF/error. Releasing an
+// unfinished source discards its observation. Production time excludes writes.
+// Create, invoke, and finally release the source on its coordinating worker:
+// completion updates only that worker's counters.
+ReplyChunkSource ObserveCommandReplySource(ReplyChunkSource source,
+                                           std::size_t command,
+                                           CommandOutcome outcome,
+                                           std::uint64_t execution_ticks);
+
+// Returns a fixed-vocabulary identity, resolving supported Redis subcommands.
+// Unknown names never become labels. Resolve before MULTI moves the request.
+std::size_t CommandResultId(const CommandRequest& request) noexcept;
+std::string_view CommandResultName(std::size_t command) noexcept;
 
 // Contiguous rendering adapter for callers that need an owned string. The HTTP
 // exporter uses the same renderer with borrowed static text and owned values.

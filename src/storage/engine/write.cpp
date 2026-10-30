@@ -21,6 +21,7 @@
 #include "flush_policy.h"
 #include "grouped/dependency_test_hook.h"
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/replication_command.h"
@@ -202,9 +203,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   SetResult result;
   if (options.return_old_value_ && exists) {
     if (found->value_.value_type() != ValueType::kString) {
-      co_return absl::Status(
-          absl::StatusCode::kInvalidArgument,
-          "WRONGTYPE Operation against a key holding the wrong kind of value");
+      co_return WrongTypeError();
     }
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      MaterializeIndexLocation(*found),
@@ -3272,7 +3271,7 @@ acquire_active_stream:
       index_memory_reservation = TryReserveMemory(allocation_bytes);
       if (!index_memory_reservation.has_value()) {
         RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
+        co_return MemoryLimitError(
             "OOM record index allocation exceeds this worker's maxmemory "
             "share");
       }

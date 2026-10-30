@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 
@@ -282,7 +283,7 @@ absl::StatusOr<ListResult> ReadIndexedList(std::string_view encoded,
       count * (sizeof(std::string) + sizeof(PackedValues::Slice) + 32));
   if (!admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM List indexed output");
+    return MemoryLimitError("OOM List indexed output");
   }
   std::size_t retained = 0;
   if (operation.kind_ == ListOperationKind::kRange &&
@@ -357,7 +358,7 @@ absl::StatusOr<ListResult> ReadPackedListRange(std::string_view encoded,
       TryReserveMemory(fixed + selected * sizeof(PackedValues::Slice));
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM List range output");
+    return MemoryLimitError("OOM List range output");
   }
   result.packed_values_ = std::make_unique<PackedValues>();
   auto& packed = *result.packed_values_;
@@ -563,8 +564,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (!metadata.ok()) co_return metadata.status();
   }
   if (exists && found->value_.value_type() != ValueType::kList) {
-    co_return absl::InvalidArgumentError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   }
   const bool read_only = IsReadOnly(operation);
   const std::uint64_t observed_index_generation =
@@ -686,8 +686,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   LAVIK_FAULT_INJECT(if (unlocked_create) {
     if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_COLLECTION_CREATE_PREPARE_KEY", key)) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM preparing collection creation");
+      co_return MemoryLimitError("OOM preparing collection creation");
     }
   });
   LAVIK_FAULT_INJECT(if (unlocked_compact_write) {

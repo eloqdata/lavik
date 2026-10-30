@@ -16,6 +16,7 @@
 
 #include "../impl.h"
 #include "dependency_guard.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 namespace {
@@ -161,7 +162,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
     {
       if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_HANDOFF_KEY", key)) {
         RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
+        co_return MemoryLimitError(
             "OOM completing grouped publication handoff");
       }
       PublishCommittedFullSyncEffects(&standalone);

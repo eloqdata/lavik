@@ -38,6 +38,7 @@
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "lavik/command_table.h"
+#include "lavik/error_detail.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
@@ -122,11 +123,14 @@ std::string_view AppendStorageError(ReplyBuilder& reply_builder,
                                     const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
       status.message().starts_with("OOM ")) {
-    return reply_builder.AppendError(status.message());
+    return reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                     status.message());
   }
   return status.message().starts_with("WRONGTYPE ")
-             ? reply_builder.AppendError(status.message())
-             : reply_builder.AppendError("ERR ", status.message());
+             ? reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                         status.message())
+             : reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                         "ERR ", status.message());
 }
 
 void AppendBulkArray(ReplyBuilder& builder,
@@ -142,7 +146,7 @@ Task<absl::Status> ListLockHoldCallback(void*, const tx::ShardSlice&) {
 absl::StatusOr<bool> ParseListLeft(std::string_view value) {
   if (CmpCaseInsensitive(value, "left")) return true;
   if (CmpCaseInsensitive(value, "right")) return false;
-  return absl::Status(absl::StatusCode::kInvalidArgument, "syntax error");
+  return SyntaxError("syntax error");
 }
 
 std::vector<std::string> EncodeListMoveEffects(
@@ -348,6 +352,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       op.count_ = 1;
       if (op.count_provided_ && !ParseNonNegative(args[2], &op.count_)) {
         co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kInvalidValue,
             "ERR value is out of range, must be positive"));
       }
       break;
@@ -358,6 +363,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       op.kind_ = storage::ListOperationKind::kIndex;
       if (!ParseInt64(args[2], &op.first_)) {
         co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kInvalidValue,
             "ERR value is not an integer or out of range"));
       }
       break;
@@ -370,6 +376,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       if (!ParseInt64(args[2], &op.first_) ||
           !ParseInt64(args[3], &op.second_)) {
         co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kInvalidValue,
             "ERR value is not an integer or out of range"));
       }
       break;
@@ -377,6 +384,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       op.kind_ = storage::ListOperationKind::kSet;
       if (!ParseInt64(args[2], &op.first_)) {
         co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kInvalidValue,
             "ERR value is not an integer or out of range"));
       }
       op.value_ = args[3];
@@ -387,7 +395,8 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       } else if (CmpCaseInsensitive(args[2], "after")) {
         op.kind_ = storage::ListOperationKind::kInsertAfter;
       } else {
-        co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kSyntax, "ERR syntax error"));
       }
       op.pivot_ = args[3];
       op.value_ = args[4];
@@ -396,6 +405,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
       op.kind_ = storage::ListOperationKind::kRemove;
       if (!ParseInt64(args[2], &op.first_)) {
         co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kInvalidValue,
             "ERR value is not an integer or out of range"));
       }
       op.value_ = args[3];
@@ -407,11 +417,13 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
         if (CmpCaseInsensitive(args[i], "rank")) {
           if (++i >= args.size() || !ParseInt64(args[i], &op.rank_)) {
             co_return BuiltReply(reply_builder.AppendError(
+                CommandErrorReason::kInvalidValue,
                 "ERR value is not an integer or out of range"));
           }
           if (op.rank_ == std::numeric_limits<std::int64_t>::min()) {
             co_return BuiltReply(
-                reply_builder.AppendError("ERR value is out of range"));
+                reply_builder.AppendError(CommandErrorReason::kInvalidValue,
+                                          "ERR value is out of range"));
           }
           if (op.rank_ == 0) {
             co_return BuiltReply(reply_builder.AppendError(
@@ -424,6 +436,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
           op.count_provided_ = true;
           if (++i >= args.size() || !ParseNonNegative(args[i], &op.count_)) {
             co_return BuiltReply(reply_builder.AppendError(
+                CommandErrorReason::kInvalidValue,
                 "ERR value is out of range, must be positive"));
           }
           ++i;
@@ -432,11 +445,13 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
           if (++i >= args.size() ||
               !ParseNonNegative(args[i], &op.max_length_)) {
             co_return BuiltReply(reply_builder.AppendError(
+                CommandErrorReason::kInvalidValue,
                 "ERR value is out of range, must be positive"));
           }
           ++i;
         } else {
-          co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kSyntax, "ERR syntax error"));
         }
       }
       break;
@@ -580,7 +595,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       auto source = ParseListLeft(args[3]);
       auto destination = ParseListLeft(args[4]);
       if (!source.ok() || !destination.ok()) {
-        co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kSyntax, "ERR syntax error"));
       }
       source_left = *source;
       destination_left = *destination;
@@ -593,19 +609,22 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     }
     const std::size_t count = static_cast<std::size_t>(numkeys);
     if (count > args.size() - 3) {
-      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kSyntax, "ERR syntax error"));
     }
     for (std::size_t i = 0; i < count; ++i) key_args.push_back(2 + i);
     const std::size_t direction_arg = 2 + count;
     auto direction = ParseListLeft(args[direction_arg]);
     if (!direction.ok()) {
-      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kSyntax, "ERR syntax error"));
     }
     pop_left = *direction;
     std::size_t next = direction_arg + 1;
     if (next < args.size()) {
       if (!CmpCaseInsensitive(args[next], "count") || next + 2 != args.size()) {
-        co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kSyntax, "ERR syntax error"));
       }
       std::int64_t parsed_count = 0;
       if (!ParseInt64(args[next + 1], &parsed_count) || parsed_count <= 0) {
@@ -639,8 +658,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       absl::Status waited = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
-        co_return BuiltReply(
-            reply_builder.AppendError("ERR ", waited.message()));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReasonForStatus(waited), "ERR ", waited.message()));
       }
     }
     snapshot_attempt.order_active_ = true;
@@ -648,8 +667,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       absl::Status waited = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
-        co_return BuiltReply(
-            reply_builder.AppendError("ERR ", waited.message()));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReasonForStatus(waited), "ERR ", waited.message()));
       }
     }
     snapshot_attempt.snapshot_active_ = true;
@@ -727,7 +746,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   }
   absl::Status status = co_await txn.Schedule();
   if (!status.ok()) {
-    co_return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
+    co_return BuiltReply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(status), "ERR ", status.message()));
   }
   status = co_await txn.Execute(&ListLockHoldCallback, nullptr, false);
   if (!status.ok()) {
@@ -738,7 +758,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       co_return ClusterValidatorFailureReply(
           txn, cluster_validator, request.connection_tls_, reply_builder);
     }
-    co_return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
+    co_return BuiltReply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(status), "ERR ", status.message()));
   }
 
   auto release = [&]() -> Task<absl::Status> {
@@ -772,8 +793,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       if (!popped->values_.empty()) {
         status = co_await release();
         if (!status.ok()) {
-          co_return BuiltReply(
-              reply_builder.AppendError("ERR ", status.message()));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReasonForStatus(status), "ERR ", status.message()));
         }
         replication.SetCommandArgs(
             EncodeListPopEffect(args[arg], pop_left, popped->values_.size()));
@@ -888,7 +909,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
   if (!released.ok()) {
-    co_return BuiltReply(reply_builder.AppendError("ERR ", released.message()));
+    co_return BuiltReply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(released), "ERR ", released.message()));
   }
   replication.SetCommandArgs(EncodeListMoveEffects(
       request.db_id_, source_key, destination_key, source_left,
@@ -916,10 +938,11 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
         extended_timeout * 1000.0L >
             static_cast<long double>(
                 std::numeric_limits<std::int64_t>::max())) {
-      co_return BuiltReply(
-          reply_builder.AppendError("ERR timeout is out of range"));
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kInvalidValue, "ERR timeout is out of range"));
     }
     co_return BuiltReply(reply_builder.AppendError(
+        CommandErrorReason::kInvalidValue,
         "ERR timeout is not a float or out of range"));
   }
   if (timeout_seconds < 0) {
@@ -958,8 +981,9 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
 
   auto wait_deadline = BlockingDeadlineFromSeconds(timeout_seconds);
   if (!wait_deadline.ok()) {
-    co_return BuiltReply(
-        reply_builder.AppendError("ERR ", wait_deadline.status().message()));
+    co_return BuiltReply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(wait_deadline.status()), "ERR ",
+        wait_deadline.status().message()));
   }
 
   auto finish_attempt = [&](const CommandReply& attempt) {
@@ -1012,14 +1036,16 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
   if (nonblocking.kind_ == CommandKind::kLMPop) {
     std::int64_t key_count = 0;
     if (!ParseRedisInt64(nonblocking.args_[1], &key_count) || key_count <= 0) {
-      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kSyntax, "ERR syntax error"));
     }
     // One argument is the command, one is numkeys, and at least one trailing
     // argument is the pop direction. Validate before reserve/indexing: BLMPOP
     // reaches this code before the nonblocking LMPOP parser runs.
     if (nonblocking.args_.size() < 3 ||
         static_cast<std::uint64_t>(key_count) > nonblocking.args_.size() - 3) {
-      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kSyntax, "ERR syntax error"));
     }
     specs.reserve(static_cast<std::size_t>(key_count));
     for (std::size_t i = 0; i < static_cast<std::size_t>(key_count); ++i) {
@@ -1053,15 +1079,20 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     }
     BlockingAttemptResult completed;
     completed.state_ = BlockingAttemptState::kComplete;
+    reply_builder.SetOutcome(attempt_builder.outcome());
     completed.reply_ = finish_attempt(result);
     co_return completed;
   };
   auto status_reply = [&](const absl::Status& status) {
     if (absl::IsAborted(status)) {
       return BuiltReply(
-          reply_builder.AppendError("TRYAGAIN ", status.message()));
+          reply_builder.AppendError(GetErrorDetail(status) == ErrorDetail::kNone
+                                        ? CommandErrorReason::kTryAgain
+                                        : CommandErrorReasonForStatus(status),
+                                    "TRYAGAIN ", status.message()));
     }
-    return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
+    return BuiltReply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(status), "ERR ", status.message()));
   };
   auto unblock_error_reply = [&] {
     return BuiltReply(reply_builder.AppendError(

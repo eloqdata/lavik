@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/fault_pause.h"
 
 namespace lavik::storage {
@@ -882,7 +883,9 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
         active_defrags_.load(std::memory_order_relaxed),
         pending_defrags_.load(std::memory_order_relaxed),
         active_extent_reclaims_.load(std::memory_order_relaxed));
-    auto exhausted = absl::ResourceExhaustedError("out of disk space");
+    auto exhausted =
+        WithErrorDetail(absl::ResourceExhaustedError("out of disk space"),
+                        ErrorDetail::kDiskSpace);
     exhausted.SetPayload(kDiskSpaceExhaustionTypeUrl, absl::Cord("foreground"));
     co_return exhausted;
   }

@@ -26,6 +26,8 @@
 
 namespace lavik {
 
+struct EncodedCommandReply;
+
 struct StringExecKey {
   storage::Digest digest_;
   std::uint16_t owner_ = 0;
@@ -53,14 +55,14 @@ bycorf::Task<CommandReply> ExecuteBitmapCommandLocked(
 bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
                                                ReplyBuilder& reply_builder);
 
-bycorf::Task<std::string> ExecuteBitOpLocked(
+bycorf::Task<EncodedCommandReply> ExecuteBitOpLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes);
 
 bycorf::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
                                              ReplyBuilder& reply_builder);
 
-bycorf::Task<std::string> ExecuteLcsLocked(
+bycorf::Task<EncodedCommandReply> ExecuteLcsLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys);
 
 }  // namespace lavik

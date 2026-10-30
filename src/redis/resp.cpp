@@ -552,6 +552,13 @@ void AppendUnsigned(std::string& output, std::uint64_t value) {
 }  // namespace
 
 void ReplyBuilder::Reset() {
+  execution_started_ = 0;
+  excluded_execution_ticks_ = 0;
+  ResetReply();
+}
+
+void ReplyBuilder::ResetReply() {
+  outcome_ = {};
   constexpr std::size_t kMaximumRetainedCapacity = 64 * 1024;
   if (buffer_.capacity() > kMaximumRetainedCapacity) {
     std::string{}.swap(buffer_);
@@ -688,12 +695,35 @@ std::string_view ReplyBuilder::AppendVerbatimString(std::string_view format,
   return buffer_;
 }
 
+EncodedCommandReply EncodeCommandRejection(std::string_view message,
+                                           CommandErrorReason reason) {
+  return {
+      EncodeError(message),
+      {CommandResult::kRejected, reason, CommandErrorPrefixForReply(message)}};
+}
+
+EncodedCommandReply EncodeCommandError(std::string_view message,
+                                       CommandErrorReason reason) {
+  return {
+      EncodeError(message),
+      {CommandResult::kFailed, reason, CommandErrorPrefixForReply(message)}};
+}
+
 std::string_view ReplyBuilder::AppendError(std::string_view message) {
-  return AppendError({}, message);
+  return AppendError(std::string_view{}, message);
+}
+
+std::string_view ReplyBuilder::AppendError(CommandErrorReason reason,
+                                           std::string_view message) {
+  const auto encoded = AppendError(std::string_view{}, message);
+  outcome_.reason_ = reason;
+  return encoded;
 }
 
 std::string_view ReplyBuilder::AppendError(std::string_view prefix,
                                            std::string_view message) {
+  outcome_ = {CommandResult::kFailed, CommandErrorReason::kClientError,
+              CommandErrorPrefixForReply(prefix.empty() ? message : prefix)};
   buffer_.push_back('-');
   buffer_.append(prefix);
   buffer_.append(message);
@@ -780,20 +810,24 @@ std::string ClusterTryAgainMessage(std::string_view message) {
 
 std::string_view AppendMovedError(ReplyBuilder& builder, std::uint16_t slot,
                                   std::string_view host, std::uint16_t port) {
-  return builder.AppendError(ClusterMovedMessage(slot, host, port));
+  return builder.AppendRejectedError(CommandErrorReason::kMoved,
+                                     ClusterMovedMessage(slot, host, port));
 }
 
 std::string_view AppendCrossSlotError(ReplyBuilder& builder) {
-  return builder.AppendError(kClusterCrossSlotMessage);
+  return builder.AppendRejectedError(CommandErrorReason::kClientError,
+                                     kClusterCrossSlotMessage);
 }
 
 std::string_view AppendClusterDownUnboundError(ReplyBuilder& builder) {
-  return builder.AppendError(kClusterDownUnboundMessage);
+  return builder.AppendRejectedError(CommandErrorReason::kClusterDown,
+                                     kClusterDownUnboundMessage);
 }
 
 std::string_view AppendTryAgainError(ReplyBuilder& builder,
                                      std::string_view message) {
-  return builder.AppendError(ClusterTryAgainMessage(message));
+  return builder.AppendRejectedError(CommandErrorReason::kTryAgain,
+                                     ClusterTryAgainMessage(message));
 }
 
 std::string_view EncodeScanReply(ReplyBuilder& builder, std::uint64_t cursor,

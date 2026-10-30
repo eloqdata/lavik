@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/hash_read.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
@@ -123,8 +124,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
             TryReserveMemory(AllocatorUsableSizeForRequest(key.size() + 1));
         if (!key_admission) {
           RecordMemoryRejection();
-          co_return absl::ResourceExhaustedError(
-              "OOM grouped parent key copy admission");
+          co_return MemoryLimitError("OOM grouped parent key copy admission");
         }
         owned_key.assign(key);
       }
@@ -277,17 +277,17 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
   if (packed) {
     if (directory.groups().size() >
         (SIZE_MAX - retained - sizeof(HashReadSnapshot)) / sizeof(std::string))
-      co_return absl::ResourceExhaustedError("OOM Hash output is too large");
+      co_return MemoryLimitError("OOM Hash output is too large");
     retained += sizeof(HashReadSnapshot) +
                 directory.groups().size() * sizeof(std::string);
   }
   if (count > (SIZE_MAX - retained) / (width * slot_bytes))
-    co_return absl::ResourceExhaustedError("OOM Hash output is too large");
+    co_return MemoryLimitError("OOM Hash output is too large");
   retained += count * width * slot_bytes;
   auto output = TryReserveMemory(retained);
   if (!output) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM Hash output retention");
+    co_return MemoryLimitError("OOM Hash output retention");
   }
   HashResult result;
   result.key_exists_ = true;
@@ -306,7 +306,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
                result.values_.capacity() * sizeof(result.values_[0]);
   }
   if (retained > output->bytes())
-    co_return absl::ResourceExhaustedError("OOM Hash output retention");
+    co_return MemoryLimitError("OOM Hash output retention");
   result.retained_charge_.Adopt(&*output, retained);
   auto read = [&](GroupedRecordId id, GroupReadLimiter* limiter = nullptr) {
     return LoadHashGroup<HashResult>(
@@ -359,7 +359,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
                 result.values_.begin() + selection.offset_ * width);
     }
     if (payload_bytes > SIZE_MAX - result.retained_charge_.bytes())
-      return absl::ResourceExhaustedError("OOM Hash output is too large");
+      return MemoryLimitError("OOM Hash output is too large");
     // Strings move without another payload allocation. Transfer their charge
     // before child ownership ends; the parent's slot storage was admitted up
     // front and each child's temporary slot array remains charged until join.
@@ -436,8 +436,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
         if (!ordinal) break;
         if (window.size() == 1 &&
             LAVIK_FAULT_MATCHES("LAVIK_FAIL_HASH_READ_BATCH_START_KEY", key)) {
-          start_status = absl::ResourceExhaustedError(
-              "OOM grouped Hash read batch admission");
+          start_status =
+              MemoryLimitError("OOM grouped Hash read batch admission");
           break;
         }
         window.Add(read(selected[*ordinal].id_, window.limiter()), *ordinal);

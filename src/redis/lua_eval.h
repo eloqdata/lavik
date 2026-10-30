@@ -27,6 +27,7 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/command_args.h"
+#include "lavik/command_outcome.h"
 #include "lavik/resp_version.h"
 
 namespace lavik {
@@ -64,9 +65,17 @@ struct LuaRedisCall {
   CommandArgsHandle args_;
 };
 
+struct LuaErrorCount {
+  CommandErrorPrefix prefix_;
+  std::uint64_t count_;
+};
+
 struct LuaExecutionStep {
   std::optional<LuaRedisCall> call_;
   std::string reply_;
+  CommandOutcome outcome_{};
+  // Newly constructed errors only; forwarded child errors were already counted.
+  std::vector<LuaErrorCount> errors_;
   bool scheduler_yield_ = false;
 };
 
@@ -107,7 +116,9 @@ class LuaExecution {
   LuaExecutionStep Start(bool replication_origin,
                          std::string_view script_name = "user_script",
                          CommandArgsView invocation_command = {});
-  LuaExecutionStep Resume(std::string_view command_reply);
+  // Preserve error provenance across redis.call/pcall and Lua error objects.
+  LuaExecutionStep Resume(std::string_view command_reply,
+                          bool error_already_counted = false);
   LuaExecutionStep ResumeAfterSchedulerYield();
   // Returns false if SCRIPT KILL won the race before this write started.
   bool MarkWriteCommand();

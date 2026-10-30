@@ -41,6 +41,7 @@
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "lavik/command_table.h"
+#include "lavik/error_detail.h"
 #include "lavik/glob.h"
 #include "lavik/memory.h"
 #include "lavik/redis_parse.h"
@@ -432,11 +433,14 @@ std::string_view StorageError(ReplyBuilder& builder,
                               const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
       status.message().starts_with("OOM ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
   return status.message().starts_with("WRONGTYPE ")
-             ? builder.AppendError(status.message())
-             : builder.AppendError("ERR " + std::string(status.message()));
+             ? builder.AppendError(CommandErrorReasonForStatus(status),
+                                   status.message())
+             : builder.AppendError(CommandErrorReasonForStatus(status),
+                                   "ERR " + std::string(status.message()));
 }
 
 Task<absl::Status> RunCompact(
@@ -509,7 +513,7 @@ absl::StatusOr<MultiPopShape> ParseMultiPopShape(
   MultiPopShape shape;
   if (request.kind_ == CommandKind::kBZPopMin ||
       request.kind_ == CommandKind::kBZPopMax) {
-    if (args.size() < 3) return absl::InvalidArgumentError("syntax error");
+    if (args.size() < 3) return SyntaxError("syntax error");
     shape.maximum_ = request.kind_ == CommandKind::kBZPopMax;
     shape.flat_reply_ = true;
     for (std::size_t i = 1; i + 1 < args.size(); ++i) {
@@ -528,7 +532,7 @@ absl::StatusOr<MultiPopShape> ParseMultiPopShape(
   const std::uint64_t key_count = static_cast<std::uint64_t>(parsed_keys);
   if (key_count > args.size() - std::min(first_key, args.size()) ||
       first_key + key_count >= args.size()) {
-    return absl::InvalidArgumentError("syntax error");
+    return SyntaxError("syntax error");
   }
   for (std::uint64_t i = 0; i < key_count; ++i) {
     shape.key_args_.push_back(first_key + static_cast<std::size_t>(i));
@@ -539,12 +543,12 @@ absl::StatusOr<MultiPopShape> ParseMultiPopShape(
   } else if (EqualCi(args[direction], "max")) {
     shape.maximum_ = true;
   } else {
-    return absl::InvalidArgumentError("syntax error");
+    return SyntaxError("syntax error");
   }
   const std::size_t trailing = args.size() - direction - 1;
   if (trailing != 0) {
     if (trailing != 2 || !EqualCi(args[direction + 1], "count")) {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
     std::int64_t parsed_count = 0;
     if (!ParseRedisInt64(args[direction + 2], &parsed_count) ||
@@ -665,7 +669,8 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
   auto parsed = ParseMultiPopShape(request);
   if (!parsed.ok()) {
     co_return Built(
-        builder.AppendError(absl::StrCat("ERR ", parsed.status().message())));
+        builder.AppendError(CommandErrorReasonForStatus(parsed.status()),
+                            absl::StrCat("ERR ", parsed.status().message())));
   }
   const MultiPopShape shape = std::move(*parsed);
   struct SnapshotAttemptGuard {
@@ -876,7 +881,7 @@ struct RangeOptions {
 absl::Status ParseRangeLimit(CommandArgsView args, std::size_t option,
                              RangeOptions* output) {
   if (option + 2 >= args.size()) {
-    return absl::InvalidArgumentError("syntax error");
+    return SyntaxError("syntax error");
   }
   if (!ParseInt(args[option + 1], &output->offset_) ||
       !ParseInt(args[option + 2], &output->count_)) {
@@ -959,7 +964,7 @@ absl::Status ValidateRangeSyntax(
         i += 3;
         continue;
       } else {
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       }
       ++i;
     }
@@ -987,13 +992,13 @@ absl::Status ValidateRangeSyntax(
         if (!parsed.ok()) return parsed;
         i += 3;
       } else {
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       }
     }
   } else if (request.kind_ == CommandKind::kZRevRange) {
     if (args.size() > 5 ||
         (args.size() == 5 && !EqualCi(args[4], "withscores"))) {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
     options.with_scores_ = args.size() == 5;
   }
@@ -1064,7 +1069,7 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
       return absl::InvalidArgumentError(
           "value is not an integer or out of range");
     if (args.size() == 4 && !EqualCi(args[3], "withscores"))
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     if (count == std::numeric_limits<std::int64_t>::min())
       return absl::InvalidArgumentError("value is out of range");
     const bool with_scores = args.size() == 4;
@@ -1087,13 +1092,13 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
                ParseInt(args[i + 1], &count) && count != 0)
         i += 2;
       else
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
     }
   } else if ((request.kind_ == CommandKind::kZRank ||
               request.kind_ == CommandKind::kZRevRank) &&
              (args.size() > 4 ||
               (args.size() == 4 && !EqualCi(args[3], "withscore")))) {
-    return absl::InvalidArgumentError("syntax error");
+    return SyntaxError("syntax error");
   } else if (request.kind_ == CommandKind::kGeoDist && args.size() == 5) {
     auto unit = UnitMeters(args[4]);
     if (!unit.ok()) return unit.status();
@@ -1110,7 +1115,8 @@ Task<CommandReply> ExecuteImpl(
   absl::Status syntax = ValidateZSetSyntax(request);
   if (!syntax.ok())
     co_return Built(
-        builder.AppendError(absl::StrCat("ERR ", syntax.message())));
+        builder.AppendError(CommandErrorReasonForStatus(syntax),
+                            absl::StrCat("ERR ", syntax.message())));
 
   if (request.kind_ == CommandKind::kZAdd ||
       request.kind_ == CommandKind::kZIncrBy ||
@@ -1151,7 +1157,8 @@ Task<CommandReply> ExecuteImpl(
     }
     const std::size_t tuple = request.kind_ == CommandKind::kGeoAdd ? 3 : 2;
     if (index >= a.size() || (a.size() - index) % tuple != 0) {
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     }
     if (request.kind_ == CommandKind::kZAdd && nx && xx) {
       co_return Built(builder.AppendError(
@@ -1168,14 +1175,16 @@ Task<CommandReply> ExecuteImpl(
           "ERR INCR option supports a single increment-element pair"));
     }
     if ((nx && xx) || (incr && (a.size() - index) != tuple)) {
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     }
     const auto input_count = (a.size() - index) / tuple;
     auto input_admission =
         TryReserveMemory(input_count * sizeof(storage::ScoredMemberView));
     if (!input_admission) {
       RecordMemoryRejection();
-      co_return Built(builder.AppendError("OOM Sorted Set input admission"));
+      co_return Built(builder.AppendError(CommandErrorReason::kOom,
+                                          "OOM Sorted Set input admission"));
     }
     // Inline point-command descriptors while keeping input admission unchanged.
     // Fill the owner before exposing its span; it survives the awaited call.
@@ -1197,7 +1206,8 @@ Task<CommandReply> ExecuteImpl(
       } else {
         if (!ParseRedisDouble(a[index], &score, true)) {
           co_return Built(
-              builder.AppendError("ERR value is not a valid float"));
+              builder.AppendError(CommandErrorReason::kInvalidValue,
+                                  "ERR value is not a valid float"));
         }
         member = a[index + 1];
       }
@@ -1340,7 +1350,8 @@ Task<CommandReply> ExecuteImpl(
         auto unit = UnitMeters(a[option + 2]);
         if (!ParseRedisDouble(a[option + 1], &radius) || radius < 0 ||
             !unit.ok())
-          co_return Built(builder.AppendError("ERR syntax error"));
+          co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                              "ERR syntax error"));
         unit_meters = *unit;
         radius_m = radius * unit_meters;
         shape_specified = true;
@@ -1353,7 +1364,8 @@ Task<CommandReply> ExecuteImpl(
         if (!ParseRedisDouble(a[option + 1], &width) ||
             !ParseRedisDouble(a[option + 2], &height) || width < 0 ||
             height < 0 || !unit.ok())
-          co_return Built(builder.AppendError("ERR syntax error"));
+          co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                              "ERR syntax error"));
         unit_meters = *unit;
         box_width_m = width * unit_meters;
         box_height_m = height * unit_meters;
@@ -1361,13 +1373,16 @@ Task<CommandReply> ExecuteImpl(
         shape_specified = true;
         option += 4;
       } else {
-        co_return Built(builder.AppendError("ERR syntax error"));
+        co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                            "ERR syntax error"));
       }
     }
     if (ascending && descending)
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     if (!center_specified || !shape_specified)
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     if (count_any && !count.has_value())
       co_return Built(
           builder.AppendError("ERR the ANY argument requires COUNT argument"));
@@ -1473,7 +1488,8 @@ Task<CommandReply> ExecuteImpl(
         TryReserveMemory((member_end - 2) * sizeof(std::string_view));
     if (!member_admission) {
       RecordMemoryRejection();
-      co_return Built(builder.AppendError("OOM Sorted Set input admission"));
+      co_return Built(builder.AppendError(CommandErrorReason::kOom,
+                                          "OOM Sorted Set input admission"));
     }
     absl::InlinedVector<std::string_view, 1> members;
     members.reserve(member_end - 2);
@@ -1564,14 +1580,16 @@ Task<CommandReply> ExecuteImpl(
                    operation.scan_count_ != 0) {
           i += 2;
         } else {
-          co_return Built(builder.AppendError("ERR syntax error"));
+          co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                              "ERR syntax error"));
         }
       }
     } else {
       std::int64_t count = 1;
       if (a.size() == 3 && (!ParseInt(a[2], &count) || count < 0))
         co_return Built(
-            builder.AppendError("ERR value is out of range, must be positive"));
+            builder.AppendError(CommandErrorReason::kInvalidValue,
+                                "ERR value is out of range, must be positive"));
       operation.kind_ = storage::SortedSetOperationKind::kPop;
       operation.reverse_ = request.kind_ == CommandKind::kZPopMax;
       operation.pop_count_ = count;
@@ -1710,7 +1728,7 @@ absl::StatusOr<std::optional<StoreShape>> ParseStoreShape(
   for (std::size_t i = begin; i < args.size(); ++i) {
     if (!EqualCi(args[i], "store") && !EqualCi(args[i], "storedist")) continue;
     if (result.has_value() || i + 1 >= args.size())
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     result = StoreShape{.destination_arg_ = i + 1,
                         .source_arg_ = 1,
                         .distance_scores_ = EqualCi(args[i], "storedist")};
@@ -1740,7 +1758,7 @@ absl::Status ComputeRangeStore(const CommandRequest& request,
       if (!parsed.ok()) return parsed;
       i += 3;
     } else {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
   }
   if (options.limit_ && options.mode_ == RangeOptions::Mode::kRank)
@@ -1881,7 +1899,7 @@ absl::StatusOr<GeoStoreQuery> ParseGeoStoreQuery(const CommandRequest& request,
       double radius = 0;
       auto unit = UnitMeters(args[i + 2]);
       if (!ParseRedisDouble(args[i + 1], &radius) || radius < 0 || !unit.ok())
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       query.unit_meters_ = *unit;
       query.radius_m_ = radius * *unit;
       area = true;
@@ -1892,7 +1910,7 @@ absl::StatusOr<GeoStoreQuery> ParseGeoStoreQuery(const CommandRequest& request,
       if (!ParseRedisDouble(args[i + 1], &width) ||
           !ParseRedisDouble(args[i + 2], &height) || width < 0 || height < 0 ||
           !unit.ok())
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       query.unit_meters_ = *unit;
       query.box_width_m_ = width * *unit;
       query.box_height_m_ = height * *unit;
@@ -1915,11 +1933,11 @@ absl::StatusOr<GeoStoreQuery> ParseGeoStoreQuery(const CommandRequest& request,
       query.descending_ = true;
       ++i;
     } else {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
   }
   if (!center || !area || (query.ascending_ && query.descending_))
-    return absl::InvalidArgumentError("syntax error");
+    return SyntaxError("syntax error");
   if (query.any_ && !query.count_)
     return absl::InvalidArgumentError(
         "the ANY argument requires COUNT argument");
@@ -1994,12 +2012,11 @@ absl::StatusOr<MemoryReservation> ReserveZSetScratch(std::size_t bytes,
   if (copies == 0 || bytes > limit - 4096 ||
       count > (limit - bytes - 4096) / 512 ||
       bytes + 4096 + count * 512 > limit / copies)
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set aggregate size overflow");
+    return MemoryLimitError("OOM Sorted Set aggregate size overflow");
   auto admission = TryReserveMemory((bytes + 4096 + count * 512) * copies);
   if (!admission) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM Sorted Set aggregate admission");
+    return MemoryLimitError("OOM Sorted Set aggregate admission");
   }
   return std::move(*admission);
 }
@@ -2007,12 +2024,11 @@ absl::StatusOr<MemoryReservation> ReserveZSetScratch(std::size_t bytes,
 absl::StatusOr<std::size_t> ZSetRetainedBytes(const ZSet& value) {
   constexpr auto limit = std::numeric_limits<std::size_t>::max();
   if (value.capacity() > limit / sizeof(Element))
-    return absl::ResourceExhaustedError("OOM Sorted Set vector size overflow");
+    return MemoryLimitError("OOM Sorted Set vector size overflow");
   std::size_t bytes = value.capacity() * sizeof(Element);
   for (const auto& element : value) {
     if (element.member_.capacity() >= limit - bytes)
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set string size overflow");
+      return MemoryLimitError("OOM Sorted Set string size overflow");
     bytes += element.member_.capacity() + 1;
   }
   return bytes;
@@ -2051,7 +2067,7 @@ absl::Status PrepareMultiContext(MultiContext* context, std::size_t arguments) {
   if (arguments > limit / slot_bytes ||
       workers >
           (limit - arguments * slot_bytes) / sizeof(storage::TxShardWrites))
-    return absl::ResourceExhaustedError("OOM Sorted Set context size overflow");
+    return MemoryLimitError("OOM Sorted Set context size overflow");
   auto admission = ReserveZSetScratch(
       arguments * slot_bytes + workers * sizeof(storage::TxShardWrites), 0, 2);
   if (!admission.ok()) return admission.status();
@@ -2210,8 +2226,7 @@ absl::Status ComputeMulti(MultiContext* context) {
     const auto retained = ZSetRetainedBytes(input);
     if (!retained.ok()) return retained.status();
     if (*retained > limit - bytes || input.size() > limit - count)
-      return absl::ResourceExhaustedError(
-          "OOM Sorted Set aggregate size overflow");
+      return MemoryLimitError("OOM Sorted Set aggregate size overflow");
     bytes += *retained;
     count += input.size();
   }
@@ -2255,12 +2270,10 @@ absl::Status ComputeMulti(MultiContext* context) {
     return true;
   };
   if (!add_strings(context->replacement_args_))
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set replication size overflow");
+    return MemoryLimitError("OOM Sorted Set replication size overflow");
   // Captured effects account their own argument and vector allocations.
   if (admission->bytes() && *retained > admission->bytes())
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set output exceeds admission");
+    return MemoryLimitError("OOM Sorted Set output exceeds admission");
   context->output_charge_.Adopt(&*admission, *retained);
   cleanup.published_ = true;
   return absl::OkStatus();
@@ -2317,8 +2330,7 @@ absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
   const auto retained = ZSetRetainedBytes(*decoded);
   if (!retained.ok()) return retained.status();
   if (admission->bytes() && *retained > admission->bytes())
-    return absl::ResourceExhaustedError(
-        "OOM Sorted Set input exceeds admission");
+    return MemoryLimitError("OOM Sorted Set input exceeds admission");
   *input = std::move(*decoded);
   charge->decoded_.Adopt(&*admission, *retained);
   return absl::OkStatus();
@@ -2352,7 +2364,7 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
       co_return absl::InternalError("Set aggregate source has missing member");
     if (member->capacity() >=
         std::numeric_limits<std::size_t>::max() - string_bytes)
-      co_return absl::ResourceExhaustedError("OOM Set aggregate size overflow");
+      co_return MemoryLimitError("OOM Set aggregate size overflow");
     string_bytes += member->capacity() + 1;
   }
   const bool transfer = members->retained_charge_.bytes() >= string_bytes;
@@ -2502,12 +2514,11 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
       if (!item) continue;
       if (item->capacity() >=
           std::numeric_limits<std::size_t>::max() - retained)
-        return absl::ResourceExhaustedError(
-            "OOM Sorted Set random snapshot size overflow");
+        return MemoryLimitError("OOM Sorted Set random snapshot size overflow");
       retained += item->capacity() + 1;
     }
     if (admission->bytes() && retained > admission->bytes())
-      return absl::ResourceExhaustedError(
+      return MemoryLimitError(
           "OOM Sorted Set random snapshot exceeds admission");
     result.retained_charge_.Adopt(&*admission, retained);
     return NoChange();
@@ -2554,6 +2565,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   auto parsed_store = ParseStoreShape(request);
   if (!parsed_store.ok())
     co_return Built(builder.AppendError(
+        CommandErrorReasonForStatus(parsed_store.status()),
         absl::StrCat("ERR ", parsed_store.status().message())));
   if ((request.kind_ == CommandKind::kGeoRadius ||
        request.kind_ == CommandKind::kGeoRadiusByMember) &&
@@ -2571,19 +2583,22 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     absl::Status syntax = ComputeRangeStore(request, ZSet{}, &ignored);
     if (!syntax.ok())
       co_return Built(
-          builder.AppendError(absl::StrCat("ERR ", syntax.message())));
+          builder.AppendError(CommandErrorReasonForStatus(syntax),
+                              absl::StrCat("ERR ", syntax.message())));
   } else if (request.kind_ == CommandKind::kGeoSearchStore ||
              request.kind_ == CommandKind::kGeoRadius ||
              request.kind_ == CommandKind::kGeoRadiusByMember) {
     auto syntax = ParseGeoStoreQuery(request, **parsed_store);
     if (!syntax.ok())
       co_return Built(
-          builder.AppendError(absl::StrCat("ERR ", syntax.status().message())));
+          builder.AppendError(CommandErrorReasonForStatus(syntax.status()),
+                              absl::StrCat("ERR ", syntax.status().message())));
   }
   auto keys = DetermineKeys(*request.spec_, args);
   if (!keys.ok())
     co_return Built(
-        builder.AppendError(absl::StrCat("ERR ", keys.status().message())));
+        builder.AppendError(CommandErrorReasonForStatus(keys.status()),
+                            absl::StrCat("ERR ", keys.status().message())));
 
   MultiContext context;
   context.request_ = &request;
@@ -2653,7 +2668,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
       else if (EqualCi(args[i + 1], "max"))
         context.score_aggregate_ = ScoreAggregate::kMax;
       else
-        co_return Built(builder.AppendError("ERR syntax error"));
+        co_return Built(builder.AppendError(CommandErrorReason::kSyntax,
+                                            "ERR syntax error"));
       i += 2;
     } else if (request.kind_ == CommandKind::kZInterCard &&
                EqualCi(args[i], "limit") && i + 1 < args.size()) {
@@ -2667,7 +2683,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
       limit = static_cast<std::uint64_t>(parsed_limit);
       i += 2;
     } else {
-      co_return Built(builder.AppendError("ERR syntax error"));
+      co_return Built(
+          builder.AppendError(CommandErrorReason::kSyntax, "ERR syntax error"));
     }
   }
 
@@ -2775,20 +2792,26 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   co_return Built(builder.View());
 }
 
-Task<std::string> ExecuteZSetMultiKeyLocked(
+Task<EncodedCommandReply> ExecuteZSetMultiKeyLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
   ReplyBuilder builder(request.resp_version_);
   const auto& args = request.args_;
   auto parsed_store = ParseStoreShape(request);
   if (!parsed_store.ok()) {
-    co_return std::string(builder.AppendError(
-        absl::StrCat("ERR ", parsed_store.status().message())));
+    co_return EncodedCommandReply{
+        std::string(builder.AppendError(
+            CommandErrorReasonForStatus(parsed_store.status()),
+            absl::StrCat("ERR ", parsed_store.status().message()))),
+        builder.outcome()};
   }
   auto keys = DetermineKeys(*request.spec_, args);
   if (!keys.ok()) {
-    co_return std::string(
-        builder.AppendError(absl::StrCat("ERR ", keys.status().message())));
+    co_return EncodedCommandReply{
+        std::string(
+            builder.AppendError(CommandErrorReasonForStatus(keys.status()),
+                                absl::StrCat("ERR ", keys.status().message()))),
+        builder.outcome()};
   }
 
   auto find_key = [&](std::size_t argument) -> const ZSetExecKey* {
@@ -2802,25 +2825,33 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       !parsed_store->has_value()) {
     const ZSetExecKey* source = find_key(1);
     if (!source)
-      co_return std::string(
-          builder.AppendError("ERR GEO source key is missing"));
+      co_return EncodedCommandReply{
+          std::string(builder.AppendError("ERR GEO source key is missing")),
+          builder.outcome()};
     CommandReply reply = co_await ExecuteZSetCommandLocked(
         request, source->digest_, &tx_writes[source->owner_], builder);
-    co_return std::string(reply.encoded_);
+    co_return EncodedCommandReply{std::string(reply.encoded_),
+                                  builder.outcome()};
   }
   if (request.kind_ == CommandKind::kZRangeStore) {
     ZSet ignored;
     absl::Status syntax = ComputeRangeStore(request, ZSet{}, &ignored);
     if (!syntax.ok())
-      co_return std::string(
-          builder.AppendError(absl::StrCat("ERR ", syntax.message())));
+      co_return EncodedCommandReply{
+          std::string(
+              builder.AppendError(CommandErrorReasonForStatus(syntax),
+                                  absl::StrCat("ERR ", syntax.message()))),
+          builder.outcome()};
   } else if (request.kind_ == CommandKind::kGeoSearchStore ||
              request.kind_ == CommandKind::kGeoRadius ||
              request.kind_ == CommandKind::kGeoRadiusByMember) {
     auto syntax = ParseGeoStoreQuery(request, **parsed_store);
     if (!syntax.ok())
-      co_return std::string(
-          builder.AppendError(absl::StrCat("ERR ", syntax.status().message())));
+      co_return EncodedCommandReply{
+          std::string(builder.AppendError(
+              CommandErrorReasonForStatus(syntax.status()),
+              absl::StrCat("ERR ", syntax.status().message()))),
+          builder.outcome()};
   }
 
   MultiContext context;
@@ -2828,7 +2859,9 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
   context.borrowed_tx_ = true;
   const auto prepared_context = PrepareMultiContext(&context, args.size());
   if (!prepared_context.ok())
-    co_return std::string(StorageError(builder, prepared_context));
+    co_return EncodedCommandReply{
+        std::string(StorageError(builder, prepared_context)),
+        builder.outcome()};
   context.store_shape_ = std::move(*parsed_store);
   const bool aggregate_store = request.kind_ == CommandKind::kZDiffStore ||
                                request.kind_ == CommandKind::kZInterStore ||
@@ -2880,8 +2913,9 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                i + key_count < args.size()) {
       for (std::size_t w = 0; w < key_count; ++w) {
         if (!ParseRedisDouble(args[i + 1 + w], &context.weights_[w], true)) {
-          co_return std::string(
-              builder.AppendError("ERR weight value is not a float"));
+          co_return EncodedCommandReply{std::string(builder.AppendError(
+                                            "ERR weight value is not a float")),
+                                        builder.outcome()};
         }
       }
       i += 1 + key_count;
@@ -2895,23 +2929,31 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       else if (EqualCi(args[i + 1], "max"))
         context.score_aggregate_ = ScoreAggregate::kMax;
       else
-        co_return std::string(builder.AppendError("ERR syntax error"));
+        co_return EncodedCommandReply{
+            std::string(builder.AppendError(CommandErrorReason::kSyntax,
+                                            "ERR syntax error")),
+            builder.outcome()};
       i += 2;
     } else if (request.kind_ == CommandKind::kZInterCard &&
                EqualCi(args[i], "limit") && i + 1 < args.size()) {
       std::int64_t parsed_limit = 0;
       if (!ParseInt(args[i + 1], &parsed_limit)) {
-        co_return std::string(
-            builder.AppendError("ERR LIMIT can't be negative"));
+        co_return EncodedCommandReply{
+            std::string(builder.AppendError("ERR LIMIT can't be negative")),
+            builder.outcome()};
       }
       if (parsed_limit < 0) {
-        co_return std::string(
-            builder.AppendError("ERR LIMIT can't be negative"));
+        co_return EncodedCommandReply{
+            std::string(builder.AppendError("ERR LIMIT can't be negative")),
+            builder.outcome()};
       }
       limit = static_cast<std::uint64_t>(parsed_limit);
       i += 2;
     } else {
-      co_return std::string(builder.AppendError("ERR syntax error"));
+      co_return EncodedCommandReply{
+          std::string(builder.AppendError(CommandErrorReason::kSyntax,
+                                          "ERR syntax error")),
+          builder.outcome()};
     }
   }
 
@@ -2919,8 +2961,10 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
        argument <= context.last_source_; ++argument) {
     const ZSetExecKey* key = find_key(argument);
     if (key == nullptr) {
-      co_return std::string(
-          builder.AppendError("ERR Sorted Set source key is missing"));
+      co_return EncodedCommandReply{
+          std::string(
+              builder.AppendError("ERR Sorted Set source key is missing")),
+          builder.outcome()};
     }
     auto read = [&]() -> Task<absl::Status> {
       const bool zset_only = request.kind_ == CommandKind::kZRangeStore ||
@@ -2948,21 +2992,27 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       status = co_await bycorf::SubmitTaskTo(key->owner_, read);
     }
     if (!status.ok()) {
-      co_return std::string(StorageError(builder, status));
+      co_return EncodedCommandReply{std::string(StorageError(builder, status)),
+                                    builder.outcome()};
     }
   }
 
   absl::Status computed = ComputeMulti(&context);
-  if (!computed.ok()) co_return std::string(StorageError(builder, computed));
+  if (!computed.ok())
+    co_return EncodedCommandReply{std::string(StorageError(builder, computed)),
+                                  builder.outcome()};
   if (context.store_) {
     const auto capture_ready = PrepareMultiCapture(context);
     if (!capture_ready.ok())
-      co_return std::string(StorageError(builder, capture_ready));
+      co_return EncodedCommandReply{
+          std::string(StorageError(builder, capture_ready)), builder.outcome()};
     const std::size_t destination_arg = context.store_shape_->destination_arg_;
     const ZSetExecKey* destination = find_key(destination_arg);
     if (destination == nullptr) {
-      co_return std::string(
-          builder.AppendError("ERR Sorted Set destination key is missing"));
+      co_return EncodedCommandReply{
+          std::string(
+              builder.AppendError("ERR Sorted Set destination key is missing")),
+          builder.outcome()};
     }
     storage::TxShardWrites& destination_writes = tx_writes[destination->owner_];
     absl::Status undo_ready = co_await bycorf::SubmitTaskTo(
@@ -2970,7 +3020,8 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
           return g_storage->DiscardTxUndoLocal(txid);
         });
     if (!undo_ready.ok())
-      co_return std::string(StorageError(builder, undo_ready));
+      co_return EncodedCommandReply{
+          std::string(StorageError(builder, undo_ready)), builder.outcome()};
     destination_writes.collect_undo_ = true;
     auto write = [&]() -> Task<absl::Status> {
       co_return co_await ReplaceMultiDestination(
@@ -2992,11 +3043,14 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                           : g_storage->DiscardTxUndoLocal(txid);
         });
     if (!status.ok()) {
-      co_return std::string(
-          StorageError(builder, undo_finished.ok() ? status : undo_finished));
+      co_return EncodedCommandReply{
+          std::string(StorageError(
+              builder, undo_finished.ok() ? status : undo_finished)),
+          builder.outcome()};
     }
     if (!undo_finished.ok())
-      co_return std::string(StorageError(builder, undo_finished));
+      co_return EncodedCommandReply{
+          std::string(StorageError(builder, undo_finished)), builder.outcome()};
     for (auto& effect : context.replacement_effects_) {
       CaptureReplicationCommand(request, effect.db_id_,
                                 std::move(effect.args_));
@@ -3021,10 +3075,10 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     else
       builder.AppendBulkString(element.member_);
   }
-  co_return std::string(builder.View());
+  co_return EncodedCommandReply{std::string(builder.View()), builder.outcome()};
 }
 
-Task<std::string> ExecuteZSetMultiPopLocked(
+Task<EncodedCommandReply> ExecuteZSetMultiPopLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
   MarkReplicationCommandHandled(request);
@@ -3032,14 +3086,20 @@ Task<std::string> ExecuteZSetMultiPopLocked(
   if (request.kind_ != CommandKind::kZMPop) {
     auto timeout = ParseBlockingZSetDeadline(request);
     if (!timeout.ok()) {
-      co_return std::string(builder.AppendError(
-          absl::StrCat("ERR ", timeout.status().message())));
+      co_return EncodedCommandReply{
+          std::string(builder.AppendError(
+              CommandErrorReasonForStatus(timeout.status()),
+              absl::StrCat("ERR ", timeout.status().message()))),
+          builder.outcome()};
     }
   }
   auto parsed = ParseMultiPopShape(request);
   if (!parsed.ok()) {
-    co_return std::string(
-        builder.AppendError(absl::StrCat("ERR ", parsed.status().message())));
+    co_return EncodedCommandReply{
+        std::string(builder.AppendError(
+            CommandErrorReasonForStatus(parsed.status()),
+            absl::StrCat("ERR ", parsed.status().message()))),
+        builder.outcome()};
   }
   const MultiPopShape shape = std::move(*parsed);
   for (std::size_t argument : shape.key_args_) {
@@ -3051,8 +3111,9 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       }
     }
     if (key == nullptr) {
-      co_return std::string(
-          builder.AppendError("ERR Sorted Set key is missing"));
+      co_return EncodedCommandReply{
+          std::string(builder.AppendError("ERR Sorted Set key is missing")),
+          builder.outcome()};
     }
     auto pop = [&]() {
       return PopZSetLocked(request.db_id_, request.args_[argument],
@@ -3070,7 +3131,9 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       popped = co_await bycorf::SubmitTaskTo(key->owner_, pop);
     }
     if (!popped.ok()) {
-      co_return std::string(StorageError(builder, popped.status()));
+      co_return EncodedCommandReply{
+          std::string(StorageError(builder, popped.status())),
+          builder.outcome()};
     }
     if (!popped->members_.empty()) {
       if (request.replication_capture_ != nullptr) {
@@ -3081,10 +3144,12 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       }
       AppendMultiPopReply(builder, request.args_[argument], *popped,
                           shape.flat_reply_);
-      co_return std::string(builder.View());
+      co_return EncodedCommandReply{std::string(builder.View()),
+                                    builder.outcome()};
     }
   }
-  co_return std::string(builder.AppendNullArray());
+  co_return EncodedCommandReply{std::string(builder.AppendNullArray()),
+                                builder.outcome()};
 }
 
 Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
@@ -3094,12 +3159,14 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   auto deadline = ParseBlockingZSetDeadline(request);
   if (!deadline.ok()) {
     co_return Built(
-        builder.AppendError(absl::StrCat("ERR ", deadline.status().message())));
+        builder.AppendError(CommandErrorReasonForStatus(deadline.status()),
+                            absl::StrCat("ERR ", deadline.status().message())));
   }
   auto shape = ParseMultiPopShape(request);
   if (!shape.ok()) {
     co_return Built(
-        builder.AppendError(absl::StrCat("ERR ", shape.status().message())));
+        builder.AppendError(CommandErrorReasonForStatus(shape.status()),
+                            absl::StrCat("ERR ", shape.status().message())));
   }
 
   std::vector<BlockingWaitSpec> specs;
@@ -3134,6 +3201,7 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
     }
     BlockingAttemptResult completed;
     completed.state_ = BlockingAttemptState::kComplete;
+    builder.SetOutcome(attempt_builder.outcome());
     completed.reply_ = Built(builder.AppendRaw(result.encoded_));
     co_return completed;
   };
@@ -3141,7 +3209,10 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   auto status_reply = [&](const absl::Status& status) {
     if (absl::IsAborted(status)) {
       return Built(
-          builder.AppendError("TRYAGAIN " + std::string(status.message())));
+          builder.AppendError(GetErrorDetail(status) == ErrorDetail::kNone
+                                  ? CommandErrorReason::kTryAgain
+                                  : CommandErrorReasonForStatus(status),
+                              "TRYAGAIN " + std::string(status.message())));
     }
     return Built(StorageError(builder, status));
   };

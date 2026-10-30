@@ -19,6 +19,7 @@
 #include "../impl.h"
 #include "absl/container/inlined_vector.h"
 #include "dependency_guard.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 
 namespace lavik::storage {
@@ -267,7 +268,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     // Reject preparation before any current-command pages are staged.
     if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_ENCODER_PREPARE_KEY", key)) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM preparing group encoders");
+      co_return MemoryLimitError("OOM preparing group encoders");
     }
     encoders.reserve(plan->writes_.size());
     encoded_sizes.reserve(plan->writes_.size());
@@ -438,7 +439,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                                     written.size() + 1)) {
           const auto abandoned = co_await abandon();
           if (!abandoned.ok()) co_return abandoned;
-          co_return absl::ResourceExhaustedError(
+          co_return MemoryLimitError(
               "OOM injected grouped auxiliary admission failure");
         });
     auto group = co_await WriteHashGroupRecordLocked(
@@ -555,8 +556,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   {
     if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_GROUP_HANDOFF_KEY", key)) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM completing grouped publication handoff");
+      co_return MemoryLimitError("OOM completing grouped publication handoff");
     }
     if (outer_transaction) {
       // Waiting for this decision before returning the command makes the outer

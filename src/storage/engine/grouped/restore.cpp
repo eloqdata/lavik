@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 
@@ -86,7 +87,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
       TryReserveMemory(4096 + (count + replaced_count) * kPerRecordScratch);
   if (!scratch) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM grouped compensation metadata");
+    co_return MemoryLimitError("OOM grouped compensation metadata");
   }
   std::optional<HashGroupDirectory> hash_directory;
   std::optional<OrderedGroupDirectory> ordered_directory;

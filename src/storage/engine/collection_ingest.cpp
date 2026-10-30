@@ -15,6 +15,7 @@
  */
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/storage/detail/collection_ingest_budget.h"
 #include "lavik/storage/detail/stream_records.h"
 
@@ -47,7 +48,7 @@ absl::Status ReserveIngestVector(std::vector<T>& values, std::size_t required,
   auto reservation = TryReserveMemory(bytes);
   if (!reservation) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError("OOM collection ingest metadata");
+    return MemoryLimitError("OOM collection ingest metadata");
   }
   const auto old_bytes = values.capacity() * sizeof(T);
   values.reserve(capacity);
@@ -139,7 +140,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
   auto initial_admission = TryReserveMemory(4096 + key.size());
   if (!initial_admission) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM collection ingest state");
+    co_return MemoryLimitError("OOM collection ingest state");
   }
   auto state = std::make_shared<ReplicaCollectionStage>();
   auto receipt_owner = std::make_shared<IngestReceiptLease>();
@@ -277,15 +278,14 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     rollback_allowance = TryReserveMemory(compensation_bytes);
     if (!rollback_allowance) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM collection rollback headroom");
+      co_return MemoryLimitError("OOM collection rollback headroom");
     }
     auto& journal = store.tx_undo_[writes.txid_];
     auto prefix_admission = TryReserveMemory(
         8192 + journal.entries_.size() * sizeof(TxUndoEntry) * 4);
     if (!prefix_admission) {
       RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError("OOM collection undo prefix");
+      co_return MemoryLimitError("OOM collection undo prefix");
     }
     journal.ReserveOneEntry();
     state->undo_charge_.Resize(state->undo_charge_.bytes() +
@@ -515,8 +515,7 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
           co_return absl::ResourceExhaustedError(
               "Stream validation size overflow");
         auto charge = TryReserveMemory(largest * 4 + 512);
-        if (!charge)
-          co_return absl::ResourceExhaustedError("OOM Stream validation keys");
+        if (!charge) co_return MemoryLimitError("OOM Stream validation keys");
         for (const auto& record : page->elements_) {
           auto valid = stream_validator.Read(record);
           if (!valid.ok()) co_return valid;

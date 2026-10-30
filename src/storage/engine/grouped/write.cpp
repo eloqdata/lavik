@@ -18,6 +18,7 @@
 
 #include "../impl.h"
 #include "dependency_test_hook.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 
@@ -33,8 +34,7 @@ StorageEngine::Impl::PrepareGroupedDecision(TxShardWrites& tx,
       AllocatorUsableSizeForRequest(sizeof(GroupedCommitDecision) + 1024));
   if (!reservation.has_value()) {
     RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM grouped commit dependency exceeds maxmemory");
+    return MemoryLimitError("OOM grouped commit dependency exceeds maxmemory");
   }
   tx.grouped_decision_ = std::allocate_shared<GroupedCommitDecision>(
       RetainedAllocator<GroupedCommitDecision>(RetainedAllocationDomain{
@@ -82,7 +82,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareGroupedDependencyLocked(
       AllocatorUsableSizeForRequest(sizeof(GroupedCommitDependency) + 1024));
   if (!admitted) {
     RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError("OOM retaining commit predecessors");
+    co_return MemoryLimitError("OOM retaining commit predecessors");
   }
   auto link = std::allocate_shared<GroupedCommitDependency>(
       RetainedAllocator<GroupedCommitDependency>(RetainedAllocationDomain{

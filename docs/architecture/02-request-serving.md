@@ -167,8 +167,10 @@ racing closure is either rejected or remains visible to the drain.
    command table and copies the connection's current database ID into the
    request.
 3. `DispatchCommand` handles connection-level transaction and client state,
-   attaches the connection's reply version, then records command metrics and
-   eligible slow-log entries around the dispatch result.
+   attaches the connection's reply version, then records legacy dispatch metrics
+   and eligible slow-log entries around the dispatch result. Logical command
+   results have a separate lifecycle, ending at execution completion or streamed
+   reply producer completion; immediate session gates observe their own results.
 4. `DispatchCommandImpl` runs the readiness and ownership admission gates.
    The replication LOADING gate rejects non-whitelisted commands while a
    standalone replica syncs or a cluster node rebuilds its Meta-authorized
@@ -482,11 +484,33 @@ SLOWLOG uses one bounded, single-owner ring per worker. Command completion
 records eligible non-blocking commands after dispatch, redacts credentials,
 and bounds copied arguments; `SLOWLOG GET` merges worker snapshots by a global
 entry ID. Its threshold and capacity are runtime-configurable. `CONFIG
-RESETSTAT` visits every worker and clears command counters only; it does not
-alter data or persistence dirty state. The successful `CONFIG` command is
+RESETSTAT` visits every worker and clears command and input-error counters; it
+does not alter data or persistence dirty state. The successful `config|resetstat` command is
 recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
+
+Redis commandstats and execution time are owned by the coordinating worker and
+snapshotted through `SubmitTo`. Static command/subcommand identities bound the
+per-command counters. Global errorstats uses a separate fixed RESP-prefix
+vocabulary; custom prefixes share `OTHER`. Reply builders classify the prefix
+when constructing errors and carry outcome metadata across workers. EXEC reduces
+shard work into one result per logical child, separate from its parent. Lua error
+objects preserve whether the child error was already counted, so propagation
+can fail the parent without duplicating global errorstats. Replication and
+background work do not enter client command accounting.
+
+Lazy reply sources retain their observation until producer completion or failure;
+abandonment does not complete a call, and socket writes do not change a completed
+outcome. INFO and Prometheus use the same owner-local counters. Sparse snapshots
+carry observed numeric command and error identities. INFO omits histograms and
+collects only the requested commandstats/errorstats fields. Prometheus emits all
+four fields for observed commands and a zero baseline for its small global error
+vocabulary. Reset clears command and error observations and permits in-flight
+completions after each owner's reset. The legacy dispatch counters and histogram
+retain their original boundary, including dispatch-time rejections and MULTI
+queue replies, without additional calls for EXEC/script children. See
+[metrics](../operations/metrics.md) for external counting and timing semantics.
 
 The external replication command surface accepts only Redis/Redis Cluster
 upstreams. `REPLICAOF` and `SLAVEOF host port` complete AUTH/PSYNC before changing
@@ -546,7 +570,8 @@ Parser and version-aware reply encoding are unit-tested independently. The
 command-table tests cover kind lookup, flags, arity, and movable key extraction.
 E2E binaries exercise HELLO/RESP3 and Pub/Sub through the Pub/Sub suite, Lua
 through the transaction suite, bounded batched MGET through the multi-key
-suite, SLOWLOG and `RESETSTAT` through the metrics suite, Sentinel failover,
+suite, SLOWLOG, `RESETSTAT`, and command-outcome accounting through the metrics
+suite, Sentinel failover,
 multi-key atomicity, `MULTI`/`EXEC`/WATCH, TTL, collections, RDB
 import/export/backup, replication logs, and Redis PSYNC behavior through the
 real server executable.
@@ -570,5 +595,6 @@ real server executable.
 | Durable process-global Function catalog lifecycle | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/lavik/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/lavik/slowlog.h`, `src/redis/slowlog.cpp`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
+| Redis commandstats, global errorstats, and typed error provenance | `include/lavik/command_outcome.h`, `include/lavik/error_detail.h`, `include/lavik/resp.h`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/lavik/rdb.h`, `src/redis/rdb.cpp`, `include/lavik/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
 | Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/list_e2e_test.cpp` |

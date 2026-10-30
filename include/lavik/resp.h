@@ -34,6 +34,7 @@
 
 #include "absl/status/statusor.h"
 #include "lavik/command_args.h"
+#include "lavik/command_outcome.h"
 #include "lavik/resp_version.h"
 
 namespace lavik {
@@ -148,14 +149,66 @@ class RespCommandParser {
 // request. Incremental network paths should retain a RespCommandParser.
 RespParseResult ParseRespCommand(std::string_view input);
 
+// Owning replies crossing coroutine and transaction boundaries carry their
+// logical outcome with the bytes. There is intentionally no conversion to an
+// owning string: callers must explicitly discard metadata when sending bytes.
+struct EncodedCommandReply {
+  std::string encoded_;
+  CommandOutcome outcome_;
+
+  EncodedCommandReply() = default;
+  EncodedCommandReply(std::string encoded, CommandOutcome outcome = {})
+      : encoded_(std::move(encoded)), outcome_(outcome) {}
+  operator std::string_view() const noexcept { return encoded_; }
+  bool empty() const noexcept { return encoded_.empty(); }
+  char front() const { return encoded_.front(); }
+  std::size_t size() const noexcept { return encoded_.size(); }
+};
+
+// The default reason covers command-specific client errors without allowing
+// arbitrary messages to become metric labels.
+EncodedCommandReply EncodeCommandRejection(std::string_view message,
+                                           CommandErrorReason reason);
+EncodedCommandReply EncodeCommandError(
+    std::string_view message,
+    CommandErrorReason reason = CommandErrorReason::kClientError);
+
 // Reuses one contiguous response buffer for the lifetime of a connection.
-// A reply remains valid until Reset() is called for the next request.
+// Reset() begins the next request; ResetReply() replaces only its reply.
+// Both invalidate views of the current reply.
 class ReplyBuilder {
  public:
   explicit ReplyBuilder(RespVersion version = RespVersion::k2)
       : version_(version) {}
 
+  // Metadata follows reply construction independently of its wire encoding.
+  // Aggregators must deliberately preserve or isolate child outcomes.
+  [[nodiscard]] CommandOutcome outcome() const noexcept { return outcome_; }
+  void SetOutcome(CommandOutcome outcome) noexcept { outcome_ = outcome; }
+
+  // Dispatch supplies a fallback start for session-local commands. Storage
+  // handlers replace it after admission; dormant blocking waits are excluded.
+  void MarkExecutionStart(std::uint64_t ticks) noexcept {
+    execution_started_ = ticks;
+    excluded_execution_ticks_ = 0;
+  }
+  void ExcludeExecutionTicks(std::uint64_t ticks) noexcept {
+    excluded_execution_ticks_ += ticks;
+  }
+  [[nodiscard]] std::uint64_t ExecutionTicks(
+      std::uint64_t fallback_start, std::uint64_t finished) const noexcept {
+    const auto elapsed =
+        finished -
+        (execution_started_ != 0 ? execution_started_ : fallback_start);
+    return elapsed > excluded_execution_ticks_
+               ? elapsed - excluded_execution_ticks_
+               : 0;
+  }
+  // Begins a new request, clearing its reply, outcome and execution timing.
   void Reset();
+  // Replaces a reply within the same request, preserving execution timing
+  // (including excluded admission waits) and the negotiated RESP version.
+  void ResetReply();
   void Reserve(std::size_t capacity);
   void SetVersion(RespVersion version) noexcept { version_ = version; }
   [[nodiscard]] RespVersion version() const noexcept { return version_; }
@@ -202,6 +255,27 @@ class ReplyBuilder {
   std::string_view AppendVerbatimString(std::string_view format,
                                         std::string_view value);
   std::string_view AppendError(std::string_view message);
+  std::string_view AppendError(CommandErrorReason reason,
+                               std::string_view message);
+  std::string_view AppendError(CommandErrorReason reason,
+                               std::string_view prefix,
+                               std::string_view message) {
+    const auto encoded = AppendError(prefix, message);
+    outcome_.reason_ = reason;
+    return encoded;
+  }
+  std::string_view AppendRejectedError(std::string_view message) {
+    return AppendRejectedError(CommandErrorReason::kClientError, message);
+  }
+  std::string_view AppendRejectedError(CommandErrorReason reason,
+                                       std::string_view message) {
+    const auto encoded = AppendError(reason, message);
+    outcome_.result_ = reason == CommandErrorReason::kMoved ||
+                               reason == CommandErrorReason::kAsk
+                           ? CommandResult::kRedirected
+                           : CommandResult::kRejected;
+    return encoded;
+  }
   std::string_view AppendError(std::string_view prefix,
                                std::string_view message);
   std::string_view AppendArrayHeader(std::uint64_t count);
@@ -210,13 +284,31 @@ class ReplyBuilder {
   std::string_view AppendMapHeader(std::uint64_t count);
   std::string_view AppendSetHeader(std::uint64_t count);
   std::string_view AppendPushHeader(std::uint64_t count);
+  // Copies wire bytes only; the caller must transfer the source outcome when
+  // forwarding a logical reply. Array assembly may deliberately omit it.
   std::string_view AppendRaw(std::string_view encoded);
+  // A successful component preserves a previous error; a non-successful
+  // component replaces the outcome. Use raw bytes for independent EXEC
+  // children.
+  template <typename Reply>
+    requires std::is_same_v<std::remove_cvref_t<Reply>, EncodedCommandReply>
+  std::string_view AppendRaw(Reply&& reply) {
+    if (reply.outcome_.result_ != CommandResult::kSuccess)
+      outcome_ = reply.outcome_;
+    return AppendRaw(std::string_view(reply));
+  }
 
   [[nodiscard]] std::string_view View() const noexcept { return buffer_; }
   [[nodiscard]] std::size_t Capacity() const noexcept {
     return buffer_.capacity();
   }
+  // Releases wire bytes without outcome metadata. Use ReleaseCommandReply when
+  // transferring a logical reply across builders or workers.
   [[nodiscard]] std::string Release() && { return std::move(buffer_); }
+  // Transfers both wire bytes and the terminal outcome to the new owner.
+  [[nodiscard]] EncodedCommandReply ReleaseCommandReply() && {
+    return {std::move(buffer_), outcome_};
+  }
 
  private:
   template <typename Range, typename Projection>
@@ -278,6 +370,9 @@ class ReplyBuilder {
 
   std::string buffer_;
   RespVersion version_ = RespVersion::k2;
+  CommandOutcome outcome_;
+  std::uint64_t execution_started_ = 0;
+  std::uint64_t excluded_execution_ticks_ = 0;
 };
 
 std::string EncodeSimpleString(std::string_view value);

@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "impl.h"
+#include "lavik/error_detail.h"
 
 namespace lavik::storage {
 namespace {
@@ -1356,7 +1357,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     // expanding checkpoint scratch beyond maxmemory.
     auto reservation = TryReserveMemory(AllocatorUsableSizeForRequest(total));
     if (!reservation)
-      co_return absl::ResourceExhaustedError("OOM checkpoint object metadata");
+      co_return MemoryLimitError("OOM checkpoint object metadata");
     std::vector<std::byte> bytes;
     bytes.reserve(total);
     auto append = [&](const void* data, std::size_t size) {
@@ -2334,8 +2335,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
           object_reservation =
               TryReserveMemory(AllocatorUsableSizeForRequest(object_size));
           if (!object_reservation)
-            co_return absl::ResourceExhaustedError(
-                "OOM checkpoint object recovery");
+            co_return MemoryLimitError("OOM checkpoint object recovery");
           object_bytes.clear();
           object_bytes.reserve(object_size);
         }

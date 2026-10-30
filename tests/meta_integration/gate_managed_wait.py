@@ -89,8 +89,7 @@ def acknowledged(root, mode):
             pipelined = Client(source)
             try:
                 pipelined.socket.sendall(
-                    C.encode_resp(["WAIT", "2", "0"])
-                    + C.encode_resp(["PING"])
+                    C.encode_resp(["WAIT", "2", "0"]) + C.encode_resp(["PING"])
                 )
                 pipelined.socket.shutdown(socket.SHUT_WR)
                 try:
@@ -124,6 +123,11 @@ def retirement_before_registration(root, mode, boundary="before"):
         ready(meta)
         assert writer.call("SET", "wait-cut", "before") == "OK"
         assert writer.call("WAIT", 1, 5000) == 1
+        before_wait = next(
+            line
+            for line in F.redis_call(source, ["INFO", "commandstats"]).splitlines()
+            if line.startswith("cmdstat_wait:")
+        )
         if boundary != "blocked":
             hold.touch()
         try:
@@ -166,6 +170,15 @@ def retirement_before_registration(root, mode, boundary="before"):
                     lambda: "connected_clients:1"
                     in F.redis_call(source, ["INFO", "clients"]).splitlines(),
                 )
+                if boundary == "disconnect":
+                    after_wait = next(
+                        line
+                        for line in F.redis_call(
+                            source, ["INFO", "commandstats"]
+                        ).splitlines()
+                        if line.startswith("cmdstat_wait:")
+                    )
+                    assert after_wait == before_wait, (before_wait, after_wait)
         finally:
             hold.unlink(missing_ok=True)
             meta.resume()

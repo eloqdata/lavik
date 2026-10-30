@@ -290,6 +290,7 @@ Task<CommandReply> ExecuteClusterModeCommand(const CommandRequest& request,
   // for direct callers that bypass the table and mirrors its error text.
   if (args.size() < 2) {
     reply.encoded_ = reply_builder.AppendError(
+        CommandErrorReason::kArity,
         "ERR wrong number of arguments for 'cluster' command");
     co_return reply;
   }

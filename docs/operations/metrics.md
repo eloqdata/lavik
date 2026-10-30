@@ -282,9 +282,9 @@ accounting. RSS and allocator diagnostics remain outside command execution.
 
 ## Business metrics
 
-- `lavik_commands_total`: completed Redis commands. QPS is
+- `lavik_commands_total`: completed ordinary dispatches. QPS is
   `rate(lavik_commands_total[1m])`.
-- `lavik_command_calls_total{command}`: completed commands by command name.
+- `lavik_command_calls_total{command}`: the same dispatches by base command name.
 - `lavik_command_duration_seconds`: command execution histogram, from
   dispatch through reply construction; socket response writes are excluded.
 - `lavik_connections`: all current TCP connections, including Redis clients,
@@ -295,6 +295,13 @@ accounting. RSS and allocator diagnostics remain outside command execution.
 - `lavik_connected_clients`: current Redis client connections. This is always
   less than or equal to `lavik_connections`.
 
+These three legacy command metrics retain their published boundary: dispatch
+returns, including dispatch-time rejections and MULTI queue replies. Immediate
+AUTH/HELLO and protocol failures are outside that boundary. EXEC/script children
+are not additional legacy calls. The histogram ends when a streamed reply is
+constructed, before its lazy producer finishes; blocking dispatch includes its
+wait. Use the commandstats metrics below for failure ratios, not these legacy calls.
+
 For example, per-command QPS and aggregate p99 latency are:
 
 ```promql
@@ -304,6 +311,86 @@ histogram_quantile(
   sum by (le) (rate(lavik_command_duration_seconds_bucket[5m]))
 )
 ```
+
+### Redis commandstats and errorstats
+
+| Metric | Meaning |
+| --- | --- |
+| `lavik_command_executions_total{command}` | Completed logical executions (`INFO commandstats` calls), including failed calls. |
+| `lavik_command_failed_calls_total{command}` | Commands that failed during execution (`failed_calls`). |
+| `lavik_command_rejected_calls_total{command}` | Commands rejected before execution (`rejected_calls`), including MOVED/ASK. |
+| `lavik_command_execution_seconds_total{command}` | Accumulated execution time; INFO converts it to `usec` and `usec_per_call`. |
+| `lavik_errors_total{err}` | Global error counts by RESP prefix, corresponding to `INFO errorstats`. |
+| `lavik_request_input_errors_total{reason}` | Input failures without a valid command: `protocol`, `query_buffer`, or `client_memory`. |
+
+Command names come from the static command table, including supported subcommands
+such as `config|get`. As in Redis, each observed command has one row with calls,
+failed calls, rejected calls, and time; the fields include zeros. Unobserved
+commands have no row. Unknown commands/subcommands contribute global `ERR` errors
+but have no commandstats row. Counters accumulate until restart or `CONFIG
+RESETSTAT`; scraping never consumes them.
+
+Global errors use the actual RESP prefix selected when constructing the error,
+independent of its internal cause. For example, AUTH errors can have either `ERR`
+or `WRONGPASS`. The fixed vocabulary is `ERR`, `WRONGTYPE`, `OOM`, `NOAUTH`,
+`WRONGPASS`, `NOPERM`, `LOADING`, `READONLY`, `MASTERDOWN`, `CLUSTERDOWN`,
+`CROSSSLOT`, `MOVED`, `ASK`, `TRYAGAIN`, `BUSY`, `BUSYGROUP`, `BUSYKEY`, `NOGROUP`,
+`NOSCRIPT`, `EXECABORT`, `NOPROTO`, `NOTBUSY`, `UNKILLABLE`, and `UNBLOCKED`.
+Unlike Redis's dynamically registered custom prefixes, Lavik groups other
+prefixes, including user-defined Lua errors, under `OTHER`. Arguments, keys,
+addresses and raw error messages never become labels.
+
+`INFO errorstats` omits zero counts. Prometheus publishes the small fixed prefix
+vocabulary at zero from startup, providing a baseline for the first rare error.
+Command-level series need two samples for `rate`/`increase`; an error preceding
+a command's first scrape cannot be reconstructed there. The global prefix
+counters provide the independent error signal. A process failure before a scrape
+can still lose observations, as with any pull-based counter.
+
+MULTI queue replies do not execute commands. EXEC records each executed child
+once, including commands spanning workers. DISCARD, WATCH abort and dirty
+transaction abort do not execute children. An error inside the EXEC reply array
+does not fail EXEC itself; EXECABORT does. Lua/Function Redis children count
+under their own command names. A caught `redis.pcall` error fails the child;
+propagating or returning it also fails EVAL/FCALL. Global errorstats counts the
+original error once. Returning a new `{err = caught.err}` object constructs a
+new error; returning the original error object preserves its provenance.
+Nested returned Lua errors are counted individually, while the outer command
+has at most one failed call. This preserves `failed_calls <= calls`; Redis's
+implementation can increment the parent failure count more than once when the
+same already-counted error object is returned repeatedly in an array. Lavik
+counts that parent as one failed execution. Thus errorstats is not a sum of
+failed_calls.
+Replication application, recovery and background work do not enter these client
+counters. Parent and child command counts are logical executions, not network
+request counts.
+
+Nil results, unsuccessful conditional writes and normal blocking timeouts are
+successful executions. An unfinished blocked or streamed command abandoned on
+disconnect does not add a completed call. Lazy producer completion or failure
+finalizes a streamed command; socket writes after completion cannot change its
+statistics. A late storage failure counts as a failed execution even when a
+partial response prevents constructing a RESP error, in which case errorstats
+has no new error. This lazy storage boundary is specific to Lavik.
+
+Execution time excludes admission, MULTI residence, dormant blocking waits and
+socket writes. It includes storage I/O and cross-worker execution waits.
+Parent EXEC/Lua times include child execution; adding both double-counts that
+work. These durations are neither CPU usage nor end-to-end latency.
+
+`CONFIG RESETSTAT` clears commandstats, errorstats, legacy command metrics and
+input-error counters on their owning workers. INFO then omits reset command and
+error rows; Prometheus retains the fixed global error prefixes with zero values.
+There is no global request barrier: in-flight commands are counted when they
+finish, and the successful `config|resetstat` call is recorded after reset.
+Use `rate`/`increase` to handle counter resets.
+
+The dashboard's **Request Health** row filters command panels by instance and
+command. Execution failure ratio is `failed_calls / calls`; admission rejection
+ratio is `rejected_calls / (calls + rejected_calls)`. Global error prefixes and
+input errors use only the instance filter. `ERR` does not distinguish client
+mistakes from service faults, so this model does not expose a service-fault
+ratio. Existing QPS and latency panels retain the legacy dispatch boundary.
 
 ## Cluster control metrics
 
@@ -599,3 +686,17 @@ only in that shard. Scraping submits a short snapshot operation to each worker
 and merges the returned copies. Command execution therefore does not contend
 on shared QPS or histogram atomics. HTTP response buffers are retained in a
 bounded per-worker pool and reused by later scrapes.
+
+INFO collects only the detail needed by its requested section. `clients` and
+`persistence` omit command statistics; `stats` receives the legacy dispatch call
+total. `commandstats` collects per-command calls, failures, rejections and time;
+`errorstats` collects global error prefixes. Default/all INFO includes both.
+No INFO section copies latency histograms.
+
+Prometheus snapshots carry only observed command rows and nonzero global error
+prefixes. RESETSTAT clears these observations. The renderer emits all four fields
+for each observed command and supplies the small fixed global error vocabulary
+at zero where absent. Metric names, labels and help text use shared immutable
+storage; only changing values are formatted into response-owned storage.
+All collections run on serving workers; include polling frequency and worker
+count when measuring application tail latency.

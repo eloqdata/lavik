@@ -110,9 +110,7 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "fields": "",
           "values": false
         },
@@ -200,9 +198,7 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "fields": "",
           "values": false
         },
@@ -269,9 +265,7 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "fields": "",
           "values": false
         },
@@ -329,9 +323,7 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "fields": "",
           "values": false
         },
@@ -1187,10 +1179,7 @@
       "id": 7,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1279,10 +1268,7 @@
       "description": "P99.9 and P99.99 are estimates interpolated from Prometheus histogram buckets. Lavik exports dense boundaries around the 3 ms SLO and progressively wider buckets at higher latency; use longer windows for low-volume traffic.",
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1398,10 +1384,7 @@
       "id": 18,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1490,10 +1473,7 @@
       "id": 19,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1518,6 +1498,580 @@
       "type": "timeseries"
     },
     {
+      "id": 62,
+      "title": "Request Health",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "panels": []
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No Data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "id": 63,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} completed",
+          "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "(sum by (instance, command) (rate(lavik_command_failed_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} failed",
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "(sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}} rejected",
+          "refId": "C"
+        }
+      ],
+      "title": "Command Executions and Errors",
+      "type": "timeseries",
+      "description": "Redis commandstats rates. Completed calls include failed calls; rejections happen before execution and include MOVED/ASK. EXEC and script children count under their command names. Queue replies do not count."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No Data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "id": 64,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, err) (rate(lavik_errors_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{err}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Errors by Prefix",
+      "type": "timeseries",
+      "description": "Global Redis errorstats by RESP prefix, including caught script errors. Forwarding the same script error does not count twice. Custom prefixes share OTHER. The command filter does not apply."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "noValue": "No Data",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 47
+      },
+      "id": 65,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "(sum by (instance, command) (rate(lavik_command_failed_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) / clamp_min(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Execution Failure Ratio",
+      "type": "timeseries",
+      "description": "Failed calls / completed executions. Includes client and server errors. Rejections and queued commands are outside the denominator. Observed idle commands show zero; missing telemetry shows No Data."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "noValue": "No Data",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 47
+      },
+      "id": 66,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "(sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) / clamp_min((sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) + sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Admission Rejection Ratio",
+      "type": "timeseries",
+      "description": "Rejected calls / (completed calls + rejected calls), including MOVED/ASK. Queued commands are excluded. Observed idle commands show zero; missing telemetry shows No Data."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "noValue": "No Data",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 55
+      },
+      "id": 67,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "(sum by (instance, command) (rate(lavik_command_execution_seconds_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) / clamp_min(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{command}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mean Command Execution Time",
+      "type": "timeseries",
+      "description": "Execution seconds / completed calls. Excludes admission, dormant blocking waits and socket writes. Includes storage and cross-worker waits; parent times include their children. This is elapsed execution time, not CPU time or end-to-end latency."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "noValue": "No Data"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 55
+      },
+      "id": 68,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, reason) (rate(lavik_request_input_errors_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "instant": false,
+          "range": true,
+          "legendFormat": "{{instance}} {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Request Input Errors",
+      "type": "timeseries",
+      "description": "Malformed protocol, query-buffer limit and client-memory admission failures have no valid command identity. The command filter does not apply."
+    },
+    {
       "id": 45,
       "type": "row",
       "title": "Storage / Transactions",
@@ -1526,7 +2080,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 63
       },
       "panels": []
     },
@@ -1612,15 +2166,12 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 39
+        "y": 64
       },
       "id": 46,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1755,15 +2306,12 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 39
+        "y": 64
       },
       "id": 47,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -1884,15 +2432,12 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 47
+        "y": 72
       },
       "id": 48,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -2034,15 +2579,12 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 47
+        "y": 72
       },
       "id": 49,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -2193,15 +2735,12 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 55
+        "y": 80
       },
       "id": 50,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -2311,15 +2850,12 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 55
+        "y": 80
       },
       "id": 51,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -2410,7 +2946,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 63
+        "y": 88
       },
       "id": 52,
       "options": {
@@ -2419,9 +2955,7 @@
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "fields": "",
           "values": false
         },
@@ -2514,7 +3048,7 @@
             "h": 4,
             "w": 5,
             "x": 0,
-            "y": 72
+            "y": 97
           },
           "id": 14,
           "options": {
@@ -2523,9 +3057,7 @@
             "justifyMode": "auto",
             "orientation": "auto",
             "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "fields": "",
               "values": false
             },
@@ -2584,7 +3116,7 @@
             "h": 4,
             "w": 5,
             "x": 5,
-            "y": 72
+            "y": 97
           },
           "id": 15,
           "options": {
@@ -2593,9 +3125,7 @@
             "justifyMode": "auto",
             "orientation": "auto",
             "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "fields": "",
               "values": false
             },
@@ -2644,7 +3174,7 @@
             "h": 4,
             "w": 4,
             "x": 10,
-            "y": 72
+            "y": 97
           },
           "id": 5,
           "options": {
@@ -2653,9 +3183,7 @@
             "justifyMode": "auto",
             "orientation": "auto",
             "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "fields": "",
               "values": false
             },
@@ -2713,7 +3241,7 @@
             "h": 4,
             "w": 5,
             "x": 14,
-            "y": 72
+            "y": 97
           },
           "id": 6,
           "options": {
@@ -2722,9 +3250,7 @@
             "justifyMode": "auto",
             "orientation": "auto",
             "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "fields": "",
               "values": false
             },
@@ -2783,7 +3309,7 @@
             "h": 4,
             "w": 5,
             "x": 19,
-            "y": 72
+            "y": 97
           },
           "id": 17,
           "options": {
@@ -2791,9 +3317,7 @@
             "minVizWidth": 75,
             "orientation": "auto",
             "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "fields": "",
               "values": false
             },
@@ -2819,7 +3343,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 96
       }
     },
     {
@@ -2828,7 +3352,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 97
       },
       "id": 20,
       "panels": [
@@ -2981,15 +3505,12 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 73
+            "y": 98
           },
           "id": 9,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -3050,7 +3571,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 73
+        "y": 98
       },
       "id": 21,
       "panels": [
@@ -3113,14 +3634,12 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 74
+            "y": 99
           },
           "id": 10,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -3153,7 +3672,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 74
+        "y": 99
       },
       "id": 23,
       "panels": [],
@@ -3220,15 +3739,12 @@
         "h": 8,
         "w": 10,
         "x": 0,
-        "y": 75
+        "y": 100
       },
       "id": 11,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ],
+          "calcs": ["lastNotNull", "max"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -3318,14 +3834,12 @@
         "h": 8,
         "w": 14,
         "x": 10,
-        "y": 75
+        "y": 100
       },
       "id": 12,
       "options": {
         "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "displayMode": "table",
           "placement": "bottom",
           "showLegend": true
@@ -3401,7 +3915,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 83
+        "y": 108
       },
       "id": 13,
       "options": {
@@ -3412,9 +3926,7 @@
         "namePlacement": "left",
         "orientation": "horizontal",
         "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
+          "calcs": ["lastNotNull"],
           "fields": "",
           "values": false
         },
@@ -3441,7 +3953,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 89
+        "y": 114
       },
       "id": 22,
       "panels": [
@@ -3504,15 +4016,12 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 90
+            "y": 115
           },
           "id": 16,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -3566,7 +4075,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 90
+        "y": 115
       },
       "id": 24,
       "panels": [
@@ -3610,7 +4119,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 91
+            "y": 116
           },
           "id": 25,
           "options": {
@@ -3621,9 +4130,7 @@
             "namePlacement": "left",
             "orientation": "horizontal",
             "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
+              "calcs": ["lastNotNull"],
               "fields": "",
               "values": false
             },
@@ -3704,15 +4211,12 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 101
+            "y": 126
           },
           "id": 34,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -3748,7 +4252,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 116
       },
       "panels": [
         {
@@ -3811,15 +4315,12 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 92
+            "y": 117
           },
           "id": 27,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -3912,15 +4413,12 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 92
+            "y": 117
           },
           "id": 28,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4014,15 +4512,12 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 101
+            "y": 126
           },
           "id": 29,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4107,15 +4602,12 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 101
+            "y": 126
           },
           "id": 30,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4200,15 +4692,12 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 110
+            "y": 135
           },
           "id": 31,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4309,15 +4798,12 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 110
+            "y": 135
           },
           "id": 32,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4418,15 +4904,12 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 93
+            "y": 118
           },
           "id": 35,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4521,15 +5004,12 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 93
+            "y": 118
           },
           "id": 36,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4613,15 +5093,12 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 101
+            "y": 126
           },
           "id": 53,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4711,15 +5188,12 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 101
+            "y": 126
           },
           "id": 54,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4803,15 +5277,12 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 109
+            "y": 134
           },
           "id": 55,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -4869,7 +5340,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 109
+            "y": 134
           },
           "id": 56,
           "options": {
@@ -4959,15 +5430,12 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 117
+            "y": 142
           },
           "id": 57,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -5031,7 +5499,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 117
+            "y": 142
           },
           "id": 58,
           "options": {
@@ -5175,15 +5643,12 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 125
+            "y": 150
           },
           "id": 59,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -5279,15 +5744,12 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 125
+            "y": 150
           },
           "id": 60,
           "options": {
             "legend": {
-              "calcs": [
-                "lastNotNull",
-                "max"
-              ],
+              "calcs": ["lastNotNull", "max"],
               "displayMode": "table",
               "placement": "bottom",
               "showLegend": true
@@ -5357,7 +5819,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 133
+            "y": 158
           },
           "id": 61,
           "options": {
@@ -5427,16 +5889,13 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 117
       }
     }
   ],
   "refresh": "10s",
   "schemaVersion": 41,
-  "tags": [
-    "lavik",
-    "prometheus"
-  ],
+  "tags": ["lavik", "prometheus"],
   "templating": {
     "list": [
       {
@@ -5466,6 +5925,34 @@
         "skipUrlSync": false,
         "sort": 1,
         "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\"}, command)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Command",
+        "multi": true,
+        "name": "command",
+        "options": [],
+        "query": {
+          "query": "label_values(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\"}, command)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
       }
     ]
   },
@@ -5474,17 +5961,11 @@
     "to": "now"
   },
   "timepicker": {
-    "refresh_intervals": [
-      "5s",
-      "10s",
-      "30s",
-      "1m",
-      "5m"
-    ]
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
   },
   "timezone": "browser",
   "title": "Lavik Overview",
   "uid": "lavik-overview",
-  "version": 10,
+  "version": 11,
   "weekStart": ""
 }

@@ -25,6 +25,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "lavik/error_detail.h"
 #include "lavik/memory.h"
 #include "lavik/storage/detail/grouped/object_index.h"
 
@@ -82,8 +83,7 @@ class GroupedScratchBudget {
     auto reservation = TryReserveMemory(bytes_ * copies);
     if (!reservation) {
       RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "OOM grouped operation scratch admission");
+      return MemoryLimitError("OOM grouped operation scratch admission");
     }
     return std::move(*reservation);
   }

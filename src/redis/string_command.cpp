@@ -29,6 +29,7 @@
 #include "absl/strings/str_cat.h"
 #include "bycorf/runtime/cross_core.h"
 #include "cluster_gate.h"
+#include "lavik/error_detail.h"
 #include "lavik/expiration.h"
 #include "lavik/memory.h"
 #include "lavik/redis_parse.h"
@@ -53,20 +54,20 @@ CommandReply Built(std::string_view encoded) {
   return reply;
 }
 
-std::string StorageError(const absl::Status& status) {
+EncodedCommandReply StorageError(const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
       status.message().starts_with("OOM ")) {
-    return EncodeError(status.message());
+    return EncodeCommandError(status.message(),
+                              CommandErrorReasonForStatus(status));
   }
   return status.message().starts_with("WRONGTYPE ")
-             ? EncodeError(status.message())
-             : EncodeError(absl::StrCat("ERR ", status.message()));
+             ? EncodeCommandError(status.message(),
+                                  CommandErrorReasonForStatus(status))
+             : EncodeCommandError(absl::StrCat("ERR ", status.message()),
+                                  CommandErrorReasonForStatus(status));
 }
 
-absl::Status WrongType() {
-  return absl::InvalidArgumentError(
-      "WRONGTYPE Operation against a key holding the wrong kind of value");
-}
+absl::Status WrongType() { return WrongTypeError(); }
 
 bycorf::Task<absl::StatusOr<std::optional<storage::RawValue>>>
 ReadOptionalStringLocked(std::uint8_t db_id, std::string_view key,
@@ -260,8 +261,7 @@ absl::StatusOr<BitFieldPlan> ParseBitFieldPlan(const CommandRequest& request) {
   const auto& args = request.args_;
   for (std::size_t i = 2; i < args.size();) {
     if (RedisEqualsIgnoreCase(args[i], "overflow")) {
-      if (i + 1 >= args.size())
-        return absl::InvalidArgumentError("syntax error");
+      if (i + 1 >= args.size()) return SyntaxError("syntax error");
       if (RedisEqualsIgnoreCase(args[i + 1], "wrap"))
         overflow = BitFieldOverflow::kWrap;
       else if (RedisEqualsIgnoreCase(args[i + 1], "sat"))
@@ -286,10 +286,9 @@ absl::StatusOr<BitFieldPlan> ParseBitFieldPlan(const CommandRequest& request) {
       opcode = BitFieldOpcode::kIncrement;
       required = 4;
     } else {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
-    if (args.size() - i < required)
-      return absl::InvalidArgumentError("syntax error");
+    if (args.size() - i < required) return SyntaxError("syntax error");
     auto type = ParseBitFieldType(args[i + 1]);
     if (!type.ok()) return type.status();
     auto offset = ParseBitOffset(args[i + 2], true, type->second);
@@ -456,10 +455,10 @@ BitFieldResult ApplyUnsignedBitField(std::uint64_t old,
 absl::StatusOr<bool> ParseBitmapUnit(std::string_view unit) {
   if (RedisEqualsIgnoreCase(unit, "bit")) return true;
   if (RedisEqualsIgnoreCase(unit, "byte")) return false;
-  return absl::InvalidArgumentError("syntax error");
+  return SyntaxError("syntax error");
 }
 
-bycorf::Task<std::string> RunBitmapLocked(
+bycorf::Task<EncodedCommandReply> RunBitmapLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx,
     const storage::MutationPrecondition* mutation_precondition) {
@@ -475,14 +474,16 @@ bycorf::Task<std::string> RunBitmapLocked(
       request.kind_ == CommandKind::kSetBit) {
     auto parsed_offset = ParseBitOffset(args[2]);
     if (!parsed_offset.ok())
-      co_return EncodeError(
-          absl::StrCat("ERR ", parsed_offset.status().message()));
+      co_return EncodeCommandError(
+          absl::StrCat("ERR ", parsed_offset.status().message()),
+          CommandErrorReasonForStatus(parsed_offset.status()));
     bit_offset = *parsed_offset;
   }
   if (request.kind_ == CommandKind::kSetBit) {
     std::int64_t parsed = 0;
     if (!ParseRedisInt64(args[3], &parsed) || (parsed != 0 && parsed != 1)) {
-      co_return EncodeError("ERR bit is not an integer or out of range");
+      co_return EncodeCommandError("ERR bit is not an integer or out of range",
+                                   CommandErrorReason::kInvalidValue);
     }
     bit_value = static_cast<int>(parsed);
   }
@@ -507,10 +508,12 @@ bycorf::Task<std::string> RunBitmapLocked(
   if (request.kind_ == CommandKind::kBitPos) {
     std::int64_t parsed = 0;
     if (!ParseRedisInt64(args[2], &parsed)) {
-      co_return EncodeError("ERR value is not an integer or out of range");
+      co_return EncodeCommandError(
+          "ERR value is not an integer or out of range",
+          CommandErrorReason::kInvalidValue);
     }
     if (parsed != 0 && parsed != 1) {
-      co_return EncodeError("ERR The bit argument must be 1 or 0.");
+      co_return EncodeCommandError("ERR The bit argument must be 1 or 0.");
     }
     bit_value = static_cast<int>(parsed);
   }
@@ -520,7 +523,9 @@ bycorf::Task<std::string> RunBitmapLocked(
       request.kind_ == CommandKind::kBitFieldRo) {
     auto parsed = ParseBitFieldPlan(request);
     if (!parsed.ok())
-      co_return EncodeError(absl::StrCat("ERR ", parsed.status().message()));
+      co_return EncodeCommandError(
+          absl::StrCat("ERR ", parsed.status().message()),
+          CommandErrorReasonForStatus(parsed.status()));
     bitfield = std::move(*parsed);
   }
 
@@ -539,7 +544,7 @@ bycorf::Task<std::string> RunBitmapLocked(
         return storage::CompactValueUpdate{};
       }
       if (args.size() != 2 && args.size() != 4 && args.size() != 5)
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       std::int64_t start = 0;
       std::int64_t end = static_cast<std::int64_t>(old.size()) - 1;
       bool bit_unit = false;
@@ -562,7 +567,7 @@ bycorf::Task<std::string> RunBitmapLocked(
         return storage::CompactValueUpdate{};
       }
       if (args.size() < 3 || args.size() > 6) {
-        return absl::InvalidArgumentError("syntax error");
+        return SyntaxError("syntax error");
       }
       std::int64_t start = 0;
       std::int64_t end = static_cast<std::int64_t>(old.size()) - 1;
@@ -580,7 +585,7 @@ bycorf::Task<std::string> RunBitmapLocked(
         auto unit = ParseBitmapUnit(args[5]);
         if (!unit.ok()) return unit.status();
         bit_unit = *unit;
-        if (!end_given) return absl::InvalidArgumentError("syntax error");
+        if (!end_given) return SyntaxError("syntax error");
       }
       if (bit_unit && !end_given) {
         end = static_cast<std::int64_t>(old.size() * 8) - 1;
@@ -629,7 +634,7 @@ bycorf::Task<std::string> RunBitmapLocked(
       WriteUnsignedBitField(&next, operation.offset_, operation.width_,
                             result.raw_);
     }
-    reply = std::move(builder).Release();
+    reply = std::move(builder).ReleaseCommandReply();
     if (!bitfield->writes_ || (exists && next == old)) {
       return storage::CompactValueUpdate{};
     }
@@ -651,7 +656,7 @@ bycorf::Task<std::string> RunBitmapLocked(
   co_return status.ok() ? reply : StorageError(status);
 }
 
-bycorf::Task<std::string> RunStringLocked(
+bycorf::Task<EncodedCommandReply> RunStringLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx,
     const storage::MutationPrecondition* mutation_precondition) {
@@ -703,7 +708,9 @@ bycorf::Task<std::string> RunStringLocked(
     auto expire_at =
         ParseExpireAt(args[2], seconds, false, seconds ? "setex" : "psetex");
     if (!expire_at.ok()) {
-      co_return EncodeError(absl::StrCat("ERR ", expire_at.status().message()));
+      co_return EncodeCommandError(
+          absl::StrCat("ERR ", expire_at.status().message()),
+          CommandErrorReasonForStatus(expire_at.status()));
     }
     storage::SetOptions options;
     options.expire_at_ms_ = *expire_at;
@@ -754,10 +761,12 @@ bycorf::Task<std::string> RunStringLocked(
        request.kind_ == CommandKind::kIncrBy ||
        request.kind_ == CommandKind::kDecrBy) &&
       !ParseRedisInt64(args[2], &first_integer)) {
-    co_return EncodeError("ERR value is not an integer or out of range");
+    co_return EncodeCommandError("ERR value is not an integer or out of range",
+                                 CommandErrorReason::kInvalidValue);
   }
   if (request.kind_ == CommandKind::kSetRange && first_integer < 0) {
-    co_return EncodeError("ERR offset is out of range");
+    co_return EncodeCommandError("ERR offset is out of range",
+                                 CommandErrorReason::kInvalidValue);
   }
   if (request.kind_ == CommandKind::kSetRange ||
       request.kind_ == CommandKind::kAppend) {
@@ -785,7 +794,8 @@ bycorf::Task<std::string> RunStringLocked(
                              RedisEqualsIgnoreCase(args[2], "exat") ||
                              RedisEqualsIgnoreCase(args[2], "pxat"));
     if (args.size() != 2 && !persist && !expiration) {
-      co_return EncodeError("ERR syntax error");
+      co_return EncodeCommandError("ERR syntax error",
+                                   CommandErrorReason::kSyntax);
     }
     if (tx == nullptr && persist) {
       replication = PrepareReplicationCommand(request, {"PERSIST", args[1]});
@@ -1011,7 +1021,7 @@ absl::StatusOr<LcsOptions> ParseLcsOptions(CommandArgsView args) {
             std::min<std::int64_t>(parsed, UINT32_MAX));
       }
     } else {
-      return absl::InvalidArgumentError("syntax error");
+      return SyntaxError("syntax error");
     }
   }
   if (options.length_only_ && options.indexes_) {
@@ -1198,7 +1208,7 @@ absl::StatusOr<BitOp> ParseBitOp(const CommandRequest& request) {
   else if (RedisEqualsIgnoreCase(name, "not"))
     operation = BitOp::kNot;
   else
-    return absl::InvalidArgumentError("syntax error");
+    return SyntaxError("syntax error");
   if (operation == BitOp::kNot && request.args_.size() != 4) {
     return absl::InvalidArgumentError(
         "BITOP NOT must be called with a single source key.");
@@ -1397,6 +1407,7 @@ bycorf::Task<CommandReply> ExecuteStringCommandLocked(
     if (!ParseRedisInt64(request.args_[2], &start) ||
         !ParseRedisInt64(request.args_[3], &stop)) {
       co_return Built(reply_builder.AppendError(
+          CommandErrorReason::kInvalidValue,
           "ERR value is not an integer or out of range"));
     }
     auto result = co_await g_storage->ExecuteStringSegmentLocked(
@@ -1410,7 +1421,7 @@ bycorf::Task<CommandReply> ExecuteStringCommandLocked(
     }
     co_return Built(reply_builder.AppendBulkString(result->value_));
   }
-  std::string encoded =
+  EncodedCommandReply encoded =
       co_await RunStringLocked(request, digest, tx, mutation_precondition);
   co_return Built(reply_builder.AppendRaw(encoded));
 }
@@ -1434,7 +1445,7 @@ bycorf::Task<CommandReply> ExecuteBitmapCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder,
     const storage::MutationPrecondition* mutation_precondition) {
-  std::string encoded =
+  EncodedCommandReply encoded =
       co_await RunBitmapLocked(request, digest, tx, mutation_precondition);
   co_return Built(reply_builder.AppendRaw(encoded));
 }
@@ -1444,6 +1455,7 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   auto operation = ParseBitOp(request);
   if (!operation.ok()) {
     co_return Built(reply_builder.AppendError(
+        CommandErrorReasonForStatus(operation.status()),
         absl::StrCat("ERR ", operation.status().message())));
   }
   tx::Transaction transaction;
@@ -1473,7 +1485,8 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) {
     co_return Built(
-        reply_builder.AppendError(absl::StrCat("ERR ", status.message())));
+        reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                  absl::StrCat("ERR ", status.message())));
   }
   BitOpContext context{
       .request_ = &request,
@@ -1520,13 +1533,15 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   co_return Built(reply_builder.AppendInteger(context.output_.size()));
 }
 
-bycorf::Task<std::string> ExecuteBitOpLocked(
+bycorf::Task<EncodedCommandReply> ExecuteBitOpLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
   MarkReplicationCommandHandled(request);
   auto operation = ParseBitOp(request);
   if (!operation.ok())
-    co_return EncodeError(absl::StrCat("ERR ", operation.status().message()));
+    co_return EncodeCommandError(
+        absl::StrCat("ERR ", operation.status().message()),
+        CommandErrorReasonForStatus(operation.status()));
   BitOpContext context{
       .request_ = &request,
       .operation_ = *operation,
@@ -1546,7 +1561,7 @@ bycorf::Task<std::string> ExecuteBitOpLocked(
   for (std::size_t argument = 3; argument < request.args_.size(); ++argument) {
     const StringExecKey* key = find_key(argument);
     if (key == nullptr)
-      co_return EncodeError("ERR BITOP source key is missing");
+      co_return EncodeCommandError("ERR BITOP source key is missing");
     auto read = [&request, key, argument]() {
       return ReadOptionalStringLocked(request.db_id_, request.args_[argument],
                                       key->digest_);
@@ -1565,7 +1580,7 @@ bycorf::Task<std::string> ExecuteBitOpLocked(
   context.output_ = ComputeBitOp(context.operation_, context.inputs_);
   const StringExecKey* destination = find_key(2);
   if (destination == nullptr)
-    co_return EncodeError("ERR BITOP destination key is missing");
+    co_return EncodeCommandError("ERR BITOP destination key is missing");
   auto write = [&context, destination, &tx_writes]() {
     return WriteBitOpDestination(&context, destination->digest_,
                                  &tx_writes[destination->owner_]);
@@ -1601,27 +1616,31 @@ bycorf::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) {
     co_return Built(
-        reply_builder.AppendError(absl::StrCat("ERR ", status.message())));
+        reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                  absl::StrCat("ERR ", status.message())));
   }
   LcsReadContext context{.request_ = &request, .values_ = {}};
   status = co_await transaction.Execute(&LcsReadCallback, &context, true);
   if (!status.ok()) {
     co_return Built(
-        reply_builder.AppendError(absl::StrCat("ERR ", status.message())));
+        reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                  absl::StrCat("ERR ", status.message())));
   }
   auto options = ParseLcsOptions(request.args_);
   if (!options.ok()) {
     co_return Built(reply_builder.AppendError(
+        CommandErrorReasonForStatus(options.status()),
         absl::StrCat("ERR ", options.status().message())));
   }
   auto result = BuildLcsReply(context.values_[0], context.values_[1], *options,
                               request.resp_version_);
   co_return result.ok() ? Built(reply_builder.AppendRaw(*result))
                         : Built(reply_builder.AppendError(
+                              CommandErrorReasonForStatus(result.status()),
                               absl::StrCat("ERR ", result.status().message())));
 }
 
-bycorf::Task<std::string> ExecuteLcsLocked(
+bycorf::Task<EncodedCommandReply> ExecuteLcsLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys) {
   std::string values[2];
   // Preserve the GCC 13 coroutine-frame invariant from BITOP: each possible
@@ -1634,7 +1653,7 @@ bycorf::Task<std::string> ExecuteLcsLocked(
         break;
       }
     }
-    if (key == nullptr) co_return EncodeError("ERR LCS key is missing");
+    if (key == nullptr) co_return EncodeCommandError("ERR LCS key is missing");
     auto read = [&request, key, argument]() {
       return ReadOptionalStringLocked(request.db_id_, request.args_[argument],
                                       key->digest_);
@@ -1648,7 +1667,7 @@ bycorf::Task<std::string> ExecuteLcsLocked(
     }
     if (!value.ok()) {
       if (value.status().message().starts_with("WRONGTYPE ")) {
-        co_return EncodeError(
+        co_return EncodeCommandError(
             "ERR The specified keys must contain string values");
       }
       co_return StorageError(value.status());
@@ -1659,13 +1678,16 @@ bycorf::Task<std::string> ExecuteLcsLocked(
   if (request.args_[1] == request.args_[2]) values[1] = values[0];
   auto options = ParseLcsOptions(request.args_);
   if (!options.ok()) {
-    co_return EncodeError(absl::StrCat("ERR ", options.status().message()));
+    co_return EncodeCommandError(
+        absl::StrCat("ERR ", options.status().message()),
+        CommandErrorReasonForStatus(options.status()));
   }
   auto result =
       BuildLcsReply(values[0], values[1], *options, request.resp_version_);
   co_return result.ok()
       ? std::move(*result)
-      : EncodeError(absl::StrCat("ERR ", result.status().message()));
+      : EncodeCommandError(absl::StrCat("ERR ", result.status().message()),
+                           CommandErrorReasonForStatus(result.status()));
 }
 
 }  // namespace lavik

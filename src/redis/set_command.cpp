@@ -36,6 +36,7 @@
 #include "bycorf/runtime/worker.h"
 #include "cluster_gate.h"
 #include "lavik/command_table.h"
+#include "lavik/error_detail.h"
 #include "lavik/memory.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
@@ -59,12 +60,15 @@ std::string_view AppendStorageError(ReplyBuilder& builder,
                                     const absl::Status& status) {
   if (status.code() == absl::StatusCode::kResourceExhausted &&
       status.message().starts_with("OOM ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
   if (status.message().starts_with("WRONGTYPE ")) {
-    return builder.AppendError(status.message());
+    return builder.AppendError(CommandErrorReasonForStatus(status),
+                               status.message());
   }
-  return builder.AppendError("ERR " + std::string(status.message()));
+  return builder.AppendError(CommandErrorReasonForStatus(status),
+                             "ERR " + std::string(status.message()));
 }
 
 bool EqualsIgnoreCase(std::string_view left, std::string_view lower) {
@@ -135,6 +139,7 @@ Task<CommandReply> ExecuteSetCommandImpl(
       if (args.size() == 3) {
         if (!ParseInteger(args[2], &operation.count_) || operation.count_ < 0) {
           co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kInvalidValue,
               "ERR value is out of range, must be positive"));
         }
         operation.count_provided_ = true;
@@ -145,11 +150,12 @@ Task<CommandReply> ExecuteSetCommandImpl(
       if (args.size() == 3) {
         if (!ParseInteger(args[2], &operation.count_)) {
           co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kInvalidValue,
               "ERR value is not an integer or out of range"));
         }
         if (operation.count_ == std::numeric_limits<std::int64_t>::min()) {
-          co_return BuiltReply(
-              reply_builder.AppendError("ERR value is out of range"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kInvalidValue, "ERR value is out of range"));
         }
         operation.count_provided_ = true;
       }
@@ -166,11 +172,13 @@ Task<CommandReply> ExecuteSetCommandImpl(
         } else if (EqualsIgnoreCase(args[i], "count") && i + 1 < args.size()) {
           if (!ParseInteger(args[i + 1], &operation.scan_count_) ||
               operation.scan_count_ == 0) {
-            co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+            co_return BuiltReply(reply_builder.AppendError(
+                CommandErrorReason::kSyntax, "ERR syntax error"));
           }
           i += 2;
         } else {
-          co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+          co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kSyntax, "ERR syntax error"));
         }
       }
       break;
@@ -288,8 +296,7 @@ struct SetMultiContext {
 };
 
 absl::Status SetMultiOom() {
-  return absl::ResourceExhaustedError(
-      "OOM Set multi-key working set exceeds maxmemory");
+  return MemoryLimitError("OOM Set multi-key working set exceeds maxmemory");
 }
 
 bool AddWorkingBytes(std::size_t* bytes, std::size_t count,
@@ -588,6 +595,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   auto key_view = DetermineKeys(*request.spec_, args);
   if (!key_view.ok()) {
     co_return BuiltReply(reply_builder.AppendError(
+        CommandErrorReasonForStatus(key_view.status()),
         absl::StrCat("ERR ", key_view.status().message())));
   }
 
@@ -598,7 +606,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       std::int64_t parsed_limit = 0;
       if (option + 1 >= args.size() ||
           !EqualsIgnoreCase(args[option], "limit")) {
-        co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+        co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kSyntax, "ERR syntax error"));
       }
       if (!ParseInteger(args[option + 1], &parsed_limit) || parsed_limit < 0) {
         co_return BuiltReply(
@@ -681,7 +690,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) {
     co_return BuiltReply(
-        reply_builder.AppendError(absl::StrCat("ERR ", status.message())));
+        reply_builder.AppendError(CommandErrorReasonForStatus(status),
+                                  absl::StrCat("ERR ", status.message())));
   }
 
   if (context.single_shard_ && move) {
