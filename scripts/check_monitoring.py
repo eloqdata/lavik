@@ -116,11 +116,15 @@ def main():
                 run("promtool", "check", "rules", queries)
 
         def panel_ids(panels):
-            return {p["id"] for p in panels} | {
-                i for p in panels for i in panel_ids(p.get("panels", []))
-            }
+            for panel in panels:
+                yield panel["id"]
+                yield from panel_ids(panel.get("panels", []))
 
-        ids = panel_ids(dashboard["panels"])
+        all_ids = list(panel_ids(dashboard["panels"]))
+        ids = set(all_ids)
+        # Collapsed rows share the dashboard's ID namespace. A duplicate can
+        # silently direct alert links to an unrelated panel after a merge.
+        assert len(ids) == len(all_ids), f"Duplicate panel IDs: {dashboard_name}"
         current_alerts = next(p for p in dashboard["panels"] if p["id"] == table_id)
         # ALERTS contains labels, not annotations. Keep its dashboard navigation map
         # aligned with the rule annotations used by notification receivers.
