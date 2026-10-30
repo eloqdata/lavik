@@ -141,7 +141,11 @@ def pair(
             prepare_target(target)
         proxy.start()
         meta.start(initial_cluster_manifest=str(manifest))
-        meta.wait_leader()
+        # Long-lease scenarios permit a first election at ten seconds. The
+        # ordinary ten-second probe would race that valid election; include
+        # another election window for scheduling and status publication.
+        election_high_ms = int(raft_args[raft_args.index("--election-ms-high") + 1])
+        meta.wait_leader(timeout=max(10, 2 * election_high_ms / 1000))
         source.start()
         target.start()
         C.command(
@@ -2069,6 +2073,50 @@ def backpressured_shutdown(root):
             target.resume()
 
 
+def start_replica_backup(reader, timeout=10):
+    """Bound retries of definite backup refusals; preserve unknown outcomes."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            reply = reader.call("BGSAVE")
+            assert reply == "Background saving started", reply
+            return
+        except H.Failure as error:
+            # Meta READY can precede the initialization-to-Follow-Owner
+            # reconnect. Both LOADING replies reject BGSAVE before a snapshot
+            # is captured. The busy reply likewise admits no new job (the
+            # previous file can appear before its active-job flag clears).
+            # Transport failures and other errors have no safe retry here.
+            if str(error) not in (
+                "LOADING Redis is loading the dataset in memory",
+                "LOADING Lavik is loading the dataset from the primary",
+                "ERR Background save already in progress",
+            ):
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.05, remaining))
+
+
+def wait_backup_checkpoint(log_path, checkpoint, backup, transactions, timeout=10):
+    """Observe a held backup cut without hiding either producer's failure."""
+    deadline = time.monotonic() + timeout
+    while True:
+        # H.wait_until retries Failure/OSError, including a Future's original
+        # Redis/transport error. These producers cannot repair failed work, so
+        # surface their outcomes before trusting even an existing checkpoint.
+        for name, pending in (("backup", backup), ("transactions", transactions)):
+            if pending.done():
+                pending.result()
+                raise H.Failure(f"{name} finished before backup release: {checkpoint}")
+        if checkpoint in Path(log_path).read_text():
+            return
+        if time.monotonic() >= deadline:
+            raise H.Failure(f"timeout ({timeout}s) waiting for: {checkpoint}")
+        time.sleep(0.05)
+
+
 def replica_backup_during_exec(root):
     # Release builds keep the concurrent smoke test; fault-enabled binaries
     # additionally prove that replay reaches the closed backup gate.
@@ -2109,17 +2157,6 @@ def replica_backup_during_exec(root):
 
         old_full = Path(source.log_path).read_text().count("selected=FULL")
 
-        def start_backup():
-            try:
-                assert reader.call("BGSAVE") == "Background saving started"
-                return True
-            except H.Failure as error:
-                # File publication precedes clearing the active-job flag.
-                # Only this definite non-admission can be retried.
-                if str(error) == "ERR Background save already in progress":
-                    return False
-                raise
-
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 pending = pool.submit(write_transactions)
@@ -2137,28 +2174,30 @@ def replica_backup_during_exec(root):
                             hold.touch()
                             # BGSAVE replies only after its cut reopens. Run it
                             # separately while observing the target checkpoint.
-                            backup = pool.submit(start_backup)
+                            backup = pool.submit(start_replica_backup, reader)
                             try:
-                                H.wait_until(
-                                    "backup gates closed",
-                                    10,
-                                    lambda: "backup test checkpoint: database gates closed"
-                                    in Path(target.log_path).read_text(),
+                                wait_backup_checkpoint(
+                                    target.log_path,
+                                    "backup test checkpoint: database gates closed",
+                                    backup,
+                                    pending,
                                 )
-                                H.wait_until(
-                                    "replica EXEC blocked by backup",
-                                    10,
-                                    lambda: "backup test checkpoint: replica EXEC waiting for database admission"
-                                    in Path(target.log_path).read_text(),
+                                wait_backup_checkpoint(
+                                    target.log_path,
+                                    "backup test checkpoint: replica EXEC waiting for database admission",
+                                    backup,
+                                    pending,
                                 )
-                                assert not backup.done(), (
-                                    "backup cut reopened before release"
-                                )
+                                if backup.done():
+                                    backup.result()
+                                    raise H.Failure(
+                                        "backup cut reopened before release"
+                                    )
                             finally:
                                 hold.unlink(missing_ok=True)
-                            assert backup.result(timeout=10)
+                            backup.result(timeout=10)
                         else:
-                            H.wait_until("replica backup admitted", 10, start_backup)
+                            start_replica_backup(reader)
                         H.wait_until(
                             "replica backup completed",
                             30,
