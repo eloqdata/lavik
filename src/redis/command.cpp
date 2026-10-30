@@ -292,12 +292,14 @@ std::string_view AppendOomError(ReplyBuilder& reply_builder) {
 std::string_view AppendStorageRejection(ReplyBuilder& builder,
                                         const absl::Status& status) {
   const auto encoded = AppendStorageError(builder, status);
-  builder.SetOutcome({CommandResult::kRejected, builder.outcome().reason_});
+  builder.SetOutcome({CommandResult::kRejected, builder.outcome().reason_,
+                      builder.outcome().prefix_});
   return encoded;
 }
 std::string_view AppendOomRejection(ReplyBuilder& builder) {
   const auto encoded = AppendOomError(builder);
-  builder.SetOutcome({CommandResult::kRejected, CommandErrorReason::kOom});
+  builder.SetOutcome({CommandResult::kRejected, CommandErrorReason::kOom,
+                      builder.outcome().prefix_});
   return encoded;
 }
 

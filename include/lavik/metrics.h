@@ -158,9 +158,10 @@ void RecordRequestInputError(RequestInputError reason) noexcept;
 void RecordCommandError(CommandErrorPrefix prefix,
                         std::uint64_t count = 1) noexcept;
 // Records a terminal logical command on its coordinating worker and consumes
-// outcome.prefix_ as a newly constructed global error. Forwarded/already-counted
-// errors must leave prefix_ empty. Queueing and cancellation add no completed
-// call. Replication and background work must not enter this client interface.
+// outcome.prefix_ as a newly constructed global error.
+// Forwarded/already-counted errors must leave prefix_ empty. Queueing and
+// cancellation add no completed call. Replication and background work must not
+// enter this client interface.
 void RecordCommandResult(std::size_t command, CommandOutcome outcome,
                          std::uint64_t execution_ticks) noexcept;
 void RecordConnectionOpened() noexcept;

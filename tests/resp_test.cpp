@@ -718,7 +718,10 @@ TEST(ReplyBuilderTest, ErrorPrefixFollowsWireInsteadOfInternalReason) {
   builder.AppendError(CommandErrorReason::kAuth, "WRONGPASS ",
                       "invalid credentials");
   EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kWrongPass);
-  builder.SetOutcome({CommandResult::kRejected, CommandErrorReason::kAuth});
+  builder.Reset();
+  builder.AppendRejectedError(CommandErrorReason::kAuth,
+                              "WRONGPASS invalid credentials");
+  EXPECT_EQ(builder.outcome().result_, CommandResult::kRejected);
   EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kWrongPass);
   builder.Reset();
   builder.AppendError("USER_DEFINED customer detail");

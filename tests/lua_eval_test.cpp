@@ -164,9 +164,9 @@ TEST(LuaEvalTest, CaughtBoundaryErrorsAndNestedNewErrorsAreCounted) {
 
 TEST(LuaEvalTest, ErrorProvenanceRequiresBooleanAndTransportIsBounded) {
   const std::vector<std::string> no_arguments;
-  for (const auto script : {
-           "return {err='ERR test',ignore_error_stats_update='false'}",
-           "error({err='ERR test',ignore_error_stats_update=1})"}) {
+  for (const auto script :
+       {"return {err='ERR test',ignore_error_stats_update='false'}",
+        "error({err='ERR test',ignore_error_stats_update=1})"}) {
     auto execution =
         lavik::LuaExecution::Create(script, no_arguments, no_arguments);
     ASSERT_TRUE(execution.ok());
@@ -175,9 +175,9 @@ TEST(LuaEvalTest, ErrorProvenanceRequiresBooleanAndTransportIsBounded) {
     EXPECT_EQ(step.errors_[0].prefix_, lavik::CommandErrorPrefix::kErr);
     EXPECT_EQ(step.errors_[0].count_, 1);
   }
-  auto execution = lavik::LuaExecution::Create(
-      "for i=1,1000 do redis.pcall() end; return 1", no_arguments,
-      no_arguments);
+  auto execution =
+      lavik::LuaExecution::Create("for i=1,1000 do redis.pcall() end; return 1",
+                                  no_arguments, no_arguments);
   ASSERT_TRUE(execution.ok());
   const auto step = (*execution)->Start(false);
   EXPECT_EQ(step.reply_, ":1\r\n");

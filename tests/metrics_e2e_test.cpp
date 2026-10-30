@@ -712,9 +712,9 @@ TEST_F(CommandResultsE2eTest, ReusedScriptErrorFailsTheParentOnce) {
   ASSERT_EQ(client_->Command({"SET", "reused:error", "text"}), "+OK");
   EXPECT_TRUE(
       client_
-          ->RawCommand({"EVAL",
-                        "local e=redis.pcall('LPUSH',KEYS[1],'x'); return {e,e}",
-                        "1", "reused:error"})
+          ->RawCommand(
+              {"EVAL", "local e=redis.pcall('LPUSH',KEYS[1],'x'); return {e,e}",
+               "1", "reused:error"})
           .starts_with("*2\r\n-WRONGTYPE"));
   EXPECT_EQ(Calls("eval"), 1);
   EXPECT_EQ(Failed("eval"), 1);
