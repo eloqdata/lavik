@@ -820,12 +820,14 @@ def mixed_full_limit(root):
                 "durably invalidated system state" in Path(first.log_path).read_text()
             )
             target_hold.unlink()
+            # Retry logs are rate-limited; count actual admission rounds while
+            # the source slot is held, independently of log emission cadence.
             H.wait_until(
                 "other native entrypoint retries shared busy slot",
                 15,
-                lambda: Path(waiting.log_path)
-                .read_text()
-                .count("native FULL admission is busy")
+                lambda: waiting.metric(
+                    "lavik_replication_retries_total", '{reason="full_busy"}'
+                )
                 >= 3,
             )
             assert (
