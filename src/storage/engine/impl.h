@@ -2647,6 +2647,13 @@ class StorageEngine::Impl {
       PreparedOrderedMutation* prepared = nullptr,
       SortedSetOrderedProbe* ordered_probe = nullptr);
 
+  // Requires the member directory's seed to match the public scan cursor
+  // seed. Retains one checked member leaf and admitted owned output at a time.
+  Task<absl::StatusOr<SortedSetResult>> ScanGroupedSortedSetMembers(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedObject::Handle object);
+
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
@@ -2857,6 +2864,18 @@ class StorageEngine::Impl {
                           MutationPrecondition mutation_precondition);
 
   Task<StorageDurabilityStats> DurabilityStats() const;
+
+  // Startup durability checks keep an uninterrupted owner-local scan.
+  // Observability scans yield between bounded batches on the owner.
+  std::uint64_t LocalDirtyStagingBytes() const;
+  Task<std::uint64_t> CollectLocalDirtyStagingBytes() const;
+  void UpdateDurabilityPending(StorageDurabilityStats& stats) const;
+
+  // Full metrics can collect replication in the same worker visits. INFO
+  // leaves this null, avoiding replication traversal and vector allocation.
+  Task<StorageDiagnosticsSnapshot> CollectDiagnostics(
+      std::vector<StorageReplicationLogMetrics>* replication_logs =
+          nullptr) const;
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 

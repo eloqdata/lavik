@@ -161,9 +161,10 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
 bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
 
-// Collects owner-worker snapshots into Prometheus text. Before readiness only
-// lavik_server_ready is emitted. The optional native observer is borrowed for
-// the duration of this coroutine; no replication decisions depend on a scrape.
+// Contiguous rendering adapter for callers that need an owned string. The HTTP
+// exporter uses the same renderer with borrowed static text and owned values.
+// Before readiness only lavik_server_ready is emitted. The optional native
+// observer is borrowed for this coroutine; no replication decision uses a scrape.
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
     std::string* output, const ReplicationManager* replication = nullptr);

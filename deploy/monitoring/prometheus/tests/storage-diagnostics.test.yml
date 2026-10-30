@@ -1,0 +1,2999 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+rule_files:
+  - ../rules/recording.yml
+  - ../rules/alerts.yml
+evaluation_interval: 15s
+group_eval_order:
+  - lavik.recording
+  - lavik.alerts
+tests:
+  - name: backlog needs full window and for, then recovers
+    interval: 15s
+    input_series:
+      - &server_ready
+        series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - &memory_rejected_commands_total
+        series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &worker_retained_memory_bytes
+        series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 10x160
+      - &worker_memory_admission_pending_bytes
+        series: lavik_worker_memory_admission_pending_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &worker_fullsync_reserved_memory_bytes
+        series: lavik_worker_fullsync_reserved_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &worker_memory_limit_bytes
+        series: lavik_worker_memory_limit_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - &capacity_bytes
+        series: lavik_storage_capacity_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - &available_bytes
+        series: lavik_storage_available_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 50x160
+      - &replication_backlog_active
+        series: lavik_replication_backlog_active{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &replication_backlog_pinned_cursors
+        series: lavik_replication_backlog_pinned_cursors{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &replication_backlog_backpressured
+        series: lavik_replication_backlog_backpressured{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &replication_publish_queue_bytes
+        series: lavik_replication_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &replication_publish_queue_capacity_bytes
+        series: lavik_replication_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - &fullsync_publish_queue_bytes
+        series: lavik_fullsync_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &fullsync_publish_queue_admitted_bytes
+        series: lavik_fullsync_publish_queue_admitted_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &fullsync_publish_queue_capacity_bytes
+        series: lavik_fullsync_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - &fullsync_sessions
+        series: lavik_fullsync_sessions{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &cluster_control_connected
+        series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &cluster_control_protocol_errors_total
+        series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &cluster_control_lease_expirations_total
+        series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x64 0x96
+      - &tx_backlog_max_bytes
+        series: lavik_storage_tx_backlog_max_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_cleaner_rounds_total
+        series: lavik_storage_tx_cleaner_rounds_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_cleaner_failures_total
+        series: lavik_storage_tx_cleaner_failures_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_cleaner_retired_blocks_total
+        series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_cleaner_running
+        series: lavik_storage_tx_cleaner_running{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_cleaner_cooldown_seconds
+        series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 60x160
+      - &tx_commit_batches_total
+        series: lavik_storage_tx_commit_batches_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_batch_transactions_total
+        series: lavik_storage_tx_commit_batch_transactions_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_input_fences_total
+        series: lavik_storage_tx_commit_input_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_merged_fences_total
+        series: lavik_storage_tx_commit_merged_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_backpressure_waits_total
+        series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_queue_depth
+        series: lavik_storage_tx_commit_queue_depth{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_queue_peak
+        series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commit_queue_high_watermark
+        series: lavik_storage_tx_commit_queue_high_watermark{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 4096x160
+      - &dirty_staging_bytes
+        series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &flushes_pending
+        series: lavik_storage_flushes_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &tx_commits_pending
+        series: lavik_storage_tx_commits_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &durability_pending
+        series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &expiration_pause_count
+        series: lavik_storage_expiration_pause_count{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &io_operations_total_write
+        series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &io_operations_total_fdatasync
+        series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - &up
+        series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 14m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 15m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 18m30s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: managed storage uses the same policy
+    interval: 15s
+    input_series:
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 10x160
+      - series: lavik_worker_memory_admission_pending_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_memory_limit_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_capacity_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_available_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 50x160
+      - series: lavik_replication_backlog_active{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_pinned_cursors{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_backpressured{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_sessions{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1+100x160
+      - series: lavik_storage_tx_backlog_max_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_rounds_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_failures_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_running{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 60x160
+      - series: lavik_storage_tx_commit_batches_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_batch_transactions_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_input_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_merged_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_depth{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_high_watermark{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 4096x160
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_flushes_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commits_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_expiration_pause_count{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 15m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: managed durability uses the same policy
+    interval: 15s
+    input_series:
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 10x160
+      - series: lavik_worker_memory_admission_pending_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_memory_limit_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_capacity_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_available_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 50x160
+      - series: lavik_replication_backlog_active{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_pinned_cursors{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_backpressured{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_sessions{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_max_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_rounds_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_failures_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_running{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 60x160
+      - series: lavik_storage_tx_commit_batches_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_batch_transactions_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_input_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_merged_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_depth{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_high_watermark{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 4096x160
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_flushes_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commits_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+      - series: lavik_storage_expiration_pause_count{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: managed backpressure uses the same policy
+    interval: 15s
+    input_series:
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 10x160
+      - series: lavik_worker_memory_admission_pending_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_memory_limit_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_capacity_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_available_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 50x160
+      - series: lavik_replication_backlog_active{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_pinned_cursors{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_backpressured{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_sessions{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_max_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_rounds_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_failures_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_running{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 60x160
+      - series: lavik_storage_tx_commit_batches_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_batch_transactions_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_input_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_merged_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 0+30x160
+      - series: lavik_storage_tx_commit_queue_depth{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_high_watermark{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 4096x160
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_flushes_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commits_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_expiration_pause_count{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 8m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: managed missing storage inputs warn
+    interval: 15s
+    input_series:
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+      - series: lavik_memory_rejected_commands_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_retained_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 10x160
+      - series: lavik_worker_memory_admission_pending_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_fullsync_reserved_memory_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_worker_memory_limit_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_capacity_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_storage_available_bytes{device="0",path="/data",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 50x160
+      - series: lavik_replication_backlog_active{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_pinned_cursors{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_backlog_backpressured{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_replication_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_publish_queue_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_admitted_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_fullsync_publish_queue_capacity_bytes{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 100x160
+      - series: lavik_fullsync_sessions{worker="0",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_connected{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_protocol_errors_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_backlog_max_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_rounds_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_failures_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_running{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 60x160
+      - series: lavik_storage_tx_commit_batches_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_batch_transactions_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_input_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_merged_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_depth{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commit_queue_high_watermark{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 4096x160
+      - series: lavik_storage_flushes_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_tx_commits_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_expiration_pause_count{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: "0x160"
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="meta-managed"}
+        values: 1x160
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: reclamation progress prevents backlog warning
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+1x160
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: disabled cleaner is intentional
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: long cooldown needs a tuned observation window
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 301x160
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: cooldown change must age out of the full window
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 600x40 60x120
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 24m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 25m15s
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: backlog counter reset requires a fresh window
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x40 0x120
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 20m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 25m15s
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: constant backlog alone is not sustained growth
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: durability needs five minutes plus for, then recovers
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - &tx_backlog_bytes
+        series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x48 0x112
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 9m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 14m30s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: ongoing writes prevent no-progress warning
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+1x160
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: ongoing fdatasync prevents no-progress warning
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+1x160
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: I/O counter reset requires a fresh progress window
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x24 0x136
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 16m15s
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: transient pending does not warn
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x12 0x148
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: sustained actual commit backpressure warns and resolves
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+30x40 1200x120
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 7m30s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 8m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 18m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: low wait rate does not warn
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+1x160
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: historical peak is not current pressure
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100000x160
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: counter reset does not become backpressure
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x40 0x120
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: not-ready storage suppresses derived warnings
+    interval: 15s
+    input_series:
+      - series: lavik_server_ready{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+30x160
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: down target suppresses derived warnings
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0+30x160
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - series: up{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x160"
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikTxCommitBackpressure",alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: idle healthy zero values do not warn
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing"}) or vector(0)
+        eval_time: 30m
+        exp_samples:
+          - labels: "{}"
+            value: 0
+  - name: missing input lavik_storage_tx_backlog_bytes
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_backlog_max_bytes
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_cleaner_rounds_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_cleaner_failures_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_cleaner_retired_blocks_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_cleaner_running
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_cleaner_cooldown_seconds
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_batches_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_batch_transactions_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_input_fences_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_merged_fences_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_backpressure_waits_total
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_queue_depth
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_queue_peak
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commit_queue_high_watermark
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_dirty_staging_bytes
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_flushes_pending
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_tx_commits_pending
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_durability_pending
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_expiration_pause_count
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_io_operations_total{operation="write"}
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: missing input lavik_storage_io_operations_total{operation="fdatasync"}
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 4m45s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 5m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: lost write input cannot masquerade as no progress
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - *tx_backlog_bytes
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - *tx_cleaner_retired_blocks_total
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 100x160
+      - *flushes_pending
+      - *tx_commits_pending
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1x160
+      - *expiration_pause_count
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0x48 stale
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 10m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertname="LavikStorageDurabilityNoProgress",alertstate="firing"}) or vector(0)
+        eval_time: 14m30s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 18m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+  - name: lost cleaner input cannot masquerade as no progress
+    interval: 15s
+    input_series:
+      - *server_ready
+      - *memory_rejected_commands_total
+      - *worker_retained_memory_bytes
+      - *worker_memory_admission_pending_bytes
+      - *worker_fullsync_reserved_memory_bytes
+      - *worker_memory_limit_bytes
+      - *capacity_bytes
+      - *available_bytes
+      - *replication_backlog_active
+      - *replication_backlog_pinned_cursors
+      - *replication_backlog_backpressured
+      - *replication_publish_queue_bytes
+      - *replication_publish_queue_capacity_bytes
+      - *fullsync_publish_queue_bytes
+      - *fullsync_publish_queue_admitted_bytes
+      - *fullsync_publish_queue_capacity_bytes
+      - *fullsync_sessions
+      - *cluster_control_connected
+      - *cluster_control_protocol_errors_total
+      - *cluster_control_lease_expirations_total
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 1+100x160
+      - *tx_backlog_max_bytes
+      - *tx_cleaner_rounds_total
+      - *tx_cleaner_failures_total
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: 0x64 stale
+      - *tx_cleaner_running
+      - *tx_cleaner_cooldown_seconds
+      - *tx_commit_batches_total
+      - *tx_commit_batch_transactions_total
+      - *tx_commit_input_fences_total
+      - *tx_commit_merged_fences_total
+      - *tx_commit_backpressure_waits_total
+      - *tx_commit_queue_depth
+      - *tx_commit_queue_peak
+      - *tx_commit_queue_high_watermark
+      - *dirty_staging_bytes
+      - *flushes_pending
+      - *tx_commits_pending
+      - *durability_pending
+      - *expiration_pause_count
+      - *io_operations_total_write
+      - *io_operations_total_fdatasync
+      - *up
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 15m
+        exp_samples:
+          - labels: "{}"
+            value: 1
+      - expr: count(ALERTS{alertname="LavikTxBacklogNotDraining",alertstate="firing"}) or vector(0)
+        eval_time: 18m30s
+        exp_samples:
+          - labels: "{}"
+            value: 0
+      - expr: count(ALERTS{alertname="LavikMetricsMissing",alertstate="firing",signal="storage_diagnostics"}) or vector(0)
+        eval_time: 22m
+        exp_samples:
+          - labels: "{}"
+            value: 1

@@ -4888,11 +4888,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   if (wants("stats")) {
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     const storage::DefragTotals defrag = g_storage->DefragStats();
-    const storage::TxCleanerTotals tx_cleaner = g_storage->TxCleanerStats();
-    const storage::TxCommitBatchTotals tx_commit_batches =
-        g_storage->TxCommitBatchStats();
-    const storage::StorageDurabilityStats durability =
-        co_await g_storage->DurabilityStats();
+    const storage::StorageDiagnosticsSnapshot diagnostics =
+        co_await g_storage->CollectDiagnostics();
+    const auto& tx_cleaner = diagnostics.tx_cleaner_;
+    const auto& tx_commit_batches = diagnostics.tx_commit_batches_;
+    const auto& durability = diagnostics.durability_;
     info += "# Stats\r\n";
     info += "total_commands_processed:" +
             std::to_string(runtime_metrics->TotalCalls()) + "\r\n";
@@ -4964,7 +4964,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info += "storage_dirty_staging_bytes:" +
             std::to_string(durability.dirty_staging_bytes_) + "\r\n";
     info += "storage_expiration_pause_count:" +
-            std::to_string(g_storage->ExpirationPauseCount()) + "\r\n";
+            std::to_string(diagnostics.expiration_pause_count_) + "\r\n";
     info += "storage_flushes_pending:" +
             std::to_string(durability.flushes_pending_) + "\r\n";
     info += "storage_tx_commits_pending:" +

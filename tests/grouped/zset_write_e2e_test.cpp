@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <optional>
@@ -2263,6 +2264,192 @@ TEST(GroupedSortedSetWriteE2e, PageScanRepliesOwnBinaryMembersAcrossRecovery) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
+}
+
+TEST(GroupedSortedSetWriteE2e, MemberScansPreserveContentsAndMutationCursors) {
+  PrivateDisk disk;
+  const std::string key = "member-scan";
+  const auto member = [](unsigned i) {
+    // Include an external member leaf as well as ordinary inline leaves.
+    return std::string(i % 2 ? "keep:" : "drop:") + std::to_string(i) +
+           std::string("\0", 1) +
+           std::string(i == 1023 ? 128 * 1024 : 128, 'm');
+  };
+  std::map<std::string, double> expected;
+  for (unsigned i = 0; i < 1024; ++i) expected.emplace(member(i), i / 8);
+  expected[member(1)] = -0.0;
+  expected[member(1021)] = std::numeric_limits<double>::infinity();
+  expected[member(1022)] = -std::numeric_limits<double>::infinity();
+  expected[member(1023)] = 1.25;
+  const auto scan = [&](Client& client, unsigned count, bool mutate,
+                        std::string_view pattern) {
+    std::set<std::string> seen;
+    std::uint64_t cursor = 0;
+    bool complete = false;
+    for (unsigned step = 0; step < 4096; ++step) {
+      const auto reply = client.Command({"ZSCAN", key, std::to_string(cursor),
+                                         "COUNT", std::to_string(count),
+                                         "MATCH", std::string(pattern)});
+      ASSERT_EQ(reply.items_.size(), 2) << reply.text_;
+      const auto& entries = reply.items_[1].items_;
+      ASSERT_EQ(entries.size() % 2, 0);
+      for (std::size_t i = 0; i < entries.size(); i += 2) {
+        const auto& name = entries[i].text_;
+        ASSERT_TRUE(expected.contains(name));
+        EXPECT_EQ(std::stod(entries[i + 1].text_), expected.at(name));
+        EXPECT_EQ(std::signbit(std::stod(entries[i + 1].text_)),
+                  std::signbit(expected.at(name)));
+        EXPECT_TRUE(seen.insert(name).second);
+      }
+      const auto next = std::stoull(reply.items_[0].text_);
+      if (next == 0) {
+        complete = true;
+        break;
+      }
+      ASSERT_GT(next, cursor);
+      cursor = next;
+      if (mutate && step == 0) {
+        // Force changes to member-prefix leaves between cursor calls. Every
+        // odd original member remains present throughout the traversal.
+        std::vector<std::string> remove{"ZREM", key};
+        for (unsigned i = 0; i < 1024; i += 2) {
+          remove.push_back(member(i));
+          expected.erase(member(i));
+        }
+        ASSERT_EQ(client.Command(remove).text_, "512");
+        std::vector<std::string> add{"ZADD", key};
+        for (unsigned i = 1024; i < 1536; ++i) {
+          add.insert(add.end(), {std::to_string(i / 8), member(i)});
+          expected.emplace(member(i), i / 8);
+        }
+        ASSERT_EQ(client.Command(add).text_, "512");
+      }
+    }
+    EXPECT_TRUE(complete);
+    if (mutate) {
+      for (unsigned i = 1; i < 1024; i += 2)
+        EXPECT_TRUE(seen.contains(member(i)));
+    } else {
+      std::set<std::string> wanted;
+      for (const auto& [name, score] : expected)
+        if (pattern == "*" ||
+            (pattern == "keep:*" && name.starts_with("keep:")))
+          wanted.insert(name);
+      EXPECT_EQ(seen, wanted);
+    }
+  };
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (const auto& [name, score] : expected)
+      seed.insert(seed.end(), {std::to_string(score), name});
+    ASSERT_EQ(client.Command(seed).text_, "1024");
+    for (const auto count : {7u, 37u, 2048u}) scan(client, count, false, "*");
+    scan(client, 37, false, "keep:*");
+    scan(client, 37, false, "missing:*");
+    scan(client, 7, true, "*");
+    scan(client, 37, false, "*");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // Cold recovery changes the process seed. The fallback must produce the
+  // same complete logical result even though the persisted routing differs.
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  scan(client, 37, false, "*");
+  scan(client, 37, false, "keep:*");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, MemberScansSurviveDemotionAndPromotion) {
+  PrivateDisk disk;
+  const std::string key = "scan-representation";
+  const auto padding = [](unsigned generation, unsigned i) {
+    return std::to_string(generation) + ":" + std::to_string(i) +
+           std::string(512, 'p');
+  };
+  const std::set<std::string> stable{"keep:0", "keep:1", "keep:2", "keep:3"};
+  for (unsigned pass = 0; pass < 2; ++pass) {
+    // The second pass begins with a cold-recovered member directory and a
+    // fresh process seed, exercising the fallback-to-compact transition too.
+    Server server(disk, pass == 0 ? 2 : 3);
+    Client client(server.port());
+    if (pass == 0) {
+      std::vector<std::string> seed{"ZADD", key};
+      for (const auto& name : stable) seed.insert(seed.end(), {"1", name});
+      for (unsigned i = 0; i < 64; ++i)
+        seed.insert(seed.end(), {"1", padding(0, i)});
+      ASSERT_EQ(client.Command(seed).text_, "68");
+    }
+    std::set<std::string> seen;
+    std::uint64_t cursor = 0;
+    const auto page = [&] {
+      const auto reply =
+          client.Command({"ZSCAN", key, std::to_string(cursor), "COUNT", "1"});
+      ASSERT_EQ(reply.items_.size(), 2) << reply.text_;
+      const auto& entries = reply.items_[1].items_;
+      ASSERT_EQ(entries.size() % 2, 0);
+      for (std::size_t i = 0; i < entries.size(); i += 2) {
+        EXPECT_EQ(entries[i + 1].text_, "1");
+        if (stable.contains(entries[i].text_))
+          EXPECT_TRUE(seen.insert(entries[i].text_).second);
+      }
+      const auto next = std::stoull(reply.items_[0].text_);
+      if (next != 0) EXPECT_GT(next, cursor);
+      cursor = next;
+    };
+    page();
+    ASSERT_NE(cursor, 0);
+    std::vector<std::string> remove{"ZREM", key};
+    for (unsigned i = 0; i < 64; ++i) remove.push_back(padding(pass % 2, i));
+    ASSERT_EQ(client.Command(remove).text_, "64");
+    // Only four short members remain, below the compact demotion threshold.
+    page();
+    ASSERT_NE(cursor, 0);
+    std::vector<std::string> add{"ZADD", key};
+    for (unsigned i = 0; i < 64; ++i)
+      add.insert(add.end(), {"1", padding((pass + 1) % 2, i)});
+    ASSERT_EQ(client.Command(add).text_, "64");
+    for (unsigned step = 0; cursor != 0 && step < 256; ++step) page();
+    EXPECT_EQ(cursor, 0);
+    EXPECT_EQ(seen, stable);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+}
+
+TEST(GroupedSortedSetWriteE2e, MemberScansAvoidOrderedPagesAfterCheckpoint) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "member-scan-checkpoint";
+  constexpr std::string_view extra[] = {"--shutdown-checkpoint"};
+  {
+    Server server(disk, 2, {}, {}, false, 2, "2G", {}, {}, 0, 20, extra);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key.c_str());
+  // Fault ordinals are one-based; zero would leave the negative control
+  // unarmed.
+  ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "1");
+  Server recovered(disk, 2, {}, {}, false, 2, "2G", {}, {}, 0, 20, extra);
+  Client client(recovered.port());
+  ASSERT_NE(recovered.Log().find("loaded shutdown checkpoint"),
+            std::string::npos)
+      << recovered.Log();
+  const auto reply = client.Command({"ZSCAN", key, "0", "COUNT", "512"});
+  ASSERT_EQ(reply.items_.size(), 2) << reply.text_;
+  EXPECT_EQ(reply.items_[0].text_, "0");
+  EXPECT_EQ(reply.items_[1].items_.size(), 512);
+  const auto failed = client.Command({"ZRANGE", key, "0", "-1"});
+  EXPECT_EQ(failed.kind_, '-');
+  EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
 TEST(GroupedSortedSetWriteE2e, ScanCursorsAndAllPopEntryPointsRecover) {

@@ -2206,6 +2206,8 @@ endforeach()
       tests/metrics_e2e_test.cpp
     )
     target_link_libraries(lavik_metrics_e2e_test PRIVATE GTest::gtest)
+    target_compile_definitions(lavik_metrics_e2e_test PRIVATE
+      LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>)
     add_test(
       NAME lavik_metrics_e2e
       COMMAND lavik_metrics_e2e_test $<TARGET_FILE:lavik>

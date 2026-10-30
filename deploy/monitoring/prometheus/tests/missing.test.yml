@@ -51,6 +51,50 @@ tests:
         values: "0x200"
       - series: lavik_cluster_control_lease_expirations_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
         values: "0x200"
+      - series: lavik_storage_tx_backlog_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_backlog_max_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_cleaner_rounds_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_cleaner_failures_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_cleaner_retired_blocks_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_cleaner_running{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_cleaner_cooldown_seconds{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "60x200"
+      - series: lavik_storage_tx_commit_batches_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_batch_transactions_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_input_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_merged_fences_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_backpressure_waits_total{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_queue_depth{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_queue_peak{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commit_queue_high_watermark{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "4096x200"
+      - series: lavik_storage_dirty_staging_bytes{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_flushes_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_tx_commits_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_durability_pending{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_expiration_pause_count{job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_io_operations_total{operation="write",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
+      - series: lavik_storage_io_operations_total{operation="fdatasync",job="lavik",cluster="test",instance="data:9100",lavik_mode="standalone"}
+        values: "0x200"
     promql_expr_test:
       - expr: count(ALERTS{alertstate="firing"}) or vector(0)
         eval_time: 30m

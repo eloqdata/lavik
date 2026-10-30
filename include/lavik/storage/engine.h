@@ -149,6 +149,7 @@ struct DefragTotals {
 // appending its commit decision.
 struct StorageDurabilityStats {
   std::uint64_t dirty_staging_bytes_ = 0;
+  // Active per-worker flush runners, not queued blocks or individual I/Os.
   unsigned flushes_pending_ = 0;
   std::uint64_t tx_commits_pending_ = 0;
 
@@ -262,20 +263,38 @@ struct TxCleanerTotals {
   std::uint32_t cooldown_ms_ = 0;
   // Occupied Tx-record bytes in sealed, unreclaimed blocks across workers.
   std::uint64_t tx_backlog_bytes_total_ = 0;
-  // Largest such backlog on one worker; admission is assessed per worker.
+  // Largest such backlog on one worker. Neither byte gauge is an admission
+  // threshold, block count, or estimate of retained metadata memory.
   std::uint64_t tx_backlog_bytes_max_ = 0;
   bool running_ = false;
 };
 
 struct TxCommitBatchTotals {
+  // Counted when dequeued for processing, before durability succeeds.
   std::uint64_t batches_ = 0;
   std::uint64_t transactions_ = 0;
   std::uint64_t input_fences_ = 0;
   std::uint64_t merged_fences_ = 0;
+  // Process-wide queued receipts; dequeued, in-flight batches are excluded.
   std::uint64_t queue_depth_ = 0;
+  // Historical process-wide maximum, retained when the queue drains.
   std::uint64_t queue_peak_ = 0;
+  // Enqueues that encountered the local watermark, not time spent waiting.
   std::uint64_t backpressure_waits_ = 0;
+  // Per-worker threshold: not a denominator for the process-wide depth.
   std::uint64_t queue_high_watermark_ = 0;
+};
+
+// Shared cold-path diagnostics for INFO and Prometheus. Each field retains its
+// source's observation semantics; this is not an atomic cross-worker cut.
+// Storage counters are reinitialized with the engine; CONFIG RESETSTAT does
+// not clear them. An initialized idle engine reports zero pending work.
+struct StorageDiagnosticsSnapshot {
+  TxCleanerTotals tx_cleaner_;
+  TxCommitBatchTotals tx_commit_batches_;
+  StorageDurabilityStats durability_;
+  // Current nesting depth of explicit expiration pauses, not pause events.
+  std::uint32_t expiration_pause_count_ = 0;
 };
 
 struct StorageDeviceMetrics {
@@ -310,6 +329,7 @@ struct StorageReplicationLogMetrics {
 struct StorageMetricsSnapshot {
   std::vector<StorageDeviceMetrics> devices_;
   std::vector<StorageReplicationLogMetrics> replication_logs_;
+  StorageDiagnosticsSnapshot diagnostics_;
 };
 
 struct ScanBatch {
@@ -2126,6 +2146,12 @@ class StorageEngine {
   std::uint32_t TxCleanerCooldownMs() const noexcept;
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
+  // Collect existing diagnostics without running INFO. Mutable staging is
+  // sampled on each data worker without locking. Large slot tables yield
+  // between bounded batches; each batch reads without suspension. The
+  // pending durability counts retain conservative before/after sampling.
+  // Requires initialized workers that remain alive until collection finishes.
+  bycorf::Task<StorageDiagnosticsSnapshot> CollectDiagnostics() const;
   bycorf::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
