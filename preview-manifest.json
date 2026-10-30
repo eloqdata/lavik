@@ -1,21 +1,21 @@
 {
   "prometheus_version": "3.11.3",
   "grafana_version": "13.1.0",
-  "lavik_sha256": "fa6017f047df989de897bb83a75ab9f6fe743b7facef0296dd587699ac8f69ac",
+  "lavik_sha256": "416cded1e4b77ebd1af95b9dd3cd34ce856d32e47151ea3f71597027b6c5c3e6",
   "ports": {
-    "redis": 38449,
-    "metrics": 39219,
-    "prometheus": 52727,
-    "grafana": 54715
+    "redis": 47909,
+    "metrics": 54187,
+    "prometheus": 58089,
+    "grafana": 40657
   },
   "idle": [
     {
       "metric": {
         "command": "lpush",
-        "instance": "127.0.0.1:39219"
+        "instance": "127.0.0.1:54187"
       },
       "value": [
-        1793363070.705,
+        1793363971.159,
         "0"
       ]
     }
@@ -24,11 +24,11 @@
     {
       "metric": {
         "command": "lpush",
-        "instance": "127.0.0.1:39219"
+        "instance": "127.0.0.1:54187"
       },
       "value": [
-        1793363112.742,
-        "0.9897582540125055"
+        1793364013.193,
+        "0.9895953433821053"
       ]
     }
   ],
@@ -36,23 +36,23 @@
     {
       "metric": {
         "command": "lpush",
-        "instance": "127.0.0.1:39219"
+        "instance": "127.0.0.1:54187"
       },
       "value": [
-        1793363112.743,
+        1793364013.194,
         "0"
       ]
     }
   ],
-  "response_bytes": 49557,
+  "response_bytes": 52288,
   "reset": [
     {
       "metric": {
         "command": "lpush",
-        "instance": "127.0.0.1:39219"
+        "instance": "127.0.0.1:54187"
       },
       "value": [
-        1793363136.143,
+        1793364052.918,
         "1"
       ]
     }
@@ -62,18 +62,27 @@
   "dashboard_version": 1,
   "panel_queries_checked": 119,
   "browser": {
-    "loaded_url": "http://127.0.0.1:54715/d/lavik-overview/lavik-overview?orgId=1&from=now-5m&to=now&var-instance=127.0.0.1%3A39219&var-command=lpush",
+    "loaded_url": "http://127.0.0.1:40657/d/lavik-overview/lavik-overview?orgId=1&from=now-5m&to=now&var-instance=127.0.0.1%3A54187&var-command=lpush",
     "title": "Lavik Overview - Dashboards - Grafana",
     "alerts_visible": true,
     "request_health_panels_visible": 6,
     "command_filter_applied": true,
     "lpush_and_get_filters_applied": true,
+    "subcommand_multiselect_all_filters_applied": true,
     "page_errors": [],
     "query_errors": []
   },
-  "source_commit": "b93ea8933d81900437150787fe5f23a4fbdd6250",
+  "source_commit": "c54e7f69962bfd9ffa70aaf881e52a74d07e8982",
   "baseline_commit": "d37d47de7448447903a52630bccf954d47388b82",
+  "unit_tests": 46,
+  "metrics_e2e": "passed",
   "release_build": "passed",
-  "monitoring_config_tests": 6,
-  "note": "Functional demo, not a benchmark. One successful LPUSH and 91 WRONGTYPE failures; GET succeeds 60 times. Current-head full CTest was not rerun for this rebase; previous b466beac passed 82 selected entries."
+  "debug_build": "passed",
+  "promql_fixture_cases": 24,
+  "review_regressions": {
+    "subcommand_before": "Grafana query HTTP 400",
+    "precision_before": "both cumulative timer families lose 1 ms increments at 1234567.891 seconds",
+    "after": "passed"
+  },
+  "note": "Functional demo, not a benchmark. Counters and metric dimensions are unchanged by the review fixes."
 }

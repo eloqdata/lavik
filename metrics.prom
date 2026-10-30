@@ -162,6 +162,7 @@ lavik_command_executions_total{command="get"} 60
 lavik_command_executions_total{command="set"} 1
 lavik_command_executions_total{command="lpush"} 92
 lavik_command_executions_total{command="info"} 2
+lavik_command_executions_total{command="config|get"} 1
 lavik_command_executions_total{command="client|setinfo"} 2
 # HELP lavik_command_failed_calls_total Executed commands that failed.
 # TYPE lavik_command_failed_calls_total counter
@@ -171,6 +172,7 @@ lavik_command_failed_calls_total{command="get"} 0
 lavik_command_failed_calls_total{command="set"} 0
 lavik_command_failed_calls_total{command="lpush"} 91
 lavik_command_failed_calls_total{command="info"} 0
+lavik_command_failed_calls_total{command="config|get"} 0
 lavik_command_failed_calls_total{command="client|setinfo"} 0
 # HELP lavik_command_rejected_calls_total Commands rejected before execution, including redirects.
 # TYPE lavik_command_rejected_calls_total counter
@@ -180,16 +182,18 @@ lavik_command_rejected_calls_total{command="get"} 0
 lavik_command_rejected_calls_total{command="set"} 0
 lavik_command_rejected_calls_total{command="lpush"} 0
 lavik_command_rejected_calls_total{command="info"} 0
+lavik_command_rejected_calls_total{command="config|get"} 0
 lavik_command_rejected_calls_total{command="client|setinfo"} 0
 # HELP lavik_command_execution_seconds_total Time spent executing logical commands.
 # TYPE lavik_command_execution_seconds_total counter
-lavik_command_execution_seconds_total{command="ping"} 3.21304e-06
-lavik_command_execution_seconds_total{command="hello"} 1.34887e-05
-lavik_command_execution_seconds_total{command="get"} 0.00347152
-lavik_command_execution_seconds_total{command="set"} 9.11879e-05
-lavik_command_execution_seconds_total{command="lpush"} 0.00217105
-lavik_command_execution_seconds_total{command="info"} 8.31879e-05
-lavik_command_execution_seconds_total{command="client|setinfo"} 1.9687e-06
+lavik_command_execution_seconds_total{command="ping"} 1.0573910139627323e-06
+lavik_command_execution_seconds_total{command="hello"} 1.4513039492629935e-05
+lavik_command_execution_seconds_total{command="get"} 0.003478012957897174
+lavik_command_execution_seconds_total{command="set"} 9.125258363549021e-05
+lavik_command_execution_seconds_total{command="lpush"} 0.0020489994372952995
+lavik_command_execution_seconds_total{command="info"} 0.00011449127290575916
+lavik_command_execution_seconds_total{command="config|get"} 3.7765207020066993e-06
+lavik_command_execution_seconds_total{command="client|setinfo"} 1.6860864934816922e-06
 # HELP lavik_errors_total Redis errors by RESP prefix, including caught script errors. Custom prefixes use OTHER.
 # TYPE lavik_errors_total counter
 lavik_errors_total{err="ERR"} 1
@@ -284,7 +288,7 @@ lavik_storage_durability_pending 0
 lavik_storage_expiration_pause_count 0
 # HELP lavik_commands_total Completed Redis commands.
 # TYPE lavik_commands_total counter
-lavik_commands_total 159
+lavik_commands_total 160
 # HELP lavik_command_calls_total Completed Redis commands by command.
 # TYPE lavik_command_calls_total counter
 lavik_command_calls_total{command="ping"} 1
@@ -292,6 +296,7 @@ lavik_command_calls_total{command="get"} 60
 lavik_command_calls_total{command="set"} 1
 lavik_command_calls_total{command="lpush"} 92
 lavik_command_calls_total{command="client"} 3
+lavik_command_calls_total{command="config"} 1
 lavik_command_calls_total{command="info"} 2
 # HELP lavik_command_duration_seconds Redis command execution latency, excluding socket response writes.
 # TYPE lavik_command_duration_seconds histogram
@@ -299,7 +304,7 @@ lavik_command_duration_seconds_bucket{command="ping",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000002"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000004"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000008"} 0
-lavik_command_duration_seconds_bucket{command="ping",le="0.000016"} 1
+lavik_command_duration_seconds_bucket{command="ping",le="0.000016"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000032"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="0.000064"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="0.000128"} 1
@@ -327,7 +332,7 @@ lavik_command_duration_seconds_bucket{command="ping",le="2"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="4"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="8"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="+Inf"} 1
-lavik_command_duration_seconds_sum{command="ping"} 1.23409e-05
+lavik_command_duration_seconds_sum{command="ping"} 1.7543473443008323e-05
 lavik_command_duration_seconds_count{command="ping"} 1
 lavik_command_duration_seconds_bucket{command="get",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000002"} 0
@@ -335,7 +340,7 @@ lavik_command_duration_seconds_bucket{command="get",le="0.000004"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000008"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000016"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000032"} 0
-lavik_command_duration_seconds_bucket{command="get",le="0.000064"} 42
+lavik_command_duration_seconds_bucket{command="get",le="0.000064"} 35
 lavik_command_duration_seconds_bucket{command="get",le="0.000128"} 60
 lavik_command_duration_seconds_bucket{command="get",le="0.000256"} 60
 lavik_command_duration_seconds_bucket{command="get",le="0.000512"} 60
@@ -361,7 +366,7 @@ lavik_command_duration_seconds_bucket{command="get",le="2"} 60
 lavik_command_duration_seconds_bucket{command="get",le="4"} 60
 lavik_command_duration_seconds_bucket{command="get",le="8"} 60
 lavik_command_duration_seconds_bucket{command="get",le="+Inf"} 60
-lavik_command_duration_seconds_sum{command="get"} 0.00357124
+lavik_command_duration_seconds_sum{command="get"} 0.0035651433687516687
 lavik_command_duration_seconds_count{command="get"} 60
 lavik_command_duration_seconds_bucket{command="set",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="set",le="0.000002"} 0
@@ -395,16 +400,16 @@ lavik_command_duration_seconds_bucket{command="set",le="2"} 1
 lavik_command_duration_seconds_bucket{command="set",le="4"} 1
 lavik_command_duration_seconds_bucket{command="set",le="8"} 1
 lavik_command_duration_seconds_bucket{command="set",le="+Inf"} 1
-lavik_command_duration_seconds_sum{command="set"} 0.000126343
+lavik_command_duration_seconds_sum{command="set"} 0.00012053561907192278
 lavik_command_duration_seconds_count{command="set"} 1
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000002"} 0
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000004"} 0
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000008"} 0
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000016"} 2
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000032"} 34
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000064"} 68
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000128"} 81
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000016"} 27
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000032"} 38
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000064"} 83
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000128"} 89
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000256"} 91
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000512"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="0.001"} 92
@@ -429,7 +434,7 @@ lavik_command_duration_seconds_bucket{command="lpush",le="2"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="4"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="8"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="+Inf"} 92
-lavik_command_duration_seconds_sum{command="lpush"} 0.00548076
+lavik_command_duration_seconds_sum{command="lpush"} 0.004025473677116464
 lavik_command_duration_seconds_count{command="lpush"} 92
 lavik_command_duration_seconds_bucket{command="client",le="0.000001"} 1
 lavik_command_duration_seconds_bucket{command="client",le="0.000002"} 2
@@ -463,8 +468,42 @@ lavik_command_duration_seconds_bucket{command="client",le="2"} 3
 lavik_command_duration_seconds_bucket{command="client",le="4"} 3
 lavik_command_duration_seconds_bucket{command="client",le="8"} 3
 lavik_command_duration_seconds_bucket{command="client",le="+Inf"} 3
-lavik_command_duration_seconds_sum{command="client"} 7.58522e-06
+lavik_command_duration_seconds_sum{command="client"} 9.646953872452756e-06
 lavik_command_duration_seconds_count{command="client"} 3
+lavik_command_duration_seconds_bucket{command="config",le="0.000001"} 0
+lavik_command_duration_seconds_bucket{command="config",le="0.000002"} 0
+lavik_command_duration_seconds_bucket{command="config",le="0.000004"} 0
+lavik_command_duration_seconds_bucket{command="config",le="0.000008"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.000016"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.000032"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.000064"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.000128"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.000256"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.000512"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.001"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.00125"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.0015"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.002"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.0025"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.003"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.0035"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.004"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.005"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.006"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.008"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.016"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.032"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.064"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.128"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.256"} 1
+lavik_command_duration_seconds_bucket{command="config",le="0.512"} 1
+lavik_command_duration_seconds_bucket{command="config",le="1"} 1
+lavik_command_duration_seconds_bucket{command="config",le="2"} 1
+lavik_command_duration_seconds_bucket{command="config",le="4"} 1
+lavik_command_duration_seconds_bucket{command="config",le="8"} 1
+lavik_command_duration_seconds_bucket{command="config",le="+Inf"} 1
+lavik_command_duration_seconds_sum{command="config"} 4.121737998506045e-06
+lavik_command_duration_seconds_count{command="config"} 1
 lavik_command_duration_seconds_bucket{command="info",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="info",le="0.000002"} 0
 lavik_command_duration_seconds_bucket{command="info",le="0.000004"} 0
@@ -497,7 +536,7 @@ lavik_command_duration_seconds_bucket{command="info",le="2"} 2
 lavik_command_duration_seconds_bucket{command="info",le="4"} 2
 lavik_command_duration_seconds_bucket{command="info",le="8"} 2
 lavik_command_duration_seconds_bucket{command="info",le="+Inf"} 2
-lavik_command_duration_seconds_sum{command="info"} 8.8894e-05
+lavik_command_duration_seconds_sum{command="info"} 0.00012001214095481293
 lavik_command_duration_seconds_count{command="info"} 2
 # HELP lavik_storage_io_operations_total Completed storage I/O operations.
 # TYPE lavik_storage_io_operations_total counter
@@ -578,13 +617,13 @@ lavik_memory_current_bytes 824465008
 lavik_memory_used_bytes 824465008
 # HELP lavik_memory_rss_bytes Resident process memory.
 # TYPE lavik_memory_rss_bytes gauge
-lavik_memory_rss_bytes 871514112
+lavik_memory_rss_bytes 871649280
 # HELP lavik_memory_committed_bytes Memory committed by the configured allocator.
 # TYPE lavik_memory_committed_bytes gauge
-lavik_memory_committed_bytes 906690560
+lavik_memory_committed_bytes 906756096
 # HELP lavik_memory_reserved_bytes Address space reserved by the configured allocator.
 # TYPE lavik_memory_reserved_bytes gauge
-lavik_memory_reserved_bytes 1076232192
+lavik_memory_reserved_bytes 1076297728
 # HELP lavik_memory_max_bytes Configured process memory limit.
 # TYPE lavik_memory_max_bytes gauge
 lavik_memory_max_bytes 1073741824
@@ -725,6 +764,6 @@ lavik_fullsync_publish_queue_admitted_bytes{worker="1"} 0
 lavik_fullsync_publish_queue_capacity_bytes{worker="1"} 0
 lavik_fullsync_sessions{worker="1"} 0
 lavik_fullsync_publish_queue_backpressure_waits_total{worker="1"} 0
-lavik_storage_capacity_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-rebased/data"} 260046848
-lavik_storage_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-rebased/data"} 159383552
-lavik_filesystem_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-rebased/data"} 912541175808
+lavik_storage_capacity_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/review-20261030/after/data"} 260046848
+lavik_storage_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/review-20261030/after/data"} 159383552
+lavik_filesystem_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/review-20261030/after/data"} 912492335104
