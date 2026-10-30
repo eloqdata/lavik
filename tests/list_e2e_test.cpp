@@ -24,15 +24,18 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <future>
 #include <iterator>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2888,6 +2891,8 @@ class LargeHashDurabilityE2eTest : public ::testing::Test {
   }
 
   static constexpr std::string_view kKey = "{large-hash-gc}:hash";
+  void VerifyGcSourceAfterDeletingFillers(
+      const std::vector<std::string>& fillers) const;
   void CheckGcCrash(std::string_view point);
   void CheckOom(bool injected_storage_failure);
   std::string data_path_;
@@ -2987,6 +2992,91 @@ TEST_F(LargeHashDurabilityE2eTest,
   server.Stop();
 }
 
+void LargeHashDurabilityE2eTest::VerifyGcSourceAfterDeletingFillers(
+    const std::vector<std::string>& fillers) const {
+  using namespace lavik::storage;
+  // Inspect the stopped image, before arming a crash point. Ignore stale
+  // headers whose allocation bits are clear; recovery will not scan them.
+  std::ifstream input(data_path_, std::ios::binary | std::ios::ate);
+  ASSERT_TRUE(input);
+  const auto bytes = input.tellg();
+  ASSERT_GT(bytes, 0);
+  const auto capacity_blocks =
+      static_cast<std::uint64_t>(bytes) / kStorageBlockBytes;
+  // This fixture's 128 MiB device fits in the first bitmap page.
+  ASSERT_LE(capacity_blocks, kMetadataPagePayloadBytes * 8);
+  std::array<std::byte, kMetadataPagePayloadBytes> bitmap{};
+  std::uint64_t bitmap_generation = 0;
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    std::array<std::byte, kDirectIoAlignment> page{};
+    input.seekg(MetadataPageSlotOffset(kScanBitmapMetadataOffset, 0, slot));
+    input.read(reinterpret_cast<char*>(page.data()), page.size());
+    ASSERT_TRUE(input);
+    std::array<std::byte, kMetadataPagePayloadBytes> payload{};
+    std::uint64_t generation = 0;
+    if (DecodeMetadataPage(page, MetadataPageKind::kScanBitmap, 0, &generation,
+                           payload) &&
+        generation > bitmap_generation) {
+      bitmap_generation = generation;
+      bitmap = payload;
+    }
+  }
+  ASSERT_NE(bitmap_generation, 0);
+
+  const std::unordered_set<std::string_view> filler_keys(fillers.begin(),
+                                                         fillers.end());
+  bool has_gc_source = false;
+  std::ostringstream layout;
+  for (std::uint32_t local = DataBlockBegin(capacity_blocks);
+       local < capacity_blocks; ++local) {
+    if ((std::to_integer<unsigned>(bitmap[local / 8]) & (1U << (local % 8))) ==
+        0)
+      continue;
+    std::array<std::byte, kBlockHeaderBytes> pages{};
+    input.seekg(static_cast<std::uint64_t>(local) * kStorageBlockBytes);
+    input.read(reinterpret_cast<char*>(pages.data()), pages.size());
+    ASSERT_TRUE(input);
+    BlockHeader block;
+    if (!DecodeBlockHeaderPages(pages, &block) ||
+        block.kind_ != BlockKind::kRecords || block.record_count_ == 0)
+      continue;
+    std::vector<std::byte> body(block.committed_bytes_ - kBlockHeaderBytes);
+    input.read(reinterpret_cast<char*>(body.data()), body.size());
+    ASSERT_TRUE(input);
+    std::size_t offset = 0;
+    std::uint64_t filler_bytes = 0;
+    unsigned records = 0;
+    while (offset + kRecordHeaderBaseBytes <= body.size()) {
+      std::uint64_t magic = 0;
+      std::memcpy(&magic, body.data() + offset, sizeof(magic));
+      if (magic == 0) {
+        offset += kRecordAlignment;
+        continue;
+      }
+      RecordHeader record;
+      std::string_view key;
+      ASSERT_TRUE(
+          DecodeRecordHeader(std::span(body).subspan(offset), &record, &key));
+      ASSERT_LE(record.total_disk_bytes_, body.size() - offset);
+      if (record.kind_ == RecordKind::kValue && filler_keys.contains(key))
+        filler_bytes += record.total_disk_bytes_;
+      offset += record.total_disk_bytes_;
+      ++records;
+    }
+    ASSERT_EQ(records, block.record_count_);
+    layout << "block=" << block.block_id_ << " filler_bytes=" << filler_bytes
+           << " used_bytes=" << body.size() << '\n';
+    // Every filler has one unchanged value until DEL. Treat all other bytes,
+    // including padding and obsolete Hash copies, as live: deleting at least
+    // half the occupied bytes guarantees the recovered, sealed block meets
+    // the defrag threshold regardless of TxCleaner promotion interleaving.
+    has_gc_source |= filler_bytes * 2 >= body.size();
+  }
+  ASSERT_TRUE(has_gc_source)
+      << "Deleting fillers would not guarantee a defrag source:\n"
+      << layout.str();
+}
+
 void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
 #if defined(NDEBUG) && !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires Debug or the explicitly test-instrumented module";
@@ -2995,35 +3085,59 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
   const std::string filler_value(16 * 1024 - 1, 'f');
   std::vector<std::string> fillers;
   // Fill ordinary record blocks with compact Strings; values at 16 KiB
-  // would promote and move their payloads into transaction blocks.
-  for (unsigned i = 0; i < 400; ++i)
+  // would promote and move their payloads into transaction blocks. Their
+  // combined payload must exceed the 9 MiB Hash so deletion guarantees a
+  // source below the live-ratio threshold even when promoted pages mix with
+  // fillers. Four hundred fillers can leave every source more than half live.
+  for (unsigned i = 0; i < 600; ++i)
     fillers.push_back(std::string("{large-hash-gc}:filler-") +
                       std::to_string(i));
   {
     ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2);
     RespClient client(port_);
+    ASSERT_EQ(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+              "+OK");
     ASSERT_EQ(client.Command(WriteCommand(value)), ":10");
-    // Same hash slot puts the root beside filler payloads. Group children
-    // belong to transaction blocks and are relocated by the tx cleaner.
-    for (const auto& key : fillers)
-      ASSERT_EQ(client.Command({"SET", key, filler_value}), "+OK");
+    for (std::size_t i = 0; i < fillers.size(); ++i) {
+      ASSERT_EQ(client.Command({"SET", fillers[i], filler_value}), "+OK");
+      if (i + 1 != 220) continue;
+      // Force the problematic preparation order: place some same-shard
+      // fillers before promoting the sealed Hash pages, then append the
+      // remaining fillers. Await actual cleanup rather than a timing delay.
+      ASSERT_EQ(
+          client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+          "+OK");
+      const auto deadline = std::chrono::steady_clock::now() + 30s;
+      std::string info;
+      do {
+        info = client.Command({"INFO", "STATS"});
+        if (info.find("tx_backlog_bytes_total:0\r\n") != std::string::npos)
+          break;
+        std::this_thread::sleep_for(10ms);
+      } while (std::chrono::steady_clock::now() < deadline);
+      ASSERT_NE(info.find("tx_backlog_bytes_total:0\r\n"), std::string::npos)
+          << info;
+    }
     ASSERT_TRUE(WaitForDurability(client));
     server.Kill();
   }
+  ASSERT_NO_FATAL_FAILURE(VerifyGcSourceAfterDeletingFillers(fillers));
   {
-    ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2,
-                         point);
+    // Recovery can promote Hash pages before the first client connects. Keep
+    // the cleaner paused from startup so that an armed copy fault cannot
+    // terminate the server before we send the commands that trigger GC.
+    ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2, point,
+                         {}, {{"LAVIK_TX_CLEANER_START_PAUSED", "1"}});
     RespClient ready(port_);
-    // Both crash points require relocation to run. Recovered transaction
-    // blocks can retain the Hash's pages; promote them without depending on
-    // the default idle cleaner cadence or incidental allocation pressure.
-    ASSERT_EQ(ready.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
-              "+OK");
     std::vector<std::string_view> command{"DEL"};
     for (const auto& key : fillers) command.push_back(key);
     const int fd = ConnectSocket(port_);
     ASSERT_GE(fd, 0);
-    SendAll(fd, EncodeCommand(command));
+    // Either deletion or promotion can hit the fault. Send both requests on
+    // the established connection without requiring a reply or a new client.
+    SendAll(fd, EncodeCommand(command) +
+                    EncodeCommand(
+                        {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}));
     server.WaitForCrash();
     ASSERT_EQ(::close(fd), 0);
   }
