@@ -159,7 +159,7 @@ void AppendReplicationProgressMetrics(
   struct CounterFamily {
     std::string_view name;
     std::string_view help;
-    std::uint64_t ReplicationProgressTotals::*value;
+    std::uint64_t ReplicationProgressTotals::* value;
     bool target_only = false;
   };
   constexpr std::array counters{
@@ -366,13 +366,12 @@ void AppendReplicationProgressMetrics(
        "Native next-LSN within one current history/flow; unavailable cursors "
        "omitted. Never use cross-node arithmetic or rate.");
   for_each_flow([&](const auto& row) {
-    for (const auto& [name, cursor] :
-         std::array<std::pair<std::string_view,
-                             const std::optional<std::uint64_t>*>, 4>{
-             {{"published", &row.published_},
-              {"received", &row.received_},
-              {"applied", &row.applied_},
-              {"ack_sent", &row.ack_}}})
+    for (const auto& [name, cursor] : std::array<
+             std::pair<std::string_view, const std::optional<std::uint64_t>*>,
+             4>{{{"published", &row.published_},
+                 {"received", &row.received_},
+                 {"applied", &row.applied_},
+                 {"ack_sent", &row.ack_}}})
       if (*cursor)
         flow_metric("cursor_next_lsn", row, **cursor, "cursor", name);
   });
@@ -390,7 +389,8 @@ void AppendReplicationProgressMetrics(
     for (unsigned phase = 0; phase != row.phases_.size(); ++phase)
       if (row.phases_[phase] != 0)
         flow_metric("fullsync_phase_seconds", row, row.phase_seconds_[phase],
-                    "phase", FullSyncPhaseName(static_cast<FullSyncPhase>(phase)));
+                    "phase",
+                    FullSyncPhaseName(static_cast<FullSyncPhase>(phase)));
   });
   type("fullsync_elapsed_seconds", "gauge",
        "Maximum current native FULL attempt duration; not a timeout or "
