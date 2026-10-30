@@ -27,6 +27,13 @@ scrape_configs:
       - files:
           - targets/lavik.json
         refresh_interval: 30s
+  - job_name: lavik-meta
+    metrics_path: /metrics
+    scheme: http
+    file_sd_configs:
+      - files:
+          - targets/lavik-meta.json
+        refresh_interval: 30s
 rule_files:
   - rules/*.yml
 alerting:

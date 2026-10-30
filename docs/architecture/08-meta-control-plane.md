@@ -36,7 +36,12 @@ waits for accepted foreign notifications, then stops Bycorf. A failed demotion
 notification is fail-stop; no later leader generation may reuse authority whose
 revocation was not delivered.
 
-The process exposes independent Raft, Data-control, Admin, and optional
+An optional metrics listener runs on a separate bounded worker. Scrapes read
+published Raft state and independent counters through an owned-buffer ABI;
+they do not enter protocol or application executors. The listener starts before
+recovery and is stopped and drained before runtime teardown.
+
+The process exposes independent Raft, Data-control, Admin, metrics, and optional
 Sentinel network responsibilities. `--addr` is
 the local Raft listener, `--data-control-addr` accepts Data-node control
 sessions, and the required concrete `--ctl-addr` is the remote operator/Admin

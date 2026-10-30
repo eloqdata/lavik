@@ -27,6 +27,7 @@
 #include "absl/container/node_hash_map.h"
 #include "absl/strings/str_cat.h"
 #include "lavik/memory.h"
+#include "lavik/storage/detail/ordered_compact_codec.h"
 #include "lavik/storage/detail/stream_records.h"
 #include "lavik/storage/format.h"
 #include "rdb_record_spool.h"
@@ -72,9 +73,7 @@ constexpr std::uint8_t kSelectDb = 254;
 constexpr std::uint8_t kEof = 255;
 
 constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
-constexpr std::string_view kListMagic = "LVL1";
 
-constexpr std::string_view kZSetMagic = "LZS1";
 // Lavik's v1 Stream layout includes macro-node counts; it is independent of
 // the standard Redis RDB version and has no legacy development decoder.
 constexpr std::string_view kStreamMagic = "LXS1";
@@ -2030,22 +2029,16 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
   if (raw.value_type_ == storage::ValueType::kString)
     return LogicalValue{raw.value_type_, std::string(input)};
   if (raw.value_type_ == storage::ValueType::kList) {
-    if (!input.starts_with(kListMagic) || input.size() < 8)
-      return Bad("invalid Lavik List");
-    Reader reader(input.substr(4));
-    std::uint32_t count = 0;
-    if (!reader.Le32(&count) || count != raw.logical_size_ || count == 0)
-      return Bad("invalid Lavik List count");
+    auto reader = storage::OrderedCompactReader::Open(
+        storage::OrderedCollectionKind::kList, input, raw.logical_size_);
+    if (!reader.ok()) return Bad(reader.status().message());
     Strings values;
-    values.reserve(count);
-    for (std::uint32_t i = 0; i < count; ++i) {
-      std::uint32_t size = 0;
-      std::string_view value;
-      if (!reader.Le32(&size) || !reader.View(size, &value))
-        return Bad("truncated Lavik List");
-      values.emplace_back(value);
+    values.reserve(reader->size());
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return Bad(entry.status().message());
+      values.emplace_back(entry->value_);
     }
-    if (!reader.done()) return Bad("trailing Lavik List data");
     return LogicalValue{raw.value_type_, std::move(values)};
   }
   if (raw.value_type_ == storage::ValueType::kSet ||
@@ -2085,26 +2078,16 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     return LogicalValue{raw.value_type_, std::move(pairs)};
   }
   if (raw.value_type_ == storage::ValueType::kSortedSet) {
-    if (!input.starts_with(kZSetMagic) || input.size() < 8)
-      return Bad("invalid Lavik Zset");
-    Reader reader(input.substr(4));
-    std::uint32_t count = 0;
-    if (!reader.Le32(&count) || count != raw.logical_size_ || count == 0)
-      return Bad("invalid Lavik Zset count");
+    auto reader = storage::OrderedCompactReader::Open(
+        storage::OrderedCollectionKind::kSortedSet, input, raw.logical_size_);
+    if (!reader.ok()) return Bad(reader.status().message());
     ZElements values;
-    values.reserve(count);
-    for (std::uint32_t i = 0; i < count; ++i) {
-      std::uint64_t bits = 0;
-      std::uint32_t size = 0;
-      std::string_view member;
-      if (!reader.Le64(&bits) || !reader.Le32(&size) ||
-          !reader.View(size, &member))
-        return Bad("truncated Lavik Zset");
-      double score = std::bit_cast<double>(bits);
-      if (std::isnan(score)) return Bad("NaN Lavik Zset score");
-      values.push_back({std::string(member), score});
+    values.reserve(reader->size());
+    for (std::size_t i = 0; i < reader->size(); ++i) {
+      auto entry = reader->Next();
+      if (!entry.ok()) return Bad(entry.status().message());
+      values.push_back({std::string(entry->value_), entry->score_});
     }
-    if (!reader.done()) return Bad("trailing Lavik Zset data");
     return LogicalValue{raw.value_type_, std::move(values)};
   }
   if (raw.value_type_ == storage::ValueType::kStream) {
@@ -2224,7 +2207,7 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
       if (!text_size(&bytes, value)) return Bad("value exceeds Lavik limits");
     }
     raw.logical_size_ = values.size();
-    raw.encoded_ = std::string(kListMagic);
+    raw.encoded_ = std::string(storage::kListMagicV1);
     raw.encoded_.reserve(bytes);
     PutLe32(&raw.encoded_, static_cast<std::uint32_t>(values.size()));
     for (const auto& value : values) {
@@ -2274,7 +2257,7 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
         return Bad("value exceeds Lavik limits");
     }
     raw.logical_size_ = values.size();
-    raw.encoded_ = std::string(kZSetMagic);
+    raw.encoded_ = std::string(storage::kSortedSetMagicV1);
     raw.encoded_.reserve(bytes);
     PutLe32(&raw.encoded_, values.size());
     for (const auto& value : values) {

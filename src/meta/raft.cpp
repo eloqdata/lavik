@@ -149,13 +149,14 @@ void MetaRaftResult::when_ready(handler_type2 handler) {
 
 void MetaRaftResult::Complete(MetaRaftResultCode code,
                               std::shared_ptr<MetaRaftBuffer> data,
-                              std::uint64_t index) {
+                              std::uint64_t index, bool admission_rejected) {
   handler_type2 handler;
   {
     std::lock_guard lock(mutex_);
     if (ready_) std::terminate();
     ready_ = true;
     code_ = code;
+    admission_rejected_ = admission_rejected;
     data_ = std::move(data);
     index_ = index;
     handler = std::move(handler_);
@@ -438,12 +439,20 @@ bool MetaRaft::initial_bindings_pending() const {
   return false;
 }
 
+absl::StatusOr<std::string> MetaRaft::CollectMetrics() const {
+  LavikRaftBytes bytes{};
+  const int result = lavik_raft_metrics(handle_, &bytes);
+  std::unique_ptr<void, decltype(&std::free)> owner(bytes.data, &std::free);
+  if (result != 0) return absl::InternalError("Raft metrics collection failed");
+  return std::string(static_cast<const char*>(bytes.data), bytes.size);
+}
+
 std::pair<std::uint64_t, std::shared_ptr<MetaRaftResult>>
 MetaRaft::NewResult() {
   auto result = std::make_shared<MetaRaftResult>();
   std::lock_guard lock(requests_mutex_);
   if (stopping_.load() || requests_.size() >= 256) {
-    result->Complete(MetaRaftResultCode::CANCELLED, {});
+    result->Complete(MetaRaftResultCode::CANCELLED, {}, 0, true);
     return {0, std::move(result)};
   }
   const auto ticket = ++next_ticket_;
@@ -466,7 +475,7 @@ void MetaRaft::OnResult(std::uint64_t ticket, std::uint64_t index, int code,
   result->Complete(code == 0   ? MetaRaftResultCode::OK
                    : code == 2 ? MetaRaftResultCode::NOT_LEADER
                                : MetaRaftResultCode::CANCELLED,
-                   std::move(payload), index);
+                   std::move(payload), index, code == 2 || code == 3);
 }
 
 std::shared_ptr<MetaRaftResult> MetaRaft::append_entries(

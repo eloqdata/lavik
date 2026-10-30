@@ -697,6 +697,39 @@ class ContinuousSetProbe:
                 raise H.Failure(f"{self.writer} write probe made too few observations")
 
 
+def wait_initial_membership(fixture, timeout=10):
+    """Wait for every bootstrap candidate to apply the initial identities."""
+    # The leader's complete directory makes every member a Data bootstrap
+    # candidate. A lagging follower may still omit its own identity and must
+    # finish reconciliation before the fixture starts any Data process.
+    deadline = time.monotonic() + timeout
+    latest = None
+    pending = {}
+    while time.monotonic() < deadline:
+        try:
+            latest = fixture.cluster_status(deadline)
+            if latest.get("meta_membership_stable"):
+                pending = {}
+                for meta in fixture.metas:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    pending[meta.id] = meta.status(timeout=min(1.0, remaining)).get(
+                        "initial_bindings_pending"
+                    )
+                if len(pending) == len(fixture.metas) and all(
+                    value == "0" for value in pending.values()
+                ):
+                    return
+        except (OSError, H.Failure):
+            pass
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    raise H.Failure(
+        "initial Meta identities did not converge before Data bootstrap: "
+        f"status={latest}; initial_bindings_pending={pending}"
+    )
+
+
 def wait_ready(fixture, description, timeout=90):
     deadline = time.monotonic() + timeout
     latest = None
@@ -1150,22 +1183,7 @@ class FailoverFixture:
             # launch sequentially without introducing concurrent Python calls.
             meta.start(initial_cluster_manifest=self.manifest, wait_ready=False)
         self.leader = H.find_leader(self.metas, timeout=20)
-        membership_deadline = time.monotonic() + 10
-        latest = None
-        while time.monotonic() < membership_deadline:
-            try:
-                latest = self.cluster_status(membership_deadline)
-            except H.Failure:
-                time.sleep(0.05)
-                continue
-            if latest.get("meta_membership_stable"):
-                break
-            time.sleep(0.05)
-        else:
-            raise H.Failure(
-                "initial Meta identities did not converge before Cluster "
-                f"Create: status={latest}"
-            )
+        wait_initial_membership(self)
         leader_seed = getattr(
             self.leader,
             "advertised_data_control_endpoint",

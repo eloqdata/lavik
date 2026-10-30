@@ -22,6 +22,7 @@ export async function setup(root, api, created, options = {}) {
     storage: "file",
     hugepageMiB: 8192,
     metricsPort: 9100,
+    metaMetricsPort: 9200,
     grafanaPort: 3000,
     prometheusPort: 9090,
     release: "nightly",
@@ -138,11 +139,11 @@ export async function setup(root, api, created, options = {}) {
     "metricsPort",
     "Data metrics base port",
     "number",
-  )}${field("grafanaPort", "Grafana port", "number")}${field(
-    "prometheusPort",
-    "Prometheus port",
+  )}${field("metaMetricsPort", "Meta metrics base port", "number")}${field(
+    "grafanaPort",
+    "Grafana port",
     "number",
-  )}</div></details>`
+  )}${field("prometheusPort", "Prometheus port", "number")}</div></details>`
   }
   <div class="error" id="setup-error" role="alert"></div><div class="actions"><button class="primary" type="submit">Check hosts & review</button></div></form><div id="setup-review"></div>`;
   const form = root.querySelector("#setup-form");

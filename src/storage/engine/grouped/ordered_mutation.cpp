@@ -322,7 +322,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             (plan.root_.kind_ != OrderedCollectionKind::kString &&
              compact.size() != plan.root_.item_count_))
           co_return absl::DataLossError("ordered demotion count mismatch");
-        auto encoded = EncodeOrderedCompactValue(plan.root_.kind_, compact);
+        auto encoded = EncodeOrderedCompactValue(
+            plan.root_.kind_, compact,
+            HasOrderedIndex(plan.root_.kind_) ? 2 : 1);
         if (!encoded.ok()) co_return encoded.status();
         if (encoded->size() >= kCollectionGroupTargetBytes)
           co_return absl::InternalError("ordered demotion byte bound failed");
@@ -481,7 +483,15 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     if (plan.root_.kind_ == OrderedCollectionKind::kStream && !page.retired_) {
       auto max_key = StreamRecordKey(page.entries_.back().value_);
       if (!max_key.ok()) co_return max_key.status();
-      candidate.stream_max_key_.Set(*max_key);
+      candidate.max_key_.Set(*max_key);
+    } else if (plan.root_.kind_ == OrderedCollectionKind::kSortedSet &&
+               !page.retired_) {
+      // Publish the boundary with this logical page version, including edits
+      // that keep its ID and count but replace its last member.
+      candidate.max_key_.Set(
+          page.encoded_sorted_set_
+              ? page.encoded_sorted_set_->entries().back().value_
+              : std::string_view(entries.back().value_));
     }
     candidates.push_back(std::move(candidate));
   }

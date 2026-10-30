@@ -1716,7 +1716,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     // The grouped task owns its graph/version protocol. Keep its borrowed
     // digest in this awaitable, not in the constructor's argument lifetime.
     slow_ = engine.LoadGroupedValue(store, partition, db_id, key, digest_,
-                                    location, std::move(grouped_snapshot));
+                                    location, std::move(grouped_snapshot),
+                                    GroupedValueEncoding::kLogicalStream);
   } else if (location.external() ||
              location.block_owner() != store.worker_->id()) {
     slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,

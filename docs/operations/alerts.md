@@ -7,6 +7,10 @@ Prometheus rules. Its optional Alertmanager routes notifications; installing the
 stack alone does not configure a production receiver. Use the local drill before
 relying on delivery. [Metrics](metrics.md) defines the underlying signals.
 
+The independent [Meta / Raft monitoring runbook](meta-monitoring.md#alert-policy)
+documents the `lavik-meta` job's rules and dedicated dashboard. Both jobs share
+notification routing and target-down inhibition.
+
 ## Policy
 
 These conservative defaults are starting points, not measured workload SLOs.
@@ -260,10 +264,10 @@ return and the recovery window; inspect each target's actual health.
 
 ## Coverage boundaries
 
-Rules observe existing Data metrics. Meta/Raft member health, serving-authority
-state, command error ratios, detailed storage progress and latency attribution
-remain separate work under #391, #393, #394 and #396. Native replication progress
-and FULL population recovery are covered; Redis PSYNC keeps its existing
-diagnostics. Native snapshots unavailable for five minutes trigger the
-`LavikMetricsMissing` native_replication signal. No node_exporter or centralized log platform is
+The Data and Meta rule sets observe their respective exported metrics; they do
+not prove Data serving authority. Command error ratios, detailed storage progress
+and latency attribution remain separate work under #391, #394 and #396. Native
+replication progress and FULL population recovery are covered; Redis PSYNC keeps
+its existing diagnostics. Native snapshots unavailable for five minutes trigger
+the `LavikMetricsMissing` native_replication signal. No node_exporter or centralized log platform is
 included. Monitoring does not participate in authorization or replication decisions.

@@ -3,7 +3,8 @@
 """Run production rule expressions through real Prometheus and Alertmanager.
 
 Only timing is accelerated. HTTP fixtures stand in for controllable metric sources
-and notification channels; --lavik-bin additionally exercises a real paused server.
+and notification channels; --lavik-bin exercises a real paused Data server and
+--meta-bin exercises a paused voter in a real three-member Meta cluster.
 Artifacts are retained in --output, including webhook bodies and process logs.
 """
 
@@ -16,6 +17,7 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -132,6 +134,7 @@ def main():
     parser.add_argument("--tools", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lavik-bin", type=Path)
+    parser.add_argument("--meta-bin", type=Path)
     args = parser.parse_args()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
@@ -162,10 +165,18 @@ def main():
         fixture = Endpoints(args.output).start()
         stack.callback(fixture.close)
         fixture_address = f"127.0.0.1:{fixture.server.server_port}"
+        meta_fixture = Endpoints(args.output).start()
+        stack.callback(meta_fixture.close)
+        meta_address = f"127.0.0.1:{meta_fixture.server.server_port}"
+        meta_healthy = (Path(__file__).parent / "meta-healthy.prom").read_text()
+        meta_fixture.set(meta_healthy)
         prom_port, am_port = port(), port()
         prom_url = f"http://127.0.0.1:{prom_port}"
         am_url = f"http://127.0.0.1:{am_port}"
         rules = yaml.safe_load((MONITORING / "prometheus/rules/alerts.yml").read_text())
+        rules["groups"] += yaml.safe_load(
+            (MONITORING / "prometheus/rules/meta-alerts.yml").read_text()
+        )["groups"]
         for group in rules["groups"]:
             for rule in group["rules"]:
                 rule["for"] = "3s"
@@ -176,6 +187,9 @@ def main():
         recordings = yaml.safe_load(
             (MONITORING / "prometheus/rules/recording.yml").read_text()
         )
+        recordings["groups"] += yaml.safe_load(
+            (MONITORING / "prometheus/rules/meta-recording.yml").read_text()
+        )["groups"]
         write_yaml(args.output / "recording.yml", recordings)
         am_config = yaml.safe_load(
             (MONITORING / "alertmanager/alertmanager.yml").read_text()
@@ -244,6 +258,34 @@ def main():
                 }
             )
         (args.output / "targets.json").write_text(json.dumps(targets))
+        meta_targets = [
+            {"targets": [meta_address], "labels": {"cluster": "drill-meta"}}
+        ]
+        meta_nodes = []
+        if args.meta_bin:
+            # Reuse the real Raft harness and its bounded process cleanup; no
+            # production fault hooks or notification credentials are required.
+            sys.path.insert(0, str(ROOT / "tests/meta_integration"))
+            import harness as H
+
+            workdir = args.output / "meta"
+            workdir.mkdir()
+            meta_nodes = H.make_nodes(str(args.meta_bin.resolve()), str(workdir), 3)
+            mesh = H.Mesh()
+            stack.callback(mesh.close)
+            for node in meta_nodes:
+                stack.callback(node.force_kill)
+                node.metrics_port = H.free_port()
+                node.args += ["--metrics-port", str(node.metrics_port)]
+            meta_leader = H.bootstrap_meshed_cluster(meta_nodes, mesh)
+            assert meta_leader.propose("alert-drill")[1].startswith("OK ")
+            meta_targets.append(
+                {
+                    "targets": [f"127.0.0.1:{n.metrics_port}" for n in meta_nodes],
+                    "labels": {"cluster": "drill-meta-real"},
+                }
+            )
+        (args.output / "meta-targets.json").write_text(json.dumps(meta_targets))
         prom_config = {
             "global": {
                 "scrape_interval": "1s",
@@ -258,7 +300,13 @@ def main():
                     "file_sd_configs": [
                         {"files": ["targets.json"], "refresh_interval": "1s"}
                     ],
-                }
+                },
+                {
+                    "job_name": "lavik-meta",
+                    "file_sd_configs": [
+                        {"files": ["meta-targets.json"], "refresh_interval": "1s"}
+                    ],
+                },
             ],
             "alerting": {
                 "alertmanagers": [
@@ -299,12 +347,12 @@ def main():
         wait_for("Prometheus ready", lambda: fetch(prom_url + "/-/ready"))
         wait_for("Alertmanager ready", lambda: fetch(am_url + "/-/ready"))
 
-        def active(name, severity=None):
+        def active(name, severity=None, instance=fixture_address):
             alerts = json.loads(fetch(am_url + "/api/v2/alerts"))
             return [
                 a
                 for a in alerts
-                if a["labels"].get("instance") == fixture_address
+                if a["labels"].get("instance") == instance
                 and a["labels"]["alertname"] == name
                 and (severity is None or a["labels"].get("severity") == severity)
             ]
@@ -439,6 +487,105 @@ def main():
             lambda: fixture.matching("LavikFullSyncFailures", "resolved", "warning"),
         )
         assert not fixture.matching("LavikMetaDisconnected")
+        meta_fixture.set(
+            meta_healthy.replace(
+                'lavik_meta_raft_peer_fresh{peer_id="2"} 1',
+                'lavik_meta_raft_peer_fresh{peer_id="2"} 0',
+            )
+        )
+        wait_for(
+            "Meta redundancy warning",
+            lambda: fixture.matching(
+                "LavikMetaVoterUnavailable", receiver="warning", instance=meta_address
+            ),
+        )
+        meta_fixture.set(available=False)
+        wait_for(
+            "Meta target down critical",
+            lambda: fixture.matching(
+                "LavikTargetDown", receiver="critical", instance=meta_address
+            ),
+        )
+        wait_for(
+            "Meta target down inhibits redundancy warning",
+            lambda: [
+                a
+                for a in active("LavikMetaVoterUnavailable", "warning", meta_address)
+                if a["status"]["inhibitedBy"]
+            ],
+        )
+        meta_fixture.set(meta_healthy)
+        wait_for(
+            "Meta target restored",
+            lambda: fixture.matching(
+                "LavikTargetDown", "resolved", "critical", meta_address
+            ),
+        )
+        wait_for(
+            "Meta redundancy restored",
+            lambda: fixture.matching(
+                "LavikMetaVoterUnavailable", "resolved", "warning", meta_address
+            ),
+        )
+        meta_fixture.set(
+            meta_healthy.replace(
+                "lavik_meta_raft_leader_authority 1",
+                "lavik_meta_raft_leader_authority 0",
+            ).replace(
+                "lavik_meta_data_control_eligible 1",
+                "lavik_meta_data_control_eligible 0",
+            )
+        )
+        wait_for(
+            "Meta cluster no-leader critical",
+            lambda: fixture.matching("LavikMetaNoLeader", receiver="critical"),
+        )
+        wait_for(
+            "Meta cluster control unavailable",
+            lambda: fixture.matching(
+                "LavikMetaControlUnavailable", receiver="critical"
+            ),
+        )
+        meta_fixture.set(meta_healthy)
+        for name in ("LavikMetaNoLeader", "LavikMetaControlUnavailable"):
+            wait_for(
+                f"{name} resolved",
+                lambda: fixture.matching(name, "resolved", "critical"),
+            )
+        if meta_nodes:
+            victim = next(n for n in meta_nodes if n != meta_leader)
+            victim_address = f"127.0.0.1:{victim.metrics_port}"
+            victim.pause()
+            wait_for(
+                "real Meta paused target",
+                lambda: fixture.matching(
+                    "LavikTargetDown", receiver="critical", instance=victim_address
+                ),
+            )
+            wait_for(
+                "real Meta voter evidence expired",
+                lambda: fixture.matching(
+                    "LavikMetaVoterUnavailable",
+                    receiver="warning",
+                    instance=f"127.0.0.1:{meta_leader.metrics_port}",
+                ),
+            )
+            victim.resume()
+            wait_for(
+                "real Meta resumed target",
+                lambda: fixture.matching(
+                    "LavikTargetDown", "resolved", "critical", victim_address
+                ),
+            )
+            wait_for(
+                "real Meta voter evidence restored",
+                lambda: fixture.matching(
+                    "LavikMetaVoterUnavailable",
+                    "resolved",
+                    "warning",
+                    f"127.0.0.1:{meta_leader.metrics_port}",
+                ),
+            )
         if lavik:
             lavik.send_signal(signal.SIGSTOP)
             wait_for(
@@ -456,18 +603,23 @@ def main():
             )
         for delivery in fixture.deliveries:
             for alert in delivery["body"]["alerts"]:
+                is_meta = alert["labels"].get("job") == "lavik-meta"
+                dashboard = "lavik-meta" if is_meta else "lavik-overview"
+                runbook = "meta-monitoring" if is_meta else "alerts"
                 assert alert["annotations"]["dashboard_url"].startswith(
-                    "http://monitor.example:3000/d/lavik-overview/"
+                    f"http://monitor.example:3000/d/{dashboard}/"
                 )
                 assert "viewPanel=" in alert["annotations"]["dashboard_url"]
                 assert (
-                    "/docs/operations/alerts.md#" in alert["annotations"]["runbook_url"]
+                    f"/docs/operations/{runbook}.md#"
+                    in alert["annotations"]["runbook_url"]
                 )
         (args.output / "result.json").write_text(
             json.dumps(
                 {
                     "status": "passed",
                     "real_lavik": bool(lavik),
+                    "real_meta": bool(meta_nodes),
                     "notifications": len(fixture.deliveries),
                 },
                 indent=2,

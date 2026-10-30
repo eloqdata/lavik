@@ -780,13 +780,13 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 ordered_group = RecoveryOrderedMetadata{
                     .previous_ = decoded->previous_,
                     .next_ = decoded->next_,
-                    .stream_max_key_ = {},
+                    .max_key_ = {},
                 };
                 if (!decoded->retired_) {
                   auto max_key =
                       StreamRecordKey(decoded->entries_.back().value_);
                   if (!max_key.ok()) co_return max_key.status();
-                  ordered_group->stream_max_key_.Set(*max_key);
+                  ordered_group->max_key_.Set(*max_key);
                 }
               } else {
                 ordered_group = RecoveryOrderedMetadata{
@@ -1576,7 +1576,7 @@ StorageEngine::Impl::RecoverOrderedObject(
       candidate.previous_ = physical.ordered_group_->previous_;
       candidate.next_ = physical.ordered_group_->next_;
       if (root.kind_ == OrderedCollectionKind::kStream) {
-        candidate.stream_max_key_ = physical.ordered_group_->stream_max_key_;
+        candidate.max_key_ = physical.ordered_group_->max_key_;
       } else {
         candidate.min_score_ = physical.ordered_group_->scores_.min_;
         candidate.max_score_ = physical.ordered_group_->scores_.max_;

@@ -142,9 +142,10 @@ class LoadValueAwaitableTestPeer : public testing::Test {
         Store(), location, std::move(manifest), nullptr, true);
   }
   auto ReadGrouped(bool pinned = false) {
-    return storage_.impl_->LoadGroupedValue(Store(), Store().partitions_[0], 0,
-                                            key_, digest_, location_,
-                                            pinned ? grouped_ : nullptr);
+    return storage_.impl_->LoadGroupedValue(
+        Store(), Store().partitions_[0], 0, key_, digest_, location_,
+        pinned ? grouped_ : nullptr,
+        StorageEngine::Impl::GroupedValueEncoding::kLogicalStream);
   }
   auto ReadGroupedHash(bool packed = false) {
     return storage_.impl_->ReadGroupedHashResult(
@@ -673,7 +674,7 @@ class LoadValueAwaitableTestPeer : public testing::Test {
                                              .record_token_ = i + 1});
       const auto max_key = StreamRecordKey(page.entries_.back().value_);
       ASSERT_TRUE(max_key.ok()) << max_key.status();
-      records.back().stream_max_key_.Set(*max_key);
+      records.back().max_key_.Set(*max_key);
       const GroupedRecordId id{i + 1, 0};
       ASSERT_NO_FATAL_FAILURE(
           AppendGroupedPage(id, std::move(*encoded), end - first));

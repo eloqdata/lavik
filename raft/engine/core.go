@@ -110,7 +110,7 @@ func (c *core) status() Status {
 		learners[id] = true
 	}
 	first, _ := c.memory.FirstIndex()
-	return Status{Role: Role{Term: b.GetTerm(), Leader: b.Lead, IsLeader: b.RaftState == raft.StateLeader,
+	return Status{ProtocolRole: b.RaftState.String(), Role: Role{Term: b.GetTerm(), Leader: b.Lead, IsLeader: b.RaftState == raft.StateLeader,
 		CaughtUp: b.RaftState == raft.StateLeader && c.applied > 0 && appliedTerm == b.GetTerm()},
 		Commit: b.GetCommit(), Applied: c.applied, Durable: c.durableFrontier(), Snapshot: c.snapshot, Members: c.memberList(), ConfigIndex: c.configIndex, Learners: learners, FirstIndex: first, RetainedBytes: c.retainedBytes}
 }

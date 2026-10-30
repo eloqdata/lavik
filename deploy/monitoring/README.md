@@ -17,8 +17,8 @@ limitations under the License.
 # Lavik monitoring stack
 
 This directory runs Prometheus and Grafana on any Docker host that can reach
-the Lavik metrics endpoints. Lavik itself does not run in this Compose
-project.
+the Lavik metrics endpoints. Data and Meta use separate jobs and dashboards.
+Lavik itself does not run in this Compose project.
 
 ## Prerequisites
 
@@ -53,6 +53,8 @@ At minimum, set a reachable target. The default Grafana login is
 
 ```dotenv
 LAVIK_TARGETS=10.0.0.11:9100
+LAVIK_META_TARGETS=10.0.0.21:9200,10.0.0.22:9200,10.0.0.23:9200
+LAVIK_CLUSTER=production-a
 GRAFANA_ADMIN_PASSWORD=admin
 ```
 
@@ -144,8 +146,9 @@ GRAFANA_PUBLIC_URL=https://grafana.example.com
 ```
 
 `LAVIK_MODE` accepts `standalone` and `meta-managed`; managed Single and Cluster
-both use the latter. Legacy `LAVIK_TARGETS` defaults to standalone. Meta rules
-require the managed label; the zero-valued standalone Meta gauges are not faults.
+both use the latter. Legacy `LAVIK_TARGETS` defaults to standalone. Data-side
+Meta-session rules require the managed label; standalone control gauges are not
+faults. The independent Meta server rules are scoped by job `lavik-meta`.
 Admin supplies managed labels and the deployed Grafana URL automatically.
 
 For mixed clusters or modes, copy `prometheus/targets.example.json`, replace its
@@ -216,7 +219,8 @@ Validate using the tools from the same pinned images as deployment:
 
 ```sh
 docker compose run --rm --no-deps --entrypoint promtool prometheus \
-  check rules /etc/prometheus/rules/recording.yml /etc/prometheus/rules/alerts.yml
+  check rules /etc/prometheus/rules/recording.yml /etc/prometheus/rules/alerts.yml \
+  /etc/prometheus/rules/meta-recording.yml /etc/prometheus/rules/meta-alerts.yml
 docker compose run --rm --no-deps --entrypoint promtool prometheus \
   check config /etc/prometheus/prometheus.yml
 docker compose run --rm --no-deps --entrypoint amtool alertmanager \
@@ -249,17 +253,19 @@ scripts/install_monitoring_tools.sh /tmp/lavik-monitoring-tools
 python3 scripts/check_monitoring.py --tools /tmp/lavik-monitoring-tools
 python3 -m unittest discover -s tests -p test_monitoring_config.py
 python3 tests/monitoring/e2e.py --tools /tmp/lavik-monitoring-tools \
-  --output /tmp/lavik-monitoring-drill --lavik-bin ./build_debug/lavik
+  --output /tmp/lavik-monitoring-drill --lavik-bin ./build_debug/lavik \
+  --meta-bin ./build_debug/lavik-meta
 ```
 
 Use a new output directory for each drill. The script starts isolated loopback
 services and a recording HTTP receiver, drives real rule evaluation and validates
 firing, warning/critical routing, deduplication, inhibition and resolved delivery.
-It also pauses/resumes a temporary Lavik process to exercise actual scrape failure.
+It also pauses/resumes a temporary Data process and a voter in a real three-Meta
+cluster to exercise scrape failure, reduced voter redundancy and recovery.
 Only test timing is shortened; production rule expressions are reused and their
 full timing is covered by promtool tests. It needs no production receiver secrets.
-Omitting `--lavik-bin` runs the controllable-exporter portion only, which is not the
-complete real-process acceptance test. Logs, notification JSON and a result file
+Omitting a binary flag skips that real-process portion; controllable-exporter
+checks alone are not complete real-process acceptance. Logs, notification JSON and a result file
 remain in the output directory for inspection; all started processes are stopped.
 
 ### Native replication and FULL recovery
@@ -284,3 +290,36 @@ population recovery notifications from firing through resolved. Rule tests cover
 idle, slow progress, missing snapshots, disconnects and counter resets. Deploy
 the matching exporter with these rules: an older exporter lacks the observation
 availability signal and triggers `LavikMetricsMissing` after five minutes.
+
+## Meta / Raft dashboard
+
+Start each Meta with `--metrics-port 9200 --metrics-bind <private-IP>` and add
+its reachable address to `LAVIK_META_TARGETS`. An empty value supports a
+Data-only deployment. `LAVIK_CLUSTER` is a stable identifier shared by both
+jobs; use letters, digits, dots, dashes or underscores. After changing targets,
+run `docker compose up -d --force-recreate target-config` to regenerate both
+file-discovery lists (each file is replaced atomically). Verify `lavik-meta` as well as `lavik` under
+Prometheus `/targets`.
+
+Meta alerts use the same Alertmanager routing and are shipped in
+`prometheus/rules/meta-*.yml`; see the [Meta alert policy](../../docs/operations/meta-monitoring.md#alert-policy).
+An empty Meta target list is supported and does not raise an absent-target alert.
+
+Open `/d/lavik-meta/lavik-meta` for **Lavik Meta / Raft**. It follows the existing
+palette, stat cards and section layout, but contains only the Meta job. The
+Data overview's Data → Meta row reports client-side control sessions. Select
+one cluster: the six summary cards always cover that whole cluster and keep a
+fixed size as nodes are added. Use **Node details** to filter the sortable,
+paginated node table and the charts, or click a node in the table to focus it.
+Summary values that require complete source coverage show **Unknown** when a
+target or required source is unavailable. Down targets remain in the table
+with unknown runtime fields; expired peer-applied values are absent.
+
+Start with proposal outcomes, latency, in-flight work and replication/apply
+lag. Storage/snapshot, transport, Data-control and exporter diagnostics are
+collapsed initially. Raw term, leader hints, log indices and vote-response
+counts remain available through Prometheus for specific investigations; they
+are not dashboard health indicators. Consult the
+[metric contracts](../../docs/operations/metrics.md#meta--raft-metrics) and
+[fault runbook](../../docs/operations/meta-monitoring.md) before interpreting
+leader hints, transient replication gaps or on-demand lane connections.

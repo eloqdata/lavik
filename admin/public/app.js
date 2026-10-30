@@ -568,7 +568,16 @@ function renderDashboard(view) {
               view.deployment.grafanaPort || 3000
             }/d/lavik-overview/lavik-overview" target="_blank" rel="noopener noreferrer">Grafana · ${escape(
               host.host,
-            )} ↗</a>`;
+            )} · Data ↗</a> · ${
+              view.deployment.metaMetricsSupported === true &&
+              view.deployment.nodes?.some(
+                (node) => node.kind === "meta" && node.metrics,
+              )
+                ? `<a href="http://${escape(ip)}:${
+                    view.deployment.grafanaPort || 3000
+                  }/d/lavik-meta/lavik-meta" target="_blank" rel="noopener noreferrer">Meta / Raft ↗</a>`
+                : "Meta metrics unavailable for this deployment"
+            }`;
           })
           .join(
             " · ",

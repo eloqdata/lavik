@@ -297,6 +297,27 @@ func lavik_raft_status(handle C.uint64_t, out *C.LavikRaftBytes) C.int {
 	return 0
 }
 
+//export lavik_raft_metrics
+func lavik_raft_metrics(handle C.uint64_t, out *C.LavikRaftBytes) C.int {
+	if out == nil {
+		return 1
+	}
+	var runtime *engine.Runtime
+	if handle != 0 {
+		i := lookup(handle)
+		if i == nil {
+			return 1
+		}
+		runtime = i.runtime
+	}
+	data, err := engine.CollectMetrics(runtime)
+	if err != nil {
+		return 1
+	}
+	output(out, data)
+	return 0
+}
+
 //export lavik_raft_close
 func lavik_raft_close(handle C.uint64_t) {
 	i := lookup(handle)

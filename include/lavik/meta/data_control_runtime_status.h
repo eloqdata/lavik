@@ -19,8 +19,11 @@
 // Compact volatile status registry published by the Data-control worker.
 // This is observational only: lease authorization never reads it back.
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -105,6 +108,13 @@ struct MetaDataControlLeadershipState {
   std::uint64_t leader_authority_eligibility_revision_ = 0;
 };
 
+struct MetaDataControlLeadershipObservation {
+  MetaDataControlLeadershipState state_;
+  // Age describes publication, not an expiring authority certificate.
+  std::chrono::steady_clock::time_point published_ =
+      std::chrono::steady_clock::now();
+};
+
 class MetaDataControlRuntimeStatus {
  public:
   // Starts a new leader-owned observation epoch. Status capture uses this
@@ -169,8 +179,17 @@ class MetaDataControlRuntimeStatus {
   MetaDataControlRuntimeSnapshot Snapshot() const;
   // Copies only the leadership bracket used after off-worker status encoding.
   MetaDataControlLeadershipState LeadershipState() const;
+  // Metrics reads this compact publication without entering the node registry.
+  std::shared_ptr<const MetaDataControlLeadershipObservation>
+  MetricsLeadership() const {
+    return metrics_leadership_.load(std::memory_order_acquire);
+  }
 
  private:
+  void PublishLeadership();  // existing writer mutex held
+  std::atomic<std::shared_ptr<const MetaDataControlLeadershipObservation>>
+      metrics_leadership_{
+          std::make_shared<MetaDataControlLeadershipObservation>()};
   mutable std::mutex mutex_;
   std::uint64_t leader_term_ = 0;
   bool leader_authority_eligible_ = false;

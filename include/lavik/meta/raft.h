@@ -46,7 +46,7 @@ class MetaRaftResult {
       std::function<void(MetaRaftResult&, std::shared_ptr<std::exception>&)>;
   void when_ready(handler_type2 handler);
   void Complete(MetaRaftResultCode code, std::shared_ptr<MetaRaftBuffer> data,
-                std::uint64_t index = 0);
+                std::uint64_t index = 0, bool admission_rejected = false);
   // Result fields are immutable after completion. Read them from the handler
   // or after has_result() observes publication; submission alone is no proof.
   MetaRaftResultCode get_result_code() const { return code_; }
@@ -56,6 +56,8 @@ class MetaRaftResult {
     std::lock_guard lock(mutex_);
     return ready_;
   }
+  // True only when dispatch or protocol admission proved no append occurred.
+  bool admission_rejected() const { return admission_rejected_; }
   bool get_accepted() const { return code_ == MetaRaftResultCode::OK; }
   std::string get_result_str() const {
     return std::to_string(static_cast<int>(code_));
@@ -65,6 +67,7 @@ class MetaRaftResult {
   mutable std::mutex mutex_;
   bool ready_ = false;
   bool registered_ = false;
+  bool admission_rejected_ = false;
   handler_type2 handler_;
   MetaRaftResultCode code_ = MetaRaftResultCode::CANCELLED;
   std::shared_ptr<MetaRaftBuffer> data_;
@@ -148,6 +151,8 @@ class MetaRaft : public std::enable_shared_from_this<MetaRaft> {
       MetaRaftOptions options, MetaStateMachine& machine);
   ~MetaRaft();
   void shutdown();
+  // Scrape-only owned text. Caller must drain collection before shutdown.
+  absl::StatusOr<std::string> CollectMetrics() const;
   // The usable leader's Raft term, or -1. Once revoked, a term never becomes
   // usable again; reelection and current-term application are required.
   std::int64_t leader_term() const {

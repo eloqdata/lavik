@@ -26,8 +26,8 @@ curl http://127.0.0.1:9100/metrics
 `--metrics-port=0` disables the HTTP listener. The endpoint is `GET /metrics`
 and uses the Prometheus text exposition format.
 
-A ready-to-run Prometheus and Grafana deployment, including a provisioned
-dashboard and multi-node discovery, is available in
+A ready-to-run Prometheus and Grafana deployment, including separate Data and Meta
+dashboards and multi-node discovery, is available in
 [`deploy/monitoring`](../../deploy/monitoring/README.md).
 
 `lavik_cluster_control_wait_seconds` measures completed Meta control steps,
@@ -39,8 +39,8 @@ threshold. Compare their distribution with the effective heartbeat interval
 and lease duration; use `lavik_cluster_control_lease_expirations_total` to
 identify actual local lease failures.
 
-The Grafana overview includes a collapsed **Meta Control Plane** row for these step
-timings, connection state, lease decisions, expirations, reconnects, and
+The Grafana overview includes a collapsed **Data → Meta Control Plane** row for
+these step timings, connection state, lease decisions, expirations, reconnects, and
 directive results. The metrics HTTP service runs on the data workers; the
 last runtime worker remains dedicated to Meta control tasks.
 
@@ -52,6 +52,105 @@ reachability; `lavik_server_ready` means storage startup completed and no runtim
 storage failure is latched. It does not prove serving authority or FULL population
 readiness. Before readiness, the exporter deliberately emits only that gauge;
 other families must not be treated as missing failures during recovery.
+## Meta / Raft metrics
+
+`lavik-meta` has an independent `GET /metrics` HTTP listener. Add
+`--metrics-port 9200` to the normal Meta startup command; the default port `0`
+disables it. `--metrics-bind` defaults to `127.0.0.1`; set it explicitly to a
+numeric private IP (or wildcard) when Prometheus is remote. IPv6 is supported.
+The listener has no TLS or authentication; limit network access to monitoring
+hosts. Raft, Admin, Data-control and Sentinel ports are unrelated.
+
+The **Lavik Meta / Raft** dashboard uses job `lavik-meta` and a stable `cluster`
+target label. The Data **Lavik Overview** dashboard's Data → Meta row observes
+the Data client side; it does not describe the Meta process.
+
+Collection runs on a separate worker and reads the protocol owner's published
+status and independently updated counters. It never waits for RawNode,
+application or storage work. There is no periodic full-state export or retained
+text cache. Limits are 32 accepted connections, 16 KiB headers, an 8 MiB body,
+a 3 second connection deadline and one collection at a time. Overload or failed
+collection returns HTTP 503; a connection past its deadline closes. Recovery
+can be scraped before the runtime exists; `lavik_meta_source_available` marks
+missing sources and their fields are omitted. Shutdown stops ingress and joins
+collection before destroying sources. Prometheus `up=0` covers fail-stop and
+network failures when no further application metrics can be collected.
+
+### Upstream process metrics
+
+These six families retain etcd v3.7.0 names, HELP, types and histogram buckets.
+Each histogram has finite upper bounds `0.001 * 2^i` seconds for `i=0..13`,
+plus `+Inf`. They are process-wide; production runs one Meta runtime per process.
+Multi-runtime tests must compare deltas rather than attribute upstream values
+to a test node. A narrow registry reuses these actual collectors through the
+registration API. Other default-registry collectors (including Go/process collectors),
+`etcd_snap_db_*` and `etcd_server_*`, are neither collected nor exported by
+this interface.
+
+| Family | Contract |
+|---|---|
+| `etcd_disk_wal_fsync_duration_seconds` | WAL internal synchronization, including sync inside `Save()` |
+| `etcd_disk_wal_write_duration_seconds` | Record writes into PageWriter, potentially buffered; not full durability |
+| `etcd_disk_wal_write_bytes_total` | Upstream **Gauge**, despite its cumulative name; encoded WAL bytes |
+| `etcd_debugging_snap_save_marshalling_duration_seconds` | etcd envelope, checksum and serialization; excludes C++ capture |
+| `etcd_debugging_snap_save_total_duration_seconds` | Successful `SaveSnap()` only; excludes Lavik rename, directory sync and WAL publication |
+| `etcd_snap_fsync_duration_seconds` | File write **and** synchronization, not only the fsync syscall |
+
+### Lavik metric contracts
+
+Names below beginning `raft_` have prefix `lavik_meta_raft_`; other names have
+prefix `lavik_meta_`. Indices, bytes, states and current counts are Gauges.
+`*_total` are Counters except the upstream WAL-byte Gauge noted above.
+
+| Families | Meaning |
+|---|---|
+| `raft_member_id`, `raft_term`, `raft_leader_id`, `raft_role{role}`, `raft_learner` | Local identity, term, leader hint (zero unknown), complete one-hot protocol role, learner flag; none certifies authority |
+| `raft_leader_authority`, `data_control_eligible`, `data_control_term`, `data_control_leadership_age_seconds` | Separate local usable Raft authority and published Data-control eligibility/term and publication age (not a freshness certificate) |
+| `raft_durable_index`, `raft_commit_index`, `raft_applied_index` | Current-branch durable prefix (may regress), Raft commit, completed C++ application |
+| `raft_snapshot_index`, `raft_first_log_index`, `raft_config_index` | Installed/published snapshot, first retained log, applied configuration |
+| `raft_retained_log_bytes`, `raft_pending_durability_bytes` | Logical retained bytes and durability reservations, not filesystem usage |
+| `raft_member{peer_id,kind}` | Current member directory; kind is voter or learner |
+| `raft_peer_match_index`, `raft_peer_next_index`, `raft_peer_pending_snapshot_index`, `raft_peer_replication_state{state}` | Leader-only peer replication, distinct from application |
+| `raft_peer_applied_index`, `raft_peer_fresh`, `raft_peer_heartbeat_age_seconds` | Valid Lavik heartbeat evidence, freshness and age from challenge send; unknown or stale applied is **absent**, never filled with zero |
+| `raft_status_age_seconds`, `raft_leadership_validity_seconds` | Age of immutable protocol publication and heartbeat evidence validity interval |
+| `raft_peer_send_failures_total`, `raft_vote_responses_total{result}` | Outbound dial/write failures; granted/rejected vote **and pre-vote** responses handed to transport |
+| `raft_snapshot_consecutive_failures`, `raft_gc_consecutive_failures` | Consecutive-failure Gauges, reset on success |
+| `raft_snapshot_errors_total`, `raft_gc_errors_total` | Monotonic failed local snapshot rounds and reclamation attempts |
+| `proposals_total{result}`, `proposal_duration_seconds{result}`, `proposals_inflight` | First caller outcome, entry-to-result Histogram including queueing, and calls awaiting that result |
+| `raft_wal_errors_total{stage}` | Fixed stages `save`, `sync`, `snapshot_marker`; no error-text labels |
+| `raft_operation_duration_seconds{stage}`, `raft_operations_total{stage,result}`, `raft_operation_inflight{stage}`, `raft_operation_age_seconds{stage}` | Completed stage Histogram, success/error outcomes, active stage and monotonic age |
+| `raft_lane_connected{peer_id,lane,direction}`, `raft_lane_queued_messages`, `raft_lane_queue_capacity`, `raft_lane_queue_rejections_total`, `raft_lane_errors_total{stage}` | Authorized peer lanes `control/log/snapshot`; errors `connect/read/write`; log/snapshot connect on demand, so zero alone is not a fault |
+| `data_control_live_session_tasks`, `data_control_live_authority_session_tasks`, `data_control_live_leader_tasks`, `data_control_active_sessions` | Existing Data-control task/session Gauges |
+| `data_control_{accepted_sessions,redirected_sessions,rejected_sessions,protocol_errors,full_states_sent,lease_grants,lease_denials,observations_accepted,observations_rejected,directive_results_committed}_total` | Existing atomic Data-control counters |
+| `phase{phase}`, `source_available{source}`, `collection_errors_total`, `collection_duration_seconds` | One-hot starting/recovering/running/stopping, assembled sources, failed collections and Summary of prior completed collections (sum/count, no quantiles) |
+
+Proposal results are `applied_success`, `applied_rejected`, `admission_rejected`
+and `outcome_unknown`. Timeout, cancellation or demotion after submission is
+unknown unless admission proves no append happened. Late completion never
+counts again or rewrites that outcome. Proposal and operation histograms use
+finite bounds 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.3, 1, 5, 30 and
+120 seconds, plus infinity. Timings use monotonic clocks.
+
+Operation stages are `persist` (one ordered executor batch through completion),
+`capture`/`install` (C++ work plus snapshot encode/decode), `prepare` (file,
+rename, directory sync) and `publish` (durable snapshot transaction). Received
+snapshot publication includes its covering WAL commit. These layers overlap
+upstream write/fsync timing and must not be added together. A prepared file
+is not a published snapshot. Upstream snapshot histograms sometimes count only
+success; use stage outcome counters for attempts and failures.
+
+Raft fields share one published cut; independent counters and C++ authority do
+not promise a global transaction. Peer series use current member IDs only and
+stop exporting on removal. Terms are values, never labels. Lane counters retain
+reconnect history for the current authorized peer incarnation; an identity or
+endpoint replacement can reset them. Read errors exclude deadline expiry before
+any frame-header bytes arrive; EOF and incomplete-frame deadlines still count.
+Source age is not evidence of fresh quorum; combine it with freshness and
+authority.
+
+Fault queries and rehearsal examples are in the
+[Meta monitoring runbook](meta-monitoring.md), including the installed Meta alert
+policy. The existing optional Alertmanager handles both Data and Meta rules.
 
 ## Native replication progress and FULL recovery
 

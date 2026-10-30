@@ -179,6 +179,7 @@ struct ProposeWaiter {
   MetaRaftResultCode code_ = MetaRaftResultCode::CANCELLED;
   std::optional<MetaApplyResult> apply_result_;
   bool has_exception_ = false;
+  bool admission_rejected_ = false;
   bycorf::ForeignExecutor foreign_executor_;
   bool inline_resume_ = false;
   // Released only when Raft resolves the append, not when the caller's
@@ -253,6 +254,7 @@ void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
       return;
     }
     waiter->code_ = result.get_result_code();
+    waiter->admission_rejected_ = result.admission_rejected();
     // Shutdown delivers CANCELLED; a missing exception does not turn an
     // unresolved proposal into a successful application outcome.
     waiter->has_exception_ = (err != nullptr);
@@ -1168,6 +1170,9 @@ void MetaLeadershipRelay::Forward(MetaCoordinator& coordinator, Edge edge) {
 bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     MetaCommand command, AuthenticatedPrincipal principal,
     std::uint64_t expected_leader_term) {
+  // The frame owns first-result accounting, including cancellation. Late Raft
+  // completions retain no metric handle and cannot count or rewrite it.
+  MetaProposalMetrics::Attempt attempt(proposal_metrics_);
   if (stopping_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kCancelled,
                            "meta: coordinator is stopping");
@@ -1367,6 +1372,7 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
         }
       });
   if (!submitted.ok()) co_return submitted;
+  attempt.SetOutcome(MetaProposalMetrics::Outcome::kOutcomeUnknown);
   // The seam's own round-trip bound (Raft results have no
   // client-side timeout). It includes executor queueing time and first-wins
   // against the raft completion.
@@ -1377,6 +1383,8 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   co_await ProposeAwaiter(waiter);
 
   // The waiter is filled (see ProposeAwaiter for the happens-before).
+  if (waiter->admission_rejected_)
+    attempt.SetOutcome(MetaProposalMetrics::Outcome::kAdmissionRejected);
   switch (waiter->code_) {
     case MetaRaftResultCode::OK:
       break;
@@ -1404,6 +1412,10 @@ bycorf::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
         absl::StatusCode::kInternal,
         "meta: committed apply result has a mismatched command tag");
   }
+  attempt.SetOutcome(waiter->apply_result_->verdict_ ==
+                             MetaAuditVerdict::kRejected
+                         ? MetaProposalMetrics::Outcome::kAppliedRejected
+                         : MetaProposalMetrics::Outcome::kAppliedSuccess);
   co_return *waiter->apply_result_;
 }
 

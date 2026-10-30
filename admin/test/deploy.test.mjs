@@ -275,6 +275,73 @@ test("a stale follower review cannot replace a changed plan or create an orphan 
   }
 });
 
+test("follower metrics allocation follows Data ports per IP and rejects Meta collisions", async (t) => {
+  for (const scenario of [
+    { name: "colocated Meta and Data", host: input.hosts[0], metrics: 9103 },
+    {
+      name: "another SSH route to the same IP",
+      host: { ...input.hosts[0], port: 2222 },
+      metrics: 9103,
+    },
+    {
+      name: "another IP starts at the Data base",
+      host: { host: "127.0.0.2", user: "ubuntu" },
+      metrics: 9100,
+    },
+    {
+      name: "next Data metrics port collides with Meta",
+      host: input.hosts[0],
+      metaMetricsPort: 9103,
+      collision: true,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const f = await fixture();
+      try {
+        const preview = await f.deployments.preview({
+          ...input,
+          monitorHosts: [0],
+          metaMetricsPort: scenario.metaMetricsPort,
+        });
+        const job = await f.deployments.create({
+          token: preview.token,
+          confirm: "test",
+        });
+        await f.fleet.update(job, "completed", "completed", "ready");
+        const plan = await f.deployments.plan("test");
+        plan.modern = true;
+        await f.deployments.save(plan);
+        f.fleet.view = async () => ({
+          status: { groups: [{ group_id: "group-1" }] },
+        });
+        const followerInput = {
+          group: "group-1",
+          host: scenario.host,
+          dataPort: 16390,
+        };
+        if (scenario.collision) {
+          const probes = f.calls.length;
+          await assert.rejects(
+            f.deployments.previewFollower("test", followerInput),
+            /Follower metrics port conflicts with another listener/,
+          );
+          assert.equal(f.calls.length, probes);
+        } else {
+          const follower = await f.deployments.previewFollower(
+            "test",
+            followerInput,
+          );
+          assert.equal(follower.ready, true);
+          assert.equal(follower.nodes[0].metrics, scenario.metrics);
+          assert.deepEqual(f.calls.at(-1).ports, [16390, scenario.metrics]);
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
 test("only explicit reads may fall back to another SSH host after a transport error", async () => {
   const f = await fixture();
   try {
@@ -520,7 +587,7 @@ test("SPDK selects every Data host and requires dedicated placement and explicit
   }
 });
 
-test("monitoring reserves ports, enables each Data exporter, and uploads all targets", async () => {
+test("monitoring separates Data and Meta targets and gates flags by binary capability", async () => {
   const f = await fixture();
   try {
     const preview = await f.deployments.preview({
@@ -529,11 +596,26 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
     });
     assert.equal(f.calls[0].monitoring, true);
     assert.deepEqual(
-      preview.nodes.filter((n) => n.metrics).map((n) => n.metrics),
+      preview.nodes
+        .filter((n) => n.kind === "data" && n.metrics)
+        .map((n) => n.metrics),
       [9100, 9101, 9102],
     );
     assert.ok(
       nodeArguments(preview, preview.nodes[3]).includes("--metrics-port"),
+    );
+    assert.deepEqual(
+      preview.nodes.filter((n) => n.kind === "meta").map((n) => n.metrics),
+      [9200, 9201, 9202],
+    );
+    assert.ok(
+      !nodeArguments(preview, preview.nodes[0]).includes("--metrics-port"),
+    );
+    await f.deployments.configureMonitoring(preview);
+    assert.deepEqual(f.calls.at(-1).metaTargets, []);
+    preview.metaMetricsSupported = true;
+    assert.ok(
+      nodeArguments(preview, preview.nodes[0]).includes("--metrics-bind"),
     );
     await f.deployments.configureMonitoring(preview);
     const request = f.calls.at(-1);
@@ -543,8 +625,15 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
       "127.0.0.1:9101",
       "127.0.0.1:9102",
     ]);
+    assert.deepEqual(request.metaTargets, [
+      "127.0.0.1:9200",
+      "127.0.0.1:9201",
+      "127.0.0.1:9202",
+    ]);
+    assert.ok(request.files["grafana/dashboards/lavik-meta.json"]);
     assert.ok(request.files["grafana/dashboards/lavik-overview.json"]);
     assert.ok(request.files["prometheus/rules/alerts.yml"]);
+    assert.ok(request.files["prometheus/rules/meta-alerts.yml"]);
     assert.ok(request.files["prometheus/rules/recording.yml"]);
     assert.ok(request.files["configure-targets.sh"]);
     assert.ok(request.files["alertmanager/alertmanager.yml"]);
@@ -552,6 +641,13 @@ test("monitoring reserves ports, enables each Data exporter, and uploads all tar
     assert.equal(
       request.grafanaUrl,
       `http://${request.address}:${request.grafanaPort}`,
+    );
+    assert.throws(
+      () =>
+        topology(
+          settings({ ...input, monitorHosts: [0], metaMetricsPort: 7200 }),
+        ),
+      /overlap/,
     );
     assert.equal(request.password, undefined);
     assert.throws(

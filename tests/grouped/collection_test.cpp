@@ -24,6 +24,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "../support/ordered_v1.h"
 #include "gtest/gtest.h"
 #include "member_directory_fixture.h"
 
@@ -185,44 +186,6 @@ TEST(GroupedCollectionTest, ListRangeOwnsOnlySelectedValues) {
   EXPECT_EQ(values->front(), page.entries_[1].value_);
 }
 
-TEST(GroupedCollectionTest, ListRangeValidatesUnselectedEntriesAndEnvelope) {
-  auto page = Page();
-  auto encoded = EncodeOrderedGroup(page);
-  ASSERT_TRUE(encoded.ok());
-  // Corruption before and after the selected middle item must still fail.
-  for (const std::size_t entry : {0, 2}) {
-    const auto offset = kOrderedGroupHeaderBytes + entry * (12 + 6);
-    auto bad = *encoded;
-    bad[offset + 11] = '\x80';  // -0 is forbidden even though it equals +0.
-    EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 1, 1).status()));
-    bad = *encoded;
-    for (int i = 0; i < 4; ++i) bad[offset + i] = '\xff';
-    EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 1, 1).status()));
-  }
-  auto bad = *encoded;
-  bad[48] = 2;  // Correct framing for two entries still leaves trailing bytes.
-  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 0, 1).status()));
-  bad = *encoded;
-  bad[56] = 1;  // Reserved envelope bytes remain checked.
-  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(bad, 0, 1).status()));
-  for (std::size_t length = 0; length < encoded->size(); ++length)
-    EXPECT_FALSE(DecodeOrderedListRange(encoded->substr(0, length), 0, 0).ok());
-  EXPECT_TRUE(
-      absl::IsOutOfRange(DecodeOrderedListRange(*encoded, 4, 0).status()));
-  EXPECT_TRUE(absl::IsOutOfRange(
-      DecodeOrderedListRange(*encoded, 1, SIZE_MAX).status()));
-  auto sorted =
-      EncodeOrderedGroup(Page(1, 3, OrderedCollectionKind::kSortedSet));
-  ASSERT_TRUE(sorted.ok());
-  EXPECT_TRUE(absl::IsDataLoss(DecodeOrderedListRange(*sorted, 0, 1).status()));
-  page.entries_.clear();
-  page.retired_ = true;
-  auto retired = EncodeOrderedGroup(page);
-  ASSERT_TRUE(retired.ok());
-  EXPECT_TRUE(
-      absl::IsDataLoss(DecodeOrderedListRange(*retired, 0, 0).status()));
-}
-
 TEST(GroupedCollectionTest, SortedSetViewsBorrowBinaryMembersAndKeepScores) {
   auto page = Page(1, 0, OrderedCollectionKind::kSortedSet);
   page.entries_ = {
@@ -237,7 +200,6 @@ TEST(GroupedCollectionTest, SortedSetViewsBorrowBinaryMembersAndKeepScores) {
   ASSERT_EQ(views->size(), page.entries_.size());
   std::size_t offset = kOrderedGroupHeaderBytes;
   for (std::size_t i = 0; i < views->size(); ++i) {
-    offset += 12;
     EXPECT_EQ((*views)[i].value_, page.entries_[i].value_);
     EXPECT_EQ((*views)[i].value_.data(), encoded->data() + offset);
     EXPECT_EQ(std::bit_cast<std::uint64_t>((*views)[i].score_),
@@ -246,33 +208,44 @@ TEST(GroupedCollectionTest, SortedSetViewsBorrowBinaryMembersAndKeepScores) {
   }
 }
 
-TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
+TEST(GroupedCollectionTest, SortedSetDecodersShareCorruptionChecks) {
   auto page = Page(1, 3, OrderedCollectionKind::kSortedSet);
   auto encoded = EncodeOrderedGroup(page);
   ASSERT_TRUE(encoded.ok());
-  // Differential corruption checks cover every header, length, score and
-  // member byte. A borrowing decoder must not weaken the owning decoder's
-  // validation just because the caller may only consume the first member.
+  // All three entry points share corrupt inputs; the encoded owner always
+  // verifies uniqueness, while full decode and borrowed views offer both
+  // policies.
   for (std::size_t i = 0; i < encoded->size(); ++i) {
     for (const unsigned mask : {1u, 0x80u, 0xffu}) {
       auto bad = *encoded;
       bad[i] ^= static_cast<char>(mask);
-      auto owned = DecodeOrderedGroup(bad);
-      auto views = DecodeSortedSetGroupViews(bad);
-      EXPECT_EQ(owned.ok(), views.ok()) << i << ":" << mask;
+      SCOPED_TRACE(testing::Message() << i << ":" << mask);
+      const auto encoded_page = DecodeEncodedSortedSetGroup(bad);
+      for (auto validation : {SortedSetMemberValidation::kVerifyUnique,
+                              SortedSetMemberValidation::kTrustStored}) {
+        auto owned = DecodeOrderedGroup(bad, validation);
+        auto views = DecodeSortedSetGroupViews(bad, validation);
+        EXPECT_EQ(owned.ok(), views.ok());
+        if (validation == SortedSetMemberValidation::kVerifyUnique)
+          EXPECT_EQ(owned.ok(), encoded_page.ok());
+      }
     }
     EXPECT_FALSE(DecodeSortedSetGroupViews(encoded->substr(0, i)).ok());
+    EXPECT_FALSE(DecodeEncodedSortedSetGroup(encoded->substr(0, i)).ok());
   }
   auto duplicate = *encoded;
   // Different scores can order duplicate member names correctly; uniqueness
   // must still reject a repeated, non-adjacent member.
   duplicate.replace(duplicate.find("item-2"), 6, "item-0");
   EXPECT_TRUE(absl::IsDataLoss(DecodeSortedSetGroupViews(duplicate).status()));
+  EXPECT_TRUE(
+      absl::IsDataLoss(DecodeEncodedSortedSetGroup(duplicate).status()));
   auto nan = *encoded;
   const auto bits =
       std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN());
   for (unsigned i = 0; i < 8; ++i)
-    nan[kOrderedGroupHeaderBytes + 4 + i] = static_cast<char>(bits >> (8 * i));
+    nan[encoded->size() - (page.entries_.size() * 12 + 4) + i] =
+        static_cast<char>(bits >> (8 * i));
   EXPECT_TRUE(absl::IsDataLoss(DecodeSortedSetGroupViews(nan).status()));
   page.entries_.clear();
   page.retired_ = true;
@@ -282,6 +255,7 @@ TEST(GroupedCollectionTest, SortedSetViewsMatchOwnedDecoderCorruptionChecks) {
   auto list = EncodeOrderedGroup(Page());
   ASSERT_TRUE(list.ok());
   EXPECT_FALSE(DecodeSortedSetGroupViews(*list).ok());
+  EXPECT_FALSE(DecodeEncodedSortedSetGroup(*list).ok());
 }
 
 TEST(GroupedCollectionTest, EncodedSortedSetPageOwnsBytesAcrossCopyAndMove) {
@@ -318,48 +292,128 @@ TEST(GroupedCollectionTest, EncodedSortedSetPageOwnsBytesAcrossCopyAndMove) {
   EXPECT_FALSE(OrderedGroupEncoder::Create(ambiguous).ok());
 }
 
+TEST(GroupedCollectionTest, EncodedV1SortedSetStreamsV2WithoutMaterializing) {
+  auto original = Page(7, 0, OrderedCollectionKind::kSortedSet);
+  original.previous_ = 3;
+  original.next_ = 9;
+  original.entries_ = {
+      {"", -std::numeric_limits<double>::infinity()},
+      {std::string("a\0", 2), -0.0},
+      {std::string(128 * 1024, 'z'), std::numeric_limits<double>::infinity()}};
+  const auto wire = test::EncodeOrderedGroupV1(original);
+  ASSERT_TRUE(wire.ok());
+  const auto source = DecodeEncodedSortedSetGroup(*wire);
+  ASSERT_TRUE(source.ok());
+  ASSERT_EQ(source->encoded_sorted_set_->version(), 1);
+  const auto expected = EncodeOrderedGroup(original);
+  ASSERT_TRUE(expected.ok());
+  auto created = OrderedGroupEncoder::Create(*source);
+  ASSERT_TRUE(created.ok());
+  EXPECT_EQ(created->encoded_bytes(), wire->size() + 4);
+  auto encoder = std::move(*created);
+  std::string actual;
+  bool borrowed = false;
+  while (auto part = encoder.Next()) {
+    if (part->size() == original.entries_.back().value_.size()) {
+      EXPECT_EQ(part->data(),
+                source->encoded_sorted_set_->entries().back().value_.data());
+      borrowed = true;
+    }
+    actual.append(*part);
+  }
+  EXPECT_TRUE(borrowed);
+  EXPECT_EQ(actual, *expected);
+  EXPECT_EQ(actual.size(), encoder.encoded_bytes());
+  EXPECT_TRUE(source->entries_.empty());
+  EXPECT_EQ(source->encoded_sorted_set_->version(), 1);
+  EXPECT_EQ(source->encoded_sorted_set_->bytes(),
+            std::string_view(*wire).substr(kOrderedGroupHeaderBytes));
+  // A link-only replacement also converts the old body, retaining identity
+  // changes in the regenerated envelope rather than copying its old header.
+  auto relinked = *source;
+  relinked.next_ = original.next_ = 10;
+  EXPECT_EQ(*EncodeOrderedGroup(relinked), *EncodeOrderedGroup(original));
+}
+
+TEST(GroupedCollectionTest, EncodedV1PointUpgradeAccountsForEndOffset) {
+  const auto wire =
+      test::EncodeOrderedGroupV1(Page(1, 1, OrderedCollectionKind::kSortedSet));
+  ASSERT_TRUE(wire.ok());
+  const auto source = DecodeEncodedSortedSetGroup(*wire);
+  ASSERT_TRUE(source.ok());
+  auto too_small =
+      EditEncodedSortedSetGroup(*source, "item-0", 0, 1, wire->size());
+  ASSERT_TRUE(too_small.ok());
+  EXPECT_FALSE(*too_small);
+  auto fits =
+      EditEncodedSortedSetGroup(*source, "item-0", 0, 1, wire->size() + 4);
+  ASSERT_TRUE(fits.ok());
+  ASSERT_TRUE(*fits);
+  ASSERT_EQ((*fits)->encoded_sorted_set_->version(), 2);
+  auto encoded = EncodeOrderedGroup(**fits);
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(encoded->size(), wire->size() + 4);
+  EXPECT_EQ(source->encoded_sorted_set_->version(), 1);
+}
+
 TEST(GroupedCollectionTest, EncodedSortedSetPointEditsMatchOwnedImages) {
   auto original = Page(7, 40, OrderedCollectionKind::kSortedSet);
   original.previous_ = 3;
   original.next_ = 9;
   for (auto& entry : original.entries_) entry.value_.append(32, '\0');
-  const auto wire = EncodeOrderedGroup(original);
-  ASSERT_TRUE(wire.ok());
-  const auto decoded = DecodeEncodedSortedSetGroup(*wire);
-  ASSERT_TRUE(decoded.ok());
-  for (std::size_t index = 0; index < original.entries_.size(); ++index) {
-    for (const double score :
-         {-std::numeric_limits<double>::infinity(), -0.0, 0.0, 4.0, 19.25, 39.0,
-          std::numeric_limits<double>::infinity()}) {
+  for (bool v1 : {false, true}) {
+    auto encode = [v1](const OrderedGroupSnapshot& page) {
+      return v1 ? test::EncodeOrderedGroupV1(page) : EncodeOrderedGroup(page);
+    };
+    const auto wire = encode(original);
+    ASSERT_TRUE(wire.ok());
+    const auto decoded = DecodeEncodedSortedSetGroup(*wire);
+    ASSERT_TRUE(decoded.ok());
+    for (std::size_t index = 0; index < original.entries_.size(); ++index) {
+      for (const double score :
+           {-std::numeric_limits<double>::infinity(), -0.0, 0.0, 4.0, 19.25,
+            39.0, std::numeric_limits<double>::infinity()}) {
+        auto expected = original;
+        const auto before = expected.entries_[index].score_;
+        const auto member = expected.entries_[index].value_;
+        expected.entries_[index].score_ = score;
+        std::sort(expected.entries_.begin(), expected.entries_.end(),
+                  OrderedEntryLess);
+        auto edited =
+            EditEncodedSortedSetGroup(*decoded, member, before, score);
+        ASSERT_TRUE(edited.ok()) << edited.status();
+        ASSERT_TRUE(*edited);
+        EXPECT_TRUE((*edited)->entries_.empty());
+        ASSERT_TRUE((*edited)->encoded_sorted_set_);
+        EXPECT_EQ((*edited)->encoded_sorted_set_->version(), 2);
+        EXPECT_EQ(*EncodeOrderedGroup(**edited), *EncodeOrderedGroup(expected));
+      }
       auto expected = original;
-      const auto before = expected.entries_[index].score_;
       const auto member = expected.entries_[index].value_;
-      expected.entries_[index].score_ = score;
-      std::sort(expected.entries_.begin(), expected.entries_.end(),
-                OrderedEntryLess);
-      auto edited = EditEncodedSortedSetGroup(*decoded, member, before, score);
-      ASSERT_TRUE(edited.ok()) << edited.status();
-      ASSERT_TRUE(*edited);
-      EXPECT_TRUE((*edited)->entries_.empty());
-      EXPECT_EQ(*EncodeOrderedGroup(**edited), *EncodeOrderedGroup(expected));
+      const auto score = expected.entries_[index].score_;
+      expected.entries_.erase(expected.entries_.begin() + index);
+      auto erased =
+          EditEncodedSortedSetGroup(*decoded, member, score, std::nullopt);
+      ASSERT_TRUE(erased.ok());
+      ASSERT_TRUE(*erased);
+      EXPECT_EQ(*EncodeOrderedGroup(**erased), *EncodeOrderedGroup(expected));
+      auto restored =
+          EditEncodedSortedSetGroup(**erased, member, std::nullopt, score);
+      ASSERT_TRUE(restored.ok());
+      ASSERT_TRUE(*restored);
+      EXPECT_EQ(*EncodeOrderedGroup(**restored), *EncodeOrderedGroup(original));
+      auto resolved = EditEncodedSortedSetGroup(
+          **erased, member, std::nullopt, score, kCollectionGroupTargetBytes,
+          SortedSetMemberAbsence::kVerified);
+      ASSERT_TRUE(resolved.ok());
+      ASSERT_TRUE(*resolved);
+      EXPECT_EQ(*EncodeOrderedGroup(**resolved), *EncodeOrderedGroup(original));
     }
-    auto expected = original;
-    const auto member = expected.entries_[index].value_;
-    const auto score = expected.entries_[index].score_;
-    expected.entries_.erase(expected.entries_.begin() + index);
-    auto erased =
-        EditEncodedSortedSetGroup(*decoded, member, score, std::nullopt);
-    ASSERT_TRUE(erased.ok());
-    ASSERT_TRUE(*erased);
-    EXPECT_EQ(*EncodeOrderedGroup(**erased), *EncodeOrderedGroup(expected));
-    auto restored =
-        EditEncodedSortedSetGroup(**erased, member, std::nullopt, score);
-    ASSERT_TRUE(restored.ok());
-    ASSERT_TRUE(*restored);
-    EXPECT_EQ(*EncodeOrderedGroup(**restored), *wire);
+    // The immutable predecessor must survive every candidate edit unchanged.
+    EXPECT_EQ(decoded->encoded_sorted_set_->bytes(),
+              std::string_view(*wire).substr(kOrderedGroupHeaderBytes));
+    EXPECT_EQ(*EncodeOrderedGroup(*decoded), *EncodeOrderedGroup(original));
   }
-  // The immutable predecessor must survive every candidate edit unchanged.
-  EXPECT_EQ(*EncodeOrderedGroup(*decoded), *wire);
 }
 
 TEST(GroupedCollectionTest, EncodedSortedSetPointRejectsBadEditsAndFallsBack) {
@@ -372,6 +426,10 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointRejectsBadEditsAndFallsBack) {
       EditEncodedSortedSetGroup(*page, "item-0", std::nullopt, 10).ok());
   EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "item-0", 9, 10).ok());
   EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "missing", 0, 10).ok());
+  EXPECT_FALSE(EditEncodedSortedSetGroup(*page, "missing", 0, 10,
+                                         kCollectionGroupTargetBytes,
+                                         SortedSetMemberAbsence::kVerified)
+                   .ok());
   EXPECT_FALSE(
       EditEncodedSortedSetGroup(*page, "missing", std::nullopt, std::nullopt)
           .ok());
@@ -402,26 +460,6 @@ TEST(GroupedCollectionTest, EncodedSortedSetPointRejectsBadEditsAndFallsBack) {
   EXPECT_EQ(*EncodeOrderedGroup(*page), *wire);
 }
 
-TEST(GroupedCollectionTest, EncodedSortedSetDecoderKeepsFullValidation) {
-  auto wire = EncodeOrderedGroup(Page(1, 3, OrderedCollectionKind::kSortedSet));
-  ASSERT_TRUE(wire.ok());
-  for (std::size_t offset = 0; offset < wire->size(); ++offset) {
-    for (const unsigned mask : {1u, 0x80u, 0xffu}) {
-      auto bad = *wire;
-      bad[offset] ^= static_cast<char>(mask);
-      EXPECT_EQ(DecodeOrderedGroup(bad).ok(),
-                DecodeEncodedSortedSetGroup(bad).ok())
-          << offset;
-    }
-    EXPECT_FALSE(DecodeEncodedSortedSetGroup(wire->substr(0, offset)).ok());
-  }
-  wire->replace(wire->find("item-2"), 6, "item-0");
-  EXPECT_TRUE(absl::IsDataLoss(DecodeEncodedSortedSetGroup(*wire).status()));
-  const auto list = EncodeOrderedGroup(Page());
-  ASSERT_TRUE(list.ok());
-  EXPECT_FALSE(DecodeEncodedSortedSetGroup(*list).ok());
-}
-
 TEST(GroupedCollectionTest, SortedSetStoredReadsTrustMemberUniqueness) {
   auto page = Page(1, 3, OrderedCollectionKind::kSortedSet);
   auto encoded = EncodeOrderedGroup(page);
@@ -447,9 +485,9 @@ TEST(GroupedCollectionTest, SortedSetStoredReadsTrustMemberUniqueness) {
   }
 }
 
-TEST(GroupedCollectionTest, SortedSetStoredReadsKeepStructuralValidation) {
+TEST(GroupedCollectionTest, SortedSetStoredReadsKeepStructuralValidationV1) {
   auto encoded =
-      EncodeOrderedGroup(Page(1, 3, OrderedCollectionKind::kSortedSet));
+      test::EncodeOrderedGroupV1(Page(1, 3, OrderedCollectionKind::kSortedSet));
   ASSERT_TRUE(encoded.ok());
   const auto rejected = [](const std::string& bytes) {
     for (auto validation : {SortedSetMemberValidation::kVerifyUnique,
@@ -1079,11 +1117,14 @@ TEST(GroupedCollectionTest,
   for (std::size_t i = 0; i < bytes->size(); ++i)
     EXPECT_FALSE(DecodeOrderedGroup(bytes->substr(0, i)).ok());
   EXPECT_FALSE(DecodeOrderedGroup(*bytes + "x").ok());
-  for (std::size_t offset : {0, 8, 12, 13, 14, 48, 52, 56, 63, 64}) {
+  for (std::size_t offset : {0, 8, 12, 13, 14, 48, 52, 56, 63}) {
     auto broken = *bytes;
     broken[offset] = static_cast<char>(0xff);
     EXPECT_FALSE(DecodeOrderedGroup(broken).ok()) << offset;
   }
+  auto bad_index = *bytes;
+  bad_index[bytes->size() - (page.entries_.size() + 1) * 4] = '\xff';
+  EXPECT_FALSE(DecodeOrderedGroup(bad_index).ok());
   page.previous_ = page.id_;
   EXPECT_FALSE(EncodeOrderedGroup(page).ok());
   page.previous_ = 0;
@@ -1762,8 +1803,9 @@ TEST(GroupedCollectionTest, SameSizeListReplacementNeedsOnlyItsOwnPage) {
   }
   // A split that changes the next page's link still requires that neighbour;
   // stale pages must never pass even when the replacement has the same size.
+  const auto exact_fit = EncodeOrderedGroup(pages[1])->size();
   EXPECT_EQ(PlanOrderedCollectionSplice(*directory, Loaded({pages[1]}), 2, 1,
-                                        {{.value_ = "longer!"}}, 100)
+                                        {{.value_ = "longer!"}}, exact_fit)
                 .status()
                 .code(),
             absl::StatusCode::kInvalidArgument);
@@ -1794,9 +1836,10 @@ TEST(GroupedCollectionTest, SpliceRejectsStaleMissingDuplicateAndInvalidInput) {
             absl::StatusCode::kAborted);
   auto missing = Loaded(split->groups_);
   missing.erase(missing.begin() + 1);
-  EXPECT_FALSE(
-      PlanOrderedCollectionSplice(*directory, std::move(missing), 0, 2, {})
-          .ok());
+  EXPECT_FALSE(PlanOrderedCollectionSplice(
+                   *directory, std::move(missing), 0,
+                   split->groups_.front().entries_.size() + 1, {})
+                   .ok());
   auto duplicate = Loaded(split->groups_);
   duplicate.push_back(duplicate.front());
   EXPECT_FALSE(
@@ -2561,26 +2604,34 @@ TEST(GroupedCollectionTest, StreamingMetadataRebuildsBoundsAcrossAnyFraming) {
                    {"b", 0.0},
                    {"c", 1.5},
                    {"d", infinity}};
+  // Retain multi-byte counts as well as header/score/offset chunk boundaries.
+  for (unsigned i = 0; i < 252; ++i)
+    page.entries_.insert(page.entries_.end() - 1,
+                         {std::to_string(i), double(i + 2)});
   for (auto kind :
        {OrderedCollectionKind::kSortedSet, OrderedCollectionKind::kList}) {
     page.kind_ = kind;
     if (kind == OrderedCollectionKind::kList)
       for (auto& entry : page.entries_) entry.score_ = 0;
-    const auto encoded = EncodeOrderedGroup(page);
-    ASSERT_TRUE(encoded.ok()) << encoded.status();
-    for (const std::size_t chunk : {1, 7, 12, 63, 64, 65, 4096, 65536}) {
-      OrderedGroupMetadataDecoder decoder(encoded->size());
-      EXPECT_TRUE(decoder.Read({}).ok());
-      for (std::size_t offset = 0; offset < encoded->size(); offset += chunk)
-        ASSERT_TRUE(
-            decoder.Read(std::string_view(*encoded).substr(offset, chunk)).ok())
-            << "chunk=" << chunk << " offset=" << offset;
-      const auto metadata = decoder.Finish();
-      ASSERT_TRUE(metadata.ok()) << metadata.status();
-      EXPECT_EQ(metadata->id_, page.id_);
-      EXPECT_EQ(metadata->item_count_, page.entries_.size());
-      EXPECT_EQ(metadata->min_score_, page.entries_.front().score_);
-      EXPECT_EQ(metadata->max_score_, page.entries_.back().score_);
+    for (const bool v1 : {false, true}) {
+      const auto encoded =
+          v1 ? test::EncodeOrderedGroupV1(page) : EncodeOrderedGroup(page);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      for (const std::size_t chunk : {1, 7, 12, 63, 64, 65, 4096, 65536}) {
+        OrderedGroupMetadataDecoder decoder(encoded->size());
+        EXPECT_TRUE(decoder.Read({}).ok());
+        for (std::size_t offset = 0; offset < encoded->size(); offset += chunk)
+          ASSERT_TRUE(
+              decoder.Read(std::string_view(*encoded).substr(offset, chunk))
+                  .ok())
+              << "chunk=" << chunk << " offset=" << offset;
+        const auto metadata = decoder.Finish();
+        ASSERT_TRUE(metadata.ok()) << metadata.status();
+        EXPECT_EQ(metadata->id_, page.id_);
+        EXPECT_EQ(metadata->item_count_, page.entries_.size());
+        EXPECT_EQ(metadata->min_score_, page.entries_.front().score_);
+        EXPECT_EQ(metadata->max_score_, page.entries_.back().score_);
+      }
     }
   }
   page.retired_ = true;
@@ -2597,29 +2648,50 @@ TEST(GroupedCollectionTest, StreamingMetadataRebuildsBoundsAcrossAnyFraming) {
 }
 
 TEST(GroupedCollectionTest,
-     StreamingMetadataRejectsTruncationAndInvalidScores) {
-  auto page = Page(1, 2, OrderedCollectionKind::kSortedSet);
-  const auto encoded = EncodeOrderedGroup(page);
-  ASSERT_TRUE(encoded.ok());
-  for (std::size_t size = 0; size < encoded->size(); ++size) {
-    OrderedGroupMetadataDecoder decoder(encoded->size());
-    ASSERT_TRUE(decoder.Read(std::string_view(*encoded).substr(0, size)).ok());
-    EXPECT_FALSE(decoder.Finish().ok()) << "truncated size=" << size;
-  }
-  OrderedGroupMetadataDecoder extra(encoded->size());
-  ASSERT_TRUE(extra.Read(*encoded).ok());
-  EXPECT_FALSE(extra.Read("x").ok());
-  EXPECT_FALSE(extra.Finish().ok());
-  for (const double score : {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
-    auto corrupt = *encoded;
-    const auto second_score =
-        kOrderedGroupHeaderBytes + 12 + page.entries_[0].value_.size() + 4;
-    const auto bits = std::bit_cast<std::uint64_t>(score);
-    for (unsigned byte = 0; byte < 8; ++byte)
-      corrupt[second_score + byte] = static_cast<char>(bits >> (8 * byte));
-    OrderedGroupMetadataDecoder decoder(corrupt.size());
-    EXPECT_FALSE(decoder.Read(corrupt).ok());
-    EXPECT_FALSE(decoder.Finish().ok());
+     StreamingMetadataRejectsTruncationInvalidOffsetsAndScores) {
+  for (const auto kind :
+       {OrderedCollectionKind::kList, OrderedCollectionKind::kSortedSet}) {
+    auto page = Page(1, 32, kind);
+    const auto encoded = EncodeOrderedGroup(page);
+    ASSERT_TRUE(encoded.ok());
+    for (std::size_t size = 0; size < encoded->size(); ++size) {
+      OrderedGroupMetadataDecoder decoder(encoded->size());
+      ASSERT_TRUE(
+          decoder.Read(std::string_view(*encoded).substr(0, size)).ok());
+      EXPECT_FALSE(decoder.Finish().ok()) << "truncated size=" << size;
+    }
+    OrderedGroupMetadataDecoder extra(encoded->size());
+    ASSERT_TRUE(extra.Read(*encoded).ok());
+    EXPECT_FALSE(extra.Read("x").ok());
+    EXPECT_FALSE(extra.Finish().ok());
+    auto reject = [&](const std::string& corrupt) {
+      for (const std::size_t chunk : {1, 7, 4096}) {
+        OrderedGroupMetadataDecoder decoder(corrupt.size());
+        bool valid = true;
+        for (std::size_t offset = 0; valid && offset < corrupt.size();
+             offset += chunk)
+          valid = decoder.Read(std::string_view(corrupt).substr(offset, chunk))
+                      .ok();
+        EXPECT_FALSE(decoder.Finish().ok());
+      }
+    };
+    const auto offsets = encoded->size() - (page.entries_.size() + 1) * 4;
+    for (std::size_t i = 0; i <= page.entries_.size(); ++i) {
+      auto corrupt = *encoded;
+      std::fill_n(corrupt.begin() + offsets + i * 4, 4, '\xff');
+      reject(corrupt);
+    }
+    if (kind != OrderedCollectionKind::kSortedSet) continue;
+    for (const double score :
+         {-1.0, std::numeric_limits<double>::quiet_NaN()}) {
+      auto corrupt = *encoded;
+      const auto second_score =
+          encoded->size() - (page.entries_.size() * 12 + 4) + 8;
+      const auto bits = std::bit_cast<std::uint64_t>(score);
+      for (unsigned byte = 0; byte < 8; ++byte)
+        corrupt[second_score + byte] = static_cast<char>(bits >> (8 * byte));
+      reject(corrupt);
+    }
   }
 }
 

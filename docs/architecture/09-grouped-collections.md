@@ -99,13 +99,16 @@ Ordered roots identify a doubly linked page chain, aggregate item count and
 the next unused page identifier. Page identifiers are not reused inside an
 incarnation. Rank metadata locates a page without keeping item values resident.
 Splits and removals publish changed neighbour links and retained retirement
-records together. Sorted Set directories also retain per-page minimum and
-maximum scores, but no member boundaries. Stream directories retain bounded
-per-page maximum routing keys and a fixed header with their logical version;
-unknown or ambiguous long-name boundaries fall back to checked page reads.
-These runtime-only bounds do not change the durable page format. Recovery checks the complete chain,
-rank totals, numeric score boundaries and every present live extent checksum while
-retaining only routing metadata. Full-page decoding validates local item
+records together. Sorted Set directories retain per-page minimum and maximum
+scores plus bounded prefixes of last members. Stream directories use the same
+fixed per-page cache for maximum routing keys and retain a fixed header with
+their logical version. Foreground page replacement publishes fresh boundaries;
+unchanged logical pages share their caches across pinned views and relocation.
+Unknown or ambiguous prefixes fall back to checked page reads. Sorted Set
+member prefixes are learned lazily after recovery or checkpoint loading.
+These runtime-only caches do not change the durable page format. Recovery checks
+the complete chain, rank totals, numeric score boundaries and every present live
+extent checksum while retaining only routing metadata. Full-page decoding validates local item
 ordering; Sorted Set materialization also checks
 score/binary-member ordering across adjacent pages.
 
@@ -113,7 +116,7 @@ Sorted Sets persist each member twice: once in an ordered page and
 once as a Hash field whose value is an eight-byte little-endian IEEE-754
 score. The member index records scores, not ordered page identifiers, so
 ordered splits do not invalidate member routing. Neither directory retains
-per-member data in memory; the ordered directory's score bounds scale with
+per-member data in memory; the ordered directory's bounds scale with
 pages, not members. Both graphs have the same incarnation and cardinality.
 Their revisions need not match: an ordered-only topology change
 or compensating root may retain an older, unchanged member graph.
@@ -236,15 +239,36 @@ identity space under the same Sorted Set type and incarnation. Recovery
 bounds each graph by its own root revision.
 
 New keys, compact promotions and streaming imports build both Sorted Set
-graphs before publication. The current unreleased v1 schema has no
-compatibility decoders or migration for earlier development layouts.
+graphs before publication. List and Sorted Set physical payloads accept v1 and
+v2 independently of the outer record/root version. Typed compact writers
+use `LVL2`/`LZS2`; newly built live ordered pages use envelope version 2.
+String/Stream pages and retired pages retain version 1. Existing v1 data
+remains readable. Typed List/Sorted Set mutations encode changed compact
+values and rewritten live pages as v2, including pages whose checked input
+body is v1.
+Unchanged pages and commands that perform no write retain their stored format;
+physical relocation preserves payload bytes. Older binaries cannot read v2
+physical images.
 
-Page score bounds are derived runtime metadata, not new durable fields. Writes
-derive them from complete replacement pages and publish them with the same
-immutable directory/root view. Recovery derives them from the existing entry
-headers during the selected pages' checksum pass, skipping member payloads in
-bounded space. Physical relocation does not change logical bounds, and old
-read/snapshot views retain their own bounds.
+The indexed body concatenates item bytes, followed by a little-endian double
+score array for Sorted Sets and a little-endian u32 offset array with an end
+sentinel. Lists omit scores. Compact and grouped envelopes share this body;
+offsets address only the body data and permit empty items. Grouped full-image
+materialization and bounded collection streams emit v1 independently of the
+physical format. Completed collection imports, including RESTORE, directly
+encode v2 when shrinking a List/Sorted Set graph to a compact value. Legacy
+whole-image callbacks and native after-images can still carry either version.
+RDB export accepts both physical versions. The root/member Hash graph format is
+unchanged.
+
+Page score bounds are derived runtime metadata. Writers validate complete
+replacement pages before publication. Grouped recovery streams every offset
+and numeric score, skipping member data in bounded space; full decoders also
+check member uniqueness and binary ordering within score ties. Ordinary v2
+point/range reads trust published ordering, retain physical identity and the
+record's CRC policy, and validate the array envelope and accessed intervals.
+They do not repeat a full-page decode. Physical relocation preserves bounds,
+and retained snapshots keep their matching immutable directory/root view.
 
 Each group contains a complete snapshot, not a mutation log requiring read-time
 replay or compaction. An indivisible large field, list item or sorted-set
@@ -329,14 +353,20 @@ cleaner disabling or the allocator's authoritative capacity checks.
 ## Command access paths
 
 Compact Hash/Set point edits, List end edits, single-member Sorted Set writes
-and bounded String range edits can prepare borrowed after-images. Their read
-leases and command operands remain immutable through append allocation waits;
-only framing and changed command data need separate ownership. The append
+and bounded String range edits can prepare borrowed after-images. Checked
+source values detach from the read arena into ordinary memory before retaining
+views across lock or append waits; already-owned values reuse that storage.
+Source images and command operands remain immutable through append allocation
+waits. The append
 funnel consumes each encoder after its final suspension, then publishes the
 same complete checked record format. Published records and commit receipts
-retain no borrowed payload.
-Remote read leases and local read-pool exhaustion use owned output so a queued
-writer does not retain the last read slot needed by an earlier state-lock owner.
+retain no borrowed payload. Detached ownership keeps queued writers from
+retaining the read arena needed by an earlier state-lock owner.
+Compact Sorted Sets resolve a requested member and its slot during source
+validation because their physical format has no member-to-score index. V2
+point edits reuse that slot for deletion and binary-search the final score/member
+position; both compact and grouped point encoders borrow the surviving source
+intervals into the final after-image without an intermediate payload buffer.
 Ordinary existing compact String writes retain key intent and database
 admission while releasing worker store state for the old-value read and private
 preparation; reacquisition validates logical identity and population, allowing
@@ -435,8 +465,9 @@ before deleting its destination. Failure paths release no-longer-needed
 working state before compensation and propagate compensation failure rather
 than disguising it as an ordinary admission rejection.
 
-List length uses root metadata. Indexed/range reads validate the corresponding
-rank pages completely and copy only requested values into owned replies.
+List length uses root metadata. V2 index/range reads use page-local offsets
+and copy only requested values into owned replies; v1 reads retain sequential
+framing validation. Compact Lists use the same indexed body and read contract.
 LRANGE opts into immutable byte blocks and element offsets: each selected
 page interval is copied once, and multi-page results keep rank order after
 out-of-order owner completion. Compact LRANGE uses the same result contract.
@@ -461,9 +492,9 @@ the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
 metadata. Score lookups read only the selected member-prefix pages. Member
-ranks resolve the score through that index, search the score-bounded ordered
-pages for the exact member, and combine its page offset with the directory's
-Fenwick prefix count. Rank ranges start at the directory's selected pages;
+ranks resolve the score through that index, binary-search page maxima within
+the score-bounded interval, and combine the exact member's page offset with the
+directory's Fenwick prefix count. Rank ranges start at the directory's selected pages;
 score ranges and score counts first seek their candidate interval using
 resident score bounds. Read-only rank/score ranges overlap contiguous page
 windows under the shared physical-owner limits, then consume decoded results
@@ -471,14 +502,22 @@ in requested order. Boundary pages and LIMIT bound speculative reads; optional
 window admission falls back to the single-page path. Window children release
 physical read leases before joining, while admitted decoded pages and reply
 ownership survive until consumption. Other range modes, rank, count, scan and
-random selection borrow member bytes from one owned read lease. These reads
-validate complete page framing, ordering and identity before consumption.
+random selection borrow member bytes from one owned read lease. V2 single-page
+ranges and serial fallbacks seek directly by rank or binary-search score bounds.
+Score counts use directory totals for fully covered pages and read only partial
+boundary pages, where indexed bound positions determine the count. Random
+selection accesses selected slots directly, and member ranks binary-search
+`(score, member)` within pages selected by the member graph and score directory. Full scans and mutation
+preparation retain complete validation; ordinary indexed reads check only the
+accessed intervals after the common identity and CRC policy checks.
 Ordinary read-only scans trust the writer's member uniqueness without building
 a temporary hash set; write preparation and strict decoders retain that check.
 Public range replies opt into packed member bytes with separate scores and
 offset-based views; they do not require one owned string per returned member.
 Rank/score page readers copy borrowed members into page blocks before releasing
-the read lease, then transfer selected slices and blocks into the result.
+the read lease. Indexed serial reads copy the selected contiguous interval
+directly into a result block; page windows transfer selected slices and blocks
+from their admitted page results.
 Reverse order, bounds and LIMIT select the same logical members in either
 output representation. Replies retain their admitted buffers through encoding,
 including EXEC and Lua. Single-member mutation probes and after-images may
@@ -500,15 +539,23 @@ waits and queued window tasks for scheduling, without explicit page-work
 checkpoints. Add, increment,
 remove and GEOADD use the member index to resolve old scores
 before locating ordered source pages and routing final scores against old page
-boundaries. Resident score bounds skip unrelated pages; equal-score runs still
-require pagewise exact member comparisons. Batched requests coalesce source
-intervals and share destination boundary reads against the old logical view.
+boundaries. Resident score bounds skip unrelated pages; sparse requests
+binary-search equal-score pages using their last-member prefixes. Unknown or
+ambiguous prefixes require a midpoint page read and exact member comparison,
+preserving logarithmic page probes even for long common prefixes.
+Within checked pages, sparse member requests
+binary-search `(score, member)` while dense batches retain a single scan.
+V2 point editors binary-search old and new positions; insertion absence follows
+the member graph and resolved source page under the same logical root. Standalone
+codec callers without that evidence retain the explicit absence check.
+Dense batches coalesce source intervals and share destination boundary reads
+against the old logical view, avoiding a separate binary search for every input.
 Only changed pages and structural link neighbours remain decoded during
 publication; a score
 moving across the set does not retain or rewrite its intervening values.
-There is no resident per-member index: equal-score member searches
-can still scale with the collection, while scratch scales with requested
-members, selected pages and routing metadata.
+There is no resident per-member index. Scratch scales with requested members,
+selected pages and routing metadata; binary-search probes retain at most one
+additional page at a time.
 Repeated input members and conditional updates are evaluated in request order
 before any physical write. Endpoint pops share the typed sparse mutation path across
 single-key, multi-key and blocking commands. ZSCAN uses two pagewise passes and
@@ -670,7 +717,7 @@ the reusable containers have independent tests under `tests/containers/`.
 | Responsibility | Source |
 |---|---|
 | Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
-| Logical collection encodings and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
+| Logical collection encodings, shared indexed v2 bodies and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`, `ordered_index.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
 | Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped/hash_random.cpp`, `hash_tree.cpp` |
 | Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/containers/cow_map.h`, `include/lavik/containers/fenwick_tree.h`, `include/lavik/containers/cow_array.h` |
 | Sparse object index, group locations and immutable metadata ownership | `include/lavik/storage/detail/grouped/object_index.h`, `src/storage/engine/grouped/object_index.cpp` |

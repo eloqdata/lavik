@@ -19,6 +19,7 @@ services:
     restart: "no"
     environment:
       LAVIK_TARGETS: ${LAVIK_TARGETS:-}
+      LAVIK_META_TARGETS: ${LAVIK_META_TARGETS:-}
       LAVIK_MODE: ${LAVIK_MODE:-standalone}
       LAVIK_CLUSTER: ${LAVIK_CLUSTER:-default}
       LAVIK_TARGETS_FILE: ${LAVIK_TARGETS_FILE:-}

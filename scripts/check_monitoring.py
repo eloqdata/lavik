@@ -67,9 +67,6 @@ def main():
         manager["receivers"] = receivers["receivers"]
         config.write_text(yaml.safe_dump(manager))
         run("amtool", "check-config", config)
-    dashboard = json.loads(
-        (MONITORING / "grafana/dashboards/lavik-overview.json").read_text()
-    )
 
     # Grafana stores PromQL as strings; JSON/navigation checks alone cannot
     # catch a malformed label_replace chain or new panel expression.
@@ -91,58 +88,75 @@ def main():
                 }
             yield from dashboard_queries(panel.get("panels", []))
 
-    with tempfile.TemporaryDirectory() as directory:
-        queries = Path(directory) / "dashboard-queries.yml"
-        queries.write_text(
-            yaml.safe_dump(
-                {
-                    "groups": [
+    for dashboard_name, table_id, runbook_name, rule_name in (
+        ("lavik-overview", 37, "alerts", "alerts"),
+        ("lavik-meta", 65, "meta-monitoring", "meta-alerts"),
+    ):
+        dashboard = json.loads(
+            (MONITORING / f"grafana/dashboards/{dashboard_name}.json").read_text()
+        )
+
+        if dashboard_name == "lavik-overview":
+            with tempfile.TemporaryDirectory() as directory:
+                queries = Path(directory) / "dashboard-queries.yml"
+                queries.write_text(
+                    yaml.safe_dump(
                         {
-                            "name": "dashboard-syntax",
-                            "rules": list(dashboard_queries(dashboard["panels"])),
+                            "groups": [
+                                {
+                                    "name": "dashboard-syntax",
+                                    "rules": list(
+                                        dashboard_queries(dashboard["panels"])
+                                    ),
+                                }
+                            ]
                         }
-                    ]
-                }
+                    )
+                )
+                run("promtool", "check", "rules", queries)
+
+        def panel_ids(panels):
+            return {p["id"] for p in panels} | {
+                i for p in panels for i in panel_ids(p.get("panels", []))
+            }
+
+        ids = panel_ids(dashboard["panels"])
+        current_alerts = next(p for p in dashboard["panels"] if p["id"] == table_id)
+        # ALERTS contains labels, not annotations. Keep its dashboard navigation map
+        # aligned with the rule annotations used by notification receivers.
+        alert_routes = {
+            name: (anchor, int(panel))
+            for _, anchor, panel, name in re.findall(
+                r'"detail", "([^"|]+)\|([^"|]+)\|(\d+)", "alertname", "([^"|]+)"',
+                current_alerts["targets"][0]["expr"],
             )
-        )
-        run("promtool", "check", "rules", queries)
-
-    def panel_ids(panels):
-        return {p["id"] for p in panels} | {
-            i for p in panels for i in panel_ids(p.get("panels", []))
         }
-
-    ids = panel_ids(dashboard["panels"])
-    current_alerts = next(p for p in dashboard["panels"] if p["id"] == 37)
-    # ALERTS contains labels, not annotations. Keep its dashboard navigation map
-    # aligned with the rule annotations used by notification receivers.
-    alert_routes = {
-        name: (anchor, int(panel))
-        for _, anchor, panel, name in re.findall(
-            r'"detail", "([^"|]+)\|([^"|]+)\|(\d+)", "alertname", "([^"|]+)"',
-            current_alerts["targets"][0]["expr"],
+        runbook = (ROOT / f"docs/operations/{runbook_name}.md").read_text()
+        anchors = {
+            line[3:].strip().lower().replace(" ", "-")
+            for line in runbook.splitlines()
+            if line.startswith("## ")
+        }
+        rules = yaml.safe_load(
+            (MONITORING / f"prometheus/rules/{rule_name}.yml").read_text()
         )
-    }
-    runbook = (ROOT / "docs/operations/alerts.md").read_text()
-    anchors = {
-        line[3:].strip().lower().replace(" ", "-")
-        for line in runbook.splitlines()
-        if line.startswith("## ")
-    }
-    rules = yaml.safe_load((MONITORING / "prometheus/rules/alerts.yml").read_text())
-    for group in rules["groups"]:
-        for rule in group["rules"]:
-            annotations = rule["annotations"]
-            assert (
-                int(re.search(r"viewPanel=(\d+)", annotations["dashboard_url"])[1])
-                in ids
-            ), rule["alert"]
-            assert annotations["runbook_url"].split("#")[1] in anchors, rule["alert"]
-            assert annotations["summary"] and annotations["description"], rule["alert"]
-            assert alert_routes[rule["alert"]] == (
-                annotations["runbook_url"].split("#")[1],
-                int(re.search(r"viewPanel=(\d+)", annotations["dashboard_url"])[1]),
-            ), rule["alert"]
+        for group in rules["groups"]:
+            for rule in group["rules"]:
+                annotations = rule["annotations"]
+                assert (
+                    int(re.search(r"viewPanel=(\d+)", annotations["dashboard_url"])[1])
+                    in ids
+                ), rule["alert"]
+                assert annotations["runbook_url"].split("#")[1] in anchors, rule[
+                    "alert"
+                ]
+                assert annotations["summary"] and annotations["description"], rule[
+                    "alert"
+                ]
+                assert alert_routes[rule["alert"]] == (
+                    annotations["runbook_url"].split("#")[1],
+                    int(re.search(r"viewPanel=(\d+)", annotations["dashboard_url"])[1]),
+                ), rule["alert"]
     print("PASS: monitoring configuration, rules and navigation")
 
 

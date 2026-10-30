@@ -36,6 +36,7 @@ type genesis struct {
 // diskStore belongs exclusively to the append executor after startup. Neither
 // RawNode nor a network/Bycorf worker takes its WAL mutex or performs file I/O.
 type diskStore struct {
+	metrics *runtimeMetrics
 	wal     *wal.WAL
 	dir     string
 	genesis genesis
@@ -173,7 +174,7 @@ func openDisk(cfg Config) (*diskStore, recovered, error) {
 			return nil, rec, err
 		}
 	}
-	s := &diskStore{dir: dir, beforeSave: cfg.beforeSave, beforeIO: cfg.beforeIO}
+	s := &diskStore{metrics: newRuntimeMetrics(), dir: dir, beforeSave: cfg.beforeSave, beforeIO: cfg.beforeIO}
 	if err := json.Unmarshal(meta, &s.genesis); err != nil {
 		return nil, rec, err
 	}
@@ -344,17 +345,21 @@ func (s *diskStore) savePrepared(m *pb.Message, prepared bool) error {
 
 func (s *diskStore) saveWAL(hs *pb.HardState, entries []*pb.Entry) error {
 	if err := s.fault("wal-write"); err != nil {
+		s.metrics.walErrors[0].Inc()
 		return err
 	}
 	if err := s.wal.Save(hs, entries); err != nil {
+		s.metrics.walErrors[0].Inc()
 		return err
 	}
 	// WAL.Save may skip fsync for a commit-only update. We promise a durable
 	// prefix for every completion, including the persisted commit watermark.
 	if err := s.fault("wal-sync"); err != nil {
+		s.metrics.walErrors[1].Inc()
 		return err
 	}
 	if err := s.wal.Sync(); err != nil {
+		s.metrics.walErrors[1].Inc()
 		return err
 	}
 	if !raft.IsEmptyHardState(hs) {
@@ -434,9 +439,11 @@ func (s *diskStore) publishSnapshotMarker(image *pb.Snapshot) error {
 // the GC frontier can advance until both are durable.
 func (s *diskStore) writeSnapshotMarker(image *pb.Snapshot) error {
 	if err := s.fault("snapshot-publication"); err != nil {
+		s.metrics.walErrors[2].Inc()
 		return err
 	}
 	if err := s.wal.SaveSnapshot(&walpb.Snapshot{Index: image.Metadata.Index, Term: image.Metadata.Term, ConfState: image.Metadata.ConfState}); err != nil {
+		s.metrics.walErrors[2].Inc()
 		return err
 	}
 	crashPoint("meta-snapshot-after-marker")

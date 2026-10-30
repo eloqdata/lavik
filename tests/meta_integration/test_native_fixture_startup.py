@@ -2,7 +2,7 @@
 # Copyright (C) 2026 EloqData Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep native FULL fixtures behind the committed Meta bootstrap boundary."""
+"""Keep native FULL fixtures behind every Meta's applied bootstrap boundary."""
 
 import os
 from pathlib import Path
@@ -25,6 +25,9 @@ class NativeFixtureStartupTest(unittest.TestCase):
     def check_startup(self, scenario):
         membership_stable = False
         status_calls = 0
+        follower_status_calls = 0
+        follower_applied = False
+        start_created = F.FailoverFixture.start_created
 
         def cluster_status(_deadline):
             nonlocal membership_stable, status_calls
@@ -32,10 +35,16 @@ class NativeFixtureStartupTest(unittest.TestCase):
             membership_stable = status_calls > 1
             return {"meta_membership_stable": membership_stable}
 
-        def start_data():
-            # A leader may expose a partially committed initial directory.
-            # Data correctly rejects that response if its Meta is absent.
-            if not membership_stable:
+        def follower_status(**_kwargs):
+            nonlocal follower_status_calls, follower_applied
+            follower_status_calls += 1
+            follower_applied = follower_status_calls > 1
+            return {"initial_bindings_pending": "0" if follower_applied else "1"}
+
+        def start_data(**_kwargs):
+            # A complete leader directory exposes followers as bootstrap
+            # candidates even while a follower has not applied its own identity.
+            if not membership_stable or not follower_applied:
                 raise N.H.Failure(
                     "bootstrap Meta identity absent from committed directory"
                 )
@@ -46,9 +55,26 @@ class NativeFixtureStartupTest(unittest.TestCase):
         )
         fixture = SimpleNamespace(
             manifest="unused-manifest",
-            metas=[SimpleNamespace(start=Mock()) for _ in range(3)],
+            client_mode=N.CLIENT_MODE,
+            control_proxies=[],
+            metas=[
+                SimpleNamespace(
+                    id=i,
+                    start=Mock(),
+                    status=Mock(
+                        side_effect=follower_status if i == 3 else None,
+                        return_value={"initial_bindings_pending": "0"},
+                    ),
+                )
+                for i in range(1, 4)
+            ],
             data_nodes=[
-                SimpleNamespace(start=Mock(side_effect=start_data)) for _ in range(3)
+                SimpleNamespace(
+                    start=Mock(side_effect=start_data),
+                    alive=lambda: True,
+                    _metrics_ready=lambda: True,
+                )
+                for _ in range(3)
             ],
             cluster_status=Mock(side_effect=cluster_status),
             dump_logs=Mock(),
@@ -63,17 +89,27 @@ class NativeFixtureStartupTest(unittest.TestCase):
             patch.multiple(N.C, META="meta", DATA="data", CTL="ctl", create=True),
             patch.object(N.H, "find_leader", return_value=leader),
             patch.object(N.C, "command", side_effect=ReachedClusterCreate),
+            patch.object(F, "run_command", side_effect=ReachedClusterCreate),
         ):
             # Exercise the scenario's actual orchestration. Election alone is
-            # insufficient: one pending membership response must be tolerated
-            # before any Data process bootstraps or Cluster Create is issued.
+            # insufficient: both the leader's pending membership and a lagging
+            # follower must be tolerated before any Data process bootstraps.
             with self.assertRaises(ReachedClusterCreate):
-                scenario(Path(directory))
+                if scenario is None:
+                    fixture.ctl = "ctl"
+                    start_created(fixture)
+                else:
+                    scenario(Path(directory))
         self.assertGreaterEqual(status_calls, 2)
+        self.assertGreaterEqual(follower_status_calls, 2)
         for node in fixture.data_nodes:
             node.start.assert_called_once()
             self.assertEqual(node.seed, leader.data_control_endpoint)
-        fixture.force_kill.assert_called_once()
+        if scenario is not None:
+            fixture.force_kill.assert_called_once()
+
+    def test_follow_owner_waits_for_every_meta_before_data_bootstrap(self):
+        self.check_startup(None)
 
     def test_explicit_full_waits_for_membership_before_data_bootstrap(self):
         self.check_startup(N.explicit_full_limit)
