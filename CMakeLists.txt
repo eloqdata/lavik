@@ -2213,7 +2213,8 @@ endforeach()
       NAME lavik_metrics_e2e
       COMMAND lavik_metrics_e2e_test $<TARGET_FILE:lavik>
     )
-    set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 180)
+    # Cases start fresh servers; allow for startup variance on arm64 runners.
+    set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 240)
 
     add_executable(lavik_extent_recovery_e2e_test
       tests/extent_recovery_e2e_test.cpp
