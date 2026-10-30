@@ -23,6 +23,9 @@
 #include "impl.h"
 
 namespace lavik::storage {
+namespace {
+constexpr std::size_t kDiagnosticSlotsPerBatch = 256;
+}  // namespace
 
 std::uint64_t StorageEngine::Impl::LocalDirtyStagingBytes() const {
   std::uint64_t dirty = 0;
@@ -35,6 +38,27 @@ std::uint64_t StorageEngine::Impl::LocalDirtyStagingBytes() const {
     }
   }
   return dirty;
+}
+
+Task<std::uint64_t> StorageEngine::Impl::CollectLocalDirtyStagingBytes() const {
+  std::uint64_t dirty = 0;
+  const std::size_t limit = CurrentStore().staging_slots_.size();
+  // Capture a finite upper bound, not an iterator or slot reference. Owners
+  // may append, release and reuse slots while we yield. Each slot is read
+  // without suspension; this diagnostic is deliberately not a write barrier.
+  for (std::size_t first = 0; first < limit;
+       first += kDiagnosticSlotsPerBatch) {
+    const auto end = std::min(limit, first + kDiagnosticSlotsPerBatch);
+    for (std::size_t index = first; index < end; ++index) {
+      const auto& slot = CurrentStore().staging_slots_[index];
+      if (slot.write_buffer_id_ != 0 &&
+          slot.committed_bytes_ >= slot.durable_bytes_) {
+        dirty += slot.committed_bytes_ - slot.durable_bytes_;
+      }
+    }
+    if (end < limit) co_await bycorf::Yield(*CurrentStore().worker_);
+  }
+  co_return dirty;
 }
 
 void StorageEngine::Impl::UpdateDurabilityPending(
@@ -77,9 +101,8 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
     auto* replication = replication_logs == nullptr
                             ? nullptr
                             : &replication_logs->emplace_back();
-    result.durability_.dirty_staging_bytes_ +=
-        co_await bycorf::SubmitTo(target, [this, target, replication] {
-          const std::uint64_t dirty = LocalDirtyStagingBytes();
+    const auto dirty = co_await bycorf::SubmitTo(
+        target, [this, target, replication]() -> std::optional<std::uint64_t> {
           if (replication != nullptr) {
             const ReplicationLogInfo log = LocalReplicationLogInfo();
             *replication = StorageReplicationLogMetrics{
@@ -107,8 +130,18 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
                 .backpressured_ = log.capacity_backpressured_,
             };
           }
-          return dirty;
+          // The common small-store path keeps its single callback. Only a
+          // large historical slot table needs a separately scheduled coroutine.
+          if (CurrentStore().staging_slots_.size() > kDiagnosticSlotsPerBatch)
+            return std::nullopt;
+          return LocalDirtyStagingBytes();
         });
+    if (dirty.has_value()) {
+      result.durability_.dirty_staging_bytes_ += *dirty;
+    } else {
+      result.durability_.dirty_staging_bytes_ += co_await bycorf::SubmitTaskTo(
+          target, [this] { return CollectLocalDirtyStagingBytes(); });
+    }
   }
   UpdateDurabilityPending(result.durability_);
   result.expiration_pause_count_ = ExpirationPauseCount();

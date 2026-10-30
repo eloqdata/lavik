@@ -2858,8 +2858,10 @@ class StorageEngine::Impl {
 
   Task<StorageDurabilityStats> DurabilityStats() const;
 
-  // Shared owner-local scan and conservative pending samples for all callers.
+  // Startup durability checks keep an uninterrupted owner-local scan.
+  // Observability scans yield between bounded batches on the owner.
   std::uint64_t LocalDirtyStagingBytes() const;
+  Task<std::uint64_t> CollectLocalDirtyStagingBytes() const;
   void UpdateDurabilityPending(StorageDurabilityStats& stats) const;
 
   // Full metrics can collect replication in the same worker visits. INFO

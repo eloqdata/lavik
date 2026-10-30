@@ -406,6 +406,10 @@ class TxCleanerPipelineTestPeer : public testing::Test {
     return std::move(task).TakeResult();
   }
 
+  Task<std::uint64_t> LocalDiagnosticScan() {
+    return storage_.impl_->CollectLocalDirtyStagingBytes();
+  }
+
   void SealDiagnosticBlock() {
     On(0);
     storage_.impl_->NoteTxBlockSealedLocal(Store(0), 1);
@@ -578,6 +582,33 @@ TEST_F(TxCleanerPipelineTestPeer,
   EXPECT_EQ(subsequent.diagnostics_.durability_.flushes_pending_, 1);
   EXPECT_EQ(subsequent.diagnostics_.durability_.tx_commits_pending_, 3);
   SetPendingCounts(0, 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       DiagnosticScanYieldsAcrossSlotReuseAndGrowth) {
+  On(0);
+  auto& slots = Store(0).staging_slots_;
+  slots.resize(1024);
+  slots[1].write_buffer_id_ = 1;
+  slots[1].committed_bytes_ = kBlockHeaderBytes + 100;
+  slots[300].write_buffer_id_ = 2;
+  slots[300].committed_bytes_ = kBlockHeaderBytes + 900;
+  auto scan = LocalDiagnosticScan();
+  StartTask(scan, 0);
+  // The first batch has run, but the owner can service other work before the
+  // rest. Releasing/reusing an unvisited slot must not leave a dangling view.
+  ASSERT_FALSE(scan.done());
+  slots[1] = {};
+  slots[300] = {};
+  slots[301].write_buffer_id_ = 3;
+  slots[301].committed_bytes_ = kBlockHeaderBytes + 200;
+  slots.resize(8192);
+  slots.back().write_buffer_id_ = 4;
+  slots.back().committed_bytes_ = kBlockHeaderBytes + 1000;
+  ASSERT_TRUE(PumpUntil([&] { return scan.done(); }));
+  // New slots beyond the starting bound belong to a later observation.
+  EXPECT_EQ(std::move(scan).TakeResult(), 300);
+  EXPECT_EQ(Diagnostics().durability_.dirty_staging_bytes_, 1200);
 }
 
 TEST_F(TxCleanerPipelineTestPeer, DiagnosticsRetainQueuePeakAfterBackpressure) {

@@ -314,7 +314,10 @@ high after draining. Storage counters and peak restart with the engine;
 
 Scrapes collect snapshots on demand. Existing atomic getters supply cleaner and
 commit diagnostics; the durability collector visits each data worker and scans
-its staging slots in a non-suspending callback without taking the store mutex.
+its staging slots without taking the store mutex, yielding after each batch of
+256 slots. Each batch reads slots without suspension and the traversal stops at
+the initial slot count; concurrent growth is included in a later observation.
+Startup durability checks retain their uninterrupted owner-local scan.
 Pending flush/commit counts are sampled before and after that traversal, taking
 the larger value. This is a conservative observation, not an atomic cross-worker
 durability barrier under concurrent writes. Compare INFO and Prometheus exactly
@@ -329,6 +332,13 @@ collection thread or periodic INFO polling. Existing memory diagnostics and
 filesystem capacity queries still contribute to scrape cost. Multiple collectors
 each pay that cost; use `scrape_duration_seconds` to inspect collection time and
 compare command latency at the same offered load when tuning scrape frequency.
+
+The Data exporter shares literal HELP/TYPE text and precomputed command,
+histogram-bound and worker labels across scrapes. Each response owns its changing
+numbers and any snapshot-dependent device label text. HTTP sends bounded groups
+of borrowed and owned pieces without assembling another contiguous body; all
+pieces remain alive through send completion. Every scrape still sends a complete
+Prometheus response. This reduces text assembly work, not network payload size.
 
 The **Storage / Transactions** dashboard row aligns backlog, cleaner activity,
 commit work/queues, dirty bytes, I/O progress and pending state with command p99.

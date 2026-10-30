@@ -2143,7 +2143,8 @@ class StorageEngine {
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
   bycorf::Task<StorageDurabilityStats> DurabilityStats() const;
   // Collect existing diagnostics without running INFO. Mutable staging is
-  // sampled on each data worker without locking or suspending its callback;
+  // sampled on each data worker without locking. Large slot tables yield
+  // between bounded batches; each batch reads without suspension. The
   // pending durability counts retain conservative before/after sampling.
   // Requires initialized workers that remain alive until collection finishes.
   bycorf::Task<StorageDiagnosticsSnapshot> CollectDiagnostics() const;
