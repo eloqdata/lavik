@@ -102,7 +102,7 @@ func TestUpstreamMetricContractAndRealStoragePaths(t *testing.T) {
 func TestCollectorUsesPublishedStatusAndOmitsUnknownApplied(t *testing.T) {
 	r := &Runtime{cfg: Config{Local: testMembers()[0], Heartbeat: time.Second, ElectionTicks: 3}, disk: &diskStore{metrics: newRuntimeMetrics()}}
 	r.disk.metrics.registry.MustRegister(runtimeCollector{r})
-	status := &Status{Published: time.Now(), ProtocolRole: "StateLeader", Role: Role{Term: 7}, Members: testMembers(), Learners: map[uint64]bool{3: true}, PeerApplied: map[uint64]uint64{2: 99}, PeerAgeMicros: map[uint64]uint64{2: 1, 3: 9_000_000}, Progress: map[uint64]PeerProgress{2: {Match: 101, Next: 102, State: "StateReplicate"}}}
+	status := &Status{Published: time.Now(), ProtocolRole: "StateLeader", Role: Role{Term: 7}, Members: testMembers(), Learners: map[uint64]bool{3: true}, PeerApplied: map[uint64]uint64{2: 99}, PeerAgeMicros: map[uint64]uint64{2: 1, 3: 9_000_000}, progress: map[uint64]peerProgress{2: {Match: 101, Next: 102, State: "StateReplicate"}}}
 	r.status.Store(status)
 	families := metricFamilies(t, r)
 	if sample(t, families, "lavik_meta_raft_peer_applied_index", "peer_id", "2").GetGauge().GetValue() != 99 {

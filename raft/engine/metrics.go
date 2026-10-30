@@ -207,7 +207,7 @@ func (c runtimeCollector) Collect(ch chan<- prometheus.Metric) {
 		if member.ID == r.cfg.Local.ID || s.ProtocolRole != "StateLeader" {
 			continue
 		}
-		if p, ok := s.Progress[member.ID]; ok {
+		if p, ok := s.progress[member.ID]; ok {
 			for name, value := range map[string]uint64{"match_index": p.Match, "next_index": p.Next, "pending_snapshot_index": p.PendingSnapshot} {
 				emit(ch, "peer_"+name, "Leader-observed replication progress; not peer application progress.", prometheus.GaugeValue, float64(value), "peer_id", id)
 			}

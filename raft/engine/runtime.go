@@ -206,17 +206,11 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 	return r, nil
 }
 
-// Status returns a detached observation; callers cannot mutate the published
-// member view shared with the protocol owner.
+// Status returns an observation whose exported collections are detached;
+// callers cannot mutate the published view shared with the protocol owner.
 func (r *Runtime) Status() Status {
 	current := r.status.Load()
 	s := *current
-	if len(current.Progress) != 0 {
-		s.Progress = make(map[uint64]PeerProgress, len(current.Progress))
-		for id, progress := range current.Progress {
-			s.Progress[id] = progress
-		}
-	}
 	s.Members = append([]Member(nil), s.Members...)
 	s.PeerApplied = make(map[uint64]uint64, len(current.PeerApplied))
 	s.PeerAgeMicros = make(map[uint64]uint64, len(current.PeerAgeMicros))
@@ -302,7 +296,8 @@ func controlMessage(kind pb.MessageType) bool {
 // Propose accepts a bounded copy. Its result is buffered and completed exactly
 // once; abandoning the receiver does not block Raft or release its reservation.
 func (r *Runtime) Propose(data []byte) (<-chan Result, error) {
-	return r.ProposeInTerm(data, r.Status().Term)
+	// Reading one immutable scalar needs no detached membership/map copies.
+	return r.ProposeInTerm(data, r.status.Load().Term)
 }
 
 // ProposeInTerm binds work before crossing the asynchronous proposal queue.
@@ -353,22 +348,25 @@ func (r *Runtime) stopAdmission() {
 
 func (r *Runtime) publish() {
 	s := r.core.status()
-	s.Published = time.Now()
+	now := time.Now()
+	s.Published = now
 	if s.ProtocolRole == "StateLeader" {
-		s.Progress = make(map[uint64]PeerProgress, len(s.Members))
+		s.progress = make(map[uint64]peerProgress, len(s.Members))
 		r.core.raw.WithProgress(func(id uint64, _ raft.ProgressType, p tracker.Progress) {
-			s.Progress[id] = PeerProgress{p.Match, p.Next, p.PendingSnapshot, p.State.String()}
+			s.progress[id] = peerProgress{p.Match, p.Next, p.PendingSnapshot, p.State.String()}
 		})
 	}
 	s.Role = r.authorityRole(s.Role)
 	s.PeerApplied = map[uint64]uint64{}
 	s.PeerAgeMicros = map[uint64]uint64{}
+	// Freshness and evidence age refer to this publication's monotonic instant,
+	// avoiding two extra clock reads per peer on the protocol owner.
 	for id, peer := range r.liveness {
-		if r.peerLive(id, time.Now()) {
+		if r.peerLive(id, now) {
 			s.PeerApplied[id] = peer.applied
 		}
 		if r.knownPeer(id) && !peer.confirmed.IsZero() {
-			s.PeerAgeMicros[id] = uint64(time.Since(peer.confirmed).Microseconds())
+			s.PeerAgeMicros[id] = uint64(now.Sub(peer.confirmed).Microseconds())
 		}
 	}
 	s.PendingBytes = r.pendingBytes

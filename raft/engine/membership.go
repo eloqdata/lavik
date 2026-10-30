@@ -25,7 +25,7 @@ type memberRequest struct {
 // ChangeMember serializes a single member intent. A requested voter is added
 // as a learner first and promoted only after actual application catches up.
 func (r *Runtime) ChangeMember(member Member, remove, learner bool) (<-chan Result, error) {
-	return r.ChangeMemberInTerm(member, remove, learner, r.Status().Term)
+	return r.ChangeMemberInTerm(member, remove, learner, r.status.Load().Term)
 }
 
 // ChangeMemberInTerm keeps the caller's leadership identity through queueing
@@ -61,7 +61,7 @@ func (r *Runtime) ChangeMemberInTerm(member Member, remove, learner bool, term u
 
 // Resign withdraws the currently observed Raft term. A delayed request cannot
 // resign a leader elected in a later term.
-func (r *Runtime) Resign() { r.RequestResign(r.Status().Term) }
+func (r *Runtime) Resign() { r.RequestResign(r.status.Load().Term) }
 
 // RequestResign carries the actual Raft term, not a second authority epoch.
 func (r *Runtime) RequestResign(term uint64) {
