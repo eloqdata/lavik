@@ -269,10 +269,94 @@ process restarts legitimately increment it.
 
 `INFO STATS` reports `tx_backlog_bytes_total`, the total occupied record bytes
 in sealed Tx blocks across workers, and `tx_backlog_bytes_max`, the largest
-single-worker amount used by new-transaction admission. A high value with no
-retired-block progress can indicate an outstanding transaction or a pinned
+single-worker amount. These are diagnostic gauges, not admission thresholds.
+A high value with no retired-block progress can indicate an outstanding transaction or a pinned
 source block. The active Tx append block and extent blocks are excluded from
-both values; all allocated blocks still consume device capacity.
+both values; all allocated blocks still consume device capacity. Neither value
+measures block count, allocated device bytes, or retained metadata heap.
+
+### Transaction and durability diagnostics
+
+INFO and Prometheus share `StorageEngine::CollectDiagnostics()`. The following
+names have the prefix `lavik_storage_`; they are process-level series without
+additional exporter labels. A ready process emits all 20 series, including
+zero-valued statistics. Idle pending gauges return to zero; counters and queue
+peak retain their history. Before readiness, only `lavik_server_ready` is emitted.
+
+| Metric suffix | Type | INFO STATS field / interpretation |
+|---|---|---|
+| `tx_backlog_bytes` | gauge, bytes | `tx_backlog_bytes_total`: sum of sealed unreclaimed Tx record bytes |
+| `tx_backlog_max_bytes` | gauge, bytes | `tx_backlog_bytes_max`: largest worker's amount |
+| `tx_cleaner_rounds_total` | counter | `tx_cleaner_rounds`: rounds started, including failed attempts |
+| `tx_cleaner_failures_total` | counter | `tx_cleaner_failures` |
+| `tx_cleaner_retired_blocks_total` | counter | `tx_cleaner_retired_blocks` |
+| `tx_cleaner_running` | gauge, 0/1 | `tx_cleaner_running` |
+| `tx_cleaner_cooldown_seconds` | gauge, seconds | `tx_cleaner_cooldown_ms` divided by 1000; zero disables online cleaning |
+| `tx_commit_batches_total` | counter | `tx_commit_batches`: batches dequeued for processing |
+| `tx_commit_batch_transactions_total` | counter | `tx_commit_batch_transactions`: transactions in those batches |
+| `tx_commit_input_fences_total` | counter | `tx_commit_input_fences`: fences before merging |
+| `tx_commit_merged_fences_total` | counter | `tx_commit_merged_fences`: fences after merging |
+| `tx_commit_backpressure_waits_total` | counter | `tx_commit_backpressure_waits`: enqueues encountering their worker's watermark, not wait duration |
+| `tx_commit_queue_depth` | gauge | `tx_commit_queue_depth`: global queued receipts, excluding dequeued in-flight batches |
+| `tx_commit_queue_peak` | gauge | `tx_commit_queue_peak`: historical global maximum since engine startup |
+| `tx_commit_queue_high_watermark` | gauge | `tx_commit_queue_high_watermark`: per-worker receipt threshold |
+| `dirty_staging_bytes` | gauge, bytes | `storage_dirty_staging_bytes`: committed staging bytes not yet durable |
+| `flushes_pending` | gauge | `storage_flushes_pending`: active per-worker flush runners, not queued blocks or I/Os |
+| `tx_commits_pending` | gauge | `storage_tx_commits_pending`: unfinished commit chains, including dequeued in-flight work |
+| `durability_pending` | gauge, 0/1 | `storage_durability_pending`: dirty bytes, flush runners, or commits remain |
+| `expiration_pause_count` | gauge | `storage_expiration_pause_count`: current nested pause depth, not cumulative events |
+
+Commit batch and fence counters advance before durability succeeds. Queue depth
+can fall while `tx_commits_pending` remains positive. Do not divide global depth
+or peak by the per-worker watermark to calculate queue utilization. Peak remains
+high after draining. Storage counters and peak restart with the engine;
+`CONFIG RESETSTAT` resets command statistics but preserves these storage values.
+
+Scrapes collect snapshots on demand. Existing atomic getters supply cleaner and
+commit diagnostics; the durability collector visits each data worker and scans
+its staging slots without taking the store mutex, yielding after each batch of
+256 slots. Each batch reads slots without suspension and the traversal stops at
+the initial slot count; concurrent growth is included in a later observation.
+Startup durability checks retain their uninterrupted owner-local scan.
+Pending flush/commit counts are sampled before and after that traversal, taking
+the larger value. This is a conservative observation, not an atomic cross-worker
+durability barrier under concurrent writes. Compare INFO and Prometheus exactly
+only when the observed state is quiescent.
+
+Full scrapes read dirty staging and replication diagnostics in the same visit
+to each data worker. INFO reads only the requested diagnostics, without
+allocating replication snapshots. Command and completed I/O statistics also
+share one callback per worker. Collection cost remains proportional to data
+workers and staging slots. There is no new command-path instrumentation,
+collection thread or periodic INFO polling. Existing memory diagnostics and
+filesystem capacity queries still contribute to scrape cost. Multiple collectors
+each pay that cost; use `scrape_duration_seconds` to inspect collection time and
+compare command latency at the same offered load when tuning scrape frequency.
+
+The Data exporter shares literal HELP/TYPE text and precomputed command,
+histogram-bound and worker labels across scrapes. Each response owns its changing
+numbers and any snapshot-dependent device label text. HTTP sends bounded groups
+of borrowed and owned pieces without assembling another contiguous body; all
+pieces remain alive through send completion. Every scrape still sends a complete
+Prometheus response. This reduces text assembly work, not network payload size.
+
+The **Storage / Transactions** dashboard row aligns backlog, cleaner activity,
+commit work/queues, dirty bytes, I/O progress and pending state with command p99.
+Counter panels use `rate`; backlog is a gauge and uses its original value or
+`deriv` for growth. Missing samples stay missing. For example:
+
+```promql
+rate(lavik_storage_tx_cleaner_retired_blocks_total[5m])
+deriv(lavik_storage_tx_backlog_bytes[10m])
+rate(lavik_storage_tx_commit_backpressure_waits_total[5m])
+```
+
+Completed storage writes and `fdatasync` calls are process-wide progress proxies;
+other writes can mask a stalled transaction. Neither proves a particular commit
+durable. See the [storage alert runbook](alerts.md#storage-durability) for the
+conservative warning policy, its coverage limits and upgrade ordering.
+
+### Defrag and capacity
 
 The active defrag tuning values are exported alongside the work gauges so
 latency graphs can be correlated with runtime A/B changes:

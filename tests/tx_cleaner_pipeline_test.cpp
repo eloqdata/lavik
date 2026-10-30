@@ -19,6 +19,7 @@
 
 #include "../src/storage/engine/impl.h"
 #include "gtest/gtest.h"
+#include "lavik/metrics.h"
 
 namespace lavik::storage {
 
@@ -395,6 +396,36 @@ class TxCleanerPipelineTestPeer : public testing::Test {
     }
   }
 
+  StorageDiagnosticsSnapshot Diagnostics() {
+    auto task = storage_.CollectDiagnostics();
+    StartTask(task, 0);
+    if (!PumpUntil([&] { return task.done(); })) {
+      ADD_FAILURE() << "diagnostic snapshot did not finish";
+      return {};
+    }
+    return std::move(task).TakeResult();
+  }
+
+  Task<std::uint64_t> LocalDiagnosticScan() {
+    return storage_.impl_->CollectLocalDirtyStagingBytes();
+  }
+
+  void SealDiagnosticBlock() {
+    On(0);
+    storage_.impl_->NoteTxBlockSealedLocal(Store(0), 1);
+  }
+
+  void SetPendingCounts(unsigned flushes, std::uint64_t commits) {
+    storage_.impl_->active_flushes_.store(flushes);
+    storage_.impl_->active_tx_commits_.store(commits);
+  }
+
+  bool EnqueueDiagnosticCommit(std::uint64_t txid,
+                               std::vector<TxShardWrites> writes = {}) {
+    On(0);
+    return storage_.impl_->EnqueueTxCommit(txid, std::move(writes));
+  }
+
   template <typename Predicate>
   bool PumpUntil(Predicate ready) {
     // A deadlock watchdog, not a latency or throughput assertion. The normal
@@ -428,6 +459,237 @@ class TxCleanerPipelineTestPeer : public testing::Test {
   absl::Status promotion_scan_result_;
   AsyncNotification promotion_continue_;
 };
+
+TEST_F(TxCleanerPipelineTestPeer, DiagnosticsExcludeActiveBlocksAndSumOwners) {
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(0).ok());
+  PreparePromotion();
+  auto& runtime = Store(0).tx_blocks_.at(1);
+  runtime.counted_backlog_ = false;
+  runtime.backlog_bytes_ = 0;
+  // A live active Tx block has records and metadata but is not backlog yet.
+  EXPECT_EQ(Diagnostics().tx_cleaner_.tx_backlog_bytes_total_, 0);
+  On(0);
+  SealDiagnosticBlock();
+  SealDiagnosticBlock();  // Sealing is idempotent.
+  On(1);
+  Store(1).tx_backlog_bytes_.store(2048);
+  auto snapshot = Diagnostics();
+  EXPECT_EQ(snapshot.tx_cleaner_.tx_backlog_bytes_total_, 3072);
+  EXPECT_EQ(snapshot.tx_cleaner_.tx_backlog_bytes_max_, 2048);
+  On(1);
+  Store(1).tx_backlog_bytes_.store(0);
+  snapshot = Diagnostics();
+  EXPECT_EQ(snapshot.tx_cleaner_.tx_backlog_bytes_total_, 1024);
+  EXPECT_EQ(snapshot.tx_cleaner_.tx_backlog_bytes_max_, 1024);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DiagnosticsKeepConservativePendingSamples) {
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    On(owner);
+    auto& slots = Store(owner).staging_slots_;
+    slots.resize(3);
+    slots[1].write_buffer_id_ = 1;
+    slots[1].committed_bytes_ = kBlockHeaderBytes + 100 * (owner + 1);
+    // A released buffer's stale descriptor must not contribute dirty bytes.
+    slots[2].committed_bytes_ = kBlockHeaderBytes + 9000;
+  }
+  SetPendingCounts(2, 7);
+  auto task = storage_.CollectDiagnostics();
+  StartTask(task, 0);
+  ASSERT_FALSE(task.done());  // Paused at the remote worker snapshot.
+  SetPendingCounts(0, 0);
+  ASSERT_TRUE(PumpUntil([&] { return task.done(); }));
+  auto snapshot = std::move(task).TakeResult();
+  EXPECT_EQ(snapshot.durability_.dirty_staging_bytes_, 300);
+  EXPECT_EQ(snapshot.durability_.flushes_pending_, 2);
+  EXPECT_EQ(snapshot.durability_.tx_commits_pending_, 7);
+  EXPECT_TRUE(snapshot.durability_.pending());
+
+  task = storage_.CollectDiagnostics();
+  StartTask(task, 0);
+  SetPendingCounts(0, 3);
+  ASSERT_TRUE(PumpUntil([&] { return task.done(); }));
+  EXPECT_EQ(std::move(task).TakeResult().durability_.tx_commits_pending_, 3);
+  SetPendingCounts(0, 0);
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    On(owner);
+    auto& slot = Store(owner).staging_slots_[1];
+    slot.durable_bytes_ = slot.committed_bytes_;
+  }
+  EXPECT_FALSE(Diagnostics().durability_.pending());
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DiagnosticsReportNestedExpirationPauses) {
+  for (unsigned depth = 1; depth <= 2; ++depth) {
+    auto pause = storage_.QuiesceExpiration();
+    StartTask(pause, 0);
+    ASSERT_TRUE(PumpUntil([&] { return pause.done(); }));
+    ASSERT_TRUE(std::move(pause).TakeResult().ok());
+    EXPECT_EQ(Diagnostics().expiration_pause_count_, depth);
+  }
+  storage_.ResumeExpiration();
+  EXPECT_EQ(Diagnostics().expiration_pause_count_, 1);
+  storage_.ResumeExpiration();
+  EXPECT_EQ(Diagnostics().expiration_pause_count_, 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       ConcurrentMetricsKeepOwnerSnapshotsAndPending) {
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    On(owner);
+    auto& store = Store(owner);
+    // Model a large historical staging high-water mark after buffers drain.
+    store.staging_slots_.resize(4096);
+    for (auto& slot : store.staging_slots_) {
+      slot.committed_bytes_ = kBlockHeaderBytes + 9000;
+    }
+    auto& dirty = store.staging_slots_[1];
+    dirty.write_buffer_id_ = 1;
+    dirty.committed_bytes_ = kBlockHeaderBytes + 100 * (owner + 1);
+    store.replication_log_.next_lsn_ = 20 + owner;
+    store.replication_log_.coverage_revocations_ = 3 + owner;
+  }
+  SetPendingCounts(2, 7);
+  auto metrics = storage_.CollectMetrics();
+  StartTask(metrics, 0);
+  auto diagnostics = storage_.CollectDiagnostics();
+  StartTask(diagnostics, 0);
+  ASSERT_FALSE(metrics.done());
+  ASSERT_FALSE(diagnostics.done());
+  // Both collectors must retain their initial pending sample even if the
+  // final commit/flush finishes while their remote snapshots are queued.
+  SetPendingCounts(0, 0);
+  ASSERT_TRUE(PumpUntil([&] { return metrics.done() && diagnostics.done(); }));
+  const auto full = std::move(metrics).TakeResult();
+  const auto info = std::move(diagnostics).TakeResult();
+  EXPECT_EQ(full.diagnostics_.durability_.dirty_staging_bytes_, 300);
+  EXPECT_EQ(full.diagnostics_.durability_.dirty_staging_bytes_,
+            info.durability_.dirty_staging_bytes_);
+  EXPECT_EQ(full.diagnostics_.durability_.flushes_pending_, 2);
+  EXPECT_EQ(full.diagnostics_.durability_.tx_commits_pending_, 7);
+  ASSERT_EQ(full.replication_logs_.size(), kWorkers);
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    EXPECT_EQ(full.replication_logs_[owner].worker_id_, owner);
+    EXPECT_EQ(full.replication_logs_[owner].tail_lsn_, 19 + owner);
+    EXPECT_EQ(full.replication_logs_[owner].coverage_revocations_, 3 + owner);
+  }
+
+  metrics = storage_.CollectMetrics();
+  StartTask(metrics, 0);
+  SetPendingCounts(1, 3);
+  ASSERT_TRUE(PumpUntil([&] { return metrics.done(); }));
+  const auto subsequent = std::move(metrics).TakeResult();
+  EXPECT_EQ(subsequent.diagnostics_.durability_.flushes_pending_, 1);
+  EXPECT_EQ(subsequent.diagnostics_.durability_.tx_commits_pending_, 3);
+  SetPendingCounts(0, 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       DiagnosticScanYieldsAcrossSlotReuseAndGrowth) {
+  On(0);
+  auto& slots = Store(0).staging_slots_;
+  slots.resize(1024);
+  slots[1].write_buffer_id_ = 1;
+  slots[1].committed_bytes_ = kBlockHeaderBytes + 100;
+  slots[300].write_buffer_id_ = 2;
+  slots[300].committed_bytes_ = kBlockHeaderBytes + 900;
+  auto scan = LocalDiagnosticScan();
+  StartTask(scan, 0);
+  // The first batch has run, but the owner can service other work before the
+  // rest. Releasing/reusing an unvisited slot must not leave a dangling view.
+  ASSERT_FALSE(scan.done());
+  slots[1] = {};
+  slots[300] = {};
+  slots[301].write_buffer_id_ = 3;
+  slots[301].committed_bytes_ = kBlockHeaderBytes + 200;
+  slots.resize(8192);
+  slots.back().write_buffer_id_ = 4;
+  slots.back().committed_bytes_ = kBlockHeaderBytes + 1000;
+  ASSERT_TRUE(PumpUntil([&] { return scan.done(); }));
+  // New slots beyond the starting bound belong to a later observation.
+  EXPECT_EQ(std::move(scan).TakeResult(), 300);
+  EXPECT_EQ(Diagnostics().durability_.dirty_staging_bytes_, 1200);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DiagnosticsRetainQueuePeakAfterBackpressure) {
+  const auto watermark = storage_.TxCommitBatchStats().queue_high_watermark_;
+  ASSERT_GT(watermark, 0);
+  // Do not pump the queued runner until enqueues have reached the watermark.
+  // Empty receipts exercise accounting and drain without physical I/O.
+  for (std::uint64_t txid = 1; txid <= watermark + 1; ++txid) {
+    EXPECT_EQ(EnqueueDiagnosticCommit(txid), txid < watermark);
+  }
+  const auto queued = storage_.TxCommitBatchStats();
+  EXPECT_EQ(queued.queue_depth_, watermark + 1);
+  EXPECT_EQ(queued.queue_peak_, watermark + 1);
+  EXPECT_EQ(queued.backpressure_waits_, 2);
+  ASSERT_TRUE(PumpUntil(
+      [&] { return storage_.TxCommitBatchStats().queue_depth_ == 0; }));
+  const auto drained = Diagnostics();
+  EXPECT_EQ(drained.tx_commit_batches_.transactions_, watermark + 1);
+  EXPECT_GT(drained.tx_commit_batches_.batches_, 0);
+  EXPECT_EQ(drained.tx_commit_batches_.queue_depth_, 0);
+  EXPECT_EQ(drained.tx_commit_batches_.queue_peak_, watermark + 1);
+  EXPECT_EQ(drained.tx_commit_batches_.backpressure_waits_, 2);
+  EXPECT_EQ(drained.durability_.tx_commits_pending_, 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DiagnosticsCountBatchFencesBeforeFailure) {
+  for (std::uint64_t txid = 1; txid <= 3; ++txid) {
+    std::vector<TxShardWrites> writes(1);
+    // Repeated frontiers merge within the batch. An invalid owner then fails
+    // durability before I/O, proving these are processing, not success counts.
+    for (unsigned fence = 0; fence < 2; ++fence) {
+      writes[0].fences_.push_back(
+          {.block_id_ = 1,
+           .allocation_epoch_ = 1,
+           .committed_bytes_ = static_cast<std::uint32_t>(100 + txid),
+           .block_owner_ = kWorkers});
+    }
+    ASSERT_TRUE(EnqueueDiagnosticCommit(txid, std::move(writes)));
+  }
+  ASSERT_TRUE(PumpUntil(
+      [&] { return storage_.TxCommitBatchStats().queue_depth_ == 0; }));
+  const auto snapshot = Diagnostics();
+  EXPECT_EQ(snapshot.tx_commit_batches_.batches_, 1);
+  EXPECT_EQ(snapshot.tx_commit_batches_.transactions_, 3);
+  EXPECT_EQ(snapshot.tx_commit_batches_.input_fences_, 6);
+  EXPECT_EQ(snapshot.tx_commit_batches_.merged_fences_, 1);
+  EXPECT_EQ(snapshot.durability_.tx_commits_pending_, 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer, DiagnosticsObserveCleanerRunningAndFailure) {
+  AddLiveBacklog();
+  pause_round_ = true;
+  round_ = [] { return absl::FailedPreconditionError("test cleaner failure"); };
+  RequestCleaning();
+  ASSERT_TRUE(PumpUntil([&] { return rounds_ == 1; }));
+  const auto running = Diagnostics();
+  EXPECT_TRUE(running.tx_cleaner_.running_);
+  EXPECT_EQ(running.tx_cleaner_.rounds_, 1);
+  EXPECT_EQ(running.tx_cleaner_.failures_, 0);
+  // Disable retries before releasing the failed round, making the final
+  // sample stable without changing how an already-running round finishes.
+  ASSERT_TRUE(storage_.ConfigureTxCleanerCooldown(0).ok());
+  ResumeRound();
+  ASSERT_TRUE(PumpUntil([&] { return DriverIdle(); }));
+  const auto failed = Diagnostics();
+  EXPECT_FALSE(failed.tx_cleaner_.running_);
+  EXPECT_EQ(failed.tx_cleaner_.rounds_, 1);
+  EXPECT_EQ(failed.tx_cleaner_.failures_, 1);
+  EXPECT_EQ(failed.tx_cleaner_.retired_blocks_, 0);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
+       UnreadyExporterDoesNotReadStorageDiagnostics) {
+  std::string output;
+  auto task = RenderPrometheusMetrics(storage_, false, &output);
+  StartTask(task, 0);
+  ASSERT_TRUE(task.done());
+  ASSERT_TRUE(std::move(task).TakeResult().ok());
+  EXPECT_NE(output.find("lavik_server_ready 0\n"), std::string::npos);
+  EXPECT_EQ(output.find("lavik_storage_"), std::string::npos);
+}
 
 TEST_F(TxCleanerPipelineTestPeer, GroupedWriteDoesNotWaitForLiveBacklog) {
   AddLiveBacklog();

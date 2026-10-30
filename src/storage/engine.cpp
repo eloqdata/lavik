@@ -248,6 +248,10 @@ Task<StorageDurabilityStats> StorageEngine::DurabilityStats() const {
   return impl_->DurabilityStats();
 }
 
+Task<StorageDiagnosticsSnapshot> StorageEngine::CollectDiagnostics() const {
+  return impl_->CollectDiagnostics();
+}
+
 Task<StorageMetricsSnapshot> StorageEngine::CollectMetrics() const {
   return impl_->CollectMetrics();
 }

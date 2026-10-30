@@ -159,6 +159,8 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
 bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
 
+// Contiguous rendering adapter for callers that need an owned string. The HTTP
+// exporter uses the same renderer with borrowed static text and owned values.
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
     std::string* output);

@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -58,6 +59,8 @@ class Endpoints:
     def __init__(self, output):
         self.lock = threading.Lock()
         self.metrics = "lavik_server_ready 0\n"
+        self.growth = {}
+        self.started = time.monotonic()
         self.available = True
         self.deliveries = []
         self.output = output
@@ -69,7 +72,15 @@ class Endpoints:
 
             def do_GET(self):
                 with owner.lock:
-                    body = owner.metrics.encode()
+                    elapsed = time.monotonic() - owner.started
+                    lines = []
+                    for line in owner.metrics.splitlines():
+                        if line and not line.startswith("#"):
+                            name, value = line.rsplit(" ", 1)
+                            if name in owner.growth:
+                                line = f"{name} {float(value) + elapsed * owner.growth[name]}"
+                        lines.append(line)
+                    body = ("\n".join(lines) + "\n").encode()
                     status = 200 if owner.available else 503
                 self.send_response(status)
                 self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -104,10 +115,12 @@ class Endpoints:
         self.server.server_close()
         self.thread.join()
 
-    def set(self, metrics=None, available=True):
+    def set(self, metrics=None, available=True, growth=None):
         with self.lock:
             if metrics is not None:
                 self.metrics = metrics
+                self.growth = growth or {}
+                self.started = time.monotonic()
             self.available = available
 
     def matching(self, alert, status="firing", receiver=None, instance=None):
@@ -181,6 +194,18 @@ def main():
             for rule in group["rules"]:
                 rule["for"] = "3s"
                 rule["keep_firing_for"] = "6s"
+                # Keep the storage predicates intact while shortening their
+                # observation windows and matching history offsets. Production
+                # timing, counter resets and missing inputs have promtool tests.
+                if rule["alert"] in {
+                    "LavikTxBacklogNotDraining",
+                    "LavikStorageDurabilityNoProgress",
+                    "LavikTxCommitBackpressure",
+                }:
+                    rule["expr"] = re.sub(r"\[(5|10)m\]", r"[\1s]", rule["expr"])
+                    rule["expr"] = re.sub(
+                        r"offset (5|10)m", r"offset \1s", rule["expr"]
+                    )
         write_yaml(args.output / "alerts.yml", rules)
         recordings = yaml.safe_load(
             (MONITORING / "prometheus/rules/recording.yml").read_text()
@@ -424,6 +449,56 @@ def main():
             ),
         )
         assert not fixture.matching("LavikMetaDisconnected")
+        storage_scenarios = [
+            (
+                "LavikTxBacklogNotDraining",
+                healthy.replace(
+                    "lavik_storage_tx_backlog_bytes 0",
+                    "lavik_storage_tx_backlog_bytes 1",
+                ),
+                {"lavik_storage_tx_backlog_bytes": 1024},
+            ),
+            (
+                "LavikStorageDurabilityNoProgress",
+                healthy.replace(
+                    "lavik_storage_durability_pending 0",
+                    "lavik_storage_durability_pending 1",
+                ).replace(
+                    "lavik_storage_dirty_staging_bytes 0",
+                    "lavik_storage_dirty_staging_bytes 100",
+                ),
+                {},
+            ),
+            (
+                "LavikTxCommitBackpressure",
+                healthy,
+                {"lavik_storage_tx_commit_backpressure_waits_total": 4},
+            ),
+        ]
+        for name, metrics, growth in storage_scenarios:
+            fixture.set(metrics, growth=growth)
+            wait_for(
+                name + " warning delivered",
+                lambda: fixture.matching(name, receiver="warning"),
+            )
+            deliveries = len(fixture.matching(name, receiver="warning"))
+            time.sleep(4)
+            assert len(fixture.matching(name, receiver="warning")) == deliveries, name
+            # Make the endpoint unavailable while the derived warning remains
+            # active through keep_firing_for; TargetDown must inhibit it.
+            fixture.set(available=False)
+            wait_for(
+                name + " inhibited by target down",
+                lambda: any(
+                    a["status"]["state"] == "suppressed"
+                    for a in active(name, "warning")
+                ),
+            )
+            fixture.set(healthy)
+            wait_for(
+                name + " resolved",
+                lambda: fixture.matching(name, "resolved", "warning"),
+            )
         meta_fixture.set(
             meta_healthy.replace(
                 'lavik_meta_raft_peer_fresh{peer_id="2"} 1',

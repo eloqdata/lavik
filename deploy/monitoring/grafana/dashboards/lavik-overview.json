@@ -673,7 +673,7 @@
         {
           "refId": "A",
           "editorMode": "code",
-          "expr": "label_replace(label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace((((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending|firing\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending|firing\"}) * ignoring(alertstate) group_left() (time() - (ALERTS_FOR_STATE{job=\"lavik\",instance=~\"$instance\"} or ALERTS_FOR_STATE{alertname=\"LavikNoTargets\"}))) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending|firing\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending|firing\"}) * NaN)), \"detail\", \"$1|policy|1\", \"alertname\", \"(.+)\"), \"detail\", \"Metrics endpoint unreachable|target-down|1\", \"alertname\", \"LavikTargetDown\"), \"detail\", \"Worker admission near limit|worker-admission|25\", \"alertname\", \"LavikWorkerAdmissionHigh\"), \"detail\", \"Memory admission rejections|memory-rejections|34\", \"alertname\", \"LavikMemoryRejectedCommands\"), \"detail\", \"Writable space low|writable-space|13\", \"alertname\", \"LavikWritableSpaceLow\"), \"detail\", \"No writable space|writable-space|13\", \"alertname\", \"LavikWritableSpaceExhausted\"), \"detail\", \"Replication backlog pressure|replication-pressure|35\", \"alertname\", \"LavikBacklogPressure\"), \"detail\", \"FULL publication queue pressure|full-sync-pressure|36\", \"alertname\", \"LavikFullSyncQueuePressure\"), \"detail\", \"Meta session disconnected|meta-disconnected|29\", \"alertname\", \"LavikMetaDisconnected\"), \"detail\", \"Meta protocol errors|meta-protocol-errors|31\", \"alertname\", \"LavikMetaProtocolErrors\"), \"detail\", \"Lease expirations|lease-expirations|31\", \"alertname\", \"LavikLeaseExpirations\"), \"detail\", \"Storage not ready|not-ready|1\", \"alertname\", \"LavikServerNotReady\"), \"detail\", \"No configured targets|no-targets|1\", \"alertname\", \"LavikNoTargets\"), \"detail\", \"Required metrics missing|missing-metrics|1\", \"alertname\", \"LavikMetricsMissing\"), \"_worker\", \"worker $1\", \"worker\", \"(.+)\"), \"_device\", \"device $1\", \"device\", \"(.+)\"), \"_signal\", \"signal $1\", \"signal\", \"(.+)\"), \"_path\", \"path $1\", \"path\", \"(.+)\"), \"scope\", \" \", \"_worker\", \"_device\", \"_signal\"), \"instance\", \".*\", \"instance\", \"^$\")",
+          "expr": "label_replace(label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace((((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending|firing\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending|firing\"}) * ignoring(alertstate) group_left() (time() - (ALERTS_FOR_STATE{job=\"lavik\",instance=~\"$instance\"} or ALERTS_FOR_STATE{alertname=\"LavikNoTargets\"}))) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending|firing\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending|firing\"}) * NaN)), \"detail\", \"$1|policy|1\", \"alertname\", \"(.+)\"), \"detail\", \"Metrics endpoint unreachable|target-down|1\", \"alertname\", \"LavikTargetDown\"), \"detail\", \"Worker admission near limit|worker-admission|25\", \"alertname\", \"LavikWorkerAdmissionHigh\"), \"detail\", \"Memory admission rejections|memory-rejections|34\", \"alertname\", \"LavikMemoryRejectedCommands\"), \"detail\", \"Writable space low|writable-space|13\", \"alertname\", \"LavikWritableSpaceLow\"), \"detail\", \"No writable space|writable-space|13\", \"alertname\", \"LavikWritableSpaceExhausted\"), \"detail\", \"Replication backlog pressure|replication-pressure|35\", \"alertname\", \"LavikBacklogPressure\"), \"detail\", \"FULL publication queue pressure|full-sync-pressure|36\", \"alertname\", \"LavikFullSyncQueuePressure\"), \"detail\", \"Meta session disconnected|meta-disconnected|29\", \"alertname\", \"LavikMetaDisconnected\"), \"detail\", \"Meta protocol errors|meta-protocol-errors|31\", \"alertname\", \"LavikMetaProtocolErrors\"), \"detail\", \"Lease expirations|lease-expirations|31\", \"alertname\", \"LavikLeaseExpirations\"), \"detail\", \"Storage not ready|not-ready|1\", \"alertname\", \"LavikServerNotReady\"), \"detail\", \"No configured targets|no-targets|1\", \"alertname\", \"LavikNoTargets\"), \"detail\", \"Required metrics missing|missing-metrics|1\", \"alertname\", \"LavikMetricsMissing\"), \"detail\", \"Transaction commit backpressure|tx-commit-pressure|49\", \"alertname\", \"LavikTxCommitBackpressure\"), \"detail\", \"Pending durability without I/O progress|storage-durability|50\", \"alertname\", \"LavikStorageDurabilityNoProgress\"), \"detail\", \"Tx backlog not draining|tx-backlog|46\", \"alertname\", \"LavikTxBacklogNotDraining\"), \"_worker\", \"worker $1\", \"worker\", \"(.+)\"), \"_device\", \"device $1\", \"device\", \"(.+)\"), \"_signal\", \"signal $1\", \"signal\", \"(.+)\"), \"_path\", \"path $1\", \"path\", \"(.+)\"), \"scope\", \" \", \"_worker\", \"_device\", \"_signal\"), \"instance\", \".*\", \"instance\", \"^$\")",
           "instant": true,
           "range": false,
           "format": "table"
@@ -1032,7 +1032,7 @@
         {
           "refId": "A",
           "editorMode": "code",
-          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_join(label_replace(label_replace(label_replace(label_replace(max without (alertstate) (((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\",severity=\"critical\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\",severity=\"critical\"}) * 2) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\",severity=\"warning\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\",severity=\"warning\"}) * 1) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\"}) * 3) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending\"}) * 0)), \"_worker\", \"worker $1\", \"worker\", \"(.+)\"), \"_device\", \"device $1\", \"device\", \"(.+)\"), \"_signal\", \"signal $1\", \"signal\", \"(.+)\"), \"_path\", \"path $1\", \"path\", \"(.+)\"), \"scope\", \" \", \"_worker\", \"_device\", \"_signal\"), \"instance\", \".*\", \"instance\", \"^$\"), \"title\", \"$1\", \"alertname\", \"(.+)\"), \"title\", \"Metrics endpoint unreachable\", \"alertname\", \"LavikTargetDown\"), \"title\", \"Worker admission near limit\", \"alertname\", \"LavikWorkerAdmissionHigh\"), \"title\", \"Memory admission rejections\", \"alertname\", \"LavikMemoryRejectedCommands\"), \"title\", \"Writable space low\", \"alertname\", \"LavikWritableSpaceLow\"), \"title\", \"No writable space\", \"alertname\", \"LavikWritableSpaceExhausted\"), \"title\", \"Replication backlog pressure\", \"alertname\", \"LavikBacklogPressure\"), \"title\", \"FULL publication queue pressure\", \"alertname\", \"LavikFullSyncQueuePressure\"), \"title\", \"Meta session disconnected\", \"alertname\", \"LavikMetaDisconnected\"), \"title\", \"Meta protocol errors\", \"alertname\", \"LavikMetaProtocolErrors\"), \"title\", \"Lease expirations\", \"alertname\", \"LavikLeaseExpirations\"), \"title\", \"Storage not ready\", \"alertname\", \"LavikServerNotReady\"), \"title\", \"No configured targets\", \"alertname\", \"LavikNoTargets\"), \"title\", \"Required metrics missing\", \"alertname\", \"LavikMetricsMissing\"), \"display\", \" \u00b7 \", \"title\", \"instance\", \"scope\", \"severity\") or (label_replace(vector(4), \"display\", \"No active alert samples\", \"__name__\", \".*\") unless on () (count(count_over_time(ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending|firing\"}[$__range] @ end())) or count(count_over_time(ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending|firing\"}[$__range] @ end()))))",
+          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_join(label_replace(label_replace(label_replace(label_replace(max without (alertstate) (((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\",severity=\"critical\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\",severity=\"critical\"}) * 2) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\",severity=\"warning\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\",severity=\"warning\"}) * 1) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"firing\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"firing\"}) * 3) or ((ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending\"} or ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending\"}) * 0)), \"_worker\", \"worker $1\", \"worker\", \"(.+)\"), \"_device\", \"device $1\", \"device\", \"(.+)\"), \"_signal\", \"signal $1\", \"signal\", \"(.+)\"), \"_path\", \"path $1\", \"path\", \"(.+)\"), \"scope\", \" \", \"_worker\", \"_device\", \"_signal\"), \"instance\", \".*\", \"instance\", \"^$\"), \"title\", \"$1\", \"alertname\", \"(.+)\"), \"title\", \"Metrics endpoint unreachable\", \"alertname\", \"LavikTargetDown\"), \"title\", \"Worker admission near limit\", \"alertname\", \"LavikWorkerAdmissionHigh\"), \"title\", \"Memory admission rejections\", \"alertname\", \"LavikMemoryRejectedCommands\"), \"title\", \"Writable space low\", \"alertname\", \"LavikWritableSpaceLow\"), \"title\", \"No writable space\", \"alertname\", \"LavikWritableSpaceExhausted\"), \"title\", \"Replication backlog pressure\", \"alertname\", \"LavikBacklogPressure\"), \"title\", \"FULL publication queue pressure\", \"alertname\", \"LavikFullSyncQueuePressure\"), \"title\", \"Meta session disconnected\", \"alertname\", \"LavikMetaDisconnected\"), \"title\", \"Meta protocol errors\", \"alertname\", \"LavikMetaProtocolErrors\"), \"title\", \"Lease expirations\", \"alertname\", \"LavikLeaseExpirations\"), \"title\", \"Storage not ready\", \"alertname\", \"LavikServerNotReady\"), \"title\", \"No configured targets\", \"alertname\", \"LavikNoTargets\"), \"title\", \"Required metrics missing\", \"alertname\", \"LavikMetricsMissing\"), \"title\", \"Transaction commit backpressure\", \"alertname\", \"LavikTxCommitBackpressure\"), \"title\", \"Pending durability without I/O progress\", \"alertname\", \"LavikStorageDurabilityNoProgress\"), \"title\", \"Tx backlog not draining\", \"alertname\", \"LavikTxBacklogNotDraining\"), \"display\", \" \u00b7 \", \"title\", \"instance\", \"scope\", \"severity\") or (label_replace(vector(4), \"display\", \"No active alert samples\", \"__name__\", \".*\") unless on () (count(count_over_time(ALERTS{job=\"lavik\",instance=~\"$instance\",alertstate=~\"pending|firing\"}[$__range] @ end())) or count(count_over_time(ALERTS{alertname=\"LavikNoTargets\",alertstate=~\"pending|firing\"}[$__range] @ end()))))",
           "instant": false,
           "range": true,
           "legendFormat": "{{display}}"
@@ -1498,6 +1498,938 @@
       "type": "timeseries"
     },
     {
+      "id": 45,
+      "type": "row",
+      "title": "Storage / Transactions",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "panels": []
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Sealed, unreclaimed Tx record bytes: sum and largest worker. Excludes active blocks and extents; not block count, metadata heap or an admission threshold. P99 measures command execution, excluding socket response writes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Bytes",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Latency"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 39
+      },
+      "id": 46,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_backlog_bytes{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} total bytes",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_backlog_max_bytes{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} max worker bytes",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(lavik_command_duration_seconds_bucket{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} command P99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Tx Backlog and Command P99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Rounds are attempts, not successful reclamation. Running is a boolean. Zero cooldown disables online cleaning.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Events / second",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Running"
+              },
+              {
+                "id": "max",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 39
+      },
+      "id": 47,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_cleaner_rounds_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} rounds/s",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_cleaner_failures_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} failures/s",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_cleaner_retired_blocks_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} retired blocks/s",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_cleaner_running{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} running",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Tx Cleaner Activity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Counts advance when batches are dequeued for processing, before durability succeeds. Fence series show input and merged work, not completed durable commits.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Events / second",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 47
+      },
+      "id": 48,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_commit_batches_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} batches/s",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_commit_batch_transactions_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} transactions/s",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_commit_input_fences_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} input fences/s",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_commit_merged_fences_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} merged fences/s",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Commit Batches and Fences",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Depth is global queued receipts, excluding dequeued in-flight batches. Peak is the historical global maximum. Backpressure counts enqueues encountering a per-worker watermark, not wait duration. Do not divide global depth by the per-worker watermark.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Queued receipts",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Backpressure events / second"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 47
+      },
+      "id": 49,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_commit_queue_depth{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} queued",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_commit_queue_peak{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} historical peak",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_tx_commit_backpressure_waits_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} backpressure events/s",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Commit Queue and Backpressure",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Dirty bytes include queued and in-flight flushes. Completed write/fdatasync calls are a process-wide progress proxy; unrelated writes can mask a stalled transaction.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Bytes",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Completed I/O / second"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ops"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Completed I/O / second"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 55
+      },
+      "id": 50,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_dirty_staging_bytes{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} dirty bytes",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_io_operations_total{job=\"lavik\",instance=~\"$instance\",operation=\"write\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} writes/s",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "rate(lavik_storage_io_operations_total{job=\"lavik\",instance=~\"$instance\",operation=\"fdatasync\"}[$__rate_interval])",
+          "legendFormat": "{{instance}} fdatasync/s",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Dirty Staging and I/O Progress",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Flushes count active worker flush runners, not blocks or I/Os. Commit chains include dequeued in-flight work. Pending is a conservatively sampled boolean, not an atomic durability barrier during writes.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Pending work",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 55
+      },
+      "id": 51,
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_flushes_pending{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} flush runners",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_commits_pending{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} commit chains",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_durability_pending{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} durability pending",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Pending Durability Work",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Queue watermark applies independently to each worker. Pause count is current nesting depth, not accumulated events. Cooldown zero disables online cleaning; default backlog alerts are suppressed above 300 seconds.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 63
+      },
+      "id": 52,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_commit_queue_high_watermark{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} watermark / worker",
+          "range": false,
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_expiration_pause_count{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} expiration pause depth",
+          "range": false,
+          "refId": "B",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "editorMode": "code",
+          "expr": "lavik_storage_tx_cleaner_cooldown_seconds{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} cleaner cooldown",
+          "range": false,
+          "refId": "C",
+          "instant": true
+        }
+      ],
+      "title": "Storage Diagnostic Settings and Pauses",
+      "type": "stat"
+    },
+    {
       "id": 44,
       "type": "row",
       "title": "Additional Overview Metrics",
@@ -1542,7 +2474,7 @@
             "h": 4,
             "w": 5,
             "x": 0,
-            "y": 39
+            "y": 72
           },
           "id": 14,
           "options": {
@@ -1610,7 +2542,7 @@
             "h": 4,
             "w": 5,
             "x": 5,
-            "y": 39
+            "y": 72
           },
           "id": 15,
           "options": {
@@ -1668,7 +2600,7 @@
             "h": 4,
             "w": 4,
             "x": 10,
-            "y": 39
+            "y": 72
           },
           "id": 5,
           "options": {
@@ -1735,7 +2667,7 @@
             "h": 4,
             "w": 5,
             "x": 14,
-            "y": 39
+            "y": 72
           },
           "id": 6,
           "options": {
@@ -1803,7 +2735,7 @@
             "h": 4,
             "w": 5,
             "x": 19,
-            "y": 39
+            "y": 72
           },
           "id": 17,
           "options": {
@@ -1837,7 +2769,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 38
+        "y": 71
       }
     },
     {
@@ -1846,7 +2778,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 39
+        "y": 72
       },
       "id": 20,
       "panels": [
@@ -1999,7 +2931,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 40
+            "y": 73
           },
           "id": 9,
           "options": {
@@ -2065,7 +2997,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 40
+        "y": 73
       },
       "id": 21,
       "panels": [
@@ -2128,7 +3060,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 41
+            "y": 74
           },
           "id": 10,
           "options": {
@@ -2166,7 +3098,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 41
+        "y": 74
       },
       "id": 23,
       "panels": [],
@@ -2233,7 +3165,7 @@
         "h": 8,
         "w": 10,
         "x": 0,
-        "y": 42
+        "y": 75
       },
       "id": 11,
       "options": {
@@ -2328,7 +3260,7 @@
         "h": 8,
         "w": 14,
         "x": 10,
-        "y": 42
+        "y": 75
       },
       "id": 12,
       "options": {
@@ -2409,7 +3341,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 83
       },
       "id": 13,
       "options": {
@@ -2447,7 +3379,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 89
       },
       "id": 22,
       "panels": [
@@ -2510,7 +3442,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 57
+            "y": 90
           },
           "id": 16,
           "options": {
@@ -2569,7 +3501,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 57
+        "y": 90
       },
       "id": 24,
       "panels": [
@@ -2613,7 +3545,7 @@
             "h": 10,
             "w": 24,
             "x": 0,
-            "y": 58
+            "y": 91
           },
           "id": 25,
           "options": {
@@ -2705,7 +3637,7 @@
             "h": 8,
             "w": 24,
             "x": 0,
-            "y": 68
+            "y": 101
           },
           "id": 34,
           "options": {
@@ -2746,7 +3678,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 58
+        "y": 91
       },
       "panels": [
         {
@@ -2809,7 +3741,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 59
+            "y": 92
           },
           "id": 27,
           "options": {
@@ -2907,7 +3839,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 59
+            "y": 92
           },
           "id": 28,
           "options": {
@@ -3006,7 +3938,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 68
+            "y": 101
           },
           "id": 29,
           "options": {
@@ -3096,7 +4028,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 68
+            "y": 101
           },
           "id": 30,
           "options": {
@@ -3186,7 +4118,7 @@
             "h": 9,
             "w": 12,
             "x": 0,
-            "y": 77
+            "y": 110
           },
           "id": 31,
           "options": {
@@ -3292,7 +4224,7 @@
             "h": 9,
             "w": 12,
             "x": 12,
-            "y": 77
+            "y": 110
           },
           "id": 32,
           "options": {
@@ -3398,7 +4330,7 @@
             "h": 8,
             "w": 12,
             "x": 0,
-            "y": 60
+            "y": 93
           },
           "id": 35,
           "options": {
@@ -3498,7 +4430,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 60
+            "y": 93
           },
           "id": 36,
           "options": {
@@ -3531,7 +4463,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 92
       }
     }
   ],
@@ -3580,6 +4512,6 @@
   "timezone": "browser",
   "title": "Lavik Overview",
   "uid": "lavik-overview",
-  "version": 9,
+  "version": 10,
   "weekStart": ""
 }

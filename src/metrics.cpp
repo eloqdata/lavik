@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include "absl/strings/str_cat.h"
@@ -199,7 +200,12 @@ std::uint64_t WorkerMetricsSnapshot::TotalCalls() const noexcept {
   return total;
 }
 
+namespace {
+void PrepareMetricText(unsigned worker_count);
+}
+
 void InitWorkerMetrics(unsigned worker_count) {
+  PrepareMetricText(worker_count);
   g_worker_metrics = std::make_unique<WorkerMetricsShard[]>(worker_count);
   g_worker_metrics_count = worker_count;
   g_counter_frequency = std::max(1.0, bycorf::CycleCounterFrequency());
@@ -335,19 +341,26 @@ void RecordCommandMetric(CommandKind kind,
 }
 
 bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
+  struct LocalSnapshot {
+    WorkerMetricsData commands;
+    bycorf::Worker::StorageIoStats storage_io;
+  };
   WorkerMetricsSnapshot result;
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
     // Copy on the owner rather than reading its live cache lines remotely.
     // Slice off the live shard's alignment so it does not over-align the
     // coroutine frame holding the transfer value.
-    const auto shard =
-        co_await bycorf::SubmitTo(worker, [worker]() -> WorkerMetricsData {
-          return static_cast<const WorkerMetricsData&>(
-              g_worker_metrics[worker]);
-        });
-    const bycorf::Worker::StorageIoStats storage_io = co_await bycorf::SubmitTo(
-        worker, [] { return bycorf::ThisWorker().self_->storage_io_stats(); });
+    // Both sources belong to this worker; collect them in one round trip.
+    const auto snapshot = co_await bycorf::SubmitTo(worker, [worker] {
+      return LocalSnapshot{
+          .commands =
+              static_cast<const WorkerMetricsData&>(g_worker_metrics[worker]),
+          .storage_io = bycorf::ThisWorker().self_->storage_io_stats(),
+      };
+    });
+    const auto& shard = snapshot.commands;
+    const auto& storage_io = snapshot.storage_io;
     result.connected_clients_ += shard.connected_clients_;
     result.blocked_clients_ += shard.blocked_clients_;
     result.replication_control_connections_ +=
@@ -431,15 +444,222 @@ std::string SecondsFromMicroseconds(std::uint64_t microseconds) {
   return absl::StrCat(seconds, ".", fraction);
 }
 
+// The response owns only changing text. Literal/immutable views remain shared
+// until HTTP completion; no pointer into growing numeric scratch is retained.
+class MetricText {
+ public:
+  explicit MetricText(bycorf::HttpResponse* response) : response_(response) {}
+  void append(std::string_view text) { response_->AppendBorrowedBody(text); }
+  void Add(std::string_view text) { append(text); }
+  template <std::size_t N>
+  void Add(const char (&text)[N]) {
+    // Keep newlines with the preceding number to avoid a separate iovec.
+    if constexpr (N == 2) {
+      if (text[0] == '\n') {
+        response_->AppendBody(std::string_view(text, N - 1));
+        return;
+      }
+    }
+    append(std::string_view(text, N - 1));
+  }
+  void Add(const std::string& text) { response_->AppendBody(text); }
+  template <typename T>
+    requires std::is_arithmetic_v<T>
+  void Add(T value) {
+    response_->AppendBody(absl::AlphaNum(value).Piece());
+  }
+
+ private:
+  bycorf::HttpResponse* response_;
+};
+
+template <typename... Args>
+void AppendMetricText(MetricText* output, const Args&... args) {
+  (output->Add(args), ...);
+}
+
+struct CommandText {
+  std::string calls;
+  std::array<std::string, kCommandLatencyBucketUpperUs.size() + 1> buckets;
+  std::string sum;
+  std::string count;
+};
+struct WaitText {
+  std::array<std::string, kControlWaitBoundsUs.size() + 1> buckets;
+  std::string sum;
+  std::string count;
+};
+std::array<CommandText, kCommandKindCount> g_command_text;
+std::array<WaitText, 2> g_wait_text;
+std::vector<std::string> g_worker_text;
+std::vector<std::string> g_worker_labels;
+std::array<std::string, 20> g_storage_diagnostic_text;
+void AppendStorageDiagnostics(
+    const storage::StorageDiagnosticsSnapshot& diagnostics, MetricText* output);
+
+void PrepareMetricText(unsigned worker_count) {
+  // Startup owns these tables before workers run. Scrapes only borrow them;
+  // no lazy initialization, lock, or per-worker copy is needed.
+  for (std::size_t index = 0; index < g_command_text.size(); ++index) {
+    auto& text = g_command_text[index];
+    const auto name = CommandMetricName(static_cast<CommandKind>(index));
+    text.calls =
+        absl::StrCat("lavik_command_calls_total{command=\"", name, "\"} ");
+    for (std::size_t bucket = 0; bucket < text.buckets.size(); ++bucket) {
+      const auto bound =
+          bucket == kCommandLatencyBucketUpperUs.size()
+              ? "+Inf"
+              : SecondsFromMicroseconds(kCommandLatencyBucketUpperUs[bucket]);
+      text.buckets[bucket] =
+          absl::StrCat("lavik_command_duration_seconds_bucket{command=\"", name,
+                       "\",le=\"", bound, "\"} ");
+    }
+    text.sum = absl::StrCat("lavik_command_duration_seconds_sum{command=\"",
+                            name, "\"} ");
+    text.count = absl::StrCat("lavik_command_duration_seconds_count{command=\"",
+                              name, "\"} ");
+  }
+  for (unsigned stage = 0; stage < g_wait_text.size(); ++stage) {
+    auto& text = g_wait_text[stage];
+    const auto label = stage == 0 ? "observation" : "lease_installation";
+    for (std::size_t bucket = 0; bucket < text.buckets.size(); ++bucket) {
+      const auto bound = bucket == kControlWaitBoundsUs.size()
+                             ? "+Inf"
+                             : absl::StrCat(kControlWaitBoundsUs[bucket] / 1e6);
+      text.buckets[bucket] =
+          absl::StrCat("lavik_cluster_control_wait_seconds_bucket{stage=\"",
+                       label, "\",le=\"", bound, "\"} ");
+    }
+    text.sum = absl::StrCat("lavik_cluster_control_wait_seconds_sum{stage=\"",
+                            label, "\"} ");
+    text.count = absl::StrCat(
+        "lavik_cluster_control_wait_seconds_count{stage=\"", label, "\"} ");
+  }
+  AppendStorageDiagnostics({}, nullptr);
+  g_worker_text.resize(worker_count);
+  g_worker_labels.resize(worker_count);
+  for (unsigned worker = 0; worker < worker_count; ++worker) {
+    g_worker_text[worker] = absl::StrCat(worker);
+    g_worker_labels[worker] = absl::StrCat("worker=\"", worker, "\"");
+  }
+}
+
+void AppendStorageDiagnostics(
+    const storage::StorageDiagnosticsSnapshot& diagnostics,
+    MetricText* output) {
+  // These are process-level observations of existing storage accounting.
+  // In particular, INFO's backlog "total" is a sum, not a counter suffix.
+  std::size_t index = 0;
+  const auto append = [output, &index](std::string_view suffix,
+                                       std::string_view type,
+                                       std::string_view help, auto value) {
+    auto& prefix = g_storage_diagnostic_text[index++];
+    if (output == nullptr) {
+      // Startup-only preparation combines each family's metadata and sample
+      // name into one piece, instead of many tiny iovecs on every scrape.
+      prefix = absl::StrCat("# HELP lavik_storage_", suffix, " ", help);
+      if (type == "counter") {
+        prefix.append(
+            " Reinitialized on process startup; CONFIG RESETSTAT "
+            "does not reset this counter.");
+      }
+      absl::StrAppend(&prefix, "\n# TYPE lavik_storage_", suffix, " ", type,
+                      "\nlavik_storage_", suffix, " ");
+      return;
+    }
+    output->append(prefix);
+    AppendMetricText(output, value, "\n");
+  };
+  const auto& cleaner = diagnostics.tx_cleaner_;
+  append("tx_backlog_bytes", "gauge",
+         "Occupied record bytes in sealed unreclaimed Tx blocks summed across "
+         "workers; excludes active blocks and extents, not block count, "
+         "metadata memory or an admission threshold.",
+         cleaner.tx_backlog_bytes_total_);
+  append(
+      "tx_backlog_max_bytes", "gauge",
+      "Largest worker's occupied record bytes in sealed unreclaimed Tx "
+      "blocks; excludes active blocks and extents, not an admission threshold.",
+      cleaner.tx_backlog_bytes_max_);
+  append("tx_cleaner_rounds_total", "counter", "Tx cleaner rounds started.",
+         cleaner.rounds_);
+  append("tx_cleaner_failures_total", "counter", "Failed Tx cleaner rounds.",
+         cleaner.failures_);
+  append("tx_cleaner_retired_blocks_total", "counter",
+         "Tx blocks retired by the cleaner.", cleaner.retired_blocks_);
+  append("tx_cleaner_running", "gauge",
+         "Whether a Tx cleaner round is running.", cleaner.running_ ? 1 : 0);
+  append("tx_cleaner_cooldown_seconds", "gauge",
+         "Configured Tx cleaner cooldown; zero disables online cleaning.",
+         static_cast<double>(cleaner.cooldown_ms_) / 1000.0);
+
+  const auto& commits = diagnostics.tx_commit_batches_;
+  append(
+      "tx_commit_batches_total", "counter",
+      "Commit batches dequeued for processing, not successful durable commits.",
+      commits.batches_);
+  append("tx_commit_batch_transactions_total", "counter",
+         "Transactions dequeued into commit batches, not successful durable "
+         "commits.",
+         commits.transactions_);
+  append("tx_commit_input_fences_total", "counter",
+         "Input durability fences in dequeued commit batches.",
+         commits.input_fences_);
+  append("tx_commit_merged_fences_total", "counter",
+         "Durability fences remaining after commit-batch merging.",
+         commits.merged_fences_);
+  append("tx_commit_backpressure_waits_total", "counter",
+         "Enqueues encountering their worker's commit queue watermark; not "
+         "wait duration.",
+         commits.backpressure_waits_);
+  append("tx_commit_queue_depth", "gauge",
+         "Queued commit receipts across workers; excludes dequeued in-flight "
+         "batches.",
+         commits.queue_depth_);
+  append("tx_commit_queue_peak", "gauge",
+         "Historical process-wide commit queue depth maximum since engine "
+         "startup.",
+         commits.queue_peak_);
+  append("tx_commit_queue_high_watermark", "gauge",
+         "Per-worker commit queue watermark; not a denominator for global "
+         "queue depth.",
+         commits.queue_high_watermark_);
+
+  const auto& durability = diagnostics.durability_;
+  append("dirty_staging_bytes", "gauge",
+         "Committed staging bytes not yet durable, including queued and "
+         "in-flight flushes.",
+         durability.dirty_staging_bytes_);
+  append("flushes_pending", "gauge",
+         "Active per-worker flush runners sampled conservatively; not queued "
+         "blocks or I/Os.",
+         durability.flushes_pending_);
+  append("tx_commits_pending", "gauge",
+         "Unfinished transaction commit chains, including dequeued in-flight "
+         "batches.",
+         durability.tx_commits_pending_);
+  append("durability_pending", "gauge",
+         "Whether sampled dirty bytes, flush runners or transaction commits "
+         "remain; "
+         "not an atomic durability barrier during concurrent writes.",
+         durability.pending() ? 1 : 0);
+  append(
+      "expiration_pause_count", "gauge",
+      "Current nesting depth of explicit expiration pauses, not pause events.",
+      diagnostics.expiration_pause_count_);
+}
+
 }  // namespace
 
 bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
-    std::string* output_ptr) {
-  std::string& output = *output_ptr;
-  output.clear();
-  output.reserve(server_ready ? 32 * 1024 : 256);
-  absl::StrAppend(
+    bycorf::HttpResponse* response) {
+  response->body_.clear();
+  response->body_parts_.clear();
+  response->body_.reserve(server_ready ? 4096 : 16);
+  response->body_parts_.reserve(server_ready ? 1024 : 4);
+  MetricText output(response);
+  AppendMetricText(
       &output,
       "# HELP lavik_server_ready Whether storage startup completed without "
       "a latched runtime storage failure; not serving authority.\n"
@@ -459,25 +679,24 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   const storage::DefragTotals defrag = storage.DefragStats();
   const MemoryStats memory_metrics = GetMemoryStats();
   const std::uint64_t current_memory = memory_metrics.used_bytes_;
-  absl::StrAppend(&output,
-                  "# HELP lavik_commands_total Completed Redis commands.\n"
-                  "# TYPE lavik_commands_total counter\n"
-                  "lavik_commands_total ",
-                  worker_metrics.TotalCalls(),
-                  "\n"
-                  "# HELP lavik_command_calls_total Completed Redis commands "
-                  "by command.\n"
-                  "# TYPE lavik_command_calls_total counter\n");
+  AppendStorageDiagnostics(storage_metrics.diagnostics_, &output);
+  AppendMetricText(&output,
+                   "# HELP lavik_commands_total Completed Redis commands.\n"
+                   "# TYPE lavik_commands_total counter\n"
+                   "lavik_commands_total ",
+                   worker_metrics.TotalCalls(),
+                   "\n"
+                   "# HELP lavik_command_calls_total Completed Redis commands "
+                   "by command.\n"
+                   "# TYPE lavik_command_calls_total counter\n");
   for (std::size_t index = 0; index < worker_metrics.commands_.size();
        ++index) {
     const CommandMetricTotals& command = worker_metrics.commands_[index];
     if (command.calls_ == 0) {
       continue;
     }
-    const std::string_view name =
-        CommandMetricName(static_cast<CommandKind>(index));
-    absl::StrAppend(&output, "lavik_command_calls_total{command=\"", name,
-                    "\"} ", command.calls_, "\n");
+    output.append(g_command_text[index].calls);
+    AppendMetricText(&output, command.calls_, "\n");
   }
 
   output.append(
@@ -490,30 +709,22 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
     if (command.calls_ == 0) {
       continue;
     }
-    const std::string_view name =
-        CommandMetricName(static_cast<CommandKind>(index));
+    const auto& text = g_command_text[index];
     std::uint64_t cumulative = 0;
-    for (std::size_t bucket = 0; bucket < kCommandLatencyBucketUpperUs.size();
-         ++bucket) {
+    for (std::size_t bucket = 0; bucket < text.buckets.size(); ++bucket) {
       cumulative += command.latency_bins_[bucket];
-      absl::StrAppend(
-          &output, "lavik_command_duration_seconds_bucket{command=\"", name,
-          "\",le=\"",
-          SecondsFromMicroseconds(kCommandLatencyBucketUpperUs[bucket]), "\"} ",
-          cumulative, "\n");
+      output.append(text.buckets[bucket]);
+      AppendMetricText(&output, cumulative, "\n");
     }
-    cumulative += command.latency_bins_.back();
     const double latency_seconds = static_cast<double>(command.latency_ticks_) /
                                    worker_metrics.counter_frequency_;
-    absl::StrAppend(&output, "lavik_command_duration_seconds_bucket{command=\"",
-                    name, "\",le=\"+Inf\"} ", cumulative, "\n",
-                    "lavik_command_duration_seconds_sum{command=\"", name,
-                    "\"} ", latency_seconds, "\n",
-                    "lavik_command_duration_seconds_count{command=\"", name,
-                    "\"} ", command.calls_, "\n");
+    output.append(text.sum);
+    AppendMetricText(&output, latency_seconds, "\n");
+    output.append(text.count);
+    AppendMetricText(&output, command.calls_, "\n");
   }
 
-  absl::StrAppend(
+  AppendMetricText(
       &output,
       "# HELP lavik_storage_io_operations_total Completed storage I/O "
       "operations.\n"
@@ -710,43 +921,40 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "# HELP lavik_worker_memory_limit_bytes Retained-memory admission "
       "limit assigned to this worker.\n"
       "# TYPE lavik_worker_memory_limit_bytes gauge\n");
-  absl::StrAppend(
+  AppendMetricText(
       &output,
       "# HELP lavik_cluster_control_wait_seconds Time spent collecting data "
       "observations or installing leases, including cross-worker waits.\n"
       "# TYPE lavik_cluster_control_wait_seconds histogram\n");
   for (unsigned stage = 0; stage < control_metrics.waits_.size(); ++stage) {
-    const char* label = stage == 0 ? "observation" : "lease_installation";
+    const auto& text = g_wait_text[stage];
     const auto& wait = control_metrics.waits_[stage];
     std::uint64_t count = 0;
     for (unsigned bucket = 0; bucket < wait.buckets_.size(); ++bucket) {
       count += wait.buckets_[bucket];
-      const std::string bound =
-          bucket == kControlWaitBoundsUs.size()
-              ? "+Inf"
-              : absl::StrCat(kControlWaitBoundsUs[bucket] / 1e6);
-      absl::StrAppend(&output,
-                      "lavik_cluster_control_wait_seconds_bucket{stage=\"",
-                      label, "\",le=\"", bound, "\"} ", count, "\n");
+      output.append(text.buckets[bucket]);
+      AppendMetricText(&output, count, "\n");
     }
-    absl::StrAppend(
-        &output, "lavik_cluster_control_wait_seconds_count{stage=\"", label,
-        "\"} ", count, "\n", "lavik_cluster_control_wait_seconds_sum{stage=\"",
-        label, "\"} ", wait.sum_us_ / 1e6, "\n");
+    output.append(text.count);
+    AppendMetricText(&output, count, "\n");
+    output.append(text.sum);
+    AppendMetricText(&output, wait.sum_us_ / 1e6, "\n");
   }
   const unsigned memory_workers = MemoryAccountingWorkerCount();
   for (unsigned worker = 0; worker < memory_workers; ++worker) {
     const WorkerMemoryStats memory = GetWorkerMemoryStats(worker);
-    absl::StrAppend(&output, "lavik_worker_retained_memory_bytes{worker=\"",
-                    worker, "\"} ", memory.retained_bytes_, "\n",
-                    "lavik_worker_memory_admission_pending_bytes{worker=\"",
-                    worker, "\"} ", memory.admission_pending_bytes_, "\n",
-                    "lavik_worker_fullsync_reserved_memory_bytes{worker=\"",
-                    worker, "\"} ", memory.fullsync_reserved_bytes_, "\n",
-                    "lavik_worker_client_buffered_request_bytes{worker=\"",
-                    worker, "\"} ", memory.client_buffered_bytes_, "\n",
-                    "lavik_worker_memory_limit_bytes{worker=\"", worker, "\"} ",
-                    memory.retained_limit_bytes_, "\n");
+    const std::string_view worker_label = g_worker_text[worker];
+    AppendMetricText(
+        &output, "lavik_worker_retained_memory_bytes{worker=\"", worker_label,
+        "\"} ", memory.retained_bytes_, "\n",
+        "lavik_worker_memory_admission_pending_bytes{worker=\"", worker_label,
+        "\"} ", memory.admission_pending_bytes_, "\n",
+        "lavik_worker_fullsync_reserved_memory_bytes{worker=\"", worker_label,
+        "\"} ", memory.fullsync_reserved_bytes_, "\n",
+        "lavik_worker_client_buffered_request_bytes{worker=\"", worker_label,
+        "\"} ", memory.client_buffered_bytes_, "\n",
+        "lavik_worker_memory_limit_bytes{worker=\"", worker_label, "\"} ",
+        memory.retained_limit_bytes_, "\n");
   }
   output.append(
       "# HELP lavik_replication_backlog_bytes Allocated shared in-memory "
@@ -801,8 +1009,8 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "counter\n");
   for (const storage::StorageReplicationLogMetrics& log :
        storage_metrics.replication_logs_) {
-    const std::string labels = absl::StrCat("worker=\"", log.worker_id_, "\"");
-    absl::StrAppend(
+    const std::string_view labels = g_worker_labels[log.worker_id_];
+    AppendMetricText(
         &output, "lavik_replication_backlog_bytes{", labels, "} ",
         log.chunk_count_ * storage::kStorageBlockBytes, "\n",
         "lavik_replication_backlog_capacity_bytes{", labels, "} ",
@@ -838,16 +1046,33 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
         absl::StrCat("device=\"", device.device_id_, "\",path=\"");
     AppendEscapedLabel(device.path_, &labels);
     labels.append("\"");
-    absl::StrAppend(&output, "lavik_storage_capacity_bytes{", labels, "} ",
-                    device.capacity_bytes_, "\n",
-                    "lavik_storage_available_bytes{", labels, "} ",
-                    device.available_bytes_, "\n");
+    AppendMetricText(&output, "lavik_storage_capacity_bytes{", labels, "} ",
+                     device.capacity_bytes_, "\n",
+                     "lavik_storage_available_bytes{", labels, "} ",
+                     device.available_bytes_, "\n");
     if (device.filesystem_available_bytes_.has_value()) {
-      absl::StrAppend(&output, "lavik_filesystem_available_bytes{", labels,
-                      "} ", *device.filesystem_available_bytes_, "\n");
+      AppendMetricText(&output, "lavik_filesystem_available_bytes{", labels,
+                       "} ", *device.filesystem_available_bytes_, "\n");
     }
   }
   co_return absl::OkStatus();
+}
+
+bycorf::Task<absl::Status> RenderPrometheusMetrics(
+    const storage::StorageEngine& storage, bool server_ready,
+    std::string* output) {
+  bycorf::HttpResponse response;
+  auto status =
+      co_await RenderPrometheusMetrics(storage, server_ready, &response);
+  output->clear();
+  output->reserve(response.BodySize());
+  if (response.body_parts_.empty()) {
+    output->append(response.body_);
+  } else {
+    for (const auto& part : response.body_parts_)
+      output->append(response.Part(part));
+  }
+  co_return status;
 }
 
 std::unique_ptr<bycorf::Service> CreateMetricsService(
@@ -861,7 +1086,7 @@ std::unique_ptr<bycorf::Service> CreateMetricsService(
           bycorf::HttpResponse* response) -> bycorf::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
         co_return co_await RenderPrometheusMetrics(*storage, server_ready(),
-                                                   &response->body_);
+                                                   response);
       });
   return service;
 }

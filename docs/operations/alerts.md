@@ -35,6 +35,9 @@ No command-traffic minimum applies to capacity or absolute failure counters.
 | LavikLeaseExpirations | locally detected lease expirations increase in 5m; at least 3 for critical | warning or critical / 1m | Meta Exceptions |
 | LavikMetricsMissing | successful scrape lacks readiness, or ready target lacks required inputs | warning / 5m | Target Status |
 | LavikNoTargets | no `up{job="lavik"}` series | critical / 2m | Target Status |
+| LavikTxBacklogNotDraining | positive, growing Tx record backlog over 10m with no retired blocks and enabled cleaner cooldown at most 300s | warning / 5m | Tx Backlog and Command P99 |
+| LavikStorageDurabilityNoProgress | durability pending throughout 5m with no completed writes or fdatasync calls | warning / 5m | Dirty Staging and I/O Progress |
+| LavikTxCommitBackpressure | commit queue backpressure events exceed 1/s over 5m | warning / 5m | Commit Queue and Backpressure |
 
 The memory limit in the worker denominator already includes the retained-memory
 waterline; do not multiply it by 0.9 again. A process average can hide a full
@@ -45,6 +48,10 @@ session may be hidden by other sessions; this is not a per-replica progress SLO.
 Every alert remains firing for two minutes after its condition stops matching.
 Rate windows also take time to clear. Scrape and evaluation intervals add bounded
 detection delay, and recording groups can be observed one evaluation later.
+Tx backlog and durability no-progress rules additionally require a sample at the
+start of their observation window and no reset of the relevant progress counters
+within that window. They are diagnostics, not proofs of a specific blocked owner
+or transaction. Both standalone and Meta-managed Data use the same storage policy.
 `resolved` means the condition ended, not that service health was proved: check
 current target/readiness/missing-data state before declaring recovery.
 
@@ -204,7 +211,89 @@ return and the recovery window; inspect each target's actual health.
 ## Coverage boundaries
 
 The Data and Meta rule sets observe their respective exported metrics; they do
-not prove Data serving authority. Command error ratios, detailed storage progress,
-replica stall detection, FULL failure history/population loading and latency
-attribution remain separate work under #391 and #394–#396. No node_exporter or centralized log platform is
+not prove Data serving authority. Command error ratios, replica stall detection,
+FULL failure history/population loading and latency attribution remain separate
+work under #391, #395 and #396. Tx block counts, age and blocking reasons remain
+outside these diagnostics under #379. No node_exporter or centralized log platform is
 included. Monitoring does not participate in authorization or replication decisions.
+
+## Tx backlog
+
+`LavikTxBacklogNotDraining` warns when sealed unreclaimed Tx record bytes are
+positive and grow over ten minutes, with no retired blocks over that window,
+for five more minutes. Online cleaning must be enabled throughout the window
+and its cooldown must remain at most 300 seconds. Disabled cleaning and longer
+cooldowns suppress this default rule; operators using a longer cooldown must
+increase the observation window and its matching `offset`, then adjust the
+cooldown bound. These editable defaults allow several ordinary cleaner cycles;
+they are not a measured workload capacity limit.
+
+Inspect INFO STATS and the Storage / Transactions panels for cleaner failures,
+running state, retired-block rate, pending commit chains and durability progress.
+Check existing storage failure logs and outstanding transactions. Transaction
+leases or pinned dependencies can legitimately keep a block alive. The byte
+value excludes active Tx blocks and extents and cannot identify the number,
+age, blocking reason or metadata footprint of retained blocks. It is not an
+admission threshold. Do not infer memory usage or change Tx admission from it.
+
+The condition clears when growth stops, reclamation progresses or the rule's
+configuration gate no longer matches. After the rate and recovery windows clear,
+verify actual backlog drainage and service health. A stable positive backlog
+alone does not fire this rule; stopping producers does not prove it has drained.
+
+## Storage durability
+
+`LavikStorageDurabilityNoProgress` warns when durability remains pending over
+five minutes and neither completed writes nor completed `fdatasync` calls
+advance, for another five minutes. Missing inputs suppress the progress judgment
+and trigger the missing-metrics warning instead. A reset of either I/O counter
+requires a fresh observation window. Thresholds and timing are editable; unusually
+long configured flush intervals or maintenance pauses need matching alert policy.
+
+Inspect dirty staging bytes, active flush runners, pending commit chains, device
+space, existing I/O error logs and the write/fdatasync rate panels. Flush runners
+are not queued block or I/O counts. Queue depth may already be zero while commits
+are in flight. Expiration pause count is current nesting depth, not elapsed pause
+time or accumulated events, and is not itself a fault.
+
+I/O counters are process-wide progress proxies. Unrelated writes can mask a
+stalled transaction, and completed I/O does not prove a specific commit crossed
+its durability boundary. These statistics provide neither per-transaction age
+nor a durable acknowledgment barrier during concurrent writes. Runtime storage
+failure may withdraw readiness, leaving the existing NotReady alert responsible.
+
+The condition clears when pending drains or I/O progress resumes; the recovery
+window still applies. Confirm the relevant workload progresses before declaring
+recovery. Do not restart or delete storage solely because this warning fires.
+
+## Tx commit pressure
+
+`LavikTxCommitBackpressure` warns when enqueues encounter their local commit
+queue watermark more than once per second over five minutes, sustained for five
+minutes. This conservative initial rate is editable for the workload. It counts
+enqueues encountering pressure, not wait duration, rejected commands, or Tx block
+admission. A counter reset is handled by `rate` and is not a pressure spike.
+
+Compare commit batch/transaction and fence rates, queue depth, pending commit
+chains, dirty bytes and I/O progress with command p99. Batch counters advance at
+dequeue before durability succeeds. Queue depth is the process-wide queued count;
+peak is the process-lifetime maximum and does not drop when drained. The exported
+4096 watermark applies independently to each worker: dividing global depth by it
+would give a misleading utilization percentage. No current metric attributes
+this pressure to an individual worker.
+
+The condition clears after the wait rate subsides and the recovery window ends.
+Verify current queues and pending chains drain, not that the historical peak
+falls. Cleaner failure counts and pause depth remain supporting diagnostics,
+without standalone alert policies.
+
+### Storage diagnostics rollout
+
+The new rules require the upgraded Data exporter. Retain old rules during a
+rolling upgrade; once all targets expose the documented diagnostics and both I/O
+progress series, validate and reload the new rules. Restore the old rules before
+rolling exporters back. `LavikMetricsMissing{signal="storage_diagnostics"}` checks
+all 20 diagnostic series plus write/fdatasync operation counters on ready targets.
+It covers an unsupported old exporter as well as partially missing telemetry;
+neither is silently treated as zero. Before readiness these families are omitted
+intentionally. The warning shares Target Status and the missing-metrics runbook.

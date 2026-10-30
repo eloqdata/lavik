@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -242,15 +244,20 @@ class RespClient {
 
 class ServerProcess {
  public:
-  ServerProcess(std::string_view binary, std::uint16_t redis_port,
-                std::uint16_t metrics_port, std::string_view data_path,
-                std::string_view log_path, unsigned workers = 2,
-                std::uint64_t max_memory = 1024ULL * 1024 * 1024) {
+  ServerProcess(
+      std::string_view binary, std::uint16_t redis_port,
+      std::uint16_t metrics_port, std::string_view data_path,
+      std::string_view log_path, unsigned workers = 2,
+      std::uint64_t max_memory = 1024ULL * 1024 * 1024,
+      const std::vector<std::pair<std::string, std::string>>& env = {}) {
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("fork failed");
     }
     if (pid_ == 0) {
+      for (const auto& [key, value] : env) {
+        if (::setenv(key.c_str(), value.c_str(), 1) != 0) _exit(127);
+      }
       const int log_fd =
           ::open(std::string(log_path).c_str(),
                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
@@ -348,7 +355,7 @@ std::string HttpGet(std::uint16_t port, std::string_view target) {
   return response;
 }
 
-std::uint64_t MetricValue(std::string_view body, std::string_view name) {
+double MetricNumber(std::string_view body, std::string_view name) {
   std::size_t begin = 0;
   while (true) {
     begin = body.find(name, begin);
@@ -369,8 +376,73 @@ std::uint64_t MetricValue(std::string_view body, std::string_view name) {
     throw std::runtime_error("metric value not found: " + std::string(name));
   }
   const std::size_t end = body.find('\n', value_begin);
-  return std::stoull(
+  return std::stod(
       std::string(body.substr(value_begin + 1, end - value_begin - 1)));
+}
+
+std::uint64_t MetricValue(std::string_view body, std::string_view name) {
+  return static_cast<std::uint64_t>(MetricNumber(body, name));
+}
+
+struct DiagnosticMetric {
+  std::string_view suffix;
+  std::string_view info;
+  bool counter = false;
+  double divisor = 1;
+};
+
+constexpr std::array<DiagnosticMetric, 20> kDiagnostics{{
+    {"tx_backlog_bytes", "tx_backlog_bytes_total"},
+    {"tx_backlog_max_bytes", "tx_backlog_bytes_max"},
+    {"tx_cleaner_rounds_total", "tx_cleaner_rounds", true},
+    {"tx_cleaner_failures_total", "tx_cleaner_failures", true},
+    {"tx_cleaner_retired_blocks_total", "tx_cleaner_retired_blocks", true},
+    {"tx_cleaner_running", "tx_cleaner_running"},
+    {"tx_cleaner_cooldown_seconds", "tx_cleaner_cooldown_ms", false, 1000},
+    {"tx_commit_batches_total", "tx_commit_batches", true},
+    {"tx_commit_batch_transactions_total", "tx_commit_batch_transactions",
+     true},
+    {"tx_commit_input_fences_total", "tx_commit_input_fences", true},
+    {"tx_commit_merged_fences_total", "tx_commit_merged_fences", true},
+    {"tx_commit_backpressure_waits_total", "tx_commit_backpressure_waits",
+     true},
+    {"tx_commit_queue_depth", "tx_commit_queue_depth"},
+    {"tx_commit_queue_peak", "tx_commit_queue_peak"},
+    {"tx_commit_queue_high_watermark", "tx_commit_queue_high_watermark"},
+    {"dirty_staging_bytes", "storage_dirty_staging_bytes"},
+    {"flushes_pending", "storage_flushes_pending"},
+    {"tx_commits_pending", "storage_tx_commits_pending"},
+    {"durability_pending", "storage_durability_pending"},
+    {"expiration_pause_count", "storage_expiration_pause_count"},
+}};
+
+void CheckDiagnosticContract(std::string_view metrics, std::string_view info) {
+  for (const auto& field : kDiagnostics) {
+    const auto name = "lavik_storage_" + std::string(field.suffix);
+    SCOPED_TRACE(name);
+    EXPECT_NE(metrics.find("# HELP " + name + " "), std::string_view::npos);
+    EXPECT_NE(metrics.find("# TYPE " + name +
+                           (field.counter ? " counter\n" : " gauge\n")),
+              std::string_view::npos);
+    EXPECT_EQ(metrics.find("\n" + name + "{"), std::string_view::npos);
+    const auto marker = "\r\n" + std::string(field.info) + ":";
+    const auto start = info.find(marker);
+    ASSERT_NE(start, std::string_view::npos);
+    EXPECT_DOUBLE_EQ(
+        MetricNumber(metrics, name),
+        std::stod(std::string(info.substr(start + marker.size()))) /
+            field.divisor);
+  }
+}
+
+template <typename Predicate>
+bool WaitUntil(Predicate ready) {
+  const auto deadline = std::chrono::steady_clock::now() + 15s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (ready()) return true;
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
 }
 
 TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
@@ -404,7 +476,7 @@ TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
   // of terminating in a std::thread destructor. Declaring the gate after the
   // futures also unblocks already-created tasks if later task creation throws.
   std::vector<std::future<void>> jobs;
-  jobs.reserve(kWriters + 3);
+  jobs.reserve(kWriters + 4);
   std::promise<void> release;
   const auto start = release.get_future().share();
   for (unsigned writer = 0; writer < kWriters; ++writer) {
@@ -427,6 +499,9 @@ TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
                 "HSET count mismatch");
         require(client.Command({"HGET", hash, "field"}) == bulk,
                 "HGET lost bytes");
+        require(client.Command(
+                    {"MSET", key + ":a", value, key + ":b", value}) == "+OK",
+                "MSET failed");
       }
     }));
   }
@@ -457,24 +532,36 @@ TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
       }
     }));
   }
-  jobs.push_back(std::async(std::launch::async, [&, start] {
-    start.get();
-    std::uint64_t previous_commands = 0;
-    for (unsigned round = 0; round < kRounds; ++round) {
-      const auto response = HttpGet(metrics_port, "/metrics");
-      require(response.starts_with("HTTP/1.1 200 OK\r\n"), "scrape failed");
-      require(MetricValue(response, "lavik_server_ready") == 1,
-              "server stopped being ready");
-      const auto commands = MetricValue(response, "lavik_commands_total");
-      require(commands >= previous_commands, "command counter went backwards");
-      previous_commands = commands;
-      for (unsigned worker = 0; worker < kWorkers; ++worker)
-        require(
-            response.find("lavik_worker_memory_limit_bytes{worker=\"" +
-                          std::to_string(worker) + "\"}") != std::string::npos,
-            "scrape omitted worker");
-    }
-  }));
+  for (unsigned scraper = 0; scraper < 2; ++scraper) {
+    jobs.push_back(std::async(std::launch::async, [&, start] {
+      start.get();
+      std::uint64_t previous_commands = 0;
+      for (unsigned round = 0; round < kRounds; ++round) {
+        const auto response = HttpGet(metrics_port, "/metrics");
+        require(response.starts_with("HTTP/1.1 200 OK\r\n"), "scrape failed");
+        require(MetricValue(response, "lavik_server_ready") == 1,
+                "server stopped being ready");
+        const auto commands = MetricValue(response, "lavik_commands_total");
+        require(commands >= previous_commands,
+                "command counter went backwards");
+        previous_commands = commands;
+        require(MetricValue(response, "lavik_storage_tx_backlog_bytes") >=
+                    MetricValue(response, "lavik_storage_tx_backlog_max_bytes"),
+                "backlog max exceeds sum");
+        for (unsigned worker = 0; worker < kWorkers; ++worker)
+          require(response.find("lavik_worker_memory_limit_bytes{worker=\"" +
+                                std::to_string(worker) + "\"}") !=
+                      std::string::npos,
+                  "scrape omitted worker");
+        // Disconnect while a snapshot may still be in flight. Its frame must
+        // retain storage safely until worker callbacks have returned.
+        const int abandoned = ConnectSocket(metrics_port);
+        require(abandoned >= 0, "abandoned scrape connection failed");
+        SendAll(abandoned, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        ::close(abandoned);
+      }
+    }));
+  }
   release.set_value();
   for (auto& job : jobs) {
     try {
@@ -498,6 +585,208 @@ TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {
   EXPECT_GE(MetricValue(final_metrics, "lavik_commands_total"),
             kWriters * kWrites * 4 + 2 * kRounds * 6);
   server.Stop();
+}
+
+TEST(MetricsE2eTest, StorageDiagnosticsMatchInfoDrainAndResetOnRestart) {
+  const auto prefix = lavik::test::TestDataPath("lavik-storage-diagnostics-" +
+                                                std::to_string(::getpid()));
+  const auto data = prefix + ".data", log = prefix + ".log";
+  FileCleanup data_cleanup(data), log_cleanup(log, true);
+  const int fd =
+      ::open(data.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 512ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+  const auto redis = FindFreePort();
+  auto http = FindFreePort();
+  while (http == redis) http = FindFreePort();
+  const std::string value(65536, 'v');
+  {
+    ServerProcess server(g_lavik_binary, redis, http, data, log);
+    RespClient client(redis);
+    ASSERT_EQ(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+              "+OK");
+    CheckDiagnosticContract(HttpGet(http, "/metrics"),
+                            client.Command({"INFO", "STATS"}));
+    // Overwrite a bounded set of keys but roll several Tx blocks on both
+    // workers.
+    for (unsigned i = 0; i < 160; ++i) {
+      ASSERT_EQ(client.Command({"MSET", "diag:a", value, "diag:b", value,
+                                "diag:c", value, "diag:d", value}),
+                "+OK");
+    }
+    ASSERT_TRUE(WaitUntil([&] {
+      return MetricValue(HttpGet(http, "/metrics"),
+                         "lavik_storage_durability_pending") == 0;
+    }));
+    const auto before = HttpGet(http, "/metrics");
+    CheckDiagnosticContract(before, client.Command({"INFO", "STATS"}));
+    EXPECT_GT(MetricValue(before, "lavik_storage_tx_backlog_bytes"), 0);
+    EXPECT_GT(MetricValue(before, "lavik_storage_tx_commit_batches_total"), 0);
+    EXPECT_EQ(
+        MetricValue(before, "lavik_storage_tx_commit_batch_transactions_total"),
+        160);
+    EXPECT_GE(
+        MetricValue(before, "lavik_storage_tx_commit_input_fences_total"),
+        MetricValue(before, "lavik_storage_tx_commit_merged_fences_total"));
+    EXPECT_EQ(MetricValue(before, "lavik_storage_tx_commit_queue_depth"), 0);
+    EXPECT_GT(MetricValue(before, "lavik_storage_tx_commit_queue_peak"), 0);
+    EXPECT_EQ(
+        MetricValue(before, "lavik_storage_tx_commit_queue_high_watermark"),
+        4096);
+    ASSERT_EQ(client.Command({"CONFIG", "RESETSTAT"}), "+OK");
+    const auto after = HttpGet(http, "/metrics");
+    for (const auto& field : kDiagnostics) {
+      const auto name = "lavik_storage_" + std::string(field.suffix);
+      EXPECT_DOUBLE_EQ(MetricNumber(after, name), MetricNumber(before, name))
+          << name;
+    }
+    server.Stop();
+  }
+  {
+    std::vector<std::pair<std::string, std::string>> env;
+#if LAVIK_TEST_FAULTS_AVAILABLE
+    env.emplace_back("LAVIK_FAIL_TX_CLEANER_ONCE", "1");
+#endif
+    ServerProcess server(g_lavik_binary, redis, http, data, log, 2,
+                         1024ULL * 1024 * 1024, env);
+    RespClient client(redis);
+    EXPECT_EQ(client.Command({"GET", "diag:a"}), "$65536\r\n" + value);
+    const auto restarted = HttpGet(http, "/metrics");
+    EXPECT_EQ(MetricValue(restarted, "lavik_storage_tx_commit_batches_total"),
+              0);
+    EXPECT_EQ(MetricValue(restarted, "lavik_storage_tx_commit_queue_peak"), 0);
+    ASSERT_EQ(
+        client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "250"}),
+        "+OK");
+    ASSERT_TRUE(WaitUntil([&] {
+      const auto metrics = HttpGet(http, "/metrics");
+      return MetricValue(metrics, "lavik_storage_tx_backlog_bytes") == 0 &&
+             MetricValue(metrics, "lavik_storage_tx_cleaner_running") == 0 &&
+             MetricValue(metrics, "lavik_storage_durability_pending") == 0;
+    }));
+    // Freeze the cleaner for an exact INFO/export comparison, including
+    // fractional seconds.
+    const auto drained = HttpGet(http, "/metrics");
+    EXPECT_DOUBLE_EQ(
+        MetricNumber(drained, "lavik_storage_tx_cleaner_cooldown_seconds"),
+        0.25);
+    EXPECT_GT(
+        MetricValue(drained, "lavik_storage_tx_cleaner_retired_blocks_total"),
+        0);
+#if LAVIK_TEST_FAULTS_AVAILABLE
+    EXPECT_EQ(MetricValue(drained, "lavik_storage_tx_cleaner_failures_total"),
+              1);
+#endif
+    ASSERT_EQ(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+              "+OK");
+    CheckDiagnosticContract(HttpGet(http, "/metrics"),
+                            client.Command({"INFO", "STATS"}));
+    server.Stop();
+  }
+}
+
+TEST(MetricsE2eTest, StorageDiagnosticsRemainResponsiveDuringPausedFlush) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "Deterministic flush pause requires test fault hooks";
+#else
+  const auto prefix = lavik::test::TestDataPath("lavik-diagnostics-flush-" +
+                                                std::to_string(::getpid()));
+  const auto data = prefix + ".data", log = prefix + ".log",
+             pause = prefix + ".pause";
+  FileCleanup data_cleanup(data), log_cleanup(log, true), pause_cleanup(pause);
+  const int fd =
+      ::open(data.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+  {
+    std::ofstream marker(pause);
+  }
+  const auto redis = FindFreePort();
+  auto http = FindFreePort();
+  while (http == redis) http = FindFreePort();
+  ServerProcess server(g_lavik_binary, redis, http, data, log, 2,
+                       1024ULL * 1024 * 1024,
+                       {{"LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE", pause}});
+  RespClient client(redis);
+  ASSERT_EQ(client.Command({"SET", "diagnostic-pause", "value"}), "+OK");
+  ASSERT_TRUE(WaitUntil([&] {
+    std::ifstream stream(log);
+    return std::string(std::istreambuf_iterator<char>(stream), {})
+               .find("fault pause reached: LAVIK_FLUSH_SNAPSHOT_PAUSE_FILE") !=
+           std::string::npos;
+  }));
+  const auto blocked = HttpGet(http, "/metrics");
+  EXPECT_GT(MetricValue(blocked, "lavik_storage_dirty_staging_bytes"), 0);
+  EXPECT_EQ(MetricValue(blocked, "lavik_storage_flushes_pending"), 1);
+  EXPECT_EQ(MetricValue(blocked, "lavik_storage_durability_pending"), 1);
+  CheckDiagnosticContract(blocked, client.Command({"INFO", "STATS"}));
+  EXPECT_EQ(client.Command({"PING"}), "+PONG");
+  ASSERT_EQ(::unlink(pause.c_str()), 0);
+  ASSERT_TRUE(WaitUntil([&] {
+    return MetricValue(HttpGet(http, "/metrics"),
+                       "lavik_storage_durability_pending") == 0;
+  }));
+  EXPECT_EQ(client.Command({"GET", "diagnostic-pause"}), "$5\r\nvalue");
+  server.Stop();
+#endif
+}
+
+TEST(MetricsE2eTest, StorageFailureExportsOnlyReadiness) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "Deterministic storage failure requires test fault hooks";
+#else
+  const auto prefix = lavik::test::TestDataPath("lavik-diagnostics-unready-" +
+                                                std::to_string(::getpid()));
+  const auto data = prefix + ".data", log = prefix + ".log",
+             failure = prefix + ".fail";
+  FileCleanup data_cleanup(data), log_cleanup(log, true),
+      failure_cleanup(failure);
+  const int fd =
+      ::open(data.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+  const auto redis = FindFreePort();
+  auto http = FindFreePort();
+  while (http == redis) http = FindFreePort();
+  ServerProcess server(g_lavik_binary, redis, http, data, log, 2,
+                       1024ULL * 1024 * 1024,
+                       {{"LAVIK_EPOCH_IO_FAIL_FILE", failure},
+                        {"LAVIK_EPOCH_IO_FAIL_KIND", "write"},
+                        {"LAVIK_EPOCH_IO_FAIL_DEVICE", "1"}});
+  RespClient client(redis);
+  ASSERT_EQ(client.Command({"SET", "before-failure", "value"}), "+OK");
+  ASSERT_TRUE(WaitUntil([&] {
+    return MetricValue(HttpGet(http, "/metrics"),
+                       "lavik_storage_durability_pending") == 0;
+  }));
+  {
+    std::ofstream marker(failure);
+  }
+  // Fencing may close this connection before the command error is delivered.
+  // The HTTP endpoint must remain available but stop collecting storage.
+  try {
+    EXPECT_TRUE(client.Command({"FLUSHALL"}).starts_with('-'));
+  } catch (const std::runtime_error&) {
+  }
+  ASSERT_TRUE(WaitUntil([&] {
+    return MetricValue(HttpGet(http, "/metrics"), "lavik_server_ready") == 0;
+  }));
+  const auto response = HttpGet(http, "/metrics");
+  EXPECT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  EXPECT_EQ(response.find("lavik_storage_"), std::string::npos);
+  std::istringstream body(response.substr(response.find("\r\n\r\n") + 4));
+  std::string line;
+  unsigned samples = 0;
+  while (std::getline(body, line)) {
+    if (!line.empty() && line.front() != '#') ++samples;
+  }
+  EXPECT_EQ(samples, 1);
+  // The failed durability epoch remains fenced. The process fixture kills it
+  // on scope exit; a graceful successful shutdown is not expected here.
+#endif
 }
 
 TEST(MetricsE2eTest, ConfigResetstatClearsCommandCountersOnly) {
