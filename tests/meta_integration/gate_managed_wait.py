@@ -89,8 +89,7 @@ def acknowledged(root, mode):
             pipelined = Client(source)
             try:
                 pipelined.socket.sendall(
-                    C.encode_resp(["WAIT", "2", "0"])
-                    + C.encode_resp(["PING"])
+                    C.encode_resp(["WAIT", "2", "0"]) + C.encode_resp(["PING"])
                 )
                 pipelined.socket.shutdown(socket.SHUT_WR)
                 try:
