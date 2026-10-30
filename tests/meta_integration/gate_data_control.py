@@ -442,20 +442,18 @@ def assert_authority_challenge_denied(data, leader, minimum_fds=1, prior_denials
 
 
 def assert_keyed_write_fenced(data, label):
-    labels = '{command="set",context="client",result="rejected"}'
-    before = data.metric("lavik_command_results_total", labels)
+    labels = '{command="set"}'
+    before = data.metric("lavik_command_rejected_calls_total", labels)
     reply = data.command_head(["SET", "{gate}key", "value"])
     if not (reply.startswith("-LOADING") or reply.startswith("-CLUSTERDOWN")):
         raise H.Failure(f"{label}: keyed write was not fenced: {reply}")
-    if data.metric("lavik_command_results_total", labels) != before + 1:
+    if data.metric("lavik_command_rejected_calls_total", labels) != before + 1:
         raise H.Failure(f"{label}: fenced SET was not counted once as rejected")
-    reason = "loading" if reply.startswith("-LOADING") else "clusterdown"
+    reason = "LOADING" if reply.startswith("-LOADING") else "CLUSTERDOWN"
     if (
         data.metric(
-            "lavik_command_errors_total",
-            '{command="set",context="client",result="rejected",reason="'
-            + reason
-            + '"}',
+            "lavik_errors_total",
+            '{err="' + reason + '"}',
         )
         < 1
     ):

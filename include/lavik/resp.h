@@ -184,7 +184,14 @@ class ReplyBuilder {
   // Metadata follows reply construction independently of its wire encoding.
   // Aggregators must deliberately preserve or isolate child outcomes.
   [[nodiscard]] CommandOutcome outcome() const noexcept { return outcome_; }
-  void SetOutcome(CommandOutcome outcome) noexcept { outcome_ = outcome; }
+  void SetOutcome(CommandOutcome outcome) noexcept {
+    // Admission changes the classification of the already encoded error.
+    if (outcome.prefix_ == CommandErrorPrefix::kNone &&
+        (outcome.result_ == CommandResult::kRejected ||
+         outcome.result_ == CommandResult::kRedirected))
+      outcome.prefix_ = outcome_.prefix_;
+    outcome_ = outcome;
+  }
 
   // Dispatch supplies a fallback start for session-local commands. Storage
   // handlers replace it after admission; dormant blocking waits are excluded.

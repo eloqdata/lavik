@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -65,32 +64,18 @@ struct WorkerMetricsData {
   std::uint64_t dataset_changes_saved_ = 0;
 };
 
-constexpr std::size_t kContextCount = kCommandContextNames.size();
-constexpr std::size_t kReasonCount = kCommandErrorReasonNames.size();
-constexpr std::size_t kErrorsPerContext = 3 * kReasonCount;
-
-struct CommandErrorTotals {
-  std::array<std::uint64_t, kErrorsPerContext> counts_{};
-  // Persist exposed identities through RESETSTAT. Scanning the set bits avoids
-  // touching the cold counters for errors that have never occurred.
-  std::array<std::uint64_t, (kErrorsPerContext + 63) / 64> seen_{};
-};
-
 // Written only by the owning worker. Keep neighboring live shards on separate
 // cache lines without imposing that alignment on cross-worker return values.
 struct alignas(64) WorkerMetricsShard : WorkerMetricsData {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
   // A routing hint for the existing histogram, not snapshot data.
   std::array<std::uint8_t, kCommandKindCount> last_latency_buckets_{};
-  // Separate hot result/timing fields from cold error counters. All identities
-  // and index-list capacity are allocated at startup, so even recording OOM
-  // cannot allocate. The hot path keeps direct enum indexing and plain writes.
-  std::vector<CommandResultTotals> command_results_;
-  std::vector<CommandErrorTotals> command_errors_;
-  std::vector<std::uint8_t> seen_results_;
+  // Direct enum indexing on the hot path. Reserve identity lists at startup;
+  // recording an error (including OOM) never allocates or takes a mutex.
+  std::vector<CommandStatsTotals> command_stats_;
+  std::array<std::uint64_t, kCommandErrorPrefixNames.size()> errors_{};
   std::vector<std::size_t> observed_commands_;
-  std::vector<std::size_t> observed_results_;
-  std::vector<std::size_t> observed_error_contexts_;
+  std::vector<std::size_t> observed_stats_;
 };
 
 struct CollectedWorkerMetrics : WorkerMetricsData {
@@ -111,17 +96,9 @@ std::array<std::uint64_t, kCommandLatencyBucketUpperUs.size()>
     g_latency_bucket_upper_ticks{};
 double g_counter_frequency = 1.0;
 
-struct CommandResultText {
-  std::string labels_;
-  std::size_t result_zero_offset_ = 0;
-  std::size_t execution_zero_offset_ = 0;
-};
-// Built before workers start and immutable afterwards. Preserve the published
-// zero-series contract without formatting thousands of unused counters on each
-// scrape. This is shared text, not a cache of mutable counter snapshots.
-std::vector<CommandResultText> g_command_result_text;
-std::string g_command_result_zeros;
-std::string g_command_execution_zeros;
+// Immutable sample prefixes are shared by every response until completion.
+std::vector<std::array<std::string, 4>> g_command_stats_text;
+std::array<std::string, kCommandErrorPrefixNames.size()> g_error_text;
 
 // The response owns only changing text. Literal/immutable views remain shared
 // until HTTP completion; no pointer into growing numeric scratch is retained.
@@ -155,29 +132,6 @@ class MetricText {
 template <typename... Args>
 void AppendMetricText(MetricText* output, const Args&... args) {
   (output->Add(args), ...);
-}
-
-template <typename... Args>
-void AppendMetricText(std::string* output, const Args&... args) {
-  absl::StrAppend(output, args...);
-}
-
-template <typename Output>
-void AppendResultValues(std::string_view labels,
-                        const CommandResultTotals& totals, Output* output) {
-  for (std::size_t result = 0; result < kCommandResultNames.size(); ++result)
-    AppendMetricText(output, "lavik_command_results_total{", labels,
-                     ",result=\"", kCommandResultNames[result], "\"} ",
-                     totals.results_[result], "\n");
-}
-
-template <typename Output>
-void AppendExecutionTime(std::string_view labels,
-                         const CommandResultTotals& totals,
-                         double counter_frequency, Output* output) {
-  AppendMetricText(
-      output, "lavik_command_execution_seconds_total{", labels, "} ",
-      static_cast<double>(totals.execution_ticks_) / counter_frequency, "\n");
 }
 
 struct ClusterControlMetrics {
@@ -300,32 +254,26 @@ void InitWorkerMetrics(unsigned worker_count) {
   PrepareMetricText(worker_count);
   g_worker_metrics = std::make_unique<WorkerMetricsShard[]>(worker_count);
   g_worker_metrics_count = worker_count;
-  const auto contexts = CommandIdentityCount() * kContextCount;
+  const auto commands = CommandIdentityCount();
   for (unsigned worker = 0; worker < worker_count; ++worker) {
     auto& shard = g_worker_metrics[worker];
-    shard.command_results_.resize(contexts);
-    shard.command_errors_.resize(contexts);
-    shard.seen_results_.resize(contexts);
+    shard.command_stats_.resize(commands);
     shard.observed_commands_.reserve(kCommandKindCount);
-    shard.observed_results_.reserve(contexts);
-    shard.observed_error_contexts_.reserve(contexts);
+    shard.observed_stats_.reserve(commands);
   }
   g_counter_frequency = std::max(1.0, bycorf::CycleCounterFrequency());
-  g_command_result_text.clear();
-  g_command_result_text.resize(contexts);
-  g_command_result_zeros.clear();
-  g_command_execution_zeros.clear();
-  for (std::size_t i = 0; i < contexts; ++i) {
-    auto& text = g_command_result_text[i];
-    text.labels_ = absl::StrCat(
-        "command=\"", CommandResultName(i / kContextCount), "\",context=\"",
-        kCommandContextNames[i % kContextCount], "\"");
-    text.result_zero_offset_ = g_command_result_zeros.size();
-    text.execution_zero_offset_ = g_command_execution_zeros.size();
-    AppendResultValues(text.labels_, {}, &g_command_result_zeros);
-    AppendExecutionTime(text.labels_, {}, g_counter_frequency,
-                        &g_command_execution_zeros);
-  }
+  g_command_stats_text.resize(commands);
+  constexpr std::array<std::string_view, 4> families{
+      "lavik_command_executions_total", "lavik_command_failed_calls_total",
+      "lavik_command_rejected_calls_total",
+      "lavik_command_execution_seconds_total"};
+  for (std::size_t i = 0; i < commands; ++i)
+    for (std::size_t family = 0; family < families.size(); ++family)
+      g_command_stats_text[i][family] = absl::StrCat(
+          families[family], "{command=\"", CommandResultName(i), "\"} ");
+  for (std::size_t i = 1; i < g_error_text.size(); ++i)
+    g_error_text[i] = absl::StrCat("lavik_errors_total{err=\"",
+                                   kCommandErrorPrefixNames[i], "\"} ");
   for (std::size_t i = 0; i < kCommandLatencyBucketUpperUs.size(); ++i) {
     const long double ticks =
         static_cast<long double>(g_counter_frequency) *
@@ -464,35 +412,40 @@ void RecordRequestInputError(RequestInputError reason) noexcept {
     ++g_worker_metrics[worker].input_errors_[static_cast<unsigned>(reason)];
 }
 
-void RecordCommandResult(std::size_t command, CommandContext context,
-                         CommandOutcome outcome,
+void RecordCommandError(CommandErrorPrefix prefix,
+                        std::uint64_t count) noexcept {
+  const auto worker = bycorf::ThisWorker().id_;
+  if (worker < g_worker_metrics_count && prefix != CommandErrorPrefix::kNone)
+    g_worker_metrics[worker].errors_[static_cast<unsigned>(prefix)] += count;
+}
+
+void RecordCommandResult(std::size_t command, CommandOutcome outcome,
                          std::uint64_t execution_ticks) noexcept {
   const unsigned worker = bycorf::ThisWorker().id_;
   if (worker >= g_worker_metrics_count) return;
-  auto& shard = g_worker_metrics[worker];
-  if (command >= shard.command_results_.size() / kContextCount)
-    command = ToIndex(CommandKind::kUnknown);
-  const auto index = command * kContextCount + static_cast<unsigned>(context);
-  auto& metric = shard.command_results_[index];
-  if (outcome.result_ == CommandResult::kFailed &&
+  // Queueing is not execution. A blocked/streamed command abandoned before
+  // completion has no completed call; socket writes after completion do not
+  // affect this accounting. Neither case constructs a Redis error reply.
+  if (outcome.result_ == CommandResult::kQueued ||
+      outcome.result_ == CommandResult::kCancelled ||
       outcome.reason_ == CommandErrorReason::kCancelled)
-    outcome.result_ = CommandResult::kCancelled;
-  const auto result = static_cast<unsigned>(outcome.result_);
-  if (metric.results_[result]++ == 0) [[unlikely]] {
-    if (!shard.seen_results_[index]) {
-      shard.seen_results_[index] = true;
-      shard.observed_results_.push_back(index);
-    }
-  }
-  if (outcome.executed()) metric.execution_ticks_ += execution_ticks;
-  if (result >= 1 && result <= 3) {
-    const auto reason = static_cast<unsigned>(outcome.reason_);
-    auto& errors = shard.command_errors_[index];
-    if (std::ranges::all_of(errors.seen_, [](auto word) { return word == 0; }))
-      shard.observed_error_contexts_.push_back(index);
-    const auto error = (result - 1) * kReasonCount + reason;
-    ++errors.counts_[error];
-    errors.seen_[error / 64] |= std::uint64_t{1} << (error % 64);
+    return;
+  if (outcome.prefix_ != CommandErrorPrefix::kNone)
+    RecordCommandError(outcome.prefix_);
+  auto& shard = g_worker_metrics[worker];
+  // Unknown commands still contribute ERR, but have no commandstats identity.
+  if (command >= shard.command_stats_.size() ||
+      command == ToIndex(CommandKind::kUnknown))
+    return;
+  auto& metric = shard.command_stats_[command];
+  if (metric.calls_ == 0 && metric.rejected_calls_ == 0) [[unlikely]]
+    shard.observed_stats_.push_back(command);
+  if (outcome.executed()) {
+    ++metric.calls_;
+    metric.execution_ticks_ += execution_ticks;
+    if (outcome.result_ == CommandResult::kFailed) ++metric.failed_calls_;
+  } else {
+    ++metric.rejected_calls_;
   }
 }
 
@@ -500,7 +453,6 @@ namespace {
 struct ObservedCommandSource {
   ReplyChunkSource source_;
   std::size_t command_ = 0;
-  CommandContext context_ = CommandContext::kClient;
   CommandOutcome outcome_;
   std::uint64_t ticks_ = 0;
   bool pending_ = false;
@@ -513,7 +465,7 @@ struct ObservedCommandSource {
   }
   void Finish(CommandOutcome outcome) noexcept {
     if (!std::exchange(pending_, false)) return;
-    RecordCommandResult(command_, context_, outcome, ticks_);
+    RecordCommandResult(command_, outcome, ticks_);
   }
 };
 
@@ -537,13 +489,11 @@ bycorf::Task<absl::StatusOr<std::string>> NextObservedCommandChunk(
 
 ReplyChunkSource ObserveCommandReplySource(ReplyChunkSource source,
                                            std::size_t command,
-                                           CommandContext context,
                                            CommandOutcome outcome,
                                            std::uint64_t execution_ticks) {
   auto state = std::make_shared<ObservedCommandSource>();
   state->source_ = std::move(source);
   state->command_ = command;
-  state->context_ = context;
   state->outcome_ = outcome;
   state->ticks_ = execution_ticks;
   state->pending_ = true;
@@ -558,13 +508,6 @@ void AddMetricTotals(CommandMetricTotals& destination,
   destination.latency_ticks_ += source.latency_ticks_;
   for (std::size_t i = 0; i < source.latency_bins_.size(); ++i)
     destination.latency_bins_[i] += source.latency_bins_[i];
-}
-
-void AddMetricTotals(CommandResultTotals& destination,
-                     const CommandResultTotals& source) {
-  destination.execution_ticks_ += source.execution_ticks_;
-  for (std::size_t i = 0; i < source.results_.size(); ++i)
-    destination.results_[i] += source.results_[i];
 }
 
 void AddMetricTotals(CommandStatsTotals& destination,
@@ -616,41 +559,14 @@ CommandMetricsSnapshot CollectCommandMetrics(const WorkerMetricsShard& live,
   }
   if (detail == CommandMetricsDetail::kTotalCalls) return copy;
 
-  if (detail == CommandMetricsDetail::kFull)
-    copy.results_.reserve(live.observed_results_.size());
-  else
-    copy.stats_.reserve(live.observed_results_.size());
-  for (auto index : live.observed_results_) {
-    const auto& totals = live.command_results_[index];
-    // RESETSTAT preserves observed identities, but the renderer can supply
-    // their zero result samples without transporting an empty record.
-    if (std::ranges::all_of(totals.results_, [](auto n) { return n == 0; }))
-      continue;
-    if (detail == CommandMetricsDetail::kFull) {
-      copy.results_.push_back({index, totals});
-    } else {
-      copy.stats_.push_back(
-          {index / kContextCount,
-           {totals.Calls(), totals.results_[1],
-            totals.results_[2] + totals.results_[3], totals.execution_ticks_}});
-    }
+  if (detail != CommandMetricsDetail::kErrorStats) {
+    copy.stats_.reserve(live.observed_stats_.size());
+    for (auto command : live.observed_stats_)
+      copy.stats_.push_back({command, live.command_stats_[command]});
   }
-  if (detail != CommandMetricsDetail::kFull) {
-    // INFO transports at most one projection per command, not its contexts.
-    ReduceMetricEntries(copy.stats_);
-    return copy;
-  }
-  for (auto context : live.observed_error_contexts_) {
-    const auto& errors = live.command_errors_[context];
-    for (std::size_t word = 0; word < errors.seen_.size(); ++word) {
-      auto bits = errors.seen_[word];
-      while (bits != 0) {
-        const auto error = word * 64 + std::countr_zero(bits);
-        copy.errors_.push_back(
-            {context * kErrorsPerContext + error, errors.counts_[error]});
-        bits &= bits - 1;
-      }
-    }
+  if (detail != CommandMetricsDetail::kCommandStats) {
+    for (std::size_t i = 1; i < live.errors_.size(); ++i)
+      if (live.errors_[i] != 0) copy.errors_.push_back({i, live.errors_[i]});
   }
   return copy;
 }
@@ -697,14 +613,11 @@ bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics(
     auto& commands = result.commands_;
     commands.total_calls_ += shard.commands_.total_calls_;
     AppendMetricEntries(commands.commands_, shard.commands_.commands_);
-    AppendMetricEntries(commands.results_, shard.commands_.results_);
     AppendMetricEntries(commands.errors_, shard.commands_.errors_);
     AppendMetricEntries(commands.stats_, shard.commands_.stats_);
   }
-  // Aggregate only observed entries. A sparse transfer must not expand back
-  // into a dense error matrix on the collector, especially with many workers.
+  // Aggregate observed numeric identities without expanding sparse transfers.
   ReduceMetricEntries(result.commands_.commands_);
-  ReduceMetricEntries(result.commands_.results_);
   ReduceMetricEntries(result.commands_.errors_);
   ReduceMetricEntries(result.commands_.stats_);
   // Includes outgoing Meta streams without scheduling a metrics task on the
@@ -721,10 +634,10 @@ bycorf::Task<absl::Status> ResetCommandMetrics() {
         shard.commands_[command] = {};
       shard.observed_commands_.clear();
       shard.input_errors_ = {};
-      for (auto context : shard.observed_results_)
-        shard.command_results_[context] = {};
-      for (auto context : shard.observed_error_contexts_)
-        shard.command_errors_[context].counts_ = {};
+      for (auto command : shard.observed_stats_)
+        shard.command_stats_[command] = {};
+      shard.observed_stats_.clear();
+      shard.errors_ = {};
       return true;
     });
   }
@@ -947,51 +860,63 @@ void AppendStorageDiagnostics(
       diagnostics.expiration_pause_count_);
 }
 
-template <typename AppendActive>
-void AppendSparseResultFamily(const WorkerMetricsSnapshot& snapshot,
-                              std::string_view zeros,
-                              std::size_t CommandResultText::* zero_offset,
-                              AppendActive append_active, MetricText* output) {
-  // Keep each metric family contiguous while borrowing its zero runs between
-  // active identities. A sparse workload needs only a few shared pieces.
-  std::size_t next_zero = 0;
-  for (const auto& active : snapshot.commands_.results_) {
-    const auto& text = g_command_result_text[active.index_];
-    if (next_zero < active.index_) {
-      const auto begin = g_command_result_text[next_zero].*zero_offset;
-      output->append(zeros.substr(begin, text.*zero_offset - begin));
-    }
-    append_active(text.labels_, active.totals_);
-    next_zero = active.index_ + 1;
-  }
-  if (next_zero < g_command_result_text.size())
-    output->append(zeros.substr(g_command_result_text[next_zero].*zero_offset));
-}
-
 void AppendCommandResults(const WorkerMetricsSnapshot& snapshot,
                           MetricText* output) {
-  AppendMetricText(output,
-                   "# HELP lavik_command_results_total Logical client, EXEC, "
-                   "and script command outcomes.\n"
-                   "# TYPE lavik_command_results_total counter\n");
-  AppendSparseResultFamily(
-      snapshot, g_command_result_zeros, &CommandResultText::result_zero_offset_,
-      [output](std::string_view labels, const CommandResultTotals& totals) {
-        AppendResultValues(labels, totals, output);
-      },
-      output);
-  AppendMetricText(output,
-                   "# HELP lavik_command_execution_seconds_total Time spent "
-                   "executing logical commands.\n"
-                   "# TYPE lavik_command_execution_seconds_total counter\n");
-  AppendSparseResultFamily(
-      snapshot, g_command_execution_zeros,
-      &CommandResultText::execution_zero_offset_,
-      [&](std::string_view labels, const CommandResultTotals& totals) {
-        AppendExecutionTime(labels, totals, snapshot.counter_frequency_,
-                            output);
-      },
-      output);
+  constexpr std::array<std::string_view, 4> metadata{
+      "# HELP lavik_command_executions_total Completed logical command "
+      "executions, including failed calls.\n"
+      "# TYPE lavik_command_executions_total counter\n",
+      "# HELP lavik_command_failed_calls_total Executed commands that failed.\n"
+      "# TYPE lavik_command_failed_calls_total counter\n",
+      "# HELP lavik_command_rejected_calls_total Commands rejected before "
+      "execution, including redirects.\n"
+      "# TYPE lavik_command_rejected_calls_total counter\n",
+      "# HELP lavik_command_execution_seconds_total Time spent executing "
+      "logical commands.\n"
+      "# TYPE lavik_command_execution_seconds_total counter\n"};
+  // Redis emits one commandstats row for each observed command/subcommand.
+  // Publish all four fields together, including zero failures/rejections, and
+  // keep metric families contiguous in the text exposition.
+  for (std::size_t family = 0; family < metadata.size(); ++family) {
+    output->append(metadata[family]);
+    for (const auto& entry : snapshot.commands_.stats_) {
+      output->append(g_command_stats_text[entry.index_][family]);
+      const auto& totals = entry.totals_;
+      switch (family) {
+        case 0:
+          AppendMetricText(output, totals.calls_, "\n");
+          break;
+        case 1:
+          AppendMetricText(output, totals.failed_calls_, "\n");
+          break;
+        case 2:
+          AppendMetricText(output, totals.rejected_calls_, "\n");
+          break;
+        case 3:
+          AppendMetricText(output,
+                           static_cast<double>(totals.execution_ticks_) /
+                               snapshot.counter_frequency_,
+                           "\n");
+          break;
+      }
+    }
+  }
+  AppendMetricText(
+      output,
+      "# HELP lavik_errors_total Redis errors by RESP prefix, including caught "
+      "script errors. Custom prefixes use OTHER.\n"
+      "# TYPE lavik_errors_total counter\n");
+  auto error = snapshot.commands_.errors_.begin();
+  // A small fixed vocabulary gives the first rare error a zero baseline.
+  // INFO omits zero prefixes; Prometheus retains them across RESETSTAT.
+  for (std::size_t i = 1; i < g_error_text.size(); ++i) {
+    const auto count =
+        error != snapshot.commands_.errors_.end() && error->index_ == i
+            ? (error++)->totals_
+            : 0;
+    output->append(g_error_text[i]);
+    AppendMetricText(output, count, "\n");
+  }
   AppendMetricText(output,
                    "# HELP lavik_request_input_errors_total Request input "
                    "failures before command dispatch.\n"
@@ -1000,20 +925,6 @@ void AppendCommandResults(const WorkerMetricsSnapshot& snapshot,
     AppendMetricText(output, "lavik_request_input_errors_total{reason=\"",
                      kRequestInputErrorNames[i], "\"} ",
                      snapshot.input_errors_[i], "\n");
-  AppendMetricText(output,
-                   "# HELP lavik_command_errors_total Classified command "
-                   "errors, a projection of command results.\n"
-                   "# TYPE lavik_command_errors_total counter\n");
-  for (const auto& error : snapshot.commands_.errors_) {
-    const auto context = error.index_ / kErrorsPerContext;
-    const auto result = error.index_ % kErrorsPerContext / kReasonCount;
-    const auto reason = error.index_ % kReasonCount;
-    AppendMetricText(output, "lavik_command_errors_total{",
-                     std::string_view(g_command_result_text[context].labels_),
-                     ",result=\"", kCommandResultNames[result + 1],
-                     "\",reason=\"", kCommandErrorReasonNames[reason], "\"} ",
-                     error.totals_, "\n");
-  }
 }
 
 }  // namespace

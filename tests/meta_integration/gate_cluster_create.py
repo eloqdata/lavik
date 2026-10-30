@@ -1213,10 +1213,10 @@ def assert_redis_topology_and_replication(nodes):
                 )
 
     primary = by_id[PRIMARY_1]
-    redirected_labels = '{command="get",context="client",result="redirected"}'
-    rejected_labels = '{command="get",context="client",result="rejected"}'
-    before_redirected = primary.metric("lavik_command_results_total", redirected_labels)
-    before_rejected = primary.metric("lavik_command_results_total", rejected_labels)
+    rejected_labels = '{command="get"}'
+    before_rejected = primary.metric(
+        "lavik_command_rejected_calls_total", rejected_labels
+    )
     before_stats = redis_call(primary, ["INFO", "commandstats"])
     fenced_attempts = 0
 
@@ -1234,23 +1234,14 @@ def assert_redis_topology_and_replication(nodes):
     ):
         raise H.Failure(f"wrong-primary request returned {moved!r}")
     if (
-        primary.metric("lavik_command_results_total", redirected_labels)
-        != before_redirected + 1
+        primary.metric("lavik_command_rejected_calls_total", rejected_labels)
+        != before_rejected + fenced_attempts + 1
     ):
-        raise H.Failure("MOVED did not record exactly one redirected command")
-    if (
-        primary.metric("lavik_command_results_total", rejected_labels)
-        != before_rejected + fenced_attempts
-    ):
-        raise H.Failure("MOVED was also counted as an admission rejection")
-    if (
-        primary.metric(
-            "lavik_command_errors_total",
-            '{command="get",context="client",result="redirected",reason="moved"}',
+        raise H.Failure(
+            "MOVED and admission fences were not counted once as rejections"
         )
-        < 1
-    ):
-        raise H.Failure("MOVED reason projection is missing")
+    if primary.metric("lavik_errors_total", '{err="MOVED"}') < 1:
+        raise H.Failure("MOVED error prefix is missing")
 
     def get_stats(info):
         line = next(

@@ -34,6 +34,7 @@ using namespace std::chrono_literals;
 
 struct Snapshots {
   WorkerMetricsSnapshot empty_, full_, gauges_, totals_, info_, reset_, reused_;
+  WorkerMetricsSnapshot errors_;
 };
 
 bycorf::Task<absl::Status> CollectSnapshots(
@@ -44,24 +45,30 @@ bycorf::Task<absl::Status> CollectSnapshots(
     co_await bycorf::SubmitTo(worker, [worker] {
       for (unsigned i = 0; i < 3 + worker; ++i) {
         RecordCommandMetric(CommandKind::kGet, 100);
-        RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet),
-                            CommandContext::kClient, {}, 100);
+        RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet), {},
+                            100);
       }
-      // The same error is seen on two owners; redirected/MOVED also exercises
-      // error identities beyond the first 64-bit word of each context.
+      // The same global prefix is seen on two owners. Contexts share one
+      // commandstats row; errorstats has no command or context dimension.
       RecordCommandResult(
-          static_cast<std::size_t>(CommandKind::kGet), CommandContext::kClient,
-          {CommandResult::kRedirected, CommandErrorReason::kMoved}, 0);
+          static_cast<std::size_t>(CommandKind::kGet),
+          {CommandResult::kRedirected, CommandErrorReason::kMoved,
+           CommandErrorPrefix::kMoved},
+          0);
       RecordCommandResult(
           static_cast<std::size_t>(CommandKind::kLPush),
-          CommandContext::kScript,
-          {CommandResult::kFailed, CommandErrorReason::kWrongType}, 50);
+          {CommandResult::kFailed, CommandErrorReason::kWrongType,
+           CommandErrorPrefix::kWrongType},
+          50);
+      RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet), {}, 30);
       RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet),
-                          CommandContext::kExec, {}, 30);
+                          {CommandResult::kQueued}, 0);
+      RecordCommandResult(
+          static_cast<std::size_t>(CommandKind::kGet),
+          {CommandResult::kCancelled, CommandErrorReason::kCancelled}, 100);
       // A subcommand identity outside the legacy CommandKind array must also
       // survive sparse sorting, aggregation and INFO projection.
-      RecordCommandResult(CommandIdentityCount() - 1, CommandContext::kClient,
-                          {}, 20);
+      RecordCommandResult(CommandIdentityCount() - 1, {}, 20);
       return true;
     });
   }
@@ -72,15 +79,17 @@ bycorf::Task<absl::Status> CollectSnapshots(
       co_await CollectWorkerMetrics(CommandMetricsDetail::kTotalCalls);
   snapshots.info_ =
       co_await CollectWorkerMetrics(CommandMetricsDetail::kCommandStats);
+  snapshots.errors_ =
+      co_await CollectWorkerMetrics(CommandMetricsDetail::kErrorStats);
   const auto reset = co_await ResetCommandMetrics();
   if (!reset.ok()) co_return reset;
   snapshots.reset_ = co_await CollectWorkerMetrics();
   RecordCommandMetric(CommandKind::kGet, 200);
-  RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet),
-                      CommandContext::kClient, {}, 200);
-  RecordCommandResult(
-      static_cast<std::size_t>(CommandKind::kLPush), CommandContext::kScript,
-      {CommandResult::kFailed, CommandErrorReason::kWrongType}, 40);
+  RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet), {}, 200);
+  RecordCommandResult(static_cast<std::size_t>(CommandKind::kLPush),
+                      {CommandResult::kFailed, CommandErrorReason::kWrongType,
+                       CommandErrorPrefix::kWrongType},
+                      40);
   snapshots.reused_ = co_await CollectWorkerMetrics();
   completed->set_value(std::move(snapshots));
   co_return absl::OkStatus();
@@ -116,7 +125,7 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   const auto snapshots = result.get();
   auto expect_empty_details = [](const CommandMetricsSnapshot& commands) {
     EXPECT_TRUE(commands.commands_.empty());
-    EXPECT_TRUE(commands.results_.empty());
+
     EXPECT_TRUE(commands.errors_.empty());
     EXPECT_TRUE(commands.stats_.empty());
   };
@@ -135,45 +144,44 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   std::uint64_t buckets = 0;
   for (auto bin : full.commands_[0].totals_.latency_bins_) buckets += bin;
   EXPECT_EQ(buckets, 7);
-  ASSERT_EQ(full.results_.size(), 4);
+  ASSERT_EQ(full.stats_.size(), 3);
   ASSERT_EQ(full.errors_.size(), 2);
   for (const auto& error : full.errors_) EXPECT_EQ(error.totals_, 2);
-  EXPECT_TRUE(full.stats_.empty());
-  const auto get_context = static_cast<std::size_t>(CommandKind::kGet) * 3;
-  EXPECT_EQ(full.results_[0].index_, get_context);
-  EXPECT_EQ(full.results_[0].totals_.results_[0], 7);
-  EXPECT_EQ(full.results_[0].totals_.results_[3], 2);
-  EXPECT_EQ(full.results_[0].totals_.execution_ticks_, 700);
-  EXPECT_EQ(full.results_[1].index_, get_context + 1);
-  EXPECT_EQ(full.results_[1].totals_.results_[0], 2);
-  EXPECT_EQ(full.results_[1].totals_.execution_ticks_, 60);
-  EXPECT_EQ(full.results_.back().index_, (CommandIdentityCount() - 1) * 3);
+  EXPECT_EQ(full.stats_[0].index_, static_cast<std::size_t>(CommandKind::kGet));
+  EXPECT_EQ(full.stats_[0].totals_.calls_, 9);
+  EXPECT_EQ(full.stats_[0].totals_.rejected_calls_, 2);
+  EXPECT_EQ(full.stats_[0].totals_.execution_ticks_, 760);
+  EXPECT_EQ(full.stats_.back().index_, CommandIdentityCount() - 1);
 
   const auto& info = snapshots.info_.commands_;
   EXPECT_TRUE(info.commands_.empty());
-  EXPECT_TRUE(info.results_.empty());
+
   EXPECT_TRUE(info.errors_.empty());
   ASSERT_EQ(info.stats_.size(), 3);
   EXPECT_EQ(info.stats_[0].totals_.calls_, 9);
   EXPECT_EQ(info.stats_[0].totals_.rejected_calls_, 2);
   EXPECT_EQ(info.stats_[0].totals_.execution_ticks_, 760);
   EXPECT_EQ(info.stats_[1].totals_.failed_calls_, 2);
+  EXPECT_TRUE(snapshots.errors_.commands_.commands_.empty());
+  EXPECT_TRUE(snapshots.errors_.commands_.stats_.empty());
+  EXPECT_EQ(snapshots.errors_.commands_.errors_.size(), 2);
 
   const auto& reset = snapshots.reset_.commands_;
   EXPECT_EQ(snapshots.reset_.TotalCalls(), 0);
   EXPECT_TRUE(reset.commands_.empty());
-  EXPECT_TRUE(reset.results_.empty());
-  ASSERT_EQ(reset.errors_.size(), 2);
-  for (const auto& error : reset.errors_) EXPECT_EQ(error.totals_, 0);
+
+  EXPECT_TRUE(reset.stats_.empty());
+  EXPECT_TRUE(reset.errors_.empty());
   const auto& reused = snapshots.reused_.commands_;
   EXPECT_EQ(snapshots.reused_.TotalCalls(), 1);
   ASSERT_EQ(reused.commands_.size(), 1);
   EXPECT_EQ(reused.commands_[0].totals_.calls_, 1);
-  ASSERT_EQ(reused.results_.size(), 2);
-  EXPECT_EQ(reused.results_[0].totals_.results_[0], 1);
-  ASSERT_EQ(reused.errors_.size(), 2);
-  EXPECT_EQ(reused.errors_[0].totals_, 0);
-  EXPECT_EQ(reused.errors_[1].totals_, 1);
+  ASSERT_EQ(reused.stats_.size(), 2);
+  EXPECT_EQ(reused.stats_[0].totals_.calls_, 1);
+  ASSERT_EQ(reused.errors_.size(), 1);
+  EXPECT_EQ(reused.errors_[0].index_,
+            static_cast<unsigned>(CommandErrorPrefix::kWrongType));
+  EXPECT_EQ(reused.errors_[0].totals_, 1);
 }
 
 }  // namespace

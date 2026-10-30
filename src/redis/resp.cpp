@@ -697,12 +697,16 @@ std::string_view ReplyBuilder::AppendVerbatimString(std::string_view format,
 
 EncodedCommandReply EncodeCommandRejection(std::string_view message,
                                            CommandErrorReason reason) {
-  return {EncodeError(message), {CommandResult::kRejected, reason}};
+  return {
+      EncodeError(message),
+      {CommandResult::kRejected, reason, CommandErrorPrefixForReply(message)}};
 }
 
 EncodedCommandReply EncodeCommandError(std::string_view message,
                                        CommandErrorReason reason) {
-  return {EncodeError(message), {CommandResult::kFailed, reason}};
+  return {
+      EncodeError(message),
+      {CommandResult::kFailed, reason, CommandErrorPrefixForReply(message)}};
 }
 
 std::string_view ReplyBuilder::AppendError(std::string_view message) {
@@ -718,7 +722,8 @@ std::string_view ReplyBuilder::AppendError(CommandErrorReason reason,
 
 std::string_view ReplyBuilder::AppendError(std::string_view prefix,
                                            std::string_view message) {
-  outcome_ = {CommandResult::kFailed, CommandErrorReason::kClientError};
+  outcome_ = {CommandResult::kFailed, CommandErrorReason::kClientError,
+              CommandErrorPrefixForReply(prefix.empty() ? message : prefix)};
   buffer_.push_back('-');
   buffer_.append(prefix);
   buffer_.append(message);

@@ -4895,11 +4895,14 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
 
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
   if (wants("clients") || wants("stats") || wants("persistence") ||
-      wants("commandstats")) {
+      wants("commandstats") || wants("errorstats")) {
     runtime_metrics = co_await CollectWorkerMetrics(
-        wants("commandstats") ? CommandMetricsDetail::kCommandStats
-        : wants("stats")      ? CommandMetricsDetail::kTotalCalls
-                              : CommandMetricsDetail::kNone);
+        wants("commandstats") && wants("errorstats")
+            ? CommandMetricsDetail::kCommandAndErrorStats
+        : wants("commandstats") ? CommandMetricsDetail::kCommandStats
+        : wants("errorstats")   ? CommandMetricsDetail::kErrorStats
+        : wants("stats")        ? CommandMetricsDetail::kTotalCalls
+                                : CommandMetricsDetail::kNone);
   }
 
   std::string info;
@@ -5101,6 +5104,14 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
               ",rejected_calls=" + std::to_string(rejected) +
               ",failed_calls=" + std::to_string(failed) + "\r\n";
     }
+    info += "\r\n";
+  }
+  if (wants("errorstats")) {
+    info += "# Errorstats\r\n";
+    for (const auto& error : runtime_metrics->commands_.errors_)
+      absl::StrAppend(&info, "errorstat_",
+                      kCommandErrorPrefixNames[error.index_],
+                      ":count=", error.totals_, "\r\n");
     info += "\r\n";
   }
   if (wants("replication")) {
@@ -8265,8 +8276,8 @@ Task<EncodedCommandReply> ExecuteLuaRedisCall(
         notifications, effects, lua_execution, connection);
   }
   if (!eval_request.replication_origin_)
-    RecordCommandResult(identity.index_, CommandContext::kScript,
-                        reply.outcome_, bycorf::ReadCycleCounter() - started);
+    RecordCommandResult(identity.index_, reply.outcome_,
+                        bycorf::ReadCycleCounter() - started);
   co_return reply;
 }
 
@@ -8549,6 +8560,9 @@ Task<EncodedCommandReply> ExecuteEvalWithTransaction(
                               : std::string_view(request.args_[1]),
                   request.args_);
   for (;;) {
+    if (!request.replication_origin_)
+      for (const auto& error : step.errors_)
+        RecordCommandError(error.prefix_, error.count_);
     if (step.scheduler_yield_) {
       co_await Yield(*ThisWorker().self_);
       step = (*execution)->ResumeAfterSchedulerYield();
@@ -8558,7 +8572,9 @@ Task<EncodedCommandReply> ExecuteEvalWithTransaction(
     EncodedCommandReply command_reply = co_await ExecuteLuaRedisCall(
         request, std::move(*step.call_), declared_keys, transaction, tx_writes,
         notifications, effects, execution->get(), connection);
-    step = (*execution)->Resume(command_reply);
+    step = (*execution)
+               ->Resume(command_reply, command_reply.outcome_.prefix_ !=
+                                           CommandErrorPrefix::kNone);
   }
   co_return EncodedCommandReply{std::move(step.reply_), step.outcome_};
 }
@@ -9604,15 +9620,15 @@ Task<CommandReply> ExecuteSentinelManagementExec(
     if (local.disk_value_.valid() || local.continuation_) {
       replies.push_back(
           EncodeError("ERR management command produced a streamed reply"));
-      local_builder.SetOutcome(
-          {CommandResult::kFailed, CommandErrorReason::kInternal});
+      local_builder.SetOutcome({CommandResult::kFailed,
+                                CommandErrorReason::kInternal,
+                                CommandErrorPrefix::kErr});
     } else {
       replies.emplace_back(local.encoded_);
     }
     if (!command.replication_origin_)
       RecordCommandResult(
-          CommandResultId(command), CommandContext::kExec,
-          local_builder.outcome(),
+          CommandResultId(command), local_builder.outcome(),
           local_builder.ExecutionTicks(started, bycorf::ReadCycleCounter()));
   }
 
@@ -9679,8 +9695,12 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
   std::unique_ptr<BlockingWaitHandle> blocking_wait;
 
   for (;;) {
-    if (ctx.closing_ || ctx.wait_peer_disconnected_ ||
-        g_replication->is_replica()) {
+    if (ctx.closing_ || ctx.wait_peer_disconnected_) {
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kCancelled,
+          "ERR WAIT interrupted: client connection or primary role ended"));
+    }
+    if (g_replication->is_replica()) {
       co_return BuiltReply(reply_builder.AppendError(
           "ERR WAIT interrupted: client connection or primary role ended"));
     }
@@ -9726,8 +9746,12 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
     // Capture/count may suspend before a waiter exists. A peer disconnect or
     // connection retirement can therefore miss the registry; persistent
     // flags close that window, including an infinite WAIT with no downstream.
-    if (ctx.closing_ || ctx.wait_peer_disconnected_ ||
-        g_replication->is_replica()) {
+    if (ctx.closing_ || ctx.wait_peer_disconnected_) {
+      co_return BuiltReply(reply_builder.AppendError(
+          CommandErrorReason::kCancelled,
+          "ERR WAIT interrupted: client connection or primary role ended"));
+    }
+    if (g_replication->is_replica()) {
       co_return BuiltReply(reply_builder.AppendError(
           "ERR WAIT interrupted: client connection or primary role ended"));
     }
@@ -9738,6 +9762,7 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
               "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
         case BlockingWakeReason::kCancelled:
           co_return BuiltReply(reply_builder.AppendError(
+              CommandErrorReason::kCancelled,
               "ERR WAIT interrupted: client connection closed"));
         case BlockingWakeReason::kTimeout:
           co_return BuiltReply(reply_builder.AppendInteger(
@@ -9771,6 +9796,7 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
       });
       if (ctx.closing_ || ctx.wait_peer_disconnected_) {
         co_return BuiltReply(reply_builder.AppendError(
+            CommandErrorReason::kCancelled,
             "ERR WAIT interrupted: client connection closed"));
       }
       auto registered =
@@ -10171,8 +10197,7 @@ Task<CommandReply> ExecuteExecBody(
                 ? CommandOutcome{CommandResult::kCancelled,
                                  CommandErrorReason::kCancelled}
                 : replies_[i].outcome_;
-        RecordCommandResult(CommandResultId(commands_[i]),
-                            CommandContext::kExec, outcome,
+        RecordCommandResult(CommandResultId(commands_[i]), outcome,
                             spans_[i].Elapsed());
       }
     }
@@ -11172,8 +11197,7 @@ Task<CommandReply> ExecuteExecBody(
       continue;
     reply_chunks[i] = ObserveCommandReplySource(
         std::move(reply_chunks[i]), CommandResultId(queued[i]),
-        CommandContext::kExec, replies[i].outcome_,
-        execution_spans[i].Elapsed());
+        replies[i].outcome_, execution_spans[i].Elapsed());
     execution_spans[i] = {};
   }
   auto take_reply_bytes = [&] {
@@ -13079,8 +13103,10 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
     if (!waited.ok()) {
       const auto encoded = AppendStorageError(ctx.reply_builder_, waited);
       RecordCommandResult(
-          CommandResultId(request), CommandContext::kClient,
-          {CommandResult::kRejected, CommandErrorReason::kShutdown}, 0);
+          CommandResultId(request),
+          {CommandResult::kRejected, CommandErrorReason::kShutdown,
+           ctx.reply_builder_.outcome().prefix_},
+          0);
       co_return BuiltReply(encoded);
     }
   }
@@ -13134,16 +13160,16 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
   if (!request.replication_origin_) {
     auto outcome = ctx.reply_builder_.outcome();
     if (result_id == static_cast<std::size_t>(CommandKind::kUnknown))
-      outcome = {CommandResult::kRejected, CommandErrorReason::kUnknownCommand};
+      outcome = {CommandResult::kRejected, CommandErrorReason::kUnknownCommand,
+                 outcome.prefix_};
     const auto execution_ticks =
         ctx.reply_builder_.ExecutionTicks(started, finished);
     if (reply.continuation_ && reply.continuation_->source_) {
-      reply.continuation_->source_ = ObserveCommandReplySource(
-          std::move(reply.continuation_->source_), result_id,
-          CommandContext::kClient, outcome, execution_ticks);
+      reply.continuation_->source_ =
+          ObserveCommandReplySource(std::move(reply.continuation_->source_),
+                                    result_id, outcome, execution_ticks);
     } else {
-      RecordCommandResult(result_id, CommandContext::kClient, outcome,
-                          execution_ticks);
+      RecordCommandResult(result_id, outcome, execution_ticks);
     }
   }
   MaybeRecordSlowCommand(request.args_, ctx.peer_address_, ctx.client_name_,

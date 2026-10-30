@@ -1647,6 +1647,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
                            std::string(builder.AppendError(
                                CommandErrorReasonForStatus(read_status),
                                absl::StrCat("ERR ", read_status.message()))));
+        RecordCommandError(builder.outcome().prefix_);
         ExitPubSubMode(session);
         co_return read_status;
       }
@@ -1668,8 +1669,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       EnqueuePubSubReply(session, std::string(builder.AppendRejectedError(
                                       CommandErrorReason::kShutdown,
                                       "ERR server is shutting down")));
-      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
-                          builder.outcome(), 0);
+      RecordCommandResult(CommandResultId(request), builder.outcome(), 0);
       ExitPubSubMode(session);
       co_return absl::OkStatus();
     }
@@ -1715,8 +1715,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
                                      : std::string_view{});
         EnqueuePubSubReply(session, std::string(builder.View()));
       }
-      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
-                          builder.outcome(),
+      RecordCommandResult(CommandResultId(request), builder.outcome(),
                           bycorf::ReadCycleCounter() - execution_start);
       continue;
     }
@@ -1741,8 +1740,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
                     "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
                     "RESET are allowed in this context")));
       }
-      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
-                          builder.outcome(),
+      RecordCommandResult(CommandResultId(request), builder.outcome(),
                           bycorf::ReadCycleCounter() - execution_start);
       continue;
     }
@@ -1882,6 +1880,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         const std::string_view encoded = ctx.reply_builder_.AppendError(
             CommandErrorReasonForStatus(read_status),
             absl::StrCat("ERR ", read_status.message()));
+        // No command identity exists, but the constructed RESP error still
+        // belongs to global errorstats even if the socket write fails.
+        RecordCommandError(ctx.reply_builder_.outcome().prefix_);
         auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
             reinterpret_cast<const std::byte*>(encoded.data()),
             encoded.size()));
@@ -1909,7 +1910,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
               : ExecuteHello(authenticator_, replication_, ctx, request.args_,
                              ctx.reply_builder_);
       RecordCommandResult(static_cast<std::size_t>(request.kind_),
-                          CommandContext::kClient, ctx.reply_builder_.outcome(),
+                          ctx.reply_builder_.outcome(),
                           bycorf::ReadCycleCounter() - execution_start);
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies);
@@ -1920,7 +1921,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (!ctx.authenticated_) {
       const std::string_view encoded = ctx.reply_builder_.AppendRejectedError(
           CommandErrorReason::kNoAuth, "NOAUTH Authentication required.");
-      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+      RecordCommandResult(CommandResultId(request),
                           ctx.reply_builder_.outcome(), 0);
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies);
@@ -1950,7 +1951,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (!TryBeginRequest()) [[unlikely]] {
       const std::string_view encoded = ctx.reply_builder_.AppendRejectedError(
           CommandErrorReason::kShutdown, "ERR server is shutting down");
-      RecordCommandResult(CommandResultId(request), CommandContext::kClient,
+      RecordCommandResult(CommandResultId(request),
                           ctx.reply_builder_.outcome(), 0);
       absl::Status write_status =
           co_await FlushReplyBatch(stream, &pending_replies);

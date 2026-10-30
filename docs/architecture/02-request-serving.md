@@ -490,24 +490,27 @@ recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
-Command results and execution time are owned by the coordinating worker and
-snapshotted on each owner through `SubmitTo`. Static command/subcommand identities,
-execution contexts and result/reason enums bound cardinality. Reply builders and
-owning cross-worker replies carry outcomes, while storage statuses carry typed
-error provenance; metrics never recover categories by parsing RESP text. EXEC
-reduces shard work into one result per logical child, separate from its parent.
-Lua/Function Redis calls have a separate script context. Lazy reply sources retain
-their observation until EOF, failure or abandonment, excluding socket write time.
-INFO and Prometheus project from the same owner-local counters. Snapshots carry
-observed command, context, and error identities rather than the entire fixed
-vocabulary. INFO omits histograms and collects only its requested command totals;
-Prometheus reconstructs the published zero-valued result series at rendering.
-The legacy dispatch counters and histogram end when dispatch returns, including
-dispatch-time rejections and MULTI queue replies, and do not count EXEC/script
-children as separate calls.
-Reset retains exposed error-series identities and permits in-flight completions
-in the current worker epoch. See [metrics](../operations/metrics.md) for the
-external counting and timing contract.
+Redis commandstats and execution time are owned by the coordinating worker and
+snapshotted through `SubmitTo`. Static command/subcommand identities bound the
+per-command counters. Global errorstats uses a separate fixed RESP-prefix
+vocabulary; custom prefixes share `OTHER`. Reply builders classify the prefix
+when constructing errors and carry outcome metadata across workers. EXEC reduces
+shard work into one result per logical child, separate from its parent. Lua error
+objects preserve whether the child error was already counted, so propagation
+can fail the parent without duplicating global errorstats. Replication and
+background work do not enter client command accounting.
+
+Lazy reply sources retain their observation until producer completion or failure;
+abandonment does not complete a call, and socket writes do not change a completed
+outcome. INFO and Prometheus use the same owner-local counters. Sparse snapshots
+carry observed numeric command and error identities. INFO omits histograms and
+collects only the requested commandstats/errorstats fields. Prometheus emits all
+four fields for observed commands and a zero baseline for its small global error
+vocabulary. Reset clears command and error observations and permits in-flight
+completions after each owner's reset. The legacy dispatch counters and histogram
+retain their original boundary, including dispatch-time rejections and MULTI
+queue replies, without additional calls for EXEC/script children. See
+[metrics](../operations/metrics.md) for external counting and timing semantics.
 
 The external replication command surface accepts only Redis/Redis Cluster
 upstreams. `REPLICAOF` and `SLAVEOF host port` complete AUTH/PSYNC before changing
@@ -592,6 +595,6 @@ real server executable.
 | Durable process-global Function catalog lifecycle | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/lavik/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/lavik/slowlog.h`, `src/redis/slowlog.cpp`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
-| Command outcomes, execution-context attribution, and typed error provenance | `include/lavik/command_outcome.h`, `include/lavik/error_detail.h`, `include/lavik/resp.h`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
+| Redis commandstats, global errorstats, and typed error provenance | `include/lavik/command_outcome.h`, `include/lavik/error_detail.h`, `include/lavik/resp.h`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/lavik/rdb.h`, `src/redis/rdb.cpp`, `include/lavik/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
 | Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/list_e2e_test.cpp` |

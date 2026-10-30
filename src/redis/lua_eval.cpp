@@ -494,9 +494,9 @@ local function lavik_dispatch(protected_call, ...)
   local result = {__lavik_call(protected_call, ...)}
   if not result[1] then
     if protected_call then
-      return {err = result[2]}
+      return {err = result[2], ignore_error_stats_update = result[3]}
     end
-    error(result[2], 2)
+    error({err = result[2], ignore_error_stats_update = result[3]}, 2)
   end
   return result[2]
 end
@@ -1240,13 +1240,31 @@ std::string SanitizeRespLine(std::string_view value) {
   return result;
 }
 
+// Keep error transport bounded even when a script catches an error in a loop.
+// This vector grows only for a new member of the fixed prefix vocabulary.
+void AddLuaError(std::vector<LuaErrorCount>* errors, CommandErrorPrefix prefix,
+                 std::uint64_t count = 1) {
+  for (auto& error : *errors) {
+    if (error.prefix_ == prefix) {
+      error.count_ += count;
+      return;
+    }
+  }
+  errors->push_back({prefix, count});
+}
+
 void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
-                    RespVersion script_resp_version, int depth) {
-  // Redis counts returned error elements, including nested ones, against the
-  // outer script. A caught redis.pcall error that is not returned contributes
-  // only to the independently observed inner command.
+                    RespVersion script_resp_version, int depth,
+                    std::vector<LuaErrorCount>* errors) {
+  // Error objects carry provenance, not text-based deduplication: returning a
+  // caught pcall error preserves its count, while {err = caught.err} is new.
+  const auto append_error = [&](std::string_view message,
+                                bool counted = false) {
+    builder->AppendError(message);
+    if (!counted) AddLuaError(errors, builder->outcome().prefix_);
+  };
   if (depth > kMaxReplyDepth) {
-    builder->AppendError("ERR Lua reply has too many nested levels");
+    append_error("ERR Lua reply has too many nested levels");
     return;
   }
   if (index < 0) index = lua_gettop(state) + index + 1;
@@ -1270,7 +1288,7 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
               static_cast<lua_Number>(std::numeric_limits<long long>::max()) ||
           number <
               static_cast<lua_Number>(std::numeric_limits<long long>::min())) {
-        builder->AppendError("ERR invalid Lua number");
+        append_error("ERR invalid Lua number");
       } else {
         builder->AppendInteger(static_cast<long long>(number));
       }
@@ -1288,9 +1306,14 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
         std::size_t size = 0;
         const char* text = lua_tolstring(state, -1, &size);
         if (text == nullptr)
-          builder->AppendError("ERR invalid error reply");
-        else
-          builder->AppendError(SanitizeRespLine(std::string_view(text, size)));
+          append_error("ERR invalid error reply");
+        else {
+          RawGetField(state, index, "ignore_error_stats_update");
+          const bool counted =
+              lua_isboolean(state, -1) && lua_toboolean(state, -1) != 0;
+          lua_pop(state, 1);
+          append_error(SanitizeRespLine(std::string_view(text, size)), counted);
+        }
         lua_pop(state, 1);
         return;
       }
@@ -1300,7 +1323,7 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
         std::size_t size = 0;
         const char* text = lua_tolstring(state, -1, &size);
         if (text == nullptr)
-          builder->AppendError("ERR invalid status reply");
+          append_error("ERR invalid status reply");
         else
           builder->AppendSimpleString(
               SanitizeRespLine(std::string_view(text, size)));
@@ -1352,9 +1375,11 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
         lua_pushnil(state);
         while (lua_next(state, map) != 0) {
           lua_pushvalue(state, -2);
-          AppendLuaValue(state, -1, builder, script_resp_version, depth + 1);
+          AppendLuaValue(state, -1, builder, script_resp_version, depth + 1,
+                         errors);
           lua_pop(state, 1);
-          AppendLuaValue(state, -1, builder, script_resp_version, depth + 1);
+          AppendLuaValue(state, -1, builder, script_resp_version, depth + 1,
+                         errors);
           lua_pop(state, 1);
         }
         lua_pop(state, 1);
@@ -1369,7 +1394,8 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
         while (lua_next(state, set) != 0) {
           lua_pop(state, 1);
           lua_pushvalue(state, -1);
-          AppendLuaValue(state, -1, builder, script_resp_version, depth + 1);
+          AppendLuaValue(state, -1, builder, script_resp_version, depth + 1,
+                         errors);
           lua_pop(state, 1);
         }
         lua_pop(state, 1);
@@ -1387,7 +1413,8 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
       builder->AppendArrayHeader(count);
       for (std::size_t i = 1; i <= count; ++i) {
         lua_rawgeti(state, index, static_cast<int>(i));
-        AppendLuaValue(state, -1, builder, script_resp_version, depth + 1);
+        AppendLuaValue(state, -1, builder, script_resp_version, depth + 1,
+                       errors);
         lua_pop(state, 1);
       }
       return;
@@ -1398,35 +1425,40 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
   }
 }
 
+LuaExecutionStep LuaErrorStep(std::string message, bool counted = false) {
+  LuaExecutionStep step;
+  step.reply_ = EncodeError(message);
+  step.outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript};
+  if (!counted) AddLuaError(&step.errors_, CommandErrorPrefixForReply(message));
+  return step;
+}
+
 LuaExecutionStep RuntimeErrorStep(lua_State* state) {
+  if (lua_istable(state, -1)) {
+    RawGetField(state, -1, "ignore_error_stats_update");
+    const bool counted =
+        lua_isboolean(state, -1) && lua_toboolean(state, -1) != 0;
+    lua_pop(state, 1);
+    RawGetField(state, -1, "err");
+    if (lua_isstring(state, -1)) {
+      std::size_t size = 0;
+      const char* text = lua_tolstring(state, -1, &size);
+      return LuaErrorStep(SanitizeRespLine({text, size}), counted);
+    }
+    lua_pop(state, 1);
+  }
   std::string error = LuaError(state);
-  // Redis-library boundary validation and execution-policy rejections are
-  // already complete protocol errors. Valkey returns them directly; syntax
-  // and runtime failures in user code retain the Error-running-script
-  // envelope.
   if (error.starts_with("ERR Lua redis lib command arguments ") ||
       error.starts_with("ERR Please specify at least one argument ") ||
-      error == "ERR Write commands are not allowed from read-only scripts.") {
-    return LuaExecutionStep{
-        .call_ = std::nullopt,
-        .reply_ = EncodeError(error),
-        .outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript}};
-  }
-  return LuaExecutionStep{
-      .call_ = std::nullopt,
-      .reply_ = EncodeError(absl::StrCat("ERR Error running script: ", error)),
-      .outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript},
-  };
+      error == "ERR Write commands are not allowed from read-only scripts.")
+    return LuaErrorStep(std::move(error));
+  return LuaErrorStep(absl::StrCat("ERR Error running script: ", error));
 }
 
 LuaExecutionStep KilledStep(bool function) {
-  return LuaExecutionStep{
-      .call_ = std::nullopt,
-      .reply_ = EncodeError(
-          function ? "ERR Script killed by user with FUNCTION KILL..."
-                   : "ERR Script killed by user with SCRIPT KILL..."),
-      .outcome_ = {CommandResult::kFailed, CommandErrorReason::kScript},
-  };
+  return LuaErrorStep(function
+                          ? "ERR Script killed by user with FUNCTION KILL..."
+                          : "ERR Script killed by user with SCRIPT KILL...");
 }
 
 }  // namespace
@@ -1461,6 +1493,15 @@ struct LuaExecution::Impl {
     runtime_->ReleaseThread(thread_ref_);
   }
 
+  std::vector<LuaErrorCount> pending_errors_;
+
+  LuaExecutionStep WithPendingErrors(LuaExecutionStep step) {
+    for (const auto& error : pending_errors_)
+      AddLuaError(&step.errors_, error.prefix_, error.count_);
+    pending_errors_.clear();
+    return step;
+  }
+
   LuaExecutionStep Run(int resume_args) {
     for (;;) {
       const int status = lua_resume(state_, resume_args);
@@ -1468,26 +1509,34 @@ struct LuaExecution::Impl {
       if (status == 0) {
         if (run_control_.state_.load(std::memory_order_acquire) ==
             LuaRunState::kKillRequested) {
-          return KilledStep(run_control_.is_function_);
+          return WithPendingErrors(KilledStep(run_control_.is_function_));
         }
         ReplyBuilder builder(client_resp_version_);
+        std::vector<LuaErrorCount> errors;
         if (lua_gettop(state_) == 0)
           builder.AppendNull();
         else
-          AppendLuaValue(state_, -1, &builder, run_control_.resp_version_, 0);
+          AppendLuaValue(state_, -1, &builder, run_control_.resp_version_, 0,
+                         &errors);
         auto outcome = builder.outcome();
         if (outcome.result_ == CommandResult::kFailed)
           outcome.reason_ = CommandErrorReason::kScript;
-        return LuaExecutionStep{.call_ = std::nullopt,
-                                .reply_ = std::move(builder).Release(),
-                                .outcome_ = outcome};
+        // The coordinator records the individual fresh errors. The outer
+        // command still failed, but must not recount the final array element.
+        outcome.prefix_ = CommandErrorPrefix::kNone;
+        return WithPendingErrors(
+            LuaExecutionStep{.call_ = std::nullopt,
+                             .reply_ = std::move(builder).Release(),
+                             .outcome_ = outcome,
+                             .errors_ = std::move(errors)});
       }
-      if (status != LUA_YIELD) return RuntimeErrorStep(state_);
+      if (status != LUA_YIELD)
+        return WithPendingErrors(RuntimeErrorStep(state_));
 
       if (run_control_.scheduler_yield_pending_) {
         run_control_.scheduler_yield_pending_ = false;
-        return LuaExecutionStep{
-            .call_ = std::nullopt, .reply_ = {}, .scheduler_yield_ = true};
+        return WithPendingErrors(LuaExecutionStep{
+            .call_ = std::nullopt, .reply_ = {}, .scheduler_yield_ = true});
       }
 
       const int count = lua_gettop(state_);
@@ -1523,7 +1572,8 @@ struct LuaExecution::Impl {
         }
       }
       if (valid && !call.args_.empty()) {
-        return LuaExecutionStep{.call_ = std::move(call), .reply_ = {}};
+        return WithPendingErrors(
+            LuaExecutionStep{.call_ = std::move(call), .reply_ = {}});
       }
 
       lua_settop(state_, 0);
@@ -1534,8 +1584,10 @@ struct LuaExecution::Impl {
                 "call"
               : "ERR Lua redis lib command arguments must be strings or "
                 "integers";
+      AddLuaError(&pending_errors_, CommandErrorPrefix::kErr);
       lua_pushlstring(state_, error.data(), error.size());
-      resume_args = 2;
+      lua_pushboolean(state_, true);
+      resume_args = 3;
     }
   }
 };
@@ -1643,13 +1695,15 @@ LuaExecutionStep LuaExecution::Start(bool replication_origin,
   return impl_->Run(impl_->initial_args_);
 }
 
-LuaExecutionStep LuaExecution::Resume(std::string_view command_reply) {
+LuaExecutionStep LuaExecution::Resume(std::string_view command_reply,
+                                      bool error_already_counted) {
   lua_settop(impl_->state_, 0);
   if (!command_reply.empty() && command_reply.front() == '-') {
     const std::string error = RespErrorMessage(command_reply);
     lua_pushboolean(impl_->state_, 0);
     lua_pushlstring(impl_->state_, error.data(), error.size());
-    return impl_->Run(2);
+    lua_pushboolean(impl_->state_, error_already_counted);
+    return impl_->Run(3);
   }
   lua_pushboolean(impl_->state_, 1);
   std::size_t position = 0;
@@ -1660,7 +1714,10 @@ LuaExecutionStep LuaExecution::Resume(std::string_view command_reply) {
     lua_pushboolean(impl_->state_, 0);
     const std::string error =
         absl::StrCat("ERR invalid internal command reply: ", parsed.message());
+    AddLuaError(&impl_->pending_errors_, CommandErrorPrefix::kErr);
     lua_pushlstring(impl_->state_, error.data(), error.size());
+    lua_pushboolean(impl_->state_, true);
+    return impl_->Run(3);
   }
   return impl_->Run(2);
 }

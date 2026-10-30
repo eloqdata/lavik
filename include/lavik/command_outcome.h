@@ -20,9 +20,8 @@
 
 namespace lavik {
 
-// These are logical command events, not shard attempts or socket writes.
-// A queued client command and its later EXEC child belong to separate contexts.
-enum class CommandContext : std::uint8_t { kClient, kExec, kScript, kCount };
+// Terminal command classification is independent of shard attempts and socket
+// writes. Queueing is retained internally so it cannot become an execution.
 enum class CommandResult : std::uint8_t {
   kSuccess,
   kFailed,
@@ -33,8 +32,63 @@ enum class CommandResult : std::uint8_t {
   kCount
 };
 
-// Labels are selected at the error's source, never from encoded RESP or user
-// text. New reasons require an explicit bounded vocabulary change.
+// The wire prefix, independent of the internal cause (e.g. AUTH can return
+// ERR or WRONGPASS). User-defined Lua prefixes share OTHER so labels remain
+// bounded. Classification happens only when constructing an error reply.
+enum class CommandErrorPrefix : std::uint8_t {
+  kNone,
+  kErr,
+  kWrongType,
+  kOom,
+  kNoAuth,
+  kWrongPass,
+  kNoPerm,
+  kLoading,
+  kReadOnly,
+  kMasterDown,
+  kClusterDown,
+  kCrossSlot,
+  kMoved,
+  kAsk,
+  kTryAgain,
+  kBusy,
+  kBusyGroup,
+  kBusyKey,
+  kNoGroup,
+  kNoScript,
+  kExecAbort,
+  kNoProto,
+  kNotBusy,
+  kUnkillable,
+  kUnblocked,
+  kOther,
+  kCount
+};
+inline constexpr std::array<std::string_view, 26> kCommandErrorPrefixNames{
+    "",          "ERR",        "WRONGTYPE",   "OOM",
+    "NOAUTH",    "WRONGPASS",  "NOPERM",      "LOADING",
+    "READONLY",  "MASTERDOWN", "CLUSTERDOWN", "CROSSSLOT",
+    "MOVED",     "ASK",        "TRYAGAIN",    "BUSY",
+    "BUSYGROUP", "BUSYKEY",    "NOGROUP",     "NOSCRIPT",
+    "EXECABORT", "NOPROTO",    "NOTBUSY",     "UNKILLABLE",
+    "UNBLOCKED", "OTHER"};
+static_assert(kCommandErrorPrefixNames.size() ==
+              static_cast<unsigned>(CommandErrorPrefix::kCount));
+
+inline CommandErrorPrefix CommandErrorPrefixForReply(std::string_view text) {
+  // Redis falls back to ERR if no short, space-delimited prefix is present.
+  const auto space = text.find(' ');
+  if (space == std::string_view::npos || space >= 31)
+    return CommandErrorPrefix::kErr;
+  const auto prefix = text.substr(0, space);
+  for (std::size_t i = 1; i < kCommandErrorPrefixNames.size(); ++i)
+    if (prefix == kCommandErrorPrefixNames[i])
+      return static_cast<CommandErrorPrefix>(i);
+  return CommandErrorPrefix::kOther;
+}
+
+// Internal causes preserve execution/admission and cancellation provenance.
+// They are not exported as a metric dimension.
 enum class CommandErrorReason : std::uint8_t {
   kNone,
   kUnknownCommand,
@@ -65,28 +119,6 @@ enum class CommandErrorReason : std::uint8_t {
   kCancelled,
   kCount
 };
-
-inline constexpr std::array<std::string_view, 3> kCommandContextNames{
-    "client", "exec", "script"};
-inline constexpr std::array<std::string_view, 6> kCommandResultNames{
-    "success", "failed", "rejected", "redirected", "queued", "cancelled"};
-inline constexpr std::array<std::string_view, 27> kCommandErrorReasonNames{
-    "none",         "unknown_command",
-    "arity",        "syntax",
-    "wrongtype",    "invalid_value",
-    "noauth",       "auth",
-    "permission",   "oom",
-    "loading",      "readonly",
-    "authority",    "clusterdown",
-    "busy",         "tryagain",
-    "moved",        "ask",
-    "noscript",     "script",
-    "execabort",    "storage",
-    "storage_full", "internal",
-    "shutdown",     "client_error",
-    "cancelled"};
-static_assert(kCommandErrorReasonNames.size() ==
-              static_cast<unsigned>(CommandErrorReason::kCount));
 
 // The same status can travel through several modules before encoding. The
 // wire error prefix remains a compatibility concern of the reply encoder.
@@ -137,11 +169,15 @@ inline constexpr std::array<std::string_view, 3> kRequestInputErrorNames{
 struct CommandOutcome {
   CommandResult result_ = CommandResult::kSuccess;
   CommandErrorReason reason_ = CommandErrorReason::kNone;
+  // A newly constructed, not-yet-counted error. RecordCommandResult consumes
+  // this provenance for errorstats as well as recording the command result.
+  // Lua records its individual errors separately and leaves this field empty
+  // when propagating the outer failure, preventing child/parent double counts.
+  CommandErrorPrefix prefix_ = CommandErrorPrefix::kNone;
 
   [[nodiscard]] bool executed() const noexcept {
     return result_ == CommandResult::kSuccess ||
-           result_ == CommandResult::kFailed ||
-           result_ == CommandResult::kCancelled;
+           result_ == CommandResult::kFailed;
   }
 };
 

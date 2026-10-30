@@ -27,23 +27,20 @@ import tempfile
 DASHBOARD = (
     Path(__file__).resolve().parents[1] / "grafana/dashboards/lavik-overview.json"
 )
-TITLES = ("Execution Failure Ratio", "Admission Rejection Ratio", "Service Fault Ratio")
-LABELS = 'job="lavik",instance="node:9100",command="get",context="client"'
-OUTPUT = '{command="get",context="client",instance="node:9100"}'
+TITLES = ("Execution Failure Ratio", "Admission Rejection Ratio")
+LABELS = 'job="lavik",instance="node:9100",command="get"'
+OUTPUT = '{command="get",instance="node:9100"}'
 
 
-def series(result, values):
-    return {
-        "series": f'lavik_command_results_total{{{LABELS},result="{result}"}}',
-        "values": values,
-    }
-
-
-def error(reason, result, values):
-    return {
-        "series": f'lavik_command_errors_total{{{LABELS},result="{result}",reason="{reason}"}}',
-        "values": values,
-    }
+def counters(calls, failed="0+0x10", rejected="0+0x10"):
+    return [
+        {"series": f"lavik_command_{name}_total{{{LABELS}}}", "values": values}
+        for name, values in (
+            ("executions", calls),
+            ("failed_calls", failed),
+            ("rejected_calls", rejected),
+        )
+    ]
 
 
 def main():
@@ -55,7 +52,6 @@ def main():
             for name, value in {
                 "$instance": "node:9100",
                 "${command:regex}": ".*",
-                "${context:regex}": "client",
                 "$__rate_interval": "5m",
             }.items():
                 expr = expr.replace(name, value)
@@ -63,63 +59,36 @@ def main():
     assert set(queries) == set(TITLES)
     cases = [
         (
-            "normal and client errors",
-            [
-                series("success", "0+540x10"),
-                series("failed", "0+30x10"),
-                series("rejected", "0+30x10"),
-                error("storage", "failed", "0+12x10"),
-                error("wrongtype", "failed", "0+18x10"),
-                error("noauth", "rejected", "0+30x10"),
-            ],
-            (0.05, 0.05, 0.02),
+            "client errors and rejections",
+            counters("0+570x10", "0+30x10", "0+30x10"),
+            (30 / 570, 0.05),
             "1+0x10",
         ),
-        (
-            "zero traffic, unseen errors",
-            [series("success", "0+0x10")],
-            (0, 0, 0),
-            "1+0x10",
-        ),
-        (
-            "low traffic",
-            [
-                series("success", "0+0.054x10"),
-                series("failed", "0+0.006x10"),
-                error("internal", "failed", "0+0.006x10"),
-            ],
-            (0.1, 0, 0.1),
-            "1+0x10",
-        ),
+        ("observed command, zero traffic", counters("0+0x10"), (0, 0), "1+0x10"),
+        ("low traffic", counters("0+0.06x10", "0+0.006x10"), (0.1, 0), "1+0x10"),
         (
             "counter reset",
-            [
-                series("success", "0 54 108 162 216 270 0 54 108 162 216"),
-                series("failed", "0 6 12 18 24 30 0 6 12 18 24"),
-                error("storage", "failed", "0 6 12 18 24 30 0 6 12 18 24"),
-            ],
-            (0.1, 0, 0.1),
+            counters(
+                "0 60 120 180 240 300 0 60 120 180 240", "0 6 12 18 24 30 0 6 12 18 24"
+            ),
+            (0.1, 0),
             "1+0x10",
         ),
         (
-            "routing and queueing",
-            [
-                series("redirected", "0+60x10"),
-                series("queued", "0+600x10"),
-                error("moved", "redirected", "0+60x10"),
-            ],
-            (0, 0, 0),
+            "redirects are rejections",
+            counters("0+0x10", rejected="0+60x10"),
+            (0, 1),
             "1+0x10",
         ),
         (
             "failed scrape with recent samples",
-            [series("success", "0+60x10")],
+            counters("0+60x10"),
             None,
             "1 1 1 1 1 1 1 1 1 1 0",
         ),
         (
             "missing target with recent samples",
-            [series("success", "0+60x10")],
+            counters("0+60x10"),
             None,
             "1 1 1 1 1 1 stale _ _ _ _",
         ),
@@ -139,7 +108,7 @@ def main():
                         "eval_time": "10m",
                         "exp_samples": []
                         if expected is None
-                        else [{"labels": OUTPUT, "value": expected[i]}],
+                        else [{"labels": OUTPUT, "value": round(expected[i], 12)}],
                     }
                     for i, title in enumerate(TITLES)
                 ],

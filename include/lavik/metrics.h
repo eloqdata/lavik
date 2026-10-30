@@ -58,14 +58,6 @@ struct CommandMetricTotals {
 
 // Separate from the legacy dispatch histogram: changing its counters would
 // silently change existing QPS and latency dashboards.
-struct CommandResultTotals {
-  std::array<std::uint64_t, kCommandResultNames.size()> results_{};
-  std::uint64_t execution_ticks_ = 0;
-  [[nodiscard]] std::uint64_t Calls() const noexcept {
-    return results_[0] + results_[1] + results_[5];
-  }
-};
-// INFO's context-summed projection omits per-reason counters and histograms.
 struct CommandStatsTotals {
   std::uint64_t calls_ = 0;
   std::uint64_t failed_calls_ = 0;
@@ -88,9 +80,7 @@ struct CommandMetricEntry {
 
 struct CommandMetricsSnapshot {
   std::vector<CommandMetricEntry<CommandMetricTotals>> commands_;
-  // Result indices flatten command/context. Error indices further flatten
-  // failed/rejected/redirected and reason, in the fixed enum order.
-  std::vector<CommandMetricEntry<CommandResultTotals>> results_;
+  // Global RESP prefixes and per-command counters have separate identities.
   std::vector<CommandMetricEntry<std::uint64_t>> errors_;
   std::vector<CommandMetricEntry<CommandStatsTotals>> stats_;
   std::uint64_t total_calls_ = 0;
@@ -160,12 +150,18 @@ ClusterControlMetricsSnapshot GetClusterControlMetrics() noexcept;
 void InitWorkerMetrics(unsigned worker_count);
 void RecordCommandMetric(CommandKind kind,
                          std::uint64_t elapsed_ticks) noexcept;
-// Records one terminal logical event on its coordinating worker. Replication
-// and background callers must not enter this client-observation interface.
 // Malformed/unadmitted request bytes have no logical command identity.
 void RecordRequestInputError(RequestInputError reason) noexcept;
-void RecordCommandResult(std::size_t command, CommandContext context,
-                         CommandOutcome outcome,
+// Records a newly constructed error, including a caught script error.
+// Forwarding that same error through an outer script must not record it a
+// second time.
+void RecordCommandError(CommandErrorPrefix prefix,
+                        std::uint64_t count = 1) noexcept;
+// Records a terminal logical command on its coordinating worker and consumes
+// outcome.prefix_ as a newly constructed global error. Forwarded/already-counted
+// errors must leave prefix_ empty. Queueing and cancellation add no completed
+// call. Replication and background work must not enter this client interface.
+void RecordCommandResult(std::size_t command, CommandOutcome outcome,
                          std::uint64_t execution_ticks) noexcept;
 void RecordConnectionOpened() noexcept;
 void RecordConnectionClosed() noexcept;
@@ -200,23 +196,29 @@ enum class DefragMetricResult : std::uint8_t {
 void RecordDefragMetric(DefragMetricResult result) noexcept;
 void SetDefragActive(bool active) noexcept;
 void SetDefragPending(bool pending) noexcept;
-enum class CommandMetricsDetail { kNone, kTotalCalls, kCommandStats, kFull };
+enum class CommandMetricsDetail {
+  kNone,
+  kTotalCalls,
+  kCommandStats,
+  kErrorStats,
+  kCommandAndErrorStats,
+  kFull
+};
 // Collect only the command data the caller consumes, on its owner. INFO never
 // copies latency histograms; full scrapes transport only observed entries.
-// Published zero-valued result series are reconstructed by the renderer.
+// INFO and Prometheus share the same Redis commandstats/errorstats counters.
 bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics(
     CommandMetricsDetail detail = CommandMetricsDetail::kFull);
 // Clears Redis command counters on their owning workers. Live gauges and
 // dataset persistence accounting are deliberately preserved.
 bycorf::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
-// Completes a streamed logical command at producer EOF/error, or cancellation
-// when its connection releases the source. Production time excludes writes.
+// Completes a streamed logical command at producer EOF/error. Releasing an
+// unfinished source discards its observation. Production time excludes writes.
 // Create, invoke, and finally release the source on its coordinating worker:
-// abandonment updates that worker's counters from the source destructor.
+// completion updates only that worker's counters.
 ReplyChunkSource ObserveCommandReplySource(ReplyChunkSource source,
                                            std::size_t command,
-                                           CommandContext context,
                                            CommandOutcome outcome,
                                            std::uint64_t execution_ticks);
 

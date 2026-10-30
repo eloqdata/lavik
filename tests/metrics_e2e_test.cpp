@@ -177,6 +177,11 @@ class RespClient {
     return ReadRawReply();
   }
 
+  std::string RawRequest(std::string_view encoded) {
+    SendAll(fd_, encoded);
+    return ReadRawReply();
+  }
+
  private:
   void SendCommand(const std::vector<std::string_view>& args) {
     std::string request = "*" + std::to_string(args.size()) + "\r\n";
@@ -479,18 +484,13 @@ TEST(MetricsE2eTest, CommandStatsSeparateExecutionFromAdmission) {
   // Existing dispatch metrics deliberately still include the rejected call.
   EXPECT_EQ(MetricValue(metrics, "lavik_command_calls_total{command=\"set\"}"),
             2);
+  EXPECT_EQ(
+      MetricValue(metrics, "lavik_command_executions_total{command=\"set\"}"),
+      1);
   EXPECT_EQ(MetricValue(metrics,
-                        "lavik_command_results_total{command=\"set\",context="
-                        "\"client\",result=\"success\"}"),
+                        "lavik_command_rejected_calls_total{command=\"set\"}"),
             1);
-  EXPECT_EQ(MetricValue(metrics,
-                        "lavik_command_results_total{command=\"set\",context="
-                        "\"client\",result=\"rejected\"}"),
-            1);
-  EXPECT_EQ(MetricValue(metrics,
-                        "lavik_command_errors_total{command=\"set\",context="
-                        "\"client\",result=\"rejected\",reason=\"arity\"}"),
-            1);
+  EXPECT_EQ(MetricValue(metrics, "lavik_errors_total{err=\"ERR\"}"), 1);
   server.Stop();
 }
 
@@ -529,21 +529,30 @@ class CommandResultsE2eTest : public ::testing::Test {
     if (begin == std::string::npos) return {};
     return info.substr(begin, info.find("\r\n", begin) - begin);
   }
-  std::uint64_t Result(std::string_view command, std::string_view context,
-                       std::string_view result) {
-    return MetricValue(HttpGet(metrics_port_, "/metrics"),
-                       "lavik_command_results_total{command=\"" +
-                           std::string(command) + "\",context=\"" +
-                           std::string(context) + "\",result=\"" +
-                           std::string(result) + "\"}");
+  std::uint64_t Counter(std::string_view command, std::string_view field) {
+    const auto metrics = HttpGet(metrics_port_, "/metrics");
+    const auto name = "lavik_command_" + std::string(field) +
+                      "_total{command=\"" + std::string(command) + "\"}";
+    // Redis omits never-observed/reset command rows.
+    return metrics.find(name) == std::string::npos ? 0
+                                                   : MetricValue(metrics, name);
   }
-  std::uint64_t Error(std::string_view command, std::string_view context,
-                      std::string_view result, std::string_view reason) {
+  std::uint64_t Calls(std::string_view command) {
+    return Counter(command, "executions");
+  }
+  std::uint64_t Failed(std::string_view command) {
+    return Counter(command, "failed_calls");
+  }
+  std::uint64_t Rejected(std::string_view command) {
+    return Counter(command, "rejected_calls");
+  }
+  std::uint64_t Successful(std::string_view command) {
+    return Calls(command) - Failed(command);
+  }
+  std::uint64_t Errors(std::string_view prefix) {
     return MetricValue(
         HttpGet(metrics_port_, "/metrics"),
-        "lavik_command_errors_total{command=\"" + std::string(command) +
-            "\",context=\"" + std::string(context) + "\",result=\"" +
-            std::string(result) + "\",reason=\"" + std::string(reason) + "\"}");
+        "lavik_errors_total{err=\"" + std::string(prefix) + "\"}");
   }
   std::string data_path_, log_path_;
   std::uint16_t port_, metrics_port_;
@@ -556,9 +565,8 @@ TEST_F(CommandResultsE2eTest, QueuedCommandsDoNotCountAsExecutions) {
   EXPECT_EQ(client_->Command({"SET", "queued-key", "value"}), "+QUEUED");
   EXPECT_EQ(client_->Command({"DISCARD"}), "+OK");
   EXPECT_TRUE(Stats("set").empty());
-  EXPECT_EQ(Result("set", "client", "queued"), 1);
-  EXPECT_EQ(Result("set", "client", "success"), 0);
-  EXPECT_EQ(Result("set", "exec", "success"), 0);
+  EXPECT_EQ(Successful("set"), 0);
+  EXPECT_EQ(Successful("set"), 0);
 }
 
 TEST_F(CommandResultsE2eTest, WatchAbortDoesNotExecuteChildren) {
@@ -569,26 +577,26 @@ TEST_F(CommandResultsE2eTest, WatchAbortDoesNotExecuteChildren) {
   ASSERT_EQ(writer.Command({"SET", "watch:key", "changed"}), "+OK");
   EXPECT_EQ(client_->RawCommand({"EXEC"}), "*-1\r\n");
   EXPECT_TRUE(Stats("get").empty());
-  EXPECT_EQ(Result("get", "client", "queued"), 1);
-  EXPECT_EQ(Result("get", "exec", "success"), 0);
-  EXPECT_EQ(Result("exec", "client", "success"), 1);
+  EXPECT_EQ(Successful("get"), 0);
+  EXPECT_EQ(Successful("exec"), 1);
 }
 
 TEST_F(CommandResultsE2eTest, RestartClearsCountersAndSeenErrorSeries) {
   ASSERT_EQ(client_->Command({"SET", "restart:key", "value"}), "+OK");
   ASSERT_TRUE(client_->Command({"LPUSH", "restart:key", "x"})
                   .starts_with("-WRONGTYPE"));
-  ASSERT_EQ(Error("lpush", "client", "failed", "wrongtype"), 1);
+  ASSERT_EQ(Errors("WRONGTYPE"), 1);
   client_.reset();
   server_->Stop();
   server_ = std::make_unique<ServerProcess>(
       g_lavik_binary, port_, metrics_port_, data_path_, log_path_);
   client_ = std::make_unique<RespClient>(port_);
   EXPECT_TRUE(Stats("lpush").empty());
-  EXPECT_EQ(Result("lpush", "client", "failed"), 0);
-  EXPECT_EQ(HttpGet(metrics_port_, "/metrics")
-                .find("lavik_command_errors_total{command=\"lpush\""),
-            std::string::npos);
+  EXPECT_EQ(Failed("lpush"), 0);
+  EXPECT_EQ(Errors("WRONGTYPE"), 0);
+  EXPECT_EQ(
+      client_->Command({"INFO", "errorstats"}).find("errorstat_WRONGTYPE"),
+      std::string::npos);
   EXPECT_EQ(client_->Command({"GET", "restart:key"}), "$5\r\nvalue");
 }
 
@@ -600,8 +608,8 @@ TEST_F(CommandResultsE2eTest, AuthenticationAndHelloCountTheirActualResults) {
   EXPECT_TRUE(auth.starts_with("cmdstat_auth:calls=1,")) << auth;
   EXPECT_TRUE(auth.ends_with(",rejected_calls=0,failed_calls=1")) << auth;
   EXPECT_TRUE(Stats("hello").starts_with("cmdstat_hello:calls=1,"));
-  EXPECT_EQ(Result("auth", "client", "failed"), 1);
-  EXPECT_EQ(Result("hello", "client", "success"), 1);
+  EXPECT_EQ(Failed("auth"), 1);
+  EXPECT_EQ(Successful("hello"), 1);
 }
 
 TEST_F(CommandResultsE2eTest, SubcommandsUseBoundedCanonicalNames) {
@@ -614,8 +622,8 @@ TEST_F(CommandResultsE2eTest, SubcommandsUseBoundedCanonicalNames) {
                   .starts_with("cmdstat_config|resetstat:calls=1,"));
   EXPECT_TRUE(Stats("config").empty());
   EXPECT_TRUE(Stats("unknown").empty());
-  EXPECT_EQ(Result("config|get", "client", "success"), 1);
-  EXPECT_EQ(Result("unknown", "client", "rejected"), 2);
+  EXPECT_EQ(Successful("config|get"), 1);
+  EXPECT_EQ(Errors("ERR"), 2);
   const auto metrics = HttpGet(metrics_port_, "/metrics");
   EXPECT_EQ(metrics.find("invented-command"), std::string::npos);
   EXPECT_EQ(metrics.find("invented-subcommand"), std::string::npos);
@@ -631,10 +639,9 @@ TEST_F(CommandResultsE2eTest,
   EXPECT_TRUE(Stats("lpush").starts_with("cmdstat_lpush:calls=1,"));
   EXPECT_TRUE(Stats("lpush").ends_with(",rejected_calls=0,failed_calls=1"));
   EXPECT_TRUE(Stats("exec").ends_with(",rejected_calls=0,failed_calls=0"));
-  EXPECT_EQ(Result("lpush", "client", "queued"), 1);
-  EXPECT_EQ(Result("lpush", "exec", "failed"), 1);
-  EXPECT_EQ(Result("get", "exec", "success"), 1);
-  EXPECT_EQ(Result("exec", "client", "success"), 1);
+  EXPECT_EQ(Failed("lpush"), 1);
+  EXPECT_EQ(Successful("get"), 1);
+  EXPECT_EQ(Successful("exec"), 1);
 }
 
 TEST_F(CommandResultsE2eTest,
@@ -656,9 +663,63 @@ TEST_F(CommandResultsE2eTest,
   EXPECT_TRUE(Stats("lpush").ends_with(",rejected_calls=0,failed_calls=3"));
   EXPECT_TRUE(Stats("eval").starts_with("cmdstat_eval:calls=3,"));
   EXPECT_TRUE(Stats("eval").ends_with(",rejected_calls=0,failed_calls=2"));
-  EXPECT_EQ(Result("lpush", "script", "failed"), 3);
-  EXPECT_EQ(Result("eval", "client", "success"), 1);
-  EXPECT_EQ(Result("eval", "client", "failed"), 2);
+  EXPECT_EQ(Failed("lpush"), 3);
+  EXPECT_EQ(Successful("eval"), 1);
+  EXPECT_EQ(Failed("eval"), 2);
+  EXPECT_EQ(Errors("WRONGTYPE"), 3);
+  EXPECT_EQ(Errors("ERR"), 0);
+}
+
+TEST_F(CommandResultsE2eTest, ErrorStatsAreGlobalCumulativeAndResettable) {
+  EXPECT_EQ(Errors("ERR"), 0);
+  EXPECT_EQ(Errors("WRONGTYPE"), 0);
+  EXPECT_TRUE(client_->Command({"invented-command"}).starts_with("-ERR"));
+  ASSERT_EQ(client_->Command({"SET", "global:error", "value"}), "+OK");
+  EXPECT_TRUE(client_->Command({"LPUSH", "global:error", "x"})
+                  .starts_with("-WRONGTYPE"));
+  EXPECT_TRUE(client_
+                  ->RawCommand({"EVAL",
+                                "local e=redis.pcall('LPUSH',KEYS[1],'x'); "
+                                "return {e,{err=e.err}}",
+                                "1", "global:error"})
+                  .starts_with("*2"));
+  EXPECT_EQ(Errors("ERR"), 1);
+  EXPECT_EQ(Errors("WRONGTYPE"), 3);
+  EXPECT_EQ(Failed("lpush"), 2);
+  EXPECT_EQ(Failed("eval"), 1);
+  const auto info = client_->Command({"INFO", "errorstats"});
+  EXPECT_NE(info.find("errorstat_ERR:count=1\r\n"), std::string::npos);
+  EXPECT_NE(info.find("errorstat_WRONGTYPE:count=3\r\n"), std::string::npos);
+  EXPECT_EQ(info.find("# Commandstats"), std::string::npos);
+  EXPECT_EQ(info.find("errorstat_OOM"), std::string::npos);
+  EXPECT_EQ(client_->Command({"INFO", "errorstats"}), info);
+  EXPECT_NE(
+      client_->Command({"INFO", "all"}).find("errorstat_WRONGTYPE:count=3"),
+      std::string::npos);
+  EXPECT_TRUE(Stats("unknown").empty());
+  const auto metrics = HttpGet(metrics_port_, "/metrics");
+  EXPECT_EQ(metrics.find("lavik_command_results_total"), std::string::npos);
+  EXPECT_EQ(metrics.find("lavik_command_errors_total"), std::string::npos);
+  EXPECT_EQ(metrics.find("context="), std::string::npos);
+  ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
+  EXPECT_EQ(Errors("ERR"), 0);
+  EXPECT_EQ(Errors("WRONGTYPE"), 0);
+  EXPECT_EQ(client_->Command({"INFO", "errorstats"}).find("errorstat_"),
+            std::string::npos);
+}
+
+TEST_F(CommandResultsE2eTest, ReusedScriptErrorFailsTheParentOnce) {
+  ASSERT_EQ(client_->Command({"SET", "reused:error", "text"}), "+OK");
+  EXPECT_TRUE(
+      client_
+          ->RawCommand({"EVAL",
+                        "local e=redis.pcall('LPUSH',KEYS[1],'x'); return {e,e}",
+                        "1", "reused:error"})
+          .starts_with("*2\r\n-WRONGTYPE"));
+  EXPECT_EQ(Calls("eval"), 1);
+  EXPECT_EQ(Failed("eval"), 1);
+  EXPECT_EQ(Failed("lpush"), 1);
+  EXPECT_EQ(Errors("WRONGTYPE"), 1);
 }
 
 TEST_F(CommandResultsE2eTest, ErrorReasonsSurviveStorageAndReset) {
@@ -668,11 +729,10 @@ TEST_F(CommandResultsE2eTest, ErrorReasonsSurviveStorageAndReset) {
   EXPECT_TRUE(client_->Command({"SET", "reason:key", "value", "NX", "XX"})
                   .starts_with("-ERR syntax"));
   EXPECT_TRUE(client_->Command({"INCR", "reason:key"}).starts_with("-ERR"));
-  EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 1);
-  EXPECT_EQ(Error("set", "client", "failed", "syntax"), 1);
-  EXPECT_EQ(Error("incr", "client", "failed", "invalid_value"), 1);
+  EXPECT_EQ(Errors("WRONGTYPE"), 1);
+  EXPECT_EQ(Errors("ERR"), 2);
   ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
-  EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
+  EXPECT_EQ(Errors("WRONGTYPE"), 0);
   EXPECT_TRUE(Stats("lpush").empty());
   EXPECT_TRUE(Stats("config|resetstat")
                   .starts_with("cmdstat_config|resetstat:calls=1,"));
@@ -695,17 +755,8 @@ TEST_F(CommandResultsE2eTest, WrongTypeSourcesKeepClientErrorReasons) {
   }
   for (const auto command :
        {"get", "strlen", "getset", "set", "sort", "sort_ro"}) {
-    EXPECT_EQ(Result(command, "client", "failed"), 1) << command;
-    EXPECT_EQ(Error(command, "client", "failed", "wrongtype"), 1) << command;
-    const auto metrics = HttpGet(metrics_port_, "/metrics");
-    for (const auto reason : {"storage", "invalid_value"}) {
-      EXPECT_EQ(
-          metrics.find("command=\"" + std::string(command) +
-                       "\",context=\"client\",result=\"failed\",reason=\"" +
-                       reason + "\""),
-          std::string::npos)
-          << command << ": " << reason;
-    }
+    EXPECT_EQ(Failed(command), 1) << command;
+    EXPECT_EQ(Errors("WRONGTYPE"), commands.size());
     EXPECT_TRUE(Stats(command).ends_with(",rejected_calls=0,failed_calls=1"))
         << command;
   }
@@ -726,7 +777,7 @@ TEST_F(CommandResultsE2eTest, AdmissionAndMalformedInputHaveDistinctCounters) {
       unauthenticated.Command({"GET", "private"}).starts_with("-NOAUTH"));
   EXPECT_TRUE(Stats("get").starts_with("cmdstat_get:calls=0,"));
   EXPECT_TRUE(Stats("get").ends_with(",rejected_calls=1,failed_calls=0"));
-  EXPECT_EQ(Error("get", "client", "rejected", "noauth"), 1);
+  EXPECT_EQ(Errors("NOAUTH"), 1);
   const int fd = ConnectSocket(port_);
   ASSERT_GE(fd, 0);
   SendAll(fd, "*not-a-number\r\n");
@@ -749,7 +800,7 @@ TEST_F(CommandResultsE2eTest,
   const auto usec = stats.find(",usec=");
   ASSERT_NE(usec, std::string::npos);
   EXPECT_LT(std::stoull(stats.substr(usec + 6)), 100000);
-  EXPECT_EQ(Result("blpop", "client", "success"), 1);
+  EXPECT_EQ(Successful("blpop"), 1);
 }
 
 TEST_F(CommandResultsE2eTest, BlockingRoleChangesKeepRetryReasons) {
@@ -782,7 +833,7 @@ TEST_F(CommandResultsE2eTest, BlockingRoleChangesKeepRetryReasons) {
     }
     EXPECT_EQ(blocked.get(),
               "-TRYAGAIN replication role changed; retry command");
-    EXPECT_EQ(Error(metric, "client", "failed", "tryagain"), 1);
+    EXPECT_EQ(Errors("TRYAGAIN"), sorted_set ? 2 : 1);
     EXPECT_TRUE(Stats(metric).ends_with(",rejected_calls=0,failed_calls=1"));
     EXPECT_EQ(client_->Command({sorted_set ? "ZCARD" : "LLEN", key}), ":1");
   }
@@ -916,8 +967,8 @@ TEST_F(CommandResultsE2eTest, FunctionsObserveCaughtScriptChildren) {
           .starts_with('-'));
   ASSERT_EQ(client_->Command({"SET", "function:type", "text"}), "+OK");
   EXPECT_EQ(client_->Command({"FCALL", "caught", "1", "function:type"}), ":1");
-  EXPECT_EQ(Result("fcall", "client", "success"), 1);
-  EXPECT_EQ(Error("lpush", "script", "failed", "wrongtype"), 1);
+  EXPECT_EQ(Successful("fcall"), 1);
+  EXPECT_EQ(Errors("WRONGTYPE"), 1);
 }
 
 TEST_F(CommandResultsE2eTest,
@@ -929,8 +980,8 @@ TEST_F(CommandResultsE2eTest,
                              "extra"})
                   .starts_with('-'));
   for (const auto command : {"slowlog|get", "xinfo|stream"}) {
-    EXPECT_EQ(Result(command, "client", "failed"), 1);
-    EXPECT_EQ(Result(command, "client", "rejected"), 0);
+    EXPECT_EQ(Failed(command), 1);
+    EXPECT_EQ(Rejected(command), 0);
     EXPECT_TRUE(Stats(command).ends_with(",rejected_calls=0,failed_calls=1"));
   }
 }
@@ -944,8 +995,8 @@ TEST_F(CommandResultsE2eTest, BlockingSortedSetErrorsKeepTheirOutcome) {
   EXPECT_TRUE(client_->Command({"BZMPOP", "0.1", "1", "blocking:type", "MIN"})
                   .starts_with("-WRONGTYPE"));
   for (const auto command : {"bzpopmin", "bzpopmax", "bzmpop"}) {
-    EXPECT_EQ(Error(command, "client", "failed", "wrongtype"), 1);
-    EXPECT_EQ(Result(command, "client", "success"), 0);
+    EXPECT_EQ(Errors("WRONGTYPE"), 3);
+    EXPECT_EQ(Successful(command), 0);
     EXPECT_TRUE(Stats(command).ends_with(",rejected_calls=0,failed_calls=1"));
   }
 }
@@ -956,7 +1007,7 @@ TEST_F(CommandResultsE2eTest,
   ASSERT_EQ(client_->Command({"SADD", "stream:members", member}), ":1");
   EXPECT_TRUE(client_->RawCommand({"SRANDMEMBER", "stream:members", "-2"})
                   .starts_with("*2\r\n"));
-  EXPECT_EQ(Result("srandmember", "client", "success"), 1);
+  EXPECT_EQ(Successful("srandmember"), 1);
   const int fd = ConnectSocket(port_);
   ASSERT_GE(fd, 0);
   SendAll(fd,
@@ -969,12 +1020,17 @@ TEST_F(CommandResultsE2eTest,
   (void)::setsockopt(fd, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
   ::close(fd);
   const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (Result("srandmember", "client", "cancelled") == 0 &&
-         std::chrono::steady_clock::now() < deadline)
+  while (
+      client_->Command({"INFO", "clients"}).find("connected_clients:1\r\n") ==
+          std::string::npos &&
+      std::chrono::steady_clock::now() < deadline)
     std::this_thread::sleep_for(10ms);
-  EXPECT_EQ(Result("srandmember", "client", "cancelled"), 1);
-  EXPECT_EQ(Result("srandmember", "client", "success"), 1);
-  EXPECT_EQ(Result("srandmember", "client", "failed"), 0);
+  EXPECT_NE(
+      client_->Command({"INFO", "clients"}).find("connected_clients:1\r\n"),
+      std::string::npos);
+  EXPECT_EQ(Calls("srandmember"), 1);
+  EXPECT_EQ(Successful("srandmember"), 1);
+  EXPECT_EQ(Failed("srandmember"), 0);
 }
 
 TEST_F(CommandResultsE2eTest, LateStorageFailureCountsStreamAndExecChildOnce) {
@@ -1001,18 +1057,18 @@ TEST_F(CommandResultsE2eTest, LateStorageFailureCountsStreamAndExecChildOnce) {
     EXPECT_THROW(reader.RawCommand({"XRANGE", "late:stream", "-", "+"}),
                  std::runtime_error);
   }
-  EXPECT_EQ(Result("xrange", "client", "failed"), 1);
-  EXPECT_EQ(Result("xrange", "client", "success"), 0);
-  EXPECT_EQ(Error("xrange", "client", "failed", "oom"), 1);
+  EXPECT_EQ(Failed("xrange"), 1);
+  EXPECT_EQ(Successful("xrange"), 0);
+  EXPECT_EQ(Errors("OOM"), 0);  // No RESP error can follow a partial array.
   {
     RespClient reader(port_);
     ASSERT_EQ(reader.Command({"MULTI"}), "+OK");
     ASSERT_EQ(reader.Command({"XRANGE", "late:stream", "-", "+"}), "+QUEUED");
     EXPECT_THROW(reader.RawCommand({"EXEC"}), std::runtime_error);
   }
-  EXPECT_EQ(Result("xrange", "exec", "failed"), 1);
-  EXPECT_EQ(Result("exec", "client", "failed"), 1);
-  EXPECT_EQ(Result("xrange", "exec", "success"), 0);
+  EXPECT_EQ(Failed("xrange"), 2);
+  EXPECT_EQ(Failed("exec"), 1);
+  EXPECT_EQ(Successful("xrange"), 0);
 }
 
 TEST_F(CommandResultsE2eTest, SubscribedCommandsKeepSessionOutcomes) {
@@ -1024,8 +1080,20 @@ TEST_F(CommandResultsE2eTest, SubscribedCommandsKeepSessionOutcomes) {
                   .starts_with("*3\r\n"));
   EXPECT_TRUE(Stats("ping").starts_with("cmdstat_ping:calls=1,"));
   EXPECT_TRUE(Stats("get").starts_with("cmdstat_get:calls=0,"));
-  EXPECT_EQ(Result("ping", "client", "success"), 1);
-  EXPECT_EQ(Error("get", "client", "rejected", "permission"), 1);
+  EXPECT_EQ(Successful("ping"), 1);
+  EXPECT_EQ(Errors("ERR"), 1);
+}
+
+TEST_F(CommandResultsE2eTest, SubscribedProtocolErrorsReachGlobalErrorStats) {
+  RespClient subscriber(port_);
+  ASSERT_TRUE(subscriber.RawCommand({"SUBSCRIBE", "metrics:bad"})
+                  .starts_with("*3\r\n"));
+  EXPECT_TRUE(subscriber.RawRequest("*not-a-number\r\n").starts_with("-ERR"));
+  EXPECT_EQ(Errors("ERR"), 1);
+  EXPECT_EQ(
+      MetricValue(HttpGet(metrics_port_, "/metrics"),
+                  "lavik_request_input_errors_total{reason=\"protocol\"}"),
+      1);
 }
 
 TEST_F(CommandResultsE2eTest,
@@ -1037,9 +1105,8 @@ TEST_F(CommandResultsE2eTest,
   ASSERT_EQ(client_->Command({"MULTI"}), "+OK");
   EXPECT_TRUE(client_->Command({"SCRIPT", "LOAD"}).starts_with('-'));
   EXPECT_TRUE(client_->Command({"EXEC"}).starts_with("-EXECABORT"));
-  EXPECT_EQ(Error("script|load", "client", "rejected", "arity"), 1);
-  EXPECT_EQ(Result("script|load", "client", "queued"), 0);
-  EXPECT_EQ(Result("exec", "client", "failed"), 1);
+  EXPECT_EQ(Errors("ERR"), 2);
+  EXPECT_EQ(Failed("exec"), 1);
 }
 
 TEST_F(CommandResultsE2eTest, ScriptAdmissionAndReturnedErrorArraysMatchRedis) {
@@ -1055,10 +1122,9 @@ TEST_F(CommandResultsE2eTest, ScriptAdmissionAndReturnedErrorArraysMatchRedis) {
                   ->Command({"EVAL_RO", "return redis.call('SET',KEYS[1],'x')",
                              "1", "key"})
                   .starts_with('-'));
-  EXPECT_EQ(Result("eval", "client", "failed"), 2);
-  EXPECT_EQ(Result("eval_ro", "client", "failed"), 1);
-  EXPECT_EQ(Error("config|get", "script", "rejected", "permission"), 1);
-  EXPECT_EQ(Error("set", "script", "rejected", "readonly"), 1);
+  EXPECT_EQ(Failed("eval"), 2);
+  EXPECT_EQ(Failed("eval_ro"), 1);
+  EXPECT_EQ(Errors("ERR"), 3);
   EXPECT_TRUE(Stats("set").starts_with("cmdstat_set:calls=0,"));
 }
 
@@ -1073,8 +1139,7 @@ TEST_F(CommandResultsE2eTest, SquashedExecCountsCrossShardCommandsOnce) {
   EXPECT_EQ(client_->RawCommand({"EXEC"}),
             "*3\r\n+OK\r\n*2\r\n$3\r\none\r\n$3\r\ntwo\r\n:2\r\n");
   for (const auto* command : {"mset", "mget", "del"}) {
-    EXPECT_EQ(Result(command, "exec", "success"), 1);
-    EXPECT_EQ(Result(command, "client", "queued"), 1);
+    EXPECT_EQ(Successful(command), 1);
     EXPECT_TRUE(Stats(command).find(":calls=1,") != std::string::npos);
   }
 }
@@ -1101,12 +1166,11 @@ TEST_F(CommandResultsE2eTest, SparseExecSpansKeepLogicalCountsAcrossRuns) {
       "+QUEUED");
   ASSERT_EQ(client_->Command({"GET", "{b}:key"}), "+QUEUED");
   EXPECT_TRUE(client_->RawCommand({"EXEC"}).starts_with("*194\r\n"));
-  EXPECT_EQ(Result("get", "exec", "success"), kRounds + 1);
-  EXPECT_EQ(Result("lpush", "exec", "failed"), kRounds);
-  EXPECT_EQ(Result("exists", "exec", "success"), kRounds);
-  EXPECT_EQ(Result("exists", "script", "success"), 1);
-  EXPECT_EQ(Result("eval", "exec", "success"), 1);
-  EXPECT_EQ(Result("exec", "client", "success"), 1);
+  EXPECT_EQ(Successful("get"), kRounds + 1);
+  EXPECT_EQ(Failed("lpush"), kRounds);
+  EXPECT_EQ(Successful("exists"), kRounds + 1);
+  EXPECT_EQ(Successful("eval"), 1);
+  EXPECT_EQ(Successful("exec"), 1);
   EXPECT_TRUE(Stats("get").starts_with("cmdstat_get:calls=65,"));
   EXPECT_TRUE(Stats("lpush").ends_with(",rejected_calls=0,failed_calls=64"));
   EXPECT_TRUE(Stats("exists").starts_with("cmdstat_exists:calls=65,"));
@@ -1136,26 +1200,24 @@ TEST_F(CommandResultsE2eTest, InfoSectionsPreserveOutcomeProjection) {
     EXPECT_NE(client_->Command({"INFO", section}).find(expected),
               std::string::npos);
   }
-  EXPECT_EQ(Result("lpush", "client", "failed"), 1);
-  EXPECT_EQ(Result("lpush", "client", "rejected"), 1);
+  EXPECT_EQ(Failed("lpush"), 1);
+  EXPECT_EQ(Rejected("lpush"), 1);
   ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
   EXPECT_TRUE(Stats("lpush").empty());
-  EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
+  EXPECT_EQ(Errors("WRONGTYPE"), 0);
 }
 
 TEST_F(CommandResultsE2eTest, SparseCollectionPreservesIdleAndResetSamples) {
-  // Unused contexts must still be queryable before their first event, even
-  // though no owner sends them in its sparse snapshot.
-  EXPECT_EQ(Result("get", "exec", "failed"), 0);
-  EXPECT_EQ(Result("zrange", "script", "success"), 0);
+  // Unused command rows are absent, while the small global prefix vocabulary
+  // has a zero baseline even before the first error.
+  EXPECT_EQ(Failed("get"), 0);
+  EXPECT_EQ(Successful("zrange"), 0);
   ASSERT_EQ(client_->Command({"SET", "sparse:key", "text"}), "+OK");
   for (unsigned cycle = 0; cycle < 3; ++cycle) {
     ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
     const auto reset = HttpGet(metrics_port_, "/metrics");
-    EXPECT_EQ(MetricValue(reset,
-                          "lavik_command_results_total{command=\"get\","
-                          "context=\"client\",result=\"success\"}"),
-              0);
+    EXPECT_EQ(reset.find("lavik_command_executions_total{command=\"get\"}"),
+              std::string::npos);
     EXPECT_EQ(reset.find("lavik_command_calls_total{command=\"get\"}"),
               std::string::npos);
     EXPECT_EQ(client_->Command({"GET", "sparse:key"}), "$4\r\ntext");
@@ -1173,22 +1235,25 @@ TEST_F(CommandResultsE2eTest, SparseCollectionPreservesIdleAndResetSamples) {
                     "lavik_command_duration_seconds_bucket{command=\"get\","
                     "le=\"+Inf\"}"),
         1);
-    EXPECT_EQ(Result("get", "client", "success"), 1);
-    EXPECT_EQ(Result("get", "exec", "success"), 0);
-    EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 1);
+    EXPECT_EQ(Successful("get"), 1);
+    EXPECT_EQ(Errors("WRONGTYPE"), 1);
     // Taking another snapshot must neither consume counters nor duplicate
     // entries when an identity was reactivated by RESETSTAT.
-    EXPECT_EQ(Result("get", "client", "success"), 1);
+    EXPECT_EQ(Successful("get"), 1);
   }
   ASSERT_EQ(client_->Command({"CONFIG", "RESETSTAT"}), "+OK");
-  EXPECT_EQ(Error("lpush", "client", "failed", "wrongtype"), 0);
+  EXPECT_EQ(Errors("WRONGTYPE"), 0);
 }
 
 TEST_F(CommandResultsE2eTest, OutcomeMetricFamiliesAreContiguous) {
   auto check_groups = [&] {
-    constexpr std::array<std::string_view, 4> families{
-        "lavik_command_results_total", "lavik_command_execution_seconds_total",
-        "lavik_command_errors_total", "lavik_request_input_errors_total"};
+    constexpr std::array<std::string_view, 6> families{
+        "lavik_command_executions_total",
+        "lavik_command_failed_calls_total",
+        "lavik_command_rejected_calls_total",
+        "lavik_command_execution_seconds_total",
+        "lavik_errors_total",
+        "lavik_request_input_errors_total"};
     std::array<unsigned, families.size()> groups{};
     std::istringstream response(HttpGet(metrics_port_, "/metrics"));
     std::string line, previous;
@@ -1224,8 +1289,8 @@ TEST_F(CommandResultsE2eTest, ManagementExecCountsItsChildren) {
   ASSERT_EQ(client_->Command({"MULTI"}), "+OK");
   ASSERT_EQ(client_->Command({"CONFIG", "REWRITE"}), "+QUEUED");
   EXPECT_TRUE(client_->RawCommand({"EXEC"}).starts_with("*1\r\n-ERR"));
-  EXPECT_EQ(Result("config|rewrite", "exec", "failed"), 1);
-  EXPECT_EQ(Result("exec", "client", "success"), 1);
+  EXPECT_EQ(Failed("config|rewrite"), 1);
+  EXPECT_EQ(Successful("exec"), 1);
 }
 
 TEST(MetricsE2eTest, ConcurrentInfoAndScrapesSurviveWorkerAllocationReuse) {

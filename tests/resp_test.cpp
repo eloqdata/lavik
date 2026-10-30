@@ -695,10 +695,12 @@ TEST(ReplyBuilderTest, ReplyReplacementRetainsTimingUntilTheNextRequest) {
   builder.ResetReply();
   EXPECT_EQ(builder.outcome().result_, CommandResult::kSuccess);
   EXPECT_EQ(builder.outcome().reason_, CommandErrorReason::kNone);
+  EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kNone);
   EXPECT_EQ(builder.AppendError(CommandErrorReason::kOom, "OOM no memory"),
             "-OOM no memory\r\n");
   EXPECT_EQ(builder.outcome().result_, CommandResult::kFailed);
   EXPECT_EQ(builder.outcome().reason_, CommandErrorReason::kOom);
+  EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kOom);
   EXPECT_EQ(builder.ExecutionTicks(100, 500), 150);
   EXPECT_EQ(builder.version(), RespVersion::k3);
 
@@ -706,6 +708,21 @@ TEST(ReplyBuilderTest, ReplyReplacementRetainsTimingUntilTheNextRequest) {
   EXPECT_EQ(builder.AppendSimpleString("OK"), "+OK\r\n");
   EXPECT_EQ(builder.outcome().result_, CommandResult::kSuccess);
   EXPECT_EQ(builder.ExecutionTicks(600, 650), 50);
+}
+
+TEST(ReplyBuilderTest, ErrorPrefixFollowsWireInsteadOfInternalReason) {
+  ReplyBuilder builder;
+  builder.AppendError(CommandErrorReason::kAuth, "ERR AUTH is unavailable");
+  EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kErr);
+  builder.Reset();
+  builder.AppendError(CommandErrorReason::kAuth, "WRONGPASS ",
+                      "invalid credentials");
+  EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kWrongPass);
+  builder.SetOutcome({CommandResult::kRejected, CommandErrorReason::kAuth});
+  EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kWrongPass);
+  builder.Reset();
+  builder.AppendError("USER_DEFINED customer detail");
+  EXPECT_EQ(builder.outcome().prefix_, CommandErrorPrefix::kOther);
 }
 
 TEST(ReplyBuilderTest, ReusesBoundedCapacityAndReleasesOversizedBuffer) {

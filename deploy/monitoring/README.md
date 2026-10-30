@@ -343,65 +343,47 @@ leader hints, transient replication gaps or on-demand lane connections.
 
 ## Request Health
 
-The **Request Health** row filters by instance, static command/subcommand name,
-and execution context. Context defaults to `client`; `exec` and `script` reveal
-nested work. Selecting all contexts counts logical command events rather than
-network requests. Existing QPS and latency panels keep their legacy dispatch
-semantics and use only the instance filter.
+The **Request Health** row follows Redis commandstats/errorstats. Command panels
+filter by instance and static command/subcommand name. EXEC and script children
+share their command's counters with direct executions; totals therefore count
+logical executions, not network requests. Existing QPS and latency panels keep
+their legacy dispatch semantics and use only the instance filter.
 
-The row shows outcome rates, errors by reason, execution-failure and admission-
-rejection ratios, service-fault ratio, and input errors. Input errors have no
-valid command identity, so command/context filters do not apply to that panel.
-Ratios use terminal attempts as the denominator and omit MULTI `queued` events.
-MOVED/ASK remain visible as `redirected`; they are not service faults. A healthy
-idle target displays zero ratios. Failed or missing scrapes display **No Data**,
-including when old rate-window samples still exist. An unseen error reason has
-no error series until its first occurrence.
+The row shows completed/failed/rejected command rates, global errors by RESP
+prefix, execution failure ratio, admission rejection ratio, mean command
+execution time, and input errors. Completed calls already include failed calls.
+MOVED/ASK count as rejections. Queue replies have no completed call. Errors by
+prefix and input errors are global diagnostics; the command filter does not
+apply. `ERR` includes both client and service errors, so a service-fault ratio
+cannot be inferred from these counters.
 
-The service-fault numerator for one context is:
+Execution failure ratio is `failed_calls / calls`. Admission rejection ratio
+is `rejected_calls / (calls + rejected_calls)`. The queries clamp a zero
+denominator to `1e-9` and gate results with
+`and on (instance) (up{job="lavik"} == 1)`. An observed idle command displays
+zero; an unobserved command, failed scrape or missing target displays **No
+Data**, including when older rate-window samples remain. Never use unconditional
+`or vector(0)`, which would conceal missing telemetry.
 
-```promql
-sum by (instance, command, context) (
-  rate(lavik_command_errors_total{
-    job="lavik", context="client", result=~"failed|rejected",
-    reason=~"oom|loading|authority|clusterdown|busy|tryagain|storage|storage_full|internal|shutdown"
-  }[5m])
-)
-```
+Each observed command publishes all four fields, including zero failures and
+rejections. Global error prefixes have zero samples from startup; command-level
+`rate` needs two scrapes and cannot recover an error before the first sample.
+The global error chart provides an independent signal for such rare errors.
+Custom Lua prefixes share `OTHER` to bound cardinality. Full counting, streaming
+and reset semantics are in [metrics](../../docs/operations/metrics.md).
 
-Its denominator is:
-
-```promql
-sum by (instance, command, context) (
-  rate(lavik_command_results_total{
-    job="lavik", context="client",
-    result=~"success|failed|rejected|redirected|cancelled"
-  }[5m])
-)
-```
-
-For numerator `N` and denominator `D`, the dashboard evaluates
-`(N or on (instance,command,context) (0 * D)) / clamp_min(D, 1e-9)` and gates
-the result with `and on (instance) (up{job="lavik"} == 1)`. This zero-fill is
-anchored to real command metrics; unconditional `or vector(0)` would conceal
-missing telemetry. The dashboard JSON contains the complete queries with filters.
-Validate the actual dashboard expressions with:
+Validate the actual dashboard ratio expressions with:
 
 ```sh
 python3 deploy/monitoring/tests/check_request_health.py
 ```
 
-This requires `promtool` on PATH and covers client errors, zero/low traffic,
-counter reset, routing/queueing, failed scrapes and absent telemetry.
+This requires `promtool` on PATH and covers errors/rejections, zero/low traffic,
+counter reset, redirects, failed scrapes and absent telemetry.
 
 ### Command-error alerting boundary
 
 The existing alert framework and rules are documented above. Request Health adds
-no command-error alert rules. Such rules, including minimum traffic and sustained
-windows, remain follow-up work. The service-fault query is the starting point; routing, authentication, read-only policy,
-syntax/type/value errors, script errors and cancellation must not be silently
-added to its whitelist. Test prospective rules with retained-memory admission
-OOM, replica LOADING, expired/changed authority, storage read failure and storage
-exhaustion. Also exercise a stopped scrape target separately: missing metrics
-must not resolve a command-fault alert into a healthy zero. Full counting,
-streaming and reset semantics are in [metrics](../../docs/operations/metrics.md).
+no command-error alert rules. Future rules must choose their error scope,
+minimum traffic and sustained window explicitly, and distinguish missing
+telemetry from a healthy zero.
