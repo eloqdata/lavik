@@ -1,3 +1,156 @@
+# HELP lavik_replication_observation_available Whether a current native replication observation is available.
+# TYPE lavik_replication_observation_available gauge
+lavik_replication_observation_available 1
+# HELP lavik_replication_transfer_bytes_total Native data-frame bytes successfully sent by source or received by target, including framing.
+# TYPE lavik_replication_transfer_bytes_total counter
+lavik_replication_transfer_bytes_total{side="source",worker="0"} 0
+lavik_replication_transfer_bytes_total{side="source",worker="1"} 0
+lavik_replication_transfer_bytes_total{side="target",worker="0"} 0
+lavik_replication_transfer_bytes_total{side="target",worker="1"} 0
+# HELP lavik_replication_transfer_events_total Complete ONLINE events sent by source or accepted by target; excludes FULL and is not durable ACK progress.
+# TYPE lavik_replication_transfer_events_total counter
+lavik_replication_transfer_events_total{side="source",worker="0"} 0
+lavik_replication_transfer_events_total{side="source",worker="1"} 0
+lavik_replication_transfer_events_total{side="target",worker="0"} 0
+lavik_replication_transfer_events_total{side="target",worker="1"} 0
+# HELP lavik_replication_applied_events_total Complete native ONLINE events proven applied on target; sampled within each history and excludes FULL cut installation.
+# TYPE lavik_replication_applied_events_total counter
+lavik_replication_applied_events_total{side="target",worker="0"} 0
+lavik_replication_applied_events_total{side="target",worker="1"} 0
+# HELP lavik_replication_fullsync_items_total Native FULL snapshot record payloads and complete incremental commands processed; includes snapshot fragments, not an estimated completion percentage.
+# TYPE lavik_replication_fullsync_items_total counter
+lavik_replication_fullsync_items_total{side="source",worker="0"} 0
+lavik_replication_fullsync_items_total{side="source",worker="1"} 0
+lavik_replication_fullsync_items_total{side="target",worker="0"} 0
+lavik_replication_fullsync_items_total{side="target",worker="1"} 0
+# HELP lavik_replication_fullsync_partitions_total Completed native FULL partition handoffs across attempts.
+# TYPE lavik_replication_fullsync_partitions_total counter
+lavik_replication_fullsync_partitions_total{side="source",worker="0"} 0
+lavik_replication_fullsync_partitions_total{side="source",worker="1"} 0
+lavik_replication_fullsync_partitions_total{side="target",worker="0"} 0
+lavik_replication_fullsync_partitions_total{side="target",worker="1"} 0
+# HELP lavik_replication_fullsync_results_total Terminal native FULL attempts; successful activation is counted once per session.
+# TYPE lavik_replication_fullsync_results_total counter
+lavik_replication_fullsync_results_total{side="source",result="success"} 0
+lavik_replication_fullsync_results_total{side="source",result="failure"} 0
+lavik_replication_fullsync_results_total{side="source",result="cancelled"} 0
+lavik_replication_fullsync_results_total{side="target",result="success"} 0
+lavik_replication_fullsync_results_total{side="target",result="failure"} 0
+lavik_replication_fullsync_results_total{side="target",result="cancelled"} 0
+# HELP lavik_replication_fullsync_failures_total Native FULL failures by bounded cause, excluding cancellation and admission waits.
+# TYPE lavik_replication_fullsync_failures_total counter
+lavik_replication_fullsync_failures_total{side="source",reason="none"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="network"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="timeout"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="authentication"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="protocol"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="resource"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="storage"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="cancelled"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="full_busy"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="authority"} 0
+lavik_replication_fullsync_failures_total{side="source",reason="other"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="none"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="network"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="timeout"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="authentication"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="protocol"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="resource"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="storage"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="cancelled"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="full_busy"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="authority"} 0
+lavik_replication_fullsync_failures_total{side="target",reason="other"} 0
+# HELP lavik_replication_fullsync_duration_seconds Duration of terminal native FULL attempts, including failed and cancelled attempts.
+# TYPE lavik_replication_fullsync_duration_seconds histogram
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="1"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="5"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="10"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="30"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="60"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="300"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="900"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="3600"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="14400"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="source",le="+Inf"} 0
+lavik_replication_fullsync_duration_seconds_count{side="source"} 0
+lavik_replication_fullsync_duration_seconds_sum{side="source"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="1"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="5"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="10"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="30"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="60"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="300"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="900"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="3600"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="14400"} 0
+lavik_replication_fullsync_duration_seconds_bucket{side="target",le="+Inf"} 0
+lavik_replication_fullsync_duration_seconds_count{side="target"} 0
+lavik_replication_fullsync_duration_seconds_sum{side="target"} 0
+# HELP lavik_replication_retries_total Native target reconnect rounds by bounded cause; not FULL failures.
+# TYPE lavik_replication_retries_total counter
+lavik_replication_retries_total{reason="none"} 0
+lavik_replication_retries_total{reason="network"} 0
+lavik_replication_retries_total{reason="timeout"} 0
+lavik_replication_retries_total{reason="authentication"} 0
+lavik_replication_retries_total{reason="protocol"} 0
+lavik_replication_retries_total{reason="resource"} 0
+lavik_replication_retries_total{reason="storage"} 0
+lavik_replication_retries_total{reason="cancelled"} 0
+lavik_replication_retries_total{reason="full_busy"} 0
+lavik_replication_retries_total{reason="authority"} 0
+lavik_replication_retries_total{reason="other"} 0
+# HELP lavik_replication_native_following Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_native_following gauge
+lavik_replication_native_following 0
+# HELP lavik_replication_native_connected Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_native_connected gauge
+lavik_replication_native_connected 0
+# HELP lavik_replication_population_ready Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_population_ready gauge
+lavik_replication_population_ready 1
+# HELP lavik_replication_catalog_ready Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_catalog_ready gauge
+lavik_replication_catalog_ready 1
+# HELP lavik_replication_data_readable Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_data_readable gauge
+lavik_replication_data_readable 1
+# HELP lavik_replication_loading Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_loading gauge
+lavik_replication_loading 0
+# HELP lavik_replication_failed_stopped Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_failed_stopped gauge
+lavik_replication_failed_stopped 0
+# HELP lavik_replication_waiting Native diagnostic state; never a serving-authority grant.
+# TYPE lavik_replication_waiting gauge
+lavik_replication_waiting 0
+# HELP lavik_replication_wait_reason Current native upstream admission/authority wait; not a replication stall.
+# TYPE lavik_replication_wait_reason gauge
+lavik_replication_wait_reason{reason="full_busy"} 0
+lavik_replication_wait_reason{reason="authority"} 0
+# HELP lavik_replication_fullsync_promotion_complete Target-local durable root promotion during an active FULL; not population readiness or ONLINE. Omitted when not applicable.
+# TYPE lavik_replication_fullsync_promotion_complete gauge
+# HELP lavik_replication_loading_no_progress_seconds Time without effective population recovery progress while native recovery is required and not awaiting admission.
+# TYPE lavik_replication_loading_no_progress_seconds gauge
+lavik_replication_loading_no_progress_seconds 0
+# HELP lavik_replication_native_flow_connections Active native connections per flow; source aggregates peers.
+# TYPE lavik_replication_native_flow_connections gauge
+# HELP lavik_replication_comparable_flows Connections with coherent ONLINE cursors in one current history/flow; FULL is not applicable.
+# TYPE lavik_replication_comparable_flows gauge
+# HELP lavik_replication_pending_events Target receive-to-apply distance or maximum comparable source publish-to-ACK event distance; not bytes.
+# TYPE lavik_replication_pending_events gauge
+# HELP lavik_replication_pending_work Connections with known work at the named step.
+# TYPE lavik_replication_pending_work gauge
+# HELP lavik_replication_no_progress_seconds Longest sampled no-progress interval among connections with known work at the named step.
+# TYPE lavik_replication_no_progress_seconds gauge
+# HELP lavik_replication_cursor_next_lsn Native next-LSN within one current history/flow; unavailable cursors omitted. Never use cross-node arithmetic or rate.
+# TYPE lavik_replication_cursor_next_lsn gauge
+# HELP lavik_replication_fullsync_phase Active native FULL flows in a locally observed phase; source aggregates peers.
+# TYPE lavik_replication_fullsync_phase gauge
+# HELP lavik_replication_fullsync_phase_seconds Maximum elapsed time in the current locally observed FULL phase.
+# TYPE lavik_replication_fullsync_phase_seconds gauge
+# HELP lavik_replication_fullsync_elapsed_seconds Maximum current native FULL attempt duration; not a timeout or percentage.
+# TYPE lavik_replication_fullsync_elapsed_seconds gauge
 # HELP lavik_server_ready Whether storage startup completed without a latched runtime storage failure; not serving authority.
 # TYPE lavik_server_ready gauge
 lavik_server_ready 1
@@ -30,13 +183,13 @@ lavik_command_rejected_calls_total{command="info"} 0
 lavik_command_rejected_calls_total{command="client|setinfo"} 0
 # HELP lavik_command_execution_seconds_total Time spent executing logical commands.
 # TYPE lavik_command_execution_seconds_total counter
-lavik_command_execution_seconds_total{command="ping"} 1.58104e-05
-lavik_command_execution_seconds_total{command="hello"} 1.05983e-05
-lavik_command_execution_seconds_total{command="get"} 0.00308744
-lavik_command_execution_seconds_total{command="set"} 0.000100585
-lavik_command_execution_seconds_total{command="lpush"} 0.00180458
-lavik_command_execution_seconds_total{command="info"} 8.12322e-05
-lavik_command_execution_seconds_total{command="client|setinfo"} 1.95391e-06
+lavik_command_execution_seconds_total{command="ping"} 3.21304e-06
+lavik_command_execution_seconds_total{command="hello"} 1.34887e-05
+lavik_command_execution_seconds_total{command="get"} 0.00347152
+lavik_command_execution_seconds_total{command="set"} 9.11879e-05
+lavik_command_execution_seconds_total{command="lpush"} 0.00217105
+lavik_command_execution_seconds_total{command="info"} 8.31879e-05
+lavik_command_execution_seconds_total{command="client|setinfo"} 1.9687e-06
 # HELP lavik_errors_total Redis errors by RESP prefix, including caught script errors. Custom prefixes use OTHER.
 # TYPE lavik_errors_total counter
 lavik_errors_total{err="ERR"} 1
@@ -146,7 +299,7 @@ lavik_command_duration_seconds_bucket{command="ping",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000002"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000004"} 0
 lavik_command_duration_seconds_bucket{command="ping",le="0.000008"} 0
-lavik_command_duration_seconds_bucket{command="ping",le="0.000016"} 0
+lavik_command_duration_seconds_bucket{command="ping",le="0.000016"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="0.000032"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="0.000064"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="0.000128"} 1
@@ -174,7 +327,7 @@ lavik_command_duration_seconds_bucket{command="ping",le="2"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="4"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="8"} 1
 lavik_command_duration_seconds_bucket{command="ping",le="+Inf"} 1
-lavik_command_duration_seconds_sum{command="ping"} 2.46357e-05
+lavik_command_duration_seconds_sum{command="ping"} 1.23409e-05
 lavik_command_duration_seconds_count{command="ping"} 1
 lavik_command_duration_seconds_bucket{command="get",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000002"} 0
@@ -182,8 +335,8 @@ lavik_command_duration_seconds_bucket{command="get",le="0.000004"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000008"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000016"} 0
 lavik_command_duration_seconds_bucket{command="get",le="0.000032"} 0
-lavik_command_duration_seconds_bucket{command="get",le="0.000064"} 45
-lavik_command_duration_seconds_bucket{command="get",le="0.000128"} 59
+lavik_command_duration_seconds_bucket{command="get",le="0.000064"} 42
+lavik_command_duration_seconds_bucket{command="get",le="0.000128"} 60
 lavik_command_duration_seconds_bucket{command="get",le="0.000256"} 60
 lavik_command_duration_seconds_bucket{command="get",le="0.000512"} 60
 lavik_command_duration_seconds_bucket{command="get",le="0.001"} 60
@@ -208,7 +361,7 @@ lavik_command_duration_seconds_bucket{command="get",le="2"} 60
 lavik_command_duration_seconds_bucket{command="get",le="4"} 60
 lavik_command_duration_seconds_bucket{command="get",le="8"} 60
 lavik_command_duration_seconds_bucket{command="get",le="+Inf"} 60
-lavik_command_duration_seconds_sum{command="get"} 0.00317238
+lavik_command_duration_seconds_sum{command="get"} 0.00357124
 lavik_command_duration_seconds_count{command="get"} 60
 lavik_command_duration_seconds_bucket{command="set",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="set",le="0.000002"} 0
@@ -242,16 +395,16 @@ lavik_command_duration_seconds_bucket{command="set",le="2"} 1
 lavik_command_duration_seconds_bucket{command="set",le="4"} 1
 lavik_command_duration_seconds_bucket{command="set",le="8"} 1
 lavik_command_duration_seconds_bucket{command="set",le="+Inf"} 1
-lavik_command_duration_seconds_sum{command="set"} 0.000127996
+lavik_command_duration_seconds_sum{command="set"} 0.000126343
 lavik_command_duration_seconds_count{command="set"} 1
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000002"} 0
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000004"} 1
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000008"} 1
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000016"} 29
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000032"} 50
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000064"} 83
-lavik_command_duration_seconds_bucket{command="lpush",le="0.000128"} 84
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000004"} 0
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000008"} 0
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000016"} 2
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000032"} 34
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000064"} 68
+lavik_command_duration_seconds_bucket{command="lpush",le="0.000128"} 81
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000256"} 91
 lavik_command_duration_seconds_bucket{command="lpush",le="0.000512"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="0.001"} 92
@@ -276,12 +429,12 @@ lavik_command_duration_seconds_bucket{command="lpush",le="2"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="4"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="8"} 92
 lavik_command_duration_seconds_bucket{command="lpush",le="+Inf"} 92
-lavik_command_duration_seconds_sum{command="lpush"} 0.00430018
+lavik_command_duration_seconds_sum{command="lpush"} 0.00548076
 lavik_command_duration_seconds_count{command="lpush"} 92
 lavik_command_duration_seconds_bucket{command="client",le="0.000001"} 1
 lavik_command_duration_seconds_bucket{command="client",le="0.000002"} 2
 lavik_command_duration_seconds_bucket{command="client",le="0.000004"} 2
-lavik_command_duration_seconds_bucket{command="client",le="0.000008"} 2
+lavik_command_duration_seconds_bucket{command="client",le="0.000008"} 3
 lavik_command_duration_seconds_bucket{command="client",le="0.000016"} 3
 lavik_command_duration_seconds_bucket{command="client",le="0.000032"} 3
 lavik_command_duration_seconds_bucket{command="client",le="0.000064"} 3
@@ -310,13 +463,13 @@ lavik_command_duration_seconds_bucket{command="client",le="2"} 3
 lavik_command_duration_seconds_bucket{command="client",le="4"} 3
 lavik_command_duration_seconds_bucket{command="client",le="8"} 3
 lavik_command_duration_seconds_bucket{command="client",le="+Inf"} 3
-lavik_command_duration_seconds_sum{command="client"} 1.04339e-05
+lavik_command_duration_seconds_sum{command="client"} 7.58522e-06
 lavik_command_duration_seconds_count{command="client"} 3
 lavik_command_duration_seconds_bucket{command="info",le="0.000001"} 0
 lavik_command_duration_seconds_bucket{command="info",le="0.000002"} 0
 lavik_command_duration_seconds_bucket{command="info",le="0.000004"} 0
 lavik_command_duration_seconds_bucket{command="info",le="0.000008"} 0
-lavik_command_duration_seconds_bucket{command="info",le="0.000016"} 1
+lavik_command_duration_seconds_bucket{command="info",le="0.000016"} 0
 lavik_command_duration_seconds_bucket{command="info",le="0.000032"} 1
 lavik_command_duration_seconds_bucket{command="info",le="0.000064"} 1
 lavik_command_duration_seconds_bucket{command="info",le="0.000128"} 2
@@ -344,7 +497,7 @@ lavik_command_duration_seconds_bucket{command="info",le="2"} 2
 lavik_command_duration_seconds_bucket{command="info",le="4"} 2
 lavik_command_duration_seconds_bucket{command="info",le="8"} 2
 lavik_command_duration_seconds_bucket{command="info",le="+Inf"} 2
-lavik_command_duration_seconds_sum{command="info"} 8.5987e-05
+lavik_command_duration_seconds_sum{command="info"} 8.8894e-05
 lavik_command_duration_seconds_count{command="info"} 2
 # HELP lavik_storage_io_operations_total Completed storage I/O operations.
 # TYPE lavik_storage_io_operations_total counter
@@ -425,10 +578,10 @@ lavik_memory_current_bytes 824465008
 lavik_memory_used_bytes 824465008
 # HELP lavik_memory_rss_bytes Resident process memory.
 # TYPE lavik_memory_rss_bytes gauge
-lavik_memory_rss_bytes 871354368
+lavik_memory_rss_bytes 871514112
 # HELP lavik_memory_committed_bytes Memory committed by the configured allocator.
 # TYPE lavik_memory_committed_bytes gauge
-lavik_memory_committed_bytes 905641984
+lavik_memory_committed_bytes 906690560
 # HELP lavik_memory_reserved_bytes Address space reserved by the configured allocator.
 # TYPE lavik_memory_reserved_bytes gauge
 lavik_memory_reserved_bytes 1076232192
@@ -572,6 +725,6 @@ lavik_fullsync_publish_queue_admitted_bytes{worker="1"} 0
 lavik_fullsync_publish_queue_capacity_bytes{worker="1"} 0
 lavik_fullsync_sessions{worker="1"} 0
 lavik_fullsync_publish_queue_backpressure_waits_total{worker="1"} 0
-lavik_storage_capacity_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-final/data"} 260046848
-lavik_storage_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-final/data"} 159383552
-lavik_filesystem_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-final/data"} 889108099072
+lavik_storage_capacity_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-rebased/data"} 260046848
+lavik_storage_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-rebased/data"} 159383552
+lavik_filesystem_available_bytes{device="0",path="/mnt/local_nvme/lavik-391-validation/redis-model-20261030/live-monitoring-rebased/data"} 912541175808
