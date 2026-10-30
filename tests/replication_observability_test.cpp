@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <unordered_set>
 
 #include "gtest/gtest.h"
 #include "observability.h"
@@ -11,10 +12,47 @@ namespace lavik {
 namespace {
 constexpr std::uint64_t Seconds(unsigned n) { return n * 1'000'000'000ULL; }
 
+// Validate the wire grouping contract before sorting for value equivalence.
+// Histogram suffix samples belong to their declared family, unlike counters
+// whose names may themselves end in _count or _sum.
+void ExpectGroupedMetricFamilies(const std::string& text) {
+  std::istringstream input(text);
+  std::unordered_set<std::string> seen, histograms;
+  std::string current;
+  for (std::string line; std::getline(input, line);) {
+    if (line.empty()) continue;
+    std::string family;
+    if (line.front() == '#') {
+      std::istringstream metadata(line);
+      std::string marker, directive, kind;
+      metadata >> marker >> directive >> family;
+      if (directive != "HELP" && directive != "TYPE") continue;
+      if (directive == "TYPE") {
+        metadata >> kind;
+        if (kind == "histogram" || kind == "summary") histograms.insert(family);
+      }
+    } else {
+      family = line.substr(0, line.find_first_of("{ "));
+      for (const std::string_view suffix : {"_bucket", "_count", "_sum"}) {
+        if (!family.ends_with(suffix)) continue;
+        auto parent = family.substr(0, family.size() - suffix.size());
+        if (histograms.contains(parent)) family = std::move(parent);
+        break;
+      }
+    }
+    if (family != current) {
+      EXPECT_TRUE(seen.insert(family).second)
+          << "Noncontiguous metric family: " << family << " at " << line;
+      current = std::move(family);
+    }
+  }
+}
+
 std::vector<std::string> MetricLines(
     const ReplicationObservabilitySnapshot& snapshot) {
   std::string text;
   AppendReplicationProgressMetrics(snapshot, &text);
+  ExpectGroupedMetricFamilies(text);
   std::istringstream input(text);
   std::vector<std::string> lines;
   for (std::string line; std::getline(input, line);)

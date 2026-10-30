@@ -153,77 +153,96 @@ void AppendReplicationProgressMetrics(
   type("observation_available", "gauge",
        "Whether a current native replication observation is available.");
   metric("observation_available", "", view.available_ ? 1 : 0);
-  type("transfer_bytes_total", "counter",
-       "Native data-frame bytes successfully sent by source or received by "
-       "target, including framing.");
-  type("transfer_events_total", "counter",
-       "Complete ONLINE events sent by source or accepted by target; excludes "
-       "FULL and is not durable ACK progress.");
-  type("applied_events_total", "counter",
-       "Complete native ONLINE events proven applied on target; sampled within "
-       "each history and excludes FULL cut installation.");
-  type("fullsync_items_total", "counter",
-       "Native FULL snapshot record payloads and complete incremental commands "
-       "processed; includes snapshot fragments, not an estimated completion "
-       "percentage.");
-  type("fullsync_partitions_total", "counter",
-       "Completed native FULL partition handoffs across attempts.");
-  auto emit_total = [&](const ReplicationProgressTotals& total) {
-    const auto labels =
-        absl::StrCat("{side=\"", ReplicationSideName(total.side_),
-                     "\",worker=\"", total.worker_, "\"}");
-    metric("transfer_bytes_total", labels, total.bytes_);
-    metric("transfer_events_total", labels, total.events_);
-    metric("fullsync_items_total", labels, total.full_items_);
-    if (total.side_ == ReplicationSide::kTarget)
-      metric("applied_events_total", labels, total.applied_events_);
-    metric("fullsync_partitions_total", labels, total.partitions_);
+  // Prometheus requires each family's metadata and samples in one contiguous
+  // group. Walk the compact rows per family, writing labels directly into the
+  // final body rather than sorting samples or staging per-family text copies.
+  struct CounterFamily {
+    std::string_view name;
+    std::string_view help;
+    std::uint64_t ReplicationProgressTotals::*value;
+    bool target_only = false;
   };
-  if (view.worker_count_ != 0) {
-    // Collection preserves side/worker order while dropping only all-zero
-    // rows. Reconstruct those rows here, preserving the exporter series set
-    // even before any relationship has existed or after it has retired.
-    auto next = view.totals_.begin();
-    for (unsigned side = 0; side != 2; ++side) {
-      for (unsigned worker = 0; worker != view.worker_count_; ++worker) {
-        const auto current_side = static_cast<ReplicationSide>(side);
-        if (next != view.totals_.end() && next->side_ == current_side &&
-            next->worker_ == worker) {
-          emit_total(*next++);
-        } else {
-          emit_total({.side_ = current_side, .worker_ = worker});
+  constexpr std::array counters{
+      CounterFamily{"transfer_bytes_total",
+                    "Native data-frame bytes successfully sent by source or "
+                    "received by target, including framing.",
+                    &ReplicationProgressTotals::bytes_},
+      CounterFamily{"transfer_events_total",
+                    "Complete ONLINE events sent by source or accepted by "
+                    "target; excludes FULL and is not durable ACK progress.",
+                    &ReplicationProgressTotals::events_},
+      CounterFamily{"applied_events_total",
+                    "Complete native ONLINE events proven applied on target; "
+                    "sampled within each history and excludes FULL cut "
+                    "installation.",
+                    &ReplicationProgressTotals::applied_events_, true},
+      CounterFamily{"fullsync_items_total",
+                    "Native FULL snapshot record payloads and complete "
+                    "incremental commands processed; includes snapshot "
+                    "fragments, not an estimated completion percentage.",
+                    &ReplicationProgressTotals::full_items_},
+      CounterFamily{"fullsync_partitions_total",
+                    "Completed native FULL partition handoffs across attempts.",
+                    &ReplicationProgressTotals::partitions_}};
+  for (const auto& family : counters) {
+    type(family.name, "counter", family.help);
+    auto emit_total = [&](const ReplicationProgressTotals& total) {
+      if (family.target_only && total.side_ != ReplicationSide::kTarget) return;
+      absl::StrAppend(output, "lavik_replication_", family.name, "{side=\"",
+                      ReplicationSideName(total.side_), "\",worker=\"",
+                      total.worker_, "\"} ", total.*family.value, "\n");
+    };
+    if (view.worker_count_ != 0) {
+      // Collection preserves side/worker order while dropping only all-zero
+      // rows. Reconstruct zeros without making a dense snapshot copy.
+      auto next = view.totals_.begin();
+      for (unsigned side = 0; side != 2; ++side) {
+        for (unsigned worker = 0; worker != view.worker_count_; ++worker) {
+          const auto current_side = static_cast<ReplicationSide>(side);
+          if (next != view.totals_.end() && next->side_ == current_side &&
+              next->worker_ == worker) {
+            emit_total(*next++);
+          } else {
+            emit_total({.side_ = current_side, .worker_ = worker});
+          }
         }
       }
+    } else {
+      for (const auto& total : view.totals_) emit_total(total);
     }
-  } else {
-    for (const auto& total : view.totals_) emit_total(total);
   }
   type("fullsync_results_total", "counter",
        "Terminal native FULL attempts; successful activation is counted once "
        "per session.");
-  type("fullsync_failures_total", "counter",
-       "Native FULL failures by bounded cause, excluding cancellation and "
-       "admission waits.");
-  type("fullsync_duration_seconds", "histogram",
-       "Duration of terminal native FULL attempts, including failed and "
-       "cancelled attempts.");
   for (unsigned side = 0; side != 2; ++side) {
     const auto name = ReplicationSideName(static_cast<ReplicationSide>(side));
-    const auto& totals = view.full_totals_[side];
     for (unsigned result = 0; result != 3; ++result)
       metric(
           "fullsync_results_total",
           absl::StrCat("{side=\"", name, "\",result=\"",
                        FullSyncResultName(static_cast<FullSyncResult>(result)),
                        "\"}"),
-          totals.results_[result]);
+          view.full_totals_[side].results_[result]);
+  }
+  type("fullsync_failures_total", "counter",
+       "Native FULL failures by bounded cause, excluding cancellation and "
+       "admission waits.");
+  for (unsigned side = 0; side != 2; ++side) {
+    const auto name = ReplicationSideName(static_cast<ReplicationSide>(side));
     for (unsigned reason = 0; reason != kReplicationFailureCount; ++reason)
       metric("fullsync_failures_total",
              absl::StrCat("{side=\"", name, "\",reason=\"",
                           ReplicationFailureName(
                               static_cast<ReplicationFailure>(reason)),
                           "\"}"),
-             totals.errors_[reason]);
+             view.full_totals_[side].errors_[reason]);
+  }
+  type("fullsync_duration_seconds", "histogram",
+       "Duration of terminal native FULL attempts, including failed and "
+       "cancelled attempts.");
+  for (unsigned side = 0; side != 2; ++side) {
+    const auto name = ReplicationSideName(static_cast<ReplicationSide>(side));
+    const auto& totals = view.full_totals_[side];
     std::uint64_t count = 0;
     for (unsigned bucket = 0; bucket != totals.duration_bins_.size();
          ++bucket) {
@@ -293,67 +312,93 @@ void AppendReplicationProgressMetrics(
     row.flow_ = flow.flow_;
     row.Add(flow);
   }
+  auto for_each_flow = [&](const auto& emit) {
+    for (const auto& row : view.metric_flows_) emit(row);
+    for (const auto& [key, row] : rows) emit(row);
+  };
+  auto flow_metric = [&](std::string_view name,
+                         const ReplicationFlowMetrics& row, const auto& value,
+                         std::string_view label = {},
+                         std::string_view label_value = {}) {
+    absl::StrAppend(output, "lavik_replication_", name, "{side=\"",
+                    ReplicationSideName(row.side_), "\",worker=\"", row.worker_,
+                    "\",flow=\"", row.flow_, "\"");
+    if (!label.empty())
+      absl::StrAppend(output, ",", label, "=\"", label_value, "\"");
+    absl::StrAppend(output, "} ", value, "\n");
+  };
   type("native_flow_connections", "gauge",
        "Active native connections per flow; source aggregates peers.");
+  for_each_flow([&](const auto& row) {
+    flow_metric("native_flow_connections", row, row.connected_);
+  });
   type("comparable_flows", "gauge",
        "Connections with coherent ONLINE cursors in one current history/flow; "
        "FULL is not applicable.");
+  for_each_flow([&](const auto& row) {
+    flow_metric("comparable_flows", row, row.comparable_);
+  });
   type("pending_events", "gauge",
        "Target receive-to-apply distance or maximum comparable source "
        "publish-to-ACK event distance; not bytes.");
+  for_each_flow([&](const auto& row) {
+    if (row.comparable_ != 0)
+      flow_metric("pending_events", row, row.pending_events_);
+  });
   type("pending_work", "gauge",
        "Connections with known work at the named step.");
+  for_each_flow([&](const auto& row) {
+    for (unsigned step = 0; step != 4; ++step)
+      if (step == 3 || row.comparable_ != 0)
+        flow_metric("pending_work", row, row.pending_[step], "step",
+                    kReplicationProgressSteps[step]);
+  });
   type("no_progress_seconds", "gauge",
        "Longest sampled no-progress interval among connections with known work "
        "at the named step.");
+  for_each_flow([&](const auto& row) {
+    for (unsigned step = 0; step != 4; ++step)
+      if (step == 3 || row.comparable_ != 0)
+        flow_metric("no_progress_seconds", row, row.ages_[step], "step",
+                    kReplicationProgressSteps[step]);
+  });
   type("cursor_next_lsn", "gauge",
        "Native next-LSN within one current history/flow; unavailable cursors "
        "omitted. Never use cross-node arithmetic or rate.");
+  for_each_flow([&](const auto& row) {
+    for (const auto& [name, cursor] :
+         std::array<std::pair<std::string_view,
+                             const std::optional<std::uint64_t>*>, 4>{
+             {{"published", &row.published_},
+              {"received", &row.received_},
+              {"applied", &row.applied_},
+              {"ack_sent", &row.ack_}}})
+      if (*cursor)
+        flow_metric("cursor_next_lsn", row, **cursor, "cursor", name);
+  });
   type("fullsync_phase", "gauge",
        "Active native FULL flows in a locally observed phase; source "
        "aggregates peers.");
+  for_each_flow([&](const auto& row) {
+    for (unsigned phase = 0; phase != row.phases_.size(); ++phase)
+      flow_metric("fullsync_phase", row, row.phases_[phase], "phase",
+                  FullSyncPhaseName(static_cast<FullSyncPhase>(phase)));
+  });
   type("fullsync_phase_seconds", "gauge",
        "Maximum elapsed time in the current locally observed FULL phase.");
+  for_each_flow([&](const auto& row) {
+    for (unsigned phase = 0; phase != row.phases_.size(); ++phase)
+      if (row.phases_[phase] != 0)
+        flow_metric("fullsync_phase_seconds", row, row.phase_seconds_[phase],
+                    "phase", FullSyncPhaseName(static_cast<FullSyncPhase>(phase)));
+  });
   type("fullsync_elapsed_seconds", "gauge",
        "Maximum current native FULL attempt duration; not a timeout or "
        "percentage.");
-  auto emit_flow = [&](const ReplicationFlowMetrics& row) {
-    const auto prefix =
-        absl::StrCat("{side=\"", ReplicationSideName(row.side_), "\",worker=\"",
-                     row.worker_, "\",flow=\"", row.flow_, "\"");
-    metric("native_flow_connections", prefix + "}", row.connected_);
-    metric("comparable_flows", prefix + "}", row.comparable_);
-    if (row.comparable_ != 0)
-      metric("pending_events", prefix + "}", row.pending_events_);
-    for (unsigned step = 0; step != 4; ++step) {
-      if (step != 3 && row.comparable_ == 0) continue;
-      const auto labels = absl::StrCat(prefix, ",step=\"",
-                                       kReplicationProgressSteps[step], "\"}");
-      metric("pending_work", labels, row.pending_[step]);
-      metric("no_progress_seconds", labels, row.ages_[step]);
-    }
-    for (const auto& [name, cursor] :
-         std::array<std::pair<std::string_view, std::optional<std::uint64_t>>,
-                    4>{{{"published", row.published_},
-                        {"received", row.received_},
-                        {"applied", row.applied_},
-                        {"ack_sent", row.ack_}}})
-      if (cursor)
-        metric("cursor_next_lsn",
-               absl::StrCat(prefix, ",cursor=\"", name, "\"}"), *cursor);
-    for (unsigned phase = 0; phase != row.phases_.size(); ++phase) {
-      const auto labels = absl::StrCat(
-          prefix, ",phase=\"",
-          FullSyncPhaseName(static_cast<FullSyncPhase>(phase)), "\"}");
-      metric("fullsync_phase", labels, row.phases_[phase]);
-      if (row.phases_[phase] != 0)
-        metric("fullsync_phase_seconds", labels, row.phase_seconds_[phase]);
-    }
+  for_each_flow([&](const auto& row) {
     if (std::any_of(row.phases_.begin(), row.phases_.end(),
                     [](unsigned count) { return count != 0; }))
-      metric("fullsync_elapsed_seconds", prefix + "}", row.full_seconds_);
-  };
-  for (const auto& row : view.metric_flows_) emit_flow(row);
-  for (const auto& [key, row] : rows) emit_flow(row);
+      flow_metric("fullsync_elapsed_seconds", row, row.full_seconds_);
+  });
 }
 }  // namespace lavik
