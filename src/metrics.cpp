@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -119,6 +120,15 @@ class MetricText {
     append(std::string_view(text, N - 1));
   }
   void Add(const std::string& text) { response_->AppendBody(text); }
+  void Add(double value) {
+    // Keep small increments visible even after cumulative timers have grown
+    // large. AlphaNum's six significant digits would quantize scrape deltas.
+    char buffer[32];
+    const auto [end, error] =
+        std::to_chars(buffer, buffer + sizeof(buffer), value);
+    assert(error == std::errc{});
+    response_->AppendBody(std::string_view(buffer, end - buffer));
+  }
   template <typename T>
     requires std::is_arithmetic_v<T>
   void Add(T value) {

@@ -44,14 +44,17 @@ def counters(calls, failed="0+0x10", rejected="0+0x10"):
 
 
 def main():
-    panels = json.loads(DASHBOARD.read_text())["panels"]
+    dashboard = DASHBOARD.read_text()
+    # Generic regex formatting bypasses the Prometheus datasource's extra
+    # escaping for quoted PromQL strings (for example config|get).
+    assert "${command:regex}" not in dashboard
+    panels = json.loads(dashboard)["panels"]
     queries = {}
     for panel in panels:
         if panel["title"] in TITLES:
             expr = panel["targets"][0]["expr"]
             for name, value in {
                 "$instance": "node:9100",
-                "${command:regex}": ".*",
                 "$__rate_interval": "5m",
             }.items():
                 expr = expr.replace(name, value)
@@ -95,25 +98,62 @@ def main():
         ("missing command metrics", [], None, "1+0x10"),
     ]
     tests = []
-    for name, inputs, expected, up in cases:
-        tests.append(
-            {
-                "name": name,
-                "interval": "1m",
-                "input_series": inputs
-                + [{"series": 'up{job="lavik",instance="node:9100"}', "values": up}],
-                "promql_expr_test": [
+    for command, selector in (
+        ("get", ".*"),
+        ("get", "get"),
+        ("config|get", r"config\\|get"),
+    ):
+        for name, inputs, expected, up in cases:
+            selected_inputs = [
+                {
+                    **sample,
+                    "series": sample["series"].replace(
+                        'command="get"', f'command="{command}"'
+                    ),
+                }
+                for sample in inputs
+            ]
+            if command == "config|get":
+                # An unescaped | would incorrectly select these two commands.
+                selected_inputs += [
                     {
-                        "expr": "round((" + queries[title] + "), 1e-12)",
-                        "eval_time": "10m",
-                        "exp_samples": []
-                        if expected is None
-                        else [{"labels": OUTPUT, "value": round(expected[i], 12)}],
+                        **sample,
+                        "series": sample["series"].replace(
+                            'command="get"', f'command="{other}"'
+                        ),
                     }
-                    for i, title in enumerate(TITLES)
-                ],
-            }
-        )
+                    for other in ("config", "get")
+                    for sample in counters("0+600x10", "0+600x10", "0+600x10")
+                ]
+            tests.append(
+                {
+                    "name": f"{name}, selector={selector}",
+                    "interval": "1m",
+                    "input_series": selected_inputs
+                    + [
+                        {"series": 'up{job="lavik",instance="node:9100"}', "values": up}
+                    ],
+                    "promql_expr_test": [
+                        {
+                            "expr": "round(("
+                            + queries[title].replace("$command", selector)
+                            + "), 1e-12)",
+                            "eval_time": "10m",
+                            "exp_samples": []
+                            if expected is None
+                            else [
+                                {
+                                    "labels": OUTPUT.replace(
+                                        'command="get"', f'command="{command}"'
+                                    ),
+                                    "value": round(expected[i], 12),
+                                }
+                            ],
+                        }
+                        for i, title in enumerate(TITLES)
+                    ],
+                }
+            )
     with tempfile.TemporaryDirectory(prefix="lavik-request-health-") as tmp:
         path = Path(tmp) / "tests.json"
         path.write_text(

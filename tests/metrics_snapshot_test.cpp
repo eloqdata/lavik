@@ -17,8 +17,10 @@
 #include <array>
 #include <chrono>
 #include <future>
+#include <string>
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/strings/numbers.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/foreign_executor.h"
 #include "bycorf/runtime/runtime.h"
@@ -26,6 +28,7 @@
 #include "gtest/gtest.h"
 #include "lavik/command_table.h"
 #include "lavik/metrics.h"
+#include "lavik/storage/engine.h"
 
 namespace lavik {
 namespace {
@@ -35,6 +38,8 @@ using namespace std::chrono_literals;
 struct Snapshots {
   WorkerMetricsSnapshot empty_, full_, gauges_, totals_, info_, reset_, reused_;
   WorkerMetricsSnapshot errors_;
+  std::array<std::string, 2> exposition_;
+  std::array<double, 2> execution_seconds_;
 };
 
 bycorf::Task<absl::Status> CollectSnapshots(
@@ -91,6 +96,28 @@ bycorf::Task<absl::Status> CollectSnapshots(
                        CommandErrorPrefix::kWrongType},
                       40);
   snapshots.reused_ = co_await CollectWorkerMetrics();
+
+  const auto precision_reset = co_await ResetCommandMetrics();
+  if (!precision_reset.ok()) co_return precision_reset;
+  // Exercise the production exporter after a long uptime, then add a small
+  // increment. Six significant digits lose both the fraction and the delta.
+  // No storage workers/devices are needed for these command-only samples.
+  storage::StorageEngine storage(storage::StorageEngineOptions{});
+  const double frequency = snapshots.reused_.counter_frequency_;
+  const auto initial_ticks =
+      static_cast<std::uint64_t>(1'234'567.891 * frequency);
+  const auto delta_ticks = static_cast<std::uint64_t>(0.001 * frequency);
+  for (std::size_t i = 0; i < snapshots.exposition_.size(); ++i) {
+    const auto ticks = i == 0 ? initial_ticks : delta_ticks;
+    RecordCommandMetric(CommandKind::kGet, ticks);
+    RecordCommandResult(static_cast<std::size_t>(CommandKind::kGet), {}, ticks);
+    snapshots.execution_seconds_[i] =
+        static_cast<double>(initial_ticks + (i == 0 ? 0 : delta_ticks)) /
+        frequency;
+    const auto rendered = co_await RenderPrometheusMetrics(
+        storage, true, &snapshots.exposition_[i]);
+    if (!rendered.ok()) co_return rendered;
+  }
   completed->set_value(std::move(snapshots));
   co_return absl::OkStatus();
 }
@@ -182,6 +209,23 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   EXPECT_EQ(reused.errors_[0].index_,
             static_cast<unsigned>(CommandErrorPrefix::kWrongType));
   EXPECT_EQ(reused.errors_[0].totals_, 1);
+
+  for (const std::string_view family : {"lavik_command_execution_seconds_total",
+                                        "lavik_command_duration_seconds_sum"}) {
+    const std::string prefix = std::string(family) + "{command=\"get\"} ";
+    std::array<double, 2> seconds{};
+    for (std::size_t i = 0; i < snapshots.exposition_.size(); ++i) {
+      const auto& text = snapshots.exposition_[i];
+      const auto position = text.find(prefix);
+      ASSERT_NE(position, std::string::npos) << family;
+      const auto first = position + prefix.size();
+      ASSERT_TRUE(absl::SimpleAtod(
+          std::string_view(text).substr(first, text.find('\n', first) - first),
+          &seconds[i]));
+      EXPECT_DOUBLE_EQ(seconds[i], snapshots.execution_seconds_[i]) << family;
+    }
+    EXPECT_GT(seconds[1], seconds[0]) << family;
+  }
 }
 
 }  // namespace

@@ -1589,7 +1589,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "expr": "(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
           "instant": false,
           "range": true,
           "legendFormat": "{{instance}} {{command}} completed",
@@ -1597,7 +1597,7 @@
         },
         {
           "editorMode": "code",
-          "expr": "(sum by (instance, command) (rate(lavik_command_failed_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "expr": "(sum by (instance, command) (rate(lavik_command_failed_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
           "instant": false,
           "range": true,
           "legendFormat": "{{instance}} {{command}} failed",
@@ -1605,7 +1605,7 @@
         },
         {
           "editorMode": "code",
-          "expr": "(sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "expr": "(sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
           "instant": false,
           "range": true,
           "legendFormat": "{{instance}} {{command}} rejected",
@@ -1787,7 +1787,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "(sum by (instance, command) (rate(lavik_command_failed_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval])) / clamp_min(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "expr": "(sum by (instance, command) (rate(lavik_command_failed_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) / clamp_min(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
           "instant": false,
           "range": true,
           "legendFormat": "{{instance}} {{command}}",
@@ -1879,7 +1879,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "(sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval])) / clamp_min((sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval])) + sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval]))), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "expr": "(sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) / clamp_min((sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) + sum by (instance, command) (rate(lavik_command_rejected_calls_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval]))), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
           "instant": false,
           "range": true,
           "legendFormat": "{{instance}} {{command}}",
@@ -1970,7 +1970,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "(sum by (instance, command) (rate(lavik_command_execution_seconds_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval])) / clamp_min(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"${command:regex}\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
+          "expr": "(sum by (instance, command) (rate(lavik_command_execution_seconds_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])) / clamp_min(sum by (instance, command) (rate(lavik_command_executions_total{job=\"lavik\",instance=~\"$instance\",command=~\"$command\"}[$__rate_interval])), 1e-9)) and on (instance) (up{job=\"lavik\",instance=~\"$instance\"} == 1)",
           "instant": false,
           "range": true,
           "legendFormat": "{{instance}} {{command}}",
