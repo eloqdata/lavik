@@ -1,0 +1,4 @@
+# Errorstats
+errorstat_ERR:count=1
+errorstat_WRONGTYPE:count=91
+

@@ -1,11 +1,78 @@
 {
-  "code_commit": "5c70fdb0ccbfe12caf27eae5d5a4ff8f43b4299e",
-  "binary_sha256": "f6d0da004cbb3f3fca79509ba35b114fbc93e95fa730260172b94282d44eeee8",
-  "grafana": "13.1.0",
-  "prometheus": "3.11.3",
-  "scenario": "Equal sustained LPUSH success, WRONGTYPE execution failure, arity rejection; actual local server responses, no synthetic metrics. INFO capture precedes screenshot traffic.",
-  "images": [
-    "grafana-overview.png",
-    "grafana-request-health.png"
-  ]
+  "prometheus_version": "3.11.3",
+  "grafana_version": "13.1.0",
+  "lavik_sha256": "6c249872a2ed4a5926a40850e03c4d2d42b26f1a33bbb8a2f58e7470d20f7d7a",
+  "ports": {
+    "redis": 38827,
+    "metrics": 43289,
+    "prometheus": 59817,
+    "grafana": 57977
+  },
+  "idle": [
+    {
+      "metric": {
+        "command": "lpush",
+        "instance": "127.0.0.1:43289"
+      },
+      "value": [
+        1793361943.499,
+        "0"
+      ]
+    }
+  ],
+  "failure": [
+    {
+      "metric": {
+        "command": "lpush",
+        "instance": "127.0.0.1:43289"
+      },
+      "value": [
+        1793361985.532,
+        "0.989756530681131"
+      ]
+    }
+  ],
+  "rejection": [
+    {
+      "metric": {
+        "command": "lpush",
+        "instance": "127.0.0.1:43289"
+      },
+      "value": [
+        1793361985.533,
+        "0"
+      ]
+    }
+  ],
+  "response_bytes": 38079,
+  "reset": [
+    {
+      "metric": {
+        "command": "lpush",
+        "instance": "127.0.0.1:43289"
+      },
+      "value": [
+        1793362008.92,
+        "1"
+      ]
+    }
+  ],
+  "down": [],
+  "grafana_frames": 1,
+  "dashboard_version": 1,
+  "panel_queries_checked": 89,
+  "browser": {
+    "loaded_url": "http://127.0.0.1:57977/d/lavik-overview/lavik-overview?orgId=1&from=now-5m&to=now&var-instance=127.0.0.1%3A43289&var-command=lpush",
+    "title": "Lavik Overview - Dashboards - Grafana",
+    "alerts_visible": true,
+    "request_health_panels_visible": 6,
+    "command_filter_applied": true,
+    "lpush_and_get_filters_applied": true,
+    "page_errors": [],
+    "query_errors": []
+  },
+  "source_commit": "b466beac06cc895045685155fedcfa3e923bc32b",
+  "baseline_commit": "0d65fc9984455625ffe1a68e90c9a7afd7905103",
+  "local_ctest_passed": 82,
+  "note": "Functional demo, not a benchmark. One successful LPUSH and 91 WRONGTYPE failures; GET succeeds 60 times."
 }
