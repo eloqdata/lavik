@@ -435,10 +435,11 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
 // responsibility. record_token is caller-owned identity, never a pointer on
 // disk. Sorted Set and Stream ordering across pages must be checked using
 // ValidateOrderedGroupBoundary when their contents are read or recovered.
-// Stream routing keys are runtime-only metadata. The bounded prefix covers
-// message IDs exactly while arbitrarily long group/consumer names fall back
-// to a page read when their prefixes do not decide an ordering comparison.
-struct StreamPageMaxKey {
+// Runtime-only last-key cache: a Sorted Set member or Stream routing key.
+// Long keys fall back to a page read when their prefixes do not decide an
+// ordering comparison. An exact zero-length prefix represents an empty member;
+// a non-exact zero-length prefix represents an unknown boundary.
+struct OrderedPageMaxKey {
   // A message or macro-node ID is one kind byte plus two complete uint64s.
   static constexpr std::size_t kPrefixBytes = 17;
   std::array<char, kPrefixBytes> prefix_{};
@@ -466,13 +467,14 @@ struct OrderedGroupEntry {
   bool retired_ = false;
   // These two doubles are the resident score routing index. They are rebuilt
   // from checked pages during recovery and published with every new directory
-  // view; physical relocation shares them unchanged. No member strings are
-  // retained, so equal-score runs still require pagewise member comparisons.
+  // view; physical relocation shares them unchanged. Equal-score page routing
+  // additionally compares the bounded last-member cache below.
   double min_score_ = 0;
   double max_score_ = 0;
-  // Populated from checked Stream pages, never from the durable page header.
+  // Populated from checked Sorted Set/Stream pages, never from the durable
+  // page header. Replacement pages must not inherit the old version's cache.
   // A fixed allocation makes retained-directory admission cover the cache.
-  mutable StreamPageMaxKey stream_max_key_{};
+  mutable OrderedPageMaxKey max_key_{};
 };
 
 // Recovery candidates add decision tags to the same metadata used by resident
@@ -646,8 +648,10 @@ class OrderedGroupDirectory {
   // Only the key-owning worker may learn missing boundaries from decoded
   // pages. The page's immutable logical version is shared by pinned readers;
   // no allocation or worker-spanning lock occurs after publication.
-  absl::Status RememberStreamPageMaxKey(std::size_t index,
-                                        std::string_view key) const;
+  // Accepts Sorted Set members (including empty) and nonempty Stream keys;
+  // inconsistent boundaries within one logical version report data loss.
+  absl::Status RememberPageMaxKey(std::size_t index,
+                                  std::string_view key) const;
   std::string_view stream_header() const noexcept {
     return has_stream_header()
                ? std::string_view(stream_header_.data(), stream_header_.size())

@@ -1408,6 +1408,84 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto read_owned_page = [&](std::size_t i) {
     return read_page_impl.template operator()<LoadedOrderedGroup>(i);
   };
+  auto find_member_page =
+      [&](double score, std::string_view member,
+          bool known_member) -> Task<absl::StatusOr<std::size_t>> {
+    auto first = directory.LowerBoundScore(score);
+    auto end = directory.UpperBoundScore(score);
+    // For a member already present in the hash graph, a single score-bounded
+    // candidate needs no boundary probe: the caller checks its exact entry.
+    // In particular, a unique score must not gain a redundant page read.
+    if (known_member && end - first <= 1) co_return first;
+    std::optional<OwnedScanPage> candidate;
+    std::size_t candidate_index = kNoPage;
+    // Page maxima are ordered by (score, binary member). Only pages ending
+    // at the wanted score need member comparisons. Missing caches (including
+    // after recovery) and ambiguous long prefixes still use binary search:
+    // read one midpoint's last member at a time, then halve the interval.
+    // The result may be the next score's page, or size() for an append.
+    while (first < end) {
+      const auto mid = first + (end - first) / 2;
+      bool less = false;
+      if (metadata[mid].max_score_ == score) {
+        auto cached = metadata[mid].max_key_.LessThan(member);
+        if (cached.has_value()) {
+          less = *cached;
+        } else {
+          std::optional<AdmittedScanPage<LoadedSortedSetPage>> boundary;
+          std::string_view last;
+          if (const auto retained = probed_pages.find(mid);
+              retained != probed_pages.end()) {
+            const auto& snapshot = retained->second.page_.snapshot_;
+            last = snapshot.encoded_sorted_set_
+                       ? snapshot.encoded_sorted_set_->entries().back().value_
+                       : std::string_view(snapshot.entries_.back().value_);
+          } else if (!ReadOnly(operation)) {
+            // Keep at most the latest owned probe. If it is the selected
+            // page, the source check or writer can reuse its full validation
+            // and admission; unrelated midpoints never fill the probe cache.
+            candidate.reset();
+            auto page = co_await read_owned_page(mid);
+            if (!page.ok()) co_return page.status();
+            candidate.emplace(std::move(*page));
+            candidate_index = mid;
+            const auto& snapshot = candidate->page_.snapshot_;
+            last = snapshot.encoded_sorted_set_
+                       ? snapshot.encoded_sorted_set_->entries().back().value_
+                       : std::string_view(snapshot.entries_.back().value_);
+          } else {
+            auto page = co_await read_page(
+                mid, SortedSetPageReadMode::kIndexedProjection);
+            if (!page.ok()) co_return page.status();
+            boundary.emplace(std::move(*page));
+            if (boundary->page_.indexed_) {
+              const auto& reader = *boundary->page_.indexed_;
+              auto entry = reader.At(reader.size() - 1);
+              if (!entry.ok()) co_return entry.status();
+              last = entry->value_;
+            } else {
+              last = boundary->page_.entries_.back().value_;
+            }
+          }
+          auto remembered = directory.RememberPageMaxKey(mid, last);
+          if (!remembered.ok()) co_return remembered;
+          less = last < member;
+        }
+      }
+      if (less)
+        first = mid + 1;
+      else
+        end = mid;
+    }
+    if (candidate && candidate_index == first)
+      retain_probe(first, std::move(*candidate));
+    co_return first;
+  };
+  auto sparse_page_search = [&](std::size_t count) {
+    return count == 1 ||
+           count <= metadata.size() / std::max<std::size_t>(
+                                          1, std::bit_width(metadata.size()));
+  };
   auto remove_selected = [&]() -> Task<absl::Status> {
     const auto count = result.members_.size();
     if (count == 0) co_return absl::OkStatus();
@@ -2115,34 +2193,41 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     const auto member = operation.members_.front();
     const auto score = members.at(member).before_;
     if (!score) co_return result;
-    // The member index supplies the score, not a page identity. Equal-score
-    // runs may span pages, so compare exact members within that interval;
-    // Fenwick supplies the skipped prefix without loading unrelated pages.
-    const auto first = directory.LowerBoundScore(*score);
-    const auto end = directory.UpperBoundScore(*score);
-    for (std::size_t i = first; i < end; ++i) {
+    // Locate one page by its maximum (score, member), then use Fenwick for
+    // the skipped prefix without loading the intervening equal-score pages.
+    auto found_page = co_await find_member_page(*score, member, true);
+    if (!found_page.ok()) co_return found_page.status();
+    const auto i = *found_page;
+    if (i < metadata.size()) {
       auto page =
           co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
       if (!page.ok()) co_return page.status();
-      if (page->page_.indexed_) {
-        const auto& reader = *page->page_.indexed_;
-        auto slot = reader.LowerBound(*score, member);
-        if (!slot.ok()) co_return slot.status();
-        if (*slot == reader.size()) continue;
-        auto entry = reader.At(*slot);
-        if (!entry.ok()) co_return entry.status();
-        if (entry->score_ != *score || entry->value_ != member) continue;
-        const auto rank = directory.CountBefore(i) + *slot;
-        result.rank_ = operation.reverse_ ? result.length_ - 1 - rank : rank;
-        result.rank_score_ = *score;
-        co_return result;
-      }
-      const auto& entries = page->page_.entries_;
-      for (std::size_t j = 0; j < entries.size(); ++j) {
-        if (entries[j].value_ != member) continue;
-        if (entries[j].score_ != *score)
-          co_return absl::DataLossError("Sorted Set member score mismatch");
-        const auto rank = directory.CountBefore(i) + j;
+      auto slot = [&]() -> absl::StatusOr<std::optional<std::size_t>> {
+        if (page->page_.indexed_) {
+          const auto& reader = *page->page_.indexed_;
+          auto at = reader.LowerBound(*score, member);
+          if (!at.ok()) return at.status();
+          if (*at == reader.size()) return std::nullopt;
+          auto entry = reader.At(*at);
+          if (!entry.ok()) return entry.status();
+          if (entry->score_ == *score && entry->value_ == member) return *at;
+          return std::nullopt;
+        }
+        const auto& entries = page->page_.entries_;
+        const auto at = std::lower_bound(
+            entries.begin(), entries.end(),
+            OrderedCollectionEntryView{member, *score},
+            [](const auto& entry, const auto& key) {
+              return entry.score_ < key.score_ ||
+                     (entry.score_ == key.score_ && entry.value_ < key.value_);
+            });
+        if (at != entries.end() && at->score_ == *score && at->value_ == member)
+          return at - entries.begin();
+        return std::nullopt;
+      }();
+      if (!slot.ok()) co_return slot.status();
+      if (*slot) {
+        const auto rank = directory.CountBefore(i) + **slot;
         result.rank_ = operation.reverse_ ? result.length_ - 1 - rank : rank;
         result.rank_score_ = *score;
         co_return result;
@@ -2230,16 +2315,22 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto located = locate_page_sources(i, snapshot);
     if (!located.ok()) co_return located.status();
   }
-  // The two resident doubles bound old-score candidates without reading
-  // unrelated pages. Equal-score runs still need candidate page reads. Sort
-  // and merge requested intervals so a batch reads an overlapping page only
-  // once; interval storage is covered by the per-input reservation.
+  // Sparse requests binary-search old (score, member) boundaries. Dense
+  // batches merge score intervals and scan once rather than paying M log P
+  // probes. Both paths coalesce selected pages before loading mutation data.
   std::vector<std::pair<std::size_t, std::size_t>> source_ranges;
   source_ranges.reserve(members.size());
+  const bool sparse_sources = sparse_page_search(remaining_sources);
   for (const auto& [member, state] : members) {
     if (!state.before_ || state.source_ != kNoPage) continue;
-    const auto first = directory.LowerBoundScore(*state.before_);
-    const auto end = directory.UpperBoundScore(*state.before_);
+    auto first = directory.LowerBoundScore(*state.before_);
+    auto end = directory.UpperBoundScore(*state.before_);
+    if (sparse_sources) {
+      auto found = co_await find_member_page(*state.before_, member, true);
+      if (!found.ok()) co_return found.status();
+      first = *found;
+      end = std::min(first + 1, end);
+    }
     if (first >= end)
       co_return absl::DataLossError("member score lies outside ordered pages");
     source_ranges.emplace_back(first, end);
@@ -2249,7 +2340,16 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   for (const auto& [first, end] : source_ranges) {
     for (std::size_t i = std::max(first, scanned_end);
          i < end && remaining_sources != 0; ++i) {
-      if (probed_pages.contains(i)) continue;
+      if (const auto probe = probed_pages.find(i);
+          probe != probed_pages.end()) {
+        // Binary routing may have retained the final page after the initial
+        // probe/source check. Sparse ranges contain only unresolved sources.
+        if (sparse_sources) {
+          auto located = locate_page_sources(i, probe->second.page_.snapshot_);
+          if (!located.ok()) co_return located.status();
+        }
+        continue;
+      }
       auto page = co_await read_owned_page(i);
       if (!page.ok()) co_return page.status();
       const auto& snapshot = page->page_.snapshot_;
@@ -2299,39 +2399,56 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
            (*a.second->after_ == *b.second->after_ && a.first < b.first);
   });
   // Original page bounds remain stable fences for the entire batch, even
-  // when boundary members move. Scores alone route strict inequalities;
-  // only a tie with a page's maximum needs its last member decoded. Skip
-  // gaps in the request with an in-memory seek, preserving sequential reads
-  // for equal-score runs and reusing each boundary page within the batch.
+  // when boundary members move. Sparse destinations use binary routing;
+  // dense batches retain a single ordered walk with shared boundary reads.
   std::size_t next = 0;
-  for (std::size_t i = 0; next != pending.size() && i < metadata.size(); ++i) {
-    i = std::max(
-        i, std::min(directory.LowerBoundScore(*pending[next].second->after_),
-                    metadata.size() - 1));
-    std::optional<OwnedScanPage> boundary;
-    while (next != pending.size()) {
-      const auto& [member, state] = pending[next];
-      if (i + 1 != metadata.size()) {
-        if (*state->after_ > metadata[i].max_score_) break;
-        if (*state->after_ == metadata[i].max_score_) {
-          if (!boundary) {
-            auto page = co_await read_owned_page(i);
-            if (!page.ok()) co_return page.status();
-            boundary.emplace(std::move(*page));
-          }
-          const auto& snapshot = boundary->page_.snapshot_;
-          const std::string_view last_member =
-              snapshot.encoded_sorted_set_
-                  ? snapshot.encoded_sorted_set_->entries().back().value_
-                  : std::string_view(snapshot.entries_.back().value_);
-          if (member > last_member) break;
-        }
-      }
+  if (sparse_page_search(pending.size())) {
+    for (const auto& [member, state] : pending) {
+      auto found = co_await find_member_page(*state->after_, member, false);
+      if (!found.ok()) co_return found.status();
+      const auto i = std::min(*found, metadata.size() - 1);
       state->destination_ = i;
       modified.insert(i);
       ++next;
     }
-    if (boundary && modified.contains(i)) retain_probe(i, std::move(*boundary));
+  } else {
+    for (std::size_t i = 0; next != pending.size() && i < metadata.size();
+         ++i) {
+      i = std::max(
+          i, std::min(directory.LowerBoundScore(*pending[next].second->after_),
+                      metadata.size() - 1));
+      std::optional<OwnedScanPage> boundary;
+      while (next != pending.size()) {
+        const auto& [member, state] = pending[next];
+        if (i + 1 != metadata.size()) {
+          if (*state->after_ > metadata[i].max_score_) break;
+          if (*state->after_ == metadata[i].max_score_) {
+            auto less = metadata[i].max_key_.LessThan(member);
+            if (!less.has_value()) {
+              if (!boundary) {
+                auto page = co_await read_owned_page(i);
+                if (!page.ok()) co_return page.status();
+                boundary.emplace(std::move(*page));
+              }
+              const auto& snapshot = boundary->page_.snapshot_;
+              const std::string_view last_member =
+                  snapshot.encoded_sorted_set_
+                      ? snapshot.encoded_sorted_set_->entries().back().value_
+                      : std::string_view(snapshot.entries_.back().value_);
+              status = directory.RememberPageMaxKey(i, last_member);
+              if (!status.ok()) co_return status;
+              less = last_member < member;
+            }
+            if (*less) break;
+          }
+        }
+        state->destination_ = i;
+        modified.insert(i);
+        ++next;
+      }
+      if (boundary && modified.contains(i))
+        retain_probe(i, std::move(*boundary));
+    }
   }
   if (next != pending.size())
     co_return absl::DataLossError("Sorted Set destination scan ended early");
