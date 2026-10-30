@@ -81,6 +81,9 @@ struct NativeSessionObservation {
   std::atomic<std::uint64_t> full_succeeded_{0};
   std::atomic<bool> promotion_complete_{false};
   bool result_recorded_ = false;  // worker zero only
+  // Set by worker zero after a sample that began with every flow drained.
+  // A session completing during collection needs one final sample before GC.
+  bool drained_sampled_ = false;
   absl::Status control_failure_;  // read only after control completion
   std::atomic<bool> expected_cancel_{false};
   bool control_done_ =

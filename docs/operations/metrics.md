@@ -59,7 +59,10 @@ Collection remains pull-based: the HTTP request asks each owner worker for its
 metrics. Native replication's asynchronous `ObserveProgress()` is shared with
 `INFO replication`; it copies flow state on its owner and reads the existing
 consistent applied frontier. A worker-zero sampler updates observation clocks
-and cumulative totals once per second. The sampler does not control ACKs,
+and cumulative totals once per second. Collection batches all sessions and flows
+on each participating worker into one submission. Sampling skips output rows and
+INFO identity copies; HTTP and INFO still request fresh, validated snapshots.
+The sampler does not control ACKs,
 timeouts, reconnects or authorization, and adds no clock read to each ONLINE
 event. A scrape validates relationship/history generation before exposing active
 progress. Counter and terminal-result updates may lag by one sample interval.

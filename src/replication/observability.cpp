@@ -101,8 +101,6 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
   const auto epoch = role_epoch_.load(std::memory_order_acquire);
   const auto active = active_replica_session_;
   const auto history = history_id_;
-  const auto sources = observation_sources_;
-  const auto targets = observation_targets_;
   ReplicationObservabilitySnapshot view;
   view.available_ = true;
   const auto now = SteadyNanos();
@@ -149,15 +147,51 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
         observation.full_started_.load(std::memory_order_acquire);
     const bool full = started != 0 && observation.full_succeeded_.load(
                                           std::memory_order_acquire) == 0;
-    ReplicationFlowObservation row;
+    const bool connected = current && local.connected_;
+    bool comparable = false;
+    std::array<bool, 4> pending{};
+    // A fresh ONLINE flow may not have sent an event yet. Its accepted ACK
+    // cursor is already the lower bound of sent work.
+    sent = std::max(sent, ack);
+    if (connected && local.online_) {
+      if (side == ReplicationSide::kSource && published && ack != 0 &&
+          ack <= *published && sent <= *published) {
+        comparable = true;
+        pending[0] = *published > sent;
+        pending[2] = sent > ack;
+      } else if (side == ReplicationSide::kTarget && applied &&
+                 local.received_ >= *applied && *applied >= local.ack_sent_) {
+        comparable = true;
+        pending[1] = local.received_ > *applied;
+        pending[2] = *applied > local.ack_sent_;
+      }
+    }
+    pending[3] = connected && full;
+    const std::array<std::uint64_t, 4> progress{
+        local.bytes_, applied.value_or(0),
+        side == ReplicationSide::kSource ? ack : local.ack_sent_,
+        local.bytes_ + local.partitions_ + static_cast<unsigned>(local.phase_)};
+    if (sample) {
+      for (unsigned step = 0; step != progress.size(); ++step)
+        previous.clocks_[step].Sample(pending[step], progress[step], now);
+      return;
+    }
+    if (!current) return;
+    // The periodic sampler has no output consumer. In particular, do not copy
+    // INFO identities or build output rows merely to update sampled clocks.
+    auto& row = view.flows_.emplace_back();
     row.side_ = side;
     row.worker_ = owner;
     row.flow_ = flow;
     row.session_id_ = session_id;
     row.history_id_ = session_history;
     row.peer_id_ = peer;
-    row.connected_ = current && local.connected_;
-    row.phase_ = local.phase_;
+    row.connected_ = connected;
+    row.comparable_ = comparable;
+    row.pending_ = pending;
+    row.phase_ = full && local.phase_ == FullSyncPhase::kOnline
+                     ? FullSyncPhase::kActivate
+                     : local.phase_;
     row.full_ = full;
     row.phase_seconds_ = local.phase_started_ && now >= local.phase_started_
                              ? (now - local.phase_started_) / 1e9
@@ -167,53 +201,28 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     row.events_ = local.events_;
     row.full_items_ = local.full_items_;
     row.partitions_ = local.partitions_;
-    // A fresh ONLINE flow may not have sent an event yet. Its accepted ACK
-    // cursor is already the lower bound of sent work.
-    sent = std::max(sent, ack);
-    if (row.connected_ && local.online_) {
-      if (side == ReplicationSide::kSource && published && ack != 0 &&
-          ack <= *published && sent <= *published) {
-        row.comparable_ = true;
+    if (comparable) {
+      if (side == ReplicationSide::kSource) {
         row.published_next_lsn_ = published;
         row.ack_next_lsn_ = ack;
         row.pending_events_ = *published - ack;
-        row.pending_[0] = *published > sent;
-        row.pending_[2] = sent > ack;
-      } else if (side == ReplicationSide::kTarget && applied &&
-                 local.received_ >= *applied && *applied >= local.ack_sent_) {
-        row.comparable_ = true;
+      } else {
         row.received_next_lsn_ = local.received_;
         row.applied_next_lsn_ = applied;
-        // Zero is the local "no successful ACK write yet" sentinel, not
-        // an observed next-LSN. Pending ACK work is still known below.
+        // Zero means no successful ACK write, not an observed next-LSN.
         if (local.ack_sent_ != 0) row.ack_next_lsn_ = local.ack_sent_;
         row.pending_events_ = local.received_ - *applied;
-        row.pending_[1] = local.received_ > *applied;
-        row.pending_[2] = *applied > local.ack_sent_;
       }
     }
-    if (full && row.phase_ == FullSyncPhase::kOnline)
-      row.phase_ = FullSyncPhase::kActivate;
-    row.pending_[3] = row.connected_ && full;
-    const std::array<std::uint64_t, 4> progress{
-        local.bytes_, applied.value_or(0),
-        side == ReplicationSide::kSource ? ack : local.ack_sent_,
-        local.bytes_ + local.partitions_ + static_cast<unsigned>(local.phase_)};
-    for (unsigned step = 0; step != progress.size(); ++step) {
-      if (sample)
-        previous.clocks_[step].Sample(row.pending_[step], progress[step], now);
+    for (unsigned step = 0; step != progress.size(); ++step)
       row.no_progress_seconds_[step] =
-          previous.clocks_[step].Age(row.pending_[step], now);
-    }
-    if (current) view.flows_.push_back(std::move(row));
+          previous.clocks_[step].Age(pending[step], now);
   };
 
   auto finish = [&](detail::NativeSessionObservation& observation,
                     ReplicationSide side, std::uint64_t id,
                     const std::string& session_history, const std::string& peer,
-                    bool ended,
-                    const std::vector<detail::NativeFlowObservation>& flows,
-                    bool expected_cancel) {
+                    bool ended, const auto& flows, bool expected_cancel) {
     if (!sample || observation.result_recorded_) return;
     const auto started =
         observation.full_started_.load(std::memory_order_acquire);
@@ -236,7 +245,8 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     absl::Status failure =
         ended ? observation.control_failure_ : absl::OkStatus();
     const detail::NativeFlowObservation* first_failure = nullptr;
-    for (const auto& flow : flows) {
+    for (const auto& cut : flows) {
+      const auto& flow = cut.local_;
       if (flow.phase_ > result.phase_) result.phase_ = flow.phase_;
       if (!flow.failure_.ok() && !absl::IsCancelled(flow.failure_) &&
           (!first_failure || flow.failure_at_ < first_failure->failure_at_))
@@ -285,88 +295,135 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
         result.detail_);
   };
 
-  for (const auto& session : sources) {
-    auto& observation = session->observation_;
-    const auto flows = observation.flows_;
-    std::vector<detail::NativeFlowObservation> copies;
-    if (!flows) continue;
-    copies.reserve(flows->size());
-    for (unsigned flow = 0; flow != flows->size(); ++flow) {
-      struct Cut {
-        detail::NativeFlowObservation flow_;
-        std::uint64_t published_ = 0, sent_ = 0, ack_ = 0;
-        bool active_ = false;
-      };
-      const auto cut =
-          co_await bycorf::SubmitTo(flow, [this, session, flows, flow] {
-            const auto log = storage_->LocalReplicationLogInfo();
-            const auto progress = session->Progress(flow);
-            const auto sent = session->HighestSentNextLsn(flow);
-            return Cut{(*flows)[flow], log.tail_lsn_ + 1, sent,
-                       progress ? progress->lsn_ : 0,
-                       log.state_ == storage::ReplicationLogState::kActive};
-          });
-      copies.push_back(cut.flow_);
-      const bool current = !session->cancelled() &&
-                           session->source_history_id_ == history_id_ &&
-                           !replication_shutdown_requested_;
-      append(observation, ReplicationSide::kSource, session->id_,
-             session->source_history_id_, session->node_id_, flow, cut.flow_,
-             current,
-             cut.active_ ? std::optional(cut.published_) : std::nullopt,
-             std::nullopt, cut.sent_, cut.ack_);
+  struct FlowCut {
+    detail::NativeFlowObservation local_;
+    std::uint64_t sent_ = 0, ack_ = 0;
+  };
+  struct SourceCut {
+    std::shared_ptr<MasterSession> session_;
+    std::shared_ptr<std::vector<detail::NativeFlowObservation>> owners_;
+    std::vector<FlowCut> flows_;
+    bool drained_ = false;
+  };
+  struct TargetCut {
+    std::shared_ptr<ReplicaSession> session_;
+    std::shared_ptr<std::vector<detail::NativeFlowObservation>> owners_;
+    std::vector<FlowCut> flows_;
+    bool drained_ = false;
+  };
+  std::vector<SourceCut> source_cuts;
+  std::vector<TargetCut> target_cuts;
+  source_cuts.reserve(observation_sources_.size());
+  target_cuts.reserve(observation_targets_.size());
+  std::size_t flow_count = 0;
+  unsigned owner_count = 0;
+  for (const auto& session : observation_sources_) {
+    const auto owners = session->observation_.flows_;
+    if (!owners) continue;
+    flow_count += owners->size();
+    owner_count = std::max(owner_count, static_cast<unsigned>(owners->size()));
+    source_cuts.push_back(
+        {session, owners, std::vector<FlowCut>(owners->size()),
+         !session->control_active() && session->connected_flows() == 0});
+  }
+  for (const auto& session : observation_targets_) {
+    const auto owners = session->observation_.flows_;
+    const auto count = owners ? owners->size() : 0;
+    flow_count += count;
+    owner_count = std::max(owner_count, static_cast<unsigned>(count));
+    target_cuts.push_back(
+        {session, owners, std::vector<FlowCut>(count),
+         session->observation_.control_done_ &&
+             session->active_flows_.load(std::memory_order_acquire) == 0 &&
+             session->active_transaction_applies_.load(
+                 std::memory_order_acquire) == 0});
+  }
+  if (!sample) view.flows_.reserve(flow_count);
+  const unsigned workers = storage_->worker_count();
+  owner_count = std::min(owner_count, workers);
+  std::vector<std::optional<std::uint64_t>> published(
+      source_cuts.empty() ? 0 : owner_count);
+  if (flow_count != 0) {
+    // Retain each session and its exact flow allocation until all submissions
+    // return. Containers are sized before yielding; callbacks write only the
+    // entries owned by that worker. One submission collects every peer and
+    // every target flow on that owner, including mismatched worker layouts.
+    for (unsigned worker = 0; worker != owner_count; ++worker) {
+      (void)co_await bycorf::SubmitTo(worker, [&, worker] {
+        if (!source_cuts.empty()) {
+          const auto log = storage_->LocalReplicationLogInfo();
+          if (log.state_ == storage::ReplicationLogState::kActive)
+            published[worker] = log.tail_lsn_ + 1;
+        }
+        for (auto& source : source_cuts) {
+          if (worker >= source.flows_.size()) continue;
+          auto& cut = source.flows_[worker];
+          cut.local_ = (*source.owners_)[worker];
+          cut.sent_ = source.session_->HighestSentNextLsn(worker);
+          const auto progress = source.session_->Progress(worker);
+          cut.ack_ = progress ? progress->lsn_ : 0;
+        }
+        for (auto& target : target_cuts)
+          for (unsigned flow = worker; flow < target.flows_.size();
+               flow += workers)
+            target.flows_[flow].local_ = (*target.owners_)[flow];
+        return true;
+      });
     }
-    const bool ended =
-        !session->control_active() && session->connected_flows() == 0;
+  }
+
+  // All asynchronous collection precedes validation and rendering. Worker zero
+  // cannot replace a relationship while these final checks/rows run, so each
+  // source is validated once instead of searching all peers again for each row.
+  for (const auto& cut : source_cuts) {
+    const auto& session = cut.session_;
+    auto& observation = session->observation_;
+    const bool current = !session->cancelled() &&
+                         session->source_history_id_ == history_id_ &&
+                         !replication_shutdown_requested_;
+    for (unsigned flow = 0; flow != cut.flows_.size(); ++flow) {
+      const auto& local = cut.flows_[flow];
+      append(observation, ReplicationSide::kSource, session->id_,
+             session->source_history_id_, session->node_id_, flow, local.local_,
+             current, published[flow], std::nullopt, local.sent_, local.ack_);
+    }
     finish(observation, ReplicationSide::kSource, session->id_,
-           session->source_history_id_, session->node_id_, ended, copies,
+           session->source_history_id_, session->node_id_, cut.drained_,
+           cut.flows_,
            replication_shutdown_requested_ ||
                observation.expected_cancel_.load(std::memory_order_acquire));
+    if (sample) observation.drained_sampled_ = cut.drained_;
   }
-  for (const auto& session : targets) {
+  for (const auto& cut : target_cuts) {
+    const auto& session = cut.session_;
     auto& observation = session->observation_;
-    const auto flows = observation.flows_;
-    std::vector<detail::NativeFlowObservation> copies;
-    if (flows) {
-      copies.reserve(flows->size());
-      for (unsigned flow = 0; flow != flows->size(); ++flow) {
-        copies.push_back(co_await bycorf::SubmitTo(
-            flow % storage_->worker_count(),
-            [flows, flow] { return (*flows)[flow]; }));
-      }
-    }
     const auto frontier = session->applied_frontier_;
     auto applied = frontier ? frontier->TrySnapshot()
                             : absl::StatusOr<std::vector<std::uint64_t>>(
                                   absl::UnavailableError("no native frontier"));
     const bool current = active_replica_session_ == session &&
-                         !session->cancelled() && flows == observation.flows_;
-    for (unsigned flow = 0; flow != copies.size(); ++flow) {
+                         !session->cancelled() &&
+                         cut.owners_ == observation.flows_;
+    for (unsigned flow = 0; flow != cut.flows_.size(); ++flow) {
       const auto cursor = applied.ok() && flow < applied->size()
                               ? std::optional((*applied)[flow])
                               : std::nullopt;
       append(observation, ReplicationSide::kTarget, session->session_id_,
              session->source_history_id_, observation.peer_id_, flow,
-             copies[flow], current, std::nullopt, cursor, 0, 0);
+             cut.flows_[flow].local_, current, std::nullopt, cursor, 0, 0);
     }
-    const bool ended =
-        observation.control_done_ &&
-        session->active_flows_.load(std::memory_order_acquire) == 0 &&
-        session->active_transaction_applies_.load(std::memory_order_acquire) ==
-            0;
     finish(observation, ReplicationSide::kTarget, session->session_id_,
-           session->source_history_id_, observation.peer_id_, ended, copies,
+           session->source_history_id_, observation.peer_id_, cut.drained_,
+           cut.flows_,
            observation.expected_cancel_.load(std::memory_order_acquire));
+    if (sample) observation.drained_sampled_ = cut.drained_;
   }
   if (sample) {
     std::erase_if(observation_sources_, [](const auto& session) {
-      return !session->control_active() && session->connected_flows() == 0;
+      return session->observation_.drained_sampled_;
     });
     std::erase_if(observation_targets_, [](const auto& session) {
-      return session->observation_.control_done_ &&
-             session->active_flows_.load(std::memory_order_acquire) == 0 &&
-             session->active_transaction_applies_.load(
-                 std::memory_order_acquire) == 0;
+      return session->observation_.drained_sampled_;
     });
   }
   view.following_ =
@@ -393,7 +450,7 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     view.full_promotion_complete_ =
         active->observation_.promotion_complete_.load(
             std::memory_order_acquire);
-  view.failure_detail_ = failure_reason_;
+  if (!sample) view.failure_detail_ = failure_reason_;
   if (serve_stale != nullptr)
     view.readable_ =
         dataset_read_state(*serve_stale) == DatasetReadState::kReadable;
@@ -406,6 +463,9 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
   if (sample)
     loading_progress_clock_.Sample(view.loading_ && !view.waiting_,
                                    recovery_progress, now);
+  // Sampling maintains clocks and terminal results, but has no snapshot
+  // consumer.
+  if (sample) co_return view;
   view.loading_no_progress_seconds_ =
       loading_progress_clock_.Age(view.loading_ && !view.waiting_, now);
   if (epoch != role_epoch_.load(std::memory_order_acquire) ||
@@ -414,15 +474,6 @@ ReplicationManager::ReplicationGroup::ObserveProgress(
     view.available_ = false;
     view.flows_.clear();
   }
-  // Source control/flow cancellation need not change the group role epoch.
-  // A peer retired during an asynchronous scrape must disappear immediately.
-  std::erase_if(view.flows_, [&](const auto& row) {
-    return row.side_ == ReplicationSide::kSource &&
-           std::any_of(
-               sources.begin(), sources.end(), [&](const auto& session) {
-                 return session->id_ == row.session_id_ && session->cancelled();
-               });
-  });
   view.totals_ = observation_totals_.totals_;
   view.full_totals_ = observation_totals_.full_totals_;
   view.retries_ = observation_totals_.retries_;

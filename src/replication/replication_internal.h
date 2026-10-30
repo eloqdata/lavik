@@ -1652,12 +1652,6 @@ struct MasterSession {
       return;
     }
     ReplicaFlowProgress& progress = flows_[flow_id];
-    if (phase == ReplicationPhase::kReady &&
-        !(*observation_.flows_)[flow_id].online_) {
-      auto& observation = (*observation_.flows_)[flow_id];
-      observation.online_ = true;
-      observation.Phase(FullSyncPhase::kOnline, SteadyNanos());
-    }
     if (phase == ReplicationPhase::kReady && cursor.fragment_index_ == 0) {
       std::uint64_t unset = 0;
       (void)progress.proven_origin_lsn_.compare_exchange_strong(

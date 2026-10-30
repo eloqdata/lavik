@@ -2,7 +2,7 @@
 # Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
 """Native progress semantics through INFO and real HTTP scrapes."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import json
 import os
 from pathlib import Path
@@ -13,7 +13,7 @@ import threading
 import time
 from urllib.request import urlopen
 
-from redis_follower_smoke import H, process
+from redis_follower_smoke import Client, H, process
 
 # Retained evidence, also used by the native ACK wire-peer test.
 METRIC_SAMPLES = {}
@@ -100,6 +100,18 @@ def online_progress(binary, root):
                     (source, source_metrics),
                     (target, target_metrics),
                 ]:
+                    # Each process samples terminal results independently.
+                    wait(
+                        "local FULL result was not sampled",
+                        lambda: sum(
+                            values(
+                                scrape(metrics),
+                                "lavik_replication_fullsync_results_total",
+                                result="success",
+                            )
+                        )
+                        == 1,
+                    )
                     record(
                         root,
                         "source-idle" if client is source else "target-idle",
@@ -363,6 +375,139 @@ def full_cancel_during_scrapes(binary, root):
                 (root / "scrapes.json").write_text(json.dumps(samples))
 
 
+def multiple_peers_and_owners(binary, root):
+    """Owner batching preserves each peer, flow and final counter across retirement."""
+    root.mkdir()
+    ports = [H.free_port() for _ in range(3)]
+    with ExitStack() as stack:
+        source, source_port, _ = stack.enter_context(
+            process(
+                binary,
+                root / "source",
+                "source",
+                workers=3,
+                max_memory="4G",
+                metrics_port=ports[0],
+            )
+        )
+        assert source.call("SET", "seed", "snapshot") == "OK"
+        targets = []
+        for index, workers in enumerate((1, 2)):
+            target, _, _ = stack.enter_context(
+                process(
+                    binary,
+                    root / f"target-{index}",
+                    "target",
+                    workers=workers,
+                    metrics_port=ports[index + 1],
+                )
+            )
+            targets.append(target)
+            assert target.call("LAVIK.REPLICAOF", "127.0.0.1", source_port) == "OK"
+            wait(
+                "peer FULL did not complete",
+                lambda: info(target).get("lavik_replication_last_full_result")
+                == "success",
+            )
+            observation = info(target)
+            assert observation["lavik_replication_progress_flows"] == "3", observation
+        wait(
+            "source did not observe both peers",
+            lambda: values(
+                scrape(ports[0]),
+                "lavik_replication_native_flow_connections",
+                side="source",
+            )
+            == [2, 2, 2],
+        )
+
+        def total(port, suffix):
+            return sum(values(scrape(port), "lavik_replication_" + suffix))
+
+        # FULL result sampling has already drained its byte deltas on each node.
+        wait(
+            "source FULL totals missing",
+            lambda: sum(
+                values(
+                    scrape(ports[0]),
+                    "lavik_replication_fullsync_results_total",
+                    result="success",
+                )
+            )
+            == 2,
+        )
+        before = [total(port, "transfer_bytes_total") for port in ports]
+        stop, failures = threading.Event(), []
+
+        def collect():
+            client = Client(source_port)
+            try:
+                while not stop.is_set():
+                    observation = info(client)
+                    if observation["lavik_replication_observation_available"] == "1":
+                        rows = [
+                            dict(
+                                part.split("=", 1)
+                                for part in observation[
+                                    f"lavik_replication_progress{i}"
+                                ].split(",")
+                            )
+                            for i in range(
+                                int(observation["lavik_replication_progress_flows"])
+                            )
+                        ]
+                        assert len(
+                            {(row["session"], row["flow"]) for row in rows}
+                        ) == len(rows)
+                    for port in ports:
+                        scrape(port)
+                    stop.wait(0.01)
+            except Exception as error:
+                failures.append(repr(error))
+            finally:
+                client.close()
+
+        thread = threading.Thread(target=collect)
+        thread.start()
+        try:
+            for index in range(128):
+                assert source.call("SET", f"online-{index}", "value") == "OK"
+            assert source.call("SET", "fragmented", "x" * (2 * 1024 * 1024)) == "OK"
+            assert source.call("WAIT", 2, 10000) == 2
+            wait(
+                "batched collector lost ONLINE events",
+                lambda: [total(port, "transfer_events_total") for port in ports]
+                == [258, 129, 129],
+            )
+            after = [total(port, "transfer_bytes_total") for port in ports]
+            delta = [end - start for start, end in zip(before, after)]
+            assert delta[0] == delta[1] + delta[2] and delta[1] == delta[2], delta
+            assert targets[0].call("LAVIK.REPLICAOF", "NO", "ONE") == "OK"
+            wait(
+                "retired peer remained in source rows",
+                lambda: values(
+                    scrape(ports[0]),
+                    "lavik_replication_native_flow_connections",
+                    side="source",
+                )
+                == [1, 1, 1],
+            )
+            assert source.call("SET", "remaining-peer", "value") == "OK"
+            assert source.call("WAIT", 1, 10000) == 1
+            wait(
+                "retirement lost or duplicated process counters",
+                lambda: [total(port, "transfer_events_total") for port in ports]
+                == [259, 129, 130],
+            )
+            for index, client in enumerate((source, *targets)):
+                record(root, f"retired-{index}", client, ports[index])
+        finally:
+            stop.set()
+            thread.join(timeout=15)
+            assert not thread.is_alive()
+        assert not failures, failures
+
+
 def main():
     binary = sys.argv[1]
     parent = os.environ.get("LAVIK_TEST_DATA_DIR")
@@ -370,6 +515,7 @@ def main():
     print(f"evidence: {root}", flush=True)
     online_progress(binary, root)
     full_cancel_during_scrapes(binary, root / "cancel")
+    multiple_peers_and_owners(binary, root / "multiple-peers")
     for fault in (
         "LAVIK_REPLICATION_FAIL_PROMOTE_ONCE",
         "LAVIK_REPLICATION_FAIL_POPULATION_FINALIZE",

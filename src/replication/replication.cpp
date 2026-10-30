@@ -10491,8 +10491,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFullSync(
         ack_state->changed_.NotifyAll(*bycorf::ThisWorker().self_);
         absl::Status sent = co_await stream.WriteAllV(wire_batch);
         if (!sent.ok()) co_return sent;
-        for (const auto& iov : wire_batch)
-          ack_state->observation_->bytes_ += iov.iov_len;
+        ack_state->observation_->bytes_ += batch_bytes;
         ack_state->observation_->full_items_ += pending_acks.size();
         // Sending bytes is protocol progress even when the command's final
         // fragment (and therefore its ACK) is still minutes away.
@@ -11302,6 +11301,9 @@ auto ReplicationManager::ReplicationGroup::EnterMasterFlowBacklog(
         "malformed replication backlog cursor ACK");
   }
   session->SetBacklogCursor(flow_id, ReplicationPhase::kReady, cursor);
+  auto& observation = (*session->observation_.flows_)[flow_id];
+  observation.online_ = true;
+  observation.Phase(FullSyncPhase::kOnline, SteadyNanos());
   session->SetHighestSentNextLsn(flow_id, cursor.lsn_);
   bycorf::ThisWorker().self_->Spawn(
       MonitorBacklogStall(session, flow_id, stream.NativeFd(),
@@ -11482,6 +11484,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
     wire_batch.reserve(batch->frames_.size() * 2);
     std::vector<std::uint64_t> pending_acks;
     pending_acks.reserve(batch->frames_.size());
+    std::size_t wire_bytes = 0;
     for (const auto& frame : batch->frames_) {
       if (frame.payload_.size() > kMaxDataFrame - kOnlinePayloadHeaderBytes) {
         co_return absl::ResourceExhaustedError(
@@ -11514,6 +11517,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
       wire_batch.push_back(
           iovec{.iov_base = const_cast<char*>(frame.payload_.data()),
                 .iov_len = frame.payload_.size()});
+      wire_bytes += kOnlineWireHeaderBytes + frame.payload_.size();
       const bool last =
           (frame.header_.flags_ &
            static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast)) !=
@@ -11536,7 +11540,7 @@ auto ReplicationManager::ReplicationGroup::RunMasterFlowBacklog(
       // have consumed even if its corresponding ACK is lost on disconnect.
       session->SetHighestSentNextLsn(flow_id, batch->next_.lsn_);
       auto& observation = (*session->observation_.flows_)[flow_id];
-      for (const auto& iov : wire_batch) observation.bytes_ += iov.iov_len;
+      observation.bytes_ += wire_bytes;
       observation.events_ += pending_acks.size();
     }
     // Keep sending independently from the durable cursor. In particular,
