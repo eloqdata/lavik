@@ -1829,6 +1829,22 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     };
     for (std::size_t ordinal = 0;
          !cursor.done_ && ordinal < end_page - first_page;) {
+      if (operation.kind_ == SortedSetOperationKind::kCount &&
+          operation.range_mode_ == SortedSetRangeMode::kScore &&
+          whole_score_page(page_index(ordinal))) {
+        // Only the two score-boundary pages can be partially covered. Once
+        // inside the interval, count the complete run through the retained
+        // rank index instead of reading every payload. Leave the opposite
+        // partial page to the normal checked reader, including v1 pages.
+        const auto boundary = reverse ? first_page : end_page - 1;
+        const auto next = reverse ? first_page + !whole_score_page(boundary)
+                                  : end_page - !whole_score_page(boundary);
+        const auto next_rank = directory.CountBefore(next);
+        result.count_ += reverse ? rank - next_rank : next_rank - rank;
+        rank = next_rank;
+        ordinal = reverse ? end_page - next : next - first_page;
+        continue;
+      }
       if (score_offset_pending() && whole_score_page(page_index(ordinal))) {
         // A partial starting page must count its matches first. Once inside
         // the score interval, all pages before the opposite boundary match

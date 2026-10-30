@@ -500,10 +500,11 @@ window admission falls back to the single-page path. Window children release
 physical read leases before joining, while admitted decoded pages and reply
 ownership survive until consumption. Other range modes, rank, count, scan and
 random selection borrow member bytes from one owned read lease. V2 single-page
-ranges and serial fallbacks seek directly by rank or binary-search score bounds;
-score counts use the bound positions. Random selection accesses selected
-slots directly, and member ranks binary-search `(score, member)` within pages
-selected by the member graph and score directory. Full scans and mutation
+ranges and serial fallbacks seek directly by rank or binary-search score bounds.
+Score counts use directory totals for fully covered pages and read only partial
+boundary pages, where indexed bound positions determine the count. Random
+selection accesses selected slots directly, and member ranks binary-search
+`(score, member)` within pages selected by the member graph and score directory. Full scans and mutation
 preparation retain complete validation; ordinary indexed reads check only the
 accessed intervals after the common identity and CRC policy checks.
 Ordinary read-only scans trust the writer's member uniqueness without building

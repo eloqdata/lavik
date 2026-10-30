@@ -1536,6 +1536,115 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
   EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
+TEST(GroupedSortedSetWriteE2e, ScoreCountsSkipInteriorPagesAfterRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "score-count";
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key.c_str());
+  ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "3");
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  // The broad counts must not touch an interior payload, even when their
+  // endpoints require checked reads from partially covered pages.
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "-inf", "+inf"}).text_, "256");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "(8", "250"}).text_, "242");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "8", "(250"}).text_, "242");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "(8", "10"}).text_, "2");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "300", "400"}).text_, "0");
+  const auto failed = client.Command({"ZRANGE", key, "0", "-1"});
+  EXPECT_EQ(failed.kind_, '-');
+  EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreCountsTrackBoundsMutationsAndRecovery) {
+  PrivateDisk disk;
+  const std::string key = "score-count-ties";
+  const auto member = [](unsigned i) {
+    return std::to_string(1000 + i) + std::string(128, 'm');
+  };
+  std::map<std::string, double> expected;
+  const auto check = [&](Client& client) {
+    for (const auto& [low, high] : {std::pair{"-inf", "+inf"},
+                                    {"(-inf", "(+inf"},
+                                    {"-inf", "-inf"},
+                                    {"+inf", "+inf"},
+                                    {"(+inf", "+inf"},
+                                    {"-3", "3"},
+                                    {"(-3", "(3"},
+                                    {"-2", "1"},
+                                    {"(-2", "1"},
+                                    {"-2", "(1"},
+                                    {"0", "0"},
+                                    {"(0", "0"},
+                                    {"0.5", "1.5"},
+                                    {"2", "-2"},
+                                    {"20", "30"},
+                                    {"-20", "-10"}}) {
+      SCOPED_TRACE(std::string(low) + " .. " + high);
+      const bool exclude_low = low[0] == '(';
+      const bool exclude_high = high[0] == '(';
+      const auto minimum = std::stod(low + exclude_low);
+      const auto maximum = std::stod(high + exclude_high);
+      const auto count = std::count_if(
+          expected.begin(), expected.end(), [&](const auto& entry) {
+            return (exclude_low ? entry.second > minimum
+                                : entry.second >= minimum) &&
+                   (exclude_high ? entry.second < maximum
+                                 : entry.second <= maximum);
+          });
+      const auto reply = client.Command({"ZCOUNT", key, low, high});
+      ASSERT_EQ(reply.kind_, ':') << reply.text_;
+      EXPECT_EQ(reply.text_, std::to_string(count));
+    }
+  };
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 512; ++i) {
+      const auto score = static_cast<int>(i / 80) - 3;
+      expected.emplace(member(i), score);
+      seed.insert(seed.end(), {std::to_string(score), member(i)});
+    }
+    // Include infinities themselves, not only infinite query endpoints.
+    seed.insert(seed.end(), {"-inf", member(512), "+inf", member(513)});
+    expected.emplace(member(512), -std::numeric_limits<double>::infinity());
+    expected.emplace(member(513), std::numeric_limits<double>::infinity());
+    ASSERT_EQ(client.Command(seed).text_, "514");
+    check(client);
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "12", member(30), "-12", member(240)})
+            .text_,
+        "0");
+    expected[member(30)] = 12;
+    expected[member(240)] = -12;
+    check(client);
+    std::vector<std::string> remove{"ZREM", key};
+    for (unsigned i = 0; i < 128; ++i) {
+      remove.push_back(member(i));
+      expected.erase(member(i));
+    }
+    ASSERT_EQ(client.Command(remove).text_, "128");
+    check(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  check(client);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 TEST(GroupedSortedSetWriteE2e, ScoreOffsetsSkipInteriorPagesAfterRecovery) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires selected ordered-page failure injection";
