@@ -662,9 +662,10 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   if (server_ready && replication != nullptr) {
     const auto progress = co_await replication->ObserveProgress(
         ReplicationObservationDetail::kMetrics);
-    // Render directly into owned scratch before adding borrowed parts. The first
-    // borrowed append registers this prefix by offset, avoiding a temporary body
-    // and copy while preserving the segmented response's lifetime contract.
+    // Render directly into owned scratch before adding borrowed parts. The
+    // first borrowed append registers this prefix by offset, avoiding a
+    // temporary body and copy while preserving the segmented response's
+    // lifetime contract.
     AppendReplicationProgressMetrics(progress, &response->body_);
   }
   MetricText output(response);
@@ -1071,8 +1072,8 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, bool server_ready,
     std::string* output, const ReplicationManager* replication) {
   bycorf::HttpResponse response;
-  auto status = co_await RenderPrometheusMetrics(storage, server_ready, &response,
-                                                 replication);
+  auto status = co_await RenderPrometheusMetrics(storage, server_ready,
+                                                 &response, replication);
   output->clear();
   output->reserve(response.BodySize());
   if (response.body_parts_.empty()) {
@@ -1094,8 +1095,8 @@ std::unique_ptr<bycorf::Service> CreateMetricsService(
           const bycorf::HttpRequest&,
           bycorf::HttpResponse* response) -> bycorf::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
-        co_return co_await RenderPrometheusMetrics(
-            *storage, server_ready(), response, replication);
+        co_return co_await RenderPrometheusMetrics(*storage, server_ready(),
+                                                   response, replication);
       });
   return service;
 }
