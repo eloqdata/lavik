@@ -37,7 +37,7 @@ endpoints() {
   printf '%s' "$result"
 }
 mkdir -p "$output"
-trap 'rm -f "$output/lavik.json.tmp" "$output/alertmanagers.json.tmp"' EXIT HUP INT TERM
+trap 'rm -f "$output/lavik.json.tmp" "$output/alertmanagers.json.tmp" "$output/lavik-meta.json.tmp"' EXIT HUP INT TERM
 if [ -n "${LAVIK_TARGETS_FILE:-}" ]; then
   # Advanced file-SD is user-owned Prometheus configuration, validated by Prometheus.
   cp "${TARGET_INPUT:-/input/lavik.json}" "$output/lavik.json.tmp"
@@ -46,11 +46,21 @@ else
   printf '[{"targets":[%s],"labels":{"service":"lavik","cluster":"%s","lavik_mode":"%s"}}]\n' \
     "$targets" "$cluster" "$mode" > "$output/lavik.json.tmp"
 fi
+# Meta discovery is optional. Its dedicated job scopes rules without relying on
+# the Data target mode; no absent-target alert fires for an unused Meta job.
+if [ -n "${LAVIK_META_TARGETS:-}" ]; then
+  meta_targets=$(endpoints "$LAVIK_META_TARGETS")
+  printf '[{"targets":[%s],"labels":{"service":"lavik-meta","cluster":"%s"}}]\n' \
+    "$meta_targets" "$cluster" > "$output/lavik-meta.json.tmp"
+else
+  printf '[]\n' > "$output/lavik-meta.json.tmp"
+fi
 if [ -n "${ALERTMANAGER_TARGETS:-}" ]; then
   managers=$(endpoints "$ALERTMANAGER_TARGETS")
   printf '[{"targets":[%s]}]\n' "$managers" > "$output/alertmanagers.json.tmp"
 else
   printf '[]\n' > "$output/alertmanagers.json.tmp"
 fi
+mv "$output/lavik-meta.json.tmp" "$output/lavik-meta.json"
 mv "$output/lavik.json.tmp" "$output/lavik.json"
 mv "$output/alertmanagers.json.tmp" "$output/alertmanagers.json"

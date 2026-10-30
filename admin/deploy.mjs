@@ -120,6 +120,13 @@ export function settings(input) {
       65535,
       "Prometheus port",
     ),
+    metaMetricsPort: integer(
+      input.metaMetricsPort,
+      9200,
+      1024,
+      65400,
+      "Meta metrics base port",
+    ),
     metricsPort: integer(
       input.metricsPort,
       9100,
@@ -160,6 +167,7 @@ export function topology(config) {
     throw new AdminError(error.message);
   }
   const dataCounts = new Map();
+  const metaCounts = new Map();
   const nodes = layout.map(({ index, ...node }) => {
     // Distinct hosts can share the normal Data port. Count by advertised IP,
     // not SSH endpoint: separate SSH routes may reach the same listening IP.
@@ -170,10 +178,18 @@ export function topology(config) {
       port = config.dataPort + localIndex;
       dataCounts.set(ip, localIndex + 1);
     }
+    const ip = config.hosts[node.host].address;
+    const metaIndex = metaCounts.get(ip) || 0;
+    if (node.kind === "meta") metaCounts.set(ip, metaIndex + 1);
     return {
       ...node,
       id: node.kind === "meta" ? index + 1 : randomBytes(20).toString("hex"),
       port,
+      ...(node.kind === "meta" &&
+      config.monitorHosts?.length &&
+      config.metaMetricsPort
+        ? { metrics: config.metaMetricsPort + metaIndex }
+        : {}),
       ...(node.kind === "data" && config.monitorHosts?.length
         ? {
             metrics:
@@ -285,6 +301,9 @@ export function nodeArguments(plan, node) {
       address(ip, node.control),
       "--data-dir",
       `${directory}/state`,
+      ...(plan.metaMetricsSupported === true && node.metrics
+        ? ["--metrics-port", String(node.metrics), "--metrics-bind", ip]
+        : []),
     ];
   const prefix = plan.modern ? "--" : "--cluster-";
   return [
@@ -765,7 +784,11 @@ export class Deployments {
               Math.max(
                 plan.metricsPort - 1,
                 ...plan.nodes
-                  .filter((n) => plan.hosts[n.host].address === host.address)
+                  .filter(
+                    (n) =>
+                      n.kind === "data" &&
+                      plan.hosts[n.host].address === host.address,
+                  )
                   .map((n) => n.metrics || 0),
               ) + 1,
           }
@@ -1006,8 +1029,14 @@ export class Deployments {
     if (!plan.monitorHosts?.length) return;
     const files = await monitoringFiles();
     const targets = plan.nodes
-      .filter((n) => n.metrics)
+      .filter((n) => n.kind === "data" && n.metrics)
       .map((n) => address(plan.hosts[n.host].address, n.metrics));
+    const metaTargets =
+      plan.metaMetricsSupported === true
+        ? plan.nodes
+            .filter((n) => n.kind === "meta" && n.metrics)
+            .map((n) => address(plan.hosts[n.host].address, n.metrics))
+        : [];
     for (const index of plan.monitorHosts) {
       await this.ssh.call(
         plan.hosts[index],
@@ -1019,6 +1048,8 @@ export class Deployments {
             plan.hosts[index].address,
             plan.grafanaPort,
           )}`,
+          metaTargets,
+          legacyMonitoring: plan.metaMetricsPort == null,
           address: plan.hosts[index].address,
           grafanaPort: plan.grafanaPort,
           prometheusPort: plan.prometheusPort,
@@ -1043,11 +1074,17 @@ export class Deployments {
           versions.push(result);
         }
         if (
-          new Set(versions.map((v) => `${v.revision}/${v.modern}`)).size !== 1
+          new Set(
+            versions.map(
+              (v) =>
+                `${v.revision}/${v.modern}/${v.metaMetricsSupported === true}`,
+            ),
+          ).size !== 1
         )
           throw new AdminError(
             "Hosts resolved different release builds; deployment stopped",
           );
+        plan.metaMetricsSupported = versions[0].metaMetricsSupported === true;
         plan.modern = versions[0].modern;
         plan.version = versions[0].version;
         plan.revision = versions[0].revision;

@@ -7,9 +7,12 @@ prometheus/prometheus.yml
 prometheus/targets.example.json
 prometheus/rules/recording.yml
 prometheus/rules/alerts.yml
+prometheus/rules/meta-recording.yml
+prometheus/rules/meta-alerts.yml
 alertmanager/alertmanager.yml
 alertmanager/receivers.example.yml
 alertmanager/templates/lavik.tmpl
 grafana/dashboards/lavik-overview.json
+grafana/dashboards/lavik-meta.json
 grafana/provisioning/dashboards/lavik.yaml
 grafana/provisioning/datasources/prometheus.yaml

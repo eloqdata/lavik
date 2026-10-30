@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "lavik/meta/metrics.h"
+
 // MetaCoordinator is the in-process API for control sessions and ordinary
 // reconcilers: consumers see commands, committed views, commit subscriptions,
 // and reconciler lifecycle rather than Raft types. Process-wired membership
@@ -439,6 +441,11 @@ class MetaCoordinator {
       MetaCommand command, AuthenticatedPrincipal principal,
       std::uint64_t expected_leader_term = 0);
 
+  // Scrape-only access to independently atomic first-caller outcomes.
+  const MetaProposalMetrics& proposal_metrics() const {
+    return proposal_metrics_;
+  }
+
   // Registers a ValidateProposal plugin (see the MetaValidateHook contract).
   // Call during assembly, before the coordinator can go leader; not
   // thread-safe against in-flight Propose calls.
@@ -547,6 +554,7 @@ class MetaCoordinator {
   void DispatchMain();
   void LeadershipMain();
 
+  MetaProposalMetrics proposal_metrics_;
   std::shared_ptr<MetaRaft> server_;  // refcounted; may be null
   MetaStateMachine& state_machine_;
   MetaObservationStore& observations_;

@@ -4,6 +4,7 @@
 
 import io
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -56,7 +57,11 @@ class RemoteSafety(unittest.TestCase):
                                 "activeTargets": [
                                     {
                                         "health": "up",
-                                        "labels": {"instance": target},
+                                        "labels": {
+                                            "instance": target,
+                                            "job": "lavik",
+                                            "cluster": "test",
+                                        },
                                     }
                                     for target in request["targets"]
                                 ]
@@ -129,6 +134,94 @@ class RemoteSafety(unittest.TestCase):
                 }
             )
         self.assertFalse((root / "release").exists())
+
+    def test_meta_exporter_flags_are_probed_in_both_help_streams(self):
+        root = remote.owned(self.request, create=True)
+        release = root / "release"
+        release.mkdir()
+        asset = {"sha256": "a" * 64}
+        (release / "asset.json").write_text(json.dumps(asset))
+        (release / "VERSION").write_text("test")
+        (release / "REVISION").write_text("revision")
+        for flags, code, supported in [
+            ("--metrics-port --metrics-bind", 0, True),
+            ("--metrics-port", 0, False),
+            ("--id --addr", 0, False),
+            ("--metrics-port --metrics-bind", 1, False),
+        ]:
+            with (
+                self.subTest(flags=flags, code=code),
+                patch.object(
+                    remote,
+                    "run",
+                    side_effect=[
+                        {"code": 0, "stdout": "--meta-seed", "stderr": ""},
+                        {"code": code, "stdout": "", "stderr": flags},
+                    ],
+                ),
+            ):
+                result = remote.prepare({**self.request, "asset": asset})
+                self.assertEqual(result["metaMetricsSupported"], supported)
+
+    def test_monitoring_verifies_both_jobs_and_preserves_legacy_configuration(self):
+        root = remote.owned(self.request, create=True)
+        for legacy in (False, True):
+
+            def response(url, **kwargs):
+                targets = [
+                    {
+                        "labels": {"job": "lavik", "instance": "data:9100"},
+                        "health": "up",
+                    }
+                ]
+                if not legacy:
+                    targets[0]["labels"]["cluster"] = "test"
+                    targets.append(
+                        {
+                            "labels": {
+                                "job": "lavik-meta",
+                                "cluster": "test",
+                                "instance": "meta:9200",
+                            },
+                            "health": "up",
+                        }
+                    )
+                reply = io.BytesIO(
+                    json.dumps({"data": {"activeTargets": targets}}).encode()
+                )
+                reply.status = 200
+                return reply
+
+            with (
+                self.subTest(legacy=legacy),
+                patch.object(remote, "checked"),
+                patch.object(remote.urllib.request, "build_opener") as opener,
+            ):
+                opener.return_value.open.side_effect = response
+                result = remote.monitoring(
+                    {
+                        **self.request,
+                        "address": "127.0.0.1",
+                        "targets": ["data:9100"],
+                        "metaTargets": [] if legacy else ["meta:9200"],
+                        "grafanaUrl": "http://127.0.0.1:3000",
+                        "legacyMonitoring": legacy,
+                        "files": {
+                            "compose.yaml": "new content"
+                            if legacy
+                            else "reviewed content"
+                        },
+                    }
+                )
+                self.assertTrue(result["ok"])
+                self.assertEqual(
+                    (root / "monitoring/compose.yaml").read_text(), "reviewed content"
+                )
+                env = (root / "monitoring/.env").read_text()
+                self.assertIn("LAVIK_CLUSTER=test", env)
+                self.assertIn(
+                    "LAVIK_META_TARGETS=" + ("" if legacy else "meta:9200"), env
+                )
 
     def test_non_systemd_hosts_get_lab_guidance_without_lingering_commands(self):
         for tools in (None, "/usr/bin/systemctl"):

@@ -61,6 +61,7 @@
 #include "lavik/meta/failover_reconciler.h"
 #include "lavik/meta/identity_verifier.h"
 #include "lavik/meta/membership_reconciler.h"
+#include "lavik/meta/metrics.h"
 #include "lavik/meta/observation_store.h"
 #include "lavik/meta/proposal_executor.h"
 #include "lavik/meta/raft.h"
@@ -90,6 +91,8 @@ using lavik::meta::MetaStateMachine;
 // ---------------------------------------------------------------------------
 
 struct CliOptions {
+  int metrics_port_ = 0;
+  std::string metrics_bind_ = "127.0.0.1";
   int id_ = 0;
   bool has_id_ = false;
   // Process-local listeners. The initial manifest and then durable Raft
@@ -150,6 +153,7 @@ void PrintUsage(const char* program) {
       "          [--heartbeat-ms N] [--election-ms-low N] [--election-ms-high "
       "N]\n"
       "          [--snapshot-distance N] [--reserved-log-items N]\n"
+      "          [--metrics-port N] [--metrics-bind IP]\n"
       "          [--client-req-timeout-ms N] [--version] "
       "[--help]\n",
       program);
@@ -221,7 +225,13 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       value = argv[++ii];
     }
 
-    if (name == "--id") {
+    if (name == "--metrics-port") {
+      if (!ParseInt(value, 0, 65535, &options.metrics_port_))
+        return absl::InvalidArgumentError(
+            "metrics-port must be between 0 and 65535");
+    } else if (name == "--metrics-bind") {
+      options.metrics_bind_ = value;
+    } else if (name == "--id") {
       if (!ParseInt(value, 1, 0x7fffffff, &options.id_)) {
         return absl::Status(absl::StatusCode::kInvalidArgument,
                             "--id must be a positive integer");
@@ -619,6 +629,18 @@ int main(int argc, char** argv) {
                   .EncodeAux()));
     }
   }
+  std::unique_ptr<lavik::meta::MetaMetricsServer> metrics;
+  if (options.metrics_port_ != 0) {
+    auto started = lavik::meta::MetaMetricsServer::Start(options.metrics_bind_,
+                                                         options.metrics_port_);
+    if (!started.ok()) {
+      spdlog::critical("metrics listener failed: {}",
+                       started.status().message());
+      return 1;
+    }
+    metrics = std::move(*started);
+    metrics->SetPhase(lavik::meta::MetaMetricsServer::Phase::kRecovering);
+  }
   auto machine_or = MetaStateMachine::Open(options.data_dir_);
   if (!machine_or.ok()) {
     spdlog::critical("state machine open failed: {}",
@@ -927,6 +949,11 @@ int main(int argc, char** argv) {
     if (sentinel) coordinator->RunAsLeader(sentinel);
   }
 
+  if (metrics) {
+    metrics->Publish(
+        {server, coordinator, data_control, data_control_runtime_status});
+    metrics->SetPhase(lavik::meta::MetaMetricsServer::Phase::kRunning);
+  }
   if (exit_code == 0) {
     std::string ctl_display = options.ctl_socket_;
     if (!options.ctl_addr_.empty()) {
@@ -950,6 +977,10 @@ int main(int argc, char** argv) {
     spdlog::info("node {} shutting down on signal {}", options.id_,
                  static_cast<int>(g_last_shutdown_signal));
   }
+
+  // Collection owns sources only while ingress is live. Join it before any
+  // source is shut down, including the C ABI handle and Data-control counters.
+  if (metrics) metrics->Stop();
 
   // Stop durable workflows before draining Admin waiters. Local accepted
   // proposals/API entries may finish, but no remote Data or membership result

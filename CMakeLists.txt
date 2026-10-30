@@ -630,6 +630,7 @@ set(LAVIK_META_CORE_SOURCES
   src/meta/topology_store.cpp
   src/meta/value_codec.cpp
   src/meta/raft.cpp
+  src/meta/metrics.cpp
 )
 add_library(lavik_meta_core STATIC ${LAVIK_META_CORE_SOURCES})
 target_include_directories(lavik_meta_core PUBLIC
@@ -896,6 +897,7 @@ if (BUILD_TESTING)
     tests/meta_hash_test.cpp
     tests/meta_cluster_create_reconciler_test.cpp
     tests/meta_membership_reconciler_test.cpp
+    tests/meta_metrics_test.cpp
     tests/meta_coordinator_test.cpp
     tests/meta_candidate_plan_test.cpp
     tests/meta_control_projector_test.cpp
@@ -1063,7 +1065,7 @@ if (BUILD_TESTING)
     # allocator quarantine would turn it into a measurement of ASan retention
     # instead of the bounded live Raft queues it is intended to cover.
     set(LAVIK_META_INTEGRATION_GATES
-      initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport mtls observation_lifecycle
+      initial_meta initial_recovery snapshot_vote leader_change recovery membership membership_recovery transport metrics mtls observation_lifecycle
       partition
     )
     if (NOT LAVIK_ASAN_BUILD)

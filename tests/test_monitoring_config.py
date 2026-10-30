@@ -45,18 +45,61 @@ class TargetConfiguration(unittest.TestCase):
             ],
         )
         self.assertEqual(files["alertmanagers.json"], [])
+        self.assertEqual(files["lavik-meta.json"], [])
 
     def test_managed_cluster_and_external_alertmanager(self):
         result, files = self.run_config(
             LAVIK_TARGETS="data:9100",
             LAVIK_MODE="meta-managed",
             LAVIK_CLUSTER="orders",
+            LAVIK_META_TARGETS="meta:9200,[::1]:9201",
             ALERTMANAGER_TARGETS="am:9093",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(files["lavik.json"][0]["labels"]["lavik_mode"], "meta-managed")
         self.assertEqual(files["lavik.json"][0]["labels"]["cluster"], "orders")
         self.assertEqual(files["alertmanagers.json"], [{"targets": ["am:9093"]}])
+        self.assertEqual(
+            files["lavik-meta.json"],
+            [
+                {
+                    "targets": ["meta:9200", "[::1]:9201"],
+                    "labels": {"service": "lavik-meta", "cluster": "orders"},
+                }
+            ],
+        )
+
+    def test_invalid_meta_update_preserves_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = {
+                "lavik.json": "previous Data targets\n",
+                "lavik-meta.json": "previous Meta targets\n",
+                "alertmanagers.json": "previous receivers\n",
+            }
+            for name, content in previous.items():
+                (root / name).write_text(content)
+            for targets in (
+                "meta:0",
+                "meta:9200,meta:9200",
+                "meta:9200,",
+                'meta:9200"',
+            ):
+                with self.subTest(targets=targets):
+                    result = subprocess.run(
+                        ["sh", str(MONITORING / "configure-targets.sh")],
+                        env={
+                            "PATH": os.environ["PATH"],
+                            "TARGET_DIR": directory,
+                            "LAVIK_TARGETS": "data:9100",
+                            "LAVIK_META_TARGETS": targets,
+                        },
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(
+                        {p.name: p.read_text() for p in root.iterdir()}, previous
+                    )
 
     def test_invalid_or_duplicate_targets_are_rejected(self):
         for targets in (
