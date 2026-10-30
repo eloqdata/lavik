@@ -2434,7 +2434,9 @@ TEST(GroupedSortedSetWriteE2e, MemberScansAvoidOrderedPagesAfterCheckpoint) {
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key.c_str());
-  ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "0");
+  // Fault ordinals are one-based; zero would leave the negative control
+  // unarmed.
+  ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "1");
   Server recovered(disk, 2, {}, {}, false, 2, "2G", {}, {}, 0, 20, extra);
   Client client(recovered.port());
   ASSERT_NE(recovered.Log().find("loaded shutdown checkpoint"),
