@@ -1508,3 +1508,16 @@ After enough aggregate state has been removed, run `snapshot` and wait for
 the durability pressure on that member; if the guard remains active, continue
 with another known, effect-producing recovery item rather than sending dummy
 prunes.
+
+## Meta monitoring
+
+Enable the independent HTTP exporter with `--metrics-port 9200`. Its bind
+address defaults to loopback; remote monitoring requires an explicit numeric
+`--metrics-bind` private address and network access restrictions. Port zero
+keeps it disabled. The exporter is available during recovery with source
+availability indicators and stops before runtime teardown.
+
+Use the separate **Lavik Meta / Raft** Grafana dashboard, job `lavik-meta`, and
+stable `cluster` target label. See the [metric contracts](metrics.md#meta--raft-metrics)
+and [fault interpretation and rehearsal](meta-monitoring.md). The Data
+dashboard's Data → Meta row remains client-side evidence.

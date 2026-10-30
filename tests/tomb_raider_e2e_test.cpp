@@ -885,13 +885,21 @@ class TombRaiderControllerService final : public bycorf::Service {
         }
         auto wrote = co_await storage_->Set(kDb, key, "old-value", options);
         if (!wrote.ok()) co_return wrote.status();
+        // Expire the old value before deletion so fixture setup also covers
+        // a delayed CI worker. Delete reports logical existence; an expired
+        // value can return false while still publishing the needed tombstone.
+        if (options.expire_at_ms_ != 0) {
+          status = co_await bycorf::SleepFor(*worker_, 300ms);
+          if (!status.ok()) co_return status;
+        }
         auto deleted = co_await storage_->Delete(kDb, key);
         if (!deleted.ok()) co_return deleted.status();
-        if (!*deleted)
+        auto fixture_tombstone =
+            co_await Peer::IsTombstone(*storage_, kDb, key);
+        if (!fixture_tombstone.ok()) co_return fixture_tombstone.status();
+        if (!*fixture_tombstone)
           co_return absl::FailedPreconditionError("fixture did not tombstone");
         status = co_await Peer::SealForSweep(*storage_);
-        if (!status.ok()) co_return status;
-        status = co_await bycorf::SleepFor(*worker_, 300ms);
         if (!status.ok()) co_return status;
         bool triggered = false;
         Peer::SetHook(

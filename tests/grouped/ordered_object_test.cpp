@@ -23,8 +23,8 @@
 namespace lavik::storage {
 namespace {
 
-TEST(StreamPageMaxKeyTest, ExactIdsAndLongNamesPreserveOrdering) {
-  StreamPageMaxKey boundary;
+TEST(OrderedPageMaxKeyTest, ExactIdsAndLongNamesPreserveOrdering) {
+  OrderedPageMaxKey boundary;
   EXPECT_FALSE(boundary.LessThan("\1"));
   EXPECT_FALSE(boundary.LessThanOrEqual("\1"));
   const std::string id = std::string("\1", 1) + std::string(16, '\x7f');
@@ -43,8 +43,87 @@ TEST(StreamPageMaxKeyTest, ExactIdsAndLongNamesPreserveOrdering) {
   EXPECT_FALSE(boundary.LessThan(long_name));
   EXPECT_FALSE(boundary.LessThanOrEqual(long_name));
   EXPECT_EQ(
-      boundary.LessThan(long_name.substr(0, StreamPageMaxKey::kPrefixBytes)),
+      boundary.LessThan(long_name.substr(0, OrderedPageMaxKey::kPrefixBytes)),
       false);
+}
+
+TEST(OrderedPageMaxKeyTest, EmptyAndBinaryMembersPreserveOrdering) {
+  OrderedPageMaxKey boundary;
+  EXPECT_EQ(boundary.LessThan(""), std::nullopt);
+  boundary.Set("");
+  EXPECT_EQ(boundary.LessThan(""), false);
+  EXPECT_EQ(boundary.LessThanOrEqual(""), true);
+  EXPECT_EQ(boundary.LessThan(std::string(1, '\0')), true);
+
+  const std::string binary("\0\xff", 2);
+  boundary.Set(binary);
+  EXPECT_EQ(boundary.LessThan(std::string("\0\x7f", 2)), false);
+  EXPECT_EQ(boundary.LessThan(binary), false);
+  EXPECT_EQ(boundary.LessThanOrEqual(binary), true);
+  EXPECT_EQ(boundary.LessThan(binary + '\0'), true);
+
+  const std::string prefix(OrderedPageMaxKey::kPrefixBytes, '\0');
+  boundary.Set(prefix + "tail");
+  EXPECT_EQ(boundary.LessThan(prefix), false);
+  EXPECT_EQ(boundary.LessThanOrEqual(prefix), false);
+  EXPECT_EQ(boundary.LessThan(prefix + "other"), std::nullopt);
+  EXPECT_EQ(boundary.LessThanOrEqual(prefix + "other"), std::nullopt);
+  EXPECT_EQ(boundary.LessThan(std::string(1, '\xff')), true);
+  boundary.Set(prefix);
+  EXPECT_EQ(boundary.LessThan(prefix + '\0'), true);
+  EXPECT_EQ(boundary.LessThanOrEqual(prefix), true);
+}
+
+TEST(SortedSetDirectoryTest, PageBoundariesFollowLogicalPageVersions) {
+  OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kSortedSet,
+                             .incarnation_ = 17,
+                             .item_count_ = 2,
+                             .first_group_ = 1,
+                             .last_group_ = 2,
+                             .next_group_id_ = 3,
+                             .group_count_ = 2,
+                             .revision_ = 1};
+  root.member_index_ = grouped_test::MemberRoot(root);
+  std::vector<RecoveredOrderedGroup> pages{{{.incarnation_ = 17,
+                                             .id_ = 1,
+                                             .next_ = 2,
+                                             .sequence_ = 1,
+                                             .lsn_ = 1,
+                                             .item_count_ = 1,
+                                             .record_token_ = 1}},
+                                           {{.incarnation_ = 17,
+                                             .id_ = 2,
+                                             .previous_ = 1,
+                                             .sequence_ = 1,
+                                             .lsn_ = 2,
+                                             .item_count_ = 1,
+                                             .record_token_ = 2}}};
+  auto directory = OrderedGroupDirectory::Recover(
+      root, 1, pages, {}, 0, grouped_test::MemberDirectory(root));
+  ASSERT_TRUE(directory.ok()) << directory.status();
+  ASSERT_TRUE(directory->RememberPageMaxKey(0, "").ok());
+  EXPECT_TRUE(absl::IsDataLoss(directory->RememberPageMaxKey(0, "changed")));
+  EXPECT_TRUE(absl::IsInvalidArgument(directory->RememberPageMaxKey(2, "z")));
+
+  root.revision_ = 2;
+  auto unchanged = directory->Apply(root, 2, {}, 2);
+  ASSERT_TRUE(unchanged.ok()) << unchanged.status();
+  // Unchanged logical pages share a lazy cache even across pinned versions.
+  ASSERT_TRUE(directory->RememberPageMaxKey(1, "z").ok());
+  EXPECT_EQ(unchanged->groups()[1].max_key_.LessThan("z"), false);
+  EXPECT_EQ(unchanged->groups()[0].max_key_.LessThan(""), false);
+
+  auto replacement = pages[1];
+  replacement.sequence_ = replacement.lsn_ = 3;
+  root.revision_ = 3;
+  auto changed = unchanged->Apply(root, 3, std::span(&replacement, 1), 3);
+  ASSERT_TRUE(changed.ok()) << changed.status();
+  EXPECT_EQ(changed->groups()[1].max_key_.LessThan("z"), std::nullopt);
+  const std::string prefix(OrderedPageMaxKey::kPrefixBytes, 'y');
+  ASSERT_TRUE(changed->RememberPageMaxKey(1, prefix + "suffix").ok());
+  EXPECT_TRUE(absl::IsDataLoss(changed->RememberPageMaxKey(1, prefix)));
+  EXPECT_EQ(changed->groups()[1].max_key_.LessThan("z"), true);
+  EXPECT_EQ(unchanged->groups()[1].max_key_.LessThan("z"), false);
 }
 
 TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
@@ -81,13 +160,13 @@ TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
   header[44] = 1;
   ASSERT_TRUE(directory->RememberStreamHeader(header).ok());
   const std::string id = std::string("\1", 1) + std::string(16, '\x7f');
-  ASSERT_TRUE(directory->RememberStreamPageMaxKey(1, id).ok());
+  ASSERT_TRUE(directory->RememberPageMaxKey(1, id).ok());
 
   root.revision_ = 2;
   auto unchanged = directory->Apply(root, 2, {}, 2);
   ASSERT_TRUE(unchanged.ok()) << unchanged.status();
   EXPECT_EQ(unchanged->stream_header(), header);
-  EXPECT_EQ(unchanged->groups()[1].stream_max_key_.LessThan(id), false);
+  EXPECT_EQ(unchanged->groups()[1].max_key_.LessThan(id), false);
 
   auto replacement = pages[0];
   replacement.sequence_ = 3;
@@ -96,7 +175,7 @@ TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
   auto changed = unchanged->Apply(root, 3, std::span(&replacement, 1), 3);
   ASSERT_TRUE(changed.ok()) << changed.status();
   EXPECT_TRUE(changed->stream_header().empty());
-  EXPECT_EQ(changed->groups()[1].stream_max_key_.LessThan(id), false);
+  EXPECT_EQ(changed->groups()[1].max_key_.LessThan(id), false);
 }
 
 RecordLocation OrderedLocation(std::uint64_t block, std::uint64_t sequence,

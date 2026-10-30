@@ -38,6 +38,7 @@ type peerSender struct {
 	txGeneration   atomic.Uint64
 	rxGeneration   atomic.Uint64
 	snapshotResult atomic.Uint32
+	metrics        [laneCount]laneMetrics
 }
 type peerTable struct{ peers map[uint64]*peerSender }
 
@@ -154,6 +155,7 @@ func (n *Network) Send(m *pb.Message) bool {
 	lane := messageLane(m)
 	size := uint64(proto.Size(m))
 	if !n.sendBytes[lane].take(size, laneBudget(lane)) {
+		peer.metrics[lane].rejected.Inc()
 		return false
 	}
 	select {
@@ -161,6 +163,7 @@ func (n *Network) Send(m *pb.Message) bool {
 		return true
 	default:
 		n.sendBytes[lane].release(size)
+		peer.metrics[lane].rejected.Inc()
 		return false
 	}
 }
@@ -208,6 +211,7 @@ func (n *Network) Update(members []Member) {
 		p.queues = [laneCount]chan *pb.Message{make(chan *pb.Message, 32), make(chan *pb.Message, 16), make(chan *pb.Message, 1)}
 		next.peers[member.ID] = p
 		for lane := range laneCount {
+			p.metrics[lane].initialize(member.ID, laneNames[lane])
 			n.workers.Add(1)
 			go n.sendLoop(p, lane)
 		}
@@ -253,6 +257,7 @@ func (n *Network) untrack(conn net.Conn) {
 }
 
 func (n *Network) sendLoop(peer *peerSender, lane int) {
+	defer peer.metrics[lane].out.Store(false)
 	defer n.workers.Done()
 	defer func() {
 		for {
@@ -298,8 +303,12 @@ func (n *Network) sendLoop(peer *peerSender, lane int) {
 			if conn == nil {
 				var err error
 				conn, err = n.dial(peer.member, lane)
+				if err == nil {
+					peer.metrics[lane].out.Store(true)
+				}
 				if err != nil {
 					n.failures.Add(1)
+					peer.metrics[lane].dialErrors.Inc()
 					// Failed network messages are never local storage completions.
 					// Raft retransmits using subsequent ticks on this same lane.
 					timer := time.NewTimer(50 * time.Millisecond)
@@ -334,6 +343,8 @@ func (n *Network) sendLoop(peer *peerSender, lane int) {
 			}
 			if err != nil {
 				n.failures.Add(1)
+				peer.metrics[lane].writeErrors.Inc()
+				peer.metrics[lane].out.Store(false)
 				if lane == laneControl {
 					peer.txGeneration.Add(1)
 				}
@@ -511,6 +522,7 @@ func (n *Network) receive(raw net.Conn) {
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
 	if writeAll(conn, []byte{1}) != nil {
+		peer.metrics[lane].writeErrors.Inc()
 		return
 	}
 	key := [2]uint64{from, uint64(lane)}
@@ -519,6 +531,7 @@ func (n *Network) receive(raw net.Conn) {
 		_ = old.Close()
 	}
 	n.accepted[key] = raw
+	peer.metrics[lane].in.Store(true)
 	if lane == laneControl {
 		peer.rxGeneration.Add(1)
 	}
@@ -527,6 +540,7 @@ func (n *Network) receive(raw net.Conn) {
 		n.connectionsMu.Lock()
 		if n.accepted[key] == raw {
 			delete(n.accepted, key)
+			peer.metrics[lane].in.Store(false)
 			if lane == laneControl {
 				peer.rxGeneration.Add(1)
 			}
@@ -545,7 +559,12 @@ func (n *Network) receive(raw net.Conn) {
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(deadline))
 		var size [4]byte
-		if _, err := io.ReadFull(conn, size[:]); err != nil {
+		if received, err := io.ReadFull(conn, size[:]); err != nil {
+			// Idle lanes expire normally between frames. Once a frame starts,
+			// deadline expiry is a transfer failure, including in its body below.
+			if received != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+				peer.metrics[lane].readErrors.Inc()
+			}
 			return
 		}
 		length := binary.BigEndian.Uint32(size[:])
@@ -559,6 +578,7 @@ func (n *Network) receive(raw net.Conn) {
 			defer n.receiveBytes[lane].release(uint64(length))
 			data := make([]byte, length)
 			if _, err := io.ReadFull(conn, data); err != nil {
+				peer.metrics[lane].readErrors.Inc()
 				return false
 			}
 			var m pb.Message

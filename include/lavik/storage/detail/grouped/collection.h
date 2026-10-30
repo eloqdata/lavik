@@ -82,7 +82,8 @@ constexpr OrderedCollectionKind OrderedKind(ValueType type) noexcept {
 
 struct OrderedCollectionEntry {
   std::string value_;
-  double score_ = 0;  // Lists and Streams require positive zero on disk.
+  double score_ =
+      0;  // Lists/Streams require +0; indexed Lists omit it on disk.
   bool operator==(const OrderedCollectionEntry&) const noexcept = default;
 };
 
@@ -95,6 +96,10 @@ struct OrderedCollectionEntryView {
 
 struct OrderedGroupSnapshot;
 struct OrderedGroupSplit;
+
+// Skip insertion's member scan only when the caller has already proved
+// absence from this page under the same logical root.
+enum class SortedSetMemberAbsence : bool { kCheckSource, kVerified };
 
 // An owned, immutable member sequence certified by the checked Sorted Set
 // splitter. Moving the original vector preserves its allocations. Only const
@@ -133,6 +138,7 @@ class EncodedSortedSetEntries {
     return entries_;
   }
   std::string_view bytes() const noexcept { return *bytes_; }
+  std::uint32_t version() const noexcept { return version_; }
 
  private:
   friend absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
@@ -142,13 +148,18 @@ class EncodedSortedSetEntries {
                             std::string_view member,
                             std::optional<double> before,
                             std::optional<double> after,
-                            std::size_t target_bytes);
+                            std::size_t target_bytes,
+                            SortedSetMemberAbsence absence);
   EncodedSortedSetEntries(LocalSharedPtr<const std::string> bytes,
-                          std::vector<OrderedCollectionEntryView> entries)
-      : bytes_(std::move(bytes)), entries_(std::move(entries)) {}
+                          std::vector<OrderedCollectionEntryView> entries,
+                          std::uint32_t version)
+      : bytes_(std::move(bytes)),
+        entries_(std::move(entries)),
+        version_(version) {}
   // Declare the owner first so every borrowing view dies before its bytes.
   LocalSharedPtr<const std::string> bytes_;
   std::vector<OrderedCollectionEntryView> entries_;
+  std::uint32_t version_;
 };
 
 struct OrderedCollectionRoot {
@@ -236,8 +247,22 @@ inline std::size_t OrderedGroupSize(
 }
 
 inline constexpr std::size_t kOrderedGroupHeaderBytes = 64;
-// Each ordered item stores its byte length and score before its value.
+// Version 1 and Stream items store length/score before each value. Version 2
+// Lists/Sorted Sets instead have tail arrays; their planners use the helpers
+// below, including one extra end offset per live page.
 inline constexpr std::size_t kOrderedEntryHeaderBytes = 12;
+constexpr bool HasOrderedIndex(OrderedCollectionKind kind) noexcept {
+  return kind == OrderedCollectionKind::kList ||
+         kind == OrderedCollectionKind::kSortedSet;
+}
+constexpr std::size_t OrderedEntryOverhead(
+    OrderedCollectionKind kind) noexcept {
+  return kind == OrderedCollectionKind::kList ? 4 : 12;
+}
+constexpr std::size_t OrderedGroupFixedBytes(
+    OrderedCollectionKind kind) noexcept {
+  return kOrderedGroupHeaderBytes + (HasOrderedIndex(kind) ? 4 : 0);
+}
 inline constexpr std::size_t kOrderedCollectionRootBytes = 72;
 inline constexpr std::size_t kGroupedStreamRootBytes =
     kOrderedCollectionRootBytes + 8;
@@ -252,10 +277,12 @@ struct OrderedGroupMetadata {
   std::uint64_t next_ = 0;
   std::uint32_t item_count_ = 0;
   bool retired_ = false;
-  // Derived from entry headers, not additional durable fields. List and
-  // retired pages use zero; live Sorted Set pages retain exact score bounds.
+  // Derived from v1 entry headers or v2 score arrays, not additional fields.
+  // List and retired pages use zero; live Sorted Set pages retain exact score
+  // bounds.
   double min_score_ = 0;
   double max_score_ = 0;
+  std::uint32_t version_ = 1;
 };
 
 // Recovery reads this checked envelope only after the outer-header winner and
@@ -266,11 +293,12 @@ struct OrderedGroupMetadata {
 absl::StatusOr<OrderedGroupMetadata> DecodeOrderedGroupMetadata(
     std::string_view prefix, std::size_t encoded_bytes);
 
-// Reconstructs routing metadata from the existing page encoding in bounded
+// Reconstructs routing metadata from either page encoding in bounded
 // space. Feed the complete payload in order, after verifying any physical
 // checksum present on each fragment. Member bytes are skipped, never retained.
-// This validates framing and numeric score order, not member uniqueness or
-// equal-score member ordering; full page decoding checks those properties.
+// This validates framing, all v2 offsets and numeric score order, not member
+// uniqueness or equal-score member ordering; full page decoding checks those
+// properties.
 class OrderedGroupMetadataDecoder {
  public:
   explicit OrderedGroupMetadataDecoder(std::size_t encoded_bytes) noexcept
@@ -288,12 +316,17 @@ class OrderedGroupMetadataDecoder {
   bool failed_ = false;
   std::array<char, kOrderedGroupHeaderBytes> header_{};
   OrderedGroupMetadata metadata_;
+  std::size_t data_bytes_ = 0;
+  std::size_t previous_offset_ = 0;
+  std::size_t scores_ = 0;
 };
 
 // The cursor validates before emitting any data and borrows immutable entry
 // strings or a String segment's borrowed bytes. An extent writer can consume
 // it without a second full-value copy. The input snapshot and any borrowed
 // String source must outlive the cursor and remain unchanged.
+// Live List/Sorted Set pages always emit v2, including encoded v1 inputs;
+// String/Stream pages and retirement markers retain their current v1 format.
 class OrderedGroupEncoder {
  public:
   static absl::StatusOr<OrderedGroupEncoder> Create(
@@ -309,6 +342,7 @@ class OrderedGroupEncoder {
   std::size_t encoded_bytes_ = 0;
   std::size_t entry_ = 0;
   unsigned phase_ = 0;
+  std::size_t value_offset_ = 0;
 };
 
 absl::StatusOr<std::string> EncodeOrderedCollectionRoot(
@@ -339,23 +373,30 @@ absl::StatusOr<OrderedGroupSnapshot> DecodeEncodedSortedSetGroup(
 // nullopt for an empty/oversized after-image, leaving topology changes to the
 // ordinary planner. The input is immutable even on failure; score mismatches,
 // duplicate additions and invalid inputs are errors, never silent fallbacks.
+// Successful after-images use v2 even when the input page uses v1.
+// For v2 insertion, kVerified skips the member-only scan when
+// the caller's member graph and resolved source page already prove absence
+// from this page. Otherwise absence is checked here. Existing members and new
+// positions use binary lookup; full source validation remains mandatory.
 absl::StatusOr<std::optional<OrderedGroupSnapshot>> EditEncodedSortedSetGroup(
     const OrderedGroupSnapshot& page, std::string_view member,
     std::optional<double> before, std::optional<double> after,
-    std::size_t target_bytes = kCollectionGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes,
+    SortedSetMemberAbsence absence = SortedSetMemberAbsence::kCheckSource);
 
 // Converts a private checked/encoded page into mutable, independently owned
 // entries before split/rebalance planning. Existing mutable pages are
 // unchanged.
 void MaterializeOrderedGroupEntries(OrderedGroupSnapshot& page);
 
-// Validates a complete live List page, including entries outside the requested
-// interval, but allocates/copies only [first, first + count). The interval must
-// fit the page. Returned strings own their bytes independently of the payload.
+// Projects [first, first + count) from a live stored List page. V2 validates
+// the index envelope and selected intervals without walking other entries;
+// v1 retains full framing validation. Strict imports/mutations use
+// DecodeOrderedGroup. Returned strings own their bytes independently of input.
 absl::StatusOr<std::vector<std::string>> DecodeOrderedListRange(
     std::string_view bytes, std::size_t first, std::size_t count);
 
-// Same full-page validation, with one owned block for the selected interval
+// Same stored-read contract, with one owned block for the selected interval
 // and offsets for its elements. No returned view borrows the source payload.
 // The caller admits output and temporary slice storage before decoding.
 absl::StatusOr<PackedValues> DecodePackedOrderedListRange(
@@ -394,10 +435,11 @@ absl::Status ValidateOrderedGroupBoundary(const OrderedGroupSnapshot& left,
 // responsibility. record_token is caller-owned identity, never a pointer on
 // disk. Sorted Set and Stream ordering across pages must be checked using
 // ValidateOrderedGroupBoundary when their contents are read or recovered.
-// Stream routing keys are runtime-only metadata. The bounded prefix covers
-// message IDs exactly while arbitrarily long group/consumer names fall back
-// to a page read when their prefixes do not decide an ordering comparison.
-struct StreamPageMaxKey {
+// Runtime-only last-key cache: a Sorted Set member or Stream routing key.
+// Long keys fall back to a page read when their prefixes do not decide an
+// ordering comparison. An exact zero-length prefix represents an empty member;
+// a non-exact zero-length prefix represents an unknown boundary.
+struct OrderedPageMaxKey {
   // A message or macro-node ID is one kind byte plus two complete uint64s.
   static constexpr std::size_t kPrefixBytes = 17;
   std::array<char, kPrefixBytes> prefix_{};
@@ -425,13 +467,14 @@ struct OrderedGroupEntry {
   bool retired_ = false;
   // These two doubles are the resident score routing index. They are rebuilt
   // from checked pages during recovery and published with every new directory
-  // view; physical relocation shares them unchanged. No member strings are
-  // retained, so equal-score runs still require pagewise member comparisons.
+  // view; physical relocation shares them unchanged. Equal-score page routing
+  // additionally compares the bounded last-member cache below.
   double min_score_ = 0;
   double max_score_ = 0;
-  // Populated from checked Stream pages, never from the durable page header.
+  // Populated from checked Sorted Set/Stream pages, never from the durable
+  // page header. Replacement pages must not inherit the old version's cache.
   // A fixed allocation makes retained-directory admission cover the cache.
-  mutable StreamPageMaxKey stream_max_key_{};
+  mutable OrderedPageMaxKey max_key_{};
 };
 
 // Recovery candidates add decision tags to the same metadata used by resident
@@ -605,8 +648,10 @@ class OrderedGroupDirectory {
   // Only the key-owning worker may learn missing boundaries from decoded
   // pages. The page's immutable logical version is shared by pinned readers;
   // no allocation or worker-spanning lock occurs after publication.
-  absl::Status RememberStreamPageMaxKey(std::size_t index,
-                                        std::string_view key) const;
+  // Accepts Sorted Set members (including empty) and nonempty Stream keys;
+  // inconsistent boundaries within one logical version report data loss.
+  absl::Status RememberPageMaxKey(std::size_t index,
+                                  std::string_view key) const;
   std::string_view stream_header() const noexcept {
     return has_stream_header()
                ? std::string_view(stream_header_.data(), stream_header_.size())

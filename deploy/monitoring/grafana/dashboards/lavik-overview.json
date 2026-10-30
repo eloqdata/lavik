@@ -3671,7 +3671,7 @@
     },
     {
       "id": 26,
-      "title": "Meta Control Plane",
+      "title": "Data → Meta Control Plane",
       "type": "row",
       "collapsed": true,
       "gridPos": {

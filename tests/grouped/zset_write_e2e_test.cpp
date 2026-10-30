@@ -220,6 +220,72 @@ void ExpectDenseZSet(Client& client, std::string_view key,
   }
 }
 
+TEST(GroupedSortedSetWriteE2e,
+     IndexedPointAndBatchWritesKeepTiesAndBothIndexesAcrossRecovery) {
+  PrivateDisk disk;
+  const std::string key = "indexed-member-writes";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    // Equal-score runs span pages; the member graph resolves old scores,
+    // while binary member order determines the exact source/destination.
+    for (unsigned i = 0; i < 1024; ++i) {
+      const auto member = DenseZSetMember(i);
+      expected[member] = i % 4;
+      seed.insert(seed.end(), {std::to_string(i % 4), member});
+    }
+    ASSERT_EQ(client.Command(seed).text_, "1024");
+    for (unsigned i = 0; i < 16; ++i) {
+      const auto member = DenseZSetMember((i * 37) % 1024);
+      const auto delta = i % 2 == 0 ? 32768 : -32768;
+      const auto increment =
+          client.Command({"ZINCRBY", key, std::to_string(delta), member});
+      ASSERT_EQ(increment.kind_, '$');
+      expected[member] += delta;
+      EXPECT_EQ(std::stod(increment.text_), expected[member]);
+      ASSERT_EQ(
+          client
+              .Command({"ZADD", key, "XX", "CH", std::to_string(i % 4), member})
+              .text_,
+          "1");
+      expected[member] = i % 4;
+      ASSERT_EQ(client.Command({"ZREM", key, member, member}).text_, "1");
+      ASSERT_EQ(client.Command({"ZADD", key, "NX", "2", member}).text_, "1");
+      expected[member] = 2;
+    }
+    const auto a = DenseZSetMember(800), b = DenseZSetMember(801);
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "CH", "-32768", a, "32768", b, "0", a})
+            .text_,
+        "3");
+    expected[a] = 0;
+    expected[b] = 32768;
+    ExpectDenseZSet(client, key, expected);
+    // A dense removal/reinsertion also covers the single-scan batch path.
+    std::vector<std::string> remove{"ZREM", key}, add{"ZADD", key};
+    for (unsigned i = 0; i < 128; ++i) {
+      const auto member = DenseZSetMember(i * 7);
+      remove.push_back(member);
+      add.insert(add.end(), {std::to_string(i % 4), member});
+      expected.erase(member);
+    }
+    ASSERT_EQ(client.Command(remove).text_, "128");
+    ExpectDenseZSet(client, key, expected);
+    ASSERT_EQ(client.Command(add).text_, "128");
+    for (unsigned i = 0; i < 128; ++i) expected[DenseZSetMember(i * 7)] = i % 4;
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ASSERT_EQ(disk.LatestRootGrouped(key), true);
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 std::optional<OrderedGroupSnapshot> FirstDenseOrderedPage(
     const PrivateDisk& disk, std::string_view key) {
   std::optional<OrderedGroupSnapshot> first;
@@ -1431,6 +1497,118 @@ TEST(GroupedSortedSetWriteE2e, MemberRanksSkipUnrelatedPagesAfterRecovery) {
   }
 }
 
+TEST(GroupedSortedSetWriteE2e, MemberPrefixesSkipUnneededMidpointReads) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "member-prefix";
+  std::vector<std::string> members;
+  std::vector<std::string> seed{"ZADD", key};
+  for (unsigned i = 0; i < 64; ++i) {
+    // One member per page, distinguishable within the resident prefix.
+    members.push_back(std::to_string(1000 + i) + std::string(20 * 1024, 'x'));
+    seed.insert(seed.end(), {"7", members.back()});
+  }
+  {
+    ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY",
+                                key.c_str());
+    // An uncached binary search of 64 tied pages must read this midpoint.
+    ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "33");
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(seed).text_, "64");
+    EXPECT_EQ(client.Command({"ZRANK", key, members.back()}).text_, "63");
+    EXPECT_EQ(client.Command({"ZRANK", key, members.front()}).text_, "0");
+    EXPECT_EQ(client.Command({"ZINCRBY", key, "1", members.back()}).text_, "8");
+    const auto fresh = members[62] + std::string(1, '\0');
+    EXPECT_EQ(client.Command({"ZADD", key, "7", fresh}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "63");
+    EXPECT_EQ(client.Command({"ZREM", key, members[62]}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "62");
+    // Prefixes only settle routing; the selected page still has to be read.
+    const auto failed = client.Command({"ZRANK", key, members[32]});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZRANK", key, members.back()}).text_, "63");
+  EXPECT_EQ(client.Command({"ZSCORE", key, members.back()}).text_, "8");
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "64");
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     MemberPageSearchStaysBinaryWithUnknownOrLongPrefixes) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  for (const auto [common_prefix, checkpoint] :
+       {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
+    SCOPED_TRACE("common_prefix=" + std::to_string(common_prefix) +
+                 " checkpoint=" + std::to_string(checkpoint));
+    PrivateDisk disk;
+    const std::string key = "member-binary";
+    std::vector<std::string> members;
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 64; ++i) {
+      members.push_back((common_prefix ? std::string(32, '\0') : "") +
+                        std::to_string(1000 + i) + std::string(20 * 1024, 'x'));
+      seed.insert(seed.end(), {"7", members.back()});
+    }
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      ASSERT_EQ(client.Command(seed).text_, "64");
+      if (checkpoint)
+        ASSERT_EQ(
+            client.Command({"CONFIG", "SET", "shutdown-checkpoint", "yes"})
+                .text_,
+            "OK");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+      if (checkpoint)
+        ASSERT_NE(
+            server.Log().find("published shutdown checkpoint generation="),
+            std::string::npos)
+            << server.Log();
+    }
+    ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY",
+                                key.c_str());
+    // Recovery starts without member prefixes. Reading the first tied page
+    // fails a linear candidate scan; a binary search near the tail skips it.
+    // Long common prefixes force exact midpoint reads even after warming.
+    ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "1");
+    const std::array<std::string_view, 1> checkpoint_args{
+        checkpoint ? "--shutdown-checkpoint" : "--no-shutdown-checkpoint"};
+    Server recovered(disk, checkpoint ? 1 : 3, {}, {}, false, 2, "2G", {}, {},
+                     0, 20, checkpoint_args);
+    Client client(recovered.port());
+    if (checkpoint)
+      ASSERT_NE(recovered.Log().find("loaded shutdown checkpoint generation="),
+                std::string::npos)
+          << recovered.Log();
+    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+      EXPECT_EQ(client.Command({"ZRANK", key, members.back()}).text_, "63");
+      EXPECT_EQ(client.Command({"ZREVRANK", key, members.back()}).text_, "0");
+    }
+    EXPECT_EQ(client.Command({"ZINCRBY", key, "1", members.back()}).text_, "8");
+    const auto fresh = members[62] + std::string(1, '\xff');
+    EXPECT_EQ(client.Command({"ZADD", key, "7", fresh}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "63");
+    EXPECT_EQ(client.Command({"ZREM", key, members[62]}).text_, "1");
+    EXPECT_EQ(client.Command({"ZRANK", key, fresh}).text_, "62");
+    const auto failed = client.Command({"ZRANK", key, members.front()});
+    EXPECT_EQ(failed.kind_, '-');
+    EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+    client.Durable();
+    EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  }
+}
+
 TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires selected ordered-page failure injection";
@@ -1468,6 +1646,250 @@ TEST(GroupedSortedSetWriteE2e, ScoreBoundsSkipUnrelatedPagesAfterRecovery) {
   EXPECT_NE(first.text_.find("injected ordered-page"), std::string::npos);
   client.Durable();
   EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreCountsSkipInteriorPagesAfterRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "score-count";
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key.c_str());
+  ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "3");
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  // The broad counts must not touch an interior payload, even when their
+  // endpoints require checked reads from partially covered pages.
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "-inf", "+inf"}).text_, "256");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "(8", "250"}).text_, "242");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "8", "(250"}).text_, "242");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "(8", "10"}).text_, "2");
+  EXPECT_EQ(client.Command({"ZCOUNT", key, "300", "400"}).text_, "0");
+  const auto failed = client.Command({"ZRANGE", key, "0", "-1"});
+  EXPECT_EQ(failed.kind_, '-');
+  EXPECT_NE(failed.text_.find("injected ordered-page"), std::string::npos);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreCountsTrackBoundsMutationsAndRecovery) {
+  PrivateDisk disk;
+  const std::string key = "score-count-ties";
+  const auto member = [](unsigned i) {
+    return std::to_string(1000 + i) + std::string(128, 'm');
+  };
+  std::map<std::string, double> expected;
+  const auto check = [&](Client& client) {
+    for (const auto& [low, high] : {std::pair{"-inf", "+inf"},
+                                    {"(-inf", "(+inf"},
+                                    {"-inf", "-inf"},
+                                    {"+inf", "+inf"},
+                                    {"(+inf", "+inf"},
+                                    {"-3", "3"},
+                                    {"(-3", "(3"},
+                                    {"-2", "1"},
+                                    {"(-2", "1"},
+                                    {"-2", "(1"},
+                                    {"0", "0"},
+                                    {"(0", "0"},
+                                    {"0.5", "1.5"},
+                                    {"2", "-2"},
+                                    {"20", "30"},
+                                    {"-20", "-10"}}) {
+      SCOPED_TRACE(std::string(low) + " .. " + high);
+      const bool exclude_low = low[0] == '(';
+      const bool exclude_high = high[0] == '(';
+      const auto minimum = std::stod(low + exclude_low);
+      const auto maximum = std::stod(high + exclude_high);
+      const auto count = std::count_if(
+          expected.begin(), expected.end(), [&](const auto& entry) {
+            return (exclude_low ? entry.second > minimum
+                                : entry.second >= minimum) &&
+                   (exclude_high ? entry.second < maximum
+                                 : entry.second <= maximum);
+          });
+      const auto reply = client.Command({"ZCOUNT", key, low, high});
+      ASSERT_EQ(reply.kind_, ':') << reply.text_;
+      EXPECT_EQ(reply.text_, std::to_string(count));
+    }
+  };
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < 512; ++i) {
+      const auto score = static_cast<int>(i / 80) - 3;
+      expected.emplace(member(i), score);
+      seed.insert(seed.end(), {std::to_string(score), member(i)});
+    }
+    // Include infinities themselves, not only infinite query endpoints.
+    seed.insert(seed.end(), {"-inf", member(512), "+inf", member(513)});
+    expected.emplace(member(512), -std::numeric_limits<double>::infinity());
+    expected.emplace(member(513), std::numeric_limits<double>::infinity());
+    ASSERT_EQ(client.Command(seed).text_, "514");
+    check(client);
+    ASSERT_EQ(
+        client.Command({"ZADD", key, "12", member(30), "-12", member(240)})
+            .text_,
+        "0");
+    expected[member(30)] = 12;
+    expected[member(240)] = -12;
+    check(client);
+    std::vector<std::string> remove{"ZREM", key};
+    for (unsigned i = 0; i < 128; ++i) {
+      remove.push_back(member(i));
+      expected.erase(member(i));
+    }
+    ASSERT_EQ(client.Command(remove).text_, "128");
+    check(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  check(client);
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreOffsetsSkipInteriorPagesAfterRecovery) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires selected ordered-page failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "score-offset";
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ScopedEnvironment key_fault("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key.c_str());
+  // This interior page belongs to each query's score interval and offset,
+  // but neither its starting boundary nor its output. A sequential skip or
+  // speculative read wave would encounter the injected failure.
+  ScopedEnvironment page_fault("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE", "3");
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (const bool reverse : {false, true}) {
+    for (const bool legacy : {false, true}) {
+      for (const bool bounded : {false, true}) {
+        SCOPED_TRACE("reverse=" + std::to_string(reverse) +
+                     " legacy=" + std::to_string(legacy) +
+                     " bounded=" + std::to_string(bounded));
+        std::vector<std::string> command{
+            legacy ? (reverse ? "ZREVRANGEBYSCORE" : "ZRANGEBYSCORE")
+                   : "ZRANGE",
+            key,
+            reverse ? (bounded ? "(250" : "+inf") : (bounded ? "(8" : "-inf"),
+            reverse ? (bounded ? "8" : "-inf") : (bounded ? "250" : "+inf")};
+        if (!legacy) {
+          command.push_back("BYSCORE");
+          if (reverse) command.push_back("REV");
+        }
+        command.insert(command.end(), {"LIMIT", "210", "2", "WITHSCORES"});
+        const auto reply = client.Command(command);
+        ASSERT_EQ(reply.kind_, '*') << reply.text_;
+        ASSERT_EQ(reply.items_.size(), 4);
+        const unsigned first =
+            reverse ? (bounded ? 39 : 45) : (bounded ? 219 : 210);
+        for (unsigned i = 0; i < 2; ++i) {
+          const auto score = std::to_string(reverse ? first - i : first + i);
+          EXPECT_EQ(reply.items_[2 * i].text_, score + std::string(128, 'm'));
+          EXPECT_EQ(reply.items_[2 * i + 1].text_, score);
+        }
+        // The target can pass the score interval within its last page, or
+        // pass the entire directory. Neither case should read interior pages.
+        for (const auto* offset : {"243", "9223372036854775807"}) {
+          if (!bounded && std::string_view(offset) == "243") continue;
+          command[command.size() - 3] = offset;
+          const auto empty = client.Command(command);
+          ASSERT_EQ(empty.kind_, '*') << empty.text_;
+          EXPECT_TRUE(empty.items_.empty());
+        }
+      }
+    }
+  }
+  const auto fault = client.Command({"ZRANGE", key, "0", "-1"});
+  EXPECT_EQ(fault.kind_, '-');
+  EXPECT_NE(fault.text_.find("injected ordered-page"), std::string::npos);
+  client.Durable();
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
+TEST(GroupedSortedSetWriteE2e, ScoreOffsetsRespectBoundsAndTiesAcrossPages) {
+  PrivateDisk disk;
+  const std::string key = "score-offset-ties";
+  std::vector<std::string> members;
+  std::vector<std::string> seed{"ZADD", key};
+  for (unsigned i = 0; i < 512; ++i) {
+    // Fixed-width names make each long equal-score run span ordered pages
+    // while retaining a simple independent expected ordering.
+    members.push_back(std::to_string(1000 + i) + std::string(128, 'm'));
+    seed.insert(seed.end(), {std::to_string(i / 80), members.back()});
+  }
+  struct Bounds {
+    std::string low, high;
+    unsigned first, end;
+  };
+  for (unsigned pass = 0; pass < 2; ++pass) {
+    Server server(disk, pass == 0 ? 2 : 3);
+    Client client(server.port());
+    if (pass == 0) ASSERT_EQ(client.Command(seed).text_, "512");
+    for (const auto& bounds :
+         {Bounds{"-inf", "+inf", 0, 512}, Bounds{"(0", "(6", 80, 480},
+          Bounds{"1", "3", 80, 320}, Bounds{"(1", "3", 160, 320},
+          Bounds{"1", "(3", 80, 240}, Bounds{"2", "2", 160, 240},
+          Bounds{"1.5", "2.5", 160, 240}, Bounds{"(2", "2", 0, 0},
+          Bounds{"3", "1", 0, 0}, Bounds{"10", "11", 0, 0}}) {
+      for (const bool reverse : {false, true}) {
+        for (const std::int64_t offset :
+             {-1LL, 0LL, 1LL, 54LL, 55LL, 56LL, 79LL, 80LL, 81LL, 210LL, 399LL,
+              400LL, 511LL, 512LL, 9223372036854775807LL}) {
+          for (const int count : {-1, 0, 1, 83}) {
+            SCOPED_TRACE("pass=" + std::to_string(pass) +
+                         " bounds=" + bounds.low + "," + bounds.high +
+                         " reverse=" + std::to_string(reverse) +
+                         " offset=" + std::to_string(offset) +
+                         " count=" + std::to_string(count));
+            std::vector<std::string> command{
+                "ZRANGE", key, reverse ? bounds.high : bounds.low,
+                reverse ? bounds.low : bounds.high, "BYSCORE"};
+            if (reverse) command.push_back("REV");
+            command.insert(command.end(),
+                           {"LIMIT", std::to_string(offset),
+                            std::to_string(count), "WITHSCORES"});
+            const auto reply = client.Command(command);
+            ASSERT_EQ(reply.kind_, '*') << reply.text_;
+            const auto available = bounds.end - bounds.first;
+            const auto remaining =
+                offset < 0 || std::uint64_t(offset) >= available
+                    ? 0
+                    : available - std::uint64_t(offset);
+            const auto size = count < 0
+                                  ? remaining
+                                  : std::min<std::uint64_t>(remaining, count);
+            ASSERT_EQ(reply.items_.size(), size * 2);
+            for (std::size_t i = 0; i < size; ++i) {
+              const auto index = reverse ? bounds.end - 1 - offset - i
+                                         : bounds.first + offset + i;
+              EXPECT_EQ(reply.items_[2 * i].text_, members[index]);
+              EXPECT_EQ(reply.items_[2 * i + 1].text_,
+                        std::to_string(index / 80));
+            }
+          }
+        }
+      }
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
 }
 
 TEST(GroupedSortedSetWriteE2e, ScoreBoundsHandleLongTieRunsAndMixedBatchMoves) {

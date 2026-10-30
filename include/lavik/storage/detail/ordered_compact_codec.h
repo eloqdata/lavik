@@ -16,13 +16,25 @@
 
 #pragma once
 
+#include <optional>
+#include <string_view>
+
 #include "lavik/storage/detail/grouped/collection.h"
+#include "lavik/storage/detail/ordered_index.h"
 
 namespace lavik::storage {
+
+// Compact signatures identify both collection kind and payload version.
+// V1 also frames logical full-image streams; v2 carries the indexed body.
+inline constexpr std::string_view kListMagicV1 = "LVL1";
+inline constexpr std::string_view kListMagicV2 = "LVL2";
+inline constexpr std::string_view kSortedSetMagicV1 = "LZS1";
+inline constexpr std::string_view kSortedSetMagicV2 = "LZS2";
 
 struct OrderedCompactEntryView {
   std::string_view value_;
   double score_ = 0;
+  // V1 framing plus value; v2 has no per-entry framing, so this is value_.
   std::string_view encoded_;
 };
 
@@ -35,6 +47,11 @@ class OrderedCompactReader {
       OrderedCollectionKind kind, std::string_view encoded,
       std::uint64_t expected_count);
   std::size_t size() const noexcept { return size_; }
+  // Present for physical v2 images; point readers need not traverse unrelated
+  // entries. Next remains the strict traversal API for full-image consumers.
+  const std::optional<IndexedOrderedReader>& indexed() const noexcept {
+    return indexed_;
+  }
   absl::StatusOr<OrderedCompactEntryView> Next();
 
  private:
@@ -45,16 +62,39 @@ class OrderedCompactReader {
   std::size_t remaining_;
   std::size_t offset_ = 8;
   bool sorted_;
+  std::optional<IndexedOrderedReader> indexed_;
+};
+
+// Keeps the bounded-state v2 encoder inline without heap allocation. The
+// encoder borrows source leases and operands; keep them alive through the
+// consuming writer's append waits. An unselected payload emits no bytes.
+class OrderedCompactPayload {
+ public:
+  IndexedOrderedSplice& V2(IndexedOrderedReader source) noexcept {
+    return payload_.emplace(source);
+  }
+  std::size_t encoded_bytes() const noexcept {
+    return payload_ ? payload_->encoded_bytes() : 0;
+  }
+  bool empty() const noexcept { return encoded_bytes() == 0; }
+  std::optional<std::string_view> Next() noexcept {
+    return payload_ ? payload_->Next() : std::nullopt;
+  }
+
+ private:
+  std::optional<IndexedOrderedSplice> payload_;
 };
 
 // Logical full-image bridge used by existing callback/RDB integrations.
 // A collection can span many physical pages, so aggregate bytes have no
 // String or record-payload limit here. Each item remains limited to 512 MiB
 // and the encoded count to uint32_t. Callers separately admit materialization
-// memory and enforce physical-page or destination-buffer bounds.
+// memory and enforce physical-page or destination-buffer bounds. The default
+// v1 is the logical wire bridge. Physical writers request v2, whose body uses
+// u32 offsets and therefore requires a bounded (at most UINT32_MAX-byte) image.
 absl::StatusOr<std::string> EncodeOrderedCompactValue(
-    OrderedCollectionKind kind,
-    std::span<const OrderedCollectionEntry> entries);
+    OrderedCollectionKind kind, std::span<const OrderedCollectionEntry> entries,
+    std::uint32_t version = 1);
 absl::StatusOr<std::vector<OrderedCollectionEntry>> DecodeOrderedCompactValue(
     OrderedCollectionKind kind, std::string_view encoded,
     std::uint64_t expected_count);

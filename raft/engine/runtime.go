@@ -14,6 +14,7 @@ import (
 
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/tracker"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -146,10 +147,12 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 		return nil, err
 	}
 	if !raft.IsEmptySnap(rec.snapshot) {
+		start := disk.metrics.operations[stageInstall].begin()
 		_, data, err := decodeSnapshot(rec.snapshot.Data)
 		if err == nil {
 			err = app.Install(rec.snapshot.Metadata.GetIndex(), data)
 		}
+		disk.metrics.operations[stageInstall].end(start, err)
 		if err != nil {
 			_ = disk.wal.Close()
 			return nil, err
@@ -187,6 +190,7 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 		return nil, err
 	}
 	r.publish()
+	r.disk.metrics.registry.MustRegister(runtimeCollector{r})
 	r.refreshTransport()
 	r.workers.Add(4)
 	go r.gcLoop()
@@ -202,8 +206,8 @@ func Open(cfg Config, app Application, transport Transport, onRole func(Role), o
 	return r, nil
 }
 
-// Status returns a detached observation; callers cannot mutate the published
-// member view shared with the protocol owner.
+// Status returns an observation whose exported collections are detached;
+// callers cannot mutate the published view shared with the protocol owner.
 func (r *Runtime) Status() Status {
 	current := r.status.Load()
 	s := *current
@@ -212,7 +216,9 @@ func (r *Runtime) Status() Status {
 	s.PeerAgeMicros = make(map[uint64]uint64, len(current.PeerAgeMicros))
 	for id, index := range current.PeerApplied {
 		s.PeerApplied[id] = index
-		s.PeerAgeMicros[id] = current.PeerAgeMicros[id]
+	}
+	for id, age := range current.PeerAgeMicros {
+		s.PeerAgeMicros[id] = age
 	}
 	s.Learners = make(map[uint64]bool, len(current.Learners))
 	for id, value := range current.Learners {
@@ -290,7 +296,8 @@ func controlMessage(kind pb.MessageType) bool {
 // Propose accepts a bounded copy. Its result is buffered and completed exactly
 // once; abandoning the receiver does not block Raft or release its reservation.
 func (r *Runtime) Propose(data []byte) (<-chan Result, error) {
-	return r.ProposeInTerm(data, r.Status().Term)
+	// Reading one immutable scalar needs no detached membership/map copies.
+	return r.ProposeInTerm(data, r.status.Load().Term)
 }
 
 // ProposeInTerm binds work before crossing the asynchronous proposal queue.
@@ -341,13 +348,25 @@ func (r *Runtime) stopAdmission() {
 
 func (r *Runtime) publish() {
 	s := r.core.status()
+	now := time.Now()
+	s.Published = now
+	if s.ProtocolRole == "StateLeader" {
+		s.progress = make(map[uint64]peerProgress, len(s.Members))
+		r.core.raw.WithProgress(func(id uint64, _ raft.ProgressType, p tracker.Progress) {
+			s.progress[id] = peerProgress{p.Match, p.Next, p.PendingSnapshot, p.State.String()}
+		})
+	}
 	s.Role = r.authorityRole(s.Role)
 	s.PeerApplied = map[uint64]uint64{}
 	s.PeerAgeMicros = map[uint64]uint64{}
+	// Freshness and evidence age refer to this publication's monotonic instant,
+	// avoiding two extra clock reads per peer on the protocol owner.
 	for id, peer := range r.liveness {
-		if r.peerLive(id, time.Now()) {
+		if r.peerLive(id, now) {
 			s.PeerApplied[id] = peer.applied
-			s.PeerAgeMicros[id] = uint64(time.Since(peer.confirmed).Microseconds())
+		}
+		if r.knownPeer(id) && !peer.confirmed.IsZero() {
+			s.PeerAgeMicros[id] = uint64(now.Sub(peer.confirmed).Microseconds())
 		}
 	}
 	s.PendingBytes = r.pendingBytes
@@ -881,6 +900,7 @@ func (r *Runtime) diskLoop() {
 		case <-r.stop:
 			return
 		case tasks := <-r.diskJobs:
+			persistStart := r.disk.metrics.operations[stagePersist].begin()
 			task := tasks[0]
 			if len(tasks) > 1 {
 				// Ordered group commit: persist the final HardState and every
@@ -897,12 +917,19 @@ func (r *Runtime) diskLoop() {
 			}
 			var err error
 			if task.GetType() == pb.MsgSnap {
+				start := r.disk.metrics.operations[stagePublish].begin()
 				err = r.disk.publishSnapshotMarker(task.Snapshot)
+				r.disk.metrics.operations[stagePublish].end(start, err)
 			} else if task.GetType() == pb.MsgProp {
 				err = r.disk.saveJoin(task.Context)
+			} else if !raft.IsEmptySnap(task.Snapshot) {
+				start := r.disk.metrics.operations[stagePublish].begin()
+				err = r.disk.savePrepared(task, true)
+				r.disk.metrics.operations[stagePublish].end(start, err)
 			} else {
 				err = r.disk.savePrepared(task, true)
 			}
+			r.disk.metrics.operations[stagePersist].end(persistStart, err)
 			for _, original := range tasks {
 				done := &diskCompletion{task: original, err: err, ack: make(chan struct{})}
 				select {
@@ -929,20 +956,24 @@ func (r *Runtime) applyLoop() {
 		case job := <-r.applyJobs:
 			done := &applyCompletion{job: job, ack: make(chan struct{})}
 			if job.capture != nil {
+				start := r.disk.metrics.operations[stageCapture].begin()
 				data, err := r.app.Capture(job.capture.metadata.GetIndex())
 				if err == nil {
 					data, err = encodeSnapshot(job.capture.members, data)
 				}
 				done.err = err
+				r.disk.metrics.operations[stageCapture].end(start, err)
 				if err == nil {
 					done.snapshot = &pb.Snapshot{Metadata: job.capture.metadata, Data: data}
 				}
 			} else if job.install != nil {
+				start := r.disk.metrics.operations[stageInstall].begin()
 				_, data, err := decodeSnapshot(job.task.Snapshot.Data)
 				if err == nil {
 					err = r.app.Install(job.task.Snapshot.Metadata.GetIndex(), data)
 				}
 				done.err = err
+				r.disk.metrics.operations[stageInstall].end(start, err)
 			} else {
 				for _, e := range job.task.Entries {
 					result := Result{Index: e.GetIndex()}

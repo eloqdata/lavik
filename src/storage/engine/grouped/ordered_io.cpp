@@ -219,26 +219,68 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::LoadOrderedListRange(
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedSortedSetPage>>
-StorageEngine::Impl::LoadSortedSetPage(WorkerStore& store,
-                                       WorkerStore::PartitionStore& partition,
-                                       std::uint8_t db_id, std::string_view key,
-                                       const Digest& digest,
-                                       GroupedObject::Handle object,
-                                       std::uint64_t page_id,
-                                       SortedSetMemberValidation validation) {
+StorageEngine::Impl::LoadSortedSetPage(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, std::uint64_t page_id,
+    SortedSetMemberValidation validation, SortedSetPageReadMode mode) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
-      [validation](
+      [validation, mode](
           std::string_view payload, std::uint64_t,
           const OrderedGroupEntry& route,
           LoadedValue&& loaded) -> absl::StatusOr<LoadedSortedSetPage> {
+        if (mode == SortedSetPageReadMode::kIndexedProjection &&
+            validation == SortedSetMemberValidation::kTrustStored) {
+          auto metadata = DecodeOrderedGroupMetadata(payload, payload.size());
+          if (!metadata.ok()) return metadata.status();
+          if (metadata->version_ == 2) {
+            auto reader = IndexedOrderedReader::Open(
+                metadata->kind_, payload.substr(kOrderedGroupHeaderBytes),
+                metadata->item_count_);
+            if (!reader.ok()) return reader.status();
+            const auto first = reader->Score(0),
+                       last = reader->Score(reader->size() - 1);
+            if (!first.ok()) return first.status();
+            if (!last.ok()) return last.status();
+            if (*first != route.min_score_ || *last != route.max_score_)
+              return absl::DataLossError("ordered page score bounds mismatch");
+            return LoadedSortedSetPage{std::move(loaded), {}, *reader};
+          }
+        }
         auto entries = DecodeSortedSetGroupViews(payload, validation);
         if (!entries.ok()) return entries.status();
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)
           return absl::DataLossError("ordered page score bounds mismatch");
-        return LoadedSortedSetPage{std::move(loaded), std::move(*entries)};
+        return LoadedSortedSetPage{std::move(loaded), std::move(*entries),
+                                   std::nullopt};
       });
+}
+
+absl::StatusOr<PackedSortedSetValues> StorageEngine::Impl::PackSortedSetPage(
+    std::span<const OrderedCollectionEntryView> entries) {
+  std::size_t bytes = 0;
+  for (const auto& entry : entries) {
+    if (entry.value_.size() > SIZE_MAX - bytes)
+      return absl::ResourceExhaustedError("Sorted Set page size overflow");
+    bytes += entry.value_.size();
+  }
+  PackedSortedSetValues result;
+  result.members_.blocks_.emplace_back(bytes, '\0');
+  result.members_.values_.reserve(entries.size());
+  result.scores_.reserve(entries.size());
+  auto& block = result.members_.blocks_.front();
+  std::size_t offset = 0;
+  for (const auto& entry : entries) {
+    result.members_.values_.push_back({0, offset, entry.value_.size()});
+    if (!entry.value_.empty())
+      std::memcpy(block.data() + offset, entry.value_.data(),
+                  entry.value_.size());
+    offset += entry.value_.size();
+    result.scores_.push_back(entry.score_);
+  }
+  return result;
 }
 
 Task<absl::StatusOr<PackedSortedSetValues>>
@@ -258,28 +300,7 @@ StorageEngine::Impl::LoadPackedSortedSetPage(
         if (entries->front().score_ != route.min_score_ ||
             entries->back().score_ != route.max_score_)
           return absl::DataLossError("ordered page score bounds mismatch");
-        std::size_t bytes = 0;
-        for (const auto& entry : *entries) {
-          if (entry.value_.size() > SIZE_MAX - bytes)
-            return absl::ResourceExhaustedError(
-                "Sorted Set page size overflow");
-          bytes += entry.value_.size();
-        }
-        PackedSortedSetValues result;
-        result.members_.blocks_.emplace_back(bytes, '\0');
-        result.members_.values_.reserve(entries->size());
-        result.scores_.reserve(entries->size());
-        auto& block = result.members_.blocks_.front();
-        std::size_t offset = 0;
-        for (const auto& entry : *entries) {
-          result.members_.values_.push_back({0, offset, entry.value_.size()});
-          if (!entry.value_.empty())
-            std::memcpy(block.data() + offset, entry.value_.data(),
-                        entry.value_.size());
-          offset += entry.value_.size();
-          result.scores_.push_back(entry.score_);
-        }
-        return result;
+        return PackSortedSetPage(*entries);
       },
       limiter);
 }

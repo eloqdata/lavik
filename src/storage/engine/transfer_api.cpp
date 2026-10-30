@@ -135,7 +135,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         if (!page.ok()) co_return page.status();
         auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
         if (!max_key.ok()) co_return max_key.status();
-        auto remembered = directory.RememberStreamPageMaxKey(index, *max_key);
+        auto remembered = directory.RememberPageMaxKey(index, *max_key);
         if (!remembered.ok()) co_return remembered;
         // Retain one admitted probe. Exact-ID ranges use the same page for
         // both bounds and the eventual reply.
@@ -146,8 +146,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       };
       while (lo < hi) {
         const auto mid = lo + (hi - lo) / 2;
-        auto less = upper ? groups[mid].stream_max_key_.LessThanOrEqual(key)
-                          : groups[mid].stream_max_key_.LessThan(key);
+        auto less = upper ? groups[mid].max_key_.LessThanOrEqual(key)
+                          : groups[mid].max_key_.LessThan(key);
         if (!less) {
           auto page = co_await load(mid);
           if (!page.ok()) co_return page.status();

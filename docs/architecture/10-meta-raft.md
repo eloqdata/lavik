@@ -42,6 +42,7 @@ mutex. Its bounded role callback records an ordered edge and wakes Bycorf.
 | Bulk executor | Prepare both captured and received checksummed snapshot files, rename and directory sync |
 | Reclamation executor | Delete covered, unlocked WAL segments and obsolete snapshot files; directory sync |
 | Per-peer connection goroutines | Separate control, log, and snapshot streams, encoding, TLS and reconnect |
+| C++ metrics worker | Bounded HTTP, scrape-time collection/formatting through the owned-buffer ABI |
 
 The append executor may group adjacent ordinary tasks into one durable write.
 It preserves entry order and the final HardState, then releases each original
@@ -220,6 +221,17 @@ and retry asynchronously; they do not report successful reclamation. Status
 separates retained logical log bytes, pending durability bytes, snapshot/first
 log indices, and transport/GC failures.
 
+Metrics adapts the existing immutable status publication, including RawNode
+role and leader progress captured only by the protocol owner. Scrapes never
+request owner work or invoke C++ application callbacks. Go event metrics use a
+private registry; upstream WAL/snapshot families are explicitly allowlisted
+from their process-wide registry. C++ proposal statistics and Data-control
+atomics are collected locally; Data-control publishes only a compact leadership
+view for this reader. There is no periodic cross-runtime metric transfer or
+text cache. The independent HTTP worker limits connections, request lifetime,
+response size and collection concurrency. Recovery exposes source availability;
+shutdown drains this reader before closing any source.
+
 Shutdown seals admission and drains existing submitters before resolving queued
 work. It revokes role authority, resolves pending local
 results, closes transports, joins append/application/bulk/GC owners and their
@@ -239,5 +251,6 @@ not a submodule or an external service.
 | Ordered protocol and executor dependencies | `raft/engine/core.go`, `runtime.go`, `snapshot.go` |
 | Durable format, recovery and GC | `raft/engine/storage.go`, `gc.go`, `join.go` |
 | Peer authentication, lane isolation and freshness | `raft/engine/transport.go`, `identity.go`, `liveness.go`, `budget.go` |
+| Scrape isolation and metric contracts | `raft/engine/metrics.go`, `src/meta/metrics.cpp` |
 | Configuration workflow and learner promotion | `raft/engine/membership.go`, `src/meta/membership_reconciler.cpp` |
 | Failure, recovery and isolation contracts | `raft/engine/*_test.go`, `tests/meta_state_machine_test.cpp`, `tests/meta_integration/` |

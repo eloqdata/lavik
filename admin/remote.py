@@ -286,7 +286,12 @@ def prepare(request):
     help_result = run([str(release / "lavik"), "--help"])
     if help_result["code"]:
         raise RuntimeError(help_result["stderr"] or "Release cannot run on this host")
+    meta_help = run([str(release / "lavik-meta"), "--help"])
+    meta_flags = meta_help["stdout"] + meta_help["stderr"]
     return {
+        "metaMetricsSupported": meta_help["code"] == 0
+        and "--metrics-port" in meta_flags
+        and "--metrics-bind" in meta_flags,
         "modern": "--meta-seed" in help_result["stdout"],
         "version": (release / "VERSION").read_text().strip(),
         "revision": (release / "REVISION").read_text().strip(),
@@ -530,6 +535,11 @@ def monitoring(request):
             if directory == root:
                 break
             directory.chmod(0o755)
+        # Historical plans did not enable Meta metrics or pin the new stack
+        # contract. Keep their reviewed files; adding a follower must not turn
+        # into an implicit monitoring upgrade or overwrite operator edits.
+        if request.get("legacyMonitoring") and path.exists():
+            continue
         write_once(path, content, 0o644)
     secret = root / "grafana-password"
     if not secret.exists():
@@ -548,6 +558,7 @@ def monitoring(request):
             "LAVIK_MODE=" + request.get("mode", "meta-managed"),
             "LAVIK_CLUSTER=" + request["cluster"],
             "GRAFANA_PUBLIC_URL=" + request["grafanaUrl"],
+            "LAVIK_META_TARGETS=" + ",".join(request.get("metaTargets", [])),
             "",
         ]
     )
@@ -583,16 +594,22 @@ def monitoring(request):
         "-f",
         str(root / "compose.yaml"),
     ]
-    previous = os.environ.get("LAVIK_TARGETS")
-    os.environ["LAVIK_TARGETS"] = ",".join(request["targets"])
+    target_env = {
+        "LAVIK_TARGETS": ",".join(request["targets"]),
+        "LAVIK_META_TARGETS": ",".join(request.get("metaTargets", [])),
+        "LAVIK_CLUSTER": request["cluster"],
+    }
+    previous = {key: os.environ.get(key) for key in target_env}
+    os.environ.update(target_env)
     try:
         checked([*argv, "up", "-d"], 180)
         checked([*argv, "up", "-d", "--force-recreate", "target-config"], 30)
     finally:
-        if previous is None:
-            os.environ.pop("LAVIK_TARGETS", None)
-        else:
-            os.environ["LAVIK_TARGETS"] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     prometheus_url = f"http://127.0.0.1:{request.get('prometheusPort', 9090)}"
     deadline = time.monotonic() + 60
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -604,14 +621,33 @@ def monitoring(request):
             with opener.open(prometheus_url + "/api/v1/targets", timeout=3) as response:
                 targets = json.load(response).get("data", {}).get("activeTargets", [])
                 healthy = {
-                    target.get("labels", {}).get("instance")
+                    (
+                        target.get("labels", {}).get("job"),
+                        target.get("labels", {}).get("cluster"),
+                        target.get("labels", {}).get("instance"),
+                    )
                     for target in targets
                     if target.get("health") == "up"
                 }
-                missing = set(request["targets"]) - healthy
+                expected = {
+                    ("lavik", request["cluster"], target)
+                    for target in request["targets"]
+                }
+                expected.update(
+                    ("lavik-meta", request["cluster"], target)
+                    for target in request.get("metaTargets", [])
+                )
+                if request.get("legacyMonitoring"):
+                    healthy.update(
+                        (job, request["cluster"], instance)
+                        for job, cluster, instance in list(healthy)
+                        if job == "lavik" and cluster is None
+                    )
+                missing = expected - healthy
                 if missing:
                     raise RuntimeError(
-                        "Prometheus cannot scrape: " + ", ".join(sorted(missing))
+                        "Prometheus cannot scrape: "
+                        + ", ".join("/".join(item) for item in sorted(missing))
                     )
             address = request["address"]
             host = "[" + address + "]" if ":" in address else address

@@ -129,6 +129,18 @@ func TestEveryStorageExecutorStageLeavesStableTermLive(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("fault stage not reached")
 			}
+			// Collection must finish even with the real executor blocked. It reads
+			// only immutable protocol state and independent metric cells.
+			collected := make(chan error, 1)
+			go func() { _, err := CollectMetrics(leader); collected <- err }()
+			select {
+			case err := <-collected:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("scrape waited for blocked storage executor")
+			}
 			deadline := time.NewTimer(2 * time.Second)
 			defer deadline.Stop()
 			tick := time.NewTicker(20 * time.Millisecond)
@@ -247,6 +259,20 @@ func TestFollowerApplyStallDoesNotChangeOrdinaryMajorityCompletion(t *testing.T)
 	}
 	if nodes[victim].Status().Applied >= got.Index {
 		t.Fatal("published unapplied entry")
+	}
+	collected := make(chan error, 1)
+	go func() { _, err := CollectMetrics(nodes[victim]); collected <- err }()
+	select {
+	case err := <-collected:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("scrape waited for blocked application executor")
+	}
+	families := metricFamilies(t, nodes[victim])
+	if sample(t, families, "lavik_meta_raft_applied_index").GetGauge().GetValue() >= float64(got.Index) {
+		t.Fatal("collector substituted commit for actual application")
 	}
 	term := leader.Status().Term
 	time.Sleep(2 * time.Second)

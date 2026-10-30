@@ -23,6 +23,7 @@
 #include <limits>
 
 #include "lavik/storage/detail/grouped/hash.h"
+#include "lavik/storage/detail/ordered_compact_codec.h"
 #include "lavik/storage/detail/stream_records.h"
 
 namespace lavik::storage {
@@ -129,7 +130,9 @@ absl::StatusOr<CollectionCompactEncoder> CollectionCompactEncoder::Create(
     Put(out + 16, count, 4);
     Put(out + 24, bytes, 8);
   } else if (type != ValueType::kString) {
-    std::memcpy(out, type == ValueType::kList ? "LVL1" : "LZS1", 4);
+    const auto magic =
+        type == ValueType::kList ? kListMagicV1 : kSortedSetMagicV1;
+    std::memcpy(out, magic.data(), magic.size());
     Put(out + 4, count, 4);
   }
   return result;
@@ -296,8 +299,9 @@ absl::Status CollectionCompactDecoder::ReadHeader() {
         Get(in + 16, 4) != total_count_ || Get(in + 20, 4) != 0 ||
         Get(in + 24, 8) != total_bytes_)
       return absl::DataLossError("invalid compact Hash/Set stream header");
-  } else if (std::memcmp(in, type_ == ValueType::kList ? "LVL1" : "LZS1", 4) !=
-                 0 ||
+  } else if (std::string_view(in, kListMagicV1.size()) !=
+                 (type_ == ValueType::kList ? kListMagicV1
+                                            : kSortedSetMagicV1) ||
              Get(in + 4, 4) != total_count_) {
     return absl::DataLossError("invalid ordered compact stream header");
   }

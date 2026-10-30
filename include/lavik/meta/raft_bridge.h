@@ -45,6 +45,11 @@ int lavik_raft_member(uint64_t handle, uint64_t ticket, void* data,
                       uint64_t expected_term);
 void lavik_raft_resign(uint64_t handle, uint64_t term);
 int lavik_raft_status(uint64_t handle, LavikRaftBytes* output);
+/* Scrape-only, bounded Prometheus text. Zero handle collects upstream process
+ * metrics during recovery. Output is malloc-owned by the caller. The process
+ * drains collectors before close; no callbacks or protocol work are requested.
+ */
+int lavik_raft_metrics(uint64_t handle, LavikRaftBytes* output);
 void lavik_raft_close(uint64_t handle);
 
 #ifdef __cplusplus

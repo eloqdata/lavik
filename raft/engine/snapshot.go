@@ -90,6 +90,7 @@ func (r *Runtime) finishSnapshot(index uint64, err error) {
 	r.snapshotInProgress = false
 	if err != nil {
 		r.snapshotFailures++
+		r.disk.metrics.snapshotErrors.Inc()
 	} else {
 		r.snapshotFailures = 0
 	}
@@ -134,7 +135,9 @@ func (r *Runtime) bulkLoop() {
 		case <-r.stop:
 			return
 		case work := <-r.bulkJobs:
+			start := r.disk.metrics.operations[stagePrepare].begin()
 			done := snapshotPrepared{snapshotWork: work, err: r.disk.prepareSnapshot(work.image)}
+			r.disk.metrics.operations[stagePrepare].end(start, done.err)
 			select {
 			case r.bulkDone <- done:
 			case <-r.stop:

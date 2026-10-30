@@ -378,8 +378,8 @@ class Node:
                 reply += chunk
         return reply.decode().strip()
 
-    def status(self):
-        reply = self.ctl("status")
+    def status(self, timeout=5.0):
+        reply = self.ctl("status", timeout=timeout)
         if not reply.startswith("OK "):
             raise Failure(f"node {self.id} status: {reply}")
         fields = {}

@@ -2995,8 +2995,10 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
   const std::string filler_value(16 * 1024 - 1, 'f');
   std::vector<std::string> fillers;
   // Fill ordinary record blocks with compact Strings; values at 16 KiB
-  // would promote and move their payloads into transaction blocks.
-  for (unsigned i = 0; i < 400; ++i)
+  // would promote and move their payloads into transaction blocks. Use more
+  // filler payload than the 9 MiB Hash so deletion leaves a source below the
+  // 50% live threshold even if TxCleaner promoted Hash pages into these blocks.
+  for (unsigned i = 0; i < 600; ++i)
     fillers.push_back(std::string("{large-hash-gc}:filler-") +
                       std::to_string(i));
   {
@@ -3011,19 +3013,21 @@ void LargeHashDurabilityE2eTest::CheckGcCrash(std::string_view point) {
     server.Kill();
   }
   {
-    ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2,
-                         point);
+    // Recovery can promote Hash pages before the first client connects. Keep
+    // the cleaner paused from startup so that an armed copy fault cannot
+    // terminate the server before we send the commands that trigger GC.
+    ServerProcess server(g_lavik_binary, port_, data_path_, log_path_, 2, point,
+                         {}, {{"LAVIK_TX_CLEANER_START_PAUSED", "1"}});
     RespClient ready(port_);
-    // Both crash points require relocation to run. Recovered transaction
-    // blocks can retain the Hash's pages; promote them without depending on
-    // the default idle cleaner cadence or incidental allocation pressure.
-    ASSERT_EQ(ready.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
-              "+OK");
     std::vector<std::string_view> command{"DEL"};
     for (const auto& key : fillers) command.push_back(key);
     const int fd = ConnectSocket(port_);
     ASSERT_GE(fd, 0);
-    SendAll(fd, EncodeCommand(command));
+    // Either deletion or promotion can hit the fault. Send both requests on
+    // the established connection without requiring a reply or a new client.
+    SendAll(fd, EncodeCommand(command) +
+                    EncodeCommand(
+                        {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}));
     server.WaitForCrash();
     ASSERT_EQ(::close(fd), 0);
   }

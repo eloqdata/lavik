@@ -1,0 +1,31 @@
+# Copyright (C) 2026 EloqData Inc. SPDX-License-Identifier: Apache-2.0
+groups:
+  - name: lavik.meta.recording
+    rules:
+      - record: lavik_meta:running
+        expr: |
+          group by (cluster, job, instance) (
+            (lavik_meta_phase{job="lavik-meta",phase="running"} == 1)
+            and on (cluster, job, instance) (up{job="lavik-meta"} == 1)
+          )
+      # A successful HTTP response is insufficient: the protocol owner may have
+      # stopped publishing. Bound observation age by its own liveness window.
+      - record: lavik_meta:raft_observed
+        expr: |
+          lavik_meta:running
+          and on (cluster, job, instance) (lavik_meta_source_available{job="lavik-meta",source="raft"} == 1)
+          and on (cluster, job, instance) (
+            lavik_meta_raft_status_age_seconds{job="lavik-meta"}
+            < lavik_meta_raft_leadership_validity_seconds{job="lavik-meta"}
+          )
+          and on (cluster, job, instance) (lavik_meta_raft_leadership_validity_seconds{job="lavik-meta"} > 0)
+      - record: lavik_meta:authority
+        expr: |
+          lavik_meta_raft_leader_authority{job="lavik-meta"}
+          and on (cluster, job, instance) lavik_meta:raft_observed
+      # Cluster absence claims require every configured target, including
+      # followers/learners. A partial zero is unknown, not a no-leader assertion.
+      - record: lavik_meta:cluster_observed
+        expr: |
+          count by (cluster, job) (lavik_meta:authority)
+          == on (cluster, job) count by (cluster, job) (up{job="lavik-meta"})

@@ -69,6 +69,15 @@ void ApplyProjection(MetaDataControlRuntimeNode& node,
 
 }  // namespace
 
+void MetaDataControlRuntimeStatus::PublishLeadership() {
+  metrics_leadership_.store(
+      std::make_shared<const MetaDataControlLeadershipObservation>(
+          MetaDataControlLeadershipObservation{
+              {leader_term_, leader_authority_eligible_,
+               leader_authority_eligibility_revision_}}),
+      std::memory_order_release);
+}
+
 void MetaDataControlRuntimeStatus::BeginLeadership(std::uint64_t leader_term) {
   std::lock_guard<std::mutex> lock(mutex_);
   nodes_.clear();
@@ -77,6 +86,7 @@ void MetaDataControlRuntimeStatus::BeginLeadership(std::uint64_t leader_term) {
   leader_term_ = leader_term;
   leader_authority_eligible_ = false;
   leader_authority_eligibility_revision_ = 0;
+  PublishLeadership();
 }
 
 bool MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
@@ -89,10 +99,12 @@ bool MetaDataControlRuntimeStatus::SetLeaderAuthorityEligible(
   if (leader_authority_eligibility_revision_ ==
       std::numeric_limits<std::uint64_t>::max()) {
     leader_authority_eligible_ = false;
+    PublishLeadership();
     return false;
   }
   ++leader_authority_eligibility_revision_;
   leader_authority_eligible_ = eligible;
+  PublishLeadership();
   return leader_authority_eligible_;
 }
 
@@ -105,6 +117,7 @@ void MetaDataControlRuntimeStatus::EndLeadership(std::uint64_t leader_term) {
   leader_term_ = 0;
   leader_authority_eligible_ = false;
   leader_authority_eligibility_revision_ = 0;
+  PublishLeadership();
 }
 
 void MetaDataControlRuntimeStatus::NoteUnregisteredRetry(

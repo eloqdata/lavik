@@ -1334,6 +1334,28 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     ProposeAccepted(begin, &state.transition_revision_);
   }
 
+  void ExpectProposalMetrics(std::uint64_t success, std::uint64_t rejected,
+                             std::uint64_t admission, std::uint64_t unknown) {
+    const std::string text = coordinator_->proposal_metrics().Collect();
+    const std::pair<const char*, std::uint64_t> expected[]{
+        {"applied_success", success},
+        {"applied_rejected", rejected},
+        {"admission_rejected", admission},
+        {"outcome_unknown", unknown}};
+    for (auto [outcome, count] : expected) {
+      for (const char* metric :
+           {"lavik_meta_proposals_total",
+            "lavik_meta_proposal_duration_seconds_count"}) {
+        EXPECT_NE(text.find(std::string(metric) + "{result=\"" + outcome +
+                            "\"} " + std::to_string(count) + "\n"),
+                  std::string::npos)
+            << text;
+      }
+    }
+    EXPECT_NE(text.find("lavik_meta_proposals_inflight 0\n"),
+              std::string::npos);
+  }
+
   std::filesystem::path dir_;
   std::shared_ptr<MetaStateMachine> machine_;
   std::shared_ptr<lavik::meta::MetaRaft> server_;
@@ -1401,6 +1423,7 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
   ASSERT_TRUE(rejected.ok()) << rejected.status();
   EXPECT_EQ(rejected->verdict_, MetaAuditVerdict::kRejected);
   EXPECT_FALSE(rejected->detail_.empty());
+  ExpectProposalMetrics(1, 1, 0, 0);
   EXPECT_FALSE(machine_->CaptureRecoveryStores()
                    .stores_.identity_.FindNode(MakeNodeId(0x12))
                    .has_value());
@@ -1433,6 +1456,7 @@ TEST_F(MetaCoordinatorServerTest, ProposeNotLeaderThenLeader) {
   auto accepted = ProposeSync(MakeRegister(0x22));
   ASSERT_TRUE(accepted.ok()) << accepted.status();
   EXPECT_EQ(accepted->verdict_, MetaAuditVerdict::kAccepted);
+  ExpectProposalMetrics(1, 0, 1, 0);
 }
 
 TEST_F(MetaCoordinatorServerTest, FailSafeWalGate) {
@@ -2220,6 +2244,7 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeTimeoutIsReconcilable) {
       },
       std::chrono::seconds(10)));
   EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(), 2u);
+  ExpectProposalMetrics(1, 0, 0, 1);
 }
 
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
@@ -2279,6 +2304,29 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeDemotionIsReconcilable) {
       },
       std::chrono::seconds(10)));
   EXPECT_EQ(machine_->CaptureRecoveryStores().stores_.audit_.size(), 2u);
+  ExpectProposalMetrics(1, 0, 0, 1);
+}
+
+TEST_F(MetaCoordinatorServerTest, DestroyedProposalCountsOnceBeforeLateApply) {
+  StartServer();
+  MakeCoordinator();
+  WaitLeader();
+  const auto baseline = ProposeSync(MakeRegister(0x51));
+  ASSERT_TRUE(baseline.ok());
+  apply_barrier_.Pause();
+  auto task = coordinator_->Propose(MakeRegister(0x55), TestPrincipal());
+  auto handle = std::move(task).ReleaseHandle();
+  handle.resume();
+  ASSERT_TRUE(
+      WaitFor([&] { return server_->DurableIndex() > baseline->log_index_; },
+              std::chrono::seconds(10)));
+  handle.destroy();
+  ExpectProposalMetrics(1, 0, 0, 1);
+  apply_barrier_.Resume();
+  ASSERT_TRUE(
+      WaitFor([&] { return machine_->FindNode(MakeNodeId(0x55)).has_value(); },
+              std::chrono::seconds(10)));
+  ExpectProposalMetrics(1, 0, 0, 1);
 }
 
 TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
@@ -2322,6 +2370,7 @@ TEST_F(MetaCoordinatorServerTest, UncertainOutcomeCancelIsReconcilable) {
   EXPECT_EQ(cancelled.status().code(), absl::StatusCode::kCancelled);
   EXPECT_NE(cancelled.status().message().find("uncertain"), std::string::npos)
       << cancelled.status();
+  ExpectProposalMetrics(1, 0, 0, 1);
 }
 
 // Mock operation reconciler: reconciles one fixed operation to

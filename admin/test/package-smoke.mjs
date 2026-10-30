@@ -47,6 +47,9 @@ try {
   );
   const monitoring = await monitoringFiles();
   assert.ok(monitoring["prometheus/rules/alerts.yml"]);
+  assert.ok(monitoring["prometheus/rules/meta-alerts.yml"]);
+  assert.ok(monitoring["prometheus/rules/meta-recording.yml"]);
+  assert.ok(monitoring["grafana/dashboards/lavik-meta.json"]);
   assert.ok(monitoring["configure-targets.sh"]);
   assert.ok(monitoring["alertmanager/alertmanager.yml"]);
   assert.equal(monitoring[".env"], undefined);

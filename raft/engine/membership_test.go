@@ -47,7 +47,9 @@ func testWaitingJoiner(t *testing.T, compact bool) {
 			t.Fatal(err)
 		}
 		nodes[i] = r
-		networks[i].Start(r.Step)
+		if i == 0 {
+			networks[i].Start(r.Step)
+		}
 	}
 	eventually(t, "genesis leader", func() bool { return nodes[0].Status().CaughtUp })
 	if compact {
@@ -72,6 +74,17 @@ func testWaitingJoiner(t *testing.T, compact bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Hold the joiner before accepting connections so its learner interval is
+	// observable. Scraping cannot wait for catch-up or imply a zero applied index.
+	eventually(t, "learner published before catch-up", func() bool { return nodes[0].Status().Learners[2] })
+	families := metricFamilies(t, nodes[0])
+	if sample(t, families, "lavik_meta_raft_member", "peer_id", "2", "kind", "learner").GetGauge().GetValue() != 1 || families["lavik_meta_raft_peer_applied_index"] != nil {
+		t.Fatal("offline learner evidence misrepresented")
+	}
+	if families["lavik_meta_raft_peer_match_index"] == nil {
+		t.Fatal("missing learner replication progress")
+	}
+	networks[1].Start(nodes[1].Step)
 	select {
 	case outcome := <-result:
 		if outcome.Err != nil {
@@ -85,6 +98,9 @@ func testWaitingJoiner(t *testing.T, compact bool) {
 	}
 	if s := nodes[0].Status(); len(s.Members) != 2 || s.Learners[2] {
 		t.Fatalf("not promoted: %+v", s)
+	}
+	if sample(t, metricFamilies(t, nodes[0]), "lavik_meta_raft_member", "peer_id", "2", "kind", "voter").GetGauge().GetValue() != 1 {
+		t.Fatal("promoted member still learner")
 	}
 	result, err = nodes[0].Propose([]byte("joined write"))
 	if err != nil {
@@ -111,4 +127,8 @@ func testWaitingJoiner(t *testing.T, compact bool) {
 		t.Fatal("remove failed")
 	}
 	eventually(t, "removed descriptor", func() bool { return len(nodes[0].Status().Members) == 1 })
+	eventually(t, "removed peer metric series", func() bool {
+		families := metricFamilies(t, nodes[0])
+		return families["lavik_meta_raft_peer_match_index"] == nil && families["lavik_meta_raft_lane_connected"] == nil
+	})
 }

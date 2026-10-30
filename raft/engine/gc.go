@@ -116,6 +116,7 @@ func (r *Runtime) gcLoop() {
 			// Expose it instead of hiding growing physical disk consumption.
 			if err := r.disk.reclaim(r.disk.gcCut.Load()); err != nil {
 				r.gcFailures.Add(1)
+				r.disk.metrics.gcErrors.Inc()
 			} else {
 				r.gcFailures.Store(0)
 			}
