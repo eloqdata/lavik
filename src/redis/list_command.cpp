@@ -1085,8 +1085,11 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
   };
   auto status_reply = [&](const absl::Status& status) {
     if (absl::IsAborted(status)) {
-      return BuiltReply(reply_builder.AppendError(
-          CommandErrorReasonForStatus(status), "TRYAGAIN ", status.message()));
+      return BuiltReply(
+          reply_builder.AppendError(GetErrorDetail(status) == ErrorDetail::kNone
+                                        ? CommandErrorReason::kTryAgain
+                                        : CommandErrorReasonForStatus(status),
+                                    "TRYAGAIN ", status.message()));
     }
     return BuiltReply(reply_builder.AppendError(
         CommandErrorReasonForStatus(status), "ERR ", status.message()));

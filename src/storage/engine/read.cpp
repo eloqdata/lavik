@@ -16,6 +16,7 @@
 
 #include "absl/crc/crc32c.h"
 #include "impl.h"
+#include "lavik/error_detail.h"
 #include "lavik/random_sample.h"
 
 namespace lavik::storage {
@@ -546,9 +547,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
     if (found->value_.value_type() != ValueType::kString) {
-      co_return absl::Status(
-          absl::StatusCode::kInvalidArgument,
-          "WRONGTYPE Operation against a key holding the wrong kind of value");
+      co_return WrongTypeError();
     }
     if (trace != nullptr) {
       trace->hit_ = true;
@@ -875,9 +874,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
   }
   if (found->value_.value_type() != ValueType::kString) {
-    co_return absl::Status(
-        absl::StatusCode::kInvalidArgument,
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   }
   co_return found->value_.logical_size();
 }

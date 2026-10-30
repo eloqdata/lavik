@@ -1061,13 +1061,15 @@ def redis_connection(data):
         raise
 
 
-def retry_clusterdown(description, operation, timeout=2.0):
+def retry_clusterdown(description, operation, timeout=2.0, *, on_self_fence=None):
     """Retry only the finite-lease self-fence admitted by this gate.
 
     Cluster READY can precede causal confirmation of the latest Grant. With
     the deliberately short process-test lease, Data may therefore reject one
     command while it reconnects for a fresh causal sequence. Every other
     transport or Redis error remains an immediate assertion failure.
+    The optional observer accounts for each rejected attempt separately from
+    the eventual reply when a caller verifies command counters.
     """
     deadline = time.monotonic() + timeout
     attempts = 0
@@ -1089,6 +1091,8 @@ def retry_clusterdown(description, operation, timeout=2.0):
                 raise
         if reply != TRANSIENT_SELF_FENCE:
             return reply
+        if on_self_fence is not None:
+            on_self_fence()
         last_reply = reply
     raise H.Failure(
         f"{description} remained self-fenced after {attempts} attempts: {last_reply}"
@@ -1105,7 +1109,7 @@ def redis_call(data, arguments):
     return retry_clusterdown(f"Redis {arguments[0]} on {data.node_id}", call_once)
 
 
-def redis_error(data, arguments):
+def redis_error(data, arguments, *, on_self_fence=None):
     def call_once():
         with redis_connection(data) as sock:
             sock.settimeout(3.0)
@@ -1117,7 +1121,11 @@ def redis_error(data, arguments):
                 )
             return line[1:-2].decode(errors="replace")
 
-    return retry_clusterdown(f"Redis {arguments[0]} error on {data.node_id}", call_once)
+    return retry_clusterdown(
+        f"Redis {arguments[0]} error on {data.node_id}",
+        call_once,
+        on_self_fence=on_self_fence,
+    )
 
 
 def readonly_get(data, key):
@@ -1210,7 +1218,15 @@ def assert_redis_topology_and_replication(nodes):
     before_redirected = primary.metric("lavik_command_results_total", redirected_labels)
     before_rejected = primary.metric("lavik_command_results_total", rejected_labels)
     before_stats = redis_call(primary, ["INFO", "commandstats"])
-    moved = redis_error(primary, ["GET", keys["group-2"]])
+    fenced_attempts = 0
+
+    def count_self_fence():
+        nonlocal fenced_attempts
+        fenced_attempts += 1
+
+    moved = redis_error(
+        primary, ["GET", keys["group-2"]], on_self_fence=count_self_fence
+    )
     expected_endpoint = endpoint_tuple(by_id[PRIMARY_2])
     if (
         not moved.startswith(f"MOVED {redis_slot(keys['group-2'])} ")
@@ -1224,7 +1240,7 @@ def assert_redis_topology_and_replication(nodes):
         raise H.Failure("MOVED did not record exactly one redirected command")
     if (
         primary.metric("lavik_command_results_total", rejected_labels)
-        != before_rejected
+        != before_rejected + fenced_attempts
     ):
         raise H.Failure("MOVED was also counted as an admission rejection")
     if (
@@ -1246,7 +1262,8 @@ def assert_redis_topology_and_replication(nodes):
     after = get_stats(redis_call(primary, ["INFO", "commandstats"]))
     if (
         after["calls"] != before["calls"]
-        or int(after["rejected_calls"]) != int(before["rejected_calls"]) + 1
+        or int(after["rejected_calls"])
+        != int(before["rejected_calls"]) + fenced_attempts + 1
         or after["failed_calls"] != before["failed_calls"]
     ):
         raise H.Failure(

@@ -677,6 +677,39 @@ TEST_F(CommandResultsE2eTest, ErrorReasonsSurviveStorageAndReset) {
                   .starts_with("cmdstat_config|resetstat:calls=1,"));
 }
 
+TEST_F(CommandResultsE2eTest, WrongTypeSourcesKeepClientErrorReasons) {
+  ASSERT_EQ(client_->Command({"LPUSH", "type:list", "item"}), ":1");
+  ASSERT_EQ(client_->Command({"SET", "type:string", "value"}), "+OK");
+  const std::vector<std::vector<std::string_view>> commands{
+      {"GET", "type:list"},
+      {"STRLEN", "type:list"},
+      {"GETSET", "type:list", "value"},
+      {"SET", "type:list", "value", "GET"},
+      {"SORT", "type:string"},
+      {"SORT_RO", "type:string"}};
+  for (const auto& command : commands) {
+    EXPECT_EQ(client_->Command(command),
+              "-WRONGTYPE Operation against a key holding the wrong kind of "
+              "value");
+  }
+  for (const auto command :
+       {"get", "strlen", "getset", "set", "sort", "sort_ro"}) {
+    EXPECT_EQ(Result(command, "client", "failed"), 1) << command;
+    EXPECT_EQ(Error(command, "client", "failed", "wrongtype"), 1) << command;
+    const auto metrics = HttpGet(metrics_port_, "/metrics");
+    for (const auto reason : {"storage", "invalid_value"}) {
+      EXPECT_EQ(
+          metrics.find("command=\"" + std::string(command) +
+                       "\",context=\"client\",result=\"failed\",reason=\"" +
+                       reason + "\""),
+          std::string::npos)
+          << command << ": " << reason;
+    }
+    EXPECT_TRUE(Stats(command).ends_with(",rejected_calls=0,failed_calls=1"))
+        << command;
+  }
+}
+
 TEST_F(CommandResultsE2eTest, AdmissionAndMalformedInputHaveDistinctCounters) {
   client_.reset();
   server_->Stop();
@@ -716,6 +749,42 @@ TEST_F(CommandResultsE2eTest,
   ASSERT_NE(usec, std::string::npos);
   EXPECT_LT(std::stoull(stats.substr(usec + 6)), 100000);
   EXPECT_EQ(Result("blpop", "client", "success"), 1);
+}
+
+TEST_F(CommandResultsE2eTest, BlockingRoleChangesKeepRetryReasons) {
+  for (const bool sorted_set : {false, true}) {
+    const char* command = sorted_set ? "BZPOPMIN" : "BLPOP";
+    const char* metric = sorted_set ? "bzpopmin" : "blpop";
+    const char* key = sorted_set ? "retry:zset" : "retry:list";
+    auto blocked = std::async(std::launch::async, [&, command, key] {
+      RespClient waiting(port_);
+      return waiting.Command({command, key, "5"});
+    });
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    bool registered = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (client_->Command({"INFO", "clients"}).find("blocked_clients:1\r\n") !=
+          std::string::npos) {
+        registered = true;
+        break;
+      }
+      std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_TRUE(registered);
+    // Even a standalone NO ONE transition advances the role epoch. Wake the
+    // old waiter afterward so its retry must reject the stale admission.
+    ASSERT_EQ(client_->Command({"REPLICAOF", "NO", "ONE"}), "+OK");
+    if (sorted_set) {
+      ASSERT_EQ(client_->Command({"ZADD", key, "1", "item"}), ":1");
+    } else {
+      ASSERT_EQ(client_->Command({"RPUSH", key, "item"}), ":1");
+    }
+    EXPECT_EQ(blocked.get(),
+              "-TRYAGAIN replication role changed; retry command");
+    EXPECT_EQ(Error(metric, "client", "failed", "tryagain"), 1);
+    EXPECT_TRUE(Stats(metric).ends_with(",rejected_calls=0,failed_calls=1"));
+    EXPECT_EQ(client_->Command({sorted_set ? "ZCARD" : "LLEN", key}), ":1");
+  }
 }
 
 TEST_F(CommandResultsE2eTest, ExclusiveCommandsExcludeDatabaseDrainAdmission) {

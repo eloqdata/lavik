@@ -3209,7 +3209,9 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   auto status_reply = [&](const absl::Status& status) {
     if (absl::IsAborted(status)) {
       return Built(
-          builder.AppendError(CommandErrorReasonForStatus(status),
+          builder.AppendError(GetErrorDetail(status) == ErrorDetail::kNone
+                                  ? CommandErrorReason::kTryAgain
+                                  : CommandErrorReasonForStatus(status),
                               "TRYAGAIN " + std::string(status.message())));
     }
     return Built(StorageError(builder, status));

@@ -203,9 +203,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   SetResult result;
   if (options.return_old_value_ && exists) {
     if (found->value_.value_type() != ValueType::kString) {
-      co_return absl::Status(
-          absl::StatusCode::kInvalidArgument,
-          "WRONGTYPE Operation against a key holding the wrong kind of value");
+      co_return WrongTypeError();
     }
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      MaterializeIndexLocation(*found),

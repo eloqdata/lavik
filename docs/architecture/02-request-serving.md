@@ -564,7 +564,8 @@ Parser and version-aware reply encoding are unit-tested independently. The
 command-table tests cover kind lookup, flags, arity, and movable key extraction.
 E2E binaries exercise HELLO/RESP3 and Pub/Sub through the Pub/Sub suite, Lua
 through the transaction suite, bounded batched MGET through the multi-key
-suite, SLOWLOG and `RESETSTAT` through the metrics suite, Sentinel failover,
+suite, SLOWLOG, `RESETSTAT`, and command-outcome accounting through the metrics
+suite, Sentinel failover,
 multi-key atomicity, `MULTI`/`EXEC`/WATCH, TTL, collections, RDB
 import/export/backup, replication logs, and Redis PSYNC behavior through the
 real server executable.
@@ -588,5 +589,6 @@ real server executable.
 | Durable process-global Function catalog lifecycle | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/lavik/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/lavik/slowlog.h`, `src/redis/slowlog.cpp`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
+| Command outcomes, execution-context attribution, and typed error provenance | `include/lavik/command_outcome.h`, `include/lavik/error_detail.h`, `include/lavik/resp.h`, `include/lavik/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/lavik/rdb.h`, `src/redis/rdb.cpp`, `include/lavik/rdb_collection.h`, `src/redis/rdb_collection.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
 | Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/redis_follower_smoke.py`, `tests/list_e2e_test.cpp` |

@@ -275,8 +275,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       source.elements_ = std::move(*members);
       co_return source;
     }
-    co_return absl::FailedPreconditionError(
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
+    co_return WrongTypeError();
   };
   if (key.owner_ == ThisWorker().id_) co_return co_await read();
   co_return co_await SubmitTaskTo(key.owner_, read);
