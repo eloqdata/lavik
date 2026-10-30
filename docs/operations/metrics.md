@@ -221,8 +221,11 @@ the larger value. This is a conservative observation, not an atomic cross-worker
 durability barrier under concurrent writes. Compare INFO and Prometheus exactly
 only when the observed state is quiescent.
 
-This adds one low-frequency durability traversal per scrape, proportional to
-data workers and staging slots. There is no new command-path instrumentation,
+Full scrapes read dirty staging and replication diagnostics in the same visit
+to each data worker. INFO reads only the requested diagnostics, without
+allocating replication snapshots. Command and completed I/O statistics also
+share one callback per worker. Collection cost remains proportional to data
+workers and staging slots. There is no new command-path instrumentation,
 collection thread or periodic INFO polling. Existing memory diagnostics and
 filesystem capacity queries still contribute to scrape cost. Multiple collectors
 each pay that cost; use `scrape_duration_seconds` to inspect collection time and

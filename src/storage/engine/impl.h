@@ -2857,7 +2857,15 @@ class StorageEngine::Impl {
 
   Task<StorageDurabilityStats> DurabilityStats() const;
 
-  Task<StorageDiagnosticsSnapshot> CollectDiagnostics() const;
+  // Shared owner-local scan and conservative pending samples for all callers.
+  std::uint64_t LocalDirtyStagingBytes() const;
+  void UpdateDurabilityPending(StorageDurabilityStats& stats) const;
+
+  // Full metrics can collect replication in the same worker visits. INFO
+  // leaves this null, avoiding replication traversal and vector allocation.
+  Task<StorageDiagnosticsSnapshot> CollectDiagnostics(
+      std::vector<StorageReplicationLogMetrics>* replication_logs =
+          nullptr) const;
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 

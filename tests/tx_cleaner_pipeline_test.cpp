@@ -529,6 +529,57 @@ TEST_F(TxCleanerPipelineTestPeer, DiagnosticsReportNestedExpirationPauses) {
   EXPECT_EQ(Diagnostics().expiration_pause_count_, 0);
 }
 
+TEST_F(TxCleanerPipelineTestPeer,
+       ConcurrentMetricsKeepOwnerSnapshotsAndPending) {
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    On(owner);
+    auto& store = Store(owner);
+    // Model a large historical staging high-water mark after buffers drain.
+    store.staging_slots_.resize(4096);
+    for (auto& slot : store.staging_slots_) {
+      slot.committed_bytes_ = kBlockHeaderBytes + 9000;
+    }
+    auto& dirty = store.staging_slots_[1];
+    dirty.write_buffer_id_ = 1;
+    dirty.committed_bytes_ = kBlockHeaderBytes + 100 * (owner + 1);
+    store.replication_log_.next_lsn_ = 20 + owner;
+    store.replication_log_.coverage_revocations_ = 3 + owner;
+  }
+  SetPendingCounts(2, 7);
+  auto metrics = storage_.CollectMetrics();
+  StartTask(metrics, 0);
+  auto diagnostics = storage_.CollectDiagnostics();
+  StartTask(diagnostics, 0);
+  ASSERT_FALSE(metrics.done());
+  ASSERT_FALSE(diagnostics.done());
+  // Both collectors must retain their initial pending sample even if the
+  // final commit/flush finishes while their remote snapshots are queued.
+  SetPendingCounts(0, 0);
+  ASSERT_TRUE(PumpUntil([&] { return metrics.done() && diagnostics.done(); }));
+  const auto full = std::move(metrics).TakeResult();
+  const auto info = std::move(diagnostics).TakeResult();
+  EXPECT_EQ(full.diagnostics_.durability_.dirty_staging_bytes_, 300);
+  EXPECT_EQ(full.diagnostics_.durability_.dirty_staging_bytes_,
+            info.durability_.dirty_staging_bytes_);
+  EXPECT_EQ(full.diagnostics_.durability_.flushes_pending_, 2);
+  EXPECT_EQ(full.diagnostics_.durability_.tx_commits_pending_, 7);
+  ASSERT_EQ(full.replication_logs_.size(), kWorkers);
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    EXPECT_EQ(full.replication_logs_[owner].worker_id_, owner);
+    EXPECT_EQ(full.replication_logs_[owner].tail_lsn_, 19 + owner);
+    EXPECT_EQ(full.replication_logs_[owner].coverage_revocations_, 3 + owner);
+  }
+
+  metrics = storage_.CollectMetrics();
+  StartTask(metrics, 0);
+  SetPendingCounts(1, 3);
+  ASSERT_TRUE(PumpUntil([&] { return metrics.done(); }));
+  const auto subsequent = std::move(metrics).TakeResult();
+  EXPECT_EQ(subsequent.diagnostics_.durability_.flushes_pending_, 1);
+  EXPECT_EQ(subsequent.diagnostics_.durability_.tx_commits_pending_, 3);
+  SetPendingCounts(0, 0);
+}
+
 TEST_F(TxCleanerPipelineTestPeer, DiagnosticsRetainQueuePeakAfterBackpressure) {
   const auto watermark = storage_.TxCommitBatchStats().queue_high_watermark_;
   ASSERT_GT(watermark, 0);

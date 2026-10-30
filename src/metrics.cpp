@@ -335,19 +335,26 @@ void RecordCommandMetric(CommandKind kind,
 }
 
 bycorf::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
+  struct LocalSnapshot {
+    WorkerMetricsData commands;
+    bycorf::Worker::StorageIoStats storage_io;
+  };
   WorkerMetricsSnapshot result;
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
     // Copy on the owner rather than reading its live cache lines remotely.
     // Slice off the live shard's alignment so it does not over-align the
     // coroutine frame holding the transfer value.
-    const auto shard =
-        co_await bycorf::SubmitTo(worker, [worker]() -> WorkerMetricsData {
-          return static_cast<const WorkerMetricsData&>(
-              g_worker_metrics[worker]);
-        });
-    const bycorf::Worker::StorageIoStats storage_io = co_await bycorf::SubmitTo(
-        worker, [] { return bycorf::ThisWorker().self_->storage_io_stats(); });
+    // Both sources belong to this worker; collect them in one round trip.
+    const auto snapshot = co_await bycorf::SubmitTo(worker, [worker] {
+      return LocalSnapshot{
+          .commands =
+              static_cast<const WorkerMetricsData&>(g_worker_metrics[worker]),
+          .storage_io = bycorf::ThisWorker().self_->storage_io_stats(),
+      };
+    });
+    const auto& shard = snapshot.commands;
+    const auto& storage_io = snapshot.storage_io;
     result.connected_clients_ += shard.connected_clients_;
     result.blocked_clients_ += shard.blocked_clients_;
     result.replication_control_connections_ +=
