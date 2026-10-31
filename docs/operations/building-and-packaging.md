@@ -406,8 +406,15 @@ devices, including oversized elements, transaction failure and cold restart:
 
 ```bash
 cmake --build bld-clang18-debug --target lavik lavik_grouped_hash_write_e2e_test lavik_grouped_ordered_write_e2e_test -j 8
-ctest --test-dir bld-clang18-debug -R '^lavik_grouped_(hash|ordered)_write_e2e$' --output-on-failure
+ctest --test-dir bld-clang18-debug -R '^lavik_grouped_(hash|ordered)_write_e2e($|\.)' --output-on-failure
 ```
+
+The ordered write executable registers each GoogleTest case with CTest under
+the `lavik_grouped_ordered_write_e2e.` prefix, including parameterized cases.
+Each case has a five-minute deadline and runs serially on its host. CI can
+distribute the cases across its isolated runners; newly added cases are
+discovered automatically. The opt-in large RDB stress invocation below remains
+separate from ordinary CTest execution.
 
 The collection write-concurrency suite uses cold compact and grouped records
 and deterministic Debug pauses to verify that unrelated keys progress while
