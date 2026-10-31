@@ -2362,14 +2362,14 @@ endforeach()
     target_compile_definitions(lavik_grouped_ordered_write_e2e_test PRIVATE
       LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
-    add_test(
-      NAME lavik_grouped_ordered_write_e2e
-      COMMAND lavik_grouped_ordered_write_e2e_test $<TARGET_FILE:lavik>
-    )
-    # This aggregate suite repeatedly starts and recovers storage, including
-    # large RDB and crash-recovery cases on Debug CI runners.
-    set_tests_properties(lavik_grouped_ordered_write_e2e PROPERTIES
-      TIMEOUT 1800 RUN_SERIAL TRUE
+    # Discover individual cases so CI can distribute repeated storage starts
+    # and recoveries across its isolated runners. Each case retains a bounded
+    # deadline and serial execution on its host; new cases enter CI without a
+    # hand-maintained filter or sharing one growing aggregate timeout.
+    gtest_discover_tests(lavik_grouped_ordered_write_e2e_test
+      TEST_PREFIX lavik_grouped_ordered_write_e2e.
+      EXTRA_ARGS $<TARGET_FILE:lavik>
+      PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_list_e2e_test

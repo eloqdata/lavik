@@ -491,8 +491,11 @@ a replacement interval. Only changed snapshots enter
 the writer, and admitted reply buffers retain their charge across owner hops.
 
 Sorted Set operations use a typed storage interface. Cardinality reads root
-metadata. Score lookups read only the selected member-prefix pages. Member
-ranks resolve the score through that index, binary-search page maxima within
+metadata. Score lookups project requested scores from selected member-prefix
+pages directly into reply positions, preserving duplicate operands and misses.
+They retain one checked page at a time and copy scalar scores before releasing
+its lease; no member payload or mutation state survives the read. Member
+ranks resolve the score through the member index, binary-search page maxima within
 the score-bounded interval, and combine the exact member's page offset with the
 directory's Fenwick prefix count. Rank ranges start at the directory's selected pages;
 score ranges and score counts first seek their candidate interval using

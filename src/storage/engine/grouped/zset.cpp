@@ -27,6 +27,7 @@
 #include "lavik/glob.h"
 #include "lavik/random_sample.h"
 #include "lavik/storage/detail/grouped/scratch.h"
+#include "lavik/storage/detail/hash_read.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 #include "read_window.h"
 #include "zset_work_budget.h"
@@ -1188,9 +1189,17 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
     if (ReadOnly(operation)) unlock.Unlock();
     const auto version =
         (*view) ? std::optional((*view)->version()) : std::nullopt;
-    auto read = co_await ExecuteGroupedSortedSetLocked(
-        store, partition, db_id, key, digest, operation, std::move(*view), tx,
-        replication, mutation_precondition);
+    // Dispatch score-only reads before entering the general mutation/range
+    // coroutine. The non-coroutine selector adds no forwarding frame, while
+    // the common population-change handling below remains in force.
+    auto read = co_await [&]() -> Task<absl::StatusOr<SortedSetResult>> {
+      if (operation.kind_ == SortedSetOperationKind::kScores)
+        return ReadGroupedSortedSetScores(store, partition, db_id, key, digest,
+                                          operation, std::move(*view));
+      return ExecuteGroupedSortedSetLocked(store, partition, db_id, key, digest,
+                                           operation, std::move(*view), tx,
+                                           replication, mutation_precondition);
+    }();
     if (!read.ok() && ReadOnly(operation) && version &&
         (EffectiveRecordDbEpoch(partition, db_id) != version->db_epoch_ ||
          partition.replication_epoch_ != version->replication_epoch_ ||
@@ -1243,6 +1252,114 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
       db_id, key, digest, ValueType::kSortedSet, ReadOnly(operation), callback,
       tx, now, replication, prepare_unlocked, mutation_precondition);
   if (!status.ok()) co_return status;
+  co_return result;
+}
+
+Task<absl::StatusOr<SortedSetResult>>
+StorageEngine::Impl::ReadGroupedSortedSetScores(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object) {
+  if (!object || !object->is_ordered() ||
+      object->ordered_directory().root().kind_ !=
+          OrderedCollectionKind::kSortedSet)
+    co_return absl::DataLossError("invalid grouped Sorted Set view");
+  SortedSetResult result;
+  result.key_exists_ = true;
+  result.length_ = object->ordered_directory().root().item_count_;
+  const auto fields = operation.members_;
+  auto status = PrepareScoreReply(fields.size(), &result);
+  if (!status.ok()) co_return status;
+  if (fields.empty()) co_return result;
+  if (shutdown_flush_requested_)
+    co_return absl::CancelledError("member read cancelled by shutdown");
+  // Single-member score reads do not need a batch plan or mutation map.
+  // Published leaves have unique fields; the checked Hash lookup stops at the
+  // match. Decode its score before releasing the physical read lease.
+  if (fields.size() == 1) {
+    const auto* route = object->directory().Find(fields.front());
+    if (!route) co_return absl::DataLossError("missing member prefix route");
+    auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                              digest, object, route->id_);
+    if (!leaf.ok()) co_return leaf.status();
+    const auto bytes = leaf->loaded_.value();
+    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                   bytes.size());
+    auto value =
+        FindHashGroupField(payload, leaf->field_count_, fields.front());
+    if (!value.ok()) co_return value.status();
+    if (*value) {
+      auto score = DecodeSortedSetMemberScore(**value);
+      if (!score.ok()) co_return score.status();
+      result.scores_.front() = *score;
+    }
+    co_return result;
+  }
+  if (fields.size() > SIZE_MAX / sizeof(HashFieldLookup) ||
+      fields.size() > std::vector<HashFieldLookup>{}.max_size()) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("Sorted Set lookup plan overflow");
+  }
+  auto scratch = TryReserveMemory(fields.size() * sizeof(HashFieldLookup));
+  if (!scratch) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM Sorted Set lookup plan");
+  }
+  std::vector<HashFieldLookup> requests;
+  requests.reserve(fields.size());
+  if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("OOM Sorted Set lookup plan");
+  }
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    const auto* route = object->directory().Find(fields[i]);
+    if (!route) co_return absl::DataLossError("missing member prefix route");
+    requests.push_back({.group_ = route->id_,
+                        .field_ = fields[i],
+                        .result_index_ = i,
+                        .value_ = std::nullopt});
+  }
+  std::sort(requests.begin(), requests.end(), [](const auto& a, const auto& b) {
+    return a.group_ != b.group_ ? a.group_ < b.group_ : a.field_ < b.field_;
+  });
+  // One request-local plan, one checked leaf at a time. Repeated operands keep
+  // distinct reply positions; misses remain nil. Match only this leaf's
+  // requests, avoiding a hash lookup for every unrelated stored member.
+  for (std::size_t begin = 0; begin < requests.size();) {
+    auto end = begin + 1;
+    while (end < requests.size() &&
+           requests[end].group_ == requests[begin].group_)
+      ++end;
+    if (shutdown_flush_requested_)
+      co_return absl::CancelledError("member read cancelled by shutdown");
+    auto leaf = co_await LoadHashGroupPayload(
+        store, partition, db_id, key, digest, object, requests[begin].group_);
+    if (!leaf.ok()) co_return leaf.status();
+    const auto bytes = leaf->loaded_.value();
+    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                   bytes.size());
+    auto page_requests = std::span(requests).subspan(begin, end - begin);
+    if (page_requests.size() == 1) {
+      auto value = FindHashGroupField(payload, leaf->field_count_,
+                                      page_requests.front().field_);
+      if (!value.ok()) co_return value.status();
+      page_requests.front().value_ = *value;
+    } else {
+      auto status =
+          FindHashGroupFields(payload, leaf->field_count_, page_requests);
+      if (!status.ok()) co_return status;
+    }
+    for (auto& request : page_requests) {
+      if (request.value_) {
+        auto score = DecodeSortedSetMemberScore(*request.value_);
+        if (!score.ok()) co_return score.status();
+        result.scores_[request.result_index_] = *score;
+      }
+      // No borrowed value survives the lease or the next asynchronous read.
+      request.value_.reset();
+    }
+    begin = end;
+  }
   co_return result;
 }
 
