@@ -26,7 +26,7 @@
   "title": "Lavik Slow Command Traces",
   "tags": ["lavik", "latency"],
   "version": 1,
-  "refresh": "5s",
+  "refresh": "",
   "time": {
     "from": "now-15m",
     "to": "now"
@@ -76,7 +76,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Requires the optional `diagnostics-logs` Compose profile (Loki + Alloy). Expand a log entry to inspect JSON fields and stage offsets/durations. `trace_id` stays a JSON field, never a Loki stream label or Prometheus label. This view shows structured logs; it does not synthesize a waterfall from the stage array. Logs are separately rate limited to 20 entries/s/worker; retained history and histograms are independent. CLI: `LATENCY TRACE GET 20`, `LATENCY TRACE SHOW <id>`."
+        "content": "Requires the optional `diagnostics-logs` Compose profile (Loki + Alloy). Expand a log entry to inspect JSON fields and stage offsets/durations. `trace_id` stays a JSON field, never a Loki stream label or Prometheus label. This view shows structured logs; it does not synthesize a waterfall from the stage array. Log output defaults to 20 entries/s/worker; configure it with latency-diagnostics-log-max-per-second (0 removes the rate limit). The bounded queue may still drop records. Retained history and histograms are independent. CLI: `LATENCY TRACE GET 20`, `LATENCY TRACE SHOW <id>`."
       }
     },
     {
@@ -96,7 +96,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\"",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{.command}} total={{.total_us}}us trace={{.trace_id}} worker={{.worker}} {{ __line__ }}\"",
           "queryType": "range",
           "maxLines": 200
         }
@@ -105,10 +105,11 @@
         "showTime": true,
         "showLabels": false,
         "showCommonLabels": false,
-        "wrapLogMessage": true,
+        "wrapLogMessage": false,
         "enableLogDetails": true,
         "sortOrder": "Descending",
-        "dedupStrategy": "none"
+        "dedupStrategy": "none",
+        "prettifyLogMessage": false
       }
     }
   ]
