@@ -1,0 +1,322 @@
+[
+  {
+    "workers": 1,
+    "mode": "log-off-64",
+    "runs": 5,
+    "ops_sec": {
+      "median": 115505.12,
+      "min": 113656.26,
+      "max": 115753.57
+    },
+    "p99_ms": {
+      "median": 0.671,
+      "min": 0.663,
+      "max": 0.703
+    },
+    "p999_ms": {
+      "median": 3.791,
+      "min": 3.743,
+      "max": 3.919
+    },
+    "cpu_us_per_op": {
+      "median": 8.319208281464526,
+      "min": 8.315623334279406,
+      "max": 8.472160638500032
+    },
+    "rss_kib": {
+      "median": 764380,
+      "min": 764292,
+      "max": 764536
+    },
+    "log_bytes": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    },
+    "log_records": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  {
+    "workers": 1,
+    "mode": "log-on-64",
+    "runs": 5,
+    "ops_sec": {
+      "median": 114173.56,
+      "min": 113300.81,
+      "max": 115663.5
+    },
+    "p99_ms": {
+      "median": 0.687,
+      "min": 0.679,
+      "max": 0.703
+    },
+    "p999_ms": {
+      "median": 3.791,
+      "min": 3.743,
+      "max": 4.191
+    },
+    "cpu_us_per_op": {
+      "median": 8.433541851123028,
+      "min": 8.313199802561506,
+      "max": 8.472280199486898
+    },
+    "rss_kib": {
+      "median": 764412,
+      "min": 764392,
+      "max": 764696
+    },
+    "log_bytes": {
+      "median": 142726,
+      "min": 142426,
+      "max": 143205
+    },
+    "log_records": {
+      "median": 200,
+      "min": 200,
+      "max": 200
+    }
+  },
+  {
+    "workers": 1,
+    "mode": "log-off-1",
+    "runs": 5,
+    "ops_sec": {
+      "median": 109784.22,
+      "min": 109041.05,
+      "max": 110485.2
+    },
+    "p99_ms": {
+      "median": 0.703,
+      "min": 0.687,
+      "max": 0.735
+    },
+    "p999_ms": {
+      "median": 3.727,
+      "min": 3.663,
+      "max": 3.919
+    },
+    "cpu_us_per_op": {
+      "median": 8.770971091316465,
+      "min": 8.715302822834998,
+      "max": 8.821552464853635
+    },
+    "rss_kib": {
+      "median": 764412,
+      "min": 764300,
+      "max": 764624
+    },
+    "log_bytes": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    },
+    "log_records": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  {
+    "workers": 1,
+    "mode": "log-on-1",
+    "runs": 5,
+    "ops_sec": {
+      "median": 109745.46,
+      "min": 108276.37,
+      "max": 110411.47
+    },
+    "p99_ms": {
+      "median": 0.695,
+      "min": 0.663,
+      "max": 0.735
+    },
+    "p999_ms": {
+      "median": 3.791,
+      "min": 3.759,
+      "max": 3.903
+    },
+    "cpu_us_per_op": {
+      "median": 8.775535444069375,
+      "min": 8.72117506740119,
+      "max": 8.90998971427094
+    },
+    "rss_kib": {
+      "median": 764604,
+      "min": 764412,
+      "max": 764788
+    },
+    "log_bytes": {
+      "median": 142489,
+      "min": 141478,
+      "max": 158657
+    },
+    "log_records": {
+      "median": 200,
+      "min": 200,
+      "max": 220
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-off-64",
+    "runs": 5,
+    "ops_sec": {
+      "median": 197948.11,
+      "min": 196936.7,
+      "max": 198821.08
+    },
+    "p99_ms": {
+      "median": 0.615,
+      "min": 0.607,
+      "max": 0.631
+    },
+    "p999_ms": {
+      "median": 2.975,
+      "min": 2.959,
+      "max": 2.991
+    },
+    "cpu_us_per_op": {
+      "median": 9.324458205903294,
+      "min": 9.273904570314954,
+      "max": 9.337162974873943
+    },
+    "rss_kib": {
+      "median": 876328,
+      "min": 876252,
+      "max": 876532
+    },
+    "log_bytes": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    },
+    "log_records": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-on-64",
+    "runs": 5,
+    "ops_sec": {
+      "median": 199485.75,
+      "min": 196944.56,
+      "max": 200417.48
+    },
+    "p99_ms": {
+      "median": 0.623,
+      "min": 0.607,
+      "max": 0.639
+    },
+    "p999_ms": {
+      "median": 2.959,
+      "min": 2.959,
+      "max": 3.023
+    },
+    "cpu_us_per_op": {
+      "median": 9.293042097881697,
+      "min": 9.180047167481481,
+      "max": 9.385457656289649
+    },
+    "rss_kib": {
+      "median": 876656,
+      "min": 876420,
+      "max": 876684
+    },
+    "log_bytes": {
+      "median": 296917,
+      "min": 295776,
+      "max": 297702
+    },
+    "log_records": {
+      "median": 400,
+      "min": 400,
+      "max": 400
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-off-1",
+    "runs": 5,
+    "ops_sec": {
+      "median": 188397.27,
+      "min": 187826.76,
+      "max": 190831.57
+    },
+    "p99_ms": {
+      "median": 0.623,
+      "min": 0.583,
+      "max": 0.631
+    },
+    "p999_ms": {
+      "median": 2.991,
+      "min": 2.959,
+      "max": 3.023
+    },
+    "cpu_us_per_op": {
+      "median": 9.845371932144952,
+      "min": 9.693532422770055,
+      "max": 9.987090248479443
+    },
+    "rss_kib": {
+      "median": 876376,
+      "min": 876300,
+      "max": 876596
+    },
+    "log_bytes": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    },
+    "log_records": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-on-1",
+    "runs": 5,
+    "ops_sec": {
+      "median": 191062.75,
+      "min": 186930.23,
+      "max": 192494.6
+    },
+    "p99_ms": {
+      "median": 0.583,
+      "min": 0.567,
+      "max": 0.599
+    },
+    "p999_ms": {
+      "median": 3.039,
+      "min": 2.959,
+      "max": 3.055
+    },
+    "cpu_us_per_op": {
+      "median": 9.785048132494785,
+      "min": 9.770717973757753,
+      "max": 9.911857748526591
+    },
+    "rss_kib": {
+      "median": 876588,
+      "min": 876504,
+      "max": 876672
+    },
+    "log_bytes": {
+      "median": 297860,
+      "min": 294890,
+      "max": 299984
+    },
+    "log_records": {
+      "median": 400,
+      "min": 400,
+      "max": 400
+    }
+  }
+]

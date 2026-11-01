@@ -1,0 +1,162 @@
+[
+  {
+    "workers": 2,
+    "mode": "log-off-64",
+    "runs": 1,
+    "ops_sec": {
+      "median": 197433.14,
+      "min": 197433.14,
+      "max": 197433.14
+    },
+    "p99_ms": {
+      "median": 0.623,
+      "min": 0.623,
+      "max": 0.623
+    },
+    "p999_ms": {
+      "median": 2.975,
+      "min": 2.975,
+      "max": 2.975
+    },
+    "cpu_us_per_op": {
+      "median": 9.342686148885344,
+      "min": 9.342686148885344,
+      "max": 9.342686148885344
+    },
+    "rss_kib": {
+      "median": 876472,
+      "min": 876472,
+      "max": 876472
+    },
+    "log_bytes": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    },
+    "log_records": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-on-64",
+    "runs": 1,
+    "ops_sec": {
+      "median": 196100.06,
+      "min": 196100.06,
+      "max": 196100.06
+    },
+    "p99_ms": {
+      "median": 0.647,
+      "min": 0.647,
+      "max": 0.647
+    },
+    "p999_ms": {
+      "median": 2.975,
+      "min": 2.975,
+      "max": 2.975
+    },
+    "cpu_us_per_op": {
+      "median": 9.378127175426386,
+      "min": 9.378127175426386,
+      "max": 9.378127175426386
+    },
+    "rss_kib": {
+      "median": 876568,
+      "min": 876568,
+      "max": 876568
+    },
+    "log_bytes": {
+      "median": 4436755,
+      "min": 4436755,
+      "max": 4436755
+    },
+    "log_records": {
+      "median": 6000,
+      "min": 6000,
+      "max": 6000
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-off-1",
+    "runs": 1,
+    "ops_sec": {
+      "median": 189078.32,
+      "min": 189078.32,
+      "max": 189078.32
+    },
+    "p99_ms": {
+      "median": 0.583,
+      "min": 0.583,
+      "max": 0.583
+    },
+    "p999_ms": {
+      "median": 2.959,
+      "min": 2.959,
+      "max": 2.959
+    },
+    "cpu_us_per_op": {
+      "median": 9.882461117116508,
+      "min": 9.882461117116508,
+      "max": 9.882461117116508
+    },
+    "rss_kib": {
+      "median": 876200,
+      "min": 876200,
+      "max": 876200
+    },
+    "log_bytes": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    },
+    "log_records": {
+      "median": 0,
+      "min": 0,
+      "max": 0
+    }
+  },
+  {
+    "workers": 2,
+    "mode": "log-on-1",
+    "runs": 1,
+    "ops_sec": {
+      "median": 187073.2,
+      "min": 187073.2,
+      "max": 187073.2
+    },
+    "p99_ms": {
+      "median": 0.599,
+      "min": 0.599,
+      "max": 0.599
+    },
+    "p999_ms": {
+      "median": 2.991,
+      "min": 2.991,
+      "max": 2.991
+    },
+    "cpu_us_per_op": {
+      "median": 9.92063845580131,
+      "min": 9.92063845580131,
+      "max": 9.92063845580131
+    },
+    "rss_kib": {
+      "median": 876604,
+      "min": 876604,
+      "max": 876604
+    },
+    "log_bytes": {
+      "median": 4446895,
+      "min": 4446895,
+      "max": 4446895
+    },
+    "log_records": {
+      "median": 6000,
+      "min": 6000,
+      "max": 6000
+    }
+  }
+]

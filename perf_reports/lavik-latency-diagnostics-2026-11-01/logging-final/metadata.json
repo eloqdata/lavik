@@ -1,0 +1,29 @@
+{
+  "started_utc": "2026-11-01T11:07:18Z",
+  "arguments": {
+    "baseline": "build_perf/lavik",
+    "candidate": "build_perf/lavik",
+    "output": "/mnt/local_nvme/lavik-396/logging-final",
+    "server_cpus": "0,2",
+    "client_cpus": "4,6",
+    "single_client_cpus": "4,6",
+    "seconds": 10,
+    "rounds": 5,
+    "logging_only": true,
+    "log_limit": 20,
+    "modes": null,
+    "workers": "2"
+  },
+  "binary_sha256": {
+    "baseline": "7fe05f9f3aea772b1ecef9dad13b46a1f7ccb756c92bc21f5166244f397ec4d7",
+    "candidate": "7fe05f9f3aea772b1ecef9dad13b46a1f7ccb756c92bc21f5166244f397ec4d7"
+  },
+  "uname": [
+    "Linux",
+    "liunyl-dev",
+    "6.17.0-1018-azure",
+    "#18~24.04.1-Ubuntu SMP Thu May 28 16:39:11 UTC 2026",
+    "x86_64"
+  ],
+  "memtier_version": "memtier_benchmark v=2.5.1 sha=00000000:0 bits=64 libevent=2.1.12-stable openssl=OpenSSL 3.0.13 30 Jan 2024 prometheus=yes\nCopyright (C) 2011-2026 Redis Ltd.\nThis is free software.  You may redistribute copies of it under the terms of\nthe GNU General Public License <http://www.gnu.org/licenses/gpl.html>.\nThere is NO WARRANTY, to the extent permitted by law.\n"
+}

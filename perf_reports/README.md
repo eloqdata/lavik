@@ -24,6 +24,7 @@ Each report provides an English `README.md` and a Simplified Chinese
 
 | Report | Test date | English | 简体中文 |
 |---|---|---|---|
+| Online latency diagnostics: pressure metrics, sampling and logging | 2026-11-01 | [English](lavik-latency-diagnostics-2026-11-01/README.md) | [简体中文](lavik-latency-diagnostics-2026-11-01/README.zh-CN.md) |
 | v0.2.0 versus in-memory databases: 2 / 16 vCPUs, up to 1B keys | 2026-10-21 | [English](lavik-v0.2.0-vs-memory-databases-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-vs-memory-databases-2026-10-21/README.zh-CN.md) |
 | v0.2.0: 1TB versus Dragonfly, Garnet, Kvrocks, Pika and Tendis | 2026-10-21–2026-10-22 | [English](lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-storage-peers-1tb-2026-10-21/README.zh-CN.md) |
 | v0.2.0: Aerospike YCSB A/B/C/D throughput and tail latency | 2026-10-21 | [English](lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.md) | [简体中文](lavik-v0.2.0-aerospike-ycsb-2026-10-21/README.zh-CN.md) |

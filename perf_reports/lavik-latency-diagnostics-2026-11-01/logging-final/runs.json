@@ -1,0 +1,1742 @@
+[
+  {
+    "workers": 2,
+    "round": 0,
+    "mode": "log-off-64",
+    "ops_sec": 197730.25,
+    "p99_ms": 0.623,
+    "p999_ms": 3.007,
+    "server_cpu_seconds": 18.47,
+    "cpu_us_per_op": 9.34022699735217,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000836998891167,
+    "thread_cpu": {
+      "1721591": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721592": {
+        "runtime_ns": 5054302,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721593": {
+        "runtime_ns": 9178470603,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721594": {
+        "runtime_ns": 9142913602,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721595": {
+        "runtime_ns": 15121928,
+        "name": "iou-wrk-1721593",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721598": {
+        "runtime_ns": 67324714,
+        "name": "iou-wrk-1721594",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721605": {
+        "runtime_ns": 55270658,
+        "name": "iou-wrk-1721593",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.455,
+    "elapsed_seconds": 10.013940025120974,
+    "rss_kib": 876572,
+    "raw": "w2-r0-log-off-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 0,
+    "mode": "log-on-64",
+    "ops_sec": 199060.95,
+    "p99_ms": 0.631,
+    "p999_ms": 3.023,
+    "server_cpu_seconds": 18.43,
+    "cpu_us_per_op": 9.25755233932772,
+    "log_bytes": 294148,
+    "log_records": 400,
+    "measurement_seconds": 10.000992158431877,
+    "thread_cpu": {
+      "1721646": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721647": {
+        "runtime_ns": 7210338,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721648": {
+        "runtime_ns": 9176125942,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721649": {
+        "runtime_ns": 9104150379,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721653": {
+        "runtime_ns": 65728391,
+        "name": "iou-wrk-1721649",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721666": {
+        "runtime_ns": 32671226,
+        "name": "iou-wrk-1721648",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.467,
+    "elapsed_seconds": 11.012441363185644,
+    "rss_kib": 876524,
+    "raw": "w2-r0-log-on-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 0,
+    "mode": "log-off-1",
+    "ops_sec": 189728.46,
+    "p99_ms": 0.591,
+    "p999_ms": 2.959,
+    "server_cpu_seconds": 18.67,
+    "cpu_us_per_op": 9.839443678803034,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000950832574091,
+    "thread_cpu": {
+      "1721684": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721685": {
+        "runtime_ns": 5946465,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721686": {
+        "runtime_ns": 9298623234,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721687": {
+        "runtime_ns": 9240805753,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721688": {
+        "runtime_ns": 45291283,
+        "name": "iou-wrk-1721686",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721691": {
+        "runtime_ns": 62860439,
+        "name": "iou-wrk-1721687",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721695": {
+        "runtime_ns": 22797946,
+        "name": "iou-wrk-1721686",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.41,
+    "elapsed_seconds": 11.011320457793772,
+    "rss_kib": 876556,
+    "raw": "w2-r0-log-off-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 0,
+    "mode": "log-on-1",
+    "ops_sec": 188945.82,
+    "p99_ms": 0.591,
+    "p999_ms": 3.023,
+    "server_cpu_seconds": 18.689999999999998,
+    "cpu_us_per_op": 9.890903702606085,
+    "log_bytes": 297054,
+    "log_records": 400,
+    "measurement_seconds": 10.000829867524986,
+    "thread_cpu": {
+      "1721702": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721703": {
+        "runtime_ns": 5153197,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721704": {
+        "runtime_ns": 9279034137,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721705": {
+        "runtime_ns": 9284217719,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721706": {
+        "runtime_ns": 38497187,
+        "name": "iou-wrk-1721704",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721709": {
+        "runtime_ns": 63517667,
+        "name": "iou-wrk-1721705",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721713": {
+        "runtime_ns": 27295439,
+        "name": "iou-wrk-1721704",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.4,
+    "elapsed_seconds": 10.011622361838818,
+    "rss_kib": 876604,
+    "raw": "w2-r0-log-on-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 1,
+    "mode": "log-on-64",
+    "ops_sec": 196105.8,
+    "p99_ms": 0.623,
+    "p999_ms": 2.991,
+    "server_cpu_seconds": 18.44,
+    "cpu_us_per_op": 9.402277247865749,
+    "log_bytes": 293321,
+    "log_records": 400,
+    "measurement_seconds": 10.000861779712789,
+    "thread_cpu": {
+      "1721737": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721738": {
+        "runtime_ns": 5207884,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721739": {
+        "runtime_ns": 9174102897,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721740": {
+        "runtime_ns": 9114594597,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721744": {
+        "runtime_ns": 67775042,
+        "name": "iou-wrk-1721740",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721749": {
+        "runtime_ns": 33804581,
+        "name": "iou-wrk-1721739",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721769": {
+        "runtime_ns": 39465331,
+        "name": "iou-wrk-1721739",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.441,
+    "elapsed_seconds": 10.011254224926233,
+    "rss_kib": 876580,
+    "raw": "w2-r1-log-on-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 1,
+    "mode": "log-off-1",
+    "ops_sec": 187347.44,
+    "p99_ms": 0.599,
+    "p999_ms": 3.007,
+    "server_cpu_seconds": 18.58,
+    "cpu_us_per_op": 9.916526120279242,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000883919203806,
+    "thread_cpu": {
+      "1721770": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721771": {
+        "runtime_ns": 4565642,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721772": {
+        "runtime_ns": 9244477653,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721773": {
+        "runtime_ns": 9203447724,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721774": {
+        "runtime_ns": 32221,
+        "name": "iou-wrk-1721772",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721777": {
+        "runtime_ns": 65916633,
+        "name": "iou-wrk-1721773",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721781": {
+        "runtime_ns": 68788006,
+        "name": "iou-wrk-1721772",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.39,
+    "elapsed_seconds": 11.011298522353172,
+    "rss_kib": 876416,
+    "raw": "w2-r1-log-off-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 1,
+    "mode": "log-on-1",
+    "ops_sec": 191010.99,
+    "p99_ms": 0.575,
+    "p999_ms": 3.007,
+    "server_cpu_seconds": 18.75,
+    "cpu_us_per_op": 9.815350999569171,
+    "log_bytes": 303128,
+    "log_records": 400,
+    "measurement_seconds": 10.000853877570082,
+    "thread_cpu": {
+      "1721787": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721788": {
+        "runtime_ns": 7315192,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721789": {
+        "runtime_ns": 9297629364,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721790": {
+        "runtime_ns": 9315697318,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721791": {
+        "runtime_ns": 32077429,
+        "name": "iou-wrk-1721789",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721794": {
+        "runtime_ns": 62586245,
+        "name": "iou-wrk-1721790",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721807": {
+        "runtime_ns": 33209333,
+        "name": "iou-wrk-1721789",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.413,
+    "elapsed_seconds": 11.011761697009206,
+    "rss_kib": 878780,
+    "raw": "w2-r1-log-on-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 1,
+    "mode": "log-off-64",
+    "ops_sec": 199712.19,
+    "p99_ms": 0.599,
+    "p999_ms": 2.975,
+    "server_cpu_seconds": 18.549999999999997,
+    "cpu_us_per_op": 9.287533526494002,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000896790526406,
+    "thread_cpu": {
+      "1721816": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721817": {
+        "runtime_ns": 5664182,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721818": {
+        "runtime_ns": 9230127916,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721819": {
+        "runtime_ns": 9184152338,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721820": {
+        "runtime_ns": 16410219,
+        "name": "iou-wrk-1721818",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721823": {
+        "runtime_ns": 64446230,
+        "name": "iou-wrk-1721819",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721828": {
+        "runtime_ns": 52780415,
+        "name": "iou-wrk-1721818",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.478,
+    "elapsed_seconds": 11.011103087104857,
+    "rss_kib": 876456,
+    "raw": "w2-r1-log-off-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 2,
+    "mode": "log-off-1",
+    "ops_sec": 189335.26,
+    "p99_ms": 0.615,
+    "p999_ms": 2.991,
+    "server_cpu_seconds": 18.67,
+    "cpu_us_per_op": 9.859912142743221,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000915835750826,
+    "thread_cpu": {
+      "1721837": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721838": {
+        "runtime_ns": 4971340,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721839": {
+        "runtime_ns": 9273079942,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721840": {
+        "runtime_ns": 9261654988,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721841": {
+        "runtime_ns": 44495382,
+        "name": "iou-wrk-1721839",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721844": {
+        "runtime_ns": 60531914,
+        "name": "iou-wrk-1721840",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721851": {
+        "runtime_ns": 22813661,
+        "name": "iou-wrk-1721839",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.413,
+    "elapsed_seconds": 10.011810343712568,
+    "rss_kib": 876324,
+    "raw": "w2-r2-log-off-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 2,
+    "mode": "log-on-1",
+    "ops_sec": 187562.13,
+    "p99_ms": 0.615,
+    "p999_ms": 2.975,
+    "server_cpu_seconds": 18.560000000000002,
+    "cpu_us_per_op": 9.894471410788494,
+    "log_bytes": 300129,
+    "log_records": 400,
+    "measurement_seconds": 10.000926093129781,
+    "thread_cpu": {
+      "1721893": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721894": {
+        "runtime_ns": 5106052,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721895": {
+        "runtime_ns": 9236208400,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721896": {
+        "runtime_ns": 9194692007,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721900": {
+        "runtime_ns": 66255467,
+        "name": "iou-wrk-1721896",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721904": {
+        "runtime_ns": 61333941,
+        "name": "iou-wrk-1721895",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721909": {
+        "runtime_ns": 5940777,
+        "name": "iou-wrk-1721895",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.401,
+    "elapsed_seconds": 10.01172604970634,
+    "rss_kib": 876640,
+    "raw": "w2-r2-log-on-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 2,
+    "mode": "log-off-64",
+    "ops_sec": 201185.13,
+    "p99_ms": 0.583,
+    "p999_ms": 3.007,
+    "server_cpu_seconds": 18.53,
+    "cpu_us_per_op": 9.209590498764186,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000903148259516,
+    "thread_cpu": {
+      "1721910": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721911": {
+        "runtime_ns": 5462683,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721912": {
+        "runtime_ns": 9251736681,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721913": {
+        "runtime_ns": 9142590568,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721917": {
+        "runtime_ns": 67090813,
+        "name": "iou-wrk-1721913",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721922": {
+        "runtime_ns": 67836376,
+        "name": "iou-wrk-1721912",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.485,
+    "elapsed_seconds": 11.01046898495406,
+    "rss_kib": 876480,
+    "raw": "w2-r2-log-off-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 2,
+    "mode": "log-on-64",
+    "ops_sec": 200865.96,
+    "p99_ms": 0.567,
+    "p999_ms": 3.039,
+    "server_cpu_seconds": 18.61,
+    "cpu_us_per_op": 9.264071332851461,
+    "log_bytes": 294347,
+    "log_records": 400,
+    "measurement_seconds": 10.000878197580118,
+    "thread_cpu": {
+      "1721929": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721930": {
+        "runtime_ns": 5367349,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721931": {
+        "runtime_ns": 9262292243,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721932": {
+        "runtime_ns": 9213442866,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721933": {
+        "runtime_ns": 66938469,
+        "name": "iou-wrk-1721931",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721936": {
+        "runtime_ns": 62433721,
+        "name": "iou-wrk-1721932",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721941": {
+        "runtime_ns": 2064344,
+        "name": "iou-wrk-1721931",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.475,
+    "elapsed_seconds": 10.011551834642887,
+    "rss_kib": 876544,
+    "raw": "w2-r2-log-on-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 3,
+    "mode": "log-on-1",
+    "ops_sec": 188800.07,
+    "p99_ms": 0.615,
+    "p999_ms": 2.991,
+    "server_cpu_seconds": 18.61,
+    "cpu_us_per_op": 9.856166697914052,
+    "log_bytes": 300548,
+    "log_records": 400,
+    "measurement_seconds": 10.000833156470756,
+    "thread_cpu": {
+      "1721951": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721952": {
+        "runtime_ns": 7039977,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721953": {
+        "runtime_ns": 9254540869,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721954": {
+        "runtime_ns": 9221792782,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721961": {
+        "runtime_ns": 65472164,
+        "name": "iou-wrk-1721954",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721979": {
+        "runtime_ns": 65245919,
+        "name": "iou-wrk-1721953",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.416,
+    "elapsed_seconds": 11.01162195019424,
+    "rss_kib": 876500,
+    "raw": "w2-r3-log-on-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 3,
+    "mode": "log-off-64",
+    "ops_sec": 197642.62,
+    "p99_ms": 0.647,
+    "p999_ms": 2.991,
+    "server_cpu_seconds": 18.38,
+    "cpu_us_per_op": 9.298744163621471,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000935020999014,
+    "thread_cpu": {
+      "1721991": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1721992": {
+        "runtime_ns": 4040932,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1721993": {
+        "runtime_ns": 9134618710,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721994": {
+        "runtime_ns": 9107332638,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1721995": {
+        "runtime_ns": 48567169,
+        "name": "iou-wrk-1721993",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1721999": {
+        "runtime_ns": 68101992,
+        "name": "iou-wrk-1721994",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722003": {
+        "runtime_ns": 20061357,
+        "name": "iou-wrk-1721993",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.451,
+    "elapsed_seconds": 11.011812794953585,
+    "rss_kib": 876424,
+    "raw": "w2-r3-log-off-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 3,
+    "mode": "log-on-64",
+    "ops_sec": 200748.13,
+    "p99_ms": 0.607,
+    "p999_ms": 3.039,
+    "server_cpu_seconds": 18.450000000000003,
+    "cpu_us_per_op": 9.189738971566102,
+    "log_bytes": 294397,
+    "log_records": 400,
+    "measurement_seconds": 10.00095990931522,
+    "thread_cpu": {
+      "1722009": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1722010": {
+        "runtime_ns": 7758100,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1722011": {
+        "runtime_ns": 9191949287,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722012": {
+        "runtime_ns": 9128999314,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722013": {
+        "runtime_ns": 69275136,
+        "name": "iou-wrk-1722011",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722016": {
+        "runtime_ns": 65485390,
+        "name": "iou-wrk-1722012",
+        "affinity": [
+          2
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.471,
+    "elapsed_seconds": 11.01123801805079,
+    "rss_kib": 876620,
+    "raw": "w2-r3-log-on-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 3,
+    "mode": "log-off-1",
+    "ops_sec": 190216.96,
+    "p99_ms": 0.575,
+    "p999_ms": 3.023,
+    "server_cpu_seconds": 18.7,
+    "cpu_us_per_op": 9.82995233787281,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000943133567059,
+    "thread_cpu": {
+      "1722036": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1722037": {
+        "runtime_ns": 4225026,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1722038": {
+        "runtime_ns": 9308485023,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722039": {
+        "runtime_ns": 9263348615,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722040": {
+        "runtime_ns": 20144593,
+        "name": "iou-wrk-1722038",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722043": {
+        "runtime_ns": 61670150,
+        "name": "iou-wrk-1722039",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722047": {
+        "runtime_ns": 44503214,
+        "name": "iou-wrk-1722038",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.416,
+    "elapsed_seconds": 10.011961063370109,
+    "rss_kib": 876616,
+    "raw": "w2-r3-log-off-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 4,
+    "mode": "log-off-64",
+    "ops_sec": 196244.0,
+    "p99_ms": 0.639,
+    "p999_ms": 2.975,
+    "server_cpu_seconds": 18.400000000000002,
+    "cpu_us_per_op": 9.37527546240744,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.000861172825665,
+    "thread_cpu": {
+      "1722068": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1722069": {
+        "runtime_ns": 3065295,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1722070": {
+        "runtime_ns": 9186879445,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722071": {
+        "runtime_ns": 9080462704,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722072": {
+        "runtime_ns": 67009063,
+        "name": "iou-wrk-1722070",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722075": {
+        "runtime_ns": 67030362,
+        "name": "iou-wrk-1722071",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722088": {
+        "runtime_ns": 3117,
+        "name": "iou-wrk-1722070",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.441,
+    "elapsed_seconds": 10.011654273606837,
+    "rss_kib": 876348,
+    "raw": "w2-r4-log-off-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 4,
+    "mode": "log-on-64",
+    "ops_sec": 197713.67,
+    "p99_ms": 0.631,
+    "p999_ms": 3.023,
+    "server_cpu_seconds": 18.43,
+    "cpu_us_per_op": 9.320772122040921,
+    "log_bytes": 297893,
+    "log_records": 400,
+    "measurement_seconds": 10.00084617315535,
+    "thread_cpu": {
+      "1722089": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1722090": {
+        "runtime_ns": 7651842,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1722091": {
+        "runtime_ns": 9184481088,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722092": {
+        "runtime_ns": 9103455761,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722096": {
+        "runtime_ns": 67624981,
+        "name": "iou-wrk-1722092",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722101": {
+        "runtime_ns": 70568143,
+        "name": "iou-wrk-1722091",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722107": {
+        "runtime_ns": 49967,
+        "name": "iou-wrk-1722091",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.456,
+    "elapsed_seconds": 11.011128451675177,
+    "rss_kib": 876684,
+    "raw": "w2-r4-log-on-64/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 4,
+    "mode": "log-off-1",
+    "ops_sec": 189079.81,
+    "p99_ms": 0.591,
+    "p999_ms": 3.023,
+    "server_cpu_seconds": 18.69,
+    "cpu_us_per_op": 9.883727386809111,
+    "log_bytes": 0,
+    "log_records": 0,
+    "measurement_seconds": 10.00099904902591,
+    "thread_cpu": {
+      "1722119": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1722120": {
+        "runtime_ns": 5721342,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1722121": {
+        "runtime_ns": 9282675214,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722122": {
+        "runtime_ns": 9277114731,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722123": {
+        "runtime_ns": 24555291,
+        "name": "iou-wrk-1722121",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722126": {
+        "runtime_ns": 63967775,
+        "name": "iou-wrk-1722122",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722136": {
+        "runtime_ns": 41083428,
+        "name": "iou-wrk-1722121",
+        "affinity": [
+          0
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.399,
+    "elapsed_seconds": 11.011089138686657,
+    "rss_kib": 876640,
+    "raw": "w2-r4-log-off-1/memtier.json"
+  },
+  {
+    "workers": 2,
+    "round": 4,
+    "mode": "log-on-1",
+    "ops_sec": 186221.66,
+    "p99_ms": 0.639,
+    "p999_ms": 2.959,
+    "server_cpu_seconds": 18.54,
+    "cpu_us_per_op": 9.954982431120543,
+    "log_bytes": 298128,
+    "log_records": 400,
+    "measurement_seconds": 10.000898928728269,
+    "thread_cpu": {
+      "1722140": {
+        "runtime_ns": 0,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": true
+      },
+      "1722141": {
+        "runtime_ns": 5727999,
+        "name": "lavik",
+        "affinity": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "main": false
+      },
+      "1722142": {
+        "runtime_ns": 9229770891,
+        "name": "lavik",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722143": {
+        "runtime_ns": 9173677419,
+        "name": "lavik",
+        "affinity": [
+          2
+        ],
+        "main": false
+      },
+      "1722144": {
+        "runtime_ns": 52328576,
+        "name": "iou-wrk-1722142",
+        "affinity": [
+          0
+        ],
+        "main": false
+      },
+      "1722147": {
+        "runtime_ns": 66586339,
+        "name": "iou-wrk-1722143",
+        "affinity": [
+          2
+        ],
+        "main": false
+      }
+    },
+    "client_cpu_cores": 1.389,
+    "elapsed_seconds": 11.011862588115036,
+    "rss_kib": 876520,
+    "raw": "w2-r4-log-on-1/memtier.json"
+  }
+]

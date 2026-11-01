@@ -1,0 +1,1 @@
+["/home/ubuntu/.codex/worktrees/b977/keylane/build_perf/lavik", "--cpus", "0,2", "--port", "40603", "--metrics-port", "41215", "--data-file", "/mnt/local_nvme/lavik-396/logging-final/w2-r3-log-off-64/data", "--logtostderr", "--log-dir", "/mnt/local_nvme/lavik-396/logging-final/w2-r3-log-off-64/logs"]

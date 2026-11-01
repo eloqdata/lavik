@@ -1,0 +1,86 @@
+[
+  {
+    "workers": 2,
+    "from": "log-off-64",
+    "to": "log-on-64",
+    "paired_runs": [
+      {
+        "round": 0,
+        "qps_change_pct": 0.6729875676584784,
+        "cpu_per_op_change_pct": -0.885146132400072,
+        "p99_ms_change": 0.008000000000000007,
+        "p999_ms_change": 0.016000000000000014
+      },
+      {
+        "round": 1,
+        "qps_change_pct": -1.8057936273193964,
+        "cpu_per_op_change_pct": 1.2354595657116496,
+        "p99_ms_change": 0.02400000000000002,
+        "p999_ms_change": 0.016000000000000014
+      },
+      {
+        "round": 2,
+        "qps_change_pct": -0.15864492569606092,
+        "cpu_per_op_change_pct": 0.5915663035678476,
+        "p99_ms_change": -0.016000000000000014,
+        "p999_ms_change": 0.03200000000000003
+      },
+      {
+        "round": 3,
+        "qps_change_pct": 1.5712754667996265,
+        "cpu_per_op_change_pct": -1.1722571364186862,
+        "p99_ms_change": -0.040000000000000036,
+        "p999_ms_change": 0.04800000000000004
+      },
+      {
+        "round": 4,
+        "qps_change_pct": 0.7488993294062496,
+        "cpu_per_op_change_pct": -0.5813518822467056,
+        "p99_ms_change": -0.008000000000000007,
+        "p999_ms_change": 0.04800000000000004
+      }
+    ]
+  },
+  {
+    "workers": 2,
+    "from": "log-off-1",
+    "to": "log-on-1",
+    "paired_runs": [
+      {
+        "round": 0,
+        "qps_change_pct": -0.4125053247151178,
+        "cpu_per_op_change_pct": 0.5229972901202862,
+        "p99_ms_change": 0.0,
+        "p999_ms_change": 0.06400000000000006
+      },
+      {
+        "round": 1,
+        "qps_change_pct": 1.9554844197497312,
+        "cpu_per_op_change_pct": -1.020267778079753,
+        "p99_ms_change": -0.02400000000000002,
+        "p999_ms_change": 0.0
+      },
+      {
+        "round": 2,
+        "qps_change_pct": -0.936502794038474,
+        "cpu_per_op_change_pct": 0.35050279906101434,
+        "p99_ms_change": 0.0,
+        "p999_ms_change": -0.016000000000000014
+      },
+      {
+        "round": 3,
+        "qps_change_pct": -0.7448810032501751,
+        "cpu_per_op_change_pct": 0.2666784043320769,
+        "p99_ms_change": 0.040000000000000036,
+        "p999_ms_change": -0.03200000000000003
+      },
+      {
+        "round": 4,
+        "qps_change_pct": -1.5116103617832,
+        "cpu_per_op_change_pct": 0.720932918551842,
+        "p99_ms_change": 0.04800000000000004,
+        "p999_ms_change": -0.06400000000000006
+      }
+    ]
+  }
+]

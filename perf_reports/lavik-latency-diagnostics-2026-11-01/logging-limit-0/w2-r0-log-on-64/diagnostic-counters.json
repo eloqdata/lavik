@@ -1,0 +1,10 @@
+{
+  "lavik_latency_diagnostics_samples_total{result=\"eligible\"}": 3559570.0,
+  "lavik_latency_diagnostics_samples_total{result=\"selected\"}": 55367.0,
+  "lavik_latency_diagnostics_samples_total{result=\"pool_dropped\"}": 0.0,
+  "lavik_latency_diagnostics_samples_total{result=\"filtered\"}": 0.0,
+  "lavik_latency_diagnostics_samples_total{result=\"retained\"}": 55367.0,
+  "lavik_latency_diagnostics_samples_total{result=\"overwritten\"}": 55111.0,
+  "lavik_latency_diagnostics_samples_total{result=\"cancelled\"}": 0.0,
+  "lavik_latency_diagnostics_samples_total{result=\"log_dropped\"}": 0.0
+}

@@ -1,0 +1,30 @@
+[
+  {
+    "workers": 2,
+    "from": "log-off-64",
+    "to": "log-on-64",
+    "paired_runs": [
+      {
+        "round": 0,
+        "qps_change_pct": -0.2710371855073168,
+        "cpu_per_op_change_pct": 0.7429628435191127,
+        "p99_ms_change": 0.016000000000000014,
+        "p999_ms_change": 0.0
+      }
+    ]
+  },
+  {
+    "workers": 2,
+    "from": "log-off-1",
+    "to": "log-on-1",
+    "paired_runs": [
+      {
+        "round": 0,
+        "qps_change_pct": 0.8570549099655489,
+        "cpu_per_op_change_pct": 0.6831152871569213,
+        "p99_ms_change": -0.02400000000000002,
+        "p999_ms_change": 0.03200000000000003
+      }
+    ]
+  }
+]
