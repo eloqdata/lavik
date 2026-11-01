@@ -25,7 +25,7 @@
   "uid": "lavik-latency-traces",
   "title": "Lavik Slow Command Traces",
   "tags": ["lavik", "latency"],
-  "version": 1,
+  "version": 2,
   "refresh": "",
   "time": {
     "from": "now-15m",
@@ -72,11 +72,355 @@
         "x": 0,
         "y": 0,
         "w": 24,
-        "h": 4
+        "h": 5
       },
       "options": {
         "mode": "markdown",
-        "content": "Requires the optional `diagnostics-logs` Compose profile (Loki + Alloy). Expand a log entry to inspect JSON fields and stage offsets/durations. `trace_id` stays a JSON field, never a Loki stream label or Prometheus label. This view shows structured logs; it does not synthesize a waterfall from the stage array. Log output defaults to 20 entries/s/worker; configure it with latency-diagnostics-log-max-per-second (0 removes the rate limit). The bounded queue may still drop records. Retained history and histograms are independent. CLI: `LATENCY TRACE GET 20`, `LATENCY TRACE SHOW <id>`."
+        "content": "Charts show the **latest matching command** in the selected time range. Enter an exact **Trace ID (regex)** from a log row to pin a command.\n\n**Left:** measured intervals placed by start time. **Right:** cumulative duration per stage. Stages overlap and must not be summed. Repeated reads show up to eight retained intervals per stage; totals include all observations. Expand the log for interval counts and omissions. Zero-microsecond intervals may be invisible. Logs require the optional Loki/Alloy profile; retained history is also available through `LATENCY TRACE SHOW <id>`."
+      }
+    },
+    {
+      "id": 3,
+      "title": "Latest matching command — stage timeline",
+      "description": "Horizontal position is start_us from command readiness; each visible bar is one measured interval. Stages may overlap or be nested. Repeated read stages show only their earliest eight retained intervals (numbered #1–#8); consult the log for intervals_dropped. Sub-microsecond values are rounded down in the existing JSON and can be invisible. server_total is the measured command wall time.",
+      "type": "barchart",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 16
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lavik-loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{ $sep := \\\"\\\" }}[{{ range $stage := fromJson .stages }}{{ if $stage.intervals }}{{ range $i, $span := $stage.intervals }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }} #{{ add $i 1 }}\\\",\\\"start_us\\\":{{ $span.start_us }},\\\"duration_us\\\":{{ $span.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ else }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }}\\\",\\\"start_us\\\":{{ $stage.start_us }},\\\"duration_us\\\":{{ $stage.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ end }}]\"",
+          "queryType": "range",
+          "direction": "backward",
+          "maxLines": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "reduce",
+          "options": {
+            "reducers": ["last"],
+            "mode": "seriesToRows"
+          }
+        },
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Last",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": ["name", "start_us", "duration_us"]
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "fillOpacity": 90,
+            "lineWidth": 0,
+            "axisLabel": "Time since command readiness",
+            "axisPlacement": "auto",
+            "axisGridShow": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "start_us"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "transparent"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_us"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Measured interval"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xField": "name",
+        "stacking": "normal",
+        "showValue": "never",
+        "groupWidth": 0.75,
+        "barWidth": 0.8,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "text": {
+          "valueSize": 14
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Latest matching command — cumulative stage durations",
+      "description": "duration_us for each stage of the same latest matching command, including all observations of repeated reads. Parent/child and parallel stages overlap: do not sum bars or interpret them as percentages of server_total.",
+      "type": "barchart",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 16
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lavik-loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{.stages}}\"",
+          "queryType": "range",
+          "direction": "backward",
+          "maxLines": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "reduce",
+          "options": {
+            "reducers": ["last"],
+            "mode": "seriesToRows"
+          }
+        },
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Last",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": ["name", "duration_us"]
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "fillOpacity": 90,
+            "lineWidth": 0,
+            "axisLabel": "Cumulative measured duration",
+            "axisPlacement": "auto",
+            "axisGridShow": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_us"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Cumulative duration"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "name"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(request_queue|response_queue)( #[1-8])?$",
+                      "result": {
+                        "color": "yellow"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(dispatch)( #[1-8])?$",
+                      "result": {
+                        "color": "blue"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(route_to_owner|route_back)( #[1-8])?$",
+                      "result": {
+                        "color": "light-blue"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(key_lock|store_lock|append_capacity)( #[1-8])?$",
+                      "result": {
+                        "color": "orange"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(lookup|decode)( #[1-8])?$",
+                      "result": {
+                        "color": "purple"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(read_buffer|read_io)( #[1-8])?$",
+                      "result": {
+                        "color": "green"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(append|durability_wait)( #[1-8])?$",
+                      "result": {
+                        "color": "red"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(socket_send)( #[1-8])?$",
+                      "result": {
+                        "color": "cyan"
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(server_total)( #[1-8])?$",
+                      "result": {
+                        "color": "gray"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xField": "name",
+        "stacking": "none",
+        "showValue": "always",
+        "groupWidth": 0.75,
+        "barWidth": 0.8,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "colorByField": "name",
+        "text": {
+          "valueSize": 14
+        }
       }
     },
     {
@@ -85,9 +429,9 @@
       "type": "logs",
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 21,
         "w": 24,
-        "h": 22
+        "h": 18
       },
       "datasource": {
         "type": "loki",

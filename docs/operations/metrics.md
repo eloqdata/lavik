@@ -512,9 +512,15 @@ queued output; recent history and counters are process memory, not durable stora
 
 The optional [monitoring log profile](../../deploy/monitoring/README.md#online-latency-diagnostics)
 collects these messages with Alloy into Loki. **Lavik Slow Command Traces** shows
-expandable JSON records and filters by command/trace ID. It does not automatically
-render custom stage arrays as waterfalls. Ordinary metrics deployment continues
-to require only Prometheus/Grafana.
+expandable JSON records and filters by command/trace ID. Its native bar charts
+show the latest matching command's stage timeline and cumulative stage durations;
+enter an exact trace ID to pin a command. The timeline uses actual retained
+intervals, including up to eight intervals for each repeated read stage. The
+duration chart includes all observations even when detailed intervals are
+truncated. Stages can overlap or be nested, so their durations are not additive.
+Zero-microsecond JSON durations can be invisible on the timeline. These views
+query existing logs and add no server instrumentation or log volume. Ordinary
+metrics deployment continues to require only Prometheus/Grafana.
 
 ## Cluster control metrics
 

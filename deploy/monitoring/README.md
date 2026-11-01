@@ -405,7 +405,17 @@ LAVIK_LOG_DIR=/absolute/path/to/lavik/logs docker compose --profile diagnostics-
 
 The additional **Lavik Slow Command Traces** dashboard uses the `lavik-loki`
 datasource and supports command/trace-ID filters and expandable log details.
-It shows JSON stage offsets/durations rather than an automatic waterfall.
+The two native bar charts show the latest matching command in the selected time
+range: a timeline of actual stage intervals and cumulative duration by stage.
+Copy an exact trace ID from a log row into **Trace ID (regex)** to pin a command.
+Overlapping stages are not additive. Repeated read stages show up to eight
+retained intervals each on the timeline, while cumulative durations include all
+observations; inspect the JSON for counts and `intervals_dropped`. Rounded
+zero-microsecond intervals may be invisible. These charts use existing JSON logs
+and require no additional server instrumentation or Grafana plugins.
+Keep the timeline's `start_us` series transparent when editing the dashboard.
+Do not apply `colorByField` to that panel: Grafana applies its opacity across
+numeric series, which would display offsets as measured intervals.
 Alloy forwards only `command_latency_trace` messages, uses their completion timestamp,
 and keeps trace IDs in the JSON body. The example labels one mounted node as
 `service_name="lavik-diagnostics"`; configure a bounded node identity when
