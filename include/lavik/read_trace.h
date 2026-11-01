@@ -25,6 +25,8 @@
 namespace lavik {
 // Full payload exists only in a selected online sidecar or a trace build.
 struct ReadLatencyTrace : LatencySegmentClock {
+  LatencyIntervals buffer_timing_;
+  LatencyIntervals io_timing_;
   std::uint64_t request_start_ns_ = 0;
   std::uint64_t owner_start_ns_ = 0;
   std::uint64_t lookup_done_ns_ = 0;

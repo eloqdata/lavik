@@ -350,6 +350,8 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   result.lease_ = std::move(*acquired);
   if (result.trace_) {
     result.trace_->buffer_acquired_ns_ = result.trace_->NowNanos();
+    result.trace_->buffer_timing_.Add(result.trace_->buffer_acquire_start_ns_,
+                                      result.trace_->buffer_acquired_ns_);
     result.trace_->heap_read_buffer_ = result.lease_.buffer_id() == 0;
   }
   auto buffer = result.lease_.io_buffer();
@@ -384,13 +386,19 @@ bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
                        : worker_.SubmitRead(
                              file_, std::span(buffer_.data_, buffer_.size_),
                              offset_, this);
-  if (!status.ok() && trace_) trace_->io_complete_ns_ = trace_->NowNanos();
+  if (!status.ok() && trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->io_timing_.Add(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   return Suspend(awaiting, std::move(status));
 }
 
 void StorageEngine::RemoteReadAwaitable::TracedReadIo::Complete(
     bycorf::Worker& worker, int result, unsigned flags) {
-  if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
+  if (trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->io_timing_.Add(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   OneShotIoAwaitable::Complete(worker, result, flags);
 }
 
@@ -1223,16 +1231,19 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
 }
 
 StorageEngine::Impl::ReadExtentAwaitable StorageEngine::Impl::ReadExtentOnOwner(
-    ExtentRef ref, std::uint32_t extent_index, std::byte* destination) {
+    ExtentRef ref, std::uint32_t extent_index, std::byte* destination,
+    ReadLatencyTrace* trace) {
   return ReadExtentAwaitable(*this, CurrentStore(), ref, extent_index, 0,
-                             std::span(destination, ref.payload_bytes_), true);
+                             std::span(destination, ref.payload_bytes_), true,
+                             trace);
 }
 
 StorageEngine::Impl::ReadExtentAwaitable StorageEngine::Impl::ReadExtentSlice(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::size_t source_offset, std::span<std::byte> destination) {
+    std::size_t source_offset, std::span<std::byte> destination,
+    ReadLatencyTrace* trace) {
   return ReadExtentAwaitable(*this, store, ref, extent_index, source_offset,
-                             destination);
+                             destination, false, trace);
 }
 
 Task<absl::Status>
@@ -1241,18 +1252,20 @@ StorageEngine::Impl::ReadExtentAwaitable::RemoteRead::operator()() {
   // below supplies the I/O and pool continuation without another loader frame.
   co_return co_await engine_->ReadExtentSlice(*engine_->stores_[owner_], ref_,
                                               extent_index_, source_offset_,
-                                              destination_);
+                                              destination_, trace_);
 }
 
 StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
     Impl& engine, WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::size_t source_offset, std::span<std::byte> destination, bool route)
+    std::size_t source_offset, std::span<std::byte> destination, bool route,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       ref_(ref),
       extent_index_(extent_index),
       source_offset_(source_offset),
-      destination_(destination) {
+      destination_(destination),
+      trace_(trace) {
   if (source_offset > ref.payload_bytes_ ||
       destination.size() > ref.payload_bytes_ - source_offset) {
     ready_ = absl::InvalidArgumentError("extent slice is out of range");
@@ -1267,7 +1280,7 @@ StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
     if (owner != store.worker_->id()) {
       remote_.emplace(bycorf::SubmitTaskTo(
           owner, RemoteRead{&engine, owner, ref, extent_index, source_offset,
-                            destination}));
+                            destination, trace}));
       return;
     }
   }
@@ -1291,6 +1304,7 @@ StorageEngine::Impl::ReadExtentAwaitable::~ReadExtentAwaitable() {
 }
 
 void StorageEngine::Impl::ReadExtentAwaitable::PrepareBuffer() {
+  const auto started = trace_ ? trace_->NowNanos() : 0;
   auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
   // Force the extent's full-range probe to fail independently of record reads
   // so end-to-end recovery tests can exercise streaming without stalling it.
@@ -1302,6 +1316,7 @@ void StorageEngine::Impl::ReadExtentAwaitable::PrepareBuffer() {
       });
   if (acquired.ok()) {
     lease_ = std::move(*acquired);
+    if (trace_) trace_->buffer_timing_.Add(started, trace_->NowNanos());
   } else if (absl::IsResourceExhausted(acquired.status()) &&
              store_.buffers_.read_capacity_bytes() != 0) {
     // Stream through a smaller arena range without any dynamic DMA allocation.
@@ -1339,6 +1354,7 @@ bool StorageEngine::Impl::ReadExtentAwaitable::SubmitRead(
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
   const auto [file_id, offset] = engine_.FileOffset(ref_.block_id_);
+  if (trace_) io_start_ns_ = trace_->NowNanos();
   return Suspend(
       awaiting, lease_.registered()
                     ? store_.worker_->SubmitReadFixed(store_.files_[file_id],
@@ -1352,6 +1368,7 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
   if (remote_) return remote_->await_resume();
   if (ready_) return std::move(*ready_);
   if (chunked_.valid()) return std::move(chunked_).TakeResult();
+  if (trace_) trace_->io_timing_.Add(io_start_ns_, trace_->NowNanos());
   auto read =
       Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
   if (!read.ok()) return read.status();
@@ -1388,7 +1405,9 @@ bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
 }
 
 Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
+  const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
+  if (trace_) trace_->buffer_timing_.Add(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   const auto capacity = chunk.io_buffer().size_;
@@ -1399,9 +1418,18 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
   for (std::size_t offset = 0; offset < header_bytes.size();) {
     auto buffer = chunk.io_buffer();
     buffer.size_ = std::min(capacity, header_bytes.size() - offset);
+    const auto io_start = trace_ ? trace_->NowNanos() : 0;
     auto read = co_await ReadStorageBuffer(
         *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
         block_offset + offset);
+    LAVIK_FAULT_INJECT(
+        if (trace_ &&
+            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+          auto delayed = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
+          if (!delayed.ok()) co_return delayed;
+        });
+    if (trace_) trace_->io_timing_.Add(io_start, trace_->NowNanos());
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -1424,9 +1452,18 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
     auto buffer = chunk.io_buffer();
     const auto remaining = ref_.payload_bytes_ - offset;
     buffer.size_ = std::min(capacity, AlignDirect(remaining));
+    const auto io_start = trace_ ? trace_->NowNanos() : 0;
     auto read = co_await ReadStorageBuffer(
         *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
         block_offset + kBlockHeaderBytes + offset);
+    LAVIK_FAULT_INJECT(
+        if (trace_ &&
+            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+          auto delayed = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
+          if (!delayed.ok()) co_return delayed;
+        });
+    if (trace_) trace_->io_timing_.Add(io_start, trace_->NowNanos());
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -1613,6 +1650,8 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   }
   if (trace != nullptr) {
     trace->buffer_acquired_ns_ = trace->NowNanos();
+    trace->buffer_timing_.Add(trace->buffer_acquire_start_ns_,
+                              trace->buffer_acquired_ns_);
     trace->heap_read_buffer_ = output.buffer_id() == 0;
     trace->disk_read_ = true;
   }
@@ -1638,7 +1677,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     const ExtentRef& ref = extents->at(index);
     const absl::Status read =
         co_await ReadExtentOnOwner(ref, static_cast<std::uint32_t>(index),
-                                   destination.data_ + output_offset);
+                                   destination.data_ + output_offset, trace);
     if (!read.ok()) co_return read;
     output_offset += ref.payload_bytes_;
   }
@@ -1648,6 +1687,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   }
   if (trace != nullptr) {
     trace->io_complete_ns_ = trace->NowNanos();
+
     trace->decode_done_ns_ = trace->io_complete_ns_;
   }
   const std::size_t value_offset =
@@ -1692,9 +1732,10 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
   if (location.grouped()) {
     // The grouped task owns its graph/version protocol. Keep its borrowed
     // digest in this awaitable, not in the constructor's argument lifetime.
-    slow_ = engine.LoadGroupedValue(store, partition, db_id, key, digest_,
-                                    location, std::move(grouped_snapshot),
-                                    GroupedValueEncoding::kLogicalStream);
+    slow_ =
+        engine.LoadGroupedValue(store, partition, db_id, key, digest_, location,
+                                std::move(grouped_snapshot),
+                                GroupedValueEncoding::kLogicalStream, trace);
   } else if (location.external() ||
              location.block_owner() != store.worker_->id()) {
     slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
@@ -1779,6 +1820,8 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   }
   if (trace_) {
     trace_->buffer_acquired_ns_ = trace_->NowNanos();
+    trace_->buffer_timing_.Add(trace_->buffer_acquire_start_ns_,
+                               trace_->buffer_acquired_ns_);
     trace_->heap_read_buffer_ = lease_.buffer_id() == 0;
   }
   // Resolve staging memory only after acquiring the buffer: waiting can let
@@ -1832,7 +1875,9 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
   // PrepareLocal pins the physical incarnation before this task can wait.
   // Keep the pin across every chunk, and validate the complete private image
   // with the same decoder/checksum rules as a single read before publishing it.
+  const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
+  if (trace_) trace_->buffer_timing_.Add(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   if (PopulationChanged()) co_return absl::NotFoundError("key not found");
@@ -1840,10 +1885,19 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
   for (std::size_t offset = 0; offset < read_bytes_;) {
     auto buffer = chunk.io_buffer();
     buffer.size_ = std::min(buffer.size_, read_bytes_ - offset);
+    const auto io_start = trace_ ? trace_->NowNanos() : 0;
     auto read = co_await ReadStorageBuffer(
         *store_.worker_, store_.files_[file_id_], buffer, chunk.registered(),
         aligned_offset_ + offset);
+    LAVIK_FAULT_INJECT(
+        if (trace_ &&
+            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+          auto delayed = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
+          if (!delayed.ok()) co_return delayed;
+        });
     if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
+    if (trace_) trace_->io_timing_.Add(io_start, trace_->io_complete_ns_);
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -1947,7 +2001,10 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
                                        std::span(buffer.data_, buffer.size_),
                                        aligned_offset_, this);
   if (Suspend(awaiting, status)) return std::noop_coroutine();
-  if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
+  if (trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->io_timing_.Add(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   if (partition_ && absl::IsAborted(status)) {
     Retry(std::move(status));
     return SuspendRead(awaiting);
@@ -1958,7 +2015,10 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
 void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
                                                        int bytes,
                                                        unsigned flags) {
-  if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
+  if (trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->io_timing_.Add(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   if (bytes >= 0) worker.RecordStorageReadCompletion(bytes);
   if (partition_ && bytes >= 0 &&
       static_cast<std::size_t>(bytes) == read_bytes_) {

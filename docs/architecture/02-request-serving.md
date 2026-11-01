@@ -496,8 +496,10 @@ awaited owner execution borrows their pointers. Runtime selection has a deadline
 sampling probability and server-total threshold. Owner-local snapshots expose
 conditional stage histograms and bounded recent JSON records through `LATENCY
 TRACE`; cancellation retires the lease. Fixed SPSC queues copy completed records
-to a logging thread, so diagnostic log backpressure drops output without blocking
-request workers. Requests and replies do not embed diagnostic payloads.
+to a logging thread that owns a separate rotating JSONL file sink, so diagnostic
+log backpressure drops output without blocking request workers or sharing their
+ordinary logging sink. Runtime output control leaves histograms and recent
+history active. Requests and replies do not embed diagnostic payloads.
 
 Redis commandstats and execution time are owned by the coordinating worker and
 snapshotted through `SubmitTo`. Static command/subcommand identities bound the

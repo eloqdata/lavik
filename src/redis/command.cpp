@@ -1430,6 +1430,8 @@ enum class RuntimeConfigKey : std::uint8_t {
   kBackgroundWarrant,
   kSpdkMaxCompletions,
   kStreamNodeMaxEntries,
+  kLatencyLogMaxPerSecond,
+  kLatencyLogEnabled,
   kLatencyEnabled,
   kLatencyDuration,
   kLatencySample,
@@ -1449,6 +1451,10 @@ struct RuntimeConfigDescriptor {
 // CONFIG command metadata only. Execution paths never consult this table;
 // each subsystem reads its owning runtime state directly.
 constexpr std::array kRuntimeConfigs{
+    RuntimeConfigDescriptor{"latency-diagnostics-log-max-per-second",
+                            RuntimeConfigKey::kLatencyLogMaxPerSecond},
+    RuntimeConfigDescriptor{"latency-diagnostics-log-enabled",
+                            RuntimeConfigKey::kLatencyLogEnabled},
     RuntimeConfigDescriptor{"latency-diagnostics-enabled",
                             RuntimeConfigKey::kLatencyEnabled},
     RuntimeConfigDescriptor{"latency-diagnostics-duration-seconds",
@@ -1717,6 +1723,11 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
               bycorf::ThisWorker().self_->spdk_max_completions_per_poll());
         case RuntimeConfigKey::kStreamNodeMaxEntries:
           return std::to_string(StreamNodeMaxEntries());
+        case RuntimeConfigKey::kLatencyLogMaxPerSecond:
+          return LatencyDiagnosticsConfig(
+              "latency-diagnostics-log-max-per-second");
+        case RuntimeConfigKey::kLatencyLogEnabled:
+          return LatencyDiagnosticsConfig("latency-diagnostics-log-enabled");
         case RuntimeConfigKey::kLatencyEnabled:
           return LatencyDiagnosticsConfig("latency-diagnostics-enabled");
         case RuntimeConfigKey::kLatencyDuration:
@@ -4435,6 +4446,20 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
       .chunks_ = [state] { return state->Next(); }};
 }
 
+#if LAVIK_ENABLE_TRACE
+template <typename Trace>
+void CopyOnlineStorageTrace(Trace* legacy, const Trace& online) {
+  if (!legacy) return;
+  const auto request_start = legacy->request_start_ns_;
+  const auto owner_start = legacy->owner_start_ns_;
+  const auto remote = legacy->remote_;
+  *legacy = online;
+  legacy->request_start_ns_ = request_start;
+  legacy->owner_start_ns_ = owner_start;
+  legacy->remote_ = remote;
+}
+#endif
+
 Task<CommandReply> ExecuteStorageCommand(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     ReadLatencyTrace* read_trace = nullptr,
@@ -4454,14 +4479,29 @@ Task<CommandReply> ExecuteStorageCommand(
   }
   struct FinishOnlineOwner {
     OnlineLatencyTrace* trace;
+#if LAVIK_ENABLE_TRACE
+    ReadLatencyTrace* legacy_read;
+    SetLatencyTrace* legacy_set;
+#endif
     ~FinishOnlineOwner() {
       if (!trace) return;
       if (trace->is_set_)
         trace->set_.owner_done_ns_ = LatencyMonotonicNanos();
       else
         trace->read_.owner_done_ns_ = LatencyMonotonicNanos();
+#if LAVIK_ENABLE_TRACE
+      if (trace->is_set_)
+        CopyOnlineStorageTrace(legacy_set, trace->set_);
+      else
+        CopyOnlineStorageTrace(legacy_read, trace->read_);
+#endif
     }
-  } finish_online{request.latency_trace_};
+  } finish_online{request.latency_trace_
+#if LAVIK_ENABLE_TRACE
+                  ,
+                  read_trace, set_trace
+#endif
+  };
   if (auto* online = request.latency_trace_) {
     if (online->is_set_) {
       set_trace = &online->set_;
@@ -13714,22 +13754,22 @@ Task<CommandReply> ExecuteCommandBody(
             auto& v = request.latency_trace_->read_;
             v.owner_start_ns_ = LatencyMonotonicNanos();
           }
+          ReadLatencyTrace* detail =
+              request.latency_trace_ ? &request.latency_trace_->read_ : nullptr;
+#if LAVIK_ENABLE_TRACE
+          if (!detail) detail = &trace;
+#endif
           auto fast = co_await g_storage->TryRemoteRead(
               request.db_id_, args[key_arg], slot,
               request.spec_->remote_read_type_,
-              request.spec_->remote_read_metadata_
-#if LAVIK_ENABLE_TRACE
-              ,
-              &trace
-#else
-              ,
-              request.latency_trace_ ? &request.latency_trace_->read_ : nullptr
-#endif
-          );
+              request.spec_->remote_read_metadata_, detail);
           if (fast) {
             if (request.latency_trace_) {
               auto& v = request.latency_trace_->read_;
               v.owner_done_ns_ = LatencyMonotonicNanos();
+#if LAVIK_ENABLE_TRACE
+              CopyOnlineStorageTrace(&trace, v);
+#endif
             }
             CommandReply reply;
             if (const char* error = CommandServingGenerationError(request);

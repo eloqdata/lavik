@@ -435,6 +435,20 @@ all eligible commands. `latency-diagnostics-slow-threshold-us` defaults to
 `latency-diagnostics-enabled` accepts yes/no. Enabling again restarts the time
 window using the current duration; editing duration alone does not extend an
 active window. Sampling and threshold changes apply to newly selected commands.
+`latency-diagnostics-log-enabled` defaults to `yes` and accepts `yes/no`.
+Set it to `no` to stop offering new records to the diagnostic log queue while
+keeping sampling, histograms and recent history. Records already queued can
+still drain. `lavik_latency_diagnostics_log_enabled` exposes this switch.
+`latency-diagnostics-log-max-per-second` defaults to 20 (range 0–1000000),
+shared by GET/SET records offered to the log queue on each data worker.
+Zero removes the enqueue rate limit;
+it does not remove the bounded queue or guarantee delivery. Changes take
+immediate effect on new output attempts. Lowering a limit below the current
+window's usage suppresses output until its next reset. The budget permits
+bursts within each one-second window rather than spacing records evenly.
+A consumer recovering from a stalled sink may drain queued records together;
+this is not a strict per-second disk-write limit.
+`lavik_latency_diagnostics_log_max_per_second` exposes the configured limit.
 Settings are runtime-only and are not persisted by CONFIG REWRITE. They are
 independent of SLOWLOG and the legacy compile-time aggregate trace.
 
@@ -464,8 +478,16 @@ requires a lock. `append_capacity` contains block/buffer acquisition and related
 flush waits; `append` is its overlapping parent. `durability_wait` records a SET
 waiting for a previously yielded staging slot, not a promise that every SET
 waits for fsync. Background flush I/O is not assigned to individual SETs.
-`read_io` includes I/O completion and, on ordinary reads, scheduling until the
-awaiting coroutine resumes. `response_queue` ends when the socket write starts;
+`read_io` measures physical read operations, including scheduling until resume
+for extent/chunk reads. Repeated buffer/I/O observations contribute their sum
+to the per-command stage histogram. Paged String GETs keep separate sampled
+state per concurrent page and merge it on the key owner. These temporary
+sidecars exist only within the bounded read window. Parallel child durations
+are resource-time sums and can exceed server-total wall time. Detail includes
+up to eight exact `intervals`,
+`observations`, `span_us`, and `intervals_dropped`; aggregate duration remains
+complete when interval detail is truncated. Gaps between intervals are not I/O
+time. `response_queue` ends when the socket write starts;
 commands in a pipeline share the same batch send span. Never add stage p99s or
 sum overlapping parent/child spans to infer total latency.
 
@@ -475,13 +497,18 @@ use monotonic timestamps rather than subtracting raw counters from different
 cores. This does not calibrate inter-core TSC offsets. Timing is diagnostic,
 including host scheduling/preemption, not a CPU-time measurement.
 
-A background consumer writes `command_latency_trace` JSON messages through the
-normal rotating Lavik logger, without keys, values, client addresses or arguments.
-Per-worker SPSC queues hold 64 copies; output is capped separately at 20 records
-per second per worker. A full queue or output budget increments `log_dropped`
-without suppressing history or histogram updates. Workers never call the log
-sink for diagnostic records. Shutdown can discard queued output; recent history
-and counters are process memory, not durable storage.
+A background consumer writes `command_latency_trace` JSON messages to a dedicated
+`<log-dir>/latency-diagnostics.log` rotating JSONL sink, without keys, values,
+client addresses or arguments.
+Per-worker SPSC queues hold 64 copies; output has its own configurable rate
+limit, initially 20 records per second per worker. A full queue or output budget
+increments `log_dropped`
+without suppressing history or histogram updates. Workers never call the
+diagnostic log sink. Its sink instance and file are independent of normal worker logging;
+rotation reuses the configured file-size and file-count limits. Diagnostic
+output stays in this file even when ordinary logging targets stderr. The consumer
+flushes its userspace buffer every 20 ms without fsync. Shutdown can discard
+queued output; recent history and counters are process memory, not durable storage.
 
 The optional [monitoring log profile](../../deploy/monitoring/README.md#online-latency-diagnostics)
 collects these messages with Alloy into Loki. **Lavik Slow Command Traces** shows

@@ -2553,7 +2553,7 @@ int RunServer(ServerOptions options) {
                    options.dbfilename_),
       std::move(options.rdb_save_rules_));
   InitWorkerMetrics(options.shard_count_);
-  InitLatencyDiagnostics(options.shard_count_);
+  InitLatencyDiagnostics(options.shard_count_, &options.logging_);
   InitSlowLog(options.shard_count_, options.slowlog_log_slower_than_us_,
               options.slowlog_max_len_);
   SetLuaScriptBusyThresholdMs(options.lua_time_limit_ms_);

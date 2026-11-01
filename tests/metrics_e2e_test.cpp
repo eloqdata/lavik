@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iterator>
@@ -268,7 +269,8 @@ class ServerProcess {
       std::string_view log_path, unsigned workers = 2,
       std::uint64_t max_memory = 1024ULL * 1024 * 1024,
       std::vector<std::string> extra = {},
-      const std::vector<std::pair<std::string, std::string>>& env = {}) {
+      const std::vector<std::pair<std::string, std::string>>& env = {})
+      : diagnostic_log_dir_(std::string(log_path) + ".diagnostics") {
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("fork failed");
@@ -288,6 +290,8 @@ class ServerProcess {
       std::vector<std::string> arguments{
           std::string(binary),
           "--logtostderr",
+          "--log-dir",
+          diagnostic_log_dir_,
           "--port",
           std::to_string(redis_port),
           "--metrics-port",
@@ -319,6 +323,7 @@ class ServerProcess {
     if (pid_ > 0) {
       (void)::kill(pid_, SIGKILL);
       (void)::waitpid(pid_, nullptr, 0);
+      RemoveDiagnosticLogs();
     }
   }
 
@@ -333,6 +338,7 @@ class ServerProcess {
         pid_ = -1;
         ASSERT_TRUE(WIFEXITED(status));
         ASSERT_EQ(WEXITSTATUS(status), 0);
+        RemoveDiagnosticLogs();
         return;
       }
       ASSERT_GE(waited, 0);
@@ -342,6 +348,12 @@ class ServerProcess {
   }
 
  private:
+  void RemoveDiagnosticLogs() {
+    if (::testing::Test::HasFailure()) return;
+    std::error_code error;
+    std::filesystem::remove_all(diagnostic_log_dir_, error);
+  }
+  std::string diagnostic_log_dir_;
   pid_t pid_ = -1;
 };
 

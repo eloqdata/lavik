@@ -30,6 +30,7 @@
 #include "lavik/set_trace.h"
 
 namespace lavik {
+struct LoggingOptions;
 
 // These resources measure actual suspension, including maintenance callers.
 // Ownership remains on the worker that suspended; no shared hot-path lock.
@@ -87,6 +88,7 @@ struct OnlineLatencyTrace {
   ReadLatencyTrace read_;
   SetLatencyTrace set_;
   std::uint64_t id_ = 0;
+  std::uint64_t timestamp_ns_ = 0;
   std::uint64_t ready_ns_ = 0;
   std::uint64_t dispatch_ns_ = 0;
   std::uint64_t dispatch_done_ns_ = 0;
@@ -121,7 +123,10 @@ class OnlineTraceHandle {
 };
 
 // Initialize before workers start; stop the log consumer after workers stop.
-void InitLatencyDiagnostics(unsigned workers);
+// Diagnostic JSON uses its own rotating sink in log_dir_, even when ordinary
+// logging targets stderr. Options are copied before the consumer starts.
+void InitLatencyDiagnostics(unsigned workers,
+                            const LoggingOptions* logging = nullptr);
 void StopLatencyDiagnostics();
 std::uint64_t LatencyMonotonicNanos() noexcept;
 OnlineTraceHandle SelectOnlineTrace(std::string_view command);

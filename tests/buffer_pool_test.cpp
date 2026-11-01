@@ -250,6 +250,8 @@ TEST(BufferPoolTest, RejectsFewerThanTwoWriteSlotsBeforeAllocation) {
 }
 
 TEST(BufferPoolTest, ReadAllocationFailureWaitsForFixedSlot) {
+  InitLatencyDiagnostics(1);
+  absl::Cleanup stop_diagnostics = [] { StopLatencyDiagnostics(); };
 #if !LAVIK_FAULTS_ENABLED
   GTEST_SKIP() << "requires read buffer allocation failure injection";
 #endif

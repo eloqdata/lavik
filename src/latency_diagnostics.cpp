@@ -20,6 +20,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <thread>
 
@@ -27,6 +28,8 @@
 #include "absl/strings/str_cat.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/logging.h"
+#include "spdlog/sinks/rotating_file_sink.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik {
@@ -34,10 +37,28 @@ namespace {
 constexpr unsigned kCapacity = 256;
 constexpr unsigned kHistory = 128;
 constexpr unsigned kLogCapacity = 64;
-constexpr unsigned kLogPerSecond = 20;
 constexpr std::array<std::string_view, 5> kResources{
     "key_lock", "store_lock", "read_buffer", "write_buffer", "durability"};
-constexpr std::array<std::string_view, 16> kStages{
+enum Stage {
+  kRequestQueue,
+  kDispatch,
+  kRouteToOwner,
+  kRouteBack,
+  kKeyLock,
+  kStoreLock,
+  kLookup,
+  kReadBuffer,
+  kReadIo,
+  kAppendCapacity,
+  kAppend,
+  kDurabilityWait,
+  kResponseQueue,
+  kSocketSend,
+  kServerTotal,
+  kDecode,
+  kStageCount
+};
+constexpr std::array<std::string_view, kStageCount> kStages{
     "request_queue",  "dispatch",        "route_to_owner", "route_back",
     "key_lock",       "store_lock",      "lookup",         "read_buffer",
     "read_io",        "append_capacity", "append",         "durability_wait",
@@ -83,6 +104,9 @@ std::atomic<std::uint64_t> g_deadline_ns{0};
 std::atomic<std::uint32_t> g_duration{300}, g_sample{64};
 std::atomic<std::uint64_t> g_threshold{10000};
 std::jthread g_logger;
+std::atomic<std::uint64_t> g_sink_dropped{0};
+std::atomic<bool> g_log_enabled{true};
+std::atomic<std::uint32_t> g_log_limit{20};
 Shard* Local() {
   if (!g_shards || bycorf::ThisWorker().id_ >= g_count) return nullptr;
   return &g_shards[bycorf::ThisWorker().id_];
@@ -99,48 +123,58 @@ bool Enabled() {
 
 struct Span {
   std::uint64_t start = 0, end = 0;
+  const LatencyIntervals* timing = nullptr;
 };
+std::uint64_t Duration(const Span& span) {
+  return span.timing ? span.timing->total_ns : span.end - span.start;
+}
 std::array<Span, kStages.size()> Spans(const OnlineLatencyTrace& t) {
   std::array<Span, kStages.size()> s{};
-  s[0] = {t.ready_ns_, t.dispatch_ns_};
-  s[1] = {t.dispatch_ns_, t.dispatch_done_ns_};
+  s[kRequestQueue] = {t.ready_ns_, t.dispatch_ns_};
+  s[kDispatch] = {t.dispatch_ns_, t.dispatch_done_ns_};
   if (t.is_set_) {
     const auto& v = t.set_;
     if (v.remote_) {
-      s[2] = {t.dispatch_ns_, v.owner_start_ns_};
-      s[3] = {v.owner_done_ns_, t.dispatch_done_ns_};
+      s[kRouteToOwner] = {t.dispatch_ns_, v.owner_start_ns_};
+      s[kRouteBack] = {v.owner_done_ns_, t.dispatch_done_ns_};
     }
-    s[4] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
-    s[5] = {v.store_lock_start_ns_, v.store_lock_acquired_ns_};
-    s[6] = {v.store_lock_acquired_ns_, v.lookup_done_ns_};
-    s[9] = {v.block_wait_start_ns_, v.block_ready_ns_};
-    s[10] = {v.append_start_ns_, v.append_done_ns_};
-    s[11] = {v.durability_start_ns_, v.durability_done_ns_};
+    s[kKeyLock] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
+    s[kStoreLock] = {v.store_lock_start_ns_, v.store_lock_acquired_ns_};
+    s[kLookup] = {v.store_lock_acquired_ns_, v.lookup_done_ns_};
+    s[kAppendCapacity] = {v.block_wait_start_ns_, v.block_ready_ns_};
+    s[kAppend] = {v.append_start_ns_, v.append_done_ns_};
+    s[kDurabilityWait] = {v.durability_start_ns_, v.durability_done_ns_};
   } else {
     const auto& v = t.read_;
     // Direct remote reads execute I/O on the connection worker; ownership
     // alone must not create a fictitious outbound or return routing span.
     if (v.remote_) {
-      s[2] = {t.dispatch_ns_, v.owner_start_ns_};
-      s[3] = {v.owner_done_ns_, t.dispatch_done_ns_};
+      s[kRouteToOwner] = {t.dispatch_ns_, v.owner_start_ns_};
+      s[kRouteBack] = {v.owner_done_ns_, t.dispatch_done_ns_};
     }
-    s[4] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
-    s[6] = {v.owner_start_ns_, v.lookup_done_ns_};
-    s[7] = {v.buffer_acquire_start_ns_, v.buffer_acquired_ns_};
-    s[8] = {v.io_submit_ns_, v.io_complete_ns_};
-    s[15] = {v.io_complete_ns_, v.decode_done_ns_};
+    s[kKeyLock] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
+    s[kLookup] = {v.owner_start_ns_, v.lookup_done_ns_};
+    s[kReadBuffer] = {v.buffer_acquire_start_ns_, v.buffer_acquired_ns_};
+    if (v.disk_read_) s[kReadIo] = {v.io_submit_ns_, v.io_complete_ns_};
+    if (v.buffer_timing_.count)
+      s[kReadBuffer] = {v.buffer_timing_.first_ns, v.buffer_timing_.last_ns,
+                        &v.buffer_timing_};
+    if (v.io_timing_.count)
+      s[kReadIo] = {v.io_timing_.first_ns, v.io_timing_.last_ns, &v.io_timing_};
+    s[kDecode] = {v.io_complete_ns_, v.decode_done_ns_};
   }
-  s[12] = {t.dispatch_done_ns_, t.send_ns_};
-  s[13] = {t.send_ns_, t.done_ns_};
-  s[14] = {t.ready_ns_, t.done_ns_};
+  s[kResponseQueue] = {t.dispatch_done_ns_, t.send_ns_};
+  s[kSocketSend] = {t.send_ns_, t.done_ns_};
+  s[kServerTotal] = {t.ready_ns_, t.done_ns_};
   return s;
 }
 bool Valid(const Span& s) { return s.start && s.end >= s.start; }
 std::string Json(const OnlineLatencyTrace& t) {
   std::string out = absl::StrCat(
-      "{\"event\":\"command_latency_trace\",\"trace_id\":\"", t.id_,
-      "\",\"command\":\"", t.is_set_ ? "SET" : "GET",
-      "\",\"worker\":", t.origin_,
+      "{\"event\":\"command_latency_trace\",\"level\":\"info\",\"timestamp_"
+      "unix_ns\":\"",
+      t.timestamp_ns_, "\",\"trace_id\":\"", t.id_, "\",\"command\":\"",
+      t.is_set_ ? "SET" : "GET", "\",\"worker\":", t.origin_,
       ",\"total_us\":", (t.done_ns_ - t.ready_ns_) / 1000,
       ",\"threshold_us\":", t.threshold_us_,
       ",\"sample_every\":", t.sample_every_,
@@ -154,7 +188,25 @@ std::string Json(const OnlineLatencyTrace& t) {
     first = false;
     absl::StrAppend(&out, "{\"name\":\"", kStages[i],
                     "\",\"start_us\":", (span.start - t.ready_ns_) / 1000,
-                    ",\"duration_us\":", (span.end - span.start) / 1000, "}");
+                    ",\"duration_us\":", Duration(span) / 1000);
+    if (span.timing && span.timing->count > 1) {
+      absl::StrAppend(&out, ",\"observations\":", span.timing->count,
+                      ",\"span_us\":", (span.end - span.start) / 1000,
+                      ",\"intervals\":[");
+      const auto count = std::min<std::uint64_t>(span.timing->count,
+                                                 span.timing->intervals.size());
+      for (unsigned n = 0; n < count; ++n) {
+        const auto& interval = span.timing->intervals[n];
+        if (n) out += ',';
+        absl::StrAppend(
+            &out, "{\"start_us\":", (interval.start_ns - t.ready_ns_) / 1000,
+            ",\"duration_us\":", (interval.end_ns - interval.start_ns) / 1000,
+            "}");
+      }
+      absl::StrAppend(&out,
+                      "],\"intervals_dropped\":", span.timing->count - count);
+    }
+    out += '}';
   }
   out += "]}";
   return out;
@@ -171,21 +223,25 @@ void Retain(OnlineLatencyTrace& t) {
     return;
   }
   ++s.metrics.retained;
+  t.timestamp_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
   const auto spans = Spans(t);
   for (unsigned i = 0; i < spans.size(); ++i)
-    if (Valid(spans[i]))
-      s.metrics.hist[t.is_set_][i].Add(spans[i].end - spans[i].start);
+    if (Valid(spans[i])) s.metrics.hist[t.is_set_][i].Add(Duration(spans[i]));
   if (s.history_size == kHistory)
     ++s.metrics.overwritten;
   else
     ++s.history_size;
   s.history[s.history_next++ % kHistory] = t;
+  if (!g_log_enabled.load(std::memory_order_relaxed)) return;
   if (t.done_ns_ - s.log_epoch >= 1000000000) {
     s.log_epoch = t.done_ns_;
     s.log_count = 0;
   }
   const auto head = s.log_head.load(std::memory_order_relaxed);
-  if (s.log_count >= kLogPerSecond ||
+  const auto limit = g_log_limit.load(std::memory_order_relaxed);
+  if ((limit != 0 && s.log_count >= limit) ||
       head - s.log_tail.load(std::memory_order_acquire) == kLogCapacity) {
     ++s.metrics.log_dropped;
     return;
@@ -201,7 +257,7 @@ std::uint64_t LatencyMonotonicNanos() noexcept {
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
-void InitLatencyDiagnostics(unsigned workers) {
+void InitLatencyDiagnostics(unsigned workers, const LoggingOptions* options) {
   StopLatencyDiagnostics();
   g_count = workers;
   g_shards = std::make_unique<Shard[]>(workers);
@@ -211,7 +267,23 @@ void InitLatencyDiagnostics(unsigned workers) {
     s.random = 0x9e3779b97f4a7c15ULL ^ (w + 1);
     for (unsigned i = 0; i < kCapacity; ++i) s.free[i] = i;
   }
-  g_logger = std::jthread([](std::stop_token stop) {
+  const auto settings = options ? *options : LoggingOptions{};
+  g_sink_dropped = 0;
+  g_logger = std::jthread([settings](std::stop_token stop) {
+    std::shared_ptr<spdlog::logger> logger;
+    std::uint64_t retry_ns = 0;
+    // This sink is deliberately not registered as the default logger and
+    // shares no sink mutex or stderr descriptor with ordinary worker logging.
+    const auto open_logger = [&] {
+      const auto path =
+          std::filesystem::path(settings.log_dir_) / "latency-diagnostics.log";
+      auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_st>(
+          path.string(), settings.max_log_size_mb_ * 1024 * 1024,
+          settings.max_log_files_ - 1, false);
+      logger = std::make_shared<spdlog::logger>("latency-diagnostics", sink);
+      logger->set_pattern("%v");
+      logger->set_error_handler([](const std::string&) { ++g_sink_dropped; });
+    };
     while (!stop.stop_requested()) {
       for (unsigned w = 0; w < g_count; ++w) {
         auto& s = g_shards[w];
@@ -220,9 +292,20 @@ void InitLatencyDiagnostics(unsigned workers) {
         while (tail != head && !stop.stop_requested()) {
           const auto entry = s.logs[tail % kLogCapacity];
           s.log_tail.store(++tail, std::memory_order_release);
-          spdlog::info("{}", Json(entry));
+          if (!logger && LatencyMonotonicNanos() >= retry_ns) {
+            try {
+              open_logger();
+            } catch (const spdlog::spdlog_ex&) {
+              retry_ns = LatencyMonotonicNanos() + 1000000000;
+            }
+          }
+          if (logger)
+            logger->info("{}", Json(entry));
+          else
+            ++g_sink_dropped;
         }
       }
+      if (logger) logger->flush();
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
   });
@@ -298,6 +381,13 @@ void EndLatencyWait(LatencyResource resource) noexcept {
 }
 absl::Status ConfigureLatencyDiagnostics(std::string_view name,
                                          std::string_view value) {
+  if (name == "latency-diagnostics-log-enabled") {
+    if (!absl::EqualsIgnoreCase(value, "yes") &&
+        !absl::EqualsIgnoreCase(value, "no"))
+      return absl::InvalidArgumentError("expected yes or no");
+    g_log_enabled = absl::EqualsIgnoreCase(value, "yes");
+    return absl::OkStatus();
+  }
   if (name == "latency-diagnostics-enabled") {
     if (!absl::EqualsIgnoreCase(value, "yes") &&
         !absl::EqualsIgnoreCase(value, "no"))
@@ -315,7 +405,10 @@ absl::Status ConfigureLatencyDiagnostics(std::string_view name,
   if (error != std::errc{} || end != value.data() + value.size())
     return absl::InvalidArgumentError(
         "value is not an integer or out of range");
-  if (name == "latency-diagnostics-duration-seconds" && n >= 1 && n <= 3600)
+  if (name == "latency-diagnostics-log-max-per-second" && n <= 1000000)
+    g_log_limit = n;
+  else if (name == "latency-diagnostics-duration-seconds" && n >= 1 &&
+           n <= 3600)
     g_duration = n;
   else if (name == "latency-diagnostics-sample-every" && n >= 1 && n <= 1000000)
     g_sample = n;
@@ -327,6 +420,10 @@ absl::Status ConfigureLatencyDiagnostics(std::string_view name,
   return absl::OkStatus();
 }
 std::string LatencyDiagnosticsConfig(std::string_view name) {
+  if (name == "latency-diagnostics-log-max-per-second")
+    return std::to_string(g_log_limit.load());
+  if (name == "latency-diagnostics-log-enabled")
+    return g_log_enabled.load() ? "yes" : "no";
   if (name == "latency-diagnostics-enabled") return Enabled() ? "yes" : "no";
   if (name == "latency-diagnostics-duration-seconds")
     return std::to_string(g_duration.load());
@@ -396,6 +493,7 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
         for (unsigned b = 0; b < h.bins.size(); ++b) h.bins[b] += v.bins[b];
       }
   }
+  total.log_dropped += g_sink_dropped.load(std::memory_order_relaxed);
   std::string out;
   const auto gauge = [&](std::string_view name, auto value,
                          std::string_view help) {
@@ -407,6 +505,12 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
       "Complete parsed commands awaiting dispatch; excludes MULTI residency.");
   gauge("lavik_response_writes_inflight", total.writes,
         "Ordinary Redis socket writes currently awaiting completion.");
+  gauge("lavik_latency_diagnostics_log_max_per_second", g_log_limit.load(),
+        "Per-worker diagnostic record enqueue limit; zero removes the rate "
+        "limit but not the bounded queue.");
+  gauge("lavik_latency_diagnostics_log_enabled", g_log_enabled.load() ? 1 : 0,
+        "Whether retained diagnostic records are offered to the asynchronous "
+        "log sink.");
   gauge("lavik_latency_diagnostics_enabled", Enabled() ? 1 : 0,
         "Whether new eligible commands can be sampled.");
   gauge("lavik_latency_diagnostics_sample_every", g_sample.load(),

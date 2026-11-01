@@ -1,21 +1,17 @@
-// Mount an operator-selected Lavik log directory read-only at /var/log/lavik.
+// Diagnostics use a dedicated rotating JSONL file, separate from worker logs.
 local.file_match "lavik" {
-  path_targets = [{"__path__" = "/var/log/lavik/lavik.log", "service_name" = "lavik-diagnostics"}]
+  path_targets = [{"__path__" = "/var/log/lavik/latency-diagnostics.log", "service_name" = "lavik-diagnostics"}]
 }
 loki.source.file "lavik" {
   targets    = local.file_match.lavik.targets
   forward_to = [loki.process.diagnostics.receiver]
 }
 loki.process "diagnostics" {
-  stage.match {
-    selector = "{service_name=\"lavik-diagnostics\"} !~ \"command_latency_trace\""
-    action   = "drop"
+  stage.json { expressions = { timestamp = "timestamp_unix_ns" } }
+  stage.timestamp {
+    source = "timestamp"
+    format = "UnixNs"
   }
-  // The normal Lavik logger prepends timestamp/level to its JSON message.
-  stage.regex {
-    expression = `(?P<json>\{"event":"command_latency_trace".*)$`
-  }
-  stage.output { source = "json" }
   forward_to = [loki.write.local.receiver]
 }
 loki.write "local" {

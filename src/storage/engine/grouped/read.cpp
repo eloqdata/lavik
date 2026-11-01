@@ -458,13 +458,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
-                                      WorkerStore::PartitionStore& partition,
-                                      std::uint8_t db_id, std::string_view key,
-                                      const Digest& digest,
-                                      RecordLocation location,
-                                      GroupedObject::Handle snapshot,
-                                      GroupedValueEncoding encoding) {
+StorageEngine::Impl::LoadGroupedValue(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    RecordLocation location, GroupedObject::Handle snapshot,
+    GroupedValueEncoding encoding, ReadLatencyTrace* trace) {
   const bool pinned = snapshot != nullptr;
   if (!pinned) {
     auto found = partition.grouped_objects_[db_id].Lookup(
@@ -483,8 +481,9 @@ StorageEngine::Impl::LoadGroupedValue(WorkerStore& store,
     co_return absl::DataLossError("missing grouped materialization view");
   if (snapshot->is_ordered() && snapshot->ordered_directory().root().kind_ ==
                                     OrderedCollectionKind::kString) {
-    co_return co_await LoadGroupedStringValue(
-        store, partition, db_id, key, digest, std::move(snapshot), pinned);
+    co_return co_await LoadGroupedStringValue(store, partition, db_id, key,
+                                              digest, std::move(snapshot),
+                                              pinned, trace);
   }
   GroupedScratchBudget budget;
   auto include_group = [&](GroupedRecordId id) -> absl::Status {

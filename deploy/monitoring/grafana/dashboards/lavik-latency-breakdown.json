@@ -273,12 +273,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.99, sum by(le,command)(rate(lavik_command_duration_seconds{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by(le,command)(rate(lavik_command_duration_seconds_bucket{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{command}} p99"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.999, sum by(le,command)(rate(lavik_command_duration_seconds{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.999, sum by(le,command)(rate(lavik_command_duration_seconds_bucket{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{command}} p99.9"
         }
       ],
@@ -341,6 +341,16 @@
           "refId": "E",
           "expr": "lavik_latency_diagnostics_inflight{job=\"lavik\",instance=~\"$instance\"}",
           "legendFormat": "contexts in flight"
+        },
+        {
+          "refId": "F",
+          "expr": "lavik_latency_diagnostics_log_enabled{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "log output enabled"
+        },
+        {
+          "refId": "G",
+          "expr": "lavik_latency_diagnostics_log_max_per_second{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "logs / worker / s (0=unlimited)"
         }
       ],
       "fieldConfig": {

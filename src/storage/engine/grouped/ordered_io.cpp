@@ -26,10 +26,24 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
-    Decode decode, GroupReadLimiter* limiter) {
+    Decode decode, GroupReadLimiter* limiter, ReadLatencyTrace* trace) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
+  // Concurrent pages never write into a shared command trace. This temporary
+  // sidecar exists only for timed reads and is bounded by the existing read
+  // window. Its physical reads may hop workers; merge only after returning to
+  // this key owner, without changing the parent's routing or clock anchor.
+  auto detail = trace ? std::make_unique<ReadLatencyTrace>() : nullptr;
+  absl::Cleanup merge_trace = [&] {
+    if (!trace) return;
+    trace->buffer_timing_.Merge(detail->buffer_timing_);
+    trace->io_timing_.Merge(detail->io_timing_);
+    trace->disk_read_ |= detail->disk_read_ || detail->io_timing_.count != 0;
+    trace->heap_read_buffer_ |= detail->heap_read_buffer_;
+    trace->io_submit_ns_ = trace->io_timing_.first_ns;
+    trace->io_complete_ns_ = trace->io_timing_.last_ns;
+  };
   const auto original = object->version();
   const auto root = object->ordered_directory().root();
   const GroupedRecordId id{page_id, 0};
@@ -82,24 +96,23 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents,
-                                               nullptr, true);
+                                               detail.get(), true);
     } else if (location.block_owner() == store.worker_->id()) {
       loaded = co_await LoadValueLocal(store, db_id, key, location,
-                                       original.replication_epoch_, nullptr,
-                                       original.db_epoch_);
+                                       original.replication_epoch_,
+                                       detail.get(), original.db_epoch_);
     } else {
       const unsigned owner = location.block_owner();
       // The caller keeps key alive across this awaited hop. Borrowing it avoids
       // copying a multi-megabyte parent once for every small ordered page.
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
-          [this, owner, db_id, key, location,
+          [this, owner, db_id, key, location, detail = detail.get(),
            epoch = original.replication_epoch_,
            db_epoch =
                original.db_epoch_]() -> Task<absl::StatusOr<LoadedValue>> {
-            co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
-                                              location, epoch, nullptr,
-                                              db_epoch);
+            co_return co_await LoadValueLocal(
+                *stores_[owner], db_id, key, location, epoch, detail, db_epoch);
           });
     }
     if (EffectiveRecordDbEpoch(partition, db_id) != original.db_epoch_ ||
@@ -347,7 +360,7 @@ Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadGroupedStringValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, bool pinned) {
+    GroupedObject::Handle object, bool pinned, ReadLatencyTrace* trace) {
   const auto& directory = object->ordered_directory();
   const auto& root = directory.root();
   if (root.item_count_ == 0 || root.item_count_ > kMaxStringBytes ||
@@ -458,7 +471,7 @@ StorageEngine::Impl::LoadGroupedStringValue(
           std::memcpy(destination.data(), bytes.data(), bytes.size());
           return bytes.size();
         },
-        window ? window->limiter() : nullptr);
+        window ? window->limiter() : nullptr, trace);
   };
   std::size_t written = 0;
   if (!window) {
@@ -510,6 +523,7 @@ StorageEngine::Impl::LoadGroupedStringValue(
     co_return absl::DataLossError("grouped String aggregate mismatch");
   const auto offset =
       static_cast<std::size_t>(output.data_ - buffer->bytes().data());
+  if (trace) trace->decode_done_ns_ = trace->NowNanos();
   co_return LoadedValue{std::move(*buffer), offset, written};
 }
 

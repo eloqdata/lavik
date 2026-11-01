@@ -3714,7 +3714,8 @@ class StorageEngine::Impl {
    public:
     ReadExtentAwaitable(Impl& engine, WorkerStore& store, ExtentRef ref,
                         std::uint32_t extent_index, std::size_t source_offset,
-                        std::span<std::byte> destination, bool route = false);
+                        std::span<std::byte> destination, bool route = false,
+                        ReadLatencyTrace* trace = nullptr);
     ~ReadExtentAwaitable();
     bool await_ready() const noexcept { return ready_.has_value(); }
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
@@ -3729,6 +3730,7 @@ class StorageEngine::Impl {
       std::uint32_t extent_index_;
       std::size_t source_offset_;
       std::span<std::byte> destination_;
+      ReadLatencyTrace* trace_ = nullptr;
       Task<absl::Status> operator()();
     };
     void PrepareBuffer();
@@ -3744,6 +3746,8 @@ class StorageEngine::Impl {
     std::uint32_t extent_index_;
     std::size_t source_offset_;
     std::span<std::byte> destination_;
+    ReadLatencyTrace* trace_ = nullptr;
+    std::uint64_t io_start_ns_ = 0;
     std::size_t read_bytes_ = 0;
     BlockState* pinned_ = nullptr;
     std::optional<absl::Status> ready_;
@@ -4199,17 +4203,19 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       RecordLocation location, GroupedObject::Handle snapshot,
-      GroupedValueEncoding encoding);
+      GroupedValueEncoding encoding, ReadLatencyTrace* trace = nullptr);
 
   // Reads an entire extent on its physical owner into caller-owned storage.
   // Local routing returns the physical awaitable without a wrapper task.
   ReadExtentAwaitable ReadExtentOnOwner(ExtentRef ref,
                                         std::uint32_t extent_index,
-                                        std::byte* destination);
+                                        std::byte* destination,
+                                        ReadLatencyTrace* trace = nullptr);
   ReadExtentAwaitable ReadExtentSlice(WorkerStore& store, ExtentRef ref,
                                       std::uint32_t extent_index,
                                       std::size_t source_offset,
-                                      std::span<std::byte> destination);
+                                      std::span<std::byte> destination,
+                                      ReadLatencyTrace* trace = nullptr);
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
@@ -4550,7 +4556,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
-      Decode decode, GroupReadLimiter* limiter = nullptr);
+      Decode decode, GroupReadLimiter* limiter = nullptr,
+      ReadLatencyTrace* trace = nullptr);
   Task<absl::StatusOr<ListResult>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4610,7 +4617,8 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<LoadedValue>> LoadGroupedStringValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, bool pinned);
+      GroupedObject::Handle object, bool pinned,
+      ReadLatencyTrace* trace = nullptr);
   // Consumes an unstarted preflight encoder with the same snapshot lifetime
   // contract as WriteHashGroupRecordLocked, including across extent IO.
   Task<absl::StatusOr<GroupedRecordLocation>> WriteOrderedGroupRecordLocked(

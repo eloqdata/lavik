@@ -1789,6 +1789,7 @@ if (BUILD_TESTING)
 
   add_executable(lavik_unit_tests
     tests/buffer_pool_test.cpp
+    tests/latency_trace_test.cpp
     tests/storage_write_buffer_test.cpp
     tests/redis_export_buffer_test.cpp
     tests/client_retirement_test.cpp
