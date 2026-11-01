@@ -1,1 +1,0 @@
-["/mnt/local_nvme/lavik-396/baseline-build/lavik", "--cpus", "0,2", "--port", "51213", "--metrics-port", "50379", "--data-file", "/mnt/local_nvme/lavik-396/feature-final/w2-r0-baseline/data", "--logtostderr", "--log-dir", "/mnt/local_nvme/lavik-396/feature-final/w2-r0-baseline/logs"]
