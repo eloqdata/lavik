@@ -450,6 +450,7 @@ add_library(lavik_module
   src/storage/engine/write.cpp
   src/storage/format.cpp
   src/memory.cpp
+  src/latency_diagnostics.cpp
   src/metrics.cpp
   src/replication/observability.cpp
   src/replication/observability_format.cpp
@@ -2213,6 +2214,15 @@ endforeach()
       NAME lavik_metrics_e2e
       COMMAND lavik_metrics_e2e_test $<TARGET_FILE:lavik>
     )
+    set(LAVIK_LATENCY_TEST_ARGS)
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR LAVIK_ENABLE_TEST_FAULTS)
+      list(APPEND LAVIK_LATENCY_TEST_ARGS --faults)
+    endif()
+    add_test(NAME lavik_latency_diagnostics_e2e
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/latency_diagnostics_e2e.py
+        $<TARGET_FILE:lavik> ${LAVIK_LATENCY_TEST_ARGS})
+    set_tests_properties(lavik_latency_diagnostics_e2e PROPERTIES TIMEOUT 60)
     # Cases start fresh servers; allow for startup variance on arm64 runners.
     set_tests_properties(lavik_metrics_e2e PROPERTIES TIMEOUT 240)
 

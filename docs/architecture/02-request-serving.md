@@ -490,6 +490,15 @@ recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
+Online GET/SET diagnosis is independent of SLOWLOG and command statistics.
+Ready batches own bounded worker-local trace leases through reply send completion;
+awaited owner execution borrows their pointers. Runtime selection has a deadline,
+sampling probability and server-total threshold. Owner-local snapshots expose
+conditional stage histograms and bounded recent JSON records through `LATENCY
+TRACE`; cancellation retires the lease. Fixed SPSC queues copy completed records
+to a logging thread, so diagnostic log backpressure drops output without blocking
+request workers. Requests and replies do not embed diagnostic payloads.
+
 Redis commandstats and execution time are owned by the coordinating worker and
 snapshotted through `SubmitTo`. Static command/subcommand identities bound the
 per-command counters. Global errorstats uses a separate fixed RESP-prefix

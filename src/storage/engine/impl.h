@@ -15,10 +15,10 @@
  */
 
 #pragma once
-
 #include <fcntl.h>
 #include <linux/fs.h>
 
+#include "lavik/latency_diagnostics.h"
 #include "lavik/storage/engine.h"
 #ifdef BLOCK_SIZE
 #undef BLOCK_SIZE
@@ -2238,7 +2238,16 @@ class StorageEngine::Impl {
     // Serializes this store's index, active append block, staging state, and
     // block accounting. Release it across block allocation and long I/O;
     // callers that do so must revalidate any state observed before the wait.
-    AsyncMutex store_state_mutex_;
+    // Preserve AsyncMutex's owner-local unlock/guard contract while counting
+    // only acquisitions that actually suspend, for every storage caller.
+    class StoreStateMutex : public AsyncMutex {
+     public:
+      auto Lock() noexcept {
+        return LatencyWaitAwaiter(AsyncMutex::Lock(),
+                                  LatencyResource::kStoreLock);
+      }
+    };
+    StoreStateMutex store_state_mutex_;
     // Owner-local completion hint. A wake never proves durability: waiters
     // recheck their block/epoch/byte boundary under store_state_mutex_.
     AsyncNotification durability_progress_;
@@ -4348,12 +4357,8 @@ class StorageEngine::Impl {
       bool capture_fullsync = true, TxUndoLog* replacement_undo = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
       GroupMutationWrite* grouped = nullptr,
-      const InlineRecordPayload* inline_payload = nullptr
-#if LAVIK_ENABLE_TRACE
-      ,
-      SetLatencyTrace* trace = nullptr
-#endif
-  );
+      const InlineRecordPayload* inline_payload = nullptr,
+      SetLatencyTrace* trace = nullptr);
 
   Task<absl::Status> CaptureRdbSnapshotBeforeWriteLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -4667,12 +4672,8 @@ class StorageEngine::Impl {
   Task<absl::Status> WriteRecordLocked(
       WorkerStore& store, const RecordWriteRequest& request,
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
-      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr
-#if LAVIK_ENABLE_TRACE
-      ,
-      SetLatencyTrace* trace = nullptr
-#endif
-  );
+      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
+      SetLatencyTrace* trace = nullptr);
 
   Task<absl::StatusOr<IndirectKeyHandle>> EnsureIndirectKey(
       WorkerStore& store, std::string_view key, const Digest& digest,

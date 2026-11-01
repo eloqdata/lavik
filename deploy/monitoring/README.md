@@ -387,3 +387,34 @@ The existing alert framework and rules are documented above. Request Health adds
 no command-error alert rules. Future rules must choose their error scope,
 minimum traffic and sustained window explicitly, and distinguish missing
 telemetry from a healthy zero.
+
+## Online latency diagnostics
+
+Open **Lavik Latency Breakdown** from the overview dashboard link. It includes
+ready queue and socket-write gauges, actual resource suspension rates/current
+waiters, full dispatch latency, runtime diagnostic status, sample/filter/drop
+rates and slow-subset stage histograms. The dashboard labels boundaries and
+stage overlap explicitly. See the [runtime controls and contracts](../../docs/operations/metrics.md#online-latency-diagnostics).
+
+Individual JSON records are optional. To collect the normal rotating Lavik log
+with the bundled Alloy/Loki profile, select the actual host log directory:
+
+```bash
+LAVIK_LOG_DIR=/absolute/path/to/lavik/logs docker compose --profile diagnostics-logs up -d
+```
+
+The additional **Lavik Slow Command Traces** dashboard uses the `lavik-loki`
+datasource and supports command/trace-ID filters and expandable log details.
+It shows JSON stage offsets/durations rather than an automatic waterfall.
+Alloy forwards only `command_latency_trace` messages, strips the logger prefix,
+and keeps trace IDs in the JSON body. The example labels one mounted node as
+`service_name="lavik-diagnostics"`; configure a bounded node identity when
+extending this to multiple nodes. Log times are collection times. Loki uses
+local filesystem storage with seven-day retention; its API is internal to the
+Compose network. The profile adds no logging dependency to the Lavik server.
+
+Enable collection through Redis CONFIG, then inspect both recent history and
+logs. The output cap can omit records from Loki while histograms/history still
+include them. Stopping diagnostics stops new measurement but keeps retained
+records for inspection. The log dashboard requires this optional profile; the
+metrics dashboard works without it.

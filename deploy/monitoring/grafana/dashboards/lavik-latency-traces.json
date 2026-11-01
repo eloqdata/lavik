@@ -1,0 +1,115 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "liveNow": false,
+  "schemaVersion": 41,
+  "timezone": "browser",
+  "uid": "lavik-latency-traces",
+  "title": "Lavik Slow Command Traces",
+  "tags": ["lavik", "latency"],
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "command",
+        "label": "Command",
+        "type": "custom",
+        "query": "GET,SET",
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "trace_id",
+        "label": "Trace ID (regex)",
+        "type": "textbox",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Latency metrics",
+      "url": "/d/lavik-latency-breakdown"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Slow command detail",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Requires the optional `diagnostics-logs` Compose profile (Loki + Alloy). Expand a log entry to inspect JSON fields and stage offsets/durations. `trace_id` stays a JSON field, never a Loki stream label or Prometheus label. This view shows structured logs; it does not synthesize a waterfall from the stage array. Logs are separately rate limited to 20 entries/s/worker; retained history and histograms are independent. CLI: `LATENCY TRACE GET 20`, `LATENCY TRACE SHOW <id>`."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Selected slow GET/SET traces",
+      "type": "logs",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 22
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lavik-loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\"",
+          "queryType": "range",
+          "maxLines": 200
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    }
+  ]
+}

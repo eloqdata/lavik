@@ -562,6 +562,7 @@ bool RegisteredBufferPool::AcquireReadAwaiter::await_suspend(
     std::coroutine_handle<> awaiting) {
   if (await_ready()) return false;
   awaiting_ = awaiting;
+  wait_.Begin(LatencyResource::kReadBuffer);
   pool_->read_waiters_.push_back(this);
   return true;
 }
@@ -572,12 +573,14 @@ bool RegisteredBufferPool::AcquireReadAwaiter::SuspendWith(
   continuation_ = &continuation;
   continuation.origin_ = pool_->owner_worker_;
   continuation.reply_deferred_ = true;
+  wait_.Begin(LatencyResource::kReadBuffer);
   pool_->read_waiters_.push_back(this);
   return true;
 }
 
 absl::StatusOr<ReadBufferLease>
 RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
+  wait_.End();
   if (pool_ == nullptr || !pool_->initialized())
     return absl::FailedPreconditionError("read arena is not initialized");
   if (!assigned_.valid()) await_ready();
@@ -674,12 +677,14 @@ bool RegisteredBufferPool::AcquireWriteAwaiter::await_suspend(
     std::coroutine_handle<> awaiting) {
   if (await_ready()) return false;
   awaiting_ = awaiting;
+  wait_.Begin(LatencyResource::kWriteBuffer);
   pool_->write_waiters_.push_back(this);
   return true;
 }
 
 absl::StatusOr<std::uint16_t>
 RegisteredBufferPool::AcquireWriteAwaiter::await_resume() {
+  wait_.End();
   if (pool_->write_acquisition_failed_) {
     if (assigned_buffer_id_ != 0)
       pool_->ReleaseWriteBuffer(std::exchange(assigned_buffer_id_, 0));

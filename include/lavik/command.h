@@ -44,6 +44,7 @@
 namespace lavik {
 
 class BlockingWakeCascade;
+struct OnlineLatencyTrace;
 class CapturedPubSubPublication;
 
 namespace cluster {
@@ -385,6 +386,7 @@ enum class CommandKind {
   kLastSave,
   kMonitor,
   kSlowLog,
+  kLatency,
   kTombRaider,
   kDefrag,
   kUnknown,
@@ -399,6 +401,7 @@ struct CommandSpec;
 // extending the coroutine allocation contract and measuring its cost on
 // ordinary commands.
 struct alignas(std::max_align_t) CommandRequest {
+  OnlineLatencyTrace* latency_trace_ = nullptr;
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
   // Reply protocol for every nested/cross-core execution path. Replication
@@ -495,6 +498,7 @@ struct alignas(std::max_align_t) CommandRequest {
   // can start with an empty handle instead of copying arguments they replace.
   [[nodiscard]] CommandRequest WithArgs(CommandArgsHandle args) const {
     return CommandRequest{
+        .latency_trace_ = latency_trace_,
         .kind_ = kind_,
         .db_id_ = db_id_,
         .resp_version_ = resp_version_,
@@ -567,8 +571,8 @@ struct CommandReply {
   std::unique_ptr<ReplyContinuation> continuation_;
   bool close_connection_ = false;
   bool start_monitoring_ = false;
-  ReadLatencyTrace read_trace_;
-  SetLatencyTrace set_trace_;
+  LegacyReadLatencyTrace read_trace_;
+  LegacySetLatencyTrace set_trace_;
   std::optional<std::uint8_t> selected_db_;
 };
 

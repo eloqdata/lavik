@@ -147,7 +147,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     const MutationPrecondition* mutation_precondition, bool acquire_key_lock) {
   assert(db_id < kLogicalDatabaseCount);
   if (acquire_key_lock && trace != nullptr) {
-    trace->key_lock_start_ns_ = SetTraceNowNanos();
+    trace->key_lock_start_ns_ = trace->NowNanos();
   }
   // Routing already computed this slot from the same immutable key. Reuse it
   // for both transaction admission and partition selection; internal callers
@@ -165,13 +165,13 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
                                          tx::LockMode::kExclusive, slot)
                                    : tx::TxShard::Guard{};
   if (acquire_key_lock && trace != nullptr) {
-    trace->key_lock_acquired_ns_ = SetTraceNowNanos();
+    trace->key_lock_acquired_ns_ = trace->NowNanos();
   }
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, slot);
-  if (trace != nullptr) trace->store_lock_start_ns_ = SetTraceNowNanos();
+  if (trace != nullptr) trace->store_lock_start_ns_ = trace->NowNanos();
   co_await store.store_state_mutex_.Lock();
-  if (trace != nullptr) trace->store_lock_acquired_ns_ = SetTraceNowNanos();
+  if (trace != nullptr) trace->store_lock_acquired_ns_ = trace->NowNanos();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
   RecordIndex::Entry* found = nullptr;
@@ -200,7 +200,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   if (exists && found->value_.has_expiry() && IsExpiredNow(*found)) {
     exists = false;
   }
-  if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
+  if (trace != nullptr) trace->lookup_done_ns_ = trace->NowNanos();
   SetResult result;
   if (options.return_old_value_ && exists) {
     if (found->value_.value_type() != ValueType::kString) {
@@ -235,21 +235,17 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     replication->args_.emplace_back("PXAT");
     replication->args_.emplace_back(std::to_string(expire_at_ms));
   }
-  if (trace != nullptr) trace->append_start_ns_ = SetTraceNowNanos();
+  if (trace != nullptr) trace->append_start_ns_ = trace->NowNanos();
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
       std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, replication,
-      true, nullptr, mutation_precondition
-#if LAVIK_ENABLE_TRACE
-      ,
-      /*grouped=*/nullptr, /*inline_payload=*/nullptr, trace
-#endif
-  );
-  if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
+      true, nullptr, mutation_precondition,
+      /*grouped=*/nullptr, /*inline_payload=*/nullptr, trace);
+  if (trace != nullptr) trace->append_done_ns_ = trace->NowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
-  if (trace != nullptr) trace->replication_done_ns_ = SetTraceNowNanos();
+  if (trace != nullptr) trace->replication_done_ns_ = trace->NowNanos();
   co_return result;
 }
 
@@ -632,7 +628,9 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
           co_await GroupedDependencyTestWaiter(
               CurrentStore().durability_progress_, predecessor->txid_);
 #else
-          co_await CurrentStore().durability_progress_.Wait();
+          co_await LatencyWaitAwaiter(
+              CurrentStore().durability_progress_.Wait(),
+              LatencyResource::kDurability);
 #endif
         } else {
           const auto waited = co_await bycorf::SleepFor(
@@ -2090,12 +2088,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
     bool capture_fullsync, TxUndoLog* replacement_undo,
     const MutationPrecondition* mutation_precondition,
-    GroupMutationWrite* grouped, const InlineRecordPayload* inline_payload
-#if LAVIK_ENABLE_TRACE
-    ,
-    SetLatencyTrace* trace
-#endif
-) {
+    GroupMutationWrite* grouped, const InlineRecordPayload* inline_payload,
+    SetLatencyTrace* trace) {
   if (RuntimeFailureLatched()) {
     co_return absl::FailedPreconditionError(
         "storage writer is stopped after an IO failure");
@@ -2239,12 +2233,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .mark_watched_ = true,
     };
     status = co_await WriteRecordLocked(store, record_write, *extents,
-                                        std::move(commit_retirements)
-#if LAVIK_ENABLE_TRACE
-                                            ,
-                                        trace
-#endif
-    );
+                                        std::move(commit_retirements), trace);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -2271,12 +2260,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .mark_watched_ = true,
     };
     status = co_await WriteRecordLocked(store, record_write, nullptr,
-                                        std::move(commit_retirements)
-#if LAVIK_ENABLE_TRACE
-                                            ,
-                                        trace
-#endif
-    );
+                                        std::move(commit_retirements), trace);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -2762,12 +2746,8 @@ bool StorageEngine::Impl::ValidGroupedWrite(const RecordWriteRequest& request,
 Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, const RecordWriteRequest& request,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
-    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements
-#if LAVIK_ENABLE_TRACE
-    ,
-    SetLatencyTrace* trace
-#endif
-) {
+    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
+    SetLatencyTrace* trace) {
   // Direct FIFO handoff does not wake the remaining writers to yield a new
   // active buffer. A writer ahead of them must make its staging slot returnable
   // on every exit, including stale-relocation/validation failures after an
@@ -3005,9 +2985,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     return fits() && active_stream()->write_buffer_id_ != 0;
   };
 acquire_active_stream:
-#if LAVIK_ENABLE_TRACE
-  if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
-#endif
+  if (trace != nullptr) trace->block_wait_start_ns_ = trace->NowNanos();
   while (!append_ready()) {
     // The gate elects one normal writer per stream. Maintenance can bypass it
     // to unblock physical allocation; recheck identity after every wait.
@@ -3033,7 +3011,10 @@ acquire_active_stream:
         // Yielding closes appends before flushing. The old slot may still be
         // in I/O or pinned by a reader; never bind a replacement over it.
         store.store_state_mutex_.Unlock(*store.worker_);
-        co_await store.durability_progress_.Wait();
+        if (trace) trace->durability_start_ns_ = trace->NowNanos();
+        co_await LatencyWaitAwaiter(store.durability_progress_.Wait(),
+                                    LatencyResource::kDurability);
+        if (trace) trace->durability_done_ns_ = trace->NowNanos();
         co_await store.store_state_mutex_.Lock();
         continue;
       }
@@ -3091,13 +3072,9 @@ acquire_active_stream:
         store.standby_block_.has_value()) {
       allocated = *store.standby_block_;
       store.standby_block_.reset();
-#if LAVIK_ENABLE_TRACE
       if (trace != nullptr) trace->standby_block_ = true;
-#endif
     } else {
-#if LAVIK_ENABLE_TRACE
       if (trace != nullptr) trace->allocated_block_ = true;
-#endif
       allocated = co_await AcquireWriteBlock(
           store, request.for_defrag_, request.unlock_writer_while_waiting_);
     }
@@ -3176,9 +3153,7 @@ acquire_active_stream:
       }
     }
   }
-#if LAVIK_ENABLE_TRACE
-  if (trace != nullptr) trace->block_ready_ns_ = SetTraceNowNanos();
-#endif
+  if (trace != nullptr) trace->block_ready_ns_ = trace->NowNanos();
 
   // Block allocation may have released the store-state lock. A client write
   // can replace this key, or FLUSHDB/replica reset can replace its index,
@@ -3665,9 +3640,7 @@ acquire_active_stream:
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
   }
-#if LAVIK_ENABLE_TRACE
-  if (trace != nullptr) trace->encode_done_ns_ = SetTraceNowNanos();
-#endif
+  if (trace != nullptr) trace->encode_done_ns_ = trace->NowNanos();
 
   // No suspension separates append validation from publication. The buffer
   // remains attached until its full dirty tail and outstanding readers drain.
@@ -4034,9 +4007,7 @@ acquire_active_stream:
   if (request.written_location_ != nullptr) {
     *request.written_location_ = location;
   }
-#if LAVIK_ENABLE_TRACE
-  if (trace != nullptr) trace->index_done_ns_ = SetTraceNowNanos();
-#endif
+  if (trace != nullptr) trace->index_done_ns_ = trace->NowNanos();
   grouped_root_guard.completed_ = true;
   co_return absl::OkStatus();
 }

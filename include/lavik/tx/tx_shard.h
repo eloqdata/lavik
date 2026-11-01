@@ -15,7 +15,6 @@
  */
 
 #pragma once
-
 #include <array>
 #include <atomic>
 #include <cassert>
@@ -29,6 +28,7 @@
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "bycorf/runtime/sync.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/intent_lock.h"
 #include "lavik/tx/tx_queue.h"
@@ -126,6 +126,7 @@ class TxShard {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
+      wait_.Begin(LatencyResource::kKeyLock);
       waiter_.txid_ = shard_->AllocateTxid();
       waiter_.keys_ = keys_;
       waiter_.resume_ = handle;
@@ -133,6 +134,7 @@ class TxShard {
     }
 
     Guard await_resume() noexcept {
+      wait_.End();
       owns_intents_ = false;
       return Guard(shard_, keys_);
     }
@@ -142,6 +144,7 @@ class TxShard {
     KeyRef inline_key_{};
     std::span<const KeyRef> keys_;
     TxWaiter waiter_;
+    LatencyWait wait_;
     bool granted_ = false;
     bool owns_intents_ = false;
   };

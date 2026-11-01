@@ -574,6 +574,72 @@ class CommandResultsE2eTest : public ::testing::Test {
   std::unique_ptr<RespClient> client_;
 };
 
+TEST_F(CommandResultsE2eTest, OnlineTraceSamplingRetentionAndMetrics) {
+  auto config = [&](std::string_view key, std::string_view value) {
+    EXPECT_EQ(client_->Command({"CONFIG", "SET", key, value}), "+OK");
+  };
+  config("LATENCY-DIAGNOSTICS-SAMPLE-EVERY", "1");
+  config("latency-diagnostics-slow-threshold-us", "0");
+  config("latency-diagnostics-enabled", "yes");
+  for (unsigned i = 0; i < 200; ++i)
+    ASSERT_EQ(client_->Command({"GET", "missing-private-key"}), "$-1");
+  config("latency-diagnostics-enabled", "no");
+  const auto history = client_->RawCommand({"LATENCY", "TRACE", "GET", "1024"});
+  EXPECT_TRUE(history.starts_with("*128\r\n")) << history.substr(0, 80);
+  EXPECT_EQ(history.find("missing-private-key"), std::string::npos);
+  const auto metrics = HttpGet(metrics_port_, "/metrics");
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "lavik_latency_diagnostics_samples_total{result=\"selected\"}"),
+            200);
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "lavik_latency_diagnostics_samples_total{result=\"retained\"}"),
+            200);
+  EXPECT_EQ(
+      MetricValue(
+          metrics,
+          "lavik_latency_diagnostics_samples_total{result=\"overwritten\"}"),
+      72);
+  EXPECT_GT(
+      MetricValue(
+          metrics,
+          "lavik_latency_diagnostics_samples_total{result=\"log_dropped\"}"),
+      0);
+  EXPECT_EQ(MetricValue(metrics,
+                        "lavik_latency_diagnostics_stage_seconds_count{command="
+                        "\"GET\",stage=\"server_total\"}"),
+            200);
+  EXPECT_EQ(MetricValue(metrics,
+                        "lavik_latency_diagnostics_stage_seconds_count{command="
+                        "\"GET\",stage=\"read_io\"}"),
+            0);
+  EXPECT_EQ(MetricValue(metrics, "lavik_latency_diagnostics_inflight"), 0);
+  EXPECT_EQ(MetricValue(metrics, "lavik_request_queue_length"), 0);
+  EXPECT_EQ(MetricValue(metrics, "lavik_response_writes_inflight"), 0);
+  config("latency-diagnostics-sample-every", "64");
+  config("latency-diagnostics-enabled", "yes");
+  for (unsigned i = 0; i < 4096; ++i)
+    ASSERT_EQ(client_->Command({"GET", "missing-private-key"}), "$-1");
+  config("latency-diagnostics-enabled", "no");
+  const auto sampled =
+      MetricValue(
+          HttpGet(metrics_port_, "/metrics"),
+          "lavik_latency_diagnostics_samples_total{result=\"selected\"}") -
+      200;
+  EXPECT_GT(sampled, 0);
+  EXPECT_LT(sampled, 160);
+  EXPECT_EQ(client_->Command({"LATENCY", "TRACE", "SHOW", "0"}).substr(0, 4),
+            "-ERR");
+  EXPECT_EQ(client_->Command({"LATENCY", "TRACE", "GET", "1025"}).substr(0, 4),
+            "-ERR");
+  EXPECT_EQ(client_
+                ->Command({"CONFIG", "SET",
+                           "latency-diagnostics-duration-seconds", "0"})
+                .substr(0, 4),
+            "-ERR");
+}
+
 TEST_F(CommandResultsE2eTest, QueuedCommandsDoNotCountAsExecutions) {
   EXPECT_EQ(client_->Command({"MULTI"}), "+OK");
   EXPECT_EQ(client_->Command({"SET", "queued-key", "value"}), "+QUEUED");
@@ -1761,6 +1827,68 @@ TEST(MetricsE2eTest, ConfigResetstatClearsCommandCountersOnly) {
   EXPECT_EQ(first.Command({"CONFIG", "RESETSTAT"}), "+OK");
   const std::string stats = first.Command({"INFO", "stats"});
   EXPECT_NE(stats.find("total_commands_processed:1\r\n"), std::string::npos);
+  server.Stop();
+}
+
+TEST(MetricsE2eTest, OnlineLatencyTraceLifecycleAndThreshold) {
+  const std::string prefix = lavik::test::TestDataPath(
+      "lavik-latency-e2e-" + std::to_string(::getpid()));
+  FileCleanup data_cleanup(prefix + ".data");
+  FileCleanup log_cleanup(prefix + ".log");
+  const int fd = ::open((prefix + ".data").c_str(),
+                        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ::close(fd);
+  const auto port = FindFreePort();
+  auto metrics_port = FindFreePort();
+  while (metrics_port == port) metrics_port = FindFreePort();
+  ServerProcess server(g_lavik_binary, port, metrics_port, prefix + ".data",
+                       prefix + ".log");
+  RespClient client(port);
+  EXPECT_EQ(client.Command({"LATENCY", "TRACE", "GET"}), "*0");
+  EXPECT_EQ(
+      client.Command({"CONFIG", "SET", "latency-diagnostics-sample-every", "0"})
+          .substr(0, 4),
+      "-ERR");
+  EXPECT_EQ(client.Command(
+                {"CONFIG", "SET", "latency-diagnostics-sample-every", "1"}),
+            "+OK");
+  EXPECT_EQ(client.Command(
+                {"CONFIG", "SET", "latency-diagnostics-duration-seconds", "1"}),
+            "+OK");
+  EXPECT_EQ(client.Command({"CONFIG", "SET",
+                            "latency-diagnostics-slow-threshold-us", "0"}),
+            "+OK");
+  EXPECT_EQ(
+      client.Command({"CONFIG", "SET", "latency-diagnostics-enabled", "yes"}),
+      "+OK");
+  EXPECT_EQ(
+      client.Command({"SET", "private-latency-key", "private-latency-value"}),
+      "+OK");
+  EXPECT_EQ(client.Command({"GET", "private-latency-key"}),
+            "$21\r\nprivate-latency-value");
+  const auto traces = client.RawCommand({"LATENCY", "TRACE", "GET", "20"});
+  EXPECT_NE(traces.find("command_latency_trace"), std::string::npos) << traces;
+  EXPECT_NE(traces.find("server_total"), std::string::npos) << traces;
+  EXPECT_NE(traces.find("socket_send"), std::string::npos) << traces;
+  EXPECT_NE(traces.find("key_lock"), std::string::npos) << traces;
+  EXPECT_EQ(traces.find("private-latency"), std::string::npos) << traces;
+  EXPECT_EQ(client.Command({"LATENCY", "TRACE", "RESET"}), "+OK");
+  EXPECT_EQ(client.Command({"LATENCY", "TRACE", "GET"}), "*0");
+  EXPECT_EQ(
+      client.Command({"CONFIG", "SET", "latency-diagnostics-slow-threshold-us",
+                      "1000000000"}),
+      "+OK");
+  EXPECT_EQ(client.Command({"GET", "missing"}), "$-1");
+  EXPECT_EQ(client.Command({"LATENCY", "TRACE", "GET"}), "*0");
+  std::this_thread::sleep_for(1100ms);
+  const auto config =
+      client.RawCommand({"CONFIG", "GET", "latency-diagnostics-enabled"});
+  EXPECT_NE(config.find("$2\r\nno\r\n"), std::string::npos) << config;
+  EXPECT_EQ(
+      client.Command({"CONFIG", "SET", "latency-diagnostics-enabled", "no"}),
+      "+OK");
   server.Stop();
 }
 

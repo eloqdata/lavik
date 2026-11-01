@@ -1816,17 +1816,13 @@ class StorageEngine {
   // type selects the expected compact encoding. metadata_only returns length
   // and expiry from the index with an empty payload and no buffer/block pin.
   // Never use this for reads inside EXEC/Lua or a multi-key transaction.
-  // Trace builds optionally borrow caller-owned timing state through
-  // completion.
+  // A selected online diagnostic or legacy trace build may borrow caller-owned
+  // timing state through completion.
   RemoteReadAwaitable TryRemoteRead(std::uint8_t db_id, std::string_view key,
                                     std::uint16_t slot,
                                     ValueType type = ValueType::kString,
-                                    bool metadata_only = false
-#if LAVIK_ENABLE_TRACE
-                                    ,
-                                    ReadLatencyTrace* trace = nullptr
-#endif
-  );
+                                    bool metadata_only = false,
+                                    ReadLatencyTrace* trace = nullptr);
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
@@ -2213,12 +2209,8 @@ class StorageEngine::RemoteReadAwaitable {
   };
 
   RemoteReadAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
-                      std::uint16_t slot, ValueType type, bool metadata_only
-#if LAVIK_ENABLE_TRACE
-                      ,
-                      ReadLatencyTrace* trace
-#endif
-  );
+                      std::uint16_t slot, ValueType type, bool metadata_only,
+                      ReadLatencyTrace* trace);
   bool Current(const Impl& engine) const noexcept;
 
   Result ready_;
@@ -2237,9 +2229,8 @@ class StorageEngine::RemoteReadAwaitable {
   // including when an admitted awaitable is destroyed without being awaited.
   Pin pin_;
   ReadBufferLease lease_;
-#if LAVIK_ENABLE_TRACE
   // Timestamp the actual CQE before the connection is scheduled again. This
-  // trace-only completion leaves the production I/O awaitable and frame intact.
+  // completion keeps CQE time separate from subsequent coroutine scheduling.
   class TracedReadIo : public bycorf::OneShotIoAwaitable {
    public:
     TracedReadIo(bycorf::Worker& worker, bycorf::FixedFile file,
@@ -2260,9 +2251,6 @@ class StorageEngine::RemoteReadAwaitable {
   };
   ReadLatencyTrace* trace_;
   std::optional<TracedReadIo> io_;
-#else
-  std::optional<bycorf::SizeIoAwaitable> io_;
-#endif
 };
 
 }  // namespace lavik::storage

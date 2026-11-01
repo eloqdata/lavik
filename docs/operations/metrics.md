@@ -392,6 +392,103 @@ input errors use only the instance filter. `ERR` does not distinguish client
 mistakes from service faults, so this model does not expose a service-fault
 ratio. Existing QPS and latency panels retain the legacy dispatch boundary.
 
+## Online latency diagnostics
+
+The **Lavik Latency Breakdown** dashboard keeps always-on pressure signals
+separate from conditional GET/SET diagnostics. The existing command histogram
+and SLOWLOG retain their existing boundaries and configuration.
+
+| Signal | Semantics |
+|---|---|
+| `lavik_request_queue_length` | Complete parsed commands still in a connection's ready batch; excludes time queued inside MULTI. |
+| `lavik_response_writes_inflight` | Ordinary Redis reply writes awaiting completion; a pipeline batch counts as one write. Excludes replication and metrics HTTP. |
+| `lavik_wait_events_total{resource}` / `lavik_waiters{resource}` | Actual suspensions and current waiters for `key_lock`, `store_lock`, `read_buffer`, `write_buffer`, and `durability`. Counts include storage maintenance; they are not per-command counts. Fast acquisitions read no clock and add no event. |
+| `lavik_latency_diagnostics_stage_seconds{command,stage}` | Histogram of stages actually observed in selected GET/SET commands whose server-total duration reaches the threshold. Missing stages do not contribute synthetic zero samples. |
+| `lavik_latency_diagnostics_samples_total{result}` | `eligible`, `selected`, `pool_dropped`, `filtered`, `retained`, `overwritten`, `cancelled`, and `log_dropped`. `eligible` counts GET/SET names seen while enabled before session/arity validation; unsupported contexts are cancelled. These counters are cumulative and have different meanings, not disjoint command outcomes. |
+
+Resource coverage is TxShard key-set acquisitions, the storage-state mutex,
+read/write buffer awaiters, and storage durability-progress waits. Transaction
+coordination has additional admission/ordering queues; existing storage and
+transaction diagnostics remain useful alongside these signals. Queue and waiter
+snapshots are instantaneous and short spikes may fall between scrapes.
+
+Collection is disabled after every restart and needs no trace-specific binary.
+Use one `CONFIG SET` per setting:
+
+```text
+CONFIG SET latency-diagnostics-duration-seconds 120
+CONFIG SET latency-diagnostics-sample-every 64
+CONFIG SET latency-diagnostics-slow-threshold-us 10000
+CONFIG SET latency-diagnostics-enabled yes
+CONFIG GET latency-diagnostics-*
+LATENCY TRACE GET 20
+LATENCY TRACE SHOW 65536
+CONFIG SET latency-diagnostics-enabled no
+LATENCY TRACE RESET
+```
+
+`latency-diagnostics-duration-seconds` defaults to 300 (range 1–3600).
+`latency-diagnostics-sample-every` defaults to 64 (range 1–1000000), meaning
+independent pseudorandom selection probability 1/N, not Hz. Set N=1 to select
+all eligible commands. `latency-diagnostics-slow-threshold-us` defaults to
+10000 (range 0–3600000000); zero retains every completed selected command.
+`latency-diagnostics-enabled` accepts yes/no. Enabling again restarts the time
+window using the current duration; editing duration alone does not extend an
+active window. Sampling and threshold changes apply to newly selected commands.
+Settings are runtime-only and are not persisted by CONFIG REWRITE. They are
+independent of SLOWLOG and the legacy compile-time aggregate trace.
+
+The deadline stops new selection automatically, including on an otherwise idle
+server. In-flight samples finish with their captured configuration. Above-threshold
+samples update the diagnostic histograms and recent history; below-threshold
+samples update only filtering counters. The threshold reduces retention/output
+cost, not the cost of measuring selected commands. Histograms describe the slow
+sampled subset, **not the full request population**.
+
+Each data worker has 256 trace contexts and retains its latest 128 slow traces.
+There is no hidden per-second acquisition cap: pool exhaustion increments
+`pool_dropped`, even at N=1. Connection cancellation releases its leases and
+increments `cancelled`. History overwrites increment `overwritten`. GET defaults
+to 10 records and accepts 0–1024; SHOW returns at most one record. These Lavik
+extensions return arrays of JSON bulk strings; RESET clears only recent history,
+not cumulative counters/histograms, and does not quiesce in-flight samples.
+Trace IDs are process-local and must not be used as metric or Loki stream labels.
+
+`server_total` runs from ready-queue insertion through server socket write
+completion, not client RTT. `dispatch` includes admission, execution and awaited
+worker hops. `route_to_owner` measures dispatch to storage-owner entry and can
+include admission; `route_back` includes owner completion to origin dispatch
+completion. Direct remote GET I/O runs on the connection worker and has no
+synthetic routing span. GET key-lock timing exists only when optimistic reading
+requires a lock. `append_capacity` contains block/buffer acquisition and related
+flush waits; `append` is its overlapping parent. `durability_wait` records a SET
+waiting for a previously yielded staging slot, not a promise that every SET
+waits for fsync. Background flush I/O is not assigned to individual SETs.
+`read_io` includes I/O completion and, on ordinary reads, scheduling until the
+awaiting coroutine resumes. `response_queue` ends when the socket write starts;
+commands in a pipeline share the same batch send span. Never add stage p99s or
+sum overlapping parent/child spans to infer total latency.
+
+Within a worker segment, sampled storage timings use TSC and the existing cached
+counter frequency. A new worker segment anchors TSC to steady_clock; worker hops
+use monotonic timestamps rather than subtracting raw counters from different
+cores. This does not calibrate inter-core TSC offsets. Timing is diagnostic,
+including host scheduling/preemption, not a CPU-time measurement.
+
+A background consumer writes `command_latency_trace` JSON messages through the
+normal rotating Lavik logger, without keys, values, client addresses or arguments.
+Per-worker SPSC queues hold 64 copies; output is capped separately at 20 records
+per second per worker. A full queue or output budget increments `log_dropped`
+without suppressing history or histogram updates. Workers never call the log
+sink for diagnostic records. Shutdown can discard queued output; recent history
+and counters are process memory, not durable storage.
+
+The optional [monitoring log profile](../../deploy/monitoring/README.md#online-latency-diagnostics)
+collects these messages with Alloy into Loki. **Lavik Slow Command Traces** shows
+expandable JSON records and filters by command/trace ID. It does not automatically
+render custom stage arrays as waterfalls. Ordinary metrics deployment continues
+to require only Prometheus/Grafana.
+
 ## Cluster control metrics
 
 Meta-managed Data nodes export process-level control health without node,

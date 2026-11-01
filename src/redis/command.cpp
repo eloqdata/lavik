@@ -69,6 +69,7 @@
 #include "lavik/fault_injection.h"
 #include "lavik/fault_pause.h"
 #include "lavik/glob.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/monitor.h"
@@ -825,6 +826,7 @@ bool LoadingAllowedCommand(const CommandRequest& request) {
     case CommandKind::kReadOnly:
     case CommandKind::kReadWrite:
     case CommandKind::kMonitor:
+    case CommandKind::kLatency:
     case CommandKind::kSlowLog:
     case CommandKind::kPublish:
     case CommandKind::kPubSub:
@@ -1255,6 +1257,33 @@ bool ParseSlowLogCount(std::string_view text, std::int64_t* value) {
   return error == std::errc{} && parsed_end == end;
 }
 
+Task<CommandReply> ExecuteLatency(const CommandRequest& request,
+                                  ReplyBuilder& builder) {
+  const auto& args = request.args_;
+  if (args.size() >= 3 && CmpCaseInsensitive(args[1], "TRACE")) {
+    if (args.size() == 3 && CmpCaseInsensitive(args[2], "RESET")) {
+      co_await ResetLatencyTraces();
+      co_return BuiltReply(builder.AppendSimpleString("OK"));
+    }
+    if (args.size() <= 4 && (CmpCaseInsensitive(args[2], "GET") ||
+                             CmpCaseInsensitive(args[2], "SHOW"))) {
+      std::uint64_t count = 10, id = 0;
+      const bool show = CmpCaseInsensitive(args[2], "SHOW");
+      if ((show && args.size() != 4) ||
+          (args.size() == 4 && !ParseUint64(args[3], show ? &id : &count)) ||
+          count > 1024 || (show && id == 0))
+        co_return BuiltReply(
+            builder.AppendError("ERR invalid trace count or ID"));
+      const auto entries = co_await GetLatencyTraces(show ? 1 : count, id);
+      builder.AppendArrayHeader(entries.size());
+      for (const auto& entry : entries) builder.AppendBulkString(entry);
+      co_return BuiltReply(builder.View());
+    }
+  }
+  co_return BuiltReply(builder.AppendError(
+      "ERR use LATENCY TRACE GET [count], SHOW id, or RESET"));
+}
+
 Task<CommandReply> ExecuteSlowLog(const CommandRequest& request,
                                   ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
@@ -1401,6 +1430,10 @@ enum class RuntimeConfigKey : std::uint8_t {
   kBackgroundWarrant,
   kSpdkMaxCompletions,
   kStreamNodeMaxEntries,
+  kLatencyEnabled,
+  kLatencyDuration,
+  kLatencySample,
+  kLatencyThreshold,
   kSlowLogThreshold,
   kSlowLogMaxLen,
   kLuaTimeLimit,
@@ -1416,6 +1449,14 @@ struct RuntimeConfigDescriptor {
 // CONFIG command metadata only. Execution paths never consult this table;
 // each subsystem reads its owning runtime state directly.
 constexpr std::array kRuntimeConfigs{
+    RuntimeConfigDescriptor{"latency-diagnostics-enabled",
+                            RuntimeConfigKey::kLatencyEnabled},
+    RuntimeConfigDescriptor{"latency-diagnostics-duration-seconds",
+                            RuntimeConfigKey::kLatencyDuration},
+    RuntimeConfigDescriptor{"latency-diagnostics-sample-every",
+                            RuntimeConfigKey::kLatencySample},
+    RuntimeConfigDescriptor{"latency-diagnostics-slow-threshold-us",
+                            RuntimeConfigKey::kLatencyThreshold},
     RuntimeConfigDescriptor{kSnapshotReadConcurrencyConfig,
                             RuntimeConfigKey::kSnapshotReadConcurrency},
     RuntimeConfigDescriptor{kSnapshotBatchSizeConfig,
@@ -1676,6 +1717,16 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
               bycorf::ThisWorker().self_->spdk_max_completions_per_poll());
         case RuntimeConfigKey::kStreamNodeMaxEntries:
           return std::to_string(StreamNodeMaxEntries());
+        case RuntimeConfigKey::kLatencyEnabled:
+          return LatencyDiagnosticsConfig("latency-diagnostics-enabled");
+        case RuntimeConfigKey::kLatencyDuration:
+          return LatencyDiagnosticsConfig(
+              "latency-diagnostics-duration-seconds");
+        case RuntimeConfigKey::kLatencySample:
+          return LatencyDiagnosticsConfig("latency-diagnostics-sample-every");
+        case RuntimeConfigKey::kLatencyThreshold:
+          return LatencyDiagnosticsConfig(
+              "latency-diagnostics-slow-threshold-us");
         case RuntimeConfigKey::kSlowLogThreshold:
           return std::to_string(SlowLogThresholdMicros());
         case RuntimeConfigKey::kSlowLogMaxLen:
@@ -1969,6 +2020,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       } else {
         configured = SetStreamNodeMaxEntries(value);
       }
+    } else if (config->name_.starts_with("latency-diagnostics-")) {
+      configured = ConfigureLatencyDiagnostics(config->name_, args[3]);
     } else if (config->key_ == RuntimeConfigKey::kSlowLogThreshold) {
       std::int64_t threshold = 0;
       if (!ParseSlowLogCount(args[3], &threshold) || threshold < -1) {
@@ -4397,6 +4450,27 @@ Task<CommandReply> ExecuteStorageCommand(
         error != nullptr) {
       co_return BuiltReply(reply_builder.AppendRejectedError(
           CommandErrorReason::kAuthority, error));
+    }
+  }
+  struct FinishOnlineOwner {
+    OnlineLatencyTrace* trace;
+    ~FinishOnlineOwner() {
+      if (!trace) return;
+      if (trace->is_set_)
+        trace->set_.owner_done_ns_ = LatencyMonotonicNanos();
+      else
+        trace->read_.owner_done_ns_ = LatencyMonotonicNanos();
+    }
+  } finish_online{request.latency_trace_};
+  if (auto* online = request.latency_trace_) {
+    if (online->is_set_) {
+      set_trace = &online->set_;
+      set_trace->remote_ = ThisWorker().id_ != online->origin_;
+      set_trace->owner_start_ns_ = LatencyMonotonicNanos();
+    } else {
+      read_trace = &online->read_;
+      read_trace->remote_ = ThisWorker().id_ != online->origin_;
+      read_trace->owner_start_ns_ = LatencyMonotonicNanos();
     }
   }
   CommandReply reply;
@@ -13371,6 +13445,9 @@ Task<CommandReply> ExecuteCommandBody(
     case CommandKind::kConfig:
       co_return co_await ExecuteConfig(request, reply_builder);
 
+    case CommandKind::kLatency:
+      co_return co_await ExecuteLatency(request, reply_builder);
+
     case CommandKind::kSlowLog:
       co_return co_await ExecuteSlowLog(request, reply_builder);
 
@@ -13633,6 +13710,10 @@ Task<CommandReply> ExecuteCommandBody(
 #if LAVIK_ENABLE_TRACE
           trace.owner_start_ns_ = trace.request_start_ns_;
 #endif
+          if (request.latency_trace_) {
+            auto& v = request.latency_trace_->read_;
+            v.owner_start_ns_ = LatencyMonotonicNanos();
+          }
           auto fast = co_await g_storage->TryRemoteRead(
               request.db_id_, args[key_arg], slot,
               request.spec_->remote_read_type_,
@@ -13640,9 +13721,16 @@ Task<CommandReply> ExecuteCommandBody(
 #if LAVIK_ENABLE_TRACE
               ,
               &trace
+#else
+              ,
+              request.latency_trace_ ? &request.latency_trace_->read_ : nullptr
 #endif
           );
           if (fast) {
+            if (request.latency_trace_) {
+              auto& v = request.latency_trace_->read_;
+              v.owner_done_ns_ = LatencyMonotonicNanos();
+            }
             CommandReply reply;
             if (const char* error = CommandServingGenerationError(request);
                 error)

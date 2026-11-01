@@ -355,7 +355,7 @@ cleanup as another durable phase.
 | Keyspace export | RedisShake SyncReader consumes full RDB and incremental PSYNC from one currently authorized Primary, with shared backlog backpressure and bounded temporary disk staging; ScanReader provides one-shot export through ordinary authenticated scan/read commands, including Cluster discovery |
 | Local storage | Existing files, raw block devices, or `spdk://` namespaces supplied through repeated `--data-file` options |
 | RDB files | Startup import and Redis-compatible `SAVE`/`BGSAVE` output through filesystem paths |
-| Prometheus/Grafana/Alertmanager | Plaintext HTTP `/metrics`; optional Compose deployment evaluates user-owned rules and routes alerts through an optional local or external Alertmanager. Deployment labels distinguish standalone from Meta-managed targets; monitoring never grants authority. |
+| Prometheus/Grafana/Alertmanager | Plaintext HTTP `/metrics`; optional Compose deployment evaluates user-owned rules and routes alerts through an optional local or external Alertmanager. Deployment labels distinguish standalone from Meta-managed targets; monitoring never grants authority. An optional Alloy/Loki profile collects bounded online latency diagnostic JSON independently of the metrics path. |
 
 No production service-manager unit, orchestration manifest for the Lavik
 process itself, or supported platform matrix is defined in this repository;
