@@ -2,8 +2,9 @@
 # Copyright (C) 2026 EloqData Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Keep native FULL fixtures behind every Meta's applied bootstrap boundary."""
+"""Check native fixture admission and asynchronous failure reporting."""
 
+from concurrent.futures import Future
 import os
 from pathlib import Path
 import tempfile
@@ -22,6 +23,48 @@ class ReachedClusterCreate(Exception):
 
 
 class NativeFixtureStartupTest(unittest.TestCase):
+    def test_pair_accepts_leader_published_after_long_election_window(self):
+        now = 0.0
+
+        def sleep(seconds):
+            nonlocal now
+            now += seconds
+
+        def wait_leader(timeout=10):
+            # The Raft election is allowed to consume its whole ten-second
+            # window, followed by one status-publication/scheduling interval.
+            N.H.wait_until("leader published", timeout, lambda: now >= 10.05)
+
+        meta = Mock()
+        meta.wait_leader.side_effect = wait_leader
+        source, target = Mock(), Mock()
+        source.log_tail.return_value = target.log_tail.return_value = ""
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.multiple(N.C, META="meta", DATA="data", CTL="ctl", create=True),
+            patch.object(N.H, "Node", return_value=meta),
+            patch.object(N, "DataProcess", side_effect=[source, target]),
+            patch.object(N.C, "DirectiveBarrier"),
+            patch.object(N.C, "meta_manifest_lines", return_value=[]),
+            patch.object(N.C, "command", side_effect=ReachedClusterCreate),
+            patch.object(N.H, "dump_node_logs"),
+            patch.object(
+                N.H, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep)
+            ),
+        ):
+            with self.assertRaises(ReachedClusterCreate):
+                with N.pair(
+                    Path(directory),
+                    "long-election",
+                    raft_args=N.H.raft_args(
+                        election_ms_low=5000, election_ms_high=10000
+                    ),
+                ):
+                    self.fail("cluster creation should stop the fixture")
+        source.start.assert_called_once()
+        target.start.assert_called_once()
+        self.assertGreaterEqual(now, 10.05)
+
     def check_startup(self, scenario):
         membership_stable = False
         status_calls = 0
@@ -214,6 +257,118 @@ class BootstrapCreationAdmissionTest(unittest.TestCase):
         with self.assertRaisesRegex(C.H.Failure, "bootstrap creation exceeded 10s"):
             C.create_after_membership_admission(meta, "fixed request")
         meta.ctl.assert_called_once()
+
+
+class ReplicaBackupAdmissionTest(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.clock = SimpleNamespace(monotonic=lambda: self.now, sleep=self.advance)
+        self.clock_patch = patch.object(N, "time", self.clock)
+        self.clock_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+
+    def advance(self, duration):
+        self.now += duration
+
+    def test_startup_loading_and_previous_backup_busy_retry_then_start_once(self):
+        reader = Mock()
+        reader.call.side_effect = [
+            N.H.Failure("LOADING Redis is loading the dataset in memory"),
+            N.H.Failure("LOADING Lavik is loading the dataset from the primary"),
+            N.H.Failure("ERR Background save already in progress"),
+            "Background saving started",
+        ]
+        N.start_replica_backup(reader)
+        self.assertEqual(reader.call.call_count, 4)
+        self.assertTrue(
+            all(call.args == ("BGSAVE",) for call in reader.call.call_args_list)
+        )
+
+    def test_other_errors_and_unknown_outcomes_are_not_retried(self):
+        for error in (
+            N.H.Failure("ERR RDB cut failed"),
+            N.H.Failure("Data closed its Redis connection"),
+            N.H.Failure("CLUSTERDOWN Hash slot not served"),
+            OSError("connection reset"),
+            TimeoutError("unknown backup outcome"),
+        ):
+            with self.subTest(error=error):
+                reader = Mock()
+                reader.call.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    N.start_replica_backup(reader)
+                self.assertIs(raised.exception, error)
+                reader.call.assert_called_once_with("BGSAVE")
+
+    def test_persistent_loading_reports_its_error_at_deadline(self):
+        reader = Mock()
+        error = N.H.Failure("LOADING Redis is loading the dataset in memory")
+        reader.call.side_effect = error
+        with self.assertRaises(N.H.Failure) as raised:
+            N.start_replica_backup(reader)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.now, 10)
+
+
+class ReplicaBackupCheckpointTest(unittest.TestCase):
+    def setUp(self):
+        self.backup = Future()
+        self.transactions = Future()
+        self.now = 0.0
+        self.clock = SimpleNamespace(monotonic=lambda: self.now, sleep=self.advance)
+        self.clock_patch = patch.object(N, "time", self.clock)
+        self.clock_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+        self.log_patch = patch.object(N, "Path")
+        self.log = self.log_patch.start().return_value
+        self.log.read_text.return_value = ""
+        self.addCleanup(self.log_patch.stop)
+
+    def advance(self, duration):
+        self.now += duration
+
+    def wait(self):
+        N.wait_backup_checkpoint(
+            "target.log", "database gates closed", self.backup, self.transactions
+        )
+
+    def test_checkpoint_requires_live_producers(self):
+        self.log.read_text.side_effect = ["", "database gates closed"]
+        self.wait()
+        self.assertGreater(self.now, 0)
+
+    def test_background_errors_are_not_replaced_by_timeout(self):
+        for producer in ("backup", "transactions"):
+            for error in (
+                N.H.Failure("Redis rejected request"),
+                OSError("peer closed"),
+            ):
+                with self.subTest(producer=producer, error=error):
+                    self.backup, self.transactions = Future(), Future()
+                    getattr(self, producer).set_exception(error)
+                    with self.assertRaises(type(error)) as raised:
+                        self.wait()
+                    self.assertIs(raised.exception, error)
+                    self.assertEqual(self.now, 0)
+
+    def test_existing_checkpoint_does_not_hide_a_failed_backup(self):
+        self.log.read_text.return_value = "database gates closed"
+        self.backup.set_exception(N.H.Failure("RDB cut failed"))
+        with self.assertRaisesRegex(N.H.Failure, "RDB cut failed"):
+            self.wait()
+
+    def test_early_backup_completion_is_not_a_held_cut(self):
+        self.backup.set_result(True)
+        with self.assertRaisesRegex(
+            N.H.Failure, "backup finished before backup release"
+        ):
+            self.wait()
+        self.assertEqual(self.now, 0)
+
+    def test_missing_checkpoint_still_times_out(self):
+        with self.assertRaisesRegex(N.H.Failure, "timeout .*database gates closed"):
+            self.wait()
+        self.assertGreaterEqual(self.now, 10)
 
 
 if __name__ == "__main__":

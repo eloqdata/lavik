@@ -2194,6 +2194,9 @@ INSTANTIATE_TEST_SUITE_P(
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
+  // CMake discovery lists cases without a server argument. Listing never
+  // enters a fixture or creates storage; actual runs still require a server.
+  if (GTEST_FLAG_GET(list_tests)) return RUN_ALL_TESTS();
   if (argc != 2) return 2;
   grouped_e2e::server_binary = argv[1];
   return RUN_ALL_TESTS();

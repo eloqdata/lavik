@@ -2647,6 +2647,14 @@ class StorageEngine::Impl {
       PreparedOrderedMutation* prepared = nullptr,
       SortedSetOrderedProbe* ordered_probe = nullptr);
 
+  // Read-only score projection. The shared key intent stays with the caller;
+  // each checked member leaf is decoded into owned scalar scores before
+  // release.
+  Task<absl::StatusOr<SortedSetResult>> ReadGroupedSortedSetScores(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedObject::Handle object);
+
   // Requires the member directory's seed to match the public scan cursor
   // seed. Retains one checked member leaf and admitted owned output at a time.
   Task<absl::StatusOr<SortedSetResult>> ScanGroupedSortedSetMembers(

@@ -1399,6 +1399,129 @@ TEST(GroupedSortedSetWriteE2e, BatchedMemberIndexChangesMatchOrderedPages) {
   verify(client);
 }
 
+TEST(GroupedSortedSetWriteE2e, MemberScoreProjectionPreservesOrderAndRecovery) {
+  PrivateDisk disk;
+  const std::string key = "score-projection";
+  const auto member = [](unsigned i) {
+    return std::to_string(i) + std::string("\0", 1) +
+           std::string(i == 511 ? 128 * 1024 : 128, 'm');
+  };
+  std::map<std::string, double> expected;
+  for (unsigned i = 0; i < 512; ++i)
+    expected.emplace(member(i), static_cast<int>(i % 7) - 3);
+  expected[""] = -0.0;
+  expected[member(0)] = -std::numeric_limits<double>::infinity();
+  expected[member(511)] = std::numeric_limits<double>::infinity();
+  expected[member(37)] = 1.25;
+  const auto check = [&](Client& client) {
+    std::vector<std::string> operands{"missing",   member(511), member(37), "",
+                                      member(511), "missing",   member(0)};
+    // Out-of-order, repeated and missing operands span many leaves. Repeating
+    // all members also exercises multiple matches in the same physical leaf.
+    for (unsigned i = 512; i != 0; --i) {
+      operands.push_back(member(i - 1));
+      operands.push_back(member(i - 1));
+    }
+    std::vector<std::string> command{"ZMSCORE", key};
+    command.insert(command.end(), operands.begin(), operands.end());
+    const auto scores = client.Command(command);
+    ASSERT_EQ(scores.items_.size(), operands.size());
+    for (std::size_t i = 0; i < operands.size(); ++i) {
+      const auto found = expected.find(operands[i]);
+      ASSERT_EQ(scores.items_[i].kind_, '$');
+      if (found == expected.end()) {
+        EXPECT_EQ(scores.items_[i].text_, "-1");
+      } else {
+        const auto value = std::stod(scores.items_[i].text_);
+        EXPECT_EQ(value, found->second);
+        EXPECT_EQ(std::signbit(value), std::signbit(found->second));
+      }
+    }
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& [name, score] : expected)
+      ordered.emplace_back(score, name);
+    std::sort(ordered.begin(), ordered.end());
+    for (const auto& name : {std::string{}, member(0), member(37), member(511),
+                             std::string("missing")}) {
+      const auto found = expected.find(name);
+      const auto score = client.Command({"ZSCORE", key, name});
+      const auto single_batch = client.Command({"ZMSCORE", key, name});
+      ASSERT_EQ(single_batch.items_.size(), 1);
+      EXPECT_EQ(single_batch.items_[0].text_, score.text_);
+      for (const auto* op : {"ZRANK", "ZREVRANK"}) {
+        const auto rank = client.Command({op, key, name, "WITHSCORE"});
+        if (found == expected.end()) {
+          EXPECT_EQ(score.text_, "-1");
+          EXPECT_EQ(rank.kind_, '*');
+          EXPECT_EQ(rank.text_, "-1");
+        } else {
+          EXPECT_EQ(std::stod(score.text_), found->second);
+          const auto index = std::find(ordered.begin(), ordered.end(),
+                                       std::pair{found->second, name}) -
+                             ordered.begin();
+          ASSERT_EQ(rank.items_.size(), 2);
+          EXPECT_EQ(rank.items_[0].text_,
+                    std::to_string(std::string_view(op) == "ZRANK"
+                                       ? index
+                                       : ordered.size() - 1 - index));
+          EXPECT_EQ(std::stod(rank.items_[1].text_), found->second);
+        }
+      }
+    }
+  };
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (const auto& [name, score] : expected)
+      seed.insert(seed.end(), {std::to_string(score), name});
+    ASSERT_EQ(client.Command(seed).text_, "513");
+    check(client);
+    ASSERT_EQ(client.Command({"ZREM", key, member(37)}).text_, "1");
+    expected.erase(member(37));
+    ASSERT_EQ(client.Command({"ZADD", key, "7.5", member(511)}).text_, "0");
+    expected[member(511)] = 7.5;
+    check(client);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  check(client);
+  // The same projection must honor transaction read-your-writes.
+  ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+  ASSERT_EQ(client.Command({"ZADD", key, "3.5", "tx-member"}).text_, "QUEUED");
+  ASSERT_EQ(
+      client.Command({"ZMSCORE", key, "tx-member", "missing", "tx-member"})
+          .text_,
+      "QUEUED");
+  const auto replies = client.Command({"EXEC"});
+  ASSERT_EQ(replies.items_.size(), 2);
+  ASSERT_EQ(replies.items_[1].items_.size(), 3);
+  EXPECT_EQ(replies.items_[1].items_[0].text_, "3.5");
+  EXPECT_EQ(replies.items_[1].items_[1].text_, "-1");
+  EXPECT_EQ(replies.items_[1].items_[2].text_, "3.5");
+  // GEO point reads share kScores. An external member forces grouped storage,
+  // so these exercise the projection rather than only the compact path.
+  ASSERT_EQ(client
+                .Command({"GEOADD", "projection-geo", "13.361389", "38.115556",
+                          member(511), "15.087269", "37.502669", member(0)})
+                .text_,
+            "2");
+  const auto hashes = client.Command(
+      {"GEOHASH", "projection-geo", member(511), "missing", member(511)});
+  ASSERT_EQ(hashes.items_.size(), 3);
+  EXPECT_EQ(hashes.items_[0].text_, "sqc8b49rny0");
+  EXPECT_EQ(hashes.items_[1].text_, "-1");
+  EXPECT_EQ(hashes.items_[2].text_, hashes.items_[0].text_);
+  EXPECT_EQ(
+      client
+          .Command({"GEODIST", "projection-geo", member(511), member(0), "km"})
+          .text_,
+      "166.2742");
+  ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
+}
+
 TEST(GroupedSortedSetWriteE2e, MemberScoresUsePrefixPagesWithoutOrderedReads) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires ordered-read failure injection";
