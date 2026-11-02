@@ -1059,15 +1059,7 @@ class CommandBufferGuard {
   std::size_t bytes_;
 };
 
-// Preserve error provenance: transport backends can use the same status codes
-// as parser/admission failures. Only the latter construct a RESP error and
-// contribute to errorstats; a failed socket read simply ends the session.
-struct CommandReadResult {
-  absl::Status status_;
-  bool transport_ended_ = false;
-};
-
-Task<CommandReadResult> ReadCommandBatch(
+Task<absl::Status> ReadCommandBatch(
     TcpStream& stream, RequestInputBuffer* input, RespCommandParser* parser,
     CommandBatch* ready, ClientBufferReservation* client_buffers,
     const std::atomic<std::size_t>* query_buffer_limit,
@@ -1094,9 +1086,9 @@ Task<CommandReadResult> ReadCommandBatch(
                                     : RequestInputError::kProtocol);
         if (!ready->empty()) {
           deferred_error->emplace(std::move(parsed.status_));
-          co_return CommandReadResult{};
+          co_return absl::OkStatus();
         }
-        co_return CommandReadResult{std::move(parsed.status_)};
+        co_return parsed.status_;
       }
       if (parsed.state_ == RespParseState::kOk) {
         ready->Push(std::move(parsed.command_), *unassigned_input_bytes);
@@ -1114,7 +1106,7 @@ Task<CommandReadResult> ReadCommandBatch(
       // Everything before it is now parser-owned and already consumed.
       break;
     }
-    if (!ready->empty()) co_return CommandReadResult{};
+    if (!ready->empty()) co_return absl::OkStatus();
 
     const std::size_t bulk_reservation = parser->BulkReadReservationSize();
     if (bulk_reservation != 0) {
@@ -1126,14 +1118,14 @@ Task<CommandReadResult> ReadCommandBatch(
       if (!client_buffers->TryAcquire(bulk_reservation)) [[unlikely]] {
         RecordRequestInputError(RequestInputError::kClientMemory);
         RecordMemoryRejection();
-        co_return CommandReadResult{absl::ResourceExhaustedError(
-            "client request buffers exceed the memory limit")};
+        co_return absl::ResourceExhaustedError(
+            "client request buffers exceed the memory limit");
       }
       const auto prepared = parser->PrepareBulkRead(bulk_reservation);
       if (!prepared.ok()) [[unlikely]] {
         client_buffers->Release(bulk_reservation);
         RecordRequestInputError(RequestInputError::kQueryBuffer);
-        co_return CommandReadResult{prepared};
+        co_return prepared;
       }
     }
     if (auto body = parser->BulkReadBuffer(); !body.empty()) {
@@ -1142,9 +1134,9 @@ Task<CommandReadResult> ReadCommandBatch(
       auto read_result =
           co_await stream.ReadSomeBuffered(std::as_writable_bytes(body));
       if (!read_result.ok()) [[unlikely]]
-        co_return CommandReadResult{read_result.status(), true};
+        co_return read_result.status();
       if (*read_result == 0) [[unlikely]] {
-        co_return CommandReadResult{absl::OkStatus(), true};
+        co_return absl::UnavailableError("peer closed connection");
       }
       // The limit may have shrunk while the direct read was suspended. Never
       // dispatch a command using a stale guard merely because its destination
@@ -1154,7 +1146,7 @@ Task<CommandReadResult> ReadCommandBatch(
       const auto committed = parser->CommitBulkRead(*read_result);
       if (!committed.ok()) [[unlikely]] {
         RecordRequestInputError(RequestInputError::kQueryBuffer);
-        co_return CommandReadResult{committed};
+        co_return committed;
       }
       assert(*read_result <=
              std::numeric_limits<std::size_t>::max() - *unassigned_input_bytes);
@@ -1172,10 +1164,10 @@ Task<CommandReadResult> ReadCommandBatch(
     std::span<std::byte> buffer = input->AppendBuffer();
     auto read_result = co_await stream.ReadSome(buffer);
     if (!read_result.ok()) [[unlikely]] {
-      co_return CommandReadResult{read_result.status(), true};
+      co_return read_result.status();
     }
     if (*read_result == 0) [[unlikely]] {
-      co_return CommandReadResult{absl::OkStatus(), true};
+      co_return absl::UnavailableError("peer closed connection");
     }
     // Read into the already allocated socket buffer first, then charge once
     // for the bytes that the parser may retain. This keeps admission out of
@@ -1183,12 +1175,12 @@ Task<CommandReadResult> ReadCommandBatch(
     if (!client_buffers->TryAcquire(*read_result)) [[unlikely]] {
       RecordRequestInputError(RequestInputError::kClientMemory);
       RecordMemoryRejection();
-      co_return CommandReadResult{absl::ResourceExhaustedError(
-          "client request buffers exceed the memory limit")};
+      co_return absl::ResourceExhaustedError(
+          "client request buffers exceed the memory limit");
     }
     input->Commit(*read_result);
   }
-  co_return CommandReadResult{};
+  co_return absl::OkStatus();
 }
 
 constexpr std::size_t kMaximumBatchedReplyBytes = 64 * 1024;
@@ -1642,26 +1634,25 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
         read_status = std::move(**deferred_read_error);
         deferred_read_error->reset();
       } else {
-        auto read = co_await ReadCommandBatch(
+        read_status = co_await ReadCommandBatch(
             stream, input, parser, ready, client_buffers,
             &client_query_buffer_limit_bytes_, unassigned_input_bytes,
             deferred_read_error);
-        if (read.transport_ended_) {
-          ClosePubSubSession(session);
-          co_return read.status_;
-        }
-        read_status = std::move(read.status_);
       }
     }
     if (!read_status.ok()) {
-      builder.Reset();
-      EnqueuePubSubReply(session,
-                         std::string(builder.AppendError(
-                             CommandErrorReasonForStatus(read_status),
-                             absl::StrCat("ERR ", read_status.message()))));
-      RecordCommandError(builder.outcome().prefix_);
-      ExitPubSubMode(session);
-      co_return read_status;
+      if (read_status.code() != absl::StatusCode::kUnavailable) {
+        builder.Reset();
+        EnqueuePubSubReply(session,
+                           std::string(builder.AppendError(
+                               CommandErrorReasonForStatus(read_status),
+                               absl::StrCat("ERR ", read_status.message()))));
+        RecordCommandError(builder.outcome().prefix_);
+        ExitPubSubMode(session);
+        co_return read_status;
+      }
+      ClosePubSubSession(session);
+      co_return absl::OkStatus();
     }
     if (ctx.closing_) {
       ClosePubSubSession(session);
@@ -1876,14 +1867,16 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         read_status = std::move(*deferred_read_error);
         deferred_read_error.reset();
       } else {
-        auto read = co_await ReadCommandBatch(
+        read_status = co_await ReadCommandBatch(
             stream, &input, &parser, &ready, &client_buffers,
             &client_query_buffer_limit_bytes_, &unassigned_input_bytes,
             &deferred_read_error);
-        if (read.transport_ended_) co_return read.status_;
-        read_status = std::move(read.status_);
       }
       if (!read_status.ok()) [[unlikely]] {
+        if (read_status.code() == absl::StatusCode::kUnavailable) [[unlikely]] {
+          co_return absl::OkStatus();
+        }
+
         const std::string_view encoded = ctx.reply_builder_.AppendError(
             CommandErrorReasonForStatus(read_status),
             absl::StrCat("ERR ", read_status.message()));

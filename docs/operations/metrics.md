@@ -365,11 +365,11 @@ Replication application, recovery and background work do not enter these client
 counters. Parent and child command counts are logical executions, not network
 request counts.
 
-Transport EOF and socket read failures (including connection resets) close the
-session without constructing a RESP error or incrementing errorstats or input-error
-counters. Protocol and request-buffer admission failures increment input-error
-counters when detected. Once the serving loop constructs their RESP error,
-errorstats counts it even if writing that error fails. A deferred parse error
+Transport EOF and reads reporting an unavailable connection (including TCP
+resets) close the session without constructing a RESP error or incrementing
+errorstats or input-error counters. Protocol and request-buffer admission failures
+increment input-error counters when detected. Once the serving loop constructs
+their RESP error, errorstats counts it even if writing that error fails. A deferred parse error
 does not reach errorstats if an earlier reply write fails and ends the session
 before the deferred error is handled.
 
