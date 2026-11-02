@@ -906,17 +906,26 @@ preserving append and copy-on-write child-before-root ordering.
 
 An ordinary successful command is therefore not necessarily crash-durable at
 reply time. `StorageDurabilityStats` reports dirty staging bytes, pending
-flushes, and pending transaction decisions for operators and tests that need a
-durability fence. Graceful shutdown closes request admission and all
+flushes, pending transaction decisions and a latched terminal failure flag.
+Successful quiescent completion requires both no pending work and no failure;
+a concurrent diagnostic snapshot is not a per-command durability fence.
+Foreground capacity exhaustion before a queued commit append retains its
+receipts for retry; later commits on that worker wait behind it. Other queued
+commit failures and storage I/O failures fail-stop storage. Direct, awaited
+commits retain their command-specific error and rollback behavior.
+Graceful shutdown stops these retries
+when it closes request admission and all
 replication target/source transports first; source flow teardown releases
 retained backlog cursors that could otherwise keep an accepted publisher
 suspended. It drains accepted requests, joins the Meta control client when
 configured, joins target apply work, aborts partial replacement roots,
 and drains source handshakes, exports, and history. No accepted directive,
 replication apply, or source-log transition can therefore mutate storage behind
-the checkpoint boundary. Accepted queued and explicitly background transaction
-commits receive up to five seconds to append their decisions; timeout fails
-shutdown and prohibits a clean certificate.
+the checkpoint boundary. Queue-owned transaction commits retain the existing
+bounded normal drain before the final flush. Failed commits are discarded
+without further retry or an added drain period. Terminal failure or timeout
+fails shutdown and prohibits a clean certificate, even when pending work has
+already returned to zero.
 
 For the optional index checkpoint, storage performs two freeze-and-drain rounds around transaction cleaning.
 The first resets even header-only active streams and drains flushes, extent

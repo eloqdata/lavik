@@ -288,9 +288,10 @@ class Client {
   void Durable() {
     const auto until = std::chrono::steady_clock::now() + 20s;
     while (std::chrono::steady_clock::now() < until) {
-      if (Command({"INFO", "STATS"})
-              .text_.find("storage_durability_pending:0\r\n") !=
-          std::string::npos)
+      const auto info = Command({"INFO", "STATS"}).text_;
+      Check(info.find("storage_durability_failed:1\r\n") == std::string::npos,
+            "storage durability failed");
+      if (info.find("storage_durability_pending:0\r\n") != std::string::npos)
         return;
       std::this_thread::sleep_for(10ms);
     }

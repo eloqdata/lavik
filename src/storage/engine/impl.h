@@ -2924,9 +2924,13 @@ class StorageEngine::Impl {
   Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                           const Digest& digest);
 
+  // A non-null retryable_capacity opts the queue into retaining grouped
+  // decisions on pre-append foreground exhaustion. It is set false for all
+  // other outcomes; direct callers retain the default terminal policy.
   Task<absl::Status> CommitTxWrites(
       std::uint64_t txid, std::vector<TxShardWrites*> shards,
-      RelocationDurabilityFence* deferred_decision = nullptr);
+      RelocationDurabilityFence* deferred_decision = nullptr,
+      bool* retryable_capacity = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
@@ -2957,6 +2961,7 @@ class StorageEngine::Impl {
         .queue_peak_ = tx_commit_queue_peak_.load(std::memory_order_acquire),
         .backpressure_waits_ =
             tx_commit_backpressure_waits_.load(std::memory_order_acquire),
+        .retries_ = tx_commit_retries_.load(std::memory_order_acquire),
         .queue_high_watermark_ = kTxCommitQueueHighWatermark,
     };
   }
@@ -3433,6 +3438,13 @@ class StorageEngine::Impl {
   Task<absl::Status> DrainReplicaRootWritesLocal(WorkerStore& store);
 
   absl::Status FlushForShutdown();
+  void BeginShutdown() noexcept {
+    shutdown_started_.store(true, std::memory_order_release);
+  }
+  bool DurabilityFailed() const noexcept {
+    return tx_commit_failed_.load(std::memory_order_acquire) ||
+           RuntimeFailureLatched();
+  }
 
   Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
       std::string_view dump, MutationPrecondition mutation_precondition);
@@ -5116,6 +5128,9 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> tx_commit_queue_depth_{0};
   std::atomic<std::uint64_t> tx_commit_queue_peak_{0};
   std::atomic<std::uint64_t> tx_commit_backpressure_waits_{0};
+  std::atomic<std::uint64_t> tx_commit_retries_{0};
+  std::atomic<bool> tx_commit_failed_{false};
+  std::atomic<bool> shutdown_started_{false};
   // Committed transactions seen during the block scans; merged by each
   // worker before the recovery barrier, read only after it.
   std::mutex recovery_committed_mutex_;

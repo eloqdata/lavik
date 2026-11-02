@@ -714,7 +714,7 @@ std::array<CommandText, kCommandKindCount> g_command_text;
 std::array<WaitText, 2> g_wait_text;
 std::vector<std::string> g_worker_text;
 std::vector<std::string> g_worker_labels;
-std::array<std::string, 20> g_storage_diagnostic_text;
+std::array<std::string, 22> g_storage_diagnostic_text;
 void AppendStorageDiagnostics(
     const storage::StorageDiagnosticsSnapshot& diagnostics, MetricText* output);
 
@@ -774,6 +774,7 @@ void AppendStorageDiagnostics(
   const auto append = [output, &index](std::string_view suffix,
                                        std::string_view type,
                                        std::string_view help, auto value) {
+    assert(index < g_storage_diagnostic_text.size());
     auto& prefix = g_storage_diagnostic_text[index++];
     if (output == nullptr) {
       // Startup-only preparation combines each family's metadata and sample
@@ -833,6 +834,9 @@ void AppendStorageDiagnostics(
          "Enqueues encountering their worker's commit queue watermark; not "
          "wait duration.",
          commits.backpressure_waits_);
+  append("tx_commit_retries_total", "counter",
+         "Additional commit attempts after foreground capacity exhaustion.",
+         commits.retries_);
   append("tx_commit_queue_depth", "gauge",
          "Queued commit receipts across workers; excludes dequeued in-flight "
          "batches.",
@@ -859,6 +863,9 @@ void AppendStorageDiagnostics(
          "Unfinished transaction commit chains, including dequeued in-flight "
          "batches.",
          durability.tx_commits_pending_);
+  append("durability_failed", "gauge",
+         "Terminal storage durability failure, latched until engine restart.",
+         durability.failed_ ? 1 : 0);
   append("durability_pending", "gauge",
          "Whether sampled dirty bytes, flush runners or transaction commits "
          "remain; "
@@ -964,6 +971,16 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
       "lavik_server_ready ",
       server_ready ? 1 : 0, "\n");
   if (!server_ready) {
+    // Fail-stop withdraws readiness; keep the reason observable without
+    // collecting worker state that may never have completed startup.
+    if (storage.RuntimeFailureLatched()) {
+      AppendMetricText(
+          &output,
+          "# HELP lavik_storage_durability_failed Terminal storage durability "
+          "failure, latched until engine restart.\n"
+          "# TYPE lavik_storage_durability_failed gauge\n"
+          "lavik_storage_durability_failed 1\n");
+    }
     co_return absl::OkStatus();
   }
 

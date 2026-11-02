@@ -658,7 +658,10 @@ void RedisService::Prepare(unsigned thread_count) {
   rdb_import_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
 }
 
-void RedisService::StopAcceptingRequests() noexcept { request_gate_.Close(); }
+void RedisService::StopAcceptingRequests() noexcept {
+  storage_->BeginShutdown();
+  request_gate_.Close();
+}
 
 void RedisService::WaitForRequestsDrained() const noexcept {
   request_gate_.WaitUntilEmpty();

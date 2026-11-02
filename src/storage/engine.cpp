@@ -939,13 +939,7 @@ void StorageEngine::InitializeTxWrites(std::uint64_t txid,
   impl_->InitializeTxWrites(txid, writes, std::move(precondition));
 }
 
-void StorageEngine::NoteTxCommitStarted() noexcept {
-  impl_->NoteTxCommitStarted();
-}
-
-void StorageEngine::NoteTxCommitFinished() noexcept {
-  impl_->NoteTxCommitFinished();
-}
+void StorageEngine::BeginShutdown() noexcept { impl_->BeginShutdown(); }
 
 TxCommitBatchTotals StorageEngine::TxCommitBatchStats() const noexcept {
   return impl_->TxCommitBatchStats();

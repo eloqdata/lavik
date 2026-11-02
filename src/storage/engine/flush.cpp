@@ -38,6 +38,10 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       store->buffers_.FailWriteWaiters();
       store->durability_progress_.NotifyAll(*store->worker_);
     }
+    // Shutdown may originate outside the runtime. Wake on the owner so
+    // reply-side backpressure cannot prevent accepted requests from draining.
+    if (shutdown_started_.load(std::memory_order_acquire) || DurabilityFailed())
+      store->tx_commit_capacity_.NotifyAll(*store->worker_);
     // External shutdown/configuration callers cannot post owner notifications.
     // Actual cleaner completions and block returns wake capacity waiters at
     // once; this only delivers control-state changes from outside the runtime.

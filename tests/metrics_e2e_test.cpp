@@ -411,7 +411,7 @@ struct DiagnosticMetric {
   double divisor = 1;
 };
 
-constexpr std::array<DiagnosticMetric, 20> kDiagnostics{{
+constexpr std::array<DiagnosticMetric, 22> kDiagnostics{{
     {"tx_backlog_bytes", "tx_backlog_bytes_total"},
     {"tx_backlog_max_bytes", "tx_backlog_bytes_max"},
     {"tx_cleaner_rounds_total", "tx_cleaner_rounds", true},
@@ -426,12 +426,14 @@ constexpr std::array<DiagnosticMetric, 20> kDiagnostics{{
     {"tx_commit_merged_fences_total", "tx_commit_merged_fences", true},
     {"tx_commit_backpressure_waits_total", "tx_commit_backpressure_waits",
      true},
+    {"tx_commit_retries_total", "tx_commit_retries", true},
     {"tx_commit_queue_depth", "tx_commit_queue_depth"},
     {"tx_commit_queue_peak", "tx_commit_queue_peak"},
     {"tx_commit_queue_high_watermark", "tx_commit_queue_high_watermark"},
     {"dirty_staging_bytes", "storage_dirty_staging_bytes"},
     {"flushes_pending", "storage_flushes_pending"},
     {"tx_commits_pending", "storage_tx_commits_pending"},
+    {"durability_failed", "storage_durability_failed"},
     {"durability_pending", "storage_durability_pending"},
     {"expiration_pause_count", "storage_expiration_pause_count"},
 }};
@@ -1656,7 +1658,7 @@ TEST(MetricsE2eTest, StorageDiagnosticsRemainResponsiveDuringPausedFlush) {
 #endif
 }
 
-TEST(MetricsE2eTest, StorageFailureExportsOnlyReadiness) {
+TEST(MetricsE2eTest, StorageFailureRemainsVisibleAfterReadinessIsWithdrawn) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "Deterministic storage failure requires test fault hooks";
 #else
@@ -1699,14 +1701,16 @@ TEST(MetricsE2eTest, StorageFailureExportsOnlyReadiness) {
   }));
   const auto response = HttpGet(http, "/metrics");
   EXPECT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
-  EXPECT_EQ(response.find("lavik_storage_"), std::string::npos);
+  EXPECT_EQ(response.find("lavik_storage_dirty_staging_bytes"),
+            std::string::npos);
   std::istringstream body(response.substr(response.find("\r\n\r\n") + 4));
   std::string line;
   unsigned samples = 0;
   while (std::getline(body, line)) {
     if (!line.empty() && line.front() != '#') ++samples;
   }
-  EXPECT_EQ(samples, 1);
+  EXPECT_EQ(samples, 2);
+  EXPECT_EQ(MetricValue(response, "lavik_storage_durability_failed"), 1);
   // The failed durability epoch remains fenced. The process fixture kills it
   // on scope exit; a graceful successful shutdown is not expected here.
 #endif

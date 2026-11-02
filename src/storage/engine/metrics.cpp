@@ -63,6 +63,7 @@ Task<std::uint64_t> StorageEngine::Impl::CollectLocalDirtyStagingBytes() const {
 
 void StorageEngine::Impl::UpdateDurabilityPending(
     StorageDurabilityStats& stats) const {
+  stats.failed_ |= DurabilityFailed();
   // Sample before and after visiting workers. A registered commit may finish
   // and append on an already-visited worker; retaining the earlier nonzero
   // count keeps the observation conservative until the next dirty-byte scan.

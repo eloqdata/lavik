@@ -332,6 +332,11 @@ That protection extends through post-root fence construction and commit-queue
 handoff, not just record staging. A rejected queue handoff does not create a
 pending-commit count without an owned receipt. Physical allocation failure
 terminates the process; recoverable handoff failures use explicit statuses.
+A queue-owned decision remains pending when foreground capacity prevents its
+commit record from being appended. The coordinator retains its receipts and
+leases until retry succeeds or shutdown abandons it; this does not replay the
+mutation. Terminal background commit failure fail-stops storage and wakes
+decision dependents.
 An explicitly failed decision also makes its published graph unreadable,
 including collection length and checked Redis key metadata. An uncommitted
 expiry cannot disguise that failure as an absent key. Internal compensation

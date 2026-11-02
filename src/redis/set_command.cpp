@@ -554,21 +554,6 @@ Task<absl::Status> SetFinishShardCallback(void* opaque, const tx::ShardSlice&) {
       context->tx_writes_[bycorf::ThisWorker().id_], context->rollback_);
 }
 
-Task<absl::Status> RunSetTxCommit(std::uint64_t txid,
-                                  std::vector<storage::TxShardWrites> writes) {
-  struct CommitDone {
-    ~CommitDone() { g_storage->NoteTxCommitFinished(); }
-  } commit_done;
-  std::vector<storage::TxShardWrites*> shards;
-  for (auto& shard : writes) {
-    if (!shard.fences_.empty() || !shard.retirements_.empty()) {
-      shards.push_back(&shard);
-    }
-  }
-  if (shards.empty()) co_return absl::OkStatus();
-  co_return co_await g_storage->CommitTxWrites(txid, std::move(shards));
-}
-
 }  // namespace
 
 void InitSetCommandStorage(storage::StorageEngine* engine) {
@@ -828,8 +813,11 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   if (write) {
     replication.SetFinalExpirations(context.tx_writes_);
     replication.Commit();
-    g_storage->NoteTxCommitStarted();
-    SpawnOnCurrentWorker(RunSetTxCommit(txid, std::move(context.tx_writes_)));
+    // FinishTxLocal settled all participants before the background handoff.
+    for (auto& shard : context.tx_writes_) shard.collect_undo_ = false;
+    const bool capacity =
+        g_storage->EnqueueTxCommit(txid, std::move(context.tx_writes_));
+    if (!capacity) co_await g_storage->WaitForTxCommitCapacity();
   }
 
   if (store) {

@@ -202,8 +202,8 @@ Owner-local grouped successors retain predecessor decisions in their receipts
 and may publish staged versions before those predecessors become durable. The
 drain completes an appended commit frontier before appending any dependent
 successor decision, preserving ancestor-before-successor durability even when
-commit records cross physical blocks. A failed predecessor fails its dependent
-receipt; unrelated receipt decisions remain independent. Cross-coordinator
+commit records cross physical blocks. A terminal commit failure fail-stops
+storage and fails remaining queue-owned decisions. Cross-coordinator
 grouped predecessors retain their existing foreground ordering boundary.
 
 The queue high watermark is 4096 receipts per worker. Enqueueing always
@@ -214,11 +214,23 @@ successful reply into a synchronous durability promise. INFO STATS exposes
 batch and transaction counts, input and merged fence counts, current and peak
 queue depth, backpressure waits, and the configured watermark.
 
-Accepted queued and explicitly background commit paths increment a shared
-pending count. Graceful shutdown gives that count up to five seconds to drain
-before freezing append streams and starting the final storage flush. After the
-deadline, shutdown proceeds without waiting further; recovery drops all tagged
-records atomically whenever their durable commit decision is absent.
+All asynchronous transaction writers, including Set and Sorted Set multi-key
+commands, transfer their settled receipts through this queue. If foreground
+capacity prevents appending a commit record, the coordinator retains that
+receipt, its grouped decisions and writer leases at the current batch cursor.
+It flushes the already-appended prefix before retrying. Later commits on the
+same coordinator cannot pass it; new command execution and other workers keep
+their existing admission and scheduling rules. Data I/O failures, failed
+predecessors and errors after commit append are terminal rather than retried.
+
+Queued and in-flight receipts share a pending count. Terminal failure is
+latched separately for the engine lifetime, so zero pending does not certify
+successful durability. Closing request admission also stops commit retries
+and releases reply-side capacity waits. Shutdown may discard failed work,
+reports failure and prohibits a clean certificate; it does not add a retry
+drain window. The existing bounded wait still limits unfinished normal commit
+work before the final storage flush. Recovery drops tagged records whose
+durable commit decision is absent.
 
 ## WATCH integration
 

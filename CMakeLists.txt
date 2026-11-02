@@ -2258,6 +2258,13 @@ endforeach()
     )
     set_tests_properties(lavik_large_bulk_e2e PROPERTIES TIMEOUT 180)
 
+    add_test(NAME lavik_tx_commit_retry_e2e
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tx_commit_retry_e2e.py $<TARGET_FILE:lavik>)
+    set_tests_properties(lavik_tx_commit_retry_e2e PROPERTIES
+      TIMEOUT 600 RUN_SERIAL TRUE
+      ENVIRONMENT "LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>")
+
     add_executable(lavik_grouped_recovery_e2e_test
       tests/grouped/recovery_e2e_test.cpp
     )

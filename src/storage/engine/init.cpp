@@ -2287,9 +2287,10 @@ bool StorageEngine::Impl::AbandonWorkerStateForProcessExit() noexcept {
 }
 
 absl::Status StorageEngine::Impl::FlushForShutdown() {
-  if (RuntimeFailureLatched()) {
+  BeginShutdown();
+  if (DurabilityFailed()) {
     return absl::FailedPreconditionError(
-        "runtime storage failure forbids a clean-shutdown checkpoint");
+        "storage durability failure forbids a clean-shutdown checkpoint");
   }
   // Shutdown must not certify a population while acknowledged transactions
   // still lack durable decisions. A bounded wait fails closed on timeout.
@@ -2297,12 +2298,18 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
       std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (active_tx_commits_.load(std::memory_order_acquire) != 0 &&
          std::chrono::steady_clock::now() < commit_deadline) {
+    if (DurabilityFailed())
+      return absl::FailedPreconditionError(
+          "transaction durability failed during shutdown");
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   if (active_tx_commits_.load(std::memory_order_acquire) != 0) {
     return absl::DeadlineExceededError(
         "transaction commits did not drain for shutdown");
   }
+  if (DurabilityFailed())
+    return absl::FailedPreconditionError(
+        "transaction durability failed during shutdown");
   // Request admission is already closed and drained, so CONFIG can no longer
   // change this process's policy. Publish one latched decision to every worker;
   // letting workers sample the live atomic independently could split barrier
