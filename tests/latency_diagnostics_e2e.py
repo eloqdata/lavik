@@ -40,7 +40,8 @@ class Client:
             raise RuntimeError("server closed RESP connection")
         kind, value = line[:1], line[1:-2]
         if kind == b"*":
-            return [self.read() for _ in range(int(value))]
+            n = int(value)
+            return None if n < 0 else [self.read() for _ in range(n)]
         if kind == b"$":
             n = int(value)
             if n < 0:
@@ -253,7 +254,7 @@ def lock_case(binary):
                 stdout=log,
                 stderr=log,
             )
-            first = second = None
+            first = second = third = None
             try:
 
                 def ready():
@@ -294,11 +295,16 @@ def lock_case(binary):
                         )
 
                 wait_for(waiting)
+                # a/b route to distinct workers; the shared key conflicts
+                # with the paused writer on one participant.
+                third = Client(port)
+                third.sock.sendall(Client.encode("MGET", "lock-private", "a", "b"))
                 time.sleep(0.08)
                 pause.unlink()
                 assert first.read() == "OK"
                 assert first.read() is None
                 assert second.read() == b"value"
+                assert third.read() == [b"value", None, None]
                 first.command("CONFIG", "SET", "latency-diagnostics-enabled", "no")
                 traces = [
                     json.loads(t) for t in first.command("LATENCY", "TRACE", "GET", 20)
@@ -309,13 +315,22 @@ def lock_case(binary):
                         max(s["duration_us"] for s in stages if s["name"] == stage)
                         >= 50_000
                     ), traces
+                multi = next(t for t in traces if t["command"] == "MGET")
+                assert (
+                    max(
+                        stage["duration_us"]
+                        for stage in multi["stages"]
+                        if stage["name"] == "key_lock"
+                    )
+                    >= 50_000
+                ), multi
                 assert b"lock-private" not in json.dumps(traces).encode()
                 print(
                     "PASS: injected append stall, key-lock wait and pipelined ready-queue attribution across two workers"
                 )
             finally:
                 pause.unlink(missing_ok=True)
-                for client in [first, second]:
+                for client in [first, second, third]:
                     if client:
                         client.close()
                 server.terminate()
@@ -339,6 +354,9 @@ def read_buffer_case(binary, workers=1):
             metrics_port = free_port()
         env = dict(
             os.environ,
+            # Recovered grouped records must remain cold: startup cleaning can
+            # otherwise relocate them into resident write buffers before GET.
+            LAVIK_TX_CLEANER_START_PAUSED="1",
             LAVIK_FAIL_READ_BUFFER_ALLOCATION="1",
             LAVIK_FAIL_EXTENT_BUFFER_ALLOCATION="1",
             LAVIK_LATENCY_PAUSE_READ_COMPLETION="1",
@@ -633,7 +651,7 @@ def logging_case(binary, unavailable=False):
                     in body
                 )
                 assert (
-                    'lavik_latency_diagnostics_stage_seconds_count{command="GET",stage="server_total"} 25'
+                    'lavik_latency_diagnostics_stage_seconds_count{command_family="get",stage="server_total"} 25'
                     in body
                 )
                 assert "lavik_latency_diagnostics_log_enabled 0" in body
@@ -660,11 +678,491 @@ def logging_case(binary, unavailable=False):
                     )
                 else:
                     wait_for(lambda: len(diagnostic.read_text().splitlines()) == 33)
-                assert len(client.command("LATENCY", "TRACE", "GET", 128)) == 57
+                # The explicit PING above is also one completed selected command.
+                assert len(client.command("LATENCY", "TRACE", "GET", 128)) == 58
                 assert "lavik_latency_diagnostics_log_max_per_second 0" in metrics()
                 print(
                     "PASS: log switch preserves history/histograms; sink unavailable="
                     + str(unavailable)
+                )
+            finally:
+                if client:
+                    client.close()
+                server.terminate()
+                try:
+                    server.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+                assert server.returncode == 0, (root / "server.log").read_text()[-6000:]
+
+
+def generic_commands_case(binary):
+    """Trace the actual command identity and common lifecycle across families."""
+    with tempfile.TemporaryDirectory(prefix="lavik-latency-families-") as tmp:
+        root = Path(tmp)
+        data = root / "data"
+        with data.open("wb") as file:
+            os.posix_fallocate(file.fileno(), 0, 1024**3)
+        port = free_port()
+        with (root / "server.log").open("wb") as log:
+            server = subprocess.Popen(
+                [
+                    binary,
+                    "--threads",
+                    "2",
+                    "--port",
+                    str(port),
+                    "--data-file",
+                    str(data),
+                    "--log-dir",
+                    str(root / "logs"),
+                    "--rdb-dir",
+                    str(root),
+                    "--logtostderr",
+                ],
+                env=dict(os.environ, LAVIK_TX_CLEANER_START_PAUSED="1"),
+                stdout=log,
+                stderr=log,
+            )
+            client = None
+            try:
+
+                def connect():
+                    nonlocal client
+                    try:
+                        client = Client(port)
+                        return client.command("PING") == "PONG"
+                    except OSError:
+                        return False
+
+                wait_for(connect)
+                # Recovery leaves the large Hash value on disk. This must
+                # exercise a real typed/grouped read, not a cached reply or
+                # a synthetic timing assignment.
+                large_value = b"h" * (512 * 1024)
+                assert (
+                    client.command("HSET", "private-family-disk", "field", large_value)
+                    == "1"
+                )
+                disk_value = b"d" * 8192
+                assert (
+                    client.command(
+                        "MSET",
+                        "private-family-disk-a",
+                        disk_value,
+                        "private-family-disk-b",
+                        disk_value,
+                    )
+                    == "OK"
+                )
+                list_values = [str(i).encode() + b"l" * 65536 for i in range(8)]
+                assert (
+                    client.command("RPUSH", "private-family-disk-list", *list_values)
+                    == "8"
+                )
+                zset_members = [str(i).encode() + b"z" * 32768 for i in range(16)]
+                zset_args = [
+                    arg for i, member in enumerate(zset_members) for arg in (i, member)
+                ]
+                assert (
+                    client.command("ZADD", "private-family-disk-zset", *zset_args)
+                    == "16"
+                )
+                assert (
+                    client.command("SET", "private-family-disk-string", large_value)
+                    == "OK"
+                )
+                stream_value = b"x" * 65536
+                stream_expected = []
+                for i in range(16):
+                    entry_id = f"{i + 1}-0"
+                    assert (
+                        client.command(
+                            "XADD",
+                            "private-family-stream",
+                            entry_id,
+                            "field",
+                            stream_value,
+                        )
+                        == entry_id.encode()
+                    )
+                    stream_expected.append(
+                        [entry_id.encode(), [b"field", stream_value]]
+                    )
+                client.close()
+                client = None
+                server.terminate()
+                assert server.wait(timeout=20) == 0
+                server = subprocess.Popen(
+                    server.args,
+                    env=dict(os.environ, LAVIK_TX_CLEANER_START_PAUSED="1"),
+                    stdout=log,
+                    stderr=log,
+                )
+                wait_for(connect)
+                for name, value in [
+                    ("sample-every", 1),
+                    ("slow-threshold-us", 0),
+                    ("log-enabled", "no"),
+                    ("enabled", "yes"),
+                ]:
+                    assert (
+                        client.command(
+                            "CONFIG", "SET", "latency-diagnostics-" + name, value
+                        )
+                        == "OK"
+                    )
+                assert (
+                    client.command("XRANGE", "private-family-stream", "-", "+")
+                    == stream_expected
+                )
+                # Read before any new append can attach the recovered tail
+                # to a write buffer and legitimately make these pages hot.
+                assert (
+                    client.command("GETRANGE", "private-family-disk-string", 0, -1)
+                    == large_value
+                )
+                assert client.command(
+                    "MGET", "private-family-disk-a", "private-family-disk-b"
+                ) == [disk_value, disk_value]
+                assert (
+                    client.command("LRANGE", "private-family-disk-list", 0, -1)
+                    == list_values
+                )
+                assert (
+                    client.command("ZRANGE", "private-family-disk-zset", 0, -1)
+                    == zset_members
+                )
+                assert (
+                    client.command("HGET", "private-family-disk", "field")
+                    == large_value
+                )
+                assert client.command("HGETALL", "private-family-disk") == [
+                    b"field",
+                    large_value,
+                ]
+                assert (
+                    client.command(
+                        "HSET", "private-family-disk", "field", b"g" * len(large_value)
+                    )
+                    == "0"
+                )
+                assert (
+                    client.command(
+                        "LPUSH", "private-family-disk-list", b"new-list-entry"
+                    )
+                    == "9"
+                )
+                assert (
+                    client.command(
+                        "ZADD", "private-family-disk-zset", 100, b"new-zset-member"
+                    )
+                    == "1"
+                )
+                assert (
+                    client.command(
+                        "SET", "private-family-disk-string", b"s" * len(large_value)
+                    )
+                    == "OK"
+                )
+                assert (
+                    client.command(
+                        "XADD",
+                        "private-family-stream",
+                        "17-0",
+                        "field",
+                        b"new-stream-entry",
+                    )
+                    == b"17-0"
+                )
+                assert client.command("PING") == "PONG"
+                assert (
+                    client.command("ECHO", "private-family-value")
+                    == b"private-family-value"
+                )
+                assert client.command("INCR", "private-family-counter") == "1"
+                assert (
+                    client.command("HSET", "private-family-hash", "field", "value")
+                    == "1"
+                )
+                assert (
+                    client.command("HGET", "private-family-hash", "field") == b"value"
+                )
+                assert (
+                    client.command(
+                        "MSET", "private-family-a", "a", "private-family-b", "b"
+                    )
+                    == "OK"
+                )
+                assert client.command(
+                    "MGET", "private-family-a", "private-family-b"
+                ) == [b"a", b"b"]
+                assert client.command("LPUSH", "private-family-list", "a", "b") == "2"
+                assert client.command("LRANGE", "private-family-list", 0, -1) == [
+                    b"b",
+                    b"a",
+                ]
+                assert client.command(
+                    "HGET", "private-family-disk", "field"
+                ) == b"g" * len(large_value)
+                assert client.command("MULTI") == "OK"
+                assert client.command("INCR", "private-family-counter") == "QUEUED"
+                assert (
+                    client.command("HGET", "private-family-hash", "field") == "QUEUED"
+                )
+                assert client.command("GET", "private-family-a") == "QUEUED"
+                assert client.command("EXEC") == ["2", b"value", b"a"]
+                assert client.command(
+                    "EVAL",
+                    "return {redis.call('GET',KEYS[1]),redis.call('GET',KEYS[2])}",
+                    2,
+                    "private-family-a",
+                    "private-family-b",
+                ) == [b"a", b"b"]
+                assert (
+                    client.command(
+                        "EVAL_RO",
+                        "for i=1,24 do redis.call('GET',KEYS[1]) end return 24",
+                        1,
+                        "private-family-a",
+                    )
+                    == "24"
+                )
+                assert client.command("BLPOP", "private-family-blocked", "0.01") is None
+                blocked_client = Client(port)
+                try:
+                    blocked_client.sock.sendall(
+                        Client.encode("BLPOP", "private-family-wake", 1)
+                    )
+                    wait_for(
+                        lambda: b"blocked_clients:1\r\n"
+                        in client.command("INFO", "clients")
+                    )
+                    time.sleep(0.01)
+                    assert (
+                        client.command("RPUSH", "private-family-wake", "wake-value")
+                        == "1"
+                    )
+                    assert blocked_client.read() == [
+                        b"private-family-wake",
+                        b"wake-value",
+                    ]
+                finally:
+                    blocked_client.close()
+                dump = client.command("DUMP", "private-family-disk")
+                assert isinstance(dump, bytes) and dump
+                assert client.command("SAVE") == "OK"
+                assert client.command("SADD", "private-family-sa", "a", "b") == "2"
+                assert client.command("SADD", "private-family-sb", "b", "c") == "2"
+                assert sorted(
+                    client.command("SUNION", "private-family-sa", "private-family-sb")
+                ) == [b"a", b"b", b"c"]
+                assert client.command("SORT", "private-family-sa", "ALPHA") == [
+                    b"a",
+                    b"b",
+                ]
+                assert client.command("ZADD", "private-family-za", 1, "a") == "1"
+                assert client.command("ZADD", "private-family-zb", 2, "b") == "1"
+                assert client.command(
+                    "ZUNION", 2, "private-family-za", "private-family-zb"
+                ) == [b"a", b"b"]
+                assert client.command("ZPOPMIN", "private-family-za") == [b"a", b"1"]
+                assert client.command("SETNX", "private-family-nx", "first") == "1"
+                assert (
+                    client.command("GETSET", "private-family-nx", "second") == b"first"
+                )
+                assert client.command("TYPE", "private-family-nx") == "string"
+                assert client.command("PTTL", "private-family-nx") == "-1"
+                assert client.command("EXISTS", "private-family-nx") == "1"
+                assert client.command("DEL", "private-family-nx") == "1"
+                assert (
+                    client.command("CONFIG", "SET", "latency-diagnostics-enabled", "no")
+                    == "OK"
+                )
+                raw = client.command("LATENCY", "TRACE", "GET", 128)
+                traces = {}
+                for value in raw:  # TRACE GET returns newest records first.
+                    trace = json.loads(value)
+                    if not trace.get("queued", False):
+                        traces.setdefault(trace["command"], trace)
+                expected = {
+                    "PING",
+                    "ECHO",
+                    "INCR",
+                    "HSET",
+                    "HGET",
+                    "MSET",
+                    "MGET",
+                    "LPUSH",
+                    "LRANGE",
+                }
+                assert expected <= traces.keys(), sorted(traces)
+                for command in expected:
+                    trace = traces[command]
+                    stages = {stage["name"]: stage for stage in trace["stages"]}
+                    assert {
+                        "request_queue",
+                        "dispatch",
+                        "socket_send",
+                        "server_total",
+                    } <= stages.keys(), trace
+                    assert stages["dispatch"]["kind"] == "summary", trace
+                    assert stages["server_total"]["kind"] == "summary", trace
+                    assert trace["write_ok"] is True, trace
+                for command in ("INCR", "HSET", "LPUSH"):
+                    assert {
+                        "key_lock",
+                        "store_lock",
+                        "lookup",
+                        "value_process",
+                        "append",
+                    } <= {stage["name"] for stage in traces[command]["stages"]}, traces[
+                        command
+                    ]
+                for command in ("MSET", "MGET"):
+                    assert {"tx_schedule", "tx_round"} <= {
+                        stage["name"] for stage in traces[command]["stages"]
+                    }, traces[command]
+                assert "append" in {
+                    stage["name"] for stage in traces["MSET"]["stages"]
+                }, traces["MSET"]
+                assert any(
+                    trace["command"] == "HGET"
+                    and any(stage["name"] == "read_io" for stage in trace["stages"])
+                    for trace in map(json.loads, raw)
+                ), raw
+                for command in ("MGET", "LRANGE", "ZRANGE", "GETRANGE", "HGETALL"):
+                    candidates = [
+                        json.loads(value)
+                        for value in raw
+                        if json.loads(value)["command"] == command
+                    ]
+                    cold = [
+                        trace
+                        for trace in candidates
+                        if any(stage["name"] == "read_io" for stage in trace["stages"])
+                    ]
+                    assert cold, candidates
+                    stages = {stage["name"]: stage for stage in cold[0]["stages"]}
+                    assert {"read_io", "decode"} <= stages.keys(), cold[0]
+                    if command != "HGETALL":
+                        assert stages["read_io"].get("observations", 1) >= 2, cold[0]
+                for command in ("HSET", "LPUSH", "ZADD", "SET"):
+                    appends = [
+                        stage
+                        for value in raw
+                        for trace in [json.loads(value)]
+                        if trace["command"] == command
+                        for stage in trace["stages"]
+                        if stage["name"] == "append"
+                    ]
+                    assert (
+                        appends
+                        and max(stage.get("observations", 1) for stage in appends) >= 2
+                    ), (command, appends)
+                    assert all(stage["kind"] == "summary" for stage in appends), appends
+                queued = [
+                    json.loads(value)
+                    for value in raw
+                    if json.loads(value).get("queued", False)
+                ]
+                assert len(queued) == 3, queued
+                for trace in queued:
+                    names = {stage["name"] for stage in trace["stages"]}
+                    assert {"dispatch", "server_total"} <= names, trace
+                    assert not ({"read_io", "value_process", "append"} & names), trace
+                for command, children in [
+                    ("EXEC", ["INCR", "HGET", "GET"]),
+                    ("EVAL", ["GET", "GET"]),
+                ]:
+                    trace = traces[command]
+                    assert [
+                        child["command"] for child in trace.get("children", [])
+                    ] == children, trace
+                    assert trace["children_omitted"] == 0, trace
+                    assert "child_execute" in {
+                        stage["name"] for stage in trace["stages"]
+                    }, trace
+                assert {"script_prepare", "script_run"} <= {
+                    stage["name"] for stage in traces["EVAL"]["stages"]
+                }, traces["EVAL"]
+                bounded = traces["EVAL_RO"]
+                assert (
+                    len(bounded["children"]) == 16 and bounded["children_omitted"] == 8
+                ), bounded
+                child_stage = next(
+                    stage
+                    for stage in bounded["stages"]
+                    if stage["name"] == "child_execute"
+                )
+                assert child_stage["observations"] == 24, bounded
+                blocked = traces["BLPOP"]
+                block_stage = next(
+                    (
+                        stage
+                        for stage in blocked["stages"]
+                        if stage["name"] == "blocking_wait"
+                    ),
+                    None,
+                )
+                assert block_stage and block_stage["duration_us"] >= 5000, blocked
+                wake_stages = {stage["name"] for stage in blocked["stages"]}
+                assert {
+                    "blocking_wait",
+                    "wake_resume",
+                    "key_lock",
+                    "store_lock",
+                    "lookup",
+                    "value_process",
+                    "append",
+                } <= wake_stages, blocked
+                assert any(
+                    {"route_to_owner", "route_back"}
+                    <= {stage["name"] for stage in traces[command]["stages"]}
+                    for command in ("INCR", "HSET", "LPUSH")
+                ), {command: traces[command] for command in ("INCR", "HSET", "LPUSH")}
+                for command in ("PING", "ECHO", "INCR", "HSET", "LPUSH", "MGET"):
+                    assert "reply_build" in {
+                        stage["name"] for stage in traces[command]["stages"]
+                    }, traces[command]
+                dump_stages = {
+                    stage["name"]: stage for stage in traces["DUMP"]["stages"]
+                }
+                assert dump_stages["socket_send"].get("observations", 1) >= 2, traces[
+                    "DUMP"
+                ]
+                assert "reply_build" in dump_stages, traces["DUMP"]
+                stream_stages = {
+                    stage["name"]: stage for stage in traces["XRANGE"]["stages"]
+                }
+                assert {"read_io", "decode", "reply_build"} <= stream_stages.keys(), (
+                    traces["XRANGE"]
+                )
+                assert stream_stages["read_io"].get("observations", 1) >= 2, traces[
+                    "XRANGE"
+                ]
+                assert "append" in {
+                    stage["name"] for stage in traces["XADD"]["stages"]
+                }, traces["XADD"]
+                assert "snapshot_prepare" in {
+                    stage["name"] for stage in traces["SAVE"]["stages"]
+                }, traces["SAVE"]
+                for command in ("SUNION", "SORT", "ZUNION", "ZPOPMIN"):
+                    assert {"lookup", "decode"} <= {
+                        stage["name"] for stage in traces[command]["stages"]
+                    }, traces[command]
+                for command in ("SETNX", "GETSET", "DEL"):
+                    assert {"lookup", "store_lock", "append"} <= {
+                        stage["name"] for stage in traces[command]["stages"]
+                    }, traces[command]
+                for command in ("TYPE", "PTTL", "EXISTS"):
+                    assert "lookup" in {
+                        stage["name"] for stage in traces[command]["stages"]
+                    }, traces[command]
+                assert "private-family" not in "".join(value.decode() for value in raw)
+                print(
+                    "PASS: canonical identities and common lifecycle across command families"
                 )
             finally:
                 if client:
@@ -688,6 +1186,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     binary = str(Path(args.binary).resolve())
+    generic_commands_case(binary)
     run(binary)
     logging_case(binary)
     logging_case(binary, unavailable=True)

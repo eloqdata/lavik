@@ -59,10 +59,12 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteList(
                          operation.kind_ == ListOperationKind::kIndex ||
                          operation.kind_ == ListOperationKind::kRange ||
                          operation.kind_ == ListOperationKind::kPosition;
+  TraceSpanScope key_wait(operation.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(key));
+  key_wait.End();
   co_return co_await ExecuteListLocked(db_id, key, digest, operation, nullptr,
                                        replication, mutation_precondition);
 }

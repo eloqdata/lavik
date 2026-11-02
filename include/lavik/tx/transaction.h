@@ -28,6 +28,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/latency_stage.h"
 #include "lavik/storage/format.h"
 #include "lavik/tx/fingerprint.h"
 #include "lavik/tx/tx_queue.h"
@@ -90,7 +91,10 @@ using ShardValidator = absl::Status (*)(void* ctx, unsigned shard_id);
 // so the frame-embedded transaction cannot dangle.
 class Transaction {
  public:
-  Transaction() = default;
+  // The caller joins every round before destruction; the trace is a borrowed
+  // foreground context and is never retained by a queue after that join.
+  explicit Transaction(OnlineLatencyTrace* diagnostics = nullptr)
+      : diagnostics_(diagnostics) {}
   Transaction(const Transaction&) = delete;
   Transaction& operator=(const Transaction&) = delete;
 
@@ -128,7 +132,8 @@ class Transaction {
   // Runs `cb` on every shard's slice. `release` drops all locks and queue
   // positions once the hop completes. Single-shard calls retain one owner-
   // local no-txid guard across non-releasing hops.
-  bycorf::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release);
+  bycorf::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release,
+                                     TraceStage stage = TraceStage::kTxRound);
 
   // Final no-op hop that releases every shard's locks and queue position.
   bycorf::Task<absl::Status> Release();
@@ -163,6 +168,8 @@ class Transaction {
     bool schedule_failed_ = false;
     bool granted_ = false;
     bool entry_hook_invoked_ = false;
+    // Owner-only clock: arming to actual hold eligibility, before callback CPU.
+    std::uint64_t key_wait_start_ns_ = 0;
   };
 
   struct RoundAwaiter {
@@ -187,6 +194,7 @@ class Transaction {
   ShardSlice Slice(const ShardData& sd) const;
   bycorf::Task<absl::Status> ExecuteSingleShard(bool release);
 
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   bool releasing_ = false;
   bool scheduled_ = false;
   std::uint64_t txid_ = 0;

@@ -35,14 +35,12 @@
     "list": [
       {
         "name": "command",
-        "label": "Command",
-        "type": "custom",
-        "query": "GET,SET",
-        "includeAll": true,
-        "allValue": ".*",
+        "label": "Command (regex)",
+        "type": "textbox",
+        "query": ".*",
         "current": {
-          "text": "All",
-          "value": "$__all"
+          "text": ".*",
+          "value": ".*"
         }
       },
       {
@@ -76,19 +74,19 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Charts show the **latest matching command** in the selected time range. Enter an exact **Trace ID (regex)** from a log row to pin a command.\n\n**Left:** measured intervals placed by start time. **Right:** cumulative duration per stage. Stages overlap and must not be summed. Repeated reads show up to eight retained intervals per stage; totals include all observations. Expand the log for interval counts and omissions. Zero-microsecond intervals may be invisible. Logs require the optional Loki/Alloy profile; retained history is also available through `LATENCY TRACE SHOW <id>`."
+        "content": "Charts show the **latest matching command** in the selected time range. Enter a **Command regex** or an exact **Trace ID** to select it.\n\n**Enclosing operations** shows parent spans such as `server_total`, `dispatch` and transaction rounds. **Measured phases** shows actual operations inside them. Parent spans contain their children and are displayed separately. EXEC/Lua show up to 16 named child command envelopes here; omitted children remain counted in the log. Parallel and repeated phases may overlap: their cumulative durations are resource-time sums, not a breakdown that adds to 100%. Up to eight exact intervals per stage are retained; totals include every observation. Expand the log for counts and omissions. Logs require the optional Loki/Alloy profile; recent history is also available with `LATENCY TRACE SHOW <id>`."
       }
     },
     {
-      "id": 3,
-      "title": "Latest matching command — stage timeline",
-      "description": "Horizontal position is start_us from command readiness; each visible bar is one measured interval. Stages may overlap or be nested. Repeated read stages show only their earliest eight retained intervals (numbered #1–#8); consult the log for intervals_dropped. Sub-microsecond values are rounded down in the existing JSON and can be invisible. server_total is the measured command wall time.",
+      "id": 5,
+      "title": "Latest matching command \u2014 enclosing operations and children",
+      "description": "Summary envelopes contain measured phases below. Their overlap expresses containment; do not add them to the phase durations.",
       "type": "barchart",
       "gridPos": {
         "x": 0,
         "y": 5,
-        "w": 12,
-        "h": 16
+        "w": 24,
+        "h": 8
       },
       "datasource": {
         "type": "loki",
@@ -97,7 +95,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{ $sep := \\\"\\\" }}[{{ range $stage := fromJson .stages }}{{ if $stage.intervals }}{{ range $i, $span := $stage.intervals }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }} #{{ add $i 1 }}\\\",\\\"start_us\\\":{{ $span.start_us }},\\\"duration_us\\\":{{ $span.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ else }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }}\\\",\\\"start_us\\\":{{ $stage.start_us }},\\\"duration_us\\\":{{ $stage.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ end }}]\"",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\", children=\"children\" | line_format `{{ $sep := \"\" }}[{{ range $stage := fromJson .stages }}{{ if and (eq $stage.kind \"summary\") (ne $stage.name \"child_execute\") }}{{ if $stage.intervals }}{{ range $i, $span := $stage.intervals }}{{ $sep }}{\"name\":\"{{ $stage.name }} #{{ add $i 1 }}\",\"start_us\":{{ $span.start_us }},\"duration_us\":{{ $span.duration_us }}}{{ $sep = \",\" }}{{ end }}{{ else }}{{ $sep }}{\"name\":\"{{ $stage.name }}\",\"start_us\":{{ $stage.start_us }},\"duration_us\":{{ $stage.duration_us }}}{{ $sep = \",\" }}{{ end }}{{ end }}{{ end }}{{ range $i, $child := fromJson .children }}{{ $sep }}{\"name\":\"child {{ $child.command }} #{{ add $i 1 }}\",\"start_us\":{{ $child.start_us }},\"duration_us\":{{ $child.duration_us }}}{{ $sep = \",\" }}{{ end }}]`",
           "queryType": "range",
           "direction": "backward",
           "maxLines": 1
@@ -138,7 +136,145 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "\u00b5s",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "fillOpacity": 90,
+            "lineWidth": 0,
+            "axisLabel": "Time since command readiness",
+            "axisPlacement": "auto",
+            "axisGridShow": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "start_us"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "transparent"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_us"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Measured interval"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xField": "name",
+        "stacking": "normal",
+        "showValue": "never",
+        "groupWidth": 0.75,
+        "barWidth": 0.8,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "text": {
+          "valueSize": 14
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Latest matching command \u2014 measured phase timeline",
+      "description": "Horizontal position is start_us from command readiness; each visible bar is one measured interval. Stages may overlap or be nested. Repeated read stages show only their earliest eight retained intervals (numbered #1\u2013#8); consult the log for intervals_dropped. Sub-microsecond values are rounded down in the existing JSON and can be invisible. server_total is the measured command wall time.",
+      "type": "barchart",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 16
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lavik-loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{ $sep := \\\"\\\" }}[{{ range $stage := fromJson .stages }}{{ if ne $stage.kind \\\"summary\\\" }}{{ if $stage.intervals }}{{ range $i, $span := $stage.intervals }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }} #{{ add $i 1 }}\\\",\\\"start_us\\\":{{ $span.start_us }},\\\"duration_us\\\":{{ $span.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ else }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }}\\\",\\\"start_us\\\":{{ $stage.start_us }},\\\"duration_us\\\":{{ $stage.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ end }}{{ end }}]\"",
+          "queryType": "range",
+          "direction": "backward",
+          "maxLines": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "reduce",
+          "options": {
+            "reducers": ["last"],
+            "mode": "seriesToRows"
+          }
+        },
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Last",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": ["name", "start_us", "duration_us"]
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "\u00b5s",
           "min": 0,
           "color": {
             "mode": "fixed",
@@ -219,12 +355,12 @@
     },
     {
       "id": 4,
-      "title": "Latest matching command — cumulative stage durations",
+      "title": "Latest matching command \u2014 cumulative phase durations",
       "description": "duration_us for each stage of the same latest matching command, including all observations of repeated reads. Parent/child and parallel stages overlap: do not sum bars or interpret them as percentages of server_total.",
       "type": "barchart",
       "gridPos": {
         "x": 12,
-        "y": 5,
+        "y": 13,
         "w": 12,
         "h": 16
       },
@@ -235,7 +371,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{.stages}}\"",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{ $sep := \\\"\\\" }}[{{ range $stage := fromJson .stages }}{{ if ne $stage.kind \\\"summary\\\" }}{{ $sep }}{\\\"name\\\":\\\"{{ $stage.name }}\\\",\\\"duration_us\\\":{{ $stage.duration_us }}}{{ $sep = \\\",\\\" }}{{ end }}{{ end }}]\"",
           "queryType": "range",
           "direction": "backward",
           "maxLines": 1
@@ -276,7 +412,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "\u00b5s",
           "min": 0,
           "color": {
             "mode": "fixed",
@@ -425,11 +561,11 @@
     },
     {
       "id": 2,
-      "title": "Selected slow GET/SET traces",
+      "title": "Selected slow command traces",
       "type": "logs",
       "gridPos": {
         "x": 0,
-        "y": 21,
+        "y": 29,
         "w": 24,
         "h": 18
       },

@@ -26,7 +26,8 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
-    Decode decode, GroupReadLimiter* limiter, ReadLatencyTrace* trace) {
+    Decode decode, GroupReadLimiter* limiter, ReadLatencyTrace* trace,
+    OnlineLatencyTrace* diagnostics) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
@@ -34,7 +35,11 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
   // sidecar exists only for timed reads and is bounded by the existing read
   // window. Its physical reads may hop workers; merge only after returning to
   // this key owner, without changing the parent's routing or clock anchor.
-  auto detail = trace ? std::make_unique<ReadLatencyTrace>() : nullptr;
+  auto* observer =
+      diagnostics ? diagnostics : (trace ? trace->diagnostics_ : nullptr);
+  auto detail =
+      trace || observer ? std::make_unique<ReadLatencyTrace>() : nullptr;
+  if (detail) detail->diagnostics_ = observer;
   absl::Cleanup merge_trace = [&] {
     if (!trace) return;
     trace->buffer_timing_.Merge(detail->buffer_timing_);
@@ -123,6 +128,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     const auto after_io = object->ReadStatus();
     if (!after_io.ok()) co_return after_io;
     if (loaded.ok()) {
+      TraceSpanScope decode_scope(observer, TraceStage::kDecode);
       const auto bytes = loaded->value();
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -161,7 +167,8 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
-    GroupReadLimiter* limiter, SortedSetMemberValidation validation) {
+    GroupReadLimiter* limiter, SortedSetMemberValidation validation,
+    OnlineLatencyTrace* diagnostics) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
       [validation](std::string_view payload, std::uint64_t sequence,
@@ -177,7 +184,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
       },
-      limiter);
+      limiter, nullptr, diagnostics);
 }
 
 Task<absl::StatusOr<LoadedOrderedGroup>>
@@ -185,7 +192,7 @@ StorageEngine::Impl::LoadEncodedSortedSetGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
-    GroupReadLimiter* limiter) {
+    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [](std::string_view payload, std::uint64_t sequence,
@@ -200,14 +207,15 @@ StorageEngine::Impl::LoadEncodedSortedSetGroupSnapshot(
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
       },
-      limiter);
+      limiter, nullptr, diagnostics);
 }
 
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::LoadOrderedListRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, std::size_t first,
-    std::size_t count, GroupReadLimiter* limiter, bool packed_output) {
+    std::size_t count, GroupReadLimiter* limiter, bool packed_output,
+    OnlineLatencyTrace* diagnostics) {
   return LoadOrderedGroup<ListResult>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [first, count, packed_output](
@@ -229,7 +237,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::LoadOrderedListRange(
         }
         return result;
       },
-      limiter);
+      limiter, nullptr, diagnostics);
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedSortedSetPage>>
@@ -237,7 +245,8 @@ StorageEngine::Impl::LoadSortedSetPage(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
-    SortedSetMemberValidation validation, SortedSetPageReadMode mode) {
+    SortedSetMemberValidation validation, SortedSetPageReadMode mode,
+    OnlineLatencyTrace* diagnostics) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [validation, mode](
@@ -269,7 +278,8 @@ StorageEngine::Impl::LoadSortedSetPage(
           return absl::DataLossError("ordered page score bounds mismatch");
         return LoadedSortedSetPage{std::move(loaded), std::move(*entries),
                                    std::nullopt};
-      });
+      },
+      nullptr, nullptr, diagnostics);
 }
 
 absl::StatusOr<PackedSortedSetValues> StorageEngine::Impl::PackSortedSetPage(
@@ -302,7 +312,7 @@ StorageEngine::Impl::LoadPackedSortedSetPage(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
-    GroupReadLimiter* limiter) {
+    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics) {
   return LoadOrderedGroup<PackedSortedSetValues>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [](std::string_view payload, std::uint64_t,
@@ -316,7 +326,7 @@ StorageEngine::Impl::LoadPackedSortedSetPage(
           return absl::DataLossError("ordered page score bounds mismatch");
         return PackSortedSetPage(*entries);
       },
-      limiter);
+      limiter, nullptr, diagnostics);
 }
 
 Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>

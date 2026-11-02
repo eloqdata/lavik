@@ -142,7 +142,9 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         auto scratch = budget.Reserve(1);
         if (!scratch.ok()) co_return scratch.status();
         auto page = co_await LoadOrderedGroupSnapshot(
-            store, partition, db_id, key, digest, object, id.prefix_);
+            store, partition, db_id, key, digest, object, id.prefix_, false,
+            nullptr, SortedSetMemberValidation::kVerifyUnique,
+            operation.diagnostics_);
         if (!page.ok()) co_return page.status();
         const auto& entries = page->snapshot_.entries_;
         for (std::size_t item = 0; item < entries.size() && visited < inspect;
@@ -401,7 +403,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
             std::min<std::uint64_t>(remaining, groups[i].item_count_ - offset);
         auto values = co_await LoadOrderedListRange(
             store, partition, db_id, key, digest, object, groups[i].id_, offset,
-            take, nullptr, packed_output);
+            take, nullptr, packed_output, operation.diagnostics_);
         if (!values.ok()) {
           read_status = values.status();
           break;
@@ -460,7 +462,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
             window.Add(LoadOrderedListRange(
                            store, partition, db_id, key, digest, object,
                            groups[begin_page + *ordinal].id_, range.first_,
-                           range.count_, window.limiter(), packed_output),
+                           range.count_, window.limiter(), packed_output,
+                           operation.diagnostics_),
                        *ordinal);
           }
           if (!read_status.ok()) break;
@@ -504,7 +507,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object,
-        directory.groups()[first->group_index_].id_);
+        directory.groups()[first->group_index_].id_, false, nullptr,
+        SortedSetMemberValidation::kVerifyUnique, operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     if (first->offset_ >= page->snapshot_.entries_.size())
       co_return absl::DataLossError("List replacement rank exceeds page");
@@ -533,9 +537,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
       continue;
     }
     if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
-    auto page =
-        co_await LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
-                                          object, directory.groups()[i].id_);
+    auto page = co_await LoadOrderedGroupSnapshot(
+        store, partition, db_id, key, digest, object, directory.groups()[i].id_,
+        false, nullptr, SortedSetMemberValidation::kVerifyUnique,
+        operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     loaded.push_back(std::move(*page));
   }
@@ -667,7 +672,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   const auto status = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition);
+      mutation_precondition, nullptr, operation.diagnostics_);
   if (!status.ok()) co_return status;
   co_return result;
 }

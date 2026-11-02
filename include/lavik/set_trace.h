@@ -19,12 +19,21 @@
 #include <cstdint>
 
 #include "lavik/latency_clock.h"
+#include "lavik/latency_stage.h"
 #ifndef LAVIK_ENABLE_TRACE
 #define LAVIK_ENABLE_TRACE 0
 #endif
 namespace lavik {
 // Full payload exists only in a selected online sidecar or a trace build.
 struct SetLatencyTrace : LatencySegmentClock {
+  OnlineLatencyTrace* diagnostics_ = nullptr;
+  // Selected pages share only the root's worker-local clock, never mutable
+  // physical payloads. Legacy-only sidecars keep their independent clock.
+  std::uint64_t NowNanos() noexcept {
+    return diagnostics_ ? TraceNowNanos(diagnostics_)
+                        : LatencySegmentClock::NowNanos();
+  }
+
   std::uint64_t request_start_ns_ = 0;
   std::uint64_t owner_start_ns_ = 0;
   std::uint64_t key_lock_start_ns_ = 0;

@@ -30,6 +30,7 @@
 #include "absl/container/flat_hash_set.h"
 #include "lavik/command_args.h"
 #include "lavik/expiration.h"
+#include "lavik/latency_stage.h"
 #include "lavik/memory.h"
 #include "lavik/storage/engine.h"
 
@@ -87,7 +88,11 @@ template <typename Reader>
 bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
     CommandArgsView arguments, std::size_t first_source,
     std::size_t last_source, SetAggregate kind, bool cardinality_only,
-    std::uint64_t limit, Reader& read) {
+    std::uint64_t limit, Reader& read,
+    OnlineLatencyTrace* diagnostics = nullptr) {
+  // Exclude awaited page/probe reads from coordinator value processing.
+  std::optional<TraceSpanScope> processing;
+  if (diagnostics) processing.emplace(diagnostics, TraceStage::kValueProcess);
   SetAggregateResult result;
   // Key holds prevent writes; a pinned command clock also prevents expiration
   // from changing the source between metadata, scan, and membership probes.
@@ -112,7 +117,10 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
       storage::HashOperation length;
       length.kind_ = storage::HashOperationKind::kLength;
       length.now_ms_ = now_ms;
+      processing.reset();
       auto checked = co_await read(i, std::move(length));
+      if (diagnostics)
+        processing.emplace(diagnostics, TraceStage::kValueProcess);
       if (!checked.ok()) co_return checked.status();
       lengths[i - first_source] = checked->length_;
       if (kind == SetAggregate::kIntersection &&
@@ -180,7 +188,10 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
       // Held key intent keeps the routing cursor stable. Consume each leaf in
       // stored order without SCAN's digest index or sorting; owned strings can
       // survive the membership reads below without retaining physical leases.
+      processing.reset();
       auto page = co_await read(current, std::move(projection));
+      if (diagnostics)
+        processing.emplace(diagnostics, TraceStage::kValueProcess);
       if (!page.ok()) co_return page.status();
       cursor = page->cursor_;
       std::size_t scratch_bytes = 0;
@@ -222,7 +233,10 @@ bycorf::Task<absl::StatusOr<SetAggregateResult>> AggregateSetPages(
             // LIMIT 1 and a shrinking candidate batch need only one bit, not
             // an admitted vector containing an owned empty Set value.
             if (single) probe.kind_ = storage::HashOperationKind::kExists;
+            processing.reset();
             auto present = co_await read(other, std::move(probe));
+            if (diagnostics)
+              processing.emplace(diagnostics, TraceStage::kValueProcess);
             if (!present.ok()) co_return present.status();
             if (single) {
               if ((present->integer_ != 0) !=

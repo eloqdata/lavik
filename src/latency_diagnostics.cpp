@@ -18,51 +18,160 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <thread>
 
+#include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "bycorf/runtime/cross_core.h"
 #include "bycorf/runtime/worker.h"
+#include "lavik/command_table.h"
 #include "lavik/logging.h"
 #include "spdlog/sinks/rotating_file_sink.h"
 #include "spdlog/spdlog.h"
 
 namespace lavik {
+
+struct TraceChild {
+  std::uint16_t command = 0;
+  std::uint64_t start = 0, end = 0;
+};
+struct TraceTimingData {
+  std::array<TraceChild, 16> children{};
+  std::uint64_t child_count = 0;
+  void AddChild(TraceChild child) noexcept {
+    if (child_count < children.size()) children[child_count] = child;
+    ++child_count;
+  }
+  std::array<LatencyIntervals, static_cast<unsigned>(TraceStage::kCount)>
+      stages;
+};
+
+struct TraceRecorder : TraceTimingData {
+  LatencySegmentClock clock;
+  unsigned worker = 0;
+};
+
+struct TraceSession {
+  explicit TraceSession(unsigned count) : workers(count) {}
+
+  TraceRecorder* Local() {
+    const auto worker = bycorf::ThisWorker().id_;
+    assert(worker < workers.size());
+    // The vector shape is immutable before publication. Each worker owns a
+    // distinct element, including its first allocation, so parallel shards
+    // never mutate the same object or clock anchor.
+    auto& recorder = workers[worker];
+    if (!recorder) {
+      recorder = std::make_unique<TraceRecorder>();
+      recorder->worker = worker;
+    }
+    return recorder.get();
+  }
+
+  std::vector<std::unique_ptr<TraceRecorder>> workers;
+};
+
 namespace {
 constexpr unsigned kCapacity = 256;
 constexpr unsigned kHistory = 128;
 constexpr unsigned kLogCapacity = 64;
+constexpr std::array<std::string_view,
+                     static_cast<unsigned>(TraceCommandFamily::kCount)>
+    kFamilies{"get",         "set",         "read",   "write",
+              "multi_key",   "transaction", "script", "blocking",
+              "replication", "pubsub",      "admin",  "other"};
+
+TraceCommandFamily Family(const CommandSpec* spec) {
+  if (!spec) return TraceCommandFamily::kOther;
+  switch (spec->kind_) {
+    case CommandKind::kGet:
+      return TraceCommandFamily::kGet;
+    case CommandKind::kSet:
+      return TraceCommandFamily::kSet;
+    case CommandKind::kExec:
+    case CommandKind::kMulti:
+    case CommandKind::kWatch:
+    case CommandKind::kUnwatch:
+    case CommandKind::kDiscard:
+      return TraceCommandFamily::kTransaction;
+    case CommandKind::kEval:
+    case CommandKind::kEvalRo:
+    case CommandKind::kEvalSha:
+    case CommandKind::kEvalShaRo:
+    case CommandKind::kFCall:
+    case CommandKind::kFCallRo:
+      return TraceCommandFamily::kScript;
+    case CommandKind::kWait:
+      return TraceCommandFamily::kReplication;
+    case CommandKind::kPublish:
+    case CommandKind::kSubscribe:
+    case CommandKind::kUnsubscribe:
+    case CommandKind::kPSubscribe:
+    case CommandKind::kPUnsubscribe:
+    case CommandKind::kPubSub:
+      return TraceCommandFamily::kPubSub;
+    default:
+      break;
+  }
+  if (spec->flags_ & kCmdMayBlock) return TraceCommandFamily::kBlocking;
+  if (spec->flags_ & kCmdMultiShard) return TraceCommandFamily::kMultiKey;
+  if (spec->flags_ & kCmdWrite) return TraceCommandFamily::kWrite;
+  if (spec->flags_ & kCmdReadOnly) return TraceCommandFamily::kRead;
+  if (spec->flags_ & kCmdAdmin) return TraceCommandFamily::kAdmin;
+  return TraceCommandFamily::kOther;
+}
 constexpr std::array<std::string_view, 5> kResources{
     "key_lock", "store_lock", "read_buffer", "write_buffer", "durability"};
-enum Stage {
-  kRequestQueue,
-  kDispatch,
-  kRouteToOwner,
-  kRouteBack,
-  kKeyLock,
-  kStoreLock,
-  kLookup,
-  kReadBuffer,
-  kReadIo,
-  kAppendCapacity,
-  kAppend,
-  kDurabilityWait,
-  kResponseQueue,
-  kSocketSend,
-  kServerTotal,
-  kDecode,
-  kStageCount
-};
-constexpr std::array<std::string_view, kStageCount> kStages{
-    "request_queue",  "dispatch",        "route_to_owner", "route_back",
-    "key_lock",       "store_lock",      "lookup",         "read_buffer",
-    "read_io",        "append_capacity", "append",         "durability_wait",
-    "response_queue", "socket_send",     "server_total",   "decode"};
+using enum TraceStage;
+constexpr auto kStageCount = static_cast<unsigned>(TraceStage::kCount);
+constexpr unsigned StageIndex(TraceStage stage) {
+  return static_cast<unsigned>(stage);
+}
+bool IsSummaryStage(unsigned stage) {
+  return stage == StageIndex(kReplyBuild) || stage == StageIndex(kAppend) ||
+         stage == StageIndex(kDispatch) || stage == StageIndex(kServerTotal) ||
+         stage == StageIndex(kTxRound) || stage == StageIndex(kChildExecute) ||
+         stage == StageIndex(kScriptRun) || stage == StageIndex(kTxFinish);
+}
+constexpr std::array<std::string_view, kStageCount> kStages{"request_queue",
+                                                            "dispatch",
+                                                            "route_to_owner",
+                                                            "route_back",
+                                                            "key_lock",
+                                                            "store_lock",
+                                                            "lookup",
+                                                            "read_buffer",
+                                                            "read_io",
+                                                            "append_capacity",
+                                                            "append",
+                                                            "durability_wait",
+                                                            "response_queue",
+                                                            "socket_send",
+                                                            "server_total",
+                                                            "decode",
+                                                            "value_process",
+                                                            "admission_wait",
+                                                            "reply_build",
+                                                            "tx_schedule",
+                                                            "tx_round",
+                                                            "tx_finish",
+                                                            "commit_queue_wait",
+                                                            "blocking_wait",
+                                                            "wake_resume",
+                                                            "replication_fence",
+                                                            "replica_ack_wait",
+                                                            "watch_check",
+                                                            "child_execute",
+                                                            "script_prepare",
+                                                            "script_run",
+                                                            "publish_fanout",
+                                                            "snapshot_prepare"};
 constexpr std::array<std::uint64_t, 15> kBoundsUs{
     1,     4,      16,      64,      256,      1000,     4000,     16000,
     64000, 256000, 1000000, 4000000, 16000000, 64000000, 256000000};
@@ -81,7 +190,7 @@ struct Metrics {
   std::array<std::uint64_t, 5> events{}, waiters{};
   std::uint64_t eligible = 0, selected = 0, pool_dropped = 0, filtered = 0,
                 retained = 0, overwritten = 0, cancelled = 0, log_dropped = 0;
-  std::array<std::array<Histogram, kStages.size()>, 2> hist{};
+  std::array<std::array<Histogram, kStages.size()>, kFamilies.size()> hist{};
 };
 struct Shard {
   Metrics metrics;
@@ -130,42 +239,55 @@ std::uint64_t Duration(const Span& span) {
 }
 std::array<Span, kStages.size()> Spans(const OnlineLatencyTrace& t) {
   std::array<Span, kStages.size()> s{};
-  s[kRequestQueue] = {t.ready_ns_, t.dispatch_ns_};
-  s[kDispatch] = {t.dispatch_ns_, t.dispatch_done_ns_};
-  if (t.is_set_) {
+  s[StageIndex(kRequestQueue)] = {t.ready_ns_, t.dispatch_ns_};
+  s[StageIndex(kDispatch)] = {t.dispatch_ns_, t.dispatch_done_ns_};
+  if (t.family_ == TraceCommandFamily::kSet) {
     const auto& v = t.set_;
     if (v.remote_) {
-      s[kRouteToOwner] = {t.dispatch_ns_, v.owner_start_ns_};
-      s[kRouteBack] = {v.owner_done_ns_, t.dispatch_done_ns_};
+      s[StageIndex(kRouteToOwner)] = {t.dispatch_ns_, v.owner_start_ns_};
+      s[StageIndex(kRouteBack)] = {v.owner_done_ns_, t.dispatch_done_ns_};
     }
-    s[kKeyLock] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
-    s[kStoreLock] = {v.store_lock_start_ns_, v.store_lock_acquired_ns_};
-    s[kLookup] = {v.store_lock_acquired_ns_, v.lookup_done_ns_};
-    s[kAppendCapacity] = {v.block_wait_start_ns_, v.block_ready_ns_};
-    s[kAppend] = {v.append_start_ns_, v.append_done_ns_};
-    s[kDurabilityWait] = {v.durability_start_ns_, v.durability_done_ns_};
-  } else {
+    s[StageIndex(kKeyLock)] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
+    s[StageIndex(kStoreLock)] = {v.store_lock_start_ns_,
+                                 v.store_lock_acquired_ns_};
+    s[StageIndex(kLookup)] = {v.store_lock_acquired_ns_, v.lookup_done_ns_};
+    s[StageIndex(kAppendCapacity)] = {v.block_wait_start_ns_,
+                                      v.block_ready_ns_};
+    s[StageIndex(kAppend)] = {v.append_start_ns_, v.append_done_ns_};
+    s[StageIndex(kDurabilityWait)] = {v.durability_start_ns_,
+                                      v.durability_done_ns_};
+  } else if (t.family_ == TraceCommandFamily::kGet) {
     const auto& v = t.read_;
     // Direct remote reads execute I/O on the connection worker; ownership
     // alone must not create a fictitious outbound or return routing span.
     if (v.remote_) {
-      s[kRouteToOwner] = {t.dispatch_ns_, v.owner_start_ns_};
-      s[kRouteBack] = {v.owner_done_ns_, t.dispatch_done_ns_};
+      s[StageIndex(kRouteToOwner)] = {t.dispatch_ns_, v.owner_start_ns_};
+      s[StageIndex(kRouteBack)] = {v.owner_done_ns_, t.dispatch_done_ns_};
     }
-    s[kKeyLock] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
-    s[kLookup] = {v.owner_start_ns_, v.lookup_done_ns_};
-    s[kReadBuffer] = {v.buffer_acquire_start_ns_, v.buffer_acquired_ns_};
-    if (v.disk_read_) s[kReadIo] = {v.io_submit_ns_, v.io_complete_ns_};
+    s[StageIndex(kKeyLock)] = {v.key_lock_start_ns_, v.key_lock_acquired_ns_};
+    s[StageIndex(kLookup)] = {v.owner_start_ns_, v.lookup_done_ns_};
+    s[StageIndex(kReadBuffer)] = {v.buffer_acquire_start_ns_,
+                                  v.buffer_acquired_ns_};
+    if (v.disk_read_)
+      s[StageIndex(kReadIo)] = {v.io_submit_ns_, v.io_complete_ns_};
     if (v.buffer_timing_.count)
-      s[kReadBuffer] = {v.buffer_timing_.first_ns, v.buffer_timing_.last_ns,
-                        &v.buffer_timing_};
+      s[StageIndex(kReadBuffer)] = {v.buffer_timing_.first_ns,
+                                    v.buffer_timing_.last_ns,
+                                    &v.buffer_timing_};
     if (v.io_timing_.count)
-      s[kReadIo] = {v.io_timing_.first_ns, v.io_timing_.last_ns, &v.io_timing_};
-    s[kDecode] = {v.io_complete_ns_, v.decode_done_ns_};
+      s[StageIndex(kReadIo)] = {v.io_timing_.first_ns, v.io_timing_.last_ns,
+                                &v.io_timing_};
+    s[StageIndex(kDecode)] = {v.io_complete_ns_, v.decode_done_ns_};
   }
-  s[kResponseQueue] = {t.dispatch_done_ns_, t.send_ns_};
-  s[kSocketSend] = {t.send_ns_, t.done_ns_};
-  s[kServerTotal] = {t.ready_ns_, t.done_ns_};
+  s[StageIndex(kResponseQueue)] = {t.dispatch_done_ns_, t.send_ns_};
+  s[StageIndex(kSocketSend)] = {t.send_ns_, t.done_ns_};
+  s[StageIndex(kServerTotal)] = {t.ready_ns_, t.done_ns_};
+  if (t.timings_) {
+    for (unsigned i = 0; i < kStageCount; ++i) {
+      const auto& timing = t.timings_->stages[i];
+      if (timing.count) s[i] = {timing.first_ns, timing.last_ns, &timing};
+    }
+  }
   return s;
 }
 bool Valid(const Span& s) { return s.start && s.end >= s.start; }
@@ -174,11 +296,14 @@ std::string Json(const OnlineLatencyTrace& t) {
       "{\"event\":\"command_latency_trace\",\"level\":\"info\",\"timestamp_"
       "unix_ns\":\"",
       t.timestamp_ns_, "\",\"trace_id\":\"", t.id_, "\",\"command\":\"",
-      t.is_set_ ? "SET" : "GET", "\",\"worker\":", t.origin_,
+      absl::AsciiStrToUpper(CommandIdentityName(t.command_id_)),
+      "\",\"command_family\":\"", kFamilies[static_cast<unsigned>(t.family_)],
+      "\",\"worker\":", t.origin_,
       ",\"total_us\":", (t.done_ns_ - t.ready_ns_) / 1000,
       ",\"threshold_us\":", t.threshold_us_,
       ",\"sample_every\":", t.sample_every_,
-      ",\"write_ok\":", t.write_ok_ ? "true" : "false", ",\"stages\":[");
+      ",\"write_ok\":", t.write_ok_ ? "true" : "false",
+      ",\"queued\":", t.queued_ ? "true" : "false", ",\"stages\":[");
   const auto spans = Spans(t);
   bool first = true;
   for (unsigned i = 0; i < spans.size(); ++i) {
@@ -186,7 +311,8 @@ std::string Json(const OnlineLatencyTrace& t) {
     if (!Valid(span) || span.start < t.ready_ns_) continue;
     if (!first) out += ',';
     first = false;
-    absl::StrAppend(&out, "{\"name\":\"", kStages[i],
+    absl::StrAppend(&out, "{\"name\":\"", kStages[i], "\",\"kind\":\"",
+                    IsSummaryStage(i) ? "summary" : "phase",
                     "\",\"start_us\":", (span.start - t.ready_ns_) / 1000,
                     ",\"duration_us\":", Duration(span) / 1000);
     if (span.timing && span.timing->count > 1) {
@@ -208,12 +334,25 @@ std::string Json(const OnlineLatencyTrace& t) {
     }
     out += '}';
   }
-  out += "]}";
+  out += "],\"children\":[";
+  const auto child_count = t.timings_ ? t.timings_->child_count : 0;
+  const auto retained = std::min<std::uint64_t>(child_count, 16);
+  for (unsigned i = 0; i < retained; ++i) {
+    const auto& child = t.timings_->children[i];
+    if (i) out += ',';
+    absl::StrAppend(&out, "{\"command\":\"",
+                    absl::AsciiStrToUpper(CommandIdentityName(child.command)),
+                    "\",\"start_us\":", (child.start - t.ready_ns_) / 1000,
+                    ",\"duration_us\":", (child.end - child.start) / 1000, "}");
+  }
+  absl::StrAppend(&out, "],\"children_omitted\":", child_count - retained, "}");
   return out;
 }
 void Release(OnlineLatencyTrace* t, bool cancelled) {
   auto& shard = g_shards[t->origin_];
   if (cancelled) ++shard.metrics.cancelled;
+  t->session_.reset();
+  t->timings_.reset();
   shard.free[shard.free_count++] = t->slot_;
 }
 void Retain(OnlineLatencyTrace& t) {
@@ -228,7 +367,9 @@ void Retain(OnlineLatencyTrace& t) {
                         .count();
   const auto spans = Spans(t);
   for (unsigned i = 0; i < spans.size(); ++i)
-    if (Valid(spans[i])) s.metrics.hist[t.is_set_][i].Add(Duration(spans[i]));
+    if (Valid(spans[i]))
+      s.metrics.hist[static_cast<unsigned>(t.family_)][i].Add(
+          Duration(spans[i]));
   if (s.history_size == kHistory)
     ++s.metrics.overwritten;
   else
@@ -251,6 +392,51 @@ void Retain(OnlineLatencyTrace& t) {
   s.log_head.store(head + 1, std::memory_order_release);
 }
 }  // namespace
+
+TraceSpanScope::TraceSpanScope(OnlineLatencyTrace* trace,
+                               TraceStage stage) noexcept
+    : stage_(stage) {
+  if (!trace || !trace->session_) return;
+  auto* recorder = trace->session_->Local();
+  recorder_ = recorder;
+  start_ns_ = recorder->clock.NowNanos();
+}
+
+void TraceSpanScope::End() noexcept {
+  if (!recorder_) return;
+  auto* recorder = static_cast<TraceRecorder*>(recorder_);
+  assert(recorder->worker == bycorf::ThisWorker().id_);
+  recorder->stages[StageIndex(stage_)].Add(start_ns_,
+                                           recorder->clock.NowNanos());
+  recorder_ = nullptr;
+}
+
+std::uint64_t TraceNowNanos(OnlineLatencyTrace* trace) noexcept {
+  return trace && trace->session_ ? trace->session_->Local()->clock.NowNanos()
+                                  : 0;
+}
+std::uint64_t OnlineLatencyTrace::BeginReplyBuild() noexcept {
+  return TraceNowNanos(this);
+}
+void OnlineLatencyTrace::EndReplyBuild(std::uint64_t token) noexcept {
+  if (token)
+    RecordTraceInterval(this, TraceStage::kReplyBuild, token,
+                        TraceNowNanos(this));
+}
+
+void RecordTraceChild(OnlineLatencyTrace* trace, std::uint16_t command,
+                      std::uint64_t start, std::uint64_t end) noexcept {
+  if (!trace || !trace->session_ || !start || end < start) return;
+  auto* recorder = trace->session_->Local();
+  recorder->AddChild({command, start, end});
+  recorder->stages[StageIndex(kChildExecute)].Add(start, end);
+}
+
+void RecordTraceInterval(OnlineLatencyTrace* trace, TraceStage stage,
+                         std::uint64_t start, std::uint64_t end) noexcept {
+  if (!trace || !trace->session_) return;
+  trace->session_->Local()->stages[StageIndex(stage)].Add(start, end);
+}
 
 std::uint64_t LatencyMonotonicNanos() noexcept {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -316,10 +502,12 @@ void StopLatencyDiagnostics() {
     g_logger.join();
   }
 }
-OnlineTraceHandle SelectOnlineTrace(std::string_view command) {
+OnlineTraceHandle SelectOnlineTrace(CommandArgsView args) {
   if (!Enabled()) return {};
-  const bool set = absl::EqualsIgnoreCase(command, "SET");
-  if (!set && !absl::EqualsIgnoreCase(command, "GET")) return {};
+  if (args.empty() || absl::EqualsIgnoreCase(args[0], "LATENCY")) return {};
+  if (args.size() >= 3 && absl::EqualsIgnoreCase(args[0], "CONFIG") &&
+      absl::StartsWithIgnoreCase(args[2], "latency-diagnostics-"))
+    return {};
   auto* s = Local();
   if (!s) return {};
   ++s->metrics.eligible;
@@ -342,10 +530,21 @@ OnlineTraceHandle SelectOnlineTrace(std::string_view command) {
   t.slot_ = slot;
   t.id_ = (++s->sequence << 16) | t.origin_;
   t.ready_ns_ = LatencyMonotonicNanos();
-  t.is_set_ = set;
+  t.command_id_ = static_cast<std::uint16_t>(CommandKind::kUnknown);
+  t.session_ = std::make_shared<TraceSession>(g_count);
+  t.read_.diagnostics_ = &t;
+  t.set_.diagnostics_ = &t;
   t.threshold_us_ = g_threshold.load(std::memory_order_relaxed);
   t.sample_every_ = n;
   return OnlineTraceHandle(&t);
+}
+void BindOnlineTraceCommand(OnlineLatencyTrace* trace,
+                            const CommandRequest& request) {
+  if (!trace) return;
+  trace->command_id_ =
+      static_cast<std::uint16_t>(ResolveCommandIdentity(request).index_);
+  trace->family_ = Family(request.spec_);
+  trace->is_set_ = request.kind_ == CommandKind::kSet;
 }
 OnlineTraceHandle& OnlineTraceHandle::operator=(
     OnlineTraceHandle&& other) noexcept {
@@ -360,6 +559,28 @@ void OnlineTraceHandle::Complete(bool ok) {
   if (!trace_) return;
   trace_->done_ns_ = LatencyMonotonicNanos();
   trace_->write_ok_ = ok;
+  if (trace_->done_ns_ - trace_->ready_ns_ >= trace_->threshold_us_ * 1000 &&
+      trace_->session_) {
+    std::shared_ptr<TraceTimingData> frozen;
+    // Callers join every foreground child before completing. No worker may
+    // write these segments after this point; background handoffs do not
+    // inherit the borrowed request trace.
+    for (const auto& recorder : trace_->session_->workers) {
+      if (!recorder) continue;
+      if (!frozen) frozen = std::make_shared<TraceTimingData>();
+      for (unsigned i = 0; i < kStageCount; ++i)
+        frozen->stages[i].Merge(recorder->stages[i]);
+      const auto retained = std::min<std::uint64_t>(recorder->child_count,
+                                                    recorder->children.size());
+      for (unsigned i = 0; i < retained; ++i)
+        frozen->AddChild(recorder->children[i]);
+      frozen->child_count += recorder->child_count - retained;
+    }
+    trace_->timings_ = std::move(frozen);
+  }
+  trace_->session_.reset();
+  trace_->read_.diagnostics_ = nullptr;
+  trace_->set_.diagnostics_ = nullptr;
   Retain(*trace_);
   Release(std::exchange(trace_, nullptr), false);
 }
@@ -485,7 +706,7 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
     total.overwritten += m.overwritten;
     total.cancelled += m.cancelled;
     total.log_dropped += m.log_dropped;
-    for (unsigned c = 0; c < 2; ++c)
+    for (unsigned c = 0; c < kFamilies.size(); ++c)
       for (unsigned i = 0; i < kStages.size(); ++i) {
         auto& h = total.hist[c][i];
         const auto& v = m.hist[c][i];
@@ -555,10 +776,15 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
                   "durations of selected commands above the server-total "
                   "threshold; overlapping spans are not additive.\n# TYPE "
                   "lavik_latency_diagnostics_stage_seconds histogram\n");
-  for (unsigned c = 0; c < 2; ++c)
+  for (unsigned c = 0; c < kFamilies.size(); ++c)
     for (unsigned i = 0; i < kStages.size(); ++i) {
       const auto& h = total.hist[c][i];
-      const auto labels = absl::StrCat("command=\"", c ? "SET" : "GET",
+      // Omit unused combinations instead of exporting a dense grid of empty
+      // histograms as command coverage grows.
+      if (std::all_of(h.bins.begin(), h.bins.end(),
+                      [](auto n) { return n == 0; }))
+        continue;
+      const auto labels = absl::StrCat("command_family=\"", kFamilies[c],
                                        "\",stage=\"", kStages[i], "\"");
       std::uint64_t cumulative = 0;
       for (unsigned b = 0; b < h.bins.size(); ++b) {

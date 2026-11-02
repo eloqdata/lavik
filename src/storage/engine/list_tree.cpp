@@ -540,10 +540,15 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
+  auto read_trace = MakeReadTrace(operation.diagnostics_);
+  auto write_trace = MakeSetTrace(operation.diagnostics_);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  TraceSpanScope store_wait(operation.diagnostics_, TraceStage::kStoreLock);
   co_await store.store_state_mutex_.Lock();
+  store_wait.End();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  TraceSpanScope lookup_scope(operation.diagnostics_, TraceStage::kLookup);
 
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
@@ -552,6 +557,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (!resolved.ok()) co_return resolved.status();
     found = *resolved;
   }
+  lookup_scope.End();
   const bool stored_value =
       found != nullptr && found->value_.kind() == RecordKind::kValue;
   // Non-expiring existing Lists keep the metadata-only clock-free path.
@@ -623,7 +629,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       if (plan.changed_) {
         const auto committed = co_await CommitGroupedOrderedMutationLocked(
             store, partition, db_id, key, digest, *object, std::move(plan),
-            expire_at_ms, tx, replication, mutation_precondition);
+            expire_at_ms, tx, replication, mutation_precondition, nullptr,
+            operation.diagnostics_);
         if (!committed.ok()) co_return committed;
       }
       co_return prepared;
@@ -723,7 +730,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   std::optional<LoadedValue> compact_source;
   if (exists) {
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     location, extents);
+                                     location, extents, read_trace.get());
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return ListResult{};
       co_return loaded.status();
@@ -763,6 +770,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     co_return ReadListSnapshot(elements, std::move(result), operation);
 
   if (!compact_edit) {
+    TraceSpanScope value_process(operation.diagnostics_,
+                                 TraceStage::kValueProcess);
     switch (operation.kind_) {
       case ListOperationKind::kPushLeft:
       case ListOperationKind::kPushRight:
@@ -961,7 +970,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (!plan.ok()) co_return plan.status();
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, nullptr, std::move(*plan),
-        expire_at_ms, tx, replication, mutation_precondition);
+        expire_at_ms, tx, replication, mutation_precondition, nullptr,
+        operation.diagnostics_);
     if (!written.ok()) co_return written;
     co_return result;
   }
@@ -989,7 +999,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? result.length_ : 0, nullptr, nullptr,
       replication, true, nullptr, mutation_precondition, nullptr,
-      inline_payload ? &*inline_payload : nullptr);
+      inline_payload ? &*inline_payload : nullptr, write_trace.get());
   if (!written.ok()) co_return written;
   co_return result;
 }

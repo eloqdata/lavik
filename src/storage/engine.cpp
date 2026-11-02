@@ -737,8 +737,10 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpiration(
 Task<absl::StatusOr<bool>> StorageEngine::Delete(
     std::uint8_t db_id, std::string_view key,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
-  return impl_->Delete(db_id, key, replication, mutation_precondition);
+    const MutationPrecondition* mutation_precondition,
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->Delete(db_id, key, replication, mutation_precondition,
+                       diagnostics);
 }
 
 Task<bool> StorageEngine::Exists(std::uint8_t db_id, std::string_view key) {
@@ -752,8 +754,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::GetLocked(
 }
 
 Task<std::vector<BatchGetValue>> StorageEngine::BatchGetLocked(
-    std::uint8_t db_id, std::span<const BatchGetRequest> requests) {
-  return impl_->BatchGetLocked(db_id, requests);
+    std::uint8_t db_id, std::span<const BatchGetRequest> requests,
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->BatchGetLocked(db_id, requests, diagnostics);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
@@ -825,8 +828,9 @@ Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
 }
 
 Task<absl::StatusOr<RawValue>> StorageEngine::ReadRawValueLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
-  return impl_->ReadRawValueLocked(db_id, key, digest);
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->ReadRawValueLocked(db_id, key, digest, diagnostics);
 }
 
 Task<absl::StatusOr<RawValue>> StorageEngine::ReadRawValue(
@@ -873,9 +877,10 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
 Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    OnlineLatencyTrace* diagnostics) {
   return impl_->DeleteLocked(db_id, key, digest, tx, replication,
-                             mutation_precondition);
+                             mutation_precondition, diagnostics);
 }
 
 Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id, std::string_view key,
@@ -926,8 +931,10 @@ std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {
 
 void StorageEngine::InitializeTxWrites(std::uint64_t txid,
                                        std::span<TxShardWrites> writes,
-                                       MutationPrecondition precondition) {
+                                       MutationPrecondition precondition,
+                                       OnlineLatencyTrace* diagnostics) {
   impl_->InitializeTxWrites(txid, writes, std::move(precondition));
+  for (auto& shard : writes) shard.diagnostics_ = diagnostics;
 }
 
 void StorageEngine::BeginShutdown() noexcept { impl_->BeginShutdown(); }

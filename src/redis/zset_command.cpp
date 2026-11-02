@@ -460,17 +460,19 @@ Task<absl::Status> RunCompact(
     co_return co_await g_storage->ExecuteCompact(
         request.db_id_, key, storage::ValueType::kSortedSet, read_only,
         callback, 0, replication ? &*replication : nullptr,
-        &mutation_precondition);
+        &mutation_precondition, {.diagnostics_ = request.latency_trace_});
   }
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kSortedSet, read_only,
-      callback, tx, 0, replication ? &*replication : nullptr);
+      callback, tx, 0, replication ? &*replication : nullptr, nullptr,
+      {.diagnostics_ = request.latency_trace_});
 }
 
 Task<absl::StatusOr<storage::SortedSetResult>> RunSortedSet(
     const CommandRequest& request, const storage::Digest* digest,
-    storage::TxShardWrites* tx, const storage::SortedSetOperation& operation,
+    storage::TxShardWrites* tx, storage::SortedSetOperation operation,
     const storage::CompactReadResult* compact = nullptr) {
+  operation.diagnostics_ = request.latency_trace_;
   if (compact != nullptr)
     co_return storage::ReadCompactSortedSet(*compact, operation);
   const bool read_only =
@@ -587,6 +589,7 @@ Task<absl::StatusOr<storage::SortedSetResult>> PopZSetLocked(
   auto popped = co_await g_storage->ExecuteSortedSetLocked(
       db_id, key, digest,
       storage::SortedSetOperation{
+          .diagnostics_ = request ? request->latency_trace_ : nullptr,
           .kind_ = storage::SortedSetOperationKind::kPop,
           .reverse_ = maximum,
           .pop_count_ = count},
@@ -697,7 +700,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     }
     snapshot_attempt.snapshot_active_ = true;
   }
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   for (std::size_t argument : shape.key_args_) {
     transaction.AddKey(
         g_storage->OwnerForKey(request.args_[argument]), request.db_id_,
@@ -2220,6 +2223,8 @@ absl::Status ComputeMultiUnchecked(MultiContext* context) {
 }
 
 absl::Status ComputeMulti(MultiContext* context) {
+  TraceSpanScope processing(context->request_->latency_trace_,
+                            TraceStage::kValueProcess);
   std::size_t bytes = 0, count = 0;
   constexpr auto limit = std::numeric_limits<std::size_t>::max();
   for (const auto& input : context->inputs_) {
@@ -2295,8 +2300,9 @@ Task<absl::Status> ReplaceMultiDestination(
   // Errors after DEL are returned to the existing transaction undo owner.
   auto encoded = Encode(context->output_);
   if (!encoded.ok()) co_return encoded.status();
-  auto deleted = co_await g_storage->DeleteLocked(request.db_id_, destination,
-                                                  digest, writes);
+  auto deleted = co_await g_storage->DeleteLocked(
+      request.db_id_, destination, digest, writes, nullptr, nullptr,
+      request.latency_trace_);
   if (!deleted.ok()) co_return deleted.status();
   if (context->output_.empty()) co_return absl::OkStatus();
   auto callback = [&](std::optional<storage::CompactValueView> value)
@@ -2317,7 +2323,8 @@ Task<absl::Status> ReplaceMultiDestination(
   };
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, destination, digest, storage::ValueType::kSortedSet,
-      false, callback, writes);
+      false, callback, writes, 0, nullptr, nullptr,
+      {.diagnostics_ = request.latency_trace_});
 }
 
 absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
@@ -2338,7 +2345,7 @@ absl::Status DecodeRetainedInput(std::optional<storage::CompactValueView> value,
 
 Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    ZSetInputCharge* charge) {
+    ZSetInputCharge* charge, OnlineLatencyTrace* diagnostics = nullptr) {
   ZSet input;
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
@@ -2347,13 +2354,15 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
     return NoChange();
   };
   absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
+      db_id, key, digest, storage::ValueType::kSortedSet, true, callback,
+      nullptr, 0, nullptr, nullptr, {.diagnostics_ = diagnostics});
   if (status.ok()) co_return input;
   if (!status.message().starts_with("WRONGTYPE ")) co_return status;
 
   // Redis ZUNION/ZINTER/ZDIFF accept Set inputs and assign every Set member
   // the implicit score 1.0.
   storage::HashOperation operation;
+  operation.diagnostics_ = diagnostics;
   operation.kind_ = storage::HashOperationKind::kKeys;
   auto members =
       co_await g_storage->ExecuteSetLocked(db_id, key, digest, operation);
@@ -2385,7 +2394,8 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
 
 Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    ZSetInputCharge* retained = nullptr) {
+    ZSetInputCharge* retained = nullptr,
+    OnlineLatencyTrace* diagnostics = nullptr) {
   ZSetInputCharge local_charge;
   auto* charge = retained ? retained : &local_charge;
   ZSet input;
@@ -2396,7 +2406,8 @@ Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(
     return NoChange();
   };
   absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db_id, key, digest, storage::ValueType::kSortedSet, true, callback);
+      db_id, key, digest, storage::ValueType::kSortedSet, true, callback,
+      nullptr, 0, nullptr, nullptr, {.diagnostics_ = diagnostics});
   if (!status.ok()) co_return status;
   co_return input;
 }
@@ -2416,11 +2427,11 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
     if (zset_only) {
       input = co_await ReadZSetOnlyLocked(
           request.db_id_, request.args_[key.arg_index_], key.digest_,
-          &context->input_charges_[key.arg_index_]);
+          &context->input_charges_[key.arg_index_], request.latency_trace_);
     } else {
       input = co_await ReadAggregateInputLocked(
           request.db_id_, request.args_[key.arg_index_], key.digest_,
-          &context->input_charges_[key.arg_index_]);
+          &context->input_charges_[key.arg_index_], request.latency_trace_);
     }
     if (!input.ok()) co_return input.status();
     context->inputs_[key.arg_index_] = std::move(*input);
@@ -2524,8 +2535,10 @@ Task<CommandReply> ExecuteZSetCommand(
 }
 
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
-    std::uint8_t db_id, std::string_view key, const storage::Digest& digest) {
-  auto elements = co_await ReadZSetOnlyLocked(db_id, key, digest);
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
+  auto elements =
+      co_await ReadZSetOnlyLocked(db_id, key, digest, nullptr, diagnostics);
   if (!elements.ok()) co_return elements.status();
   Sort(&*elements);
   std::vector<std::string> members;
@@ -2675,7 +2688,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     }
   }
 
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   if (context.store_) {
     const std::size_t destination = context.store_shape_->destination_arg_;
     transaction.AddKey(
@@ -2706,7 +2719,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.writes_.resize(g_storage->worker_count());
     g_storage->InitializeTxWrites(txid, context.writes_,
-                                  ClusterMutationPrecondition(request));
+                                  ClusterMutationPrecondition(request),
+                                  request.latency_trace_);
     for (auto& write : context.writes_) {
       write.collect_undo_ = true;
     }
@@ -2963,13 +2977,13 @@ Task<EncodedCommandReply> ExecuteZSetMultiKeyLocked(
                              request.kind_ == CommandKind::kGeoRadiusByMember;
       absl::StatusOr<ZSet> input;
       if (zset_only) {
-        input = co_await ReadZSetOnlyLocked(request.db_id_, args[argument],
-                                            key->digest_,
-                                            &context.input_charges_[argument]);
+        input = co_await ReadZSetOnlyLocked(
+            request.db_id_, args[argument], key->digest_,
+            &context.input_charges_[argument], request.latency_trace_);
       } else {
         input = co_await ReadAggregateInputLocked(
             request.db_id_, args[argument], key->digest_,
-            &context.input_charges_[argument]);
+            &context.input_charges_[argument], request.latency_trace_);
       }
       if (!input.ok()) co_return input.status();
       context.inputs_[argument] = std::move(*input);

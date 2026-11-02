@@ -200,11 +200,19 @@ void Transaction::CancelInShard(ShardData* sd) {
 }
 
 void Transaction::ArmInShard(ShardData* sd) {
+  sd->key_wait_start_ns_ = sd->tx_->diagnostics_ && !sd->node_.holds_acquired_
+                               ? TraceNowNanos(sd->tx_->diagnostics_)
+                               : 0;
   CurrentTxShard().ArmTransaction(&sd->node_, sd->granted_);
 }
 
 Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
   ShardData& shard = shards_[shard_slot];
+  if (shard.key_wait_start_ns_) {
+    RecordTraceInterval(diagnostics_, TraceStage::kKeyLock,
+                        std::exchange(shard.key_wait_start_ns_, 0),
+                        TraceNowNanos(diagnostics_));
+  }
   if (!shard.entry_hook_invoked_ && entry_hook_ != nullptr) {
     shard.entry_hook_invoked_ = true;
     entry_hook_(entry_hook_ctx_, shard.shard_id_);
@@ -250,6 +258,7 @@ void Transaction::CompleteShardRound() {
 }
 
 Task<absl::Status> Transaction::Schedule() {
+  TraceSpanScope scheduling(diagnostics_, TraceStage::kTxSchedule);
   assert(!shards_.empty() && "Seal before Schedule");
   if (single_shard()) {
     co_return absl::OkStatus();
@@ -281,6 +290,7 @@ Task<absl::Status> Transaction::ExecuteSingleShard(bool release) {
       owner, [this, release]() -> Task<absl::Status> {
         ShardData& sd = shards_[0];
         if (!single_shard_guard_.has_value()) {
+          TraceSpanScope key_wait(diagnostics_, TraceStage::kKeyLock);
           single_shard_guard_.emplace(
               co_await CurrentTxShard().AcquireKeys(sd.node_.keys_));
         }
@@ -302,7 +312,8 @@ Task<absl::Status> Transaction::ExecuteSingleShard(bool release) {
 }
 
 Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
-                                        bool release) {
+                                        bool release, TraceStage stage) {
+  TraceSpanScope round(diagnostics_, stage);
   assert(!shards_.empty() && "Seal before Execute");
   cb_ = cb;
   cb_ctx_ = ctx;
@@ -332,7 +343,7 @@ Task<absl::Status> NoopShardCallback(void*, const ShardSlice&) {
 }  // namespace
 
 Task<absl::Status> Transaction::Release() {
-  return Execute(&NoopShardCallback, nullptr, true);
+  return Execute(&NoopShardCallback, nullptr, true, TraceStage::kTxFinish);
 }
 
 namespace {

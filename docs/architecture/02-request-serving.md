@@ -490,16 +490,24 @@ recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
-Online GET/SET diagnosis is independent of SLOWLOG and command statistics.
+Online command diagnosis is independent of SLOWLOG and command statistics.
 Ready batches own bounded worker-local trace leases through reply send completion;
-awaited owner execution borrows their pointers. Runtime selection has a deadline,
-sampling probability and server-total threshold. Owner-local snapshots expose
+awaited owner execution borrows their pointers. Parallel shards and pages keep
+physical timing sidecars private and append observations only to their own
+worker's segment. Completion joins foreground children and freezes immutable
+stage data before publishing history or log records; transaction receipt
+handoff removes borrowed roots before background commit. Runtime selection has
+a deadline, sampling probability and server-total threshold. Owner-local snapshots expose
 conditional stage histograms and bounded recent JSON records through `LATENCY
 TRACE`; cancellation retires the lease. Fixed SPSC queues copy completed records
 to a logging thread that owns a separate rotating JSONL file sink, so diagnostic
 log backpressure drops output without blocking request workers or sharing their
 ordinary logging sink. Runtime output control leaves histograms and recent
-history active. Requests and replies do not embed diagnostic payloads.
+history active. Requests and replies do not embed diagnostic payloads. The shared
+RESP protocol library accepts a borrowed reply-timing observer without depending
+on the diagnostic runtime. The request lease owns that observer through awaited
+serialization and socket writes; session and detached-job handoffs retire or
+remove the borrow before the lease can end.
 
 Redis commandstats and execution time are owned by the coordinating worker and
 snapshotted through `SubmitTo`. Static command/subcommand identities bound the

@@ -89,6 +89,7 @@ struct StorageEngine::Impl::StreamPageAccess {
   const Digest& digest_;
   GroupedObject::Handle object_;
   bool unlocked_ = false;
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   std::uint64_t bytes_since_yield_ = 0;
   unsigned pages_since_yield_ = 0;
   std::vector<MemoryReservation> reservations_{};
@@ -109,7 +110,8 @@ struct StorageEngine::Impl::StreamPageAccess {
     if (!admitted.ok()) co_return admitted.status();
     page_reservations_.emplace(index, std::move(*admitted));
     auto page = co_await engine_.LoadOrderedGroupSnapshot(
-        store_, partition_, db_id_, key_, digest_, object_, id.prefix_);
+        store_, partition_, db_id_, key_, digest_, object_, id.prefix_, false,
+        nullptr, SortedSetMemberValidation::kVerifyUnique, diagnostics_);
     if (!page.ok()) co_return page.status();
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
     if (!max_key.ok()) co_return max_key.status();
@@ -606,7 +608,8 @@ struct StorageEngine::Impl::StreamPageAccess {
     }
     co_return co_await engine_.CommitGroupedOrderedMutationLocked(
         store_, partition_, db_id_, key_, digest_, object_, std::move(plan),
-        expire_at_ms, tx, replication, mutation_precondition);
+        expire_at_ms, tx, replication, mutation_precondition, nullptr,
+        diagnostics_);
   }
 
   Task<absl::StatusOr<OrderedCollectionMutationPlan>> Plan(
@@ -671,7 +674,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
     std::uint32_t node_max_entries, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedStreamMutation* prepared) {
+    PreparedStreamMutation* prepared, OnlineLatencyTrace* diagnostics) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid grouped Stream append view");
@@ -679,6 +682,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAppendLocked(
   const auto length = directory.root().logical_size();
   StreamPageAccess cache{*this, store,  partition, db_id,
                          key,   digest, object,    prepared != nullptr};
+  cache.diagnostics_ = diagnostics;
   auto& pages = cache.pages_;
   auto load = [&](std::size_t index) { return cache.Load(index); };
   auto route = [&](std::string_view wanted) { return cache.Route(wanted); };
@@ -801,9 +805,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamHeaderLocked(
     GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedStreamMutation* prepared) {
+    PreparedStreamMutation* prepared, OnlineLatencyTrace* diagnostics) {
   StreamPageAccess cache{*this, store,  partition, db_id,
                          key,   digest, object,    prepared != nullptr};
+  cache.diagnostics_ = diagnostics;
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -858,9 +863,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamInspect(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, const CompactValueCallback& callback,
-    const StreamInspectAccess& access) {
+    const StreamInspectAccess& access, OnlineLatencyTrace* diagnostics) {
   using Kind = StreamInspectAccess::Kind;
   StreamPageAccess cache{*this, store, partition, db_id, key, digest, object};
+  cache.diagnostics_ = diagnostics;
   StreamInspection inspection;
   const auto length = object->ordered_directory().root().logical_size();
   auto retain = [&](std::size_t bytes) -> absl::Status {
@@ -1048,9 +1054,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamTrimLocked(
     GroupedObject::Handle object, const CompactValueCallback& callback,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedStreamMutation* prepared) {
+    PreparedStreamMutation* prepared, OnlineLatencyTrace* diagnostics) {
   StreamPageAccess cache{*this, store,  partition, db_id,
                          key,   digest, object,    prepared != nullptr};
+  cache.diagnostics_ = diagnostics;
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -1092,9 +1099,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamDeleteLocked(
     const StreamDeleteAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedStreamMutation* prepared) {
+    PreparedStreamMutation* prepared, OnlineLatencyTrace* diagnostics) {
   StreamPageAccess cache{*this, store,  partition, db_id,
                          key,   digest, object,    prepared != nullptr};
+  cache.diagnostics_ = diagnostics;
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -1217,12 +1225,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamAckLocked(
     const StreamAckAccess& access, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedStreamMutation* prepared) {
+    PreparedStreamMutation* prepared, OnlineLatencyTrace* diagnostics) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid Stream ACK view");
   StreamPageAccess cache{*this, store,  partition, db_id,
                          key,   digest, object,    prepared != nullptr};
+  cache.diagnostics_ = diagnostics;
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto payload = StreamRecordPayload(*header);
@@ -1311,12 +1320,13 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamGroupLocked(
     const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedStreamMutation* prepared) {
+    PreparedStreamMutation* prepared, OnlineLatencyTrace* diagnostics) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid partial Stream group view");
   StreamPageAccess cache{*this, store,  partition, db_id,
                          key,   digest, object,    prepared != nullptr};
+  cache.diagnostics_ = diagnostics;
   auto header = co_await cache.Required(std::string_view("\0", 1));
   if (!header.ok()) co_return header.status();
   auto header_payload = StreamRecordPayload(*header);
@@ -1670,7 +1680,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, const CompactValueCallback& callback,
-    const StreamRangeAccess& range) {
+    const StreamRangeAccess& range, OnlineLatencyTrace* diagnostics) {
   if (!object->is_ordered() || object->ordered_directory().root().kind_ !=
                                    OrderedCollectionKind::kStream)
     co_return absl::DataLossError("invalid grouped Stream range view");
@@ -1698,7 +1708,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     if (!admitted.ok()) co_return admitted.status();
     probe_charge.emplace(std::move(*admitted));
     auto page = co_await LoadOrderedGroupSnapshot(
-        store, partition, db_id, key, digest, object, groups[index].id_);
+        store, partition, db_id, key, digest, object, groups[index].id_, false,
+        nullptr, SortedSetMemberValidation::kVerifyUnique, diagnostics);
     if (!page.ok()) co_return page.status();
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
     if (!max_key.ok()) co_return max_key.status();

@@ -184,7 +184,8 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     std::uint8_t db_id, std::vector<std::string> keys, bool move,
     bool source_left, bool destination_left, bool pop_left,
     std::uint64_t pop_count, ReplicationTransactionGuard* replication,
-    storage::MutationPrecondition mutation_precondition) {
+    storage::MutationPrecondition mutation_precondition,
+    OnlineLatencyTrace* diagnostics) {
   std::vector<tx::KeyRef> locks;
   locks.reserve(keys.size());
   for (const std::string& key : keys) {
@@ -201,12 +202,15 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
       locks.push_back(tx::KeyRef{fingerprint, tx::LockMode::kExclusive, db_id});
     }
   }
+  TraceSpanScope key_wait(diagnostics, TraceStage::kKeyLock);
   auto guard = co_await tx::CurrentTxShard().AcquireKeys(locks);
+  key_wait.End();
   if (replication != nullptr) replication->EnterCurrentShard();
 
   if (!move) {
     for (const std::string& key : keys) {
       storage::ListOperation pop;
+      pop.diagnostics_ = diagnostics;
       pop.kind_ = pop_left ? storage::ListOperationKind::kPopLeft
                            : storage::ListOperationKind::kPopRight;
       pop.count_ = pop_count;
@@ -231,9 +235,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
     storage::TxShardWrites writes;
     g_storage->InitializeTxWrites(txid, std::span(&writes, 1),
-                                  mutation_precondition);
+                                  mutation_precondition, diagnostics);
     writes.collect_undo_ = true;
     storage::ListOperation operation;
+    operation.diagnostics_ = diagnostics;
     operation.kind_ = storage::ListOperationKind::kMoveWithin;
     operation.first_ = source_left ? 1 : 0;
     operation.second_ = destination_left ? 1 : 0;
@@ -246,8 +251,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
       co_return SingleShardListOutcome(absl::OkStatus());
     }
     std::vector<storage::TxShardWrites*> write_refs{&writes};
+    TraceSpanScope durability(diagnostics, TraceStage::kDurabilityWait);
     absl::Status committed =
         co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
+    durability.End();
     if (!committed.ok()) {
       (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
       co_return SingleShardListOutcome(std::move(committed));
@@ -267,9 +274,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   storage::TxShardWrites writes;
   g_storage->InitializeTxWrites(txid, std::span(&writes, 1),
-                                mutation_precondition);
+                                mutation_precondition, diagnostics);
   writes.collect_undo_ = true;
   storage::ListOperation pop;
+  pop.diagnostics_ = diagnostics;
   pop.kind_ = source_left ? storage::ListOperationKind::kPopLeft
                           : storage::ListOperationKind::kPopRight;
   pop.count_ = 1;
@@ -283,6 +291,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   }
 
   storage::ListOperation push;
+  push.diagnostics_ = diagnostics;
   push.kind_ = destination_left ? storage::ListOperationKind::kPushLeft
                                 : storage::ListOperationKind::kPushRight;
   push.values_.push_back(popped->values_.front());
@@ -295,8 +304,10 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   // The source and destination records form one logical Redis move.
   writes.dataset_changes_ = 1;
   std::vector<storage::TxShardWrites*> write_refs{&writes};
+  TraceSpanScope durability(diagnostics, TraceStage::kDurabilityWait);
   absl::Status committed =
       co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
+  durability.End();
   if (!committed.ok()) {
     (void)co_await g_storage->FinishTxLocal(writes, /*rollback=*/true);
     co_return SingleShardListOutcome(std::move(committed));
@@ -325,6 +336,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(
     const storage::CompactReadResult* compact = nullptr) {
   const auto& args = request.args_;
   storage::ListOperation op;
+  op.diagnostics_ = request.latency_trace_;
   switch (request.kind_) {
     case CommandKind::kLPush:
     case CommandKind::kLPushX:
@@ -696,7 +708,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           }
           co_return co_await ExecuteSingleShardListMulti(
               db_id, std::move(keys), move, source_left, destination_left,
-              pop_left, pop_count, replication, mutation_precondition);
+              pop_left, pop_count, replication, mutation_precondition,
+              request.latency_trace_);
         });
     if (!outcome.status_.ok()) {
       if (IsClusterAuthorityChanged(outcome.status_)) {
@@ -729,7 +742,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     co_return BuiltReply(reply_builder.View());
   }
 
-  tx::Transaction txn;
+  tx::Transaction txn(request.latency_trace_);
   for (std::size_t arg : key_args) {
     txn.AddKey(ShardForKey(args[arg]), request.db_id_,
                storage::ComputeDigest(args[arg]),
@@ -772,6 +785,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   if (!move) {
     for (std::size_t arg : key_args) {
       storage::ListOperation op;
+      op.diagnostics_ = request.latency_trace_;
       op.kind_ = pop_left ? storage::ListOperationKind::kPopLeft
                           : storage::ListOperationKind::kPopRight;
       op.count_ = pop_count;
@@ -817,6 +831,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   const std::string_view destination_key = args[2];
   if (source_key == destination_key) {
     storage::ListOperation op;
+    op.diagnostics_ = request.latency_trace_;
     op.kind_ = storage::ListOperationKind::kMoveWithin;
     op.first_ = source_left ? 1 : 0;
     op.second_ = destination_left ? 1 : 0;
@@ -843,11 +858,13 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   std::vector<storage::TxShardWrites> writes(g_storage->worker_count());
-  g_storage->InitializeTxWrites(txid, writes, mutation_precondition);
+  g_storage->InitializeTxWrites(txid, writes, mutation_precondition,
+                                request.latency_trace_);
   for (auto& write : writes) {
     write.collect_undo_ = true;
   }
   storage::ListOperation pop;
+  pop.diagnostics_ = request.latency_trace_;
   pop.kind_ = source_left ? storage::ListOperationKind::kPopLeft
                           : storage::ListOperationKind::kPopRight;
   pop.count_ = 1;
@@ -868,6 +885,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   }
 
   storage::ListOperation push;
+  push.diagnostics_ = request.latency_trace_;
   push.kind_ = destination_left ? storage::ListOperationKind::kPushLeft
                                 : storage::ListOperationKind::kPushRight;
   push.values_.push_back(popped->values_.front());
@@ -897,7 +915,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   for (auto& write : writes) write.dataset_changes_ = 0;
   writes[source_owner].dataset_changes_ = 1;
   for (auto& write : writes) write_ptrs.push_back(&write);
+  TraceSpanScope durability(request.latency_trace_,
+                            TraceStage::kDurabilityWait);
   status = co_await g_storage->CommitTxWrites(txid, std::move(write_ptrs));
+  durability.End();
   for (const unsigned owner : {source_owner, destination_owner}) {
     (void)co_await bycorf::SubmitTaskTo(
         owner, [write = &writes[owner], rollback = !status.ok()] {

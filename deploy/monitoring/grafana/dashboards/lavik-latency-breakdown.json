@@ -60,6 +60,20 @@
         "skipUrlSync": false,
         "sort": 1,
         "type": "query"
+      },
+      {
+        "name": "command_family",
+        "label": "Diagnostic command family",
+        "type": "custom",
+        "query": "get,set,read,write,multi_key,transaction,script,blocking,replication,pubsub,admin,other",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "options": []
       }
     ]
   },
@@ -88,7 +102,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "Always-on command latency ends at reply construction. Online GET/SET traces start when a complete command enters the ready queue and end when the server socket write completes; this is **not client RTT**. Diagnostic histograms contain only selected commands exceeding the configured server-total threshold. Stages overlap: **never sum stage percentiles**. Pipelined commands share a batch send span. Runtime diagnostics auto-expire; N=1 selects every eligible command, with explicit capacity/output drops. No EXEC/Lua child or background flush is attributed as an independent command trace."
+        "content": "Always-on command latency ends at reply construction. Online command traces start when a complete command enters the ready queue and end when the server socket write completes; this is **not client RTT**. Diagnostic histograms contain only selected commands exceeding the configured server-total threshold. Stages overlap: **never sum stage percentiles**. Pipelined commands share a batch send span. Runtime diagnostics auto-expire; N=1 selects every eligible command, with explicit capacity/output drops. Command identity is preserved in recent traces. Histograms use fixed command families and emit only observed stages. Background flush is not attributed to a completed command."
       }
     },
     {
@@ -431,8 +445,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by(command,stage)(increase(lavik_latency_diagnostics_stage_seconds_count{job=\"lavik\",instance=~\"$instance\"}[$__range]))",
-          "legendFormat": "{{command}} {{stage}}"
+          "expr": "sum by(command_family,stage)(increase(lavik_latency_diagnostics_stage_seconds_count{job=\"lavik\",instance=~\"$instance\"}[$__range]))",
+          "legendFormat": "{{command_family}} {{stage}}"
         }
       ],
       "fieldConfig": {
@@ -456,7 +470,7 @@
     },
     {
       "id": 10,
-      "title": "GET slow subset \u2014 p99 stage durations",
+      "title": "Read commands \u2014 slow subset p99 stage durations",
       "type": "timeseries",
       "gridPos": {
         "x": 0,
@@ -472,7 +486,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.99,sum by(le,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command=\"GET\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99,sum by(le,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command_family=~\"get|read\"}[$__rate_interval])))",
           "legendFormat": "{{stage}}"
         }
       ],
@@ -497,7 +511,7 @@
     },
     {
       "id": 11,
-      "title": "SET slow subset \u2014 p99 stage durations",
+      "title": "Write commands \u2014 slow subset p99 stage durations",
       "type": "timeseries",
       "gridPos": {
         "x": 12,
@@ -513,7 +527,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.99,sum by(le,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command=\"SET\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99,sum by(le,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command_family=~\"set|write\"}[$__rate_interval])))",
           "legendFormat": "{{stage}}"
         }
       ],
@@ -554,13 +568,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.99,sum by(le,command)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"server_total\"}[$__rate_interval])))",
-          "legendFormat": "{{command}} p99"
+          "expr": "histogram_quantile(0.99,sum by(le,command_family)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"server_total\"}[$__rate_interval])))",
+          "legendFormat": "{{command_family}} p99"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.999,sum by(le,command)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"server_total\"}[$__rate_interval])))",
-          "legendFormat": "{{command}} p99.9"
+          "expr": "histogram_quantile(0.999,sum by(le,command_family)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"server_total\"}[$__rate_interval])))",
+          "legendFormat": "{{command_family}} p99.9"
         }
       ],
       "fieldConfig": {
@@ -612,6 +626,47 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Selected command families \u2014 slow subset p99 stage durations",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Conditional distribution of the slow sampled subset, not the stage p99 of all requests. Parent and child spans overlap.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99,sum by(le,command_family,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command_family=~\"$command_family\"}[$__rate_interval])))",
+          "legendFormat": "{{command_family}} / {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
           "color": {
             "mode": "palette-classic"
           }

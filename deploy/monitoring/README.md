@@ -405,10 +405,11 @@ LAVIK_LOG_DIR=/absolute/path/to/lavik/logs docker compose --profile diagnostics-
 
 The additional **Lavik Slow Command Traces** dashboard uses the `lavik-loki`
 datasource and supports command/trace-ID filters and expandable log details.
-The two native bar charts show the latest matching command in the selected time
-range: a timeline of actual stage intervals and cumulative duration by stage.
+The native bar charts show the latest matching command in the selected time
+range: enclosing operations and up to 16 named EXEC/Lua children, an internal
+phase timeline, and cumulative phase durations.
 Copy an exact trace ID from a log row into **Trace ID (regex)** to pin a command.
-Overlapping stages are not additive. Repeated read stages show up to eight
+Overlapping stages are not additive. Repeated stages show up to eight
 retained intervals each on the timeline, while cumulative durations include all
 observations; inspect the JSON for counts and `intervals_dropped`. Rounded
 zero-microsecond intervals may be invisible. These charts use existing JSON logs

@@ -900,6 +900,7 @@ Task<absl::Status> RunCompact(
       co_return MemoryLimitError("OOM Stream append input");
   }
   storage::CompactAccessOptions access;
+  access.diagnostics_ = request.latency_trace_;
   access.metadata_only_ = request.kind_ == CommandKind::kXLen;
   if (request.kind_ == CommandKind::kXAdd)
     access.stream_append_node_max_entries_ = StreamNodeMaxEntries();
@@ -1281,7 +1282,8 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
                         const storage::Digest* locked_digest,
                         const storage::StreamRangeAccess& range,
                         RespVersion version,
-                        const storage::CompactReadResult* compact = nullptr) {
+                        const storage::CompactReadResult* compact = nullptr,
+                        OnlineLatencyTrace* diagnostics = nullptr) {
   tx::TxShard::Guard guard;
   absl::StatusOr<storage::TransferValue> source;
   std::optional<storage::CompactValueView> compact_view;
@@ -1292,12 +1294,14 @@ PrepareStreamRangeReply(std::uint8_t db, std::string_view key,
   } else {
     const auto digest =
         locked_digest ? *locked_digest : storage::ComputeDigest(key);
-    if (!locked_digest)
+    if (!locked_digest) {
+      TraceSpanScope key_wait(diagnostics, TraceStage::kKeyLock);
       guard = co_await tx::CurrentTxShard().AcquireKey(
           db, tx::FingerprintOf(digest), tx::LockMode::kShared,
           lavik::storage::RedisSlot(key));
-    source =
-        co_await g_storage->ReadValueForTransferLocked(db, key, digest, range);
+    }
+    source = co_await g_storage->ReadValueForTransferLocked(db, key, digest,
+                                                            range, diagnostics);
     if (!source.ok()) co_return source.status();
     if (source->metadata_.value_type_ != storage::ValueType::kStream)
       co_return WrongTypeError();
@@ -1369,7 +1373,8 @@ Task<CommandReply> ExecuteStreamRangeReply(
     range.count_ = count;
   }
   auto state = co_await PrepareStreamRangeReply(
-      request.db_id_, a[1], digest, range, request.resp_version_, compact);
+      request.db_id_, a[1], digest, range, request.resp_version_, compact,
+      request.latency_trace_);
   if (!state.ok()) {
     if (state.status().code() == absl::StatusCode::kNotFound)
       co_return Built(builder.AppendArrayHeader(0));
@@ -1405,7 +1410,8 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
         storage::StreamRangeAccess{.first_ = {cursor.ms_, cursor.seq_},
                                    .count_ = count,
                                    .first_exclusive_ = true},
-        request ? request->resp_version_ : RespVersion::k2);
+        request ? request->resp_version_ : RespVersion::k2, nullptr,
+        request ? request->latency_trace_ : nullptr);
     if (!state.ok()) {
       if (absl::IsNotFound(state.status()))
         co_return ReadOneResult{.cursor_ = cursor};
@@ -1531,6 +1537,7 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     return Changed(std::move(stream));
   };
   storage::CompactAccessOptions access;
+  access.diagnostics_ = request ? request->latency_trace_ : nullptr;
   if (!group_read)
     access.stream_range_ =
         storage::StreamRangeAccess{.first_ = {cursor.ms_, cursor.seq_},
@@ -1591,7 +1598,8 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     }
     auto state = co_await PrepareStreamRangeReply(
         db_id, key, locked_digest, range,
-        request ? request->resp_version_ : RespVersion::k2);
+        request ? request->resp_version_ : RespVersion::k2, nullptr,
+        request ? request->latency_trace_ : nullptr);
     if (!state.ok()) co_return state.status();
     result.stream_ = std::move(*state);
     result.stream_->selection_charge_.Adopt(&*selection_charge,
@@ -2219,7 +2227,7 @@ Task<CommandReply> ExecuteImpl(
         request.db_id_, a[2], digest,
         storage::StreamRangeAccess{.count_ = xinfo_count == 0 ? UINT64_MAX
                                                               : xinfo_count},
-        request.resp_version_, compact);
+        request.resp_version_, compact, request.latency_trace_);
     if (!prepared.ok())
       co_return Built(StorageError(builder, prepared.status()));
     info_entries = std::move(*prepared);

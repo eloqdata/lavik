@@ -773,7 +773,8 @@ absl::Status RetainHashLookupValue(HashResult& result,
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, std::span<const std::string_view> fields) {
+    GroupedObject::Handle object, std::span<const std::string_view> fields,
+    OnlineLatencyTrace* diagnostics) {
   // Keep multi-field planning in its own coroutine so single-field reads do
   // not pay for the plan's allocations or coroutine-frame storage.
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
@@ -838,7 +839,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
            requests[end].group_ == requests[begin].group_)
       ++end;
     auto loaded = co_await LoadHashGroupPayload(
-        store, partition, db_id, key, digest, object, requests[begin].group_);
+        store, partition, db_id, key, digest, object, requests[begin].group_,
+        false, diagnostics);
     if (!loaded.ok()) [[unlikely]]
       co_return loaded.status();
     const auto bytes = loaded->loaded_.value();
@@ -888,10 +890,15 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         "Hash scan COUNT must be greater than zero");
   }
 
+  auto read_trace = MakeReadTrace(operation.diagnostics_);
+  auto write_trace = MakeSetTrace(operation.diagnostics_);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  TraceSpanScope store_wait(operation.diagnostics_, TraceStage::kStoreLock);
   co_await store.store_state_mutex_.Lock();
+  store_wait.End();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  TraceSpanScope lookup_scope(operation.diagnostics_, TraceStage::kLookup);
 
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
@@ -900,6 +907,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!resolved.ok()) co_return resolved.status();
     found = *resolved;
   }
+  lookup_scope.End();
   const bool stored_value =
       found != nullptr && found->value_.kind() == RecordKind::kValue;
   const std::uint64_t now_ms =
@@ -1062,7 +1070,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (route == nullptr) [[unlikely]]
       co_return absl::DataLossError("missing Hash field route");
     auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                digest, grouped, route->id_);
+                                                digest, grouped, route->id_,
+                                                false, operation.diagnostics_);
     if (!loaded.ok()) [[unlikely]] {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1093,7 +1102,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   if (grouped != nullptr && (operation.kind_ == HashOperationKind::kGet ||
                              operation.kind_ == HashOperationKind::kGetMany)) {
     auto values = co_await ReadGroupedHashFields(
-        store, partition, db_id, key, digest, grouped, operation.fields_);
+        store, partition, db_id, key, digest, grouped, operation.fields_,
+        operation.diagnostics_);
     if (!values.ok() && read_epoch_changed()) [[unlikely]]
       co_return HashResult{};
     co_return values;
@@ -1122,7 +1132,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (entry == nullptr)
       co_return absl::DataLossError("grouped scan has no physical page");
     auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                digest, grouped, route->id_);
+                                                digest, grouped, route->id_,
+                                                false, operation.diagnostics_);
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1164,7 +1175,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
        operation.kind_ == HashOperationKind::kReadSnapshot)) {
     auto values = co_await ReadGroupedHashResult(
         store, partition, db_id, key, digest, grouped, operation.kind_,
-        operation.with_values_, operation.packed_output_);
+        operation.with_values_, operation.packed_output_,
+        operation.diagnostics_);
     if (!values.ok() && read_epoch_changed()) co_return HashResult{};
     co_return values;
   }
@@ -1318,7 +1330,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         edits.push_back(leaf_edits[begin++].view_);
       } while (begin < leaf_edits.size() && leaf_edits[begin].id_ == id);
       auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                  digest, grouped, id);
+                                                  digest, grouped, id, false,
+                                                  operation.diagnostics_);
       if (!loaded.ok()) co_return loaded.status();
       const auto bytes = loaded->loaded_.value();
       auto edited = ApplyHashGroupEdits(
@@ -1353,8 +1366,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       // group.
       for (const auto id : selected) {
         if (unlocked_grouped_write) co_await bycorf::Yield(*store.worker_);
-        auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id,
-                                                     key, digest, grouped, id);
+        auto loaded = co_await LoadHashGroupSnapshot(
+            store, partition, db_id, key, digest, grouped, id, false, nullptr,
+            operation.diagnostics_);
         if (!loaded.ok()) {
           if (read_epoch_changed()) co_return HashResult{};
           co_return loaded.status();
@@ -1364,8 +1378,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         }
       }
     } else {
-      auto loaded = co_await LoadGroupedHashValue(store, partition, db_id, key,
-                                                  digest, grouped);
+      auto loaded =
+          co_await LoadGroupedHashValue(store, partition, db_id, key, digest,
+                                        grouped, false, operation.diagnostics_);
       if (!loaded.ok()) {
         if (read_epoch_changed()) co_return HashResult{};
         co_return loaded.status();
@@ -1374,7 +1389,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
   } else if (exists && !replace) {
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     location, extents);
+                                     location, extents, read_trace.get());
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1543,6 +1558,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     return requested;
   };
 
+  TraceSpanScope value_process(operation.diagnostics_,
+                               TraceStage::kValueProcess);
   switch (operation.kind_) {
     case HashOperationKind::kReplaceOnly: {
       // Sort request positions, not owned values: duplicate fields use the
@@ -1701,6 +1718,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     default:
       co_return absl::InternalError("read operation reached Hash mutation");
   }
+  value_process.End();
 
   result.length_ = compact_edit  ? compact_edit->count_
                    : edit_leaves ? edited_length
@@ -1815,7 +1833,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         std::vector<GroupedRecordId>(changed_groups.begin(),
                                      changed_groups.end()),
         result.length_, value_type, expire_at_ms, tx, replication,
-        mutation_precondition, grouped_plan ? &*grouped_plan : nullptr);
+        mutation_precondition, grouped_plan ? &*grouped_plan : nullptr,
+        operation.diagnostics_);
     if (!written.ok()) co_return written;
     co_return result;
   }
@@ -1842,7 +1861,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? result.length_ : 0, nullptr, nullptr,
       replication, true, nullptr, mutation_precondition, nullptr,
-      inline_payload ? &*inline_payload : nullptr);
+      inline_payload ? &*inline_payload : nullptr, write_trace.get());
   if (!written.ok()) co_return written;
   co_return result;
 }

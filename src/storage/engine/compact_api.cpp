@@ -72,10 +72,12 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     CompactAccessOptions access) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  TraceSpanScope key_wait(access.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(key));
+  key_wait.End();
   co_return co_await ExecuteCompactLocked(
       db_id, key, digest, value_type, read_only, callback, nullptr, now_ms,
       replication, false, mutation_precondition, std::move(access));
@@ -83,7 +85,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    ValueType value_type, bool read_only, const CompactValueCallback& callback,
+    ValueType value_type, bool read_only, const CompactValueCallback& apply,
     TxShardWrites* tx, std::uint64_t now_ms,
     ReplicationCommandAppend* replication, bool prepare_unlocked,
     const MutationPrecondition* mutation_precondition,
@@ -113,10 +115,23 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     co_return absl::InvalidArgumentError(
         "incompatible compact callback access contracts");
 
+  CompactValueCallback observed;
+  if (access.diagnostics_)
+    observed = [root = access.diagnostics_,
+                &apply](std::optional<CompactValueView> value) {
+      TraceSpanScope processing(root, TraceStage::kValueProcess);
+      return apply(value);
+    };
+  const auto& callback = access.diagnostics_ ? observed : apply;
+  auto read_trace = MakeReadTrace(access.diagnostics_);
+  auto write_trace = MakeSetTrace(access.diagnostics_);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  TraceSpanScope store_wait(access.diagnostics_, TraceStage::kStoreLock);
   co_await store.store_state_mutex_.Lock();
+  store_wait.End();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  TraceSpanScope lookup_scope(access.diagnostics_, TraceStage::kLookup);
 
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
@@ -126,6 +141,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     found = *resolved;
   }
 
+  lookup_scope.End();
   const bool stored_value =
       found != nullptr && found->value_.kind() == RecordKind::kValue;
   if (now_ms == 0) now_ms = UnixTimeMillis();
@@ -202,29 +218,29 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
         co_return co_await ExecuteGroupedStreamGroupLocked(
             store, partition, db_id, key, digest, grouped, callback,
             *access.stream_group_, false, tx, replication,
-            mutation_precondition, prepared);
+            mutation_precondition, prepared, access.diagnostics_);
       if (access.stream_header_)
         co_return co_await ExecuteGroupedStreamHeaderLocked(
             store, partition, db_id, key, digest, grouped, callback, tx,
-            replication, mutation_precondition, prepared);
+            replication, mutation_precondition, prepared, access.diagnostics_);
       if (access.stream_trim_)
         co_return co_await ExecuteGroupedStreamTrimLocked(
             store, partition, db_id, key, digest, grouped, callback, tx,
-            replication, mutation_precondition, prepared);
+            replication, mutation_precondition, prepared, access.diagnostics_);
       if (access.stream_delete_)
         co_return co_await ExecuteGroupedStreamDeleteLocked(
             store, partition, db_id, key, digest, grouped, callback,
             *access.stream_delete_, tx, replication, mutation_precondition,
-            prepared);
+            prepared, access.diagnostics_);
       if (access.stream_ack_)
         co_return co_await ExecuteGroupedStreamAckLocked(
             store, partition, db_id, key, digest, grouped, callback,
             *access.stream_ack_, tx, replication, mutation_precondition,
-            prepared);
+            prepared, access.diagnostics_);
       co_return co_await ExecuteGroupedStreamAppendLocked(
           store, partition, db_id, key, digest, grouped, callback,
           *access.stream_append_node_max_entries_, tx, replication,
-          mutation_precondition, prepared);
+          mutation_precondition, prepared, access.diagnostics_);
     };
     if (!CanPrepareGroupedWriteUnlocked(partition))
       co_return co_await execute(nullptr);
@@ -254,7 +270,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, grouped,
         std::move(prepared.plan_), prepared.expire_at_ms_, tx, replication,
-        mutation_precondition);
+        mutation_precondition, nullptr, access.diagnostics_);
   }
   if (grouped && access.stream_group_) {
     if (value_type != ValueType::kStream)
@@ -262,23 +278,23 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     co_return co_await ExecuteGroupedStreamGroupLocked(
         store, partition, db_id, key, digest, grouped, callback,
         *access.stream_group_, read_only, tx, replication,
-        mutation_precondition);
+        mutation_precondition, nullptr, access.diagnostics_);
   }
   if (grouped && access.stream_inspect_) {
     if (!read_only || value_type != ValueType::kStream)
       co_return absl::InvalidArgumentError("invalid Stream inspection access");
-    co_return co_await ExecuteGroupedStreamInspect(store, partition, db_id, key,
-                                                   digest, grouped, callback,
-                                                   *access.stream_inspect_);
+    co_return co_await ExecuteGroupedStreamInspect(
+        store, partition, db_id, key, digest, grouped, callback,
+        *access.stream_inspect_, access.diagnostics_);
   }
   if (grouped && access.stream_range_) {
     if (!read_only || value_type != ValueType::kStream)
       co_return absl::InvalidArgumentError("invalid Stream range access");
     found = nullptr;
     unlock.Unlock();
-    co_return co_await ExecuteGroupedStreamRange(store, partition, db_id, key,
-                                                 digest, grouped, callback,
-                                                 *access.stream_range_);
+    co_return co_await ExecuteGroupedStreamRange(
+        store, partition, db_id, key, digest, grouped, callback,
+        *access.stream_range_, access.diagnostics_);
   }
   std::optional<MemoryReservation> callback_admission;
   // Keep the preexisting bounded inline workspace available when the
@@ -348,7 +364,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   });
   if (exists) {
     auto value = co_await LoadValue(store, partition, db_id, key, digest,
-                                    location, extents);
+                                    location, extents, read_trace.get());
     if (!value.ok()) {
       if (!read_epoch_changed()) co_return value.status();
     } else {
@@ -478,7 +494,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       !encoded.empty()) {
     co_return co_await WriteGroupedStringLocked(
         store, partition, db_id, key, digest, encoded, expire_at_ms, tx,
-        replication, mutation_precondition, grouped, view->encoded_);
+        replication, mutation_precondition, grouped, view->encoded_,
+        access.diagnostics_);
   }
   const auto collection_kind = value_type == ValueType::kStream
                                    ? OrderedCollectionKind::kStream
@@ -491,7 +508,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       co_return co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, nullptr,
           std::move(*created_groups), expire_at_ms, tx, replication,
-          mutation_precondition, &created_members);
+          mutation_precondition, &created_members, access.diagnostics_);
     std::optional<MemoryReservation> stream_promotion_admission;
     OrderedCollectionMutationPlan plan;
     if (grouped == nullptr) {
@@ -550,14 +567,15 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     }
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, grouped, std::move(plan),
-        expire_at_ms, tx, replication, mutation_precondition);
+        expire_at_ms, tx, replication, mutation_precondition, nullptr,
+        access.diagnostics_);
   }
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest,
       update->erase_ ? std::string_view{} : encoded, kind, published_type,
       expire_at_ms, tx, update->erase_ ? 0 : logical_size, nullptr, nullptr,
       replication, true, nullptr, mutation_precondition, nullptr,
-      update->inline_payload_);
+      update->inline_payload_, write_trace.get());
   co_return status;
 }
 

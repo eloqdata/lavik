@@ -19,12 +19,34 @@
 #include <cstdint>
 
 #include "lavik/latency_clock.h"
+#include "lavik/latency_stage.h"
 #ifndef LAVIK_ENABLE_TRACE
 #define LAVIK_ENABLE_TRACE 0
 #endif
 namespace lavik {
 // Full payload exists only in a selected online sidecar or a trace build.
 struct ReadLatencyTrace : LatencySegmentClock {
+  OnlineLatencyTrace* diagnostics_ = nullptr;
+  // Selected pages share only the root's worker-local clock, never mutable
+  // physical payloads. Legacy-only sidecars keep their independent clock.
+  std::uint64_t NowNanos() noexcept {
+    return diagnostics_ ? TraceNowNanos(diagnostics_)
+                        : LatencySegmentClock::NowNanos();
+  }
+
+  // Keep legacy aggregates and selected request intervals in the same units.
+  void RecordBuffer(std::uint64_t start, std::uint64_t end) noexcept {
+    buffer_timing_.Add(start, end);
+    if (diagnostics_)
+      RecordTraceInterval(diagnostics_, TraceStage::kReadBuffer, start, end);
+  }
+  // Records actual submitted I/O through completion, excluding buffer waits.
+  void RecordIo(std::uint64_t start, std::uint64_t end) noexcept {
+    io_timing_.Add(start, end);
+    if (diagnostics_)
+      RecordTraceInterval(diagnostics_, TraceStage::kReadIo, start, end);
+  }
+
   LatencyIntervals buffer_timing_;
   LatencyIntervals io_timing_;
   std::uint64_t request_start_ns_ = 0;

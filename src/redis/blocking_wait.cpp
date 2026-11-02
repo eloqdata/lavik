@@ -43,6 +43,7 @@
 #include "cluster_gate.h"
 #include "lavik/cluster/authority.h"
 #include "lavik/cluster/runtime.h"
+#include "lavik/latency_stage.h"
 #include "lavik/metrics.h"
 #include "lavik/resp.h"
 #include "lavik/storage/engine.h"
@@ -891,6 +892,7 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
   };
 
   std::unique_ptr<BlockingWaitHandle> waiter;
+  std::optional<TraceSpanScope> wake_resume;
   // Blocking waits outlive the admission that accepted them. The
   // dispatch-time slot set is a pure function of these immutable wait keys;
   // every concrete attempt re-admits that set against the current state.
@@ -928,6 +930,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
         co_return timeout_reply();
       }
       const auto admission_start = bycorf::ReadCycleCounter();
+      TraceSpanScope admission(request.latency_trace_,
+                               TraceStage::kAdmissionWait);
       absl::Status slept = co_await bycorf::SleepFor(
           *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
       reply_builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
@@ -960,6 +964,7 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
           fenced.has_value()) {
         co_return std::move(*fenced);
       }
+      wake_resume.reset();  // Retry admission ends before active storage work.
       result = co_await attempt(attempt_cascade);
     }
     cascade_completion.Finish();
@@ -981,7 +986,9 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
 
     gate.Release();
     const auto wait_start = bycorf::ReadCycleCounter();
+    TraceSpanScope blocking(request.latency_trace_, TraceStage::kBlockingWait);
     const BlockingWakeReason woke = co_await WaitForBlockingReady(*waiter);
+    blocking.End();
     reply_builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
                                         wait_start);
     if (woke == BlockingWakeReason::kTimeout) co_return timeout_reply();
@@ -991,6 +998,7 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     if (woke == BlockingWakeReason::kCancelled) {
       co_return status_reply(absl::CancelledError(cancellation_message));
     }
+    wake_resume.emplace(request.latency_trace_, TraceStage::kWakeResume);
     // Readiness is not an ownership handoff. A blocking move may write a
     // destination unrelated to the key that woke it. Let requests already
     // admitted on other connections establish their destination lock queue

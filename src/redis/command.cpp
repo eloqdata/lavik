@@ -580,7 +580,9 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
         co_return reply;
       }
     }
+    TraceSpanScope fanout(request.latency_trace_, TraceStage::kPublishFanout);
     const std::uint64_t receivers = co_await PublishChannel(args[1], args[2]);
+    fanout.End();
     co_return BuiltReply(reply_builder.AppendInteger(
         static_cast<long long>(std::min<std::uint64_t>(
             receivers, std::numeric_limits<long long>::max()))));
@@ -2732,6 +2734,8 @@ Task<absl::Status> ReleaseReplicationPublisherAdmission(
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                                      const CommandRequest* request = nullptr) {
+  TraceSpanScope admission_wait(request ? request->latency_trace_ : nullptr,
+                                TraceStage::kAdmissionWait);
   ReplicationPublisherAdmission admission;
   if (request != nullptr) {
     logical_bytes = SaturatingAdd(logical_bytes,
@@ -4358,14 +4362,16 @@ PreparedDumpReply PrepareDumpReply(std::string payload) {
 // owns the command-position result after EXEC releases intents or deletes keys.
 Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
     std::uint8_t db, std::string_view key,
-    const storage::Digest* locked = nullptr) {
+    const storage::Digest* locked = nullptr,
+    OnlineLatencyTrace* diagnostics = nullptr) {
   const auto digest = locked ? *locked : storage::ComputeDigest(key);
   tx::TxShard::Guard guard;
   if (!locked)
     guard = co_await tx::CurrentTxShard().AcquireKey(
         db, tx::FingerprintOf(digest), tx::LockMode::kShared,
         lavik::storage::RedisSlot(key));
-  auto value = co_await g_storage->ReadValueForTransferLocked(db, key, digest);
+  auto value = co_await g_storage->ReadValueForTransferLocked(
+      db, key, digest, std::nullopt, diagnostics);
   guard = {};
   if (!value.ok()) co_return value.status();
   if (!value->reader_) {
@@ -4454,11 +4460,65 @@ void CopyOnlineStorageTrace(Trace* legacy, const Trace& online) {
   const auto owner_start = legacy->owner_start_ns_;
   const auto remote = legacy->remote_;
   *legacy = online;
+  legacy->diagnostics_ =
+      nullptr;  // A legacy reply cannot retain a borrowed root.
   legacy->request_start_ns_ = request_start;
   legacy->owner_start_ns_ = owner_start;
   legacy->remote_ = remote;
 }
 #endif
+
+// Keep the ordinary owner hop as a direct Bycorf awaiter. Only a selected
+// cross-worker request creates the timing coroutine inside Callback::Run;
+// callback entry/exit use independently anchored monotonic worker clocks.
+template <typename Fn>
+class CommandOwnerAwaiter {
+  struct Callback {
+    Fn fn;
+    OnlineLatencyTrace* trace;
+    std::uint64_t start;
+    std::uint64_t* done;
+    Task<CommandReply> operator()() {
+      if (!trace) return fn();
+      return Run();
+    }
+    Task<CommandReply> Run() {
+      RecordTraceInterval(trace, TraceStage::kRouteToOwner, start,
+                          TraceNowNanos(trace));
+      CommandReply reply = co_await fn();
+      *done = TraceNowNanos(trace);
+      co_return reply;
+    }
+  };
+
+ public:
+  CommandOwnerAwaiter(unsigned owner, OnlineLatencyTrace* trace, Fn fn)
+      : trace_(owner != ThisWorker().id_ ? trace : nullptr),
+        start_(trace_ ? TraceNowNanos(trace_) : 0),
+        awaiter_(owner, Callback{std::move(fn), trace_, start_, &done_}) {}
+  CommandOwnerAwaiter(const CommandOwnerAwaiter&) = delete;
+  CommandOwnerAwaiter& operator=(const CommandOwnerAwaiter&) = delete;
+  bool await_ready() { return awaiter_.await_ready(); }
+  auto await_suspend(std::coroutine_handle<> handle) {
+    return awaiter_.await_suspend(handle);
+  }
+  CommandReply&& await_resume() {
+    auto&& result = awaiter_.await_resume();
+    if (trace_)
+      RecordTraceInterval(trace_, TraceStage::kRouteBack, done_,
+                          TraceNowNanos(trace_));
+    return std::move(result);
+  }
+
+ private:
+  OnlineLatencyTrace* trace_;
+  std::uint64_t start_, done_ = 0;
+  bycorf::SubmitTaskAwaiter<Callback> awaiter_;
+};
+template <typename Fn>
+auto SubmitCommandTo(unsigned owner, OnlineLatencyTrace* trace, Fn fn) {
+  return CommandOwnerAwaiter<Fn>(owner, trace, std::move(fn));
+}
 
 Task<CommandReply> ExecuteStorageCommand(
     const CommandRequest& request, ReplyBuilder& reply_builder,
@@ -4496,13 +4556,20 @@ Task<CommandReply> ExecuteStorageCommand(
         CopyOnlineStorageTrace(legacy_read, trace->read_);
 #endif
     }
-  } finish_online{request.latency_trace_
+  } finish_online{
+      request.latency_trace_ &&
+              ((request.kind_ == CommandKind::kGet &&
+                request.latency_trace_->family_ == TraceCommandFamily::kGet) ||
+               (request.kind_ == CommandKind::kSet &&
+                request.latency_trace_->family_ == TraceCommandFamily::kSet))
+          ? request.latency_trace_
+          : nullptr
 #if LAVIK_ENABLE_TRACE
-                  ,
-                  read_trace, set_trace
+      ,
+      read_trace, set_trace
 #endif
   };
-  if (auto* online = request.latency_trace_) {
+  if (auto* online = finish_online.trace) {
     if (online->is_set_) {
       set_trace = &online->set_;
       set_trace->remote_ = ThisWorker().id_ != online->origin_;
@@ -4511,6 +4578,22 @@ Task<CommandReply> ExecuteStorageCommand(
       read_trace = &online->read_;
       read_trace->remote_ = ThisWorker().id_ != online->origin_;
       read_trace->owner_start_ns_ = LatencyMonotonicNanos();
+    }
+  }
+  // Composite commands may execute GET/SET on several shards concurrently.
+  // Their physical payloads remain private; only worker-local stage segments
+  // belong to the shared parent.
+  std::unique_ptr<ReadLatencyTrace> child_read;
+  std::unique_ptr<SetLatencyTrace> child_write;
+  if (request.latency_trace_ && !finish_online.trace) {
+    if (request.kind_ == CommandKind::kGet) {
+      child_read = std::make_unique<ReadLatencyTrace>();
+      child_read->diagnostics_ = request.latency_trace_;
+      read_trace = child_read.get();
+    } else if (request.kind_ == CommandKind::kSet) {
+      child_write = std::make_unique<SetLatencyTrace>();
+      child_write->diagnostics_ = request.latency_trace_;
+      set_trace = child_write.get();
     }
   }
   CommandReply reply;
@@ -4541,8 +4624,8 @@ Task<CommandReply> ExecuteStorageCommand(
     }
 
     case CommandKind::kType: {
-      auto metadata =
-          co_await g_storage->ReadKeyMetadata(request.db_id_, args[1]);
+      auto metadata = co_await g_storage->ReadKeyMetadata(
+          request.db_id_, args[1], request.latency_trace_);
       if (!metadata.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, metadata.status());
         co_return reply;
@@ -4554,7 +4637,8 @@ Task<CommandReply> ExecuteStorageCommand(
     }
 
     case CommandKind::kDump: {
-      auto prepared = co_await PrepareCollectionDump(request.db_id_, args[1]);
+      auto prepared = co_await PrepareCollectionDump(
+          request.db_id_, args[1], nullptr, request.latency_trace_);
       if (!prepared.ok()) {
         reply.encoded_ =
             absl::IsNotFound(prepared.status())
@@ -4841,8 +4925,8 @@ Task<CommandReply> ExecuteStorageCommand(
             std::string(request.spec_->name_) + "' command");
         co_return reply;
       }
-      auto metadata =
-          co_await g_storage->ReadKeyMetadata(request.db_id_, args[1]);
+      auto metadata = co_await g_storage->ReadKeyMetadata(
+          request.db_id_, args[1], request.latency_trace_);
       if (!metadata.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, metadata.status());
         co_return reply;
@@ -5491,7 +5575,12 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
   }
   switch (request.kind_) {
     case CommandKind::kGet: {
-      auto value = co_await g_storage->GetLocked(db_id, args[1], digest);
+      auto detail = request.latency_trace_
+                        ? std::make_unique<ReadLatencyTrace>()
+                        : nullptr;
+      if (detail) detail->diagnostics_ = request.latency_trace_;
+      auto value =
+          co_await g_storage->GetLocked(db_id, args[1], digest, detail.get());
       if (value.ok()) {
         const auto bytes = value->network_bytes();
         co_return std::string(reinterpret_cast<const char*>(bytes.data()),
@@ -5504,8 +5593,8 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kType: {
-      auto metadata =
-          co_await g_storage->ReadKeyMetadataLocked(db_id, args[1], digest);
+      auto metadata = co_await g_storage->ReadKeyMetadataLocked(
+          db_id, args[1], digest, request.latency_trace_);
       if (!metadata.ok()) co_return EncodeStorageError(metadata.status());
       const auto& info = *metadata;
       co_return EncodeSimpleString(
@@ -5513,7 +5602,8 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kDump: {
-      auto prepared = co_await PrepareCollectionDump(db_id, args[1], &digest);
+      auto prepared = co_await PrepareCollectionDump(db_id, args[1], &digest,
+                                                     request.latency_trace_);
       if (!prepared.ok())
         co_return absl::IsNotFound(prepared.status())
             ? EncodeSemanticNull(request.resp_version_)
@@ -5778,8 +5868,8 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
                                 request.kind_ == CommandKind::kPExpireTime;
       const bool absolute = request.kind_ == CommandKind::kExpireTime ||
                             request.kind_ == CommandKind::kPExpireTime;
-      auto metadata =
-          co_await g_storage->ReadKeyMetadataLocked(db_id, args[1], digest);
+      auto metadata = co_await g_storage->ReadKeyMetadataLocked(
+          db_id, args[1], digest, request.latency_trace_);
       if (!metadata.ok()) co_return EncodeStorageError(metadata.status());
       const auto& info = *metadata;
       if (!info.exists_) {
@@ -5929,7 +6019,8 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   context->writes_.resize(g_storage->worker_count());
   g_storage->InitializeTxWrites(txid, context->writes_,
-                                ClusterMutationPrecondition(request));
+                                ClusterMutationPrecondition(request),
+                                request.latency_trace_);
   for (storage::TxShardWrites& writes : context->writes_) {
     writes.collect_undo_ = true;
   }
@@ -5968,7 +6059,7 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
   // or misreport an already-decided outcome, so the hook is cleared.
   transaction.SetShardValidator(nullptr, nullptr);
   absl::Status finished = co_await transaction.Execute(
-      &TwoPhaseFinishCallback<Context>, context, true);
+      &TwoPhaseFinishCallback<Context>, context, true, TraceStage::kTxFinish);
   if (status.ok() && !finished.ok()) status = std::move(finished);
   disarm_undo();
   co_return TwoPhaseResult{std::move(status), txid, false};
@@ -6009,7 +6100,8 @@ Task<absl::Status> RenameWriteCallback(void* opaque,
         &context->writes_[bycorf::ThisWorker().id_];
     if (key.arg_index_ == 1) {
       auto deleted = co_await g_storage->DeleteLocked(
-          context->request_->db_id_, name, key.digest_, writes);
+          context->request_->db_id_, name, key.digest_, writes, nullptr,
+          nullptr, context->request_->latency_trace_);
       if (!deleted.ok()) co_return deleted.status();
       if (!*deleted) co_return absl::NotFoundError("no such key");
     } else if (key.arg_index_ == 2) {
@@ -6052,7 +6144,8 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
       context->source_, &writes);
   if (written.ok()) {
     auto deleted = co_await g_storage->DeleteLocked(
-        context->request_->db_id_, args[1], source_key->digest_, &writes);
+        context->request_->db_id_, args[1], source_key->digest_, &writes,
+        nullptr, nullptr, context->request_->latency_trace_);
     if (!deleted.ok()) {
       written = deleted.status();
     } else if (!*deleted) {
@@ -6110,8 +6203,9 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
   if (args[1] == args[2]) {
     const unsigned owner = ShardForKey(args[1]);
     auto metadata = co_await SubmitTaskTo(
-        owner, [db = request.db_id_, key = std::string(args[1])]() {
-          return g_storage->ReadKeyMetadata(db, key);
+        owner, [db = request.db_id_, key = std::string(args[1]),
+                diagnostics = request.latency_trace_]() {
+          return g_storage->ReadKeyMetadata(db, key, diagnostics);
         });
     if (!metadata.ok())
       co_return BuiltReply(
@@ -6124,7 +6218,7 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
                             : reply_builder.AppendSimpleString("OK"));
   }
 
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   for (std::size_t argument = 1; argument <= 2; ++argument) {
     transaction.AddKey(ShardForKey(args[argument]), request.db_id_,
                        storage::ComputeDigest(args[argument]),
@@ -6325,7 +6419,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
         CommandErrorReason::kAuthority, error));
   }
 
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   transaction.AddKey(ShardForKey(args[1]), request.db_id_,
                      storage::ComputeDigest(args[1]), 1, tx::LockMode::kShared,
                      storage::RedisSlot(args[1]));
@@ -6438,7 +6532,7 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
         CommandErrorReason::kArity,
         "ERR wrong number of arguments for 'msetnx' command"));
   }
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   for (std::size_t argument = 1; argument < args.size(); argument += 2) {
     transaction.AddKey(ShardForKey(args[argument]), request.db_id_,
                        storage::ComputeDigest(args[argument]),
@@ -6496,8 +6590,8 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
           .digest_ = key.digest_,
       });
     }
-    auto values =
-        co_await g_storage->BatchGetLocked(ctx->request_->db_id_, reads);
+    auto values = co_await g_storage->BatchGetLocked(
+        ctx->request_->db_id_, reads, ctx->request_->latency_trace_);
     for (std::size_t i = 0; i < values.size(); ++i) {
       if (!values[i].ok()) co_return values[i].status();
       if (values[i]->has_value()) {
@@ -6514,12 +6608,17 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
         auto replication = ctx->tx_writes_.empty()
                                ? PrepareReplicationCommand(*ctx->request_)
                                : std::nullopt;
+        std::unique_ptr<SetLatencyTrace> detail;
+        if (ctx->request_->latency_trace_) {
+          detail = std::make_unique<SetLatencyTrace>();
+          detail->diagnostics_ = ctx->request_->latency_trace_;
+        }
         auto result = co_await g_storage->SetLocked(
             ctx->request_->db_id_, name, key.digest_, args[key.arg_index_ + 1],
             {},
             ctx->tx_writes_.empty() ? nullptr
                                     : &ctx->tx_writes_[ThisWorker().id_],
-            replication ? &*replication : nullptr, nullptr,
+            replication ? &*replication : nullptr, detail.get(),
             &ctx->mutation_precondition_);
         if (!result.ok()) {
           if (!ctx->tx_writes_.empty()) {
@@ -6542,8 +6641,8 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
             ctx->request_->db_id_, name, key.digest_,
             ctx->tx_writes_.empty() ? nullptr
                                     : &ctx->tx_writes_[ThisWorker().id_],
-            replication ? &*replication : nullptr,
-            &ctx->mutation_precondition_);
+            replication ? &*replication : nullptr, &ctx->mutation_precondition_,
+            ctx->request_->latency_trace_);
         if (!deleted.ok()) {
           if (!ctx->tx_writes_.empty()) {
             (void)co_await g_storage->RollbackTxLocal(
@@ -6560,7 +6659,8 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
       case CommandKind::kTouch:
       default: {
         auto metadata = co_await g_storage->ReadKeyMetadataLocked(
-            ctx->request_->db_id_, name, key.digest_);
+            ctx->request_->db_id_, name, key.digest_,
+            ctx->request_->latency_trace_);
         if (!metadata.ok()) co_return metadata.status();
         if (metadata->exists_) {
           ctx->hits_.fetch_add(1, std::memory_order_relaxed);
@@ -6600,7 +6700,7 @@ Task<CommandReply> ExecuteMultiKey(
   }
 
   const bool write = (request.spec_->flags_ & kCmdWrite) != 0;
-  tx::Transaction txn;
+  tx::Transaction txn(request.latency_trace_);
   for (std::size_t i = keys->first_; i <= keys->last_; i += keys->step_) {
     txn.AddKey(ShardForKey(args[i]), request.db_id_,
                storage::ComputeDigest(args[i]), static_cast<std::uint32_t>(i),
@@ -6646,7 +6746,8 @@ Task<CommandReply> ExecuteMultiKey(
     write_txid = storage::StorageEngine::AllocateWriteTxid();
     ctx.tx_writes_.resize(g_storage->worker_count());
     g_storage->InitializeTxWrites(write_txid, ctx.tx_writes_,
-                                  ClusterMutationPrecondition(request));
+                                  ClusterMutationPrecondition(request),
+                                  request.latency_trace_);
     for (auto& shard : ctx.tx_writes_) {
       shard.collect_undo_ = true;
     }
@@ -6672,8 +6773,8 @@ Task<CommandReply> ExecuteMultiKey(
     // fenced off by an authority change that the write hop already beat.
     txn.SetShardValidator(nullptr, nullptr);
     ctx.rollback_ = !status.ok();
-    absl::Status finish =
-        co_await txn.Execute(&MultiKeyFinishCallback, &ctx, true);
+    absl::Status finish = co_await txn.Execute(&MultiKeyFinishCallback, &ctx,
+                                               true, TraceStage::kTxFinish);
     if (!finish.ok() && status.ok()) {
       status = finish;
     }
@@ -6704,6 +6805,8 @@ Task<CommandReply> ExecuteMultiKey(
 
   if (write && replication != nullptr) replication->Commit();
   if (!tx_commit_has_capacity) {
+    TraceSpanScope capacity(request.latency_trace_,
+                            TraceStage::kCommitQueueWait);
     co_await g_storage->WaitForTxCommitCapacity();
   }
 
@@ -6996,9 +7099,10 @@ Task<EncodedCommandReply> ExecuteExecSequentialRename(
   if (source == nullptr) co_return EncodeCommandError("ERR no such key");
   if (args[1] == args[2]) {
     auto metadata = co_await SubmitTaskTo(
-        source->owner_, [db = command.db_id_, key = std::string(args[1]),
-                         digest = source->digest_]() {
-          return g_storage->ReadKeyMetadataLocked(db, key, digest);
+        source->owner_,
+        [db = command.db_id_, key = std::string(args[1]),
+         digest = source->digest_, diagnostics = command.latency_trace_]() {
+          return g_storage->ReadKeyMetadataLocked(db, key, digest, diagnostics);
         });
     if (!metadata.ok()) co_return EncodeStorageError(metadata.status());
     const auto& info = *metadata;
@@ -7051,7 +7155,8 @@ Task<EncodedCommandReply> ExecuteExecSequentialRename(
       source->owner_,
       [db = command.db_id_, key = std::string(args[1]),
        digest = source->digest_, writes = &tx_writes[source->owner_]] {
-        return g_storage->DeleteLocked(db, key, digest, writes);
+        return g_storage->DeleteLocked(db, key, digest, writes, nullptr,
+                                       nullptr, nullptr);
       });
   if (!deleted.ok() || !*deleted) {
     const absl::Status failure =
@@ -7274,6 +7379,7 @@ Task<EncodedCommandReply> ExecuteExecSequentialSetMulti(
     auto run_set =
         [&](const ExecKey& key, storage::HashOperation operation,
             bool write) -> Task<absl::StatusOr<storage::HashResult>> {
+      operation.diagnostics_ = command.latency_trace_;
       auto execute = [&]() -> Task<absl::StatusOr<storage::HashResult>> {
         auto result = co_await g_storage->ExecuteSetLocked(
             command.db_id_, args[key.arg_], key.digest_, operation,
@@ -7408,7 +7514,8 @@ Task<EncodedCommandReply> ExecuteExecSequentialSetMulti(
         intersection ? SetAggregate::kIntersection
         : difference ? SetAggregate::kDifference
                      : SetAggregate::kUnion,
-        command.kind_ == CommandKind::kSInterCard, cardinality_limit, read);
+        command.kind_ == CommandKind::kSInterCard, cardinality_limit, read,
+        command.latency_trace_);
     if (!aggregated.ok()) co_return EncodeStorageError(aggregated.status());
     auto& output = aggregated->members_;
     if (command.kind_ == CommandKind::kSInterCard) {
@@ -7460,7 +7567,8 @@ Task<EncodedCommandReply> ExecuteExecSequentialSetMulti(
       auto remove_destination = [&]() {
         return g_storage->DeleteLocked(command.db_id_, args[1],
                                        destination->digest_,
-                                       &tx_writes[destination->owner_]);
+                                       &tx_writes[destination->owner_], nullptr,
+                                       nullptr, command.latency_trace_);
       };
       absl::StatusOr<bool> deleted;
       if (destination->owner_ == ThisWorker().id_) {
@@ -7819,6 +7927,7 @@ struct CommandExecutionSpan {
   // Coordinator-only exclusions for nested VM/catalog admission. Shard spans
   // describe execution only; their merge never contributes admission ticks.
   std::uint64_t excluded_ticks_ = 0;
+  std::uint64_t trace_start_ns_ = 0, trace_end_ns_ = 0;
   std::uint64_t Elapsed() const noexcept {
     const auto elapsed = end_ - start_;
     return elapsed > excluded_ticks_ ? elapsed - excluded_ticks_ : 0;
@@ -7827,20 +7936,36 @@ struct CommandExecutionSpan {
     if (other.end_ == 0) return;
     start_ = start_ == 0 ? other.start_ : std::min(start_, other.start_);
     end_ = std::max(end_, other.end_);
+    if (other.trace_start_ns_) {
+      trace_start_ns_ = trace_start_ns_
+                            ? std::min(trace_start_ns_, other.trace_start_ns_)
+                            : other.trace_start_ns_;
+      trace_end_ns_ = std::max(trace_end_ns_, other.trace_end_ns_);
+    }
   }
 };
 struct MeasureCommandExecution {
   CommandExecutionSpan* span_;
-  explicit MeasureCommandExecution(CommandExecutionSpan* span) : span_(span) {
-    if (span_) span_->start_ = bycorf::ReadCycleCounter();
+  OnlineLatencyTrace* diagnostics_;
+  explicit MeasureCommandExecution(CommandExecutionSpan* span,
+                                   OnlineLatencyTrace* diagnostics = nullptr)
+      : span_(span), diagnostics_(diagnostics) {
+    if (span_) {
+      span_->start_ = bycorf::ReadCycleCounter();
+      span_->trace_start_ns_ = TraceNowNanos(diagnostics_);
+    }
   }
   ~MeasureCommandExecution() {
-    if (span_) span_->end_ = bycorf::ReadCycleCounter();
+    if (span_) {
+      span_->end_ = bycorf::ReadCycleCounter();
+      span_->trace_end_ns_ = TraceNowNanos(diagnostics_);
+    }
   }
 };
 Task<EncodedCommandReply> MeasureCommandReply(Task<EncodedCommandReply> task,
-                                              CommandExecutionSpan* span) {
-  MeasureCommandExecution measure(span);
+                                              CommandExecutionSpan* span,
+                                              OnlineLatencyTrace* diagnostics) {
+  MeasureCommandExecution measure(span, diagnostics);
   co_return co_await std::move(task);
 }
 
@@ -8320,7 +8445,8 @@ Task<EncodedCommandReply> ExecuteLuaRedisCallBody(
         if (command.kind_ == CommandKind::kDel ||
             command.kind_ == CommandKind::kUnlink) {
           auto deleted = co_await g_storage->DeleteLocked(
-              command.db_id_, command.args_[key_index], digest, writes);
+              command.db_id_, command.args_[key_index], digest, writes, nullptr,
+              nullptr, command.latency_trace_);
           if (!deleted.ok()) {
             reply = EncodeStorageError(deleted.status());
           } else {
@@ -8331,7 +8457,8 @@ Task<EncodedCommandReply> ExecuteLuaRedisCallBody(
         if (command.kind_ == CommandKind::kExists ||
             command.kind_ == CommandKind::kTouch) {
           auto metadata = co_await g_storage->ReadKeyMetadataLocked(
-              command.db_id_, command.args_[key_index], digest);
+              command.db_id_, command.args_[key_index], digest,
+              command.latency_trace_);
           reply = metadata.ok() ? EncodeInteger(metadata->exists_ ? 1 : 0)
                                 : EncodeStorageError(metadata.status());
           co_return absl::OkStatus();
@@ -8369,6 +8496,8 @@ Task<EncodedCommandReply> ExecuteLuaRedisCall(
                                    eval_request.db_id_);
   CommandRequest command;
   if (built.ok()) command = std::move(*built);
+  command.latency_trace_ = eval_request.latency_trace_;
+  const auto trace_started = TraceNowNanos(command.latency_trace_);
   const auto identity = ResolveCommandIdentity(command);
   const auto started = bycorf::ReadCycleCounter();
   EncodedCommandReply reply;
@@ -8398,11 +8527,14 @@ Task<EncodedCommandReply> ExecuteLuaRedisCall(
   if (!eval_request.replication_origin_)
     RecordCommandResult(identity.index_, reply.outcome_,
                         bycorf::ReadCycleCounter() - started);
+  RecordTraceChild(command.latency_trace_, identity.index_, trace_started,
+                   TraceNowNanos(command.latency_trace_));
   co_return reply;
 }
 
-Task<bool> BeginLuaExecution() {
+Task<bool> BeginLuaExecution(OnlineLatencyTrace* diagnostics = nullptr) {
   while (g_lua_execution_active) {
+    TraceSpanScope admission(diagnostics, TraceStage::kAdmissionWait);
     co_await Yield(*ThisWorker().self_);
   }
   g_lua_execution_active = true;
@@ -8599,9 +8731,11 @@ Task<EncodedCommandReply> ExecuteEvalWithTransaction(
   const std::size_t argv_begin = 3 + key_count;
   const auto script_argv = request.args_.View().subspan(argv_begin);
   const auto vm_wait_started = bycorf::ReadCycleCounter();
-  (void)co_await BeginLuaExecution();
+  (void)co_await BeginLuaExecution(request.latency_trace_);
   *admission_ticks += bycorf::ReadCycleCounter() - vm_wait_started;
   LuaExecutionGuard lua_execution;
+  TraceSpanScope script_prepare(request.latency_trace_,
+                                TraceStage::kScriptPrepare);
   const bool source_cached =
       source_kind && !sha.empty() && FindCachedLuaScript(sha).has_value();
   absl::StatusOr<std::unique_ptr<LuaExecution>> execution =
@@ -8673,6 +8807,8 @@ Task<EncodedCommandReply> ExecuteEvalWithTransaction(
     }
   }
 
+  script_prepare.End();
+  TraceSpanScope script_run(request.latency_trace_, TraceStage::kScriptRun);
   LuaExecutionStep step =
       (*execution)
           ->Start(request.replication_origin_,
@@ -8734,7 +8870,7 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
   ClusterShardValidatorContext cluster_validator;
 
   if (key_count != 0) {
-    transaction.emplace();
+    transaction.emplace(request.latency_trace_);
     for (std::size_t i = 0; i < key_count; ++i) {
       const std::string_view key = declared_keys[i];
       transaction->AddKey(
@@ -8777,7 +8913,8 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
       const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
       tx_writes.resize(g_storage->worker_count());
       g_storage->InitializeTxWrites(txid, tx_writes,
-                                    ClusterMutationPrecondition(request));
+                                    ClusterMutationPrecondition(request),
+                                    request.latency_trace_);
     }
   }
 
@@ -8907,7 +9044,7 @@ Task<CommandReply> ExecuteScript(const CommandRequest& request,
           reply_builder.AppendError("ERR unable to compute script SHA1"));
     }
     const auto vm_wait_started = bycorf::ReadCycleCounter();
-    (void)co_await BeginLuaExecution();
+    (void)co_await BeginLuaExecution(request.latency_trace_);
     reply_builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
                                         vm_wait_started);
     LuaExecutionGuard lua_execution;
@@ -9402,7 +9539,7 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
       auto& spans = ctx->worker_spans_[self];
       span = &spans.emplace_back(i, CommandExecutionSpan{}).span_;
     }
-    MeasureCommandExecution measure(span);
+    MeasureCommandExecution measure(span, cmd.latency_trace_);
     auto record_error = [&](absl::Status status) {
       std::lock_guard<std::mutex> lock(ctx->error_mutex_);
       if (ctx->errors_[local].ok()) {
@@ -9469,7 +9606,8 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
                 }
               });
           auto deleted = co_await g_storage->DeleteLocked(
-              cmd.db_id_, args[key.arg_], key.digest_, tx);
+              cmd.db_id_, args[key.arg_], key.digest_, tx, nullptr, nullptr,
+              cmd.latency_trace_);
           if (!deleted.ok()) {
             record_error(deleted.status());
             command_failed = true;
@@ -9490,7 +9628,7 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         case CommandKind::kExists:
         case CommandKind::kTouch: {
           auto metadata = co_await g_storage->ReadKeyMetadataLocked(
-              cmd.db_id_, args[key.arg_], key.digest_);
+              cmd.db_id_, args[key.arg_], key.digest_, cmd.latency_trace_);
           if (!metadata.ok()) {
             record_error(metadata.status());
             command_failed = true;
@@ -9631,7 +9769,9 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
 // transaction needs before asking. The liveness snapshot travels with the
 // key, not the shard entry, so keys sharing a fingerprint are each compared
 // against their own snapshot.
-Task<bool> CheckConnectionWatches(const ConnectionContext& ctx) {
+Task<bool> CheckConnectionWatches(const ConnectionContext& ctx,
+                                  OnlineLatencyTrace* diagnostics = nullptr) {
+  TraceSpanScope check(diagnostics, TraceStage::kWatchCheck);
   for (const auto& watched : ctx.watched_) {
     if (watched.serving_generation_valid_ && g_replication != nullptr &&
         !g_replication->ServingGenerationMatches(watched.serving_generation_)) {
@@ -9827,8 +9967,11 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
     std::uint64_t acknowledged = 0;
     if (ctx.native_replication_watermark_dirty_) {
       if (allow_blocking) {
+        TraceSpanScope fence(request.latency_trace_,
+                             TraceStage::kReplicationFence);
         auto captured =
             co_await g_replication->CaptureNativeReplicationWatermark();
+        fence.End();
         if (!captured.ok()) {
           co_return BuiltReply(reply_builder.AppendError(
               CommandErrorReasonForStatus(captured.status()),
@@ -9943,8 +10086,11 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
     // gate; if WAIT concurrency becomes material, ACK fan-out can replace it
     // without changing the watermark contract.
     const auto sleep_start = bycorf::ReadCycleCounter();
+    TraceSpanScope ack_wait(request.latency_trace_,
+                            TraceStage::kReplicaAckWait);
     absl::Status slept =
         co_await bycorf::SleepFor(*ThisWorker().self_, sleep_for);
+    ack_wait.End();
     reply_builder.ExcludeExecutionTicks(bycorf::ReadCycleCounter() -
                                         sleep_start);
     if (!slept.ok()) {
@@ -9960,9 +10106,11 @@ Task<CommandReply> ExecuteExecBody(
     std::optional<std::uint64_t> write_admission_role_epoch,
     const ReplicationPublisherAdmission* publisher_admission = nullptr,
     bool* publisher_admission_released = nullptr,
-    ReplicationTransactionOrderGuard* preacquired_order = nullptr) {
+    ReplicationTransactionOrderGuard* preacquired_order = nullptr,
+    OnlineLatencyTrace* diagnostics = nullptr) {
   const RespVersion exec_reply_version = ctx.resp_version();
   std::vector<CommandRequest> queued = std::move(ctx.queued_);
+  for (auto& command : queued) command.latency_trace_ = diagnostics;
   const bool dirty = ctx.multi_dirty_;
   ctx.ResetMulti();
   if (dirty) {
@@ -9972,8 +10120,8 @@ Task<CommandReply> ExecuteExecBody(
         "EXECABORT Transaction discarded because of previous errors."));
   }
   if (queued.empty()) {
-    const bool clean =
-        ctx.watched_.empty() || co_await CheckConnectionWatches(ctx);
+    const bool clean = ctx.watched_.empty() ||
+                       co_await CheckConnectionWatches(ctx, diagnostics);
     co_await DropWatches(ctx);
     if (!clean) co_return BuiltReply(reply_builder.AppendNullArray());
     co_return BuiltReply(reply_builder.AppendArrayHeader(0));
@@ -10319,6 +10467,9 @@ Task<CommandReply> ExecuteExecBody(
                 : replies_[i].outcome_;
         RecordCommandResult(CommandResultId(commands_[i]), outcome,
                             spans_[i].Elapsed());
+        RecordTraceChild(commands_[i].latency_trace_,
+                         CommandResultId(commands_[i]),
+                         spans_[i].trace_start_ns_, spans_[i].trace_end_ns_);
       }
     }
   } record_children{queued, replies, execution_spans, reply_chunks};
@@ -10525,7 +10676,8 @@ Task<CommandReply> ExecuteExecBody(
         exec_txid, tx_writes,
         write_request == queued.end()
             ? storage::MutationPrecondition{}
-            : ClusterMutationPrecondition(*write_request));
+            : ClusterMutationPrecondition(*write_request),
+        diagnostics);
 
     // Every read and write owner participates in the replication barrier.
     // Any command that has not yet been reduced to an independent after-image
@@ -10764,7 +10916,7 @@ Task<CommandReply> ExecuteExecBody(
               }
             }
             if (!ctx.watched_.empty() &&
-                !co_await CheckConnectionWatches(ctx)) {
+                !co_await CheckConnectionWatches(ctx, diagnostics)) {
               watch_aborted = true;
               co_return absl::OkStatus();
             }
@@ -10780,14 +10932,14 @@ Task<CommandReply> ExecuteExecBody(
               CommandRequest& cmd = queued[i];
               cmd.resp_version_ = ctx.resp_version();
               if (!key_errors[i].empty()) {
-                MeasureCommandExecution measure(execution_span(i));
+                MeasureCommandExecution measure(execution_span(i), diagnostics);
                 replies[i] = key_errors[i];
                 ++i;
                 continue;
               }
               if (cmd_keys[i].empty()) {
-                replies[i] = co_await MeasureCommandReply(run_keyless(cmd),
-                                                          execution_span(i));
+                replies[i] = co_await MeasureCommandReply(
+                    run_keyless(cmd), execution_span(i), diagnostics);
                 ++i;
                 continue;
               }
@@ -10798,7 +10950,7 @@ Task<CommandReply> ExecuteExecBody(
                     ExecuteExecSequentialCommand(sequential, cmd, cmd_keys[i],
                                                  tx_writes, false,
                                                  &reply_chunks[i]),
-                    execution_span(i));
+                    execution_span(i), diagnostics);
                 ++i;
                 continue;
               }
@@ -10870,7 +11022,7 @@ Task<CommandReply> ExecuteExecBody(
         }
       }
     } else {
-      tx::Transaction txn;
+      tx::Transaction txn(diagnostics);
       for (std::size_t command_index = 0; command_index < cmd_keys.size();
            ++command_index) {
         for (const ExecKey& key : cmd_keys[command_index]) {
@@ -10949,7 +11101,7 @@ Task<CommandReply> ExecuteExecBody(
                                       absl::StrCat("ERR ", armed.message()))));
       }
       if (!ctx.watched_.empty()) {
-        if (!co_await CheckConnectionWatches(ctx)) {
+        if (!co_await CheckConnectionWatches(ctx, diagnostics)) {
           (void)co_await txn.Release();
           co_await DropWatches(ctx);
           co_return finalize_exec_reply(
@@ -10975,14 +11127,14 @@ Task<CommandReply> ExecuteExecBody(
         CommandRequest& cmd = queued[i];
         cmd.resp_version_ = ctx.resp_version();
         if (!key_errors[i].empty()) {
-          MeasureCommandExecution measure(execution_span(i));
+          MeasureCommandExecution measure(execution_span(i), diagnostics);
           replies[i] = key_errors[i];
           ++i;
           continue;
         }
         if (cmd_keys[i].empty()) {
-          replies[i] =
-              co_await MeasureCommandReply(run_keyless(cmd), execution_span(i));
+          replies[i] = co_await MeasureCommandReply(
+              run_keyless(cmd), execution_span(i), diagnostics);
           ++i;
           continue;
         }
@@ -10993,7 +11145,7 @@ Task<CommandReply> ExecuteExecBody(
               ExecuteEvalWithTransaction(cmd, &txn, &tx_writes,
                                          blocking_notifications, &effects, &ctx,
                                          &admission_ticks),
-              execution_span(i));
+              execution_span(i), diagnostics);
           exclude_child_admission(cmd, admission_ticks);
           StoreEvalReplicationEffects(cmd, std::move(effects));
           ++i;
@@ -11005,7 +11157,7 @@ Task<CommandReply> ExecuteExecBody(
           replies[i] = co_await MeasureCommandReply(
               ExecuteExecSequentialCommand(sequential, cmd, cmd_keys[i],
                                            tx_writes, false, &reply_chunks[i]),
-              execution_span(i));
+              execution_span(i), diagnostics);
           ++i;
           continue;
         }
@@ -11054,7 +11206,7 @@ Task<CommandReply> ExecuteExecBody(
       }
       absl::Status published =
           co_await txn.Execute(&FinishTxParticipantsCallback, &tx_writes,
-                               /*release=*/false);
+                               /*release=*/false, TraceStage::kTxFinish);
       if (!published.ok()) {
         (void)co_await txn.Release();
         co_await DropWatches(ctx);
@@ -11096,7 +11248,8 @@ Task<CommandReply> ExecuteExecBody(
     }
   } else {
     // Keyless-only transaction.
-    if (!ctx.watched_.empty() && !co_await CheckConnectionWatches(ctx)) {
+    if (!ctx.watched_.empty() &&
+        !co_await CheckConnectionWatches(ctx, diagnostics)) {
       co_await DropWatches(ctx);
       co_return finalize_exec_reply(
           BuiltReply(reply_builder.AppendNullArray()));
@@ -11110,11 +11263,11 @@ Task<CommandReply> ExecuteExecBody(
       if (close_after_exec) {
         replies[i] = EncodeCommandError("ERR EXEC interrupted");
       } else if (!key_errors[i].empty()) {
-        MeasureCommandExecution measure(execution_span(i));
+        MeasureCommandExecution measure(execution_span(i), diagnostics);
         replies[i] = key_errors[i];
       } else {
-        replies[i] = co_await MeasureCommandReply(run_keyless(queued[i]),
-                                                  execution_span(i));
+        replies[i] = co_await MeasureCommandReply(
+            run_keyless(queued[i]), execution_span(i), diagnostics);
       }
     }
   }
@@ -11363,7 +11516,8 @@ Task<CommandReply> ExecuteExecBody(
 }
 
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
-                               ReplyBuilder& reply_builder) {
+                               ReplyBuilder& reply_builder,
+                               OnlineLatencyTrace* diagnostics = nullptr) {
   // Pattern keys can depend on earlier writes in EXEC, so they cannot be
   // discovered before taking the transaction's static lock set. Isolate this
   // uncommon read-only SORT case with the existing database cut. Take the
@@ -11480,7 +11634,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     }
     co_return co_await ExecuteExecBody(
         ctx, reply_builder, write_admission_role_epoch, nullptr, nullptr,
-        needs_pattern_cut ? &pattern_order : nullptr);
+        needs_pattern_cut ? &pattern_order : nullptr, diagnostics);
   }
   if (ReplicationEventExceedsBacklog(event_bytes)) {
     ctx.ResetMulti();
@@ -11518,7 +11672,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     ActivePublisherAdmissionGuard active_admission(&*admission);
     reply = co_await ExecuteExecBody(
         ctx, reply_builder, write_admission_role_epoch, &*admission,
-        &admission_released, needs_pattern_cut ? &pattern_order : nullptr);
+        &admission_released, needs_pattern_cut ? &pattern_order : nullptr,
+        diagnostics);
   }
   if (!admission_released) {
     absl::Status released =
@@ -13025,7 +13180,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         ctx.native_replication_watermark_dirty_ = false;
         co_return BuiltReply(reply_builder.AppendSimpleString("RESET"));
       case CommandKind::kExec:
-        co_return co_await ExecuteExec(ctx, reply_builder);
+        co_return co_await ExecuteExec(ctx, reply_builder,
+                                       request.latency_trace_);
       default:
         break;
     }
@@ -13075,6 +13231,9 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       }
       request.db_id_ = ctx.multi_db_;
       request.blocking_wake_cascade_ = nullptr;
+      // QUEUED completes this network request. EXEC attaches its own trace
+      // when the stored command executes, after this pool lease has retired.
+      request.latency_trace_ = nullptr;
       ctx.queued_.push_back(std::move(request));
       reply_builder.SetOutcome(
           {CommandResult::kQueued, CommandErrorReason::kNone});
@@ -13114,6 +13273,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     }
     request.db_id_ = ctx.multi_db_;
     request.blocking_wake_cascade_ = nullptr;
+    request.latency_trace_ = nullptr;
     ctx.queued_.push_back(std::move(request));
     reply_builder.SetOutcome(
         {CommandResult::kQueued, CommandErrorReason::kNone});
@@ -13346,6 +13506,8 @@ Task<CommandReply> ExecuteCommandBody(
       }
     });
     while (!TryBeginDbOperation(request.db_id_)) {
+      TraceSpanScope admission(request.latency_trace_,
+                               TraceStage::kAdmissionWait);
       absl::Status waited = co_await bycorf::SleepFor(
           *ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
@@ -13750,12 +13912,19 @@ Task<CommandReply> ExecuteCommandBody(
 #if LAVIK_ENABLE_TRACE
           trace.owner_start_ns_ = trace.request_start_ns_;
 #endif
+          std::unique_ptr<ReadLatencyTrace> private_read;
+          ReadLatencyTrace* detail = nullptr;
           if (request.latency_trace_) {
-            auto& v = request.latency_trace_->read_;
-            v.owner_start_ns_ = LatencyMonotonicNanos();
+            if (request.kind_ == CommandKind::kGet &&
+                request.latency_trace_->family_ == TraceCommandFamily::kGet) {
+              detail = &request.latency_trace_->read_;
+            } else {
+              private_read = std::make_unique<ReadLatencyTrace>();
+              private_read->diagnostics_ = request.latency_trace_;
+              detail = private_read.get();
+            }
+            detail->owner_start_ns_ = LatencyMonotonicNanos();
           }
-          ReadLatencyTrace* detail =
-              request.latency_trace_ ? &request.latency_trace_->read_ : nullptr;
 #if LAVIK_ENABLE_TRACE
           if (!detail) detail = &trace;
 #endif
@@ -13765,10 +13934,9 @@ Task<CommandReply> ExecuteCommandBody(
               request.spec_->remote_read_metadata_, detail);
           if (fast) {
             if (request.latency_trace_) {
-              auto& v = request.latency_trace_->read_;
-              v.owner_done_ns_ = LatencyMonotonicNanos();
+              detail->owner_done_ns_ = LatencyMonotonicNanos();
 #if LAVIK_ENABLE_TRACE
-              CopyOnlineStorageTrace(&trace, v);
+              CopyOnlineStorageTrace(&trace, *detail);
 #endif
             }
             CommandReply reply;
@@ -13817,8 +13985,8 @@ Task<CommandReply> ExecuteCommandBody(
         if (request.kind_ == CommandKind::kGet) {
           CommandReply reply;
           if (trace.remote_) {
-            reply = co_await SubmitTaskTo(
-                target,
+            reply = co_await SubmitCommandTo(
+                target, request.latency_trace_,
                 [&request, &reply_builder, &trace]() -> Task<CommandReply> {
                   trace.owner_start_ns_ = ReadTraceNowNanos();
                   CommandReply result = co_await ExecuteStorageCommand(
@@ -13845,8 +14013,8 @@ Task<CommandReply> ExecuteCommandBody(
           trace.remote_ = target != ThisWorker().id_;
           CommandReply reply;
           if (trace.remote_) {
-            reply = co_await SubmitTaskTo(
-                target,
+            reply = co_await SubmitCommandTo(
+                target, request.latency_trace_,
                 [&request, &reply_builder, &trace]() -> Task<CommandReply> {
                   trace.owner_start_ns_ = SetTraceNowNanos();
                   CommandReply result = co_await ExecuteStorageCommand(
@@ -13866,8 +14034,9 @@ Task<CommandReply> ExecuteCommandBody(
         }
 #endif
         if (target != ThisWorker().id_) {
-          co_return co_await SubmitTaskTo(
-              target, [&request, &reply_builder]() -> Task<CommandReply> {
+          co_return co_await SubmitCommandTo(
+              target, request.latency_trace_,
+              [&request, &reply_builder]() -> Task<CommandReply> {
                 co_return co_await ExecuteStorageCommand(
                     request, reply_builder, nullptr, nullptr, true);
               });
@@ -14082,13 +14251,13 @@ Task<CommandReply> ExecuteCommandOnOwner(unsigned owner,
   // SubmitTaskTo already owns the callback and awaits its returned task. The
   // callback can forward that task directly instead of allocating another
   // coroutine around every cross-worker command.
-  co_return co_await SubmitTaskTo(owner,
-                                  [&request, &reply_builder, client_id,
-                                   connection]() -> Task<CommandReply> {
-                                    return ExecuteAdmittedCommand(
-                                        request, reply_builder, client_id,
-                                        connection);
-                                  });
+  co_return co_await SubmitCommandTo(owner, request.latency_trace_,
+                                     [&request, &reply_builder, client_id,
+                                      connection]() -> Task<CommandReply> {
+                                       return ExecuteAdmittedCommand(
+                                           request, reply_builder, client_id,
+                                           connection);
+                                     });
 }
 
 }  // namespace

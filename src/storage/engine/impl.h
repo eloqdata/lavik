@@ -89,6 +89,22 @@ using bycorf::Worker;
 
 class GroupReadLimiter;
 
+// A selected operation owns its mutable physical sidecars. Parallel pages and
+// shards share only the root's worker-local recorder, never these payloads.
+inline std::unique_ptr<ReadLatencyTrace> MakeReadTrace(
+    OnlineLatencyTrace* root) {
+  if (!root) return nullptr;
+  auto trace = std::make_unique<ReadLatencyTrace>();
+  trace->diagnostics_ = root;
+  return trace;
+}
+inline std::unique_ptr<SetLatencyTrace> MakeSetTrace(OnlineLatencyTrace* root) {
+  if (!root) return nullptr;
+  auto trace = std::make_unique<SetLatencyTrace>();
+  trace->diagnostics_ = root;
+  return trace;
+}
+
 // Storage operations occasionally pin immutable physical state, release the
 // worker-local metadata mutex across IO, then reacquire it for publication.
 class UnlockGuard {
@@ -2323,7 +2339,8 @@ class StorageEngine::Impl {
       bool acquire_key_lock, bool optimistic_read = false);
 
   Task<std::vector<BatchGetValue>> BatchGetLocked(
-      std::uint8_t db_id, std::span<const BatchGetRequest> requests);
+      std::uint8_t db_id, std::span<const BatchGetRequest> requests,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
                                                    std::string_view key);
@@ -2431,21 +2448,24 @@ class StorageEngine::Impl {
       const StreamGroupAccess& access, bool read_only, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      PreparedStreamMutation* prepared = nullptr);
+      PreparedStreamMutation* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   struct StreamPageAccess;
   Task<absl::Status> ExecuteGroupedStreamInspect(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, const CompactValueCallback& callback,
-      const StreamInspectAccess& access);
+      const StreamInspectAccess& access,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::Status> ExecuteGroupedStreamHeaderLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, const CompactValueCallback& callback,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      PreparedStreamMutation* prepared = nullptr);
+      PreparedStreamMutation* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamTrimLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2453,7 +2473,8 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, const CompactValueCallback& callback,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      PreparedStreamMutation* prepared = nullptr);
+      PreparedStreamMutation* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamDeleteLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2462,7 +2483,8 @@ class StorageEngine::Impl {
       const StreamDeleteAccess& access, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      PreparedStreamMutation* prepared = nullptr);
+      PreparedStreamMutation* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamAckLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2471,13 +2493,15 @@ class StorageEngine::Impl {
       const StreamAckAccess& access, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      PreparedStreamMutation* prepared = nullptr);
+      PreparedStreamMutation* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, const CompactValueCallback& callback,
-      const StreamRangeAccess& range);
+      const StreamRangeAccess& range,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::Status> ExecuteGroupedStreamAppendLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2486,7 +2510,8 @@ class StorageEngine::Impl {
       std::uint32_t node_max_entries, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      PreparedStreamMutation* prepared = nullptr);
+      PreparedStreamMutation* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::Status> ExecuteCompact(
       std::uint8_t db_id, std::string_view key, ValueType value_type,
@@ -2511,7 +2536,8 @@ class StorageEngine::Impl {
       std::string_view value, std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition,
-      GroupedObject::Handle previous = nullptr, std::string_view before = {});
+      GroupedObject::Handle previous = nullptr, std::string_view before = {},
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
@@ -2546,7 +2572,8 @@ class StorageEngine::Impl {
       ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition = nullptr,
-      HashGroupMutationPlan* prepared = nullptr);
+      HashGroupMutationPlan* prepared = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // The plan contains complete changed ordered pages, not an append-only
   // mutation log. Null previous creates/promotes a collection; the adapter
@@ -2559,7 +2586,8 @@ class StorageEngine::Impl {
       std::uint64_t expire_at_ms, TxShardWrites* tx,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
-      SortedSetMemberMutation* prepared_members = nullptr);
+      SortedSetMemberMutation* prepared_members = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   struct SortedSetMemberMutation {
     MemoryReservation scratch_;
     MemoryReservation leaves_;
@@ -2674,16 +2702,19 @@ class StorageEngine::Impl {
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
-  Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(std::uint8_t db_id,
-                                                       std::string_view key);
+  Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(
+      std::uint8_t db_id, std::string_view key,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Multi-field reads retain only requested output and one encoded group at a
   // time; the request views and immutable directory outlive the awaited call.
   Task<absl::StatusOr<HashResult>> ReadGroupedHashFields(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, std::span<const std::string_view> fields);
+      GroupedObject::Handle object, std::span<const std::string_view> fields,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // Full read-only replies retain only projected output under bounded owner
   // windows. Pages release their leases before joins, which recheck the view.
@@ -2693,7 +2724,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, HashOperationKind kind,
-      bool with_values = false, bool packed_output = false);
+      bool with_values = false, bool packed_output = false,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2706,14 +2738,15 @@ class StorageEngine::Impl {
                                            std::string_view key,
                                            const Digest& digest);
 
-  Task<absl::StatusOr<RawValue>> ReadRawValueLocked(std::uint8_t db_id,
-                                                    std::string_view key,
-                                                    const Digest& digest);
+  Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
                                               std::string_view key);
   Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::optional<StreamRangeAccess> stream_range = std::nullopt);
+      std::optional<StreamRangeAccess> stream_range = std::nullopt,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::Status> WriteValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const TransferValue& value, TxShardWrites* tx = nullptr,
@@ -2763,14 +2796,16 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
@@ -4176,25 +4211,29 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned,
-      Decode decode, GroupReadLimiter* limiter = nullptr);
+      Decode decode, GroupReadLimiter* limiter = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
   Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false);
+      GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
-      GroupReadLimiter* limiter = nullptr);
+      GroupReadLimiter* limiter = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Strict full materialization for mutation, import and legacy raw-value
   // consumers. Callers admit the decoded image; query replies instead consume
   // encoded pages through ReadGroupedHashResult or selected-entry helpers.
   Task<absl::StatusOr<HashValue>> LoadGroupedHashValue(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      GroupedObject::Handle object, bool pinned = false);
+      GroupedObject::Handle object, bool pinned = false,
+      OnlineLatencyTrace* diagnostics = nullptr);
   enum class GroupedValueEncoding : bool { kLogicalStream, kPhysicalStorage };
   // Logical consumers retain the streaming-compatible v1 image. Physical
   // demotion requests the current List/Sorted Set format directly, avoiding
@@ -4557,13 +4596,14 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
-      ReadLatencyTrace* trace = nullptr);
+      ReadLatencyTrace* trace = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<ListResult>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, std::size_t first,
       std::size_t count, GroupReadLimiter* limiter = nullptr,
-      bool packed_output = false);
+      bool packed_output = false, OnlineLatencyTrace* diagnostics = nullptr);
   // Returns owned entries after releasing the physical lease. An optional
   // caller-owned limiter accounts against the refreshed physical owner until
   // decoding finishes; it must outlive this task, including cancellation.
@@ -4574,7 +4614,8 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, std::uint64_t id, bool pinned = false,
       GroupReadLimiter* limiter = nullptr,
       SortedSetMemberValidation validation =
-          SortedSetMemberValidation::kVerifyUnique);
+          SortedSetMemberValidation::kVerifyUnique,
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Returns a fully validated encoded_sorted_set_ with entries_ empty, after
   // releasing the physical lease. The snapshot and any copies remain on the
   // key owner worker; a supplied limiter must outlive the task, including
@@ -4583,7 +4624,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
-      GroupReadLimiter* limiter = nullptr);
+      GroupReadLimiter* limiter = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   enum class SortedSetPageReadMode : bool { kFullDecode, kIndexedProjection };
   // Indexed projection applies only to v2 pages with kTrustStored; v1 and
   // kVerifyUnique retain full decoding. Both modes check identity/CRC and
@@ -4594,7 +4636,8 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, std::uint64_t id,
       SortedSetMemberValidation validation =
           SortedSetMemberValidation::kVerifyUnique,
-      SortedSetPageReadMode mode = SortedSetPageReadMode::kFullDecode);
+      SortedSetPageReadMode mode = SortedSetPageReadMode::kFullDecode,
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Copies one checked page into a contiguous member block before releasing
   // its lease. The caller admits page scratch/output before launch.
   static absl::StatusOr<PackedSortedSetValues> PackSortedSetPage(
@@ -4603,7 +4646,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
-      GroupReadLimiter* limiter = nullptr);
+      GroupReadLimiter* limiter = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,

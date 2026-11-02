@@ -19,6 +19,7 @@
 #include <array>
 #include <coroutine>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -26,11 +27,35 @@
 
 #include "absl/status/status.h"
 #include "bycorf/runtime/task.h"
+#include "lavik/command_args.h"
+#include "lavik/latency_stage.h"
 #include "lavik/read_trace.h"
+#include "lavik/reply_timing.h"
 #include "lavik/set_trace.h"
 
 namespace lavik {
 struct LoggingOptions;
+struct CommandRequest;
+struct TraceSession;
+struct TraceTimingData;
+
+// Histograms use a fixed family vocabulary; individual canonical command
+// identities belong in bounded trace records, not a dense command/stage grid.
+enum class TraceCommandFamily : std::uint8_t {
+  kGet,
+  kSet,
+  kRead,
+  kWrite,
+  kMultiKey,
+  kTransaction,
+  kScript,
+  kBlocking,
+  kReplication,
+  kPubSub,
+  kAdmin,
+  kOther,
+  kCount
+};
 
 // These resources measure actual suspension, including maintenance callers.
 // Ownership remains on the worker that suspended; no shared hot-path lock.
@@ -84,7 +109,9 @@ class LatencyWaitAwaiter {
   LatencyWait wait_;
 };
 
-struct OnlineLatencyTrace {
+struct OnlineLatencyTrace : ReplyTimingObserver {
+  std::uint64_t BeginReplyBuild() noexcept override;
+  void EndReplyBuild(std::uint64_t token) noexcept override;
   ReadLatencyTrace read_;
   SetLatencyTrace set_;
   std::uint64_t id_ = 0;
@@ -98,8 +125,15 @@ struct OnlineLatencyTrace {
   std::uint32_t sample_every_ = 0;
   unsigned origin_ = 0;
   unsigned slot_ = 0;
+  std::uint16_t command_id_ = 0;
+  TraceCommandFamily family_ = TraceCommandFamily::kOther;
   bool is_set_ = false;
   bool write_ok_ = false;
+  bool queued_ = false;
+  // Active writers are partitioned by worker. Retained records hold only
+  // frozen, immutable timings shared with the asynchronous JSON consumer.
+  std::shared_ptr<TraceSession> session_;
+  std::shared_ptr<const TraceTimingData> timings_;
 };
 
 // A worker-local pool lease. Its connection owns it through send completion;
@@ -129,7 +163,11 @@ void InitLatencyDiagnostics(unsigned workers,
                             const LoggingOptions* logging = nullptr);
 void StopLatencyDiagnostics();
 std::uint64_t LatencyMonotonicNanos() noexcept;
-OnlineTraceHandle SelectOnlineTrace(std::string_view command);
+// Diagnostic control requests are excluded to avoid tracing the commands
+// used to inspect/reset collection. Selection never retains argument text.
+OnlineTraceHandle SelectOnlineTrace(CommandArgsView args);
+void BindOnlineTraceCommand(OnlineLatencyTrace* trace,
+                            const CommandRequest& request);
 void AdjustRequestQueue(std::int64_t delta) noexcept;
 void AdjustResponseWrites(std::int64_t delta) noexcept;
 // CONFIG is runtime-only: restart always disables collection. Re-enabling

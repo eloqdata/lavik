@@ -78,6 +78,7 @@ def main():
                 expression = (
                     target["expr"]
                     .replace("$instance", ".*")
+                    .replace("$command_family", ".*")
                     .replace("$command", ".*")
                     .replace("$__rate_interval", "1m")
                     .replace("$__range", "1h")

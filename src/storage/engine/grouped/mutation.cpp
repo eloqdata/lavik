@@ -134,7 +134,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    HashGroupMutationPlan* prepared) {
+    HashGroupMutationPlan* prepared, OnlineLatencyTrace* diagnostics) {
+  if (!diagnostics && tx) diagnostics = tx->diagnostics_;
   if (field_count == 0 ||
       field_count > std::numeric_limits<std::uint32_t>::max() ||
       (value_type != ValueType::kHash && value_type != ValueType::kSet)) {
@@ -170,6 +171,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                            : MutationPrecondition{});
     tx = &standalone;
   }
+  tx->diagnostics_ = diagnostics;
   GroupedDependencyGuard dependency_guard(*tx, outer_transaction);
   const auto dependency =
       co_await PrepareGroupedDependencyLocked(store, source_side, tx);
@@ -201,6 +203,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         "grouped mutation has a stale source command sequence");
   }
   TxShardWrites batch;
+  batch.diagnostics_ = diagnostics;
   if (outer_transaction) {
     batch.txid_ = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);

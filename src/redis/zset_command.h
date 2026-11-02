@@ -41,7 +41,8 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
 // Returns members in the sorted set's native score/member order. SORT uses
 // this for BY nosort while already holding the key's transaction lock.
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
-    std::uint8_t db_id, std::string_view key, const storage::Digest& digest);
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
+    OnlineLatencyTrace* diagnostics = nullptr);
 
 // A supplied compact snapshot bypasses storage only for standalone read-only
 // commands. Its payload lease must outlive the returned task; replies own any

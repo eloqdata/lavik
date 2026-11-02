@@ -43,6 +43,7 @@
 #include "bycorf/runtime/worker.h"
 #include "lavik/fault_injection.h"
 #include "lavik/fault_pause.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/memory.h"
 #include "lavik/metrics.h"
 #include "lavik/rdb.h"
@@ -204,6 +205,7 @@ struct BackupRequestContext {
   bool serving_generation_valid_ = false;
   bool replication_origin_ = false;
   bool synchronous_ = false;
+  bool record_cut_timing_ = false;
 };
 
 BackupRequestContext CaptureRequestContext(const CommandRequest& request) {
@@ -212,6 +214,7 @@ BackupRequestContext CaptureRequestContext(const CommandRequest& request) {
       .serving_generation_valid_ =
           static_cast<bool>(request.serving_generation_valid_),
       .replication_origin_ = static_cast<bool>(request.replication_origin_),
+      .record_cut_timing_ = request.latency_trace_ != nullptr,
   };
 }
 
@@ -225,14 +228,18 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
         serving_generation_(request.serving_generation_),
         serving_generation_valid_(request.serving_generation_valid_),
         replication_origin_(request.replication_origin_),
-        synchronous_(request.synchronous_) {}
+        synchronous_(request.synchronous_),
+        record_cut_timing_(request.record_cut_timing_) {}
 
   Task<absl::Status> Run() {
+    if (record_cut_timing_) cut_start_ns_ = cut_clock_.NowNanos();
     struct CutGuard {
       BackupJob* job_;
       bool complete_ = false;
       ~CutGuard() {
         if (complete_) return;
+        if (job_->record_cut_timing_)
+          job_->cut_done_ns_ = job_->cut_clock_.NowNanos();
         job_->cut_failed_.store(true, std::memory_order_release);
         job_->cut_ready_.store(true, std::memory_order_release);
       }
@@ -319,6 +326,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       OpenAllCommandDbGates();
       gates.open_ = true;
     }
+    if (record_cut_timing_) cut_done_ns_ = cut_clock_.NowNanos();
     cut_ready_.store(true, std::memory_order_release);
     cut_guard.complete_ = true;
 
@@ -414,6 +422,14 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   }
 
   bool synchronous() const noexcept { return synchronous_; }
+
+  // The background job keeps timestamps, never the client's borrowed root.
+  // Publish them only while SAVE awaits this job or BGSAVE awaits its cut.
+  void RecordCut(OnlineLatencyTrace* trace) const noexcept {
+    if (trace && cut_ready() && cut_start_ns_ && cut_done_ns_)
+      RecordTraceInterval(trace, TraceStage::kSnapshotPrepare, cut_start_ns_,
+                          cut_done_ns_);
+  }
 
   bool cut_ready() const noexcept {
     return cut_ready_.load(std::memory_order_acquire);
@@ -574,6 +590,9 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   bool replication_origin_ = false;
   bool synchronous_ = false;
   std::atomic<unsigned> remaining_{0};
+  const bool record_cut_timing_;
+  LatencySegmentClock cut_clock_;
+  std::uint64_t cut_start_ns_ = 0, cut_done_ns_ = 0;
   std::atomic<bool> cut_ready_{false};
   std::atomic<bool> cut_failed_{false};
   // Written before cut_failed_'s release store and read only after its acquire
@@ -796,6 +815,7 @@ Task<CommandReply> ExecuteRdbBackupCommand(
             absl::StrCat("ERR RDB cut failed: ", yielded.message())));
       }
     }
+    cut->RecordCut(request.latency_trace_);
     if (cut->cut_failed()) {
       if (!cut->cut_error().empty()) {
         co_return Reply(reply_builder.AppendError(cut->cut_error()));
@@ -806,6 +826,7 @@ Task<CommandReply> ExecuteRdbBackupCommand(
         reply_builder.AppendSimpleString("Background saving started"));
   }
   absl::Status status = co_await FinishBackup(job);
+  job->RecordCut(request.latency_trace_);
   if (!status.ok()) {
     if (!job->cut_error().empty()) {
       co_return Reply(reply_builder.AppendError(job->cut_error()));

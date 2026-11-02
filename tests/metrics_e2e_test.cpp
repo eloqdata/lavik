@@ -618,14 +618,15 @@ TEST_F(CommandResultsE2eTest, OnlineTraceSamplingRetentionAndMetrics) {
           metrics,
           "lavik_latency_diagnostics_samples_total{result=\"log_dropped\"}"),
       0);
-  EXPECT_EQ(MetricValue(metrics,
-                        "lavik_latency_diagnostics_stage_seconds_count{command="
-                        "\"GET\",stage=\"server_total\"}"),
+  EXPECT_EQ(MetricValue(
+                metrics,
+                "lavik_latency_diagnostics_stage_seconds_count{command_family="
+                "\"get\",stage=\"server_total\"}"),
             200);
-  EXPECT_EQ(MetricValue(metrics,
-                        "lavik_latency_diagnostics_stage_seconds_count{command="
-                        "\"GET\",stage=\"read_io\"}"),
-            0);
+  EXPECT_EQ(metrics.find(
+                "lavik_latency_diagnostics_stage_seconds_count{command_family="
+                "\"get\",stage=\"read_io\"}"),
+            std::string::npos);
   EXPECT_EQ(MetricValue(metrics, "lavik_latency_diagnostics_inflight"), 0);
   EXPECT_EQ(MetricValue(metrics, "lavik_request_queue_length"), 0);
   EXPECT_EQ(MetricValue(metrics, "lavik_response_writes_inflight"), 0);

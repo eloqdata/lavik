@@ -567,9 +567,13 @@ void ReplyBuilder::ResetReply() {
   }
 }
 
-void ReplyBuilder::Reserve(std::size_t capacity) { buffer_.reserve(capacity); }
+void ReplyBuilder::Reserve(std::size_t capacity) {
+  BuildTiming reply_timing(*this);
+  buffer_.reserve(capacity);
+}
 
 std::string_view ReplyBuilder::AppendSimpleString(std::string_view value) {
+  BuildTiming reply_timing(*this);
   buffer_.push_back('+');
   buffer_.append(value);
   buffer_.append("\r\n");
@@ -577,6 +581,7 @@ std::string_view ReplyBuilder::AppendSimpleString(std::string_view value) {
 }
 
 std::string_view ReplyBuilder::AppendBulkString(std::string_view value) {
+  BuildTiming reply_timing(*this);
   buffer_.push_back('$');
   AppendUnsigned(buffer_, value.size());
   buffer_.append("\r\n");
@@ -587,6 +592,7 @@ std::string_view ReplyBuilder::AppendBulkString(std::string_view value) {
 
 std::string_view ReplyBuilder::AppendBulkStrings(
     std::span<const std::string> values) {
+  BuildTiming reply_timing(*this);
   return AppendBulkStrings(values, [](const std::string& value) noexcept {
     return std::string_view(value);
   });
@@ -594,11 +600,13 @@ std::string_view ReplyBuilder::AppendBulkStrings(
 
 std::string_view ReplyBuilder::AppendBulkStrings(
     std::span<const std::string_view> values) {
+  BuildTiming reply_timing(*this);
   return AppendBulkStrings(values, std::identity{});
 }
 
 std::string_view ReplyBuilder::AppendBulkStrings(
     std::span<const std::optional<std::string>> values) {
+  BuildTiming reply_timing(*this);
   return AppendBulkStrings(
       values,
       [](const std::optional<std::string>& value) noexcept
@@ -608,11 +616,13 @@ std::string_view ReplyBuilder::AppendBulkStrings(
 }
 
 std::string_view ReplyBuilder::AppendNullBulkString() {
+  BuildTiming reply_timing(*this);
   buffer_.append("$-1\r\n");
   return buffer_;
 }
 
 std::string_view ReplyBuilder::AppendNullArray() {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k3) {
     buffer_.append("_\r\n");
   } else {
@@ -622,6 +632,7 @@ std::string_view ReplyBuilder::AppendNullArray() {
 }
 
 std::string_view ReplyBuilder::AppendNull() {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k3) {
     buffer_.append("_\r\n");
     return buffer_;
@@ -630,6 +641,7 @@ std::string_view ReplyBuilder::AppendNull() {
 }
 
 std::string_view ReplyBuilder::AppendInteger(long long value) {
+  BuildTiming reply_timing(*this);
   char digits[std::numeric_limits<long long>::digits10 + 3];
   const auto [end, error] =
       std::to_chars(digits, digits + sizeof(digits), value);
@@ -641,6 +653,7 @@ std::string_view ReplyBuilder::AppendInteger(long long value) {
 }
 
 std::string_view ReplyBuilder::AppendBoolean(bool value) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k3) {
     buffer_.append(value ? "#t\r\n" : "#f\r\n");
     return buffer_;
@@ -649,6 +662,7 @@ std::string_view ReplyBuilder::AppendBoolean(bool value) {
 }
 
 std::string_view ReplyBuilder::AppendDouble(double value) {
+  BuildTiming reply_timing(*this);
   char digits[64];
   const auto [end, error] =
       std::to_chars(digits, digits + sizeof(digits), value);
@@ -666,6 +680,7 @@ std::string_view ReplyBuilder::AppendDouble(double value) {
 }
 
 std::string_view ReplyBuilder::AppendDoubleText(std::string_view value) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k2) return AppendBulkString(value);
   buffer_.push_back(',');
   buffer_.append(value);
@@ -674,6 +689,7 @@ std::string_view ReplyBuilder::AppendDoubleText(std::string_view value) {
 }
 
 std::string_view ReplyBuilder::AppendBigNumber(std::string_view value) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k2) return AppendBulkString(value);
   buffer_.push_back('(');
   buffer_.append(value);
@@ -683,6 +699,7 @@ std::string_view ReplyBuilder::AppendBigNumber(std::string_view value) {
 
 std::string_view ReplyBuilder::AppendVerbatimString(std::string_view format,
                                                     std::string_view value) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k2) return AppendBulkString(value);
   if (format.size() != 3) format = "txt";
   buffer_.push_back('=');
@@ -710,11 +727,13 @@ EncodedCommandReply EncodeCommandError(std::string_view message,
 }
 
 std::string_view ReplyBuilder::AppendError(std::string_view message) {
+  BuildTiming reply_timing(*this);
   return AppendError(std::string_view{}, message);
 }
 
 std::string_view ReplyBuilder::AppendError(CommandErrorReason reason,
                                            std::string_view message) {
+  BuildTiming reply_timing(*this);
   const auto encoded = AppendError(std::string_view{}, message);
   outcome_.reason_ = reason;
   return encoded;
@@ -722,6 +741,7 @@ std::string_view ReplyBuilder::AppendError(CommandErrorReason reason,
 
 std::string_view ReplyBuilder::AppendError(std::string_view prefix,
                                            std::string_view message) {
+  BuildTiming reply_timing(*this);
   outcome_ = {CommandResult::kFailed, CommandErrorReason::kClientError,
               CommandErrorPrefixForReply(prefix.empty() ? message : prefix)};
   buffer_.push_back('-');
@@ -732,6 +752,7 @@ std::string_view ReplyBuilder::AppendError(std::string_view prefix,
 }
 
 std::string_view ReplyBuilder::AppendArrayHeader(std::uint64_t count) {
+  BuildTiming reply_timing(*this);
   buffer_.push_back('*');
   AppendUnsigned(buffer_, count);
   buffer_.append("\r\n");
@@ -739,6 +760,7 @@ std::string_view ReplyBuilder::AppendArrayHeader(std::uint64_t count) {
 }
 
 std::string_view ReplyBuilder::AppendMapHeader(std::uint64_t count) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k2) {
     return AppendArrayHeader(count * 2);
   }
@@ -749,6 +771,7 @@ std::string_view ReplyBuilder::AppendMapHeader(std::uint64_t count) {
 }
 
 std::string_view ReplyBuilder::AppendSetHeader(std::uint64_t count) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k2) return AppendArrayHeader(count);
   buffer_.push_back('~');
   AppendUnsigned(buffer_, count);
@@ -757,6 +780,7 @@ std::string_view ReplyBuilder::AppendSetHeader(std::uint64_t count) {
 }
 
 std::string_view ReplyBuilder::AppendPushHeader(std::uint64_t count) {
+  BuildTiming reply_timing(*this);
   if (version_ == RespVersion::k2) return AppendArrayHeader(count);
   buffer_.push_back('>');
   AppendUnsigned(buffer_, count);
@@ -765,6 +789,7 @@ std::string_view ReplyBuilder::AppendPushHeader(std::uint64_t count) {
 }
 
 std::string_view ReplyBuilder::AppendRaw(std::string_view encoded) {
+  BuildTiming reply_timing(*this);
   buffer_.append(encoded);
   return buffer_;
 }

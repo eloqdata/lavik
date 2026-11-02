@@ -38,11 +38,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHash(
     const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  TraceSpanScope key_wait(operation.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
                                  : tx::LockMode::kShared,
       lavik::storage::RedisSlot(key));
+  key_wait.End();
   co_return co_await ExecuteHashLocked(db_id, key, digest, operation, nullptr,
                                        replication, mutation_precondition);
 }
@@ -53,11 +55,13 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSet(
     const MutationPrecondition* mutation_precondition) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  TraceSpanScope key_wait(operation.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
                                  : tx::LockMode::kShared,
       lavik::storage::RedisSlot(key));
+  key_wait.End();
   co_return co_await ExecuteSetLocked(db_id, key, digest, operation, nullptr,
                                       replication, mutation_precondition);
 }

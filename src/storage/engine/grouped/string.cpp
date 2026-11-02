@@ -58,7 +58,8 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
     std::string_view value, std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    GroupedObject::Handle previous, std::string_view before) {
+    GroupedObject::Handle previous, std::string_view before,
+    OnlineLatencyTrace* diagnostics) {
   if (value.empty() || value.size() > kMaxStringBytes)
     co_return absl::OutOfRangeError("invalid grouped String length");
   // Whole-value shrink can bypass segment preparation altogether. A String
@@ -107,7 +108,8 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
         replication, mutation_precondition);
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, previous, std::move(plan),
-      expire_at_ms, tx, replication, mutation_precondition);
+      expire_at_ms, tx, replication, mutation_precondition, nullptr,
+      diagnostics);
 }
 
 Task<absl::StatusOr<StringSegmentResult>>
@@ -136,12 +138,16 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
     co_return absl::InvalidArgumentError("invalid String segment operation");
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  TraceSpanScope store_wait(operation.diagnostics_, TraceStage::kStoreLock);
   co_await store.store_state_mutex_.Lock();
+  store_wait.End();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  TraceSpanScope lookup_scope(operation.diagnostics_, TraceStage::kLookup);
   auto resolved =
       co_await FindVerifiedEntry(store, partition.indexes_[db_id], digest, key);
   if (!resolved.ok()) co_return resolved.status();
   auto* found = *resolved;
+  lookup_scope.End();
   GroupedObject::Handle grouped;
   if (found && found->value_.grouped()) {
     auto object = partition.grouped_objects_[db_id].Lookup(
@@ -336,7 +342,8 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       std::string bytes;
       if (id <= grouped->group_count()) {
         auto loaded = co_await LoadOrderedGroupSnapshot(
-            store, partition, db_id, key, digest, grouped, id);
+            store, partition, db_id, key, digest, grouped, id, false, nullptr,
+            SortedSetMemberValidation::kVerifyUnique, operation.diagnostics_);
         if (!loaded.ok()) {
           if (read_only &&
               (EffectiveRecordDbEpoch(partition, db_id) != snapshot.db_epoch_ ||
@@ -377,7 +384,8 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       if (!plan.changed_) co_return result;
       const auto status = co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, grouped, std::move(plan),
-          location.expire_at_ms_, tx, replication, mutation_precondition);
+          location.expire_at_ms_, tx, replication, mutation_precondition,
+          nullptr, operation.diagnostics_);
       if (!status.ok()) co_return status;
     }
   }
