@@ -1267,7 +1267,7 @@ static_assert(sizeof(PendingReplyBatch) == sizeof(std::string) + sizeof(void*));
 Task<absl::Status> FlushReplyBatch(TcpStream& stream,
                                    PendingReplyBatch* batch) {
   if (batch->empty()) co_return absl::OkStatus();
-  if (batch->online_traces_) {
+  if (batch->online_traces_ && !batch->online_traces_->empty()) {
     const auto now = LatencyMonotonicNanos();
     for (auto& trace : *batch->online_traces_) trace.get()->send_ns_ = now;
   }

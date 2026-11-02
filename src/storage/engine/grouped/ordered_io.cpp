@@ -41,7 +41,9 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
       trace || observer ? std::make_unique<ReadLatencyTrace>() : nullptr;
   if (detail) detail->diagnostics_ = observer;
   absl::Cleanup merge_trace = [&] {
-    if (!trace) return;
+    // Online intervals already reached the root; merge standalone observers
+    // only.
+    if (!trace || observer) return;
     trace->buffer_timing_.Merge(detail->buffer_timing_);
     trace->io_timing_.Merge(detail->io_timing_);
     trace->disk_read_ |= detail->disk_read_ || detail->io_timing_.count != 0;

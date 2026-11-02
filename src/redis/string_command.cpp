@@ -1359,12 +1359,15 @@ bycorf::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,
   if (context->output_.empty()) {
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, request.args_[2], digest, tx, nullptr,
-        mutation_precondition);
+        mutation_precondition, request.latency_trace_);
     co_return deleted.ok() ? absl::OkStatus() : deleted.status();
   }
+  auto detail =
+      request.latency_trace_ ? std::make_unique<SetLatencyTrace>() : nullptr;
+  if (detail) detail->diagnostics_ = request.latency_trace_;
   auto written = co_await g_storage->SetLocked(
       request.db_id_, request.args_[2], digest, context->output_, {}, tx,
-      nullptr, nullptr, mutation_precondition);
+      nullptr, detail.get(), mutation_precondition);
   co_return written.ok() ? absl::OkStatus() : written.status();
 }
 

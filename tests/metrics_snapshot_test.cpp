@@ -42,11 +42,13 @@ struct Snapshots {
   std::array<std::string, 2> exposition_;
   std::array<double, 2> execution_seconds_;
   std::array<double, 2> diagnostic_seconds_;
+  std::string empty_diagnostics_;
 };
 
 bycorf::Task<absl::Status> CollectSnapshots(
     std::promise<Snapshots>* completed) {
   Snapshots snapshots;
+  snapshots.empty_diagnostics_ = co_await RenderLatencyDiagnosticsMetrics();
   snapshots.empty_ = co_await CollectWorkerMetrics();
   for (unsigned worker = 0; worker < 2; ++worker) {
     co_await bycorf::SubmitTo(worker, [worker] {
@@ -109,6 +111,17 @@ bycorf::Task<absl::Status> CollectSnapshots(
   const auto initial_ticks =
       static_cast<std::uint64_t>(1'234'567.891 * frequency);
   const auto delta_ticks = static_cast<std::uint64_t>(0.001 * frequency);
+  const bool selected = co_await bycorf::SubmitTo(1, [] {
+    const std::array<std::string, 3> args{"SET", "sparse-key", "value"};
+    auto trace = SelectOnlineTrace(args);
+    if (!trace) return false;
+    trace.get()->family_ = TraceCommandFamily::kSet;
+    // Zero-duration observations must survive a sparse snapshot too.
+    RecordTraceInterval(trace.get(), TraceStage::kAppend, 1, 1);
+    trace.Complete(true);
+    return true;
+  });
+  if (!selected) co_return absl::InternalError("worker sample not selected");
   for (std::size_t i = 0; i < snapshots.exposition_.size(); ++i) {
     const auto ticks = i == 0 ? initial_ticks : delta_ticks;
     RecordCommandMetric(CommandKind::kGet, ticks);
@@ -187,6 +200,14 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   }));
   ASSERT_EQ(result.wait_for(10s), std::future_status::ready);
   const auto snapshots = result.get();
+  EXPECT_EQ(snapshots.empty_diagnostics_.find("_bucket{"), std::string::npos);
+  for (const auto& text : snapshots.exposition_) {
+    EXPECT_NE(text.find("lavik_latency_diagnostics_stage_seconds_count{"
+                        "command_family=\"set\",stage=\"append\"} 1\n"),
+              std::string::npos);
+    EXPECT_EQ(text.find("command_family=\"set\",stage=\"decode\""),
+              std::string::npos);
+  }
   auto expect_empty_details = [](const CommandMetricsSnapshot& commands) {
     EXPECT_TRUE(commands.commands_.empty());
 

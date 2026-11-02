@@ -254,7 +254,7 @@ def lock_case(binary):
                 stdout=log,
                 stderr=log,
             )
-            first = second = third = None
+            first = second = third = fourth = None
             try:
 
                 def ready():
@@ -299,12 +299,17 @@ def lock_case(binary):
                 # with the paused writer on one participant.
                 third = Client(port)
                 third.sock.sendall(Client.encode("MGET", "lock-private", "a", "b"))
+                fourth = Client(port)
+                fourth.command("MULTI")
+                fourth.command("GET", "lock-private")
+                fourth.sock.sendall(Client.encode("EXEC"))
                 time.sleep(0.08)
                 pause.unlink()
                 assert first.read() == "OK"
                 assert first.read() is None
                 assert second.read() == b"value"
                 assert third.read() == [b"value", None, None]
+                assert fourth.read() == [b"value"]
                 first.command("CONFIG", "SET", "latency-diagnostics-enabled", "no")
                 traces = [
                     json.loads(t) for t in first.command("LATENCY", "TRACE", "GET", 20)
@@ -324,13 +329,22 @@ def lock_case(binary):
                     )
                     >= 50_000
                 ), multi
+                transaction = next(t for t in traces if t["command"] == "EXEC")
+                assert (
+                    max(
+                        stage["duration_us"]
+                        for stage in transaction["stages"]
+                        if stage["name"] == "key_lock"
+                    )
+                    >= 50_000
+                ), transaction
                 assert b"lock-private" not in json.dumps(traces).encode()
                 print(
                     "PASS: injected append stall, key-lock wait and pipelined ready-queue attribution across two workers"
                 )
             finally:
                 pause.unlink(missing_ok=True)
-                for client in [first, second, third]:
+                for client in [first, second, third, fourth]:
                     if client:
                         client.close()
                 server.terminate()
@@ -494,6 +508,13 @@ def read_buffer_case(binary, workers=1):
                     stage for stage in traces[0]["stages"] if stage["name"] == "read_io"
                 )
                 assert io["observations"] > 8, traces
+                decode = next(
+                    stage for stage in traces[0]["stages"] if stage["name"] == "decode"
+                )
+                # Chunk copies and checksums occur before await_resume; each
+                # physical chunk contributes actual decode work, not one
+                # return-wrapper interval per value.
+                assert decode["observations"] >= io["observations"], traces
                 assert (
                     len(io["intervals"]) == 8
                     and io["intervals_dropped"] == io["observations"] - 8
@@ -695,6 +716,90 @@ def logging_case(binary, unavailable=False):
                     server.kill()
                     server.wait()
                 assert server.returncode == 0, (root / "server.log").read_text()[-6000:]
+
+
+def storage_path_coverage(client):
+    """Small strings, grouped random access and specialized command paths."""
+    client.command("CONFIG", "SET", "latency-diagnostics-enabled", "yes")
+    client.command("SET", "coverage:string", b"v" * 1024)
+    pairs = [arg for i in range(256) for arg in (str(i), b"v" * 128)]
+    client.command("HSET", "coverage:hash", *pairs)
+    client.command("SADD", "coverage:set", *[str(i) + "v" * 64 for i in range(512)])
+
+    def trace(*command):
+        client.command("LATENCY", "TRACE", "RESET")
+        client.command(*command)
+        records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
+        found = next(t for t in records if t["command"] == command[0])
+        return {s["name"] for s in found["stages"]}
+
+    for command in [
+        ("GETRANGE", "coverage:string", 0, 20),
+        ("GETBIT", "coverage:string", 0),
+    ]:
+        assert {"read_buffer", "decode"} <= trace(*command), command
+    for command in [
+        ("APPEND", "coverage:string", "more"),
+        ("SETRANGE", "coverage:string", 0, "A"),
+        ("SETBIT", "coverage:string", 0, 1),
+    ]:
+        assert {"read_buffer", "decode", "value_process", "append"} <= trace(
+            *command
+        ), command
+    for command in [
+        ("HRANDFIELD", "coverage:hash", 2),
+        ("SRANDMEMBER", "coverage:set", 2),
+    ]:
+        assert {"read_buffer", "decode", "value_process"} <= trace(*command), command
+    assert {"read_buffer", "decode", "append"} <= trace("SPOP", "coverage:set", 2)
+    assert "append" in trace("SPOP", "coverage:set", 1000)
+    for command in [
+        ("COPY", "coverage:string", "coverage:copy"),
+        ("RENAME", "coverage:copy", "coverage:renamed"),
+    ]:
+        assert {"read_buffer", "decode", "append"} <= trace(*command), command
+    for command in [
+        ("EXPIRE", "coverage:string", 3600),
+        ("PERSIST", "coverage:string"),
+    ]:
+        assert {
+            "key_lock",
+            "store_lock",
+            "lookup",
+            "read_buffer",
+            "decode",
+            "append",
+        } <= trace(*command), command
+    assert {"key_lock", "lookup"} <= trace("STRLEN", "coverage:string")
+    assert {"read_buffer", "append"} <= trace(
+        "BITOP", "NOT", "coverage:bits", "coverage:string"
+    )
+    client.command("MULTI")
+    client.command("GET", "coverage:string")
+    client.command("EXEC")
+    records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
+    transaction = next(t for t in records if t["command"] == "EXEC")
+    assert "key_lock" in {s["name"] for s in transaction["stages"]}, transaction
+    # Grouped mutations inside an outer transaction await auxiliary durability.
+    client.command("MULTI")
+    client.command("HSET", "coverage:hash", "0", b"z" * 128)
+    client.command("EXEC")
+    records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
+    transaction = next(t for t in records if t["command"] == "EXEC")
+    assert "durability_wait" in {s["name"] for s in transaction["stages"]}, transaction
+    for command in [
+        ("COPY", "coverage:string", "coverage:exec-copy"),
+        ("RENAME", "coverage:exec-copy", "coverage:exec-renamed"),
+    ]:
+        client.command("LATENCY", "TRACE", "RESET")
+        client.command("MULTI")
+        client.command(*command)
+        client.command("EXEC")
+        records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
+        transaction = next(t for t in records if t["command"] == "EXEC")
+        assert {"read_buffer", "decode", "append"} <= {
+            stage["name"] for stage in transaction["stages"]
+        }, transaction
 
 
 def generic_commands_case(binary):
@@ -1179,6 +1284,7 @@ def generic_commands_case(binary):
                         stage["name"] for stage in traces[command]["stages"]
                     }, traces[command]
                 assert "private-family" not in "".join(value.decode() for value in raw)
+                storage_path_coverage(client)
                 print(
                     "PASS: canonical identities and common lifecycle across command families"
                 )

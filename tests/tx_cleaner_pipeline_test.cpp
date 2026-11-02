@@ -18,7 +18,9 @@
 #include <vector>
 
 #include "../src/storage/engine/impl.h"
+#include "absl/cleanup/cleanup.h"
 #include "gtest/gtest.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/metrics.h"
 
 namespace lavik::storage {
@@ -612,6 +614,30 @@ TEST_F(TxCleanerPipelineTestPeer,
 }
 
 TEST_F(TxCleanerPipelineTestPeer, DiagnosticsRetainQueuePeakAfterBackpressure) {
+  InitLatencyDiagnostics(kWorkers);
+  absl::Cleanup stop_diagnostics = [] {
+    ConfigureLatencyDiagnostics("latency-diagnostics-enabled", "no")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-log-enabled", "yes")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-sample-every", "64")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-slow-threshold-us",
+                                "10000")
+        .IgnoreError();
+    StopLatencyDiagnostics();
+  };
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-log-enabled", "no")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-sample-every", "1")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-slow-threshold-us", "0")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-enabled", "yes").ok());
   const auto watermark = storage_.TxCommitBatchStats().queue_high_watermark_;
   ASSERT_GT(watermark, 0);
   // Do not pump the queued runner until enqueues have reached the watermark.
@@ -623,8 +649,25 @@ TEST_F(TxCleanerPipelineTestPeer, DiagnosticsRetainQueuePeakAfterBackpressure) {
   EXPECT_EQ(queued.queue_depth_, watermark + 1);
   EXPECT_EQ(queued.queue_peak_, watermark + 1);
   EXPECT_EQ(queued.backpressure_waits_, 2);
-  ASSERT_TRUE(PumpUntil(
-      [&] { return storage_.TxCommitBatchStats().queue_depth_ == 0; }));
+  const std::array<std::string, 1> args{"EXEC"};
+  auto trace = SelectOnlineTrace(args);
+  ASSERT_TRUE(trace);
+  auto capacity = storage_.WaitForTxCommitCapacity(trace.get());
+  StartTask(capacity, 0);
+  EXPECT_FALSE(capacity.done());
+  ASSERT_TRUE(PumpUntil([&] {
+    return capacity.done() && storage_.TxCommitBatchStats().queue_depth_ == 0;
+  }));
+  EXPECT_TRUE(std::move(capacity).TakeResult().ok());
+  On(0);
+  trace.Complete(true);
+  auto history = GetLatencyTraces(1);
+  StartTask(history, 0);
+  ASSERT_TRUE(PumpUntil([&] { return history.done(); }));
+  const auto samples = std::move(history).TakeResult();
+  ASSERT_EQ(samples.size(), 1);
+  EXPECT_NE(samples.front().find("\"name\":\"commit_queue_wait\""),
+            std::string::npos);
   const auto drained = Diagnostics();
   EXPECT_EQ(drained.tx_commit_batches_.transactions_, watermark + 1);
   EXPECT_GT(drained.tx_commit_batches_.batches_, 0);

@@ -275,7 +275,8 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   auto reader = index.TryRead(digest);
   if (!reader) return;
   const auto* entry = std::as_const(index).Find(digest, key);
-  if (result.trace_) result.trace_->lookup_done_ns_ = result.trace_->NowNanos();
+  if (result.trace_ && !result.trace_->diagnostics_)
+    result.trace_->lookup_done_ns_ = result.trace_->NowNanos();
   if (!result.Current(*this)) return;
   if (entry && !entry->key_complete()) return;
   if (entry == nullptr || entry->value_.kind() == RecordKind::kTombstone) {
@@ -496,14 +497,15 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
          *routed_partition_id == RedisSlot(key));
   tx::TxShard::Guard key_lock;
   if (acquire_key_lock) {
-    if (trace) trace->key_lock_start_ns_ = trace->NowNanos();
+    if (trace && !trace->diagnostics_)
+      trace->key_lock_start_ns_ = trace->NowNanos();
     TraceSpanScope key_wait(trace ? trace->diagnostics_ : nullptr,
                             TraceStage::kKeyLock);
     key_lock = co_await tx::CurrentTxShard().AcquireKey(
         db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
         lavik::storage::RedisSlot(key));
   }
-  if (acquire_key_lock && trace)
+  if (acquire_key_lock && trace && !trace->diagnostics_)
     trace->key_lock_acquired_ns_ = trace->NowNanos();
   WorkerStore& store = CurrentStore();
   auto& partition = routed_partition_id.has_value()
@@ -531,7 +533,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       found = *resolved;
     }
     if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
-      if (trace != nullptr) {
+      if (trace != nullptr && !trace->diagnostics_) {
         trace->lookup_done_ns_ = trace->NowNanos();
       }
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
@@ -540,7 +542,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     if (!readable.ok()) co_return readable;
     if (IsExpiredNow(*found)) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
-      if (trace != nullptr) {
+      if (trace != nullptr && !trace->diagnostics_) {
         trace->lookup_done_ns_ = trace->NowNanos();
       }
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
@@ -548,7 +550,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     if (found->value_.value_type() != ValueType::kString) {
       co_return WrongTypeError();
     }
-    if (trace != nullptr) {
+    if (trace != nullptr && !trace->diagnostics_) {
       trace->lookup_done_ns_ = trace->NowNanos();
     }
 
@@ -847,17 +849,21 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLength(
-    std::uint8_t db_id, std::string_view key) {
+    std::uint8_t db_id, std::string_view key, OnlineLatencyTrace* diagnostics) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  TraceSpanScope key_wait(diagnostics, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
       lavik::storage::RedisSlot(key));
-  co_return co_await StringLengthLocked(db_id, key, digest);
+  key_wait.End();
+  co_return co_await StringLengthLocked(db_id, key, digest, diagnostics);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
+  TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -1466,12 +1472,18 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
       co_return absl::InternalError("short extent block read");
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
     std::memcpy(header_bytes.data() + offset, buffer.data_, buffer.size_);
     offset += buffer.size_;
   }
   BlockHeader header{};
-  if (!DecodeHeader(header_bytes, header))
-    co_return absl::InternalError("extent header does not match manifest");
+  {
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
+    if (!DecodeHeader(header_bytes, header))
+      co_return absl::InternalError("extent header does not match manifest");
+  }
 
   // Preserve the full-read contract: no caller-visible bytes change on I/O or
   // checksum failure, including corruption outside a requested slice. Only
@@ -1500,6 +1512,8 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
       co_return absl::InternalError("short extent block read");
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
     const auto payload_bytes = std::min(remaining, buffer.size_);
     if (!header.extent_no_crc_) {
       checksum = absl::ExtendCrc32c(
@@ -1515,6 +1529,8 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
                   buffer.data_ + begin - offset, end - begin);
     offset += payload_bytes;
   }
+  TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                        TraceStage::kDecode);
   if (!header.extent_no_crc_ &&
       static_cast<std::uint32_t>(checksum) != ref_.payload_checksum_)
     co_return absl::InternalError("extent payload checksum mismatch");
@@ -1932,6 +1948,8 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
       co_return absl::InternalError("short compact record read");
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
     std::memcpy(lease_.io_buffer().data_ + offset, buffer.data_, buffer.size_);
     offset += buffer.size_;
   }
@@ -2075,8 +2093,6 @@ void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
 
 StorageEngine::Impl::LoadValueAwaitable::Result
 StorageEngine::Impl::LoadValueAwaitable::await_resume() {
-  TraceSpanScope decode_scope(trace_ ? trace_->diagnostics_ : nullptr,
-                              TraceStage::kDecode);
   // Fence successful reads here, after the scheduling gap following the CQE.
   // Completion only needs this check when deciding whether to start a retry.
   if (PopulationChanged()) return absl::NotFoundError("key not found");
@@ -2099,6 +2115,8 @@ StorageEngine::Impl::LoadValueAwaitable::await_resume() {
 absl::StatusOr<StorageEngine::Impl::LoadValueAwaitable::Payload>
 StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
     const std::byte* data) const {
+  TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                        TraceStage::kDecode);
   RecordHeader record{};
   std::string_view disk_key;
   if (!DecodeRecordHeader(std::span(data, location_.total_disk_bytes()),
@@ -2131,6 +2149,9 @@ StorageEngine::Impl::LoadValueAwaitable::Result
 StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
                                                       Payload payload,
                                                       bool staged) {
+  // Staged and chunked reads finish before await_resume; time the work here.
+  TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                        TraceStage::kDecode);
   const auto* value = data + payload.offset_;
   if (!payload.no_crc_ &&
       Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)

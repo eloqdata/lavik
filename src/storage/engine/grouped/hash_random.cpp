@@ -60,6 +60,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     RecordMemoryRejection();
     co_return MemoryLimitError("OOM random sample metadata");
   }
+  TraceSpanScope sampling(operation.diagnostics_, TraceStage::kValueProcess);
   std::vector<std::uint64_t> chosen;
   if (repeat) {
     chosen.reserve(requested);
@@ -122,6 +123,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
   HashValue remaining;
   std::vector<GroupedRecordId> changed;
   changed.reserve(selected.size());
+  sampling.End();
   for (std::size_t page_index = 0; page_index < selected.size(); ++page_index) {
     if (shutdown_flush_requested_)
       co_return absl::CancelledError("random sample interrupted by shutdown");
@@ -129,8 +131,10 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     const auto& selection = selected[page_index];
     if (!pop) {
       auto loaded = co_await LoadHashGroupPayload(
-          store, partition, db_id, key, digest, object, selection.id_);
+          store, partition, db_id, key, digest, object, selection.id_, false,
+          operation.diagnostics_);
       if (!loaded.ok()) co_return loaded.status();
+      TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
       const auto bytes = loaded->loaded_.value();
       const std::string_view payload(
           reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -147,9 +151,11 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
       // including separate copies for repeated draws in their original order.
       continue;
     }
-    auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                 digest, object, selection.id_);
+    auto loaded = co_await LoadHashGroupSnapshot(
+        store, partition, db_id, key, digest, object, selection.id_, false,
+        nullptr, operation.diagnostics_);
     if (!loaded.ok()) co_return loaded.status();
+    TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
     auto& entries = loaded->snapshot_.value_.entries_;
     for (auto i = selection.begin_; i < selection.end_; ++i) {
       const auto offset = samples[i].first - selection.base_;
@@ -203,12 +209,13 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
         store, partition, db_id, key, digest, object, std::move(remaining),
         std::move(changed), result.length_, value_type,
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition);
+        mutation_precondition, nullptr, operation.diagnostics_);
   } else {
-    status = co_await AppendLocked(store, partition, db_id, key, digest, {},
-                                   RecordKind::kTombstone, ValueType::kNone, 0,
-                                   tx, 0, nullptr, nullptr, replication, true,
-                                   nullptr, mutation_precondition);
+    auto detail = MakeSetTrace(operation.diagnostics_);
+    status = co_await AppendLocked(
+        store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
+        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true,
+        nullptr, mutation_precondition, nullptr, nullptr, detail.get());
   }
   if (!status.ok()) co_return status;
   co_return result;

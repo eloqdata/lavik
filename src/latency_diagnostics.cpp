@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <charconv>
 #include <chrono>
@@ -185,12 +186,26 @@ struct Histogram {
     ns += value;
   }
 };
-struct Metrics {
+struct Counters {
   std::int64_t queued = 0, writes = 0;
   std::array<std::uint64_t, 5> events{}, waiters{};
   std::uint64_t eligible = 0, selected = 0, pool_dropped = 0, filtered = 0,
                 retained = 0, overwritten = 0, cancelled = 0, log_dropped = 0;
+};
+struct Metrics : Counters {
   std::array<std::array<Histogram, kStages.size()>, kFamilies.size()> hist{};
+  // The fixed stage vocabulary fits in one word; never allocate on Add().
+  static_assert(kStages.size() <= 64);
+  std::array<std::uint64_t, kFamilies.size()> observed{};
+};
+struct MetricsSnapshot {
+  Counters counters;
+  unsigned inflight = 0;
+  struct Entry {
+    unsigned family, stage;
+    Histogram histogram;
+  };
+  std::vector<Entry> histograms;
 };
 struct Shard {
   Metrics metrics;
@@ -366,10 +381,12 @@ void Retain(OnlineLatencyTrace& t) {
                         std::chrono::system_clock::now().time_since_epoch())
                         .count();
   const auto spans = Spans(t);
+  const auto family = static_cast<unsigned>(t.family_);
   for (unsigned i = 0; i < spans.size(); ++i)
-    if (Valid(spans[i]))
-      s.metrics.hist[static_cast<unsigned>(t.family_)][i].Add(
-          Duration(spans[i]));
+    if (Valid(spans[i])) {
+      s.metrics.hist[family][i].Add(Duration(spans[i]));
+      s.metrics.observed[family] |= std::uint64_t{1} << i;
+    }
   if (s.history_size == kHistory)
     ++s.metrics.overwritten;
   else
@@ -688,10 +705,27 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
   unsigned inflight = 0;
   for (unsigned w = 0; w < g_count; ++w) {
     const auto copy = co_await bycorf::SubmitTo(w, [w] {
-      return std::pair(g_shards[w].metrics, kCapacity - g_shards[w].free_count);
+      const auto& shard = g_shards[w];
+      const auto& metrics = shard.metrics;
+      MetricsSnapshot snapshot{.counters = metrics,
+                               .inflight = kCapacity - shard.free_count,
+                               .histograms = {}};
+      // Snapshot on the owner; a never-enabled worker copies only counters.
+      unsigned count = 0;
+      for (auto observed : metrics.observed) count += std::popcount(observed);
+      snapshot.histograms.reserve(count);
+      for (unsigned c = 0; c < kFamilies.size(); ++c) {
+        auto observed = metrics.observed[c];
+        while (observed) {
+          const auto i = static_cast<unsigned>(std::countr_zero(observed));
+          snapshot.histograms.push_back({c, i, metrics.hist[c][i]});
+          observed &= observed - 1;
+        }
+      }
+      return snapshot;
     });
-    const auto& m = copy.first;
-    inflight += copy.second;
+    const auto& m = copy.counters;
+    inflight += copy.inflight;
     total.queued += m.queued;
     total.writes += m.writes;
     for (unsigned i = 0; i < kResources.size(); ++i) {
@@ -706,13 +740,12 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
     total.overwritten += m.overwritten;
     total.cancelled += m.cancelled;
     total.log_dropped += m.log_dropped;
-    for (unsigned c = 0; c < kFamilies.size(); ++c)
-      for (unsigned i = 0; i < kStages.size(); ++i) {
-        auto& h = total.hist[c][i];
-        const auto& v = m.hist[c][i];
-        h.ns += v.ns;
-        for (unsigned b = 0; b < h.bins.size(); ++b) h.bins[b] += v.bins[b];
-      }
+    for (const auto& entry : copy.histograms) {
+      auto& h = total.hist[entry.family][entry.stage];
+      const auto& v = entry.histogram;
+      h.ns += v.ns;
+      for (unsigned b = 0; b < h.bins.size(); ++b) h.bins[b] += v.bins[b];
+    }
   }
   total.log_dropped += g_sink_dropped.load(std::memory_order_relaxed);
   std::string out;

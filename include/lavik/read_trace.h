@@ -31,15 +31,18 @@ struct ReadLatencyTrace : LatencySegmentClock {
   }
 
   void RecordBuffer(std::uint64_t start, std::uint64_t end) noexcept {
-    buffer_timing_.Add(start, end);
+    // Online output uses the root; standalone observers keep local intervals.
     if (diagnostics_)
       RecordTraceInterval(diagnostics_, TraceStage::kReadBuffer, start, end);
+    else
+      buffer_timing_.Add(start, end);
   }
   // Records actual submitted I/O through completion, excluding buffer waits.
   void RecordIo(std::uint64_t start, std::uint64_t end) noexcept {
-    io_timing_.Add(start, end);
     if (diagnostics_)
       RecordTraceInterval(diagnostics_, TraceStage::kReadIo, start, end);
+    else
+      io_timing_.Add(start, end);
   }
 
   LatencyIntervals buffer_timing_;

@@ -664,8 +664,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Get(
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(
-    std::uint8_t db_id, std::string_view key) {
-  return impl_->StringLength(db_id, key);
+    std::uint8_t db_id, std::string_view key, OnlineLatencyTrace* diagnostics) {
+  return impl_->StringLength(db_id, key, diagnostics);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Set(
@@ -729,9 +729,11 @@ Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
 Task<absl::StatusOr<bool>> StorageEngine::UpdateExpiration(
     std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
     ExpirationCondition condition, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    OnlineLatencyTrace* diagnostics) {
   return impl_->UpdateExpiration(db_id, key, expire_at_ms, condition,
-                                 replication, mutation_precondition);
+                                 replication, mutation_precondition,
+                                 diagnostics);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Delete(
@@ -760,8 +762,9 @@ Task<std::vector<BatchGetValue>> StorageEngine::BatchGetLocked(
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
-  return impl_->StringLengthLocked(db_id, key, digest);
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->StringLengthLocked(db_id, key, digest, diagnostics);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(
@@ -868,10 +871,11 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::uint64_t expire_at_ms, ExpirationCondition condition,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    OnlineLatencyTrace* diagnostics) {
   return impl_->UpdateExpirationLocked(db_id, key, digest, expire_at_ms,
                                        condition, tx, replication,
-                                       mutation_precondition);
+                                       mutation_precondition, diagnostics);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(
@@ -910,8 +914,9 @@ bool StorageEngine::EnqueueTxCommit(std::uint64_t txid,
   return impl_->EnqueueTxCommit(txid, std::move(writes));
 }
 
-Task<absl::Status> StorageEngine::WaitForTxCommitCapacity() {
-  return impl_->WaitForTxCommitCapacity();
+Task<absl::Status> StorageEngine::WaitForTxCommitCapacity(
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->WaitForTxCommitCapacity(diagnostics);
 }
 
 Task<absl::Status> StorageEngine::FinishTxLocal(TxShardWrites& shard,

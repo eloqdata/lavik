@@ -1844,7 +1844,8 @@ class StorageEngine {
       ReadLatencyTrace* trace = nullptr,
       std::optional<std::uint16_t> routed_partition_id = std::nullopt);
   bycorf::Task<absl::StatusOr<std::uint64_t>> StringLength(
-      std::uint8_t db_id, std::string_view key);
+      std::uint8_t db_id, std::string_view key,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options = {}, ReplicationCommandAppend* replication = nullptr,
@@ -1892,7 +1893,8 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
       ExpirationCondition condition,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
       ReplicationCommandAppend* replication = nullptr,
@@ -1929,7 +1931,8 @@ class StorageEngine {
       std::uint8_t db_id, std::span<const BatchGetRequest> requests,
       OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options = {},
@@ -2035,7 +2038,8 @@ class StorageEngine {
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,
@@ -2071,7 +2075,9 @@ class StorageEngine {
   // not create or await another coroutine.
   [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
                                      std::vector<TxShardWrites> writes);
-  bycorf::Task<absl::Status> WaitForTxCommitCapacity();
+  // diagnostics borrows only the foreground wait, never queued receipts.
+  bycorf::Task<absl::Status> WaitForTxCommitCapacity(
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Settles a complete transaction's participant on its owning worker while
   // its key locks are still held. Success publishes FULL after-images before
   // discarding undo; rollback restores the journal without publishing them.

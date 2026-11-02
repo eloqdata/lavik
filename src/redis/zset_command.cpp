@@ -470,9 +470,8 @@ Task<absl::Status> RunCompact(
 
 Task<absl::StatusOr<storage::SortedSetResult>> RunSortedSet(
     const CommandRequest& request, const storage::Digest* digest,
-    storage::TxShardWrites* tx, storage::SortedSetOperation operation,
+    storage::TxShardWrites* tx, const storage::SortedSetOperation& operation,
     const storage::CompactReadResult* compact = nullptr) {
-  operation.diagnostics_ = request.latency_trace_;
   if (compact != nullptr)
     co_return storage::ReadCompactSortedSet(*compact, operation);
   const bool read_only =
@@ -1217,6 +1216,7 @@ Task<CommandReply> ExecuteImpl(
       inputs.push_back({member, score});
     }
     storage::SortedSetOperation operation{
+        .diagnostics_ = request.latency_trace_,
         .kind_ = storage::SortedSetOperationKind::kAdd,
         .entries_ = inputs,
         .members_ = {},
@@ -1498,6 +1498,7 @@ Task<CommandReply> ExecuteImpl(
     members.reserve(member_end - 2);
     for (std::size_t i = 2; i < member_end; ++i) members.push_back(a[i]);
     storage::SortedSetOperation operation{
+        .diagnostics_ = request.latency_trace_,
         .kind_ = request.kind_ == CommandKind::kZCard
                      ? storage::SortedSetOperationKind::kLength
                  : request.kind_ == CommandKind::kZRem
@@ -1569,7 +1570,8 @@ Task<CommandReply> ExecuteImpl(
   if (request.kind_ == CommandKind::kZPopMin ||
       request.kind_ == CommandKind::kZPopMax ||
       request.kind_ == CommandKind::kZScan) {
-    storage::SortedSetOperation operation;
+    storage::SortedSetOperation operation{.diagnostics_ =
+                                              request.latency_trace_};
     if (request.kind_ == CommandKind::kZScan) {
       operation.kind_ = storage::SortedSetOperationKind::kScan;
       if (!ParseInt(a[2], &operation.scan_cursor_))
@@ -1629,7 +1631,8 @@ Task<CommandReply> ExecuteImpl(
       request.kind_ == CommandKind::kZRevRank ||
       request.kind_ == CommandKind::kZCount ||
       request.kind_ == CommandKind::kZLexCount) {
-    storage::SortedSetOperation operation;
+    storage::SortedSetOperation operation{.diagnostics_ =
+                                              request.latency_trace_};
     bool with_scores = false;
     std::array<std::string_view, 1> wanted{a[2]};
     if (range_read || range_remove) {
@@ -1691,7 +1694,9 @@ Task<CommandReply> ExecuteImpl(
     auto result = co_await RunSortedSet(
         request, digest, tx,
         storage::SortedSetOperation{
-            .kind_ = storage::SortedSetOperationKind::kRandom, .count_ = count},
+            .diagnostics_ = request.latency_trace_,
+            .kind_ = storage::SortedSetOperationKind::kRandom,
+            .count_ = count},
         compact);
     if (!result.ok()) co_return Built(StorageError(builder, result.status()));
     if (a.size() == 2)

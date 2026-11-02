@@ -4860,7 +4860,8 @@ Task<CommandReply> ExecuteStorageCommand(
             "ERR wrong number of arguments for 'strlen' command");
         co_return reply;
       }
-      auto length = co_await g_storage->StringLength(request.db_id_, args[1]);
+      auto length = co_await g_storage->StringLength(request.db_id_, args[1],
+                                                     request.latency_trace_);
       if (!length.ok()) {
         if (length.status().code() == absl::StatusCode::kNotFound) {
           reply.encoded_ = reply_builder.AppendInteger(0);
@@ -4946,7 +4947,8 @@ Task<CommandReply> ExecuteStorageCommand(
           ClusterMutationPrecondition(request);
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id_, args[1], *expire_at_ms, *condition,
-          replication ? &*replication : nullptr, &mutation_precondition);
+          replication ? &*replication : nullptr, &mutation_precondition,
+          request.latency_trace_);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -4966,7 +4968,8 @@ Task<CommandReply> ExecuteStorageCommand(
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id_, args[1], 0,
           storage::ExpirationCondition::kIfHasExpiration,
-          replication ? &*replication : nullptr, &mutation_precondition);
+          replication ? &*replication : nullptr, &mutation_precondition,
+          request.latency_trace_);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -5813,8 +5816,8 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kStrlen: {
-      auto length =
-          co_await g_storage->StringLengthLocked(db_id, args[1], digest);
+      auto length = co_await g_storage->StringLengthLocked(
+          db_id, args[1], digest, request.latency_trace_);
       if (!length.ok()) {
         co_return length.status().code() == absl::StatusCode::kNotFound
             ? EncodeInteger(0)
@@ -5871,7 +5874,8 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
             CommandErrorReasonForStatus(expire_at_ms.status()));
       }
       auto updated = co_await g_storage->UpdateExpirationLocked(
-          db_id, args[1], digest, *expire_at_ms, *condition, tx);
+          db_id, args[1], digest, *expire_at_ms, *condition, tx, nullptr,
+          nullptr, request.latency_trace_);
       if (updated.ok() && *updated && request.replication_capture_ != nullptr) {
         CaptureReplicationCommand(
             request, {"PEXPIREAT", args[1], std::to_string(*expire_at_ms)});
@@ -5884,7 +5888,8 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
       MarkReplicationCommandHandled(request);
       auto updated = co_await g_storage->UpdateExpirationLocked(
           db_id, args[1], digest, 0,
-          storage::ExpirationCondition::kIfHasExpiration, tx);
+          storage::ExpirationCondition::kIfHasExpiration, tx, nullptr, nullptr,
+          request.latency_trace_);
       if (updated.ok() && *updated && request.replication_capture_ != nullptr) {
         CaptureReplicationCommand(request, {"PERSIST", args[1]});
       }
@@ -6047,7 +6052,8 @@ Task<absl::Status> RenameReadCallback(void* opaque,
     const std::string_view name = context->request_->args_[key.arg_index_];
     if (key.arg_index_ == 1) {
       auto source = co_await g_storage->ReadValueForTransferLocked(
-          context->request_->db_id_, name, key.digest_);
+          context->request_->db_id_, name, key.digest_, std::nullopt,
+          context->request_->latency_trace_);
       if (!source.ok()) co_return source.status();
       context->source_ = std::move(*source);
     } else if (key.arg_index_ == 2) {
@@ -6095,7 +6101,8 @@ Task<absl::Status> RenameSingleShardCallback(void* opaque,
   }
   const auto& args = context->request_->args_;
   auto source = co_await g_storage->ReadValueForTransferLocked(
-      context->request_->db_id_, args[1], source_key->digest_);
+      context->request_->db_id_, args[1], source_key->digest_, std::nullopt,
+      context->request_->latency_trace_);
   if (!source.ok()) co_return source.status();
   context->source_ = std::move(*source);
   context->destination_exists_ = co_await g_storage->ExistsLocked(
@@ -6228,7 +6235,7 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
   replication.Commit();
   if (!g_storage->EnqueueTxCommit(execution.txid_,
                                   std::move(context.writes_))) {
-    co_await g_storage->WaitForTxCommitCapacity();
+    co_await g_storage->WaitForTxCommitCapacity(request.latency_trace_);
   }
   NotifyRenamedValue(request, args[2], context.source_.metadata_.value_type_);
   co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
@@ -6292,7 +6299,8 @@ Task<absl::Status> CopyReadCallback(void* opaque, const tx::ShardSlice& slice) {
     const std::string_view name = context->request_->args_[key.arg_index_];
     if (key.arg_index_ == 1) {
       auto source = co_await g_storage->ReadValueForTransferLocked(
-          key.db_, name, key.digest_);
+          key.db_, name, key.digest_, std::nullopt,
+          context->request_->latency_trace_);
       if (source.ok()) {
         context->source_.emplace(std::move(*source));
       } else if (source.status().code() != absl::StatusCode::kNotFound) {
@@ -6427,7 +6435,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
   replication.Commit();
   if (!g_storage->EnqueueTxCommit(execution.txid_,
                                   std::move(context.writes_))) {
-    co_await g_storage->WaitForTxCommitCapacity();
+    co_await g_storage->WaitForTxCommitCapacity(request.latency_trace_);
   }
   NotifyRenamedValue(request, options->destination_db_, args[2],
                      context.source_->metadata_.value_type_);
@@ -6539,7 +6547,7 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
   replication.Commit();
   if (!g_storage->EnqueueTxCommit(execution.txid_,
                                   std::move(context.writes_))) {
-    co_await g_storage->WaitForTxCommitCapacity();
+    co_await g_storage->WaitForTxCommitCapacity(request.latency_trace_);
   }
   co_return BuiltReply(reply_builder.AppendInteger(1));
 }
@@ -6772,9 +6780,7 @@ Task<CommandReply> ExecuteMultiKey(
 
   if (write && replication != nullptr) replication->Commit();
   if (!tx_commit_has_capacity) {
-    TraceSpanScope capacity(request.latency_trace_,
-                            TraceStage::kCommitQueueWait);
-    co_await g_storage->WaitForTxCommitCapacity();
+    co_await g_storage->WaitForTxCommitCapacity(request.latency_trace_);
   }
 
   switch (request.kind_) {
@@ -7081,9 +7087,11 @@ Task<EncodedCommandReply> ExecuteExecSequentialRename(
   }
 
   auto raw = co_await SubmitTaskTo(
-      source->owner_, [db = command.db_id_, key = std::string(args[1]),
-                       digest = source->digest_]() {
-        return g_storage->ReadValueForTransferLocked(db, key, digest);
+      source->owner_,
+      [db = command.db_id_, key = std::string(args[1]),
+       digest = source->digest_, diagnostics = command.latency_trace_]() {
+        return g_storage->ReadValueForTransferLocked(db, key, digest,
+                                                     std::nullopt, diagnostics);
       });
   if (!raw.ok()) {
     if (raw.status().code() == absl::StatusCode::kNotFound)
@@ -7171,9 +7179,11 @@ Task<EncodedCommandReply> ExecuteExecSequentialCopy(
   }
 
   auto raw = co_await SubmitTaskTo(
-      source->owner_, [db = source->db_, key = std::string(args[1]),
-                       digest = source->digest_]() {
-        return g_storage->ReadValueForTransferLocked(db, key, digest);
+      source->owner_,
+      [db = source->db_, key = std::string(args[1]), digest = source->digest_,
+       diagnostics = command.latency_trace_]() {
+        return g_storage->ReadValueForTransferLocked(db, key, digest,
+                                                     std::nullopt, diagnostics);
       });
   if (!raw.ok()) {
     if (raw.status().code() == absl::StatusCode::kNotFound) {
@@ -8929,7 +8939,7 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
     if (!read_only) {
       const std::uint64_t txid = tx_writes.front().txid_;
       if (!g_storage->EnqueueTxCommit(txid, std::move(tx_writes))) {
-        co_await g_storage->WaitForTxCommitCapacity();
+        co_await g_storage->WaitForTxCommitCapacity(request.latency_trace_);
       }
     }
   }
@@ -10868,8 +10878,10 @@ Task<CommandReply> ExecuteExecBody(
       bool watch_aborted = false;
       absl::Status status =
           co_await SubmitTaskTo(owners.front(), [&]() -> Task<absl::Status> {
+            TraceSpanScope key_wait(diagnostics, TraceStage::kKeyLock);
             auto guard = co_await tx::CurrentTxShard().AcquireKeys(
                 std::span<const tx::KeyRef>(refs));
+            key_wait.End();
             if (replication != nullptr) replication->EnterCurrentShard();
             if (exec_admission != nullptr) {
               // Choke point 2 for the single-shard fast path (which never
@@ -10976,7 +10988,7 @@ Task<CommandReply> ExecuteExecBody(
         }
       }
       if (!g_storage->EnqueueTxCommit(exec_txid, std::move(tx_writes))) {
-        co_await g_storage->WaitForTxCommitCapacity();
+        co_await g_storage->WaitForTxCommitCapacity(diagnostics);
       }
       if (!committed_catalog.ok()) {
         co_return co_await fail_catalog_replication(committed_catalog.status());
@@ -11200,7 +11212,7 @@ Task<CommandReply> ExecuteExecBody(
         }
       }
       if (!g_storage->EnqueueTxCommit(exec_txid, std::move(tx_writes))) {
-        co_await g_storage->WaitForTxCommitCapacity();
+        co_await g_storage->WaitForTxCommitCapacity(diagnostics);
       }
       if (!committed_catalog.ok()) {
         co_return co_await fail_catalog_replication(committed_catalog.status());

@@ -42,7 +42,9 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle previous, std::uint64_t expire_at_ms,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    OnlineLatencyTrace* diagnostics) {
+  if (!diagnostics && tx) diagnostics = tx->diagnostics_;
   auto& side = partition.grouped_objects_[db_id];
   if (!SameMetadataSource(previous, side.CurrentForMutation(key)))
     co_return absl::AbortedError("grouped expiration source changed");
@@ -61,6 +63,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
                            : MutationPrecondition{});
     tx = &standalone;
   }
+  tx->diagnostics_ = diagnostics;
   // No auxiliary is rewritten, but this root still inherits the preceding
   // graph's commit dependency. Owner-local writes defer that dependency to
   // commit; a shared outer transaction is one decision and never awaits itself.
@@ -171,7 +174,7 @@ Task<absl::Status> StorageEngine::Impl::UpdateGroupedExpirationLocked(
       const auto transaction_id = receipts.front().txid_;
       if (!EnqueueTxCommit(transaction_id, std::move(receipts))) {
         store.store_state_mutex_.Unlock(*store.worker_);
-        const auto capacity = co_await WaitForTxCommitCapacity();
+        const auto capacity = co_await WaitForTxCommitCapacity(diagnostics);
         co_await store.store_state_mutex_.Lock();
         handoff_status = capacity;
       }

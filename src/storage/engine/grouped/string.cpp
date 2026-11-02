@@ -105,7 +105,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
   if (plan.writes_.empty())
     co_return co_await UpdateGroupedExpirationLocked(
         store, partition, db_id, key, digest, previous, expire_at_ms, tx,
-        replication, mutation_precondition);
+        replication, mutation_precondition, diagnostics);
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, previous, std::move(plan),
       expire_at_ms, tx, replication, mutation_precondition, nullptr,
@@ -199,7 +199,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
   if (grouped && operation.kind_ == Kind::kAppend && count == 0) {
     const auto status = co_await UpdateGroupedExpirationLocked(
         store, partition, db_id, key, digest, grouped, location.expire_at_ms_,
-        tx, replication, mutation_precondition);
+        tx, replication, mutation_precondition, operation.diagnostics_);
     if (!status.ok()) co_return status;
     result.changed_ = true;
     co_return result;
@@ -256,11 +256,12 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
         if (!paused.ok()) co_return paused;
       });
     }
+    auto read_detail = MakeReadTrace(operation.diagnostics_);
     std::optional<LoadedValue> loaded;
     std::string_view before;
     if (exists) {
       auto value = co_await LoadValue(store, partition, db_id, key, digest,
-                                      location, extents);
+                                      location, extents, read_detail.get());
       if (!value.ok()) co_return value.status();
       loaded.emplace(std::move(*value));
       if (!read_only) {
@@ -270,6 +271,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       const auto data = loaded->value();
       before = {reinterpret_cast<const char*>(data.data()), data.size()};
     }
+    TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
     std::string bytes;
     CompactPayload plan;
     std::optional<InlineRecordPayload> inline_payload;
@@ -286,6 +288,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       apply(bytes, 0);
       loaded.reset();
     }
+    process.End();
     if (prepare_unlocked) {
       co_await store.store_state_mutex_.Lock();
       unlock.Adopt();
@@ -297,11 +300,13 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
         result.bit_ == operation.bit_)
       co_return result;
     if (!read_only) {
+      auto write_detail = MakeSetTrace(operation.diagnostics_);
       const auto status = co_await AppendLocked(
           store, partition, db_id, key, digest, bytes, RecordKind::kValue,
           ValueType::kString, exists ? location.expire_at_ms_ : 0, tx, new_size,
           nullptr, nullptr, replication, true, nullptr, mutation_precondition,
-          nullptr, inline_payload ? &*inline_payload : nullptr);
+          nullptr, inline_payload ? &*inline_payload : nullptr,
+          write_detail.get());
       if (!status.ok()) co_return status;
     }
   } else {

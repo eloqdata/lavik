@@ -588,7 +588,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
               absl::InternalError("injected grouped batch commit I/O failure");
         }
       } else {
-        committed = co_await CommitTxWrites(batch.txid_, {&batch});
+        committed = co_await CommitTxWrites(batch.txid_, {&batch}, nullptr,
+                                            diagnostics);
       }
       co_await store.store_state_mutex_.Lock();
       if (!committed.ok()) {
@@ -604,7 +605,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       const auto transaction_id = receipts.front().txid_;
       if (!EnqueueTxCommit(transaction_id, std::move(receipts))) {
         store.store_state_mutex_.Unlock(*store.worker_);
-        const auto capacity = co_await WaitForTxCommitCapacity();
+        const auto capacity = co_await WaitForTxCommitCapacity(diagnostics);
         co_await store.store_state_mutex_.Lock();
         if (!capacity.ok()) co_return capacity;
       }

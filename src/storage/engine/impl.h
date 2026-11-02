@@ -2342,13 +2342,14 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::span<const BatchGetRequest> requests,
       OnlineLatencyTrace* diagnostics = nullptr);
 
-  Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
-                                                   std::string_view key);
+  Task<absl::StatusOr<std::uint64_t>> StringLength(
+      std::uint8_t db_id, std::string_view key,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // Caller holds the key lock (shared); see GetLocked.
-  Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(std::uint8_t db_id,
-                                                         std::string_view key,
-                                                         const Digest& digest);
+  Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
@@ -2638,7 +2639,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle previous, std::uint64_t expire_at_ms,
       TxShardWrites* tx, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Publishes a new root revision over an already retained predecessor graph;
   // the caller separately cancels retirements for reused physical groups.
   Task<absl::Status> RestoreGroupedViewLocked(
@@ -2783,7 +2785,8 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
       ExpirationCondition condition, ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> UpdateExpirationLocked(
@@ -2791,7 +2794,8 @@ class StorageEngine::Impl {
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
@@ -2974,13 +2978,15 @@ class StorageEngine::Impl {
   Task<absl::Status> CommitTxWrites(
       std::uint64_t txid, std::vector<TxShardWrites*> shards,
       RelocationDurabilityFence* deferred_decision = nullptr,
-      bool* retryable_capacity = nullptr);
+      bool* retryable_capacity = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
   [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
                                      std::vector<TxShardWrites> writes);
-  Task<absl::Status> WaitForTxCommitCapacity();
+  Task<absl::Status> WaitForTxCommitCapacity(
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::Status> DrainTxCommitQueue(WorkerStore* store);
 
   void PublishCommittedFullSyncEffects(TxShardWrites* shard);
