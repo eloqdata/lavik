@@ -35,7 +35,6 @@
 #include "absl/status/statusor.h"
 #include "lavik/command_args.h"
 #include "lavik/command_outcome.h"
-#include "lavik/reply_timing.h"
 #include "lavik/resp_version.h"
 
 namespace lavik {
@@ -182,22 +181,6 @@ class ReplyBuilder {
   explicit ReplyBuilder(RespVersion version = RespVersion::k2)
       : version_(version) {}
 
-  // Bind only while an awaited command owns this builder. The guard restores
-  // any enclosing command before a reply or session can outlive that request.
-  class TraceBinding {
-   public:
-    TraceBinding(ReplyBuilder& builder, ReplyTimingObserver* trace)
-        : builder_(builder),
-          previous_(std::exchange(builder.diagnostics_, trace)) {}
-    TraceBinding(const TraceBinding&) = delete;
-    TraceBinding& operator=(const TraceBinding&) = delete;
-    ~TraceBinding() { builder_.diagnostics_ = previous_; }
-
-   private:
-    ReplyBuilder& builder_;
-    ReplyTimingObserver* previous_;
-  };
-
   // Metadata follows reply construction independently of its wire encoding.
   // Aggregators must deliberately preserve or isolate child outcomes.
   [[nodiscard]] CommandOutcome outcome() const noexcept { return outcome_; }
@@ -328,32 +311,9 @@ class ReplyBuilder {
   }
 
  private:
-  // Nested append helpers contribute one outer serialization interval. Bulk
-  // projections therefore read two TSC values per operation, not per field.
-  class BuildTiming {
-   public:
-    explicit BuildTiming(ReplyBuilder& builder) {
-      if (!builder.diagnostics_) return;
-      builder_ = &builder;
-      if (builder.build_depth_++ == 0) {
-        observer_ = builder.diagnostics_;
-        token_ = observer_->BeginReplyBuild();
-      }
-    }
-    ~BuildTiming() {
-      if (observer_) observer_->EndReplyBuild(token_);
-      if (builder_) --builder_->build_depth_;
-    }
-
-   private:
-    ReplyBuilder* builder_ = nullptr;
-    ReplyTimingObserver* observer_ = nullptr;
-    std::uint64_t token_ = 0;
-  };
   template <typename Range, typename Projection>
   std::string_view AppendBulkStringsProjected(const Range& values,
                                               Projection projection) {
-    BuildTiming reply_timing(*this);
     if (std::ranges::empty(values)) return buffer_;
     const std::string_view null =
         version_ == RespVersion::k3 ? "_\r\n" : "$-1\r\n";
@@ -413,8 +373,6 @@ class ReplyBuilder {
   CommandOutcome outcome_;
   std::uint64_t execution_started_ = 0;
   std::uint64_t excluded_execution_ticks_ = 0;
-  ReplyTimingObserver* diagnostics_ = nullptr;
-  unsigned build_depth_ = 0;
 };
 
 std::string EncodeSimpleString(std::string_view value);

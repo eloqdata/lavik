@@ -312,8 +312,7 @@ Task<absl::Status> Transaction::ExecuteSingleShard(bool release) {
 }
 
 Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
-                                        bool release, TraceStage stage) {
-  TraceSpanScope round(diagnostics_, stage);
+                                        bool release) {
   assert(!shards_.empty() && "Seal before Execute");
   cb_ = cb;
   cb_ctx_ = ctx;
@@ -343,7 +342,7 @@ Task<absl::Status> NoopShardCallback(void*, const ShardSlice&) {
 }  // namespace
 
 Task<absl::Status> Transaction::Release() {
-  return Execute(&NoopShardCallback, nullptr, true, TraceStage::kTxFinish);
+  return Execute(&NoopShardCallback, nullptr, true);
 }
 
 namespace {

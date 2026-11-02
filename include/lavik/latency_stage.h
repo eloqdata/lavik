@@ -21,10 +21,9 @@ namespace lavik {
 struct OnlineLatencyTrace;
 
 // This is one shared vocabulary for actual operations, not a stage matrix
-// emitted for every command. Summary spans contain work measured below them.
+// emitted for every command. Each stage records an observed operation.
 enum class TraceStage : std::uint8_t {
   kRequestQueue,
-  kDispatch,
   kRouteToOwner,
   kRouteBack,
   kKeyLock,
@@ -33,27 +32,20 @@ enum class TraceStage : std::uint8_t {
   kReadBuffer,
   kReadIo,
   kAppendCapacity,
-  kAppend,
   kDurabilityWait,
   kResponseQueue,
   kSocketSend,
-  kServerTotal,
   kDecode,
   kValueProcess,
   kAdmissionWait,
-  kReplyBuild,
   kTxSchedule,
-  kTxRound,
-  kTxFinish,
   kCommitQueueWait,
   kBlockingWait,
   kWakeResume,
   kReplicationFence,
   kReplicaAckWait,
   kWatchCheck,
-  kChildExecute,
   kScriptPrepare,
-  kScriptRun,
   kPublishFanout,
   kSnapshotPrepare,
   kCount
@@ -80,11 +72,6 @@ class TraceSpanScope {
 // Worker-local TSC time anchored to the common monotonic epoch. A null root
 // reads no clock; absolute values from awaited workers can be merged safely.
 std::uint64_t TraceNowNanos(OnlineLatencyTrace* trace) noexcept;
-// Preserve one logical child's envelope after its shard fragments join.
-// Only canonical identities enter the bounded detail; arguments are omitted.
-void RecordTraceChild(OnlineLatencyTrace* trace, std::uint16_t command,
-                      std::uint64_t start, std::uint64_t end) noexcept;
-
 // Record one already-timed interval on the caller's worker. The borrowed root
 // is valid only through the awaited request; no detached operation inherits it.
 void RecordTraceInterval(OnlineLatencyTrace* trace, TraceStage stage,

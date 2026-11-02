@@ -1594,9 +1594,7 @@ Task<absl::Status> WriteReplyContinuation(
   // Lazy producers may retain a database gate. Keep their original production
   // order and send each chunk before asking for the next one.
   while (continuation.source_) {
-    TraceSpanScope producer(diagnostics, TraceStage::kReplyBuild);
     auto chunk = co_await continuation.source_();
-    producer.End();
     if (!chunk.ok()) co_return chunk.status();
     if (chunk->empty()) break;
     std::span<const std::byte> remaining(
@@ -1933,9 +1931,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
     BindOnlineTraceCommand(buffered.trace_.get(), request);
     request.latency_trace_ = buffered.trace_.get();
-    std::optional<ReplyBuilder::TraceBinding> reply_trace;
-    if (buffered.trace_)
-      reply_trace.emplace(ctx.reply_builder_, buffered.trace_.get());
     if (request.latency_trace_)
       request.latency_trace_->dispatch_ns_ = LatencyMonotonicNanos();
     if (request.kind_ == CommandKind::kAuth ||
@@ -1951,7 +1946,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
                           bycorf::ReadCycleCounter() - execution_start);
       if (request.latency_trace_)
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
-      reply_trace.reset();
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies,
           std::move(buffered.trace_));
@@ -1966,7 +1960,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
                           ctx.reply_builder_.outcome(), 0);
       if (request.latency_trace_)
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
-      reply_trace.reset();
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies,
           std::move(buffered.trace_));
@@ -1980,7 +1973,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (handshake != ReplicationHandshake::kNone) {
         // Dedicated replication transports have their own diagnostics. A
         // command lease must not survive for the lifetime of their session.
-        reply_trace.reset();
         buffered.trace_ = {};
         request.latency_trace_ = nullptr;
         if (auto encoded =
@@ -2005,7 +1997,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
                           ctx.reply_builder_.outcome(), 0);
       if (request.latency_trace_)
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
-      reply_trace.reset();
       absl::Status write_status =
           co_await FlushReplyBatch(stream, &pending_replies);
       if (write_status.ok()) {
@@ -2071,7 +2062,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       buffered.trace_.get()->queued_ =
           ctx.reply_builder_.outcome().result_ == CommandResult::kQueued;
     }
-    reply_trace.reset();
     if (ctx.queued_.size() > queued_before) {
       multi_input_bytes += command_memory.Detach();
     } else if (queued_before != 0 && ctx.queued_.empty()) {

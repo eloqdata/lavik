@@ -500,8 +500,8 @@ server-total threshold. Prometheus exposes conditional stage histograms, and
 `LATENCY TRACE` exposes bounded recent records. A separate logging thread owns
 the rotating diagnostic JSONL sink; output is lossy and never blocks request
 workers. Disabling log output leaves histograms and recent history active.
-The shared RESP library accepts reply-timing observers without depending on the
-diagnostic runtime. See the [diagnostics runbook](../operations/metrics.md#online-latency-diagnostics)
+The shared RESP library is independent of the diagnostic runtime. See the
+[diagnostics runbook](../operations/metrics.md#online-latency-diagnostics)
 for collection, retention and stage semantics.
 
 Redis commandstats and execution time are owned by the coordinating worker and

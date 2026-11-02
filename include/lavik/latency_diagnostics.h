@@ -30,7 +30,6 @@
 #include "lavik/command_args.h"
 #include "lavik/latency_stage.h"
 #include "lavik/read_trace.h"
-#include "lavik/reply_timing.h"
 #include "lavik/set_trace.h"
 
 namespace lavik {
@@ -109,9 +108,7 @@ class LatencyWaitAwaiter {
   LatencyWait wait_;
 };
 
-struct OnlineLatencyTrace : ReplyTimingObserver {
-  std::uint64_t BeginReplyBuild() noexcept override;
-  void EndReplyBuild(std::uint64_t token) noexcept override;
+struct OnlineLatencyTrace {
   ReadLatencyTrace read_;
   SetLatencyTrace set_;
   std::uint64_t id_ = 0;

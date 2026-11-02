@@ -132,8 +132,7 @@ class Transaction {
   // Runs `cb` on every shard's slice. `release` drops all locks and queue
   // positions once the hop completes. Single-shard calls retain one owner-
   // local no-txid guard across non-releasing hops.
-  bycorf::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release,
-                                     TraceStage stage = TraceStage::kTxRound);
+  bycorf::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release);
 
   // Final no-op hop that releases every shard's locks and queue position.
   bycorf::Task<absl::Status> Release();

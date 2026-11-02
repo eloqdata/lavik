@@ -36,10 +36,8 @@ struct SetLatencyTrace : LatencySegmentClock {
   std::uint64_t store_lock_start_ns_ = 0;
   std::uint64_t store_lock_acquired_ns_ = 0;
   std::uint64_t lookup_done_ns_ = 0;
-  std::uint64_t append_start_ns_ = 0;
   std::uint64_t block_wait_start_ns_ = 0;
   std::uint64_t block_ready_ns_ = 0;
-  std::uint64_t append_done_ns_ = 0;
   std::uint64_t owner_done_ns_ = 0;
   bool remote_ = false;
   std::uint64_t durability_start_ns_ = 0;

@@ -405,15 +405,15 @@ LAVIK_LOG_DIR=/absolute/path/to/lavik/logs docker compose --profile diagnostics-
 
 The additional **Lavik Slow Command Traces** dashboard uses the `lavik-loki`
 datasource and supports command/trace-ID filters and expandable log details.
-The native bar charts show the latest matching command in the selected time
-range: enclosing operations and up to 16 named EXEC/Lua children, an internal
-phase timeline, and cumulative phase durations.
-Copy an exact trace ID from a log row into **Trace ID (regex)** to pin a command.
-Overlapping stages are not additive. Repeated stages show up to eight
-retained intervals each on the timeline, while cumulative durations include all
-observations; inspect the JSON for counts and `intervals_dropped`. Rounded
-zero-microsecond intervals may be invisible. These charts use existing JSON logs
-and require no additional server instrumentation or Grafana plugins.
+The native phase timeline shows the latest matching command in the selected
+time range, with command total elapsed time in its first row. Copy an exact trace
+ID from a log row into **Trace ID (regex)** to pin a command. Each row includes the full-stage cumulative duration, execution
+count and omitted interval count alongside its measured interval. Repeated
+stages retain up to eight exact intervals; totals include every observation.
+There is no separate enclosing-operation or cumulative-duration chart.
+Overlapping stages are not additive, and gaps can contain uninstrumented work.
+Rounded zero-microsecond intervals may be invisible. The timeline uses existing
+JSON logs and requires no additional server instrumentation or Grafana plugins.
 Keep the timeline's `start_us` series transparent when editing the dashboard.
 Do not apply `colorByField` to that panel: Grafana applies its opacity across
 numeric series, which would display offsets as measured intervals.

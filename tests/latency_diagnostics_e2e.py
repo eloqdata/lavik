@@ -315,11 +315,14 @@ def lock_case(binary):
                     json.loads(t) for t in first.command("LATENCY", "TRACE", "GET", 20)
                 ]
                 stages = [stage for trace in traces for stage in trace["stages"]]
-                for stage in ["key_lock", "request_queue", "append"]:
+                for stage in ["key_lock", "request_queue"]:
                     assert (
                         max(s["duration_us"] for s in stages if s["name"] == stage)
                         >= 50_000
                     ), traces
+                assert any(
+                    t["command"] == "SET" and t["total_us"] >= 50_000 for t in traces
+                ), traces
                 multi = next(t for t in traces if t["command"] == "MGET")
                 assert (
                     max(
@@ -672,7 +675,7 @@ def logging_case(binary, unavailable=False):
                     in body
                 )
                 assert (
-                    'lavik_latency_diagnostics_stage_seconds_count{command_family="get",stage="server_total"} 25'
+                    'lavik_latency_diagnostics_stage_seconds_count{command_family="get",stage="request_queue"} 25'
                     in body
                 )
                 assert "lavik_latency_diagnostics_log_enabled 0" in body
@@ -748,9 +751,7 @@ def storage_path_coverage(client):
         ("SETRANGE", "coverage:string", 0, "A"),
         ("SETBIT", "coverage:string", 0, 1),
     ]:
-        assert {"read_buffer", "decode", "value_process", "append"} <= trace(
-            *command
-        ), command
+        assert {"read_buffer", "decode", "value_process"} <= trace(*command), command
     for command in [
         ("HRANDFIELD", "coverage:hash", 2),
         ("SRANDMEMBER", "coverage:set", 2),
@@ -774,13 +775,15 @@ def storage_path_coverage(client):
             stage["name"] for stage in transaction["stages"]
         }, transaction
     assert {"key_lock", "store_lock", "lookup"} <= trace("DUMP", "coverage:hash")
-    assert {"read_buffer", "decode", "append"} <= trace("SPOP", "coverage:set", 2)
-    assert "append" in trace("SPOP", "coverage:set", 1000)
+    assert {"read_buffer", "decode", "value_process"} <= trace(
+        "SPOP", "coverage:set", 2
+    )
+    assert "value_process" in trace("SPOP", "coverage:set", 1000)
     for command in [
         ("COPY", "coverage:string", "coverage:copy"),
         ("RENAME", "coverage:copy", "coverage:renamed"),
     ]:
-        assert {"read_buffer", "decode", "append"} <= trace(*command), command
+        assert {"read_buffer", "decode", "value_process"} <= trace(*command), command
     for command in [
         ("EXPIRE", "coverage:string", 3600),
         ("PERSIST", "coverage:string"),
@@ -791,10 +794,10 @@ def storage_path_coverage(client):
             "lookup",
             "read_buffer",
             "decode",
-            "append",
+            "value_process",
         } <= trace(*command), command
     assert {"key_lock", "lookup"} <= trace("STRLEN", "coverage:string")
-    assert {"read_buffer", "append"} <= trace(
+    assert {"read_buffer", "value_process"} <= trace(
         "BITOP", "NOT", "coverage:bits", "coverage:string"
     )
     client.command("MULTI")
@@ -820,7 +823,7 @@ def storage_path_coverage(client):
         client.command("EXEC")
         records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
         transaction = next(t for t in records if t["command"] == "EXEC")
-        assert {"read_buffer", "decode", "append"} <= {
+        assert {"read_buffer", "decode", "value_process"} <= {
             stage["name"] for stage in transaction["stages"]
         }, transaction
     # A native control handshake enables publisher admission on all owners.
@@ -1168,12 +1171,8 @@ def generic_commands_case(binary):
                     stages = {stage["name"]: stage for stage in trace["stages"]}
                     assert {
                         "request_queue",
-                        "dispatch",
                         "socket_send",
-                        "server_total",
                     } <= stages.keys(), trace
-                    assert stages["dispatch"]["kind"] == "summary", trace
-                    assert stages["server_total"]["kind"] == "summary", trace
                     assert trace["write_ok"] is True, trace
                 for command in ("INCR", "HSET", "LPUSH"):
                     assert {
@@ -1181,15 +1180,14 @@ def generic_commands_case(binary):
                         "store_lock",
                         "lookup",
                         "value_process",
-                        "append",
                     } <= {stage["name"] for stage in traces[command]["stages"]}, traces[
                         command
                     ]
                 for command in ("MSET", "MGET"):
-                    assert {"tx_schedule", "tx_round"} <= {
+                    assert {"tx_schedule"} <= {
                         stage["name"] for stage in traces[command]["stages"]
                     }, traces[command]
-                assert "append" in {
+                assert "value_process" in {
                     stage["name"] for stage in traces["MSET"]["stages"]
                 }, traces["MSET"]
                 assert any(
@@ -1214,24 +1212,27 @@ def generic_commands_case(binary):
                     if command != "HGETALL":
                         assert stages["read_io"].get("observations", 1) >= 2, cold[0]
                 for command in ("HSET", "LPUSH", "ZADD", "SET"):
-                    appends = [
+                    processing = [
                         stage
                         for value in raw
                         for trace in [json.loads(value)]
                         if trace["command"] == command
                         for stage in trace["stages"]
-                        if stage["name"] == "append"
+                        if stage["name"] == "value_process"
                     ]
                     assert (
-                        appends
-                        and max(stage.get("observations", 1) for stage in appends) >= 2
-                    ), (command, appends)
-                    assert all(stage["kind"] == "summary" for stage in appends), appends
+                        processing
+                        and max(stage.get("observations", 1) for stage in processing)
+                        >= 2
+                    ), (command, processing)
+                    assert all(stage["kind"] == "phase" for stage in processing), (
+                        processing
+                    )
                 for command in ("ZPOPMAX", "ZREMRANGEBYRANK"):
                     stages = {
                         stage["name"]: stage for stage in traces[command]["stages"]
                     }
-                    assert {"value_process", "append"} <= stages.keys(), traces[command]
+                    assert {"value_process"} <= stages.keys(), traces[command]
                     # Selection reads the score page; nested removal also reads
                     # the member index. Both physical reads belong to this command.
                     assert stages["read_buffer"].get("observations", 1) >= 2, traces[
@@ -1245,33 +1246,48 @@ def generic_commands_case(binary):
                 assert len(queued) == 3, queued
                 for trace in queued:
                     names = {stage["name"] for stage in trace["stages"]}
-                    assert {"dispatch", "server_total"} <= names, trace
-                    assert not ({"read_io", "value_process", "append"} & names), trace
-                for command, children in [
-                    ("EXEC", ["INCR", "HGET", "GET"]),
-                    ("EVAL", ["GET", "GET"]),
-                ]:
+                    assert {"request_queue", "socket_send"} <= names, trace
+                    assert not ({"read_io", "value_process"} & names), trace
+                for command in ("EXEC", "EVAL", "EVAL_RO"):
+                    # Child storage work still contributes to the parent even
+                    # though execution envelopes are no longer collected.
                     trace = traces[command]
-                    assert [
-                        child["command"] for child in trace.get("children", [])
-                    ] == children, trace
-                    assert trace["children_omitted"] == 0, trace
-                    assert "child_execute" in {
-                        stage["name"] for stage in trace["stages"]
-                    }, trace
-                assert {"script_prepare", "script_run"} <= {
+                    stages = {stage["name"]: stage for stage in trace["stages"]}
+                    assert stages["lookup"].get("observations", 1) >= 2, trace
+                assert "script_prepare" in {
                     stage["name"] for stage in traces["EVAL"]["stages"]
                 }, traces["EVAL"]
-                bounded = traces["EVAL_RO"]
-                assert (
-                    len(bounded["children"]) == 16 and bounded["children_omitted"] == 8
-                ), bounded
-                child_stage = next(
+                repeated = next(
                     stage
-                    for stage in bounded["stages"]
-                    if stage["name"] == "child_execute"
+                    for stage in traces["EVAL_RO"]["stages"]
+                    if stage["name"] == "lookup"
                 )
-                assert child_stage["observations"] == 24, bounded
+                assert repeated["observations"] >= 24, repeated
+                assert len(repeated["intervals"]) == 8, repeated
+                assert repeated["intervals_dropped"] == repeated["observations"] - 8, (
+                    repeated
+                )
+                removed = {
+                    "dispatch",
+                    "server_total",
+                    "append",
+                    "reply_build",
+                    "tx_round",
+                    "tx_finish",
+                    "child_execute",
+                    "script_run",
+                }
+                for trace in map(json.loads, raw):
+                    assert not removed.intersection(
+                        stage["name"] for stage in trace["stages"]
+                    ), trace
+                    assert all(stage["kind"] == "phase" for stage in trace["stages"]), (
+                        trace
+                    )
+                    assert (
+                        "children" not in trace and "children_omitted" not in trace
+                    ), trace
+                    assert trace["total_us"] >= 0, trace
                 blocked = traces["BLPOP"]
                 block_stage = next(
                     (
@@ -1290,34 +1306,26 @@ def generic_commands_case(binary):
                     "store_lock",
                     "lookup",
                     "value_process",
-                    "append",
                 } <= wake_stages, blocked
                 assert any(
                     {"route_to_owner", "route_back"}
                     <= {stage["name"] for stage in traces[command]["stages"]}
                     for command in ("INCR", "HSET", "LPUSH")
                 ), {command: traces[command] for command in ("INCR", "HSET", "LPUSH")}
-                for command in ("PING", "ECHO", "INCR", "HSET", "LPUSH", "MGET"):
-                    assert "reply_build" in {
-                        stage["name"] for stage in traces[command]["stages"]
-                    }, traces[command]
                 dump_stages = {
                     stage["name"]: stage for stage in traces["DUMP"]["stages"]
                 }
                 assert dump_stages["socket_send"].get("observations", 1) >= 2, traces[
                     "DUMP"
                 ]
-                assert "reply_build" in dump_stages, traces["DUMP"]
                 stream_stages = {
                     stage["name"]: stage for stage in traces["XRANGE"]["stages"]
                 }
-                assert {"read_io", "decode", "reply_build"} <= stream_stages.keys(), (
-                    traces["XRANGE"]
-                )
+                assert {"read_io", "decode"} <= stream_stages.keys(), traces["XRANGE"]
                 assert stream_stages["read_io"].get("observations", 1) >= 2, traces[
                     "XRANGE"
                 ]
-                assert "append" in {
+                assert "value_process" in {
                     stage["name"] for stage in traces["XADD"]["stages"]
                 }, traces["XADD"]
                 assert "snapshot_prepare" in {
@@ -1328,7 +1336,7 @@ def generic_commands_case(binary):
                         stage["name"] for stage in traces[command]["stages"]
                     }, traces[command]
                 for command in ("SETNX", "GETSET", "DEL"):
-                    assert {"lookup", "store_lock", "append"} <= {
+                    assert {"lookup", "store_lock", "value_process"} <= {
                         stage["name"] for stage in traces[command]["stages"]
                     }, traces[command]
                 for command in ("TYPE", "PTTL", "EXISTS"):

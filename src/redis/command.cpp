@@ -6044,7 +6044,7 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
   // or misreport an already-decided outcome, so the hook is cleared.
   transaction.SetShardValidator(nullptr, nullptr);
   absl::Status finished = co_await transaction.Execute(
-      &TwoPhaseFinishCallback<Context>, context, true, TraceStage::kTxFinish);
+      &TwoPhaseFinishCallback<Context>, context, true);
   if (status.ok() && !finished.ok()) status = std::move(finished);
   disarm_undo();
   co_return TwoPhaseResult{std::move(status), txid, false};
@@ -6761,8 +6761,8 @@ Task<CommandReply> ExecuteMultiKey(
     // fenced off by an authority change that the write hop already beat.
     txn.SetShardValidator(nullptr, nullptr);
     ctx.rollback_ = !status.ok();
-    absl::Status finish = co_await txn.Execute(&MultiKeyFinishCallback, &ctx,
-                                               true, TraceStage::kTxFinish);
+    absl::Status finish =
+        co_await txn.Execute(&MultiKeyFinishCallback, &ctx, true);
     if (!finish.ok() && status.ok()) {
       status = finish;
     }
@@ -7917,7 +7917,6 @@ struct CommandExecutionSpan {
   // Coordinator-only exclusions for nested VM/catalog admission. Shard spans
   // describe execution only; their merge never contributes admission ticks.
   std::uint64_t excluded_ticks_ = 0;
-  std::uint64_t trace_start_ns_ = 0, trace_end_ns_ = 0;
   std::uint64_t Elapsed() const noexcept {
     const auto elapsed = end_ - start_;
     return elapsed > excluded_ticks_ ? elapsed - excluded_ticks_ : 0;
@@ -7926,36 +7925,24 @@ struct CommandExecutionSpan {
     if (other.end_ == 0) return;
     start_ = start_ == 0 ? other.start_ : std::min(start_, other.start_);
     end_ = std::max(end_, other.end_);
-    if (other.trace_start_ns_) {
-      trace_start_ns_ = trace_start_ns_
-                            ? std::min(trace_start_ns_, other.trace_start_ns_)
-                            : other.trace_start_ns_;
-      trace_end_ns_ = std::max(trace_end_ns_, other.trace_end_ns_);
-    }
   }
 };
 struct MeasureCommandExecution {
   CommandExecutionSpan* span_;
-  OnlineLatencyTrace* diagnostics_;
-  explicit MeasureCommandExecution(CommandExecutionSpan* span,
-                                   OnlineLatencyTrace* diagnostics = nullptr)
-      : span_(span), diagnostics_(diagnostics) {
+  explicit MeasureCommandExecution(CommandExecutionSpan* span) : span_(span) {
     if (span_) {
       span_->start_ = bycorf::ReadCycleCounter();
-      span_->trace_start_ns_ = TraceNowNanos(diagnostics_);
     }
   }
   ~MeasureCommandExecution() {
     if (span_) {
       span_->end_ = bycorf::ReadCycleCounter();
-      span_->trace_end_ns_ = TraceNowNanos(diagnostics_);
     }
   }
 };
 Task<EncodedCommandReply> MeasureCommandReply(Task<EncodedCommandReply> task,
-                                              CommandExecutionSpan* span,
-                                              OnlineLatencyTrace* diagnostics) {
-  MeasureCommandExecution measure(span, diagnostics);
+                                              CommandExecutionSpan* span) {
+  MeasureCommandExecution measure(span);
   co_return co_await std::move(task);
 }
 
@@ -8487,7 +8474,6 @@ Task<EncodedCommandReply> ExecuteLuaRedisCall(
   CommandRequest command;
   if (built.ok()) command = std::move(*built);
   command.latency_trace_ = eval_request.latency_trace_;
-  const auto trace_started = TraceNowNanos(command.latency_trace_);
   const auto identity = ResolveCommandIdentity(command);
   const auto started = bycorf::ReadCycleCounter();
   EncodedCommandReply reply;
@@ -8517,8 +8503,6 @@ Task<EncodedCommandReply> ExecuteLuaRedisCall(
   if (!eval_request.replication_origin_)
     RecordCommandResult(identity.index_, reply.outcome_,
                         bycorf::ReadCycleCounter() - started);
-  RecordTraceChild(command.latency_trace_, identity.index_, trace_started,
-                   TraceNowNanos(command.latency_trace_));
   co_return reply;
 }
 
@@ -8798,7 +8782,6 @@ Task<EncodedCommandReply> ExecuteEvalWithTransaction(
   }
 
   script_prepare.End();
-  TraceSpanScope script_run(request.latency_trace_, TraceStage::kScriptRun);
   LuaExecutionStep step =
       (*execution)
           ->Start(request.replication_origin_,
@@ -9529,7 +9512,7 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
       auto& spans = ctx->worker_spans_[self];
       span = &spans.emplace_back(i, CommandExecutionSpan{}).span_;
     }
-    MeasureCommandExecution measure(span, cmd.latency_trace_);
+    MeasureCommandExecution measure(span);
     auto record_error = [&](absl::Status status) {
       std::lock_guard<std::mutex> lock(ctx->error_mutex_);
       if (ctx->errors_[local].ok()) {
@@ -10457,9 +10440,6 @@ Task<CommandReply> ExecuteExecBody(
                 : replies_[i].outcome_;
         RecordCommandResult(CommandResultId(commands_[i]), outcome,
                             spans_[i].Elapsed());
-        RecordTraceChild(commands_[i].latency_trace_,
-                         CommandResultId(commands_[i]),
-                         spans_[i].trace_start_ns_, spans_[i].trace_end_ns_);
       }
     }
   } record_children{queued, replies, execution_spans, reply_chunks};
@@ -10924,14 +10904,14 @@ Task<CommandReply> ExecuteExecBody(
               CommandRequest& cmd = queued[i];
               cmd.resp_version_ = ctx.resp_version();
               if (!key_errors[i].empty()) {
-                MeasureCommandExecution measure(execution_span(i), diagnostics);
+                MeasureCommandExecution measure(execution_span(i));
                 replies[i] = key_errors[i];
                 ++i;
                 continue;
               }
               if (cmd_keys[i].empty()) {
-                replies[i] = co_await MeasureCommandReply(
-                    run_keyless(cmd), execution_span(i), diagnostics);
+                replies[i] = co_await MeasureCommandReply(run_keyless(cmd),
+                                                          execution_span(i));
                 ++i;
                 continue;
               }
@@ -10942,7 +10922,7 @@ Task<CommandReply> ExecuteExecBody(
                     ExecuteExecSequentialCommand(sequential, cmd, cmd_keys[i],
                                                  tx_writes, false,
                                                  &reply_chunks[i]),
-                    execution_span(i), diagnostics);
+                    execution_span(i));
                 ++i;
                 continue;
               }
@@ -11119,14 +11099,14 @@ Task<CommandReply> ExecuteExecBody(
         CommandRequest& cmd = queued[i];
         cmd.resp_version_ = ctx.resp_version();
         if (!key_errors[i].empty()) {
-          MeasureCommandExecution measure(execution_span(i), diagnostics);
+          MeasureCommandExecution measure(execution_span(i));
           replies[i] = key_errors[i];
           ++i;
           continue;
         }
         if (cmd_keys[i].empty()) {
-          replies[i] = co_await MeasureCommandReply(
-              run_keyless(cmd), execution_span(i), diagnostics);
+          replies[i] =
+              co_await MeasureCommandReply(run_keyless(cmd), execution_span(i));
           ++i;
           continue;
         }
@@ -11137,7 +11117,7 @@ Task<CommandReply> ExecuteExecBody(
               ExecuteEvalWithTransaction(cmd, &txn, &tx_writes,
                                          blocking_notifications, &effects, &ctx,
                                          &admission_ticks),
-              execution_span(i), diagnostics);
+              execution_span(i));
           exclude_child_admission(cmd, admission_ticks);
           StoreEvalReplicationEffects(cmd, std::move(effects));
           ++i;
@@ -11149,7 +11129,7 @@ Task<CommandReply> ExecuteExecBody(
           replies[i] = co_await MeasureCommandReply(
               ExecuteExecSequentialCommand(sequential, cmd, cmd_keys[i],
                                            tx_writes, false, &reply_chunks[i]),
-              execution_span(i), diagnostics);
+              execution_span(i));
           ++i;
           continue;
         }
@@ -11198,7 +11178,7 @@ Task<CommandReply> ExecuteExecBody(
       }
       absl::Status published =
           co_await txn.Execute(&FinishTxParticipantsCallback, &tx_writes,
-                               /*release=*/false, TraceStage::kTxFinish);
+                               /*release=*/false);
       if (!published.ok()) {
         (void)co_await txn.Release();
         co_await DropWatches(ctx);
@@ -11255,11 +11235,11 @@ Task<CommandReply> ExecuteExecBody(
       if (close_after_exec) {
         replies[i] = EncodeCommandError("ERR EXEC interrupted");
       } else if (!key_errors[i].empty()) {
-        MeasureCommandExecution measure(execution_span(i), diagnostics);
+        MeasureCommandExecution measure(execution_span(i));
         replies[i] = key_errors[i];
       } else {
-        replies[i] = co_await MeasureCommandReply(
-            run_keyless(queued[i]), execution_span(i), diagnostics);
+        replies[i] = co_await MeasureCommandReply(run_keyless(queued[i]),
+                                                  execution_span(i));
       }
     }
   }

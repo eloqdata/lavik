@@ -251,14 +251,12 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
     replication->args_.emplace_back("PXAT");
     replication->args_.emplace_back(std::to_string(expire_at_ms));
   }
-  if (trace != nullptr) trace->append_start_ns_ = trace->NowNanos();
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
       std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, replication,
       true, nullptr, mutation_precondition,
       /*grouped=*/nullptr, /*inline_payload=*/nullptr, trace);
-  if (trace != nullptr) trace->append_done_ns_ = trace->NowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
   co_return result;
@@ -2800,9 +2798,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   auto private_trace =
       !trace && request.tx_ ? MakeSetTrace(request.tx_->diagnostics_) : nullptr;
   if (!trace) trace = private_trace.get();
-  // One record append encloses capacity waits, encoding and publication.
-  TraceSpanScope append(trace ? trace->diagnostics_ : nullptr,
-                        TraceStage::kAppend);
   // Direct FIFO handoff does not wake the remaining writers to yield a new
   // active buffer. A writer ahead of them must make its staging slot returnable
   // on every exit, including stale-relocation/validation failures after an

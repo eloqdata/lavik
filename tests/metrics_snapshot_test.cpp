@@ -117,7 +117,7 @@ bycorf::Task<absl::Status> CollectSnapshots(
     if (!trace) return false;
     trace.get()->family_ = TraceCommandFamily::kSet;
     // Zero-duration observations must survive a sparse snapshot too.
-    RecordTraceInterval(trace.get(), TraceStage::kAppend, 1, 1);
+    RecordTraceInterval(trace.get(), TraceStage::kValueProcess, 1, 1);
     trace.Complete(true);
     return true;
   });
@@ -203,7 +203,7 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   EXPECT_EQ(snapshots.empty_diagnostics_.find("_bucket{"), std::string::npos);
   for (const auto& text : snapshots.exposition_) {
     EXPECT_NE(text.find("lavik_latency_diagnostics_stage_seconds_count{"
-                        "command_family=\"set\",stage=\"append\"} 1\n"),
+                        "command_family=\"set\",stage=\"value_process\"} 1\n"),
               std::string::npos);
     EXPECT_EQ(text.find("command_family=\"set\",stage=\"decode\""),
               std::string::npos);

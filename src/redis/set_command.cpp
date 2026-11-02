@@ -781,8 +781,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       // The finish hop settles (or rolls back) what the write hop did; it must
       // not be fenced off by an authority change the write hop already beat.
       transaction.SetShardValidator(nullptr, nullptr);
-      absl::Status finished = co_await transaction.Execute(
-          &SetFinishShardCallback, &context, true, TraceStage::kTxFinish);
+      absl::Status finished =
+          co_await transaction.Execute(&SetFinishShardCallback, &context, true);
       if (!finished.ok()) status = finished;
     }
     if (context.single_shard_ && !context.source_contains_) {
@@ -801,8 +801,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
       context.rollback_ = !status.ok();
       if (context.rollback_) ReleaseSetWorkingSet(&context);
       transaction.SetShardValidator(nullptr, nullptr);
-      absl::Status finished = co_await transaction.Execute(
-          &SetFinishShardCallback, &context, true, TraceStage::kTxFinish);
+      absl::Status finished =
+          co_await transaction.Execute(&SetFinishShardCallback, &context, true);
       if (!finished.ok()) status = finished;
     }
   } else if (!context.single_shard_) {

@@ -25,7 +25,7 @@
   "uid": "lavik-latency-breakdown",
   "title": "Lavik Latency Breakdown",
   "tags": ["lavik", "latency"],
-  "version": 1,
+  "version": 2,
   "refresh": "5s",
   "time": {
     "from": "now-15m",
@@ -551,59 +551,13 @@
       }
     },
     {
-      "id": 12,
-      "title": "Slow sampled server-total p99 / p99.9",
-      "type": "timeseries",
-      "gridPos": {
-        "x": 0,
-        "y": 44,
-        "w": 12,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "description": "",
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "histogram_quantile(0.99,sum by(le,command_family)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"server_total\"}[$__rate_interval])))",
-          "legendFormat": "{{command_family}} p99"
-        },
-        {
-          "refId": "B",
-          "expr": "histogram_quantile(0.999,sum by(le,command_family)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",stage=\"server_total\"}[$__rate_interval])))",
-          "legendFormat": "{{command_family}} p99.9"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      }
-    },
-    {
       "id": 13,
       "title": "Existing storage I/O rate",
       "type": "timeseries",
       "gridPos": {
-        "x": 12,
+        "x": 0,
         "y": 44,
-        "w": 12,
+        "w": 24,
         "h": 8
       },
       "datasource": {

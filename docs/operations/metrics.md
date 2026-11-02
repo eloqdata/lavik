@@ -477,14 +477,11 @@ diagnostic commands; EXEC then reports EXECABORT for the invalid transaction.
 Trace IDs are process-local and must not be used as metric or Loki stream labels.
 
 A `queued: true` record ends when the MULTI client's QUEUED reply is sent. Its
-storage work belongs to the later EXEC trace. EXEC and Lua retain at most 16
-executed-child summaries per trace, containing only canonical command names,
-start offsets and measured execution envelopes. `children_omitted` reports
-additional executed children. Shard fragments join into one logical EXEC child;
-parallel child envelopes can overlap and their order does not imply serial
-execution. The `child_execute` stage still counts all observed children after
-detail is full. Deferred reply production is measured separately from the
-child handler's execution envelope.
+storage work belongs to the later EXEC trace. EXEC and Lua child storage work
+contributes to the parent trace's phases. Child execution envelopes and outer
+command, transaction, script, append and reply-building spans are not collected.
+The record's `total_us` still measures readiness through socket write completion
+and controls threshold filtering; it is not a separate stage histogram.
 
 Stages are emitted only when the operation is observed. A write that reads its
 predecessor can include both read and write phases; a metadata-only read has no
@@ -493,35 +490,35 @@ synthetic disk phase. These names are shared across command families:
 | Stages | Measured operation |
 | --- | --- |
 | `request_queue`, `response_queue` | Parsed-command wait before dispatch; reply wait before the socket write starts |
-| `dispatch`, `server_total` | Awaited command execution envelope; readiness through socket write completion |
 | `route_to_owner`, `route_back` | Selected cross-worker queue/handoff intervals; same-worker and direct remote reads do not invent hops |
 | `admission_wait` | Actual publisher, database or Lua VM admission waits |
 | `key_lock`, `store_lock`, `lookup` | Key intent acquisition, store-state lock acquisition and index/metadata lookup |
 | `read_buffer`, `read_io`, `decode` | Physical read-buffer acquisition, submitted read through completion/resume, and value/page decoding |
 | `value_process` | Logical value inspection/modification and record encoding/copying |
-| `append`, `append_capacity`, `durability_wait` | Full append envelope, staging capacity/related flush waits, and awaited durability fences |
-| `tx_schedule`, `tx_round`, `tx_finish`, `commit_queue_wait` | Multi-key intent scheduling, joined shard rounds, completion/release rounds and commit-capacity admission |
-| `watch_check`, `child_execute` | WATCH validation and logical EXEC/Lua child execution envelopes |
-| `script_prepare`, `script_run` | Script preparation/cache lookup and VM execution including awaited Redis calls |
+| `append_capacity`, `durability_wait` | Staging capacity/related flush waits and awaited durability fences |
+| `tx_schedule`, `commit_queue_wait` | Multi-key intent scheduling and commit-capacity admission |
+| `watch_check` | WATCH validation |
+| `script_prepare` | Script preparation/cache lookup |
 | `blocking_wait`, `wake_resume` | Blocking command sleep and wake-to-next-attempt admission |
 | `replication_fence`, `replica_ack_wait` | WAIT watermark capture and actual polling sleeps for replica acknowledgements |
 | `publish_fanout` | Foreground Pub/Sub subscriber fanout |
 | `snapshot_prepare` | Awaited snapshot cut preparation; detached snapshot writing does not borrow a command trace |
-| `reply_build`, `socket_send` | RESP serialization/deferred reply production and actual socket write calls |
+| `socket_send` | Actual socket write calls |
 
-`server_total` is server elapsed time, not client RTT. `dispatch` includes
-admission, execution and awaited worker hops. Summary spans (`kind: summary`)
-contain operations measured below them; the trace dashboard displays these
-separately from phases. `append` includes capacity, encoding and publication,
-and a transaction round can include reads, value processing and appends. Stages
-are elapsed intervals, not mutually exclusive CPU accounting.
+The timeline starts with the command total from `total_us`, followed by retained
+phase intervals at their measured offsets. Each row
+also shows the stage's cumulative duration, observation count and omitted
+interval count. Totals include every observation even when the eight-interval
+detail limit is reached. Stages can overlap; gaps can contain work without a
+phase timer, and durations are not exclusive CPU accounting. The record's
+`total_us` is server elapsed time, not client RTT.
 
 A read served by resident data has no `read_io`. GET key-lock timing exists only
 when optimistic reading falls back to locking. `durability_wait` does not mean
 every write waits for fsync. Detached flush, replication and pin cleanup are not
 assigned to an already-completed command. A streamed reply can build data and
-perform several socket writes; producer waits belong to `reply_build` while
-`socket_send` contains the socket calls. Selected commands sharing a pipeline
+perform several socket writes; `socket_send` contains only the socket calls,
+not time spent waiting for its producer. Selected commands sharing a pipeline
 batch share its socket-write interval.
 
 Concurrent pages and shards own separate physical sidecars. Each worker records
@@ -560,17 +557,14 @@ queued output; recent history and counters are process memory, not durable stora
 
 The optional [monitoring log profile](../../deploy/monitoring/README.md#online-latency-diagnostics)
 collects these messages with Alloy into Loki. **Lavik Slow Command Traces** shows
-expandable JSON records and filters by command/trace ID. Its native bar charts
-show the latest matching command's enclosing operations and named EXEC/Lua
-children separately from its
-measured phase timeline and cumulative phase durations;
-enter an exact trace ID to pin a command. The timeline uses actual retained
-intervals, including up to eight intervals for each repeated stage. The
-duration chart includes all observations even when detailed intervals are
-truncated. Stages can overlap or be nested, so their durations are not additive.
-Zero-microsecond JSON durations can be invisible on the timeline. These views
-query existing logs and add no server instrumentation or log volume. Ordinary
-metrics deployment continues to require only Prometheus/Grafana.
+expandable JSON records and filters by command/trace ID. Its single timeline
+shows the command total first, followed by measured phase intervals. Enter an
+exact trace ID to pin a command. Stage labels include full cumulative duration,
+execution count and omitted interval count even when only eight intervals are
+retained. Stages can overlap and gaps can contain uninstrumented work; phase
+durations are not additive. Zero-microsecond JSON durations can be invisible.
+The view queries existing logs and adds no server instrumentation or log volume.
+Ordinary metrics deployment continues to require only Prometheus/Grafana.
 
 ## Cluster control metrics
 

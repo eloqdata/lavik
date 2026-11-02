@@ -38,17 +38,7 @@
 
 namespace lavik {
 
-struct TraceChild {
-  std::uint16_t command = 0;
-  std::uint64_t start = 0, end = 0;
-};
 struct TraceTimingData {
-  std::array<TraceChild, 16> children{};
-  std::uint64_t child_count = 0;
-  void AddChild(TraceChild child) noexcept {
-    if (child_count < children.size()) children[child_count] = child;
-    ++child_count;
-  }
   std::array<LatencyIntervals, static_cast<unsigned>(TraceStage::kCount)>
       stages;
 };
@@ -134,45 +124,16 @@ constexpr auto kStageCount = static_cast<unsigned>(TraceStage::kCount);
 constexpr unsigned StageIndex(TraceStage stage) {
   return static_cast<unsigned>(stage);
 }
-bool IsSummaryStage(unsigned stage) {
-  return stage == StageIndex(kReplyBuild) || stage == StageIndex(kAppend) ||
-         stage == StageIndex(kDispatch) || stage == StageIndex(kServerTotal) ||
-         stage == StageIndex(kTxRound) || stage == StageIndex(kChildExecute) ||
-         stage == StageIndex(kScriptRun) || stage == StageIndex(kTxFinish);
-}
-constexpr std::array<std::string_view, kStageCount> kStages{"request_queue",
-                                                            "dispatch",
-                                                            "route_to_owner",
-                                                            "route_back",
-                                                            "key_lock",
-                                                            "store_lock",
-                                                            "lookup",
-                                                            "read_buffer",
-                                                            "read_io",
-                                                            "append_capacity",
-                                                            "append",
-                                                            "durability_wait",
-                                                            "response_queue",
-                                                            "socket_send",
-                                                            "server_total",
-                                                            "decode",
-                                                            "value_process",
-                                                            "admission_wait",
-                                                            "reply_build",
-                                                            "tx_schedule",
-                                                            "tx_round",
-                                                            "tx_finish",
-                                                            "commit_queue_wait",
-                                                            "blocking_wait",
-                                                            "wake_resume",
-                                                            "replication_fence",
-                                                            "replica_ack_wait",
-                                                            "watch_check",
-                                                            "child_execute",
-                                                            "script_prepare",
-                                                            "script_run",
-                                                            "publish_fanout",
-                                                            "snapshot_prepare"};
+constexpr std::array<std::string_view, kStageCount> kStages{
+    "request_queue",   "route_to_owner",    "route_back",
+    "key_lock",        "store_lock",        "lookup",
+    "read_buffer",     "read_io",           "append_capacity",
+    "durability_wait", "response_queue",    "socket_send",
+    "decode",          "value_process",     "admission_wait",
+    "tx_schedule",     "commit_queue_wait", "blocking_wait",
+    "wake_resume",     "replication_fence", "replica_ack_wait",
+    "watch_check",     "script_prepare",    "publish_fanout",
+    "snapshot_prepare"};
 constexpr std::array<std::uint64_t, 15> kBoundsUs{
     1,     4,      16,      64,      256,      1000,     4000,     16000,
     64000, 256000, 1000000, 4000000, 16000000, 64000000, 256000000};
@@ -255,7 +216,6 @@ std::uint64_t Duration(const Span& span) {
 std::array<Span, kStages.size()> Spans(const OnlineLatencyTrace& t) {
   std::array<Span, kStages.size()> s{};
   s[StageIndex(kRequestQueue)] = {t.ready_ns_, t.dispatch_ns_};
-  s[StageIndex(kDispatch)] = {t.dispatch_ns_, t.dispatch_done_ns_};
   if (t.family_ == TraceCommandFamily::kSet) {
     const auto& v = t.set_;
     if (v.remote_) {
@@ -268,7 +228,6 @@ std::array<Span, kStages.size()> Spans(const OnlineLatencyTrace& t) {
     s[StageIndex(kLookup)] = {v.store_lock_acquired_ns_, v.lookup_done_ns_};
     s[StageIndex(kAppendCapacity)] = {v.block_wait_start_ns_,
                                       v.block_ready_ns_};
-    s[StageIndex(kAppend)] = {v.append_start_ns_, v.append_done_ns_};
     s[StageIndex(kDurabilityWait)] = {v.durability_start_ns_,
                                       v.durability_done_ns_};
   } else if (t.family_ == TraceCommandFamily::kGet) {
@@ -296,7 +255,6 @@ std::array<Span, kStages.size()> Spans(const OnlineLatencyTrace& t) {
   }
   s[StageIndex(kResponseQueue)] = {t.dispatch_done_ns_, t.send_ns_};
   s[StageIndex(kSocketSend)] = {t.send_ns_, t.done_ns_};
-  s[StageIndex(kServerTotal)] = {t.ready_ns_, t.done_ns_};
   if (t.timings_) {
     for (unsigned i = 0; i < kStageCount; ++i) {
       const auto& timing = t.timings_->stages[i];
@@ -326,8 +284,7 @@ std::string Json(const OnlineLatencyTrace& t) {
     if (!Valid(span) || span.start < t.ready_ns_) continue;
     if (!first) out += ',';
     first = false;
-    absl::StrAppend(&out, "{\"name\":\"", kStages[i], "\",\"kind\":\"",
-                    IsSummaryStage(i) ? "summary" : "phase",
+    absl::StrAppend(&out, "{\"name\":\"", kStages[i], "\",\"kind\":\"", "phase",
                     "\",\"start_us\":", (span.start - t.ready_ns_) / 1000,
                     ",\"duration_us\":", Duration(span) / 1000);
     if (span.timing && span.timing->count > 1) {
@@ -349,18 +306,7 @@ std::string Json(const OnlineLatencyTrace& t) {
     }
     out += '}';
   }
-  out += "],\"children\":[";
-  const auto child_count = t.timings_ ? t.timings_->child_count : 0;
-  const auto retained = std::min<std::uint64_t>(child_count, 16);
-  for (unsigned i = 0; i < retained; ++i) {
-    const auto& child = t.timings_->children[i];
-    if (i) out += ',';
-    absl::StrAppend(&out, "{\"command\":\"",
-                    absl::AsciiStrToUpper(CommandIdentityName(child.command)),
-                    "\",\"start_us\":", (child.start - t.ready_ns_) / 1000,
-                    ",\"duration_us\":", (child.end - child.start) / 1000, "}");
-  }
-  absl::StrAppend(&out, "],\"children_omitted\":", child_count - retained, "}");
+  out += "]}";
   return out;
 }
 void Release(OnlineLatencyTrace* t, bool cancelled) {
@@ -432,23 +378,6 @@ std::uint64_t TraceNowNanos(OnlineLatencyTrace* trace) noexcept {
   return trace && trace->session_ ? trace->session_->Local()->clock.NowNanos()
                                   : 0;
 }
-std::uint64_t OnlineLatencyTrace::BeginReplyBuild() noexcept {
-  return TraceNowNanos(this);
-}
-void OnlineLatencyTrace::EndReplyBuild(std::uint64_t token) noexcept {
-  if (token)
-    RecordTraceInterval(this, TraceStage::kReplyBuild, token,
-                        TraceNowNanos(this));
-}
-
-void RecordTraceChild(OnlineLatencyTrace* trace, std::uint16_t command,
-                      std::uint64_t start, std::uint64_t end) noexcept {
-  if (!trace || !trace->session_ || !start || end < start) return;
-  auto* recorder = trace->session_->Local();
-  recorder->AddChild({command, start, end});
-  recorder->stages[StageIndex(kChildExecute)].Add(start, end);
-}
-
 void RecordTraceInterval(OnlineLatencyTrace* trace, TraceStage stage,
                          std::uint64_t start, std::uint64_t end) noexcept {
   if (!trace || !trace->session_) return;
@@ -587,11 +516,6 @@ void OnlineTraceHandle::Complete(bool ok) {
       if (!frozen) frozen = std::make_shared<TraceTimingData>();
       for (unsigned i = 0; i < kStageCount; ++i)
         frozen->stages[i].Merge(recorder->stages[i]);
-      const auto retained = std::min<std::uint64_t>(recorder->child_count,
-                                                    recorder->children.size());
-      for (unsigned i = 0; i < retained; ++i)
-        frozen->AddChild(recorder->children[i]);
-      frozen->child_count += recorder->child_count - retained;
     }
     trace_->timings_ = std::move(frozen);
   }

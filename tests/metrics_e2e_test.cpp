@@ -621,12 +621,13 @@ TEST_F(CommandResultsE2eTest, OnlineTraceSamplingRetentionAndMetrics) {
   EXPECT_EQ(MetricValue(
                 metrics,
                 "lavik_latency_diagnostics_stage_seconds_count{command_family="
-                "\"get\",stage=\"server_total\"}"),
+                "\"get\",stage=\"request_queue\"}"),
             200);
   EXPECT_EQ(metrics.find(
                 "lavik_latency_diagnostics_stage_seconds_count{command_family="
                 "\"get\",stage=\"read_io\"}"),
             std::string::npos);
+  EXPECT_EQ(metrics.find("stage=\"server_total\""), std::string::npos);
   EXPECT_EQ(MetricValue(metrics, "lavik_latency_diagnostics_inflight"), 0);
   EXPECT_EQ(MetricValue(metrics, "lavik_request_queue_length"), 0);
   EXPECT_EQ(MetricValue(metrics, "lavik_response_writes_inflight"), 0);
@@ -1890,7 +1891,9 @@ TEST(MetricsE2eTest, OnlineLatencyTraceLifecycleAndThreshold) {
             "$21\r\nprivate-latency-value");
   const auto traces = client.RawCommand({"LATENCY", "TRACE", "GET", "20"});
   EXPECT_NE(traces.find("command_latency_trace"), std::string::npos) << traces;
-  EXPECT_NE(traces.find("server_total"), std::string::npos) << traces;
+  EXPECT_NE(traces.find("total_us"), std::string::npos) << traces;
+  EXPECT_EQ(traces.find("\"children\""), std::string::npos) << traces;
+  EXPECT_EQ(traces.find("server_total"), std::string::npos) << traces;
   EXPECT_NE(traces.find("socket_send"), std::string::npos) << traces;
   EXPECT_NE(traces.find("key_lock"), std::string::npos) << traces;
   EXPECT_EQ(traces.find("private-latency"), std::string::npos) << traces;
