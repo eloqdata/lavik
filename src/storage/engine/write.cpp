@@ -1601,6 +1601,10 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     // Transfer it under store state; no new allocation or reserve is needed.
     allocated = *store.standby_block_;
     store.standby_block_.reset();
+    LAVIK_FAULT_INJECT(
+        if (LAVIK_FAULT_MATCHES("LAVIK_TRACE_STANDBY_BLOCKS", "1"))
+            spdlog::info("foreground fallback consumed standby block {}",
+                         allocated->block_id_););
   }
   co_return allocated;
 }
@@ -1705,6 +1709,10 @@ Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
   if (publish) {
     store->standby_block_ = *allocated;
     store->standby_prefetch_pending_ = false;
+    LAVIK_FAULT_INJECT(
+        if (LAVIK_FAULT_MATCHES("LAVIK_TRACE_STANDBY_BLOCKS", "1"))
+            spdlog::info("standby prefetch published block {}",
+                         allocated->block_id_););
     store->store_state_mutex_.Unlock(*store->worker_);
     co_return absl::OkStatus();
   }

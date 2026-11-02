@@ -1125,19 +1125,35 @@ void CheckExpirationRestoresBoundedDeviceCapacity(bool prime_ordinary) {
   // it rather than assuming a byte count implies physical exhaustion.
   PrivateDisk disk(96ULL * 1024 * 1024);
   disk.PreserveOnFailure();
+  ScopedEnvironment trace_standby("LAVIK_TRACE_STANDBY_BLOCKS",
+                                  prime_ordinary ? "1" : "0");
+  ScopedEnvironment delay_standby("LAVIK_STANDBY_PREFETCH_PAUSE_MS",
+                                  prime_ordinary ? "200" : "0");
   Server server(disk, 1);
   server.PreserveOnFailure();
   Client client(server.port());
   const std::string value(900 * 1024, 'e');
+  std::string consumed_standby;
   ASSERT_EQ(client.Command({"DEFRAG", "RESUME"}).text_, "OK");
   if (prime_ordinary) {
     // Create the ordinary stream and its prefetched successor before filling
     // the transaction stream. Cleaner/expiration timing can produce the same
-    // layout; this order exposes stranded prefetch capacity deterministically.
+    // layout. Durability alone does not wait for the separate prefetch task.
     ASSERT_EQ(client.Command({"SET", "{expiry-387}ordinary", "v", "PX", "2000"})
                   .text_,
               "OK");
     client.Durable();
+    const std::string marker = "standby prefetch published block ";
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    std::string log;
+    while ((log = server.Log()).find(marker) == std::string::npos &&
+           server.Running() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(1ms);
+    const auto at = log.find(marker);
+    ASSERT_NE(at, std::string::npos) << log;
+    const auto block = std::stoull(log.substr(at + marker.size()));
+    consumed_standby = "foreground fallback consumed standby block " +
+                       std::to_string(block) + "\n";
   }
   const unsigned initial_values = prime_ordinary ? 0 : 7;
   for (unsigned i = 0; i < initial_values; ++i) {
@@ -1188,6 +1204,9 @@ void CheckExpirationRestoresBoundedDeviceCapacity(bool prime_ordinary) {
       << client.Command({"INFO", "KEYSPACE"}).text_ << server.Log();
   EXPECT_EQ(client.Command({"GET", "replacement"}).text_, value);
   client.Durable();
+  if (prime_ordinary)
+    EXPECT_NE(server.Log().find(consumed_standby), std::string::npos)
+        << server.Log();
   ASSERT_EQ(server.Wait(true), 0) << server.Log();
   EXPECT_EQ(server.Log().find("commit append failed"), std::string::npos)
       << server.Log();
@@ -1212,6 +1231,9 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
 }
 
 TEST(GroupedStringWriteE2e, ExpirationCanUseOrdinaryPrefetchCapacity) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires standby publication and consumption tracing";
+#endif
   ASSERT_NO_FATAL_FAILURE(CheckExpirationRestoresBoundedDeviceCapacity(true));
 }
 
