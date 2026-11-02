@@ -35,10 +35,8 @@
 #include "bycorf/runtime/task.h"
 #include "lavik/cluster/topology.h"
 #include "lavik/command_args.h"
-#include "lavik/read_trace.h"
 #include "lavik/resp_version.h"
 #include "lavik/retained_allocator.h"
-#include "lavik/set_trace.h"
 #include "lavik/storage/engine.h"
 
 namespace lavik {
@@ -571,18 +569,13 @@ struct CommandReply {
   std::unique_ptr<ReplyContinuation> continuation_;
   bool close_connection_ = false;
   bool start_monitoring_ = false;
-  LegacyReadLatencyTrace read_trace_;
-  LegacySetLatencyTrace set_trace_;
   std::optional<std::uint8_t> selected_db_;
 };
 
 // The direct GET result is moved through several coroutine promises. Keep its
 // common representation at 72 bytes so adding rare reply state cannot silently
-// restore the former larger coroutine frames. Diagnostic builds deliberately
-// carry stage timestamps; this size contract applies only with tracing off.
-#if !LAVIK_ENABLE_TRACE
+// restore the former larger coroutine frames. Diagnostic state stays indirect.
 static_assert(sizeof(CommandReply) == 72);
-#endif
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id);

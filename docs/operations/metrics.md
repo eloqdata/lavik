@@ -456,7 +456,7 @@ A consumer recovering from a stalled sink may drain queued records together;
 this is not a strict per-second disk-write limit.
 `lavik_latency_diagnostics_log_max_per_second` exposes the configured limit.
 Settings are runtime-only and are not persisted by CONFIG REWRITE. They are
-independent of SLOWLOG and the legacy compile-time aggregate trace.
+independent of SLOWLOG.
 
 The deadline stops new selection automatically, including on an otherwise idle
 server. In-flight samples finish with their captured configuration. Above-threshold

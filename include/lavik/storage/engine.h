@@ -1827,8 +1827,8 @@ class StorageEngine {
   // type selects the expected compact encoding. metadata_only returns length
   // and expiry from the index with an empty payload and no buffer/block pin.
   // Never use this for reads inside EXEC/Lua or a multi-key transaction.
-  // A selected online diagnostic or legacy trace build may borrow caller-owned
-  // timing state through completion.
+  // A selected online diagnostic may borrow caller-owned timing state through
+  // completion.
   RemoteReadAwaitable TryRemoteRead(std::uint8_t db_id, std::string_view key,
                                     std::uint16_t slot,
                                     ValueType type = ValueType::kString,

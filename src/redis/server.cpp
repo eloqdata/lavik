@@ -65,7 +65,6 @@
 #include "bycorf/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
-#include "latency_trace.h"
 #include "lavik/cluster/bootstrap.h"
 #include "lavik/cluster/meta_client.h"
 #include "lavik/cluster/runtime.h"
@@ -1257,33 +1256,13 @@ struct PendingReplyBatch {
       online_traces_ = std::make_unique<std::vector<OnlineTraceHandle>>();
     online_traces_->push_back(std::move(trace));
   }
-  // Empty diagnostic vectors still occupy the connection coroutine frame and
-  // participate in every batch's lifetime; omit them when tracing is off.
-#if LAVIK_ENABLE_TRACE
-  std::vector<LegacyReadLatencyTrace> read_traces_;
-  std::vector<LegacySetLatencyTrace> set_traces_;
-#endif
 
   bool empty() const noexcept { return bytes_.empty(); }
 
-  void Append(std::string_view bytes,
-              [[maybe_unused]] LegacyReadLatencyTrace read_trace = {},
-              [[maybe_unused]] LegacySetLatencyTrace set_trace = {}) {
-    bytes_.append(bytes);
-#if LAVIK_ENABLE_TRACE
-    if (read_trace.request_start_ns_ != 0) {
-      read_traces_.push_back(std::move(read_trace));
-    }
-    if (set_trace.request_start_ns_ != 0) {
-      set_traces_.push_back(std::move(set_trace));
-    }
-#endif
-  }
+  void Append(std::string_view bytes) { bytes_.append(bytes); }
 };
 
-#if !LAVIK_ENABLE_TRACE
 static_assert(sizeof(PendingReplyBatch) == sizeof(std::string) + sizeof(void*));
-#endif
 
 Task<absl::Status> FlushReplyBatch(TcpStream& stream,
                                    PendingReplyBatch* batch) {
@@ -1293,14 +1272,6 @@ Task<absl::Status> FlushReplyBatch(TcpStream& stream,
     for (auto& trace : *batch->online_traces_) trace.get()->send_ns_ = now;
   }
 
-#if LAVIK_ENABLE_TRACE
-  for (LegacyReadLatencyTrace& trace : batch->read_traces_) {
-    trace.send_start_ns_ = ReadTraceNowNanos();
-  }
-  for (LegacySetLatencyTrace& trace : batch->set_traces_) {
-    trace.send_start_ns_ = SetTraceNowNanos();
-  }
-#endif
   absl::Status status = co_await ResponseWriteAwaiter(
       stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(batch->bytes_.data()),
@@ -1308,32 +1279,19 @@ Task<absl::Status> FlushReplyBatch(TcpStream& stream,
       true, nullptr,
       batch->online_traces_ ? std::span(*batch->online_traces_)
                             : std::span<OnlineTraceHandle>{});
-#if LAVIK_ENABLE_TRACE
-  for (LegacyReadLatencyTrace& trace : batch->read_traces_) {
-    trace.send_complete_ns_ = ReadTraceNowNanos();
-    trace::RecordReadLatency(trace);
-  }
-  for (LegacySetLatencyTrace& trace : batch->set_traces_) {
-    trace.send_complete_ns_ = SetTraceNowNanos();
-    trace::RecordSetLatency(trace);
-  }
-#endif
   if (batch->online_traces_) {
     for (auto& trace : *batch->online_traces_) trace.Complete(status.ok());
     batch->online_traces_->clear();
   }
   batch->bytes_.clear();
-#if LAVIK_ENABLE_TRACE
-  batch->read_traces_.clear();
-  batch->set_traces_.clear();
-#endif
   co_return status;
 }
 
-Task<absl::Status> WriteOrBatchReplySlow(
-    TcpStream& stream, std::string_view encoded, bool more_commands,
-    PendingReplyBatch* batch, LegacyReadLatencyTrace read_trace = {},
-    LegacySetLatencyTrace set_trace = {}, OnlineTraceHandle online_trace = {}) {
+Task<absl::Status> WriteOrBatchReplySlow(TcpStream& stream,
+                                         std::string_view encoded,
+                                         bool more_commands,
+                                         PendingReplyBatch* batch,
+                                         OnlineTraceHandle online_trace = {}) {
   if (encoded.size() > kMaximumBatchedReplyBytes) {
     absl::Status flushed = co_await FlushReplyBatch(stream, batch);
     if (!flushed.ok()) co_return flushed;
@@ -1344,7 +1302,7 @@ Task<absl::Status> WriteOrBatchReplySlow(
       if (!flushed.ok()) co_return flushed;
     }
     if (more_commands || !batch->empty()) {
-      batch->Append(encoded, std::move(read_trace), std::move(set_trace));
+      batch->Append(encoded);
       batch->AddOnlineTrace(std::move(online_trace));
       if (!more_commands || batch->bytes_.size() >= kMaximumBatchedReplyBytes) {
         co_return co_await FlushReplyBatch(stream, batch);
@@ -1353,38 +1311,20 @@ Task<absl::Status> WriteOrBatchReplySlow(
     }
   }
 
-#if LAVIK_ENABLE_TRACE
-  if (read_trace.request_start_ns_ != 0) {
-    read_trace.send_start_ns_ = ReadTraceNowNanos();
-  }
-  if (set_trace.request_start_ns_ != 0) {
-    set_trace.send_start_ns_ = SetTraceNowNanos();
-  }
-#endif
   if (online_trace) online_trace.get()->send_ns_ = LatencyMonotonicNanos();
   absl::Status status = co_await ResponseWriteAwaiter(
       stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(encoded.data()), encoded.size())),
       true, online_trace.get());
   online_trace.Complete(status.ok());
-#if LAVIK_ENABLE_TRACE
-  if (read_trace.request_start_ns_ != 0) {
-    read_trace.send_complete_ns_ = ReadTraceNowNanos();
-    trace::RecordReadLatency(read_trace);
-  }
-  if (set_trace.request_start_ns_ != 0) {
-    set_trace.send_complete_ns_ = SetTraceNowNanos();
-    trace::RecordSetLatency(set_trace);
-  }
-#endif
   co_return status;
 }
 
-ResponseWriteAwaiter WriteOrBatchReply(
-    TcpStream& stream, std::string_view encoded, bool more_commands,
-    PendingReplyBatch* batch, LegacyReadLatencyTrace read_trace = {},
-    LegacySetLatencyTrace set_trace = {}, OnlineTraceHandle online_trace = {}) {
-#if !LAVIK_ENABLE_TRACE
+ResponseWriteAwaiter WriteOrBatchReply(TcpStream& stream,
+                                       std::string_view encoded,
+                                       bool more_commands,
+                                       PendingReplyBatch* batch,
+                                       OnlineTraceHandle online_trace = {}) {
   // With no pending reply and no following command, batching has no work to
   // do. Return the socket task directly instead of allocating a forwarding
   // coroutine frame per command. The serving frame still owns encoded until
@@ -1393,10 +1333,8 @@ ResponseWriteAwaiter WriteOrBatchReply(
     return ResponseWriteAwaiter(stream.WriteAll(std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(encoded.data()), encoded.size())));
   }
-#endif
   return ResponseWriteAwaiter(
       WriteOrBatchReplySlow(stream, encoded, more_commands, batch,
-                            std::move(read_trace), std::move(set_trace),
                             std::move(online_trace)),
       false);
 }
@@ -2015,7 +1953,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
       reply_trace.reset();
       absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies, {}, {},
+          stream, encoded, !ready.empty(), &pending_replies,
           std::move(buffered.trace_));
       if (!written.ok()) co_return written;
       continue;
@@ -2030,7 +1968,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         request.latency_trace_->dispatch_done_ns_ = LatencyMonotonicNanos();
       reply_trace.reset();
       absl::Status written = co_await WriteOrBatchReply(
-          stream, encoded, !ready.empty(), &pending_replies, {}, {},
+          stream, encoded, !ready.empty(), &pending_replies,
           std::move(buffered.trace_));
       if (!written.ok()) co_return written;
       continue;
@@ -2073,7 +2011,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (write_status.ok()) {
         write_status =
             co_await WriteOrBatchReply(stream, encoded, false, &pending_replies,
-                                       {}, {}, std::move(buffered.trace_));
+                                       std::move(buffered.trace_));
       }
       stream.Close().IgnoreError();
       co_return write_status;
@@ -2178,14 +2116,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         write_status = co_await FlushReplyBatch(stream, &pending_replies);
       }
       if (write_status.ok()) {
-#if LAVIK_ENABLE_TRACE
-        if (reply.read_trace_.request_start_ns_ != 0) {
-          reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
-        }
-        if (reply.set_trace_.request_start_ns_ != 0) {
-          reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
-        }
-#endif
         if (buffered.trace_)
           buffered.trace_.get()->send_ns_ = LatencyMonotonicNanos();
         write_status = co_await ResponseWriteAwaiter(
@@ -2197,14 +2127,6 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         write_status = co_await FlushReplyBatch(stream, &pending_replies);
       }
       if (write_status.ok()) {
-#if LAVIK_ENABLE_TRACE
-        if (reply.read_trace_.request_start_ns_ != 0) {
-          reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
-        }
-        if (reply.set_trace_.request_start_ns_ != 0) {
-          reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
-        }
-#endif
         if (buffered.trace_)
           buffered.trace_.get()->send_ns_ = LatencyMonotonicNanos();
         write_status = co_await WriteReplyContinuation(
@@ -2214,20 +2136,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     } else {
       write_status = co_await WriteOrBatchReply(
           stream, reply.encoded_, !ready.empty(), &pending_replies,
-          std::exchange(reply.read_trace_, {}),
-          std::exchange(reply.set_trace_, {}), std::move(buffered.trace_));
+          std::move(buffered.trace_));
     }
     buffered.trace_.Complete(write_status.ok());
-#if LAVIK_ENABLE_TRACE
-    if (reply.read_trace_.request_start_ns_ != 0) {
-      reply.read_trace_.send_complete_ns_ = ReadTraceNowNanos();
-      trace::RecordReadLatency(reply.read_trace_);
-    }
-    if (reply.set_trace_.request_start_ns_ != 0) {
-      reply.set_trace_.send_complete_ns_ = SetTraceNowNanos();
-      trace::RecordSetLatency(reply.set_trace_);
-    }
-#endif
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
     }

@@ -15,26 +15,21 @@
  */
 
 #pragma once
-#include <chrono>
 #include <cstdint>
 
 #include "lavik/latency_clock.h"
 #include "lavik/latency_stage.h"
-#ifndef LAVIK_ENABLE_TRACE
-#define LAVIK_ENABLE_TRACE 0
-#endif
 namespace lavik {
-// Full payload exists only in a selected online sidecar or a trace build.
+// Physical operation state is allocated only for selected diagnostics.
 struct ReadLatencyTrace : LatencySegmentClock {
   OnlineLatencyTrace* diagnostics_ = nullptr;
   // Selected pages share only the root's worker-local clock, never mutable
-  // physical payloads. Legacy-only sidecars keep their independent clock.
+  // physical payloads. Standalone storage observers use their own anchor.
   std::uint64_t NowNanos() noexcept {
     return diagnostics_ ? TraceNowNanos(diagnostics_)
                         : LatencySegmentClock::NowNanos();
   }
 
-  // Keep legacy aggregates and selected request intervals in the same units.
   void RecordBuffer(std::uint64_t start, std::uint64_t end) noexcept {
     buffer_timing_.Add(start, end);
     if (diagnostics_)
@@ -49,7 +44,6 @@ struct ReadLatencyTrace : LatencySegmentClock {
 
   LatencyIntervals buffer_timing_;
   LatencyIntervals io_timing_;
-  std::uint64_t request_start_ns_ = 0;
   std::uint64_t owner_start_ns_ = 0;
   std::uint64_t lookup_done_ns_ = 0;
   std::uint64_t buffer_acquire_start_ns_ = 0;
@@ -58,25 +52,9 @@ struct ReadLatencyTrace : LatencySegmentClock {
   std::uint64_t io_complete_ns_ = 0;
   std::uint64_t decode_done_ns_ = 0;
   std::uint64_t owner_done_ns_ = 0;
-  std::uint64_t origin_resume_ns_ = 0;
-  std::uint64_t send_start_ns_ = 0;
-  std::uint64_t send_complete_ns_ = 0;
   bool remote_ = false;
-  bool hit_ = false;
   bool disk_read_ = false;
-  bool heap_read_buffer_ = false;
   std::uint64_t key_lock_start_ns_ = 0;
   std::uint64_t key_lock_acquired_ns_ = 0;
 };
-#if LAVIK_ENABLE_TRACE
-using LegacyReadLatencyTrace = ReadLatencyTrace;
-inline std::uint64_t ReadTraceNowNanos() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-#else
-struct LegacyReadLatencyTrace {};
-inline constexpr std::uint64_t ReadTraceNowNanos() noexcept { return 0; }
-#endif
 }  // namespace lavik

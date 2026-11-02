@@ -343,7 +343,6 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   // Admission is only an optimization. If the local arena cannot fit the
   // record immediately, let the owner reader stream it or wait for a chunk.
   if (result.trace_) {
-    result.trace_->hit_ = true;
     result.trace_->buffer_acquire_start_ns_ = result.trace_->NowNanos();
   }
   auto acquired = local.buffers_.TryAcquireReadBuffer(result.read_bytes_);
@@ -359,7 +358,6 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
     result.trace_->buffer_acquired_ns_ = result.trace_->NowNanos();
     result.trace_->RecordBuffer(result.trace_->buffer_acquire_start_ns_,
                                 result.trace_->buffer_acquired_ns_);
-    result.trace_->heap_read_buffer_ = result.lease_.buffer_id() == 0;
   }
   auto buffer = result.lease_.io_buffer();
   assert(result.read_bytes_ <= buffer.size_);
@@ -551,7 +549,6 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       co_return WrongTypeError();
     }
     if (trace != nullptr) {
-      trace->hit_ = true;
       trace->lookup_done_ns_ = trace->NowNanos();
     }
 
@@ -1687,7 +1684,6 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     trace->buffer_acquired_ns_ = trace->NowNanos();
     trace->RecordBuffer(trace->buffer_acquire_start_ns_,
                         trace->buffer_acquired_ns_);
-    trace->heap_read_buffer_ = output.buffer_id() == 0;
     trace->disk_read_ = true;
   }
   if (trace != nullptr) {
@@ -1857,7 +1853,6 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
     trace_->buffer_acquired_ns_ = trace_->NowNanos();
     trace_->RecordBuffer(trace_->buffer_acquire_start_ns_,
                          trace_->buffer_acquired_ns_);
-    trace_->heap_read_buffer_ = lease_.buffer_id() == 0;
   }
   // Resolve staging memory only after acquiring the buffer: waiting can let
   // flush/defrag retire it. The staged copy itself never suspends, so only

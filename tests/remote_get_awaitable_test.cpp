@@ -98,12 +98,8 @@ class RemoteGetTestPeer : public testing::Test {
 
   RegisteredBufferPool& Pool() { return storage_.impl_->stores_[0]->buffers_; }
   auto Read() {
-    return storage_.TryRemoteRead(0, key_, 1, ValueType::kString, false
-#if LAVIK_ENABLE_TRACE
-                                  ,
-                                  &trace_
-#endif
-    );
+    return storage_.TryRemoteRead(0, key_, 1, ValueType::kString, false,
+                                  &trace_);
   }
 
   void Publish(ValueType type, bool grouped = false, bool staged = false,
@@ -245,28 +241,19 @@ class RemoteGetTestPeer : public testing::Test {
   std::string key_;
   std::string value_ = "remote value";
   RecordHeader header_;
-#if LAVIK_ENABLE_TRACE
   ReadLatencyTrace trace_;
-#endif
 };
 
 TEST_F(RemoteGetTestPeer, SynchronousMissAndClosedIndexFallback) {
   {
-    auto read = storage_.TryRemoteRead(0, "absent", 1, ValueType::kString, false
-#if LAVIK_ENABLE_TRACE
-                                       ,
-                                       &trace_
-#endif
-    );
+    auto read = storage_.TryRemoteRead(0, "absent", 1, ValueType::kString,
+                                       false, &trace_);
     ASSERT_TRUE(read.await_ready());
     auto result = read.await_resume();
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(absl::IsNotFound(result->status()));
-#if LAVIK_ENABLE_TRACE
     EXPECT_NE(trace_.lookup_done_ns_, 0);
-    EXPECT_FALSE(trace_.hit_);
     EXPECT_FALSE(trace_.disk_read_);
-#endif
   }
   auto writer = index_.CloseAllReaders();
   auto read = Read();
@@ -350,18 +337,13 @@ TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {
     auto read = Read();
     ASSERT_FALSE(read.await_ready());
     ASSERT_NO_FATAL_FAILURE(Complete(read));
-#if LAVIK_ENABLE_TRACE
     EXPECT_NE(trace_.lookup_done_ns_, 0);
-    EXPECT_TRUE(trace_.hit_);
     EXPECT_NE(trace_.buffer_acquired_ns_, 0);
     const auto completed = trace_.io_complete_ns_;
     EXPECT_NE(completed, 0);
-#endif
     result = read.await_resume();
-#if LAVIK_ENABLE_TRACE
     EXPECT_EQ(trace_.io_complete_ns_, completed);
     EXPECT_GE(trace_.decode_done_ns_, completed);
-#endif
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->status();
     EXPECT_EQ(result->value().view().encoded_, value_);

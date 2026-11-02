@@ -258,7 +258,6 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
   if (trace != nullptr) trace->append_done_ns_ = trace->NowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
-  if (trace != nullptr) trace->replication_done_ns_ = trace->NowNanos();
   co_return result;
 }
 
@@ -3111,9 +3110,7 @@ acquire_active_stream:
         store.standby_block_.has_value()) {
       allocated = *store.standby_block_;
       store.standby_block_.reset();
-      if (trace != nullptr) trace->standby_block_ = true;
     } else {
-      if (trace != nullptr) trace->allocated_block_ = true;
       allocated = co_await AcquireWriteBlock(
           store, request.for_defrag_, request.unlock_writer_while_waiting_);
     }
@@ -3687,7 +3684,6 @@ acquire_active_stream:
                            "record checksum encoding failed");
   }
   value_process.End();
-  if (trace != nullptr) trace->encode_done_ns_ = trace->NowNanos();
 
   // No suspension separates append validation from publication. The buffer
   // remains attached until its full dirty tail and outstanding readers drain.
@@ -4054,7 +4050,6 @@ acquire_active_stream:
   if (request.written_location_ != nullptr) {
     *request.written_location_ = location;
   }
-  if (trace != nullptr) trace->index_done_ns_ = trace->NowNanos();
   grouped_root_guard.completed_ = true;
   co_return absl::OkStatus();
 }

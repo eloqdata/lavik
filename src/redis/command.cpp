@@ -4452,22 +4452,6 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
       .chunks_ = [state] { return state->Next(); }};
 }
 
-#if LAVIK_ENABLE_TRACE
-template <typename Trace>
-void CopyOnlineStorageTrace(Trace* legacy, const Trace& online) {
-  if (!legacy) return;
-  const auto request_start = legacy->request_start_ns_;
-  const auto owner_start = legacy->owner_start_ns_;
-  const auto remote = legacy->remote_;
-  *legacy = online;
-  legacy->diagnostics_ =
-      nullptr;  // A legacy reply cannot retain a borrowed root.
-  legacy->request_start_ns_ = request_start;
-  legacy->owner_start_ns_ = owner_start;
-  legacy->remote_ = remote;
-}
-#endif
-
 // Keep the ordinary owner hop as a direct Bycorf awaiter. Only a selected
 // cross-worker request creates the timing coroutine inside Callback::Run;
 // callback entry/exit use independently anchored monotonic worker clocks.
@@ -4522,8 +4506,7 @@ auto SubmitCommandTo(unsigned owner, OnlineLatencyTrace* trace, Fn fn) {
 
 Task<CommandReply> ExecuteStorageCommand(
     const CommandRequest& request, ReplyBuilder& reply_builder,
-    ReadLatencyTrace* read_trace = nullptr,
-    SetLatencyTrace* set_trace = nullptr, bool recheck_after_dispatch = false,
+    bool recheck_after_dispatch = false,
     const storage::CompactReadResult* compact = nullptr) {
   // ExecuteCommandBody revalidates the population fence after acquiring the
   // DB gate. Local reads reach this entry without another wait; only a
@@ -4539,22 +4522,12 @@ Task<CommandReply> ExecuteStorageCommand(
   }
   struct FinishOnlineOwner {
     OnlineLatencyTrace* trace;
-#if LAVIK_ENABLE_TRACE
-    ReadLatencyTrace* legacy_read;
-    SetLatencyTrace* legacy_set;
-#endif
     ~FinishOnlineOwner() {
       if (!trace) return;
       if (trace->is_set_)
         trace->set_.owner_done_ns_ = LatencyMonotonicNanos();
       else
         trace->read_.owner_done_ns_ = LatencyMonotonicNanos();
-#if LAVIK_ENABLE_TRACE
-      if (trace->is_set_)
-        CopyOnlineStorageTrace(legacy_set, trace->set_);
-      else
-        CopyOnlineStorageTrace(legacy_read, trace->read_);
-#endif
     }
   } finish_online{
       request.latency_trace_ &&
@@ -4563,12 +4536,9 @@ Task<CommandReply> ExecuteStorageCommand(
                (request.kind_ == CommandKind::kSet &&
                 request.latency_trace_->family_ == TraceCommandFamily::kSet))
           ? request.latency_trace_
-          : nullptr
-#if LAVIK_ENABLE_TRACE
-      ,
-      read_trace, set_trace
-#endif
-  };
+          : nullptr};
+  ReadLatencyTrace* read_trace = nullptr;
+  SetLatencyTrace* set_trace = nullptr;
   if (auto* online = finish_online.trace) {
     if (online->is_set_) {
       set_trace = &online->set_;
@@ -4730,9 +4700,6 @@ Task<CommandReply> ExecuteStorageCommand(
         for (std::string_view arg : copied_args) {
           replication->args_.emplace_back(arg);
         }
-      }
-      if (set_trace != nullptr) {
-        set_trace->replication_ = replication.has_value();
       }
       const storage::MutationPrecondition mutation_precondition =
           ClusterMutationPrecondition(request);
@@ -13898,20 +13865,9 @@ Task<CommandReply> ExecuteCommandBody(
         const std::uint16_t slot = routed ? request.RoutedPartitionId()
                                           : storage::RedisSlot(args[key_arg]);
         const unsigned target = slot % g_storage->worker_count();
-#if LAVIK_ENABLE_TRACE
-        ReadLatencyTrace trace;
-        if (request.kind_ == CommandKind::kGet) {
-          trace.request_start_ns_ = ReadTraceNowNanos();
-          // Remote describes key ownership, even when this worker issues I/O.
-          trace.remote_ = target != ThisWorker().id_;
-        }
-#endif
         if (target != ThisWorker().id_ && request.spec_ != nullptr &&
             request.spec_->remote_read_type_ != storage::ValueType::kNone) {
           // Reuse the route hash for admission on the connection worker.
-#if LAVIK_ENABLE_TRACE
-          trace.owner_start_ns_ = trace.request_start_ns_;
-#endif
           std::unique_ptr<ReadLatencyTrace> private_read;
           ReadLatencyTrace* detail = nullptr;
           if (request.latency_trace_) {
@@ -13925,9 +13881,6 @@ Task<CommandReply> ExecuteCommandBody(
             }
             detail->owner_start_ns_ = LatencyMonotonicNanos();
           }
-#if LAVIK_ENABLE_TRACE
-          if (!detail) detail = &trace;
-#endif
           auto fast = co_await g_storage->TryRemoteRead(
               request.db_id_, args[key_arg], slot,
               request.spec_->remote_read_type_,
@@ -13935,9 +13888,6 @@ Task<CommandReply> ExecuteCommandBody(
           if (fast) {
             if (request.latency_trace_) {
               detail->owner_done_ns_ = LatencyMonotonicNanos();
-#if LAVIK_ENABLE_TRACE
-              CopyOnlineStorageTrace(&trace, *detail);
-#endif
             }
             CommandReply reply;
             if (const char* error = CommandServingGenerationError(request);
@@ -13962,83 +13912,18 @@ Task<CommandReply> ExecuteCommandBody(
                 compact = (**fast).view();
               else if (!absl::IsNotFound(fast->status()))
                 compact = fast->status();
-              reply = co_await ExecuteStorageCommand(
-                  request, reply_builder, nullptr, nullptr, false, &compact);
+              reply = co_await ExecuteStorageCommand(request, reply_builder,
+                                                     false, &compact);
             }
-#if LAVIK_ENABLE_TRACE
-            trace.owner_done_ns_ = ReadTraceNowNanos();
-            trace.origin_resume_ns_ = trace.owner_done_ns_;
-            reply.read_trace_ = trace;
-#endif
             co_return reply;
           }
-#if LAVIK_ENABLE_TRACE
-          // Keep attempted fast-read time in total/route-out latency, but let
-          // the owner result determine hit/disk flags and its stage timings.
-          const auto started = trace.request_start_ns_;
-          trace = {};
-          trace.request_start_ns_ = started;
-          trace.remote_ = true;
-#endif
         }
-#if LAVIK_ENABLE_TRACE
-        if (request.kind_ == CommandKind::kGet) {
-          CommandReply reply;
-          if (trace.remote_) {
-            reply = co_await SubmitCommandTo(
-                target, request.latency_trace_,
-                [&request, &reply_builder, &trace]() -> Task<CommandReply> {
-                  trace.owner_start_ns_ = ReadTraceNowNanos();
-                  CommandReply result = co_await ExecuteStorageCommand(
-                      request, reply_builder, &trace, nullptr, true);
-                  trace.owner_done_ns_ = ReadTraceNowNanos();
-                  co_return result;
-                });
-          } else {
-            trace.owner_start_ns_ = trace.request_start_ns_;
-            reply =
-                co_await ExecuteStorageCommand(request, reply_builder, &trace);
-            trace.owner_done_ns_ = ReadTraceNowNanos();
-          }
-          trace.origin_resume_ns_ = ReadTraceNowNanos();
-          reply.read_trace_ = trace;
-          co_return reply;
-        }
-        if (request.kind_ == CommandKind::kSet) {
-          // A source SET is already on the key owner by the time it gets
-          // here, so remote_ reads false. Read route-out as unmeasured, not
-          // as "no hop".
-          SetLatencyTrace trace;
-          trace.request_start_ns_ = SetTraceNowNanos();
-          trace.remote_ = target != ThisWorker().id_;
-          CommandReply reply;
-          if (trace.remote_) {
-            reply = co_await SubmitCommandTo(
-                target, request.latency_trace_,
-                [&request, &reply_builder, &trace]() -> Task<CommandReply> {
-                  trace.owner_start_ns_ = SetTraceNowNanos();
-                  CommandReply result = co_await ExecuteStorageCommand(
-                      request, reply_builder, nullptr, &trace, true);
-                  trace.owner_done_ns_ = SetTraceNowNanos();
-                  co_return result;
-                });
-          } else {
-            trace.owner_start_ns_ = trace.request_start_ns_;
-            reply = co_await ExecuteStorageCommand(request, reply_builder,
-                                                   nullptr, &trace);
-            trace.owner_done_ns_ = SetTraceNowNanos();
-          }
-          trace.origin_resume_ns_ = SetTraceNowNanos();
-          reply.set_trace_ = trace;
-          co_return reply;
-        }
-#endif
         if (target != ThisWorker().id_) {
           co_return co_await SubmitCommandTo(
               target, request.latency_trace_,
               [&request, &reply_builder]() -> Task<CommandReply> {
-                co_return co_await ExecuteStorageCommand(
-                    request, reply_builder, nullptr, nullptr, true);
+                co_return co_await ExecuteStorageCommand(request, reply_builder,
+                                                         true);
               });
         }
       }
