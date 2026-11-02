@@ -181,7 +181,9 @@ def injected(binary, path, checkpoint, failure=None):
         disk.truncate(256 * 1024 * 1024)
     base = path / "commit"
     pause = Path(str(base) + ".pause")
-    fault = Path(str(base) + (".full" if failure is None else "." + failure))
+    fault = Path(
+        str(base) + (".full" if failure in (None, "shutdown") else "." + failure)
+    )
     pause.touch()
     fault.touch()
     environment = {
@@ -195,6 +197,16 @@ def injected(binary, path, checkpoint, failure=None):
         for i in range(1, 4):
             assert command(client, "MSET", f"a{i}", "a", f"b{i}", "b") == b"OK"
         assert stats(client)[b"storage_tx_commits_pending"] == b"3"
+        if failure == "shutdown":
+            # Admission closes before the drain's first attempt. A succeeds,
+            # B first encounters exhaustion during shutdown, and C is dropped.
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=4) != 0
+            log = (path / "server.log").read_text()
+            assert log.count("tx commit test attempt txid=2") == 1
+            assert "tx commit test attempt txid=3" not in log
+            assert "all storage buffers durably flushed" not in log
+            return
         pause.unlink()
         if failure is not None:
             wait_for(
@@ -576,7 +588,7 @@ def main():
             args.case in ("all", "injected")
             and os.environ.get("LAVIK_TEST_FAULTS_AVAILABLE", "1") == "1"
         ):
-            for failure in (None, "terminal", "flush-fail"):
+            for failure in (None, "terminal", "flush-fail", "shutdown"):
                 injected(
                     args.binary,
                     root / f"injected-{failure}-{checkpoint}",
