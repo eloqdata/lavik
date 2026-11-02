@@ -725,6 +725,11 @@ def storage_path_coverage(client):
     pairs = [arg for i in range(256) for arg in (str(i), b"v" * 128)]
     client.command("HSET", "coverage:hash", *pairs)
     client.command("SADD", "coverage:set", *[str(i) + "v" * 64 for i in range(512)])
+    client.command(
+        "ZADD",
+        "coverage:zset",
+        *[arg for i in range(128) for arg in (i, str(i) + "z" * 256)],
+    )
 
     def trace(*command):
         client.command("LATENCY", "TRACE", "RESET")
@@ -751,6 +756,24 @@ def storage_path_coverage(client):
         ("SRANDMEMBER", "coverage:set", 2),
     ]:
         assert {"read_buffer", "decode", "value_process"} <= trace(*command), command
+    # Counts beyond the streaming threshold use a separate snapshot path,
+    # including when queued inside EXEC. Observe only its awaited preparation.
+    for command in [
+        ("HRANDFIELD", "coverage:hash", -1001),
+        ("SRANDMEMBER", "coverage:set", -1001),
+        ("ZRANDMEMBER", "coverage:zset", -1001),
+    ]:
+        assert {"key_lock", "read_buffer", "decode"} <= trace(*command), command
+        client.command("LATENCY", "TRACE", "RESET")
+        client.command("MULTI")
+        client.command(*command)
+        assert len(client.command("EXEC")[0]) == 1001
+        records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
+        transaction = next(t for t in records if t["command"] == "EXEC")
+        assert {"read_buffer", "decode"} <= {
+            stage["name"] for stage in transaction["stages"]
+        }, transaction
+    assert {"key_lock", "store_lock", "lookup"} <= trace("DUMP", "coverage:hash")
     assert {"read_buffer", "decode", "append"} <= trace("SPOP", "coverage:set", 2)
     assert "append" in trace("SPOP", "coverage:set", 1000)
     for command in [
@@ -800,6 +823,25 @@ def storage_path_coverage(client):
         assert {"read_buffer", "decode", "append"} <= {
             stage["name"] for stage in transaction["stages"]
         }, transaction
+    # A native control handshake enables publisher admission on all owners.
+    # Keep it alive for the write transaction without starting a data flow.
+    publisher = Client(client.sock.getpeername()[1])
+    try:
+        identity = os.urandom(20).hex()
+        response = publisher.command(
+            "LVPSYNC", 1, "?" + identity + ":12345", "?", "?", identity, identity, "?"
+        )
+        assert response.startswith("LVFULLRESYNC "), response
+        client.command("MULTI")
+        client.command("SET", "coverage:publisher", "value")
+        client.command("EXEC")
+        records = [json.loads(v) for v in client.command("LATENCY", "TRACE", "GET", 32)]
+        transaction = next(t for t in records if t["command"] == "EXEC")
+        assert "admission_wait" in {s["name"] for s in transaction["stages"]}, (
+            transaction
+        )
+    finally:
+        publisher.close()
 
 
 def generic_commands_case(binary):
@@ -947,6 +989,16 @@ def generic_commands_case(binary):
                     b"field",
                     large_value,
                 ]
+                for command in ("ZUNION", "ZINTER"):
+                    assert (
+                        client.command(command, 1, "private-family-disk-zset")
+                        == zset_members
+                    )
+                    last = json.loads(client.command("LATENCY", "TRACE", "GET", 1)[0])
+                    assert last["command"] == command, last
+                    assert {"read_buffer", "read_io", "decode", "value_process"} <= {
+                        stage["name"] for stage in last["stages"]
+                    }, last
                 assert (
                     client.command(
                         "HSET", "private-family-disk", "field", b"g" * len(large_value)

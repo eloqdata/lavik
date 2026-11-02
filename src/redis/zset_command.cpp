@@ -2493,7 +2493,8 @@ void InitZSetCommandStorage(storage::StorageEngine* engine) {
 
 Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms) {
+    bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms,
+    OnlineLatencyTrace* diagnostics) {
   storage::HashResult result;
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
@@ -2528,7 +2529,7 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
   };
   absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db_id, key, digest, storage::ValueType::kSortedSet, true, callback, tx,
-      now_ms);
+      now_ms, nullptr, nullptr, {.diagnostics_ = diagnostics});
   if (!status.ok()) co_return status;
   co_return result;
 }

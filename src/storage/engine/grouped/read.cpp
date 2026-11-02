@@ -516,11 +516,13 @@ StorageEngine::Impl::LoadGroupedValue(
   // temporary reservation ends after materialization, before the network send.
   auto scratch = budget.Reserve(2);
   if (!scratch.ok()) co_return scratch.status();
+  auto* diagnostics = trace ? trace->diagnostics_ : nullptr;
   absl::StatusOr<std::string> encoded;
   if (snapshot != nullptr && snapshot->is_ordered()) {
-    auto value = co_await LoadGroupedOrderedValue(store, partition, db_id, key,
-                                                  digest, snapshot, pinned);
+    auto value = co_await LoadGroupedOrderedValue(
+        store, partition, db_id, key, digest, snapshot, pinned, diagnostics);
     if (!value.ok()) co_return value.status();
+    TraceSpanScope process(diagnostics, TraceStage::kValueProcess);
     const auto kind = snapshot->ordered_directory().root().kind_;
     encoded = EncodeOrderedCompactValue(
         kind, *value,
@@ -529,12 +531,14 @@ StorageEngine::Impl::LoadGroupedValue(
             ? 2
             : 1);
   } else {
-    auto value = co_await LoadGroupedHashValue(store, partition, db_id, key,
-                                               digest, snapshot, pinned);
+    auto value = co_await LoadGroupedHashValue(
+        store, partition, db_id, key, digest, snapshot, pinned, diagnostics);
     if (!value.ok()) co_return value.status();
+    TraceSpanScope process(diagnostics, TraceStage::kValueProcess);
     encoded = EncodeHashValue(*value);
   }
   if (!encoded.ok()) co_return encoded.status();
+  TraceSpanScope process(diagnostics, TraceStage::kValueProcess);
   auto buffer = store.buffers_.AllocateReadOutputBuffer(encoded->size());
   if (!buffer.ok()) co_return buffer.status();
   const auto output = buffer->io_buffer();

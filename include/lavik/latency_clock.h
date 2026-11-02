@@ -42,7 +42,7 @@ struct LatencyIntervals {
     ++count;
   }
   // Merge only on the owning worker. Parallel children may finish out of
-  // order; keep the earliest detail while summing all resource time.
+  // order; keep the earliest retained detail while summing all resource time.
   void Merge(const LatencyIntervals& other) noexcept {
     if (!other.count) return;
     first_ns = count ? std::min(first_ns, other.first_ns) : other.first_ns;

@@ -33,10 +33,12 @@ struct ZSetExecKey {
 };
 
 // Captures the command-time population used by bounded negative-count reply
-// streaming. The caller owns the shared key lock during this call.
+// streaming. The caller owns the shared key lock during this call. The
+// optional diagnostic observer is borrowed only until this task completes.
 Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms);
+    bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms,
+    OnlineLatencyTrace* diagnostics = nullptr);
 
 // Returns members in the sorted set's native score/member order. SORT uses
 // this for BY nosort while already holding the key's transaction lock.

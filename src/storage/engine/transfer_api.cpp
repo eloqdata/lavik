@@ -512,10 +512,14 @@ StorageEngine::Impl::ReadValueForTransferLocked(
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
   for (;;) {
+    TraceSpanScope store_lock(diagnostics, TraceStage::kStoreLock);
     co_await store.store_state_mutex_.Lock();
+    store_lock.End();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
     auto found = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                             digest, key);
+    lookup.End();
     if (!found.ok()) co_return found.status();
     if (*found == nullptr || (*found)->value_.kind() != RecordKind::kValue)
       co_return absl::NotFoundError("key not found");
@@ -624,10 +628,14 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       // the captured blocks. Key intent preserves the logical ranks, not those
       // physical coordinates. Refresh the matching graph before materializing
       // its pin list, with no suspension between lookup and capture.
+      TraceSpanScope refresh_lock(diagnostics, TraceStage::kStoreLock);
       co_await store.store_state_mutex_.Lock();
+      refresh_lock.End();
       unlock.Adopt();
+      TraceSpanScope refresh_lookup(diagnostics, TraceStage::kLookup);
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[db_id], digest, key, location);
+      refresh_lookup.End();
       if (!resolved.ok()) co_return resolved.status();
       if (!source->Valid(*this))
         co_return absl::CancelledError(

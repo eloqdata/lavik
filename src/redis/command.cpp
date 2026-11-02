@@ -2732,9 +2732,12 @@ Task<absl::Status> ReleaseReplicationPublisherAdmission(
 }
 
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
-AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
-                                     const CommandRequest* request = nullptr) {
-  TraceSpanScope admission_wait(request ? request->latency_trace_ : nullptr,
+AcquireReplicationPublisherAdmission(
+    std::size_t logical_bytes, const CommandRequest* request = nullptr,
+    OnlineLatencyTrace* diagnostics = nullptr) {
+  TraceSpanScope admission_wait(diagnostics ? diagnostics
+                                : request   ? request->latency_trace_
+                                            : nullptr,
                                 TraceStage::kAdmissionWait);
   ReplicationPublisherAdmission admission;
   if (request != nullptr) {
@@ -3859,12 +3862,18 @@ struct NegativeRandomStreamState : RandomStreamPayloadState {
 };
 
 Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
-    const std::shared_ptr<NegativeRandomStreamState>& state) {
-  auto begin = [state]() -> Task<absl::StatusOr<std::uint64_t>> {
+    const std::shared_ptr<NegativeRandomStreamState>& state,
+    OnlineLatencyTrace* diagnostics) {
+  // Borrow only while preparing the snapshot; retained reply chunks must not
+  // keep a pointer to the command's diagnostic lease.
+  auto begin = [state, diagnostics]() -> Task<absl::StatusOr<std::uint64_t>> {
+    TraceSpanScope key_lock(diagnostics, TraceStage::kKeyLock);
     tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
         state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared,
         lavik::storage::RedisSlot(state->key_));
+    key_lock.End();
     storage::HashOperation operation;
+    operation.diagnostics_ = diagnostics;
     operation.kind_ = storage::HashOperationKind::kReadSnapshot;
     operation.with_values_ = state->options_.with_values_;
     operation.now_ms_ = state->now_ms_;
@@ -3872,7 +3881,7 @@ Task<absl::StatusOr<std::uint64_t>> BeginNegativeRandomStream(
     if (state->options_.zset_) {
       snapshot = co_await ZSetRandomSnapshotLocked(
           state->db_, state->key_, state->digest_, state->options_.with_values_,
-          nullptr, state->now_ms_);
+          nullptr, state->now_ms_, diagnostics);
     } else if (state->options_.hash_) {
       snapshot = co_await g_storage->ExecuteHashLocked(
           state->db_, state->key_, state->digest_, operation, nullptr);
@@ -3931,7 +3940,8 @@ Task<CommandReply> ExecuteNegativeRandomStream(
         CommandErrorReason::kAuthority, error));
   }
   state->now_ms_ = RedisUnixTimeMillis();
-  auto length = co_await BeginNegativeRandomStream(state);
+  auto length =
+      co_await BeginNegativeRandomStream(state, request.latency_trace_);
   if (!length.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, length.status()));
   }
@@ -3989,6 +3999,7 @@ PrepareTransactionalNegativeRandomStreamLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, NegativeRandomStreamOptions options) {
   storage::HashOperation operation;
+  operation.diagnostics_ = request.latency_trace_;
   operation.kind_ = storage::HashOperationKind::kReadSnapshot;
   operation.with_values_ = options.with_values_;
   operation.now_ms_ = RedisUnixTimeMillis();
@@ -3997,7 +4008,7 @@ PrepareTransactionalNegativeRandomStreamLocked(
   if (options.zset_) {
     snapshot = co_await ZSetRandomSnapshotLocked(
         request.db_id_, request.args_[1], digest, options.with_values_, tx,
-        operation.now_ms_);
+        operation.now_ms_, request.latency_trace_);
   } else if (options.hash_) {
     snapshot = co_await g_storage->ExecuteHashLocked(
         request.db_id_, request.args_[1], digest, operation, tx);
@@ -4366,10 +4377,12 @@ Task<absl::StatusOr<PreparedDumpReply>> PrepareCollectionDump(
     OnlineLatencyTrace* diagnostics = nullptr) {
   const auto digest = locked ? *locked : storage::ComputeDigest(key);
   tx::TxShard::Guard guard;
-  if (!locked)
+  if (!locked) {
+    TraceSpanScope key_lock(diagnostics, TraceStage::kKeyLock);
     guard = co_await tx::CurrentTxShard().AcquireKey(
         db, tx::FingerprintOf(digest), tx::LockMode::kShared,
         lavik::storage::RedisSlot(key));
+  }
   auto value = co_await g_storage->ReadValueForTransferLocked(
       db, key, digest, std::nullopt, diagnostics);
   guard = {};
@@ -11561,8 +11574,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                                               std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
       if (admission != nullptr) {
-        auto renewed =
-            co_await AcquireReplicationPublisherAdmission(logical_bytes);
+        auto renewed = co_await AcquireReplicationPublisherAdmission(
+            logical_bytes, nullptr, diagnostics);
         if (!renewed.ok()) co_return renewed.status();
         *admission = std::move(*renewed);
       }
@@ -11622,7 +11635,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         "ERR replication publisher admission failed: canonical EXEC event "
         "exceeds repl-backlog-size"));
   }
-  auto admission = co_await AcquireReplicationPublisherAdmission(logical_bytes);
+  auto admission = co_await AcquireReplicationPublisherAdmission(
+      logical_bytes, nullptr, diagnostics);
   if (!admission.ok()) {
     ctx.ResetMulti();
     co_await DropWatches(ctx);

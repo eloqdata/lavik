@@ -4659,7 +4659,8 @@ class StorageEngine::Impl {
                           WorkerStore::PartitionStore& partition,
                           std::uint8_t db_id, std::string_view key,
                           const Digest& digest, GroupedObject::Handle object,
-                          bool pinned = false);
+                          bool pinned = false,
+                          OnlineLatencyTrace* diagnostics = nullptr);
   // Assemble checked String segments into the returned lease without
   // retaining decoded pages or a second whole-value image. Admitted readers
   // overlap up to 16 groups per physical owner and join before releasing

@@ -334,7 +334,8 @@ Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
 StorageEngine::Impl::LoadGroupedOrderedValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    GroupedObject::Handle object, bool pinned) {
+    GroupedObject::Handle object, bool pinned,
+    OnlineLatencyTrace* diagnostics) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
@@ -342,8 +343,10 @@ StorageEngine::Impl::LoadGroupedOrderedValue(
   std::uint64_t logical_size = 0;
   for (const auto& metadata : object->ordered_directory().groups()) {
     auto page = co_await LoadOrderedGroupSnapshot(
-        store, partition, db_id, key, digest, object, metadata.id_, pinned);
+        store, partition, db_id, key, digest, object, metadata.id_, pinned,
+        nullptr, SortedSetMemberValidation::kVerifyUnique, diagnostics);
     if (!page.ok()) co_return page.status();
+    TraceSpanScope process(diagnostics, TraceStage::kValueProcess);
     if (page->snapshot_.previous_ != metadata.previous_ ||
         page->snapshot_.next_ != metadata.next_ ||
         OrderedGroupSize(page->snapshot_) != metadata.item_count_) {
