@@ -431,9 +431,11 @@ measures block count, allocated device bytes, or retained metadata heap.
 
 INFO and Prometheus share `StorageEngine::CollectDiagnostics()`. The following
 names have the prefix `lavik_storage_`; they are process-level series without
-additional exporter labels. A ready process emits all 20 series, including
+additional exporter labels. A ready process emits all 22 series, including
 zero-valued statistics. Idle pending gauges return to zero; counters and queue
-peak retain their history. Before readiness, only `lavik_server_ready` is emitted.
+peak retain their history. Before startup readiness, only `lavik_server_ready`
+is emitted. After a latched runtime storage failure withdraws readiness,
+`durability_failed=1` remains exported without visiting failed workers.
 
 | Metric suffix | Type | INFO STATS field / interpretation |
 |---|---|---|
@@ -449,14 +451,23 @@ peak retain their history. Before readiness, only `lavik_server_ready` is emitte
 | `tx_commit_input_fences_total` | counter | `tx_commit_input_fences`: fences before merging |
 | `tx_commit_merged_fences_total` | counter | `tx_commit_merged_fences`: fences after merging |
 | `tx_commit_backpressure_waits_total` | counter | `tx_commit_backpressure_waits`: enqueues encountering their worker's watermark, not wait duration |
+| `tx_commit_retries_total` | counter | `tx_commit_retries`: additional commit attempts after foreground capacity exhaustion |
 | `tx_commit_queue_depth` | gauge | `tx_commit_queue_depth`: global queued receipts, excluding dequeued in-flight batches |
 | `tx_commit_queue_peak` | gauge | `tx_commit_queue_peak`: historical global maximum since engine startup |
 | `tx_commit_queue_high_watermark` | gauge | `tx_commit_queue_high_watermark`: per-worker receipt threshold |
 | `dirty_staging_bytes` | gauge, bytes | `storage_dirty_staging_bytes`: committed staging bytes not yet durable |
 | `flushes_pending` | gauge | `storage_flushes_pending`: active per-worker flush runners, not queued blocks or I/Os |
 | `tx_commits_pending` | gauge | `storage_tx_commits_pending`: unfinished commit chains, including dequeued in-flight work |
+| `durability_failed` | gauge, 0/1 | `storage_durability_failed`: terminal durability failure, latched until engine restart |
 | `durability_pending` | gauge, 0/1 | `storage_durability_pending`: dirty bytes, flush runners, or commits remain |
 | `expiration_pause_count` | gauge | `storage_expiration_pause_count`: current nested pause depth, not cumulative events |
+
+A quiescent `durability_pending=0` certifies successful completion only when
+`durability_failed=0` too. Retrying capacity exhaustion remains pending without
+setting failure; terminal failure remains visible after receipts are released.
+Shutdown stops retries, and abandoned commits make shutdown fail rather than
+publish a clean certificate. None of these metrics strengthens ordinary command
+replies into synchronous durability promises.
 
 Commit batch and fence counters advance before durability succeeds. Queue depth
 can fall while `tx_commits_pending` remains positive. Do not divide global depth

@@ -656,6 +656,36 @@ TEST_F(TxCleanerPipelineTestPeer, DiagnosticsCountBatchFencesBeforeFailure) {
   EXPECT_EQ(snapshot.tx_commit_batches_.input_fences_, 6);
   EXPECT_EQ(snapshot.tx_commit_batches_.merged_fences_, 1);
   EXPECT_EQ(snapshot.durability_.tx_commits_pending_, 0);
+  EXPECT_TRUE(snapshot.durability_.failed_);
+  // No pending work must not certify a failed transaction's population.
+  auto durable = storage_.MakeDurable(
+      DurabilityFrontier{.history_context_ = "test", .flow_cursors_ = {1}}, {});
+  StartTask(durable, 0);
+  ASSERT_TRUE(PumpUntil([&] { return durable.done(); }));
+  EXPECT_FALSE(std::move(durable).TakeResult().ok());
+  EXPECT_FALSE(storage_.FlushForShutdown().ok());
+}
+
+TEST_F(TxCleanerPipelineTestPeer, ShutdownFailureCannotCertifyZeroPending) {
+  storage_.BeginShutdown();
+  for (std::uint64_t txid = 1; txid <= 2; ++txid) {
+    std::vector<TxShardWrites> writes(1);
+    writes[0].txid_ = txid;
+    writes[0].fences_.push_back({.block_owner_ = kWorkers});
+    ASSERT_TRUE(EnqueueDiagnosticCommit(txid, std::move(writes)));
+  }
+  ASSERT_TRUE(PumpUntil(
+      [&] { return storage_.TxCommitBatchStats().queue_depth_ == 0; }));
+  const auto snapshot = Diagnostics();
+  EXPECT_FALSE(snapshot.durability_.pending());
+  EXPECT_TRUE(snapshot.durability_.failed_);
+  EXPECT_FALSE(storage_.RuntimeFailureLatched());
+  auto durable = storage_.MakeDurable(
+      DurabilityFrontier{.history_context_ = "test", .flow_cursors_ = {1}}, {});
+  StartTask(durable, 0);
+  ASSERT_TRUE(PumpUntil([&] { return durable.done(); }));
+  EXPECT_FALSE(std::move(durable).TakeResult().ok());
+  EXPECT_FALSE(storage_.FlushForShutdown().ok());
 }
 
 TEST_F(TxCleanerPipelineTestPeer, DiagnosticsObserveCleanerRunningAndFailure) {

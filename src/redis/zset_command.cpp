@@ -2469,19 +2469,6 @@ Task<absl::Status> MultiFinishShard(void* opaque, const tx::ShardSlice&) {
       context->writes_[bycorf::ThisWorker().id_], context->rollback_);
 }
 
-Task<absl::Status> CommitMulti(std::uint64_t txid,
-                               std::vector<storage::TxShardWrites> writes) {
-  struct Done {
-    ~Done() { g_storage->NoteTxCommitFinished(); }
-  } done;
-  std::vector<storage::TxShardWrites*> shards;
-  for (auto& shard : writes)
-    if (!shard.fences_.empty() || !shard.retirements_.empty())
-      shards.push_back(&shard);
-  if (shards.empty()) co_return absl::OkStatus();
-  co_return co_await g_storage->CommitTxWrites(txid, std::move(shards));
-}
-
 }  // namespace
 
 void InitZSetCommandStorage(storage::StorageEngine* engine) {
@@ -2764,14 +2751,17 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     replication.SetCommandArgs(std::move(context.replacement_args_));
     replication.SetFinalExpirations(context.writes_);
     replication.Commit();
-    g_storage->NoteTxCommitStarted();
-    bycorf::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
+    // FinishTxLocal settled all participants before the background handoff.
+    for (auto& shard : context.writes_) shard.collect_undo_ = false;
+    const bool capacity =
+        g_storage->EnqueueTxCommit(txid, std::move(context.writes_));
     if (!context.output_.empty()) {
       NotifyZSetBlockingKey(
           request,
           args[context.store_shape_ ? context.store_shape_->destination_arg_
                                     : 1]);
     }
+    if (!capacity) co_await g_storage->WaitForTxCommitCapacity();
     co_return Built(builder.AppendInteger(context.output_.size()));
   }
   if (request.kind_ == CommandKind::kZInterCard) {

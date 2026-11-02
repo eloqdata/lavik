@@ -5061,6 +5061,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(tx_commit_batches.queue_peak_) + "\r\n";
     info += "tx_commit_backpressure_waits:" +
             std::to_string(tx_commit_batches.backpressure_waits_) + "\r\n";
+    info += "tx_commit_retries:" + std::to_string(tx_commit_batches.retries_) +
+            "\r\n";
     info += "tx_commit_queue_high_watermark:" +
             std::to_string(tx_commit_batches.queue_high_watermark_) +
             "\r\n\r\n";
@@ -5072,6 +5074,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(durability.flushes_pending_) + "\r\n";
     info += "storage_tx_commits_pending:" +
             std::to_string(durability.tx_commits_pending_) + "\r\n";
+    info += std::string("storage_durability_failed:") +
+            (durability.failed_ ? "1\r\n" : "0\r\n");
     info += std::string("storage_durability_pending:") +
             (durability.pending() ? "1\r\n\r\n" : "0\r\n\r\n");
 #if LAVIK_ENABLE_CROSS_CORE_HOP_COUNT

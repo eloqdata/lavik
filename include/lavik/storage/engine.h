@@ -143,15 +143,19 @@ struct DefragTotals {
 };
 
 // Cold-path observability for tests and operators that need to know whether
-// every write acknowledged so far has crossed its crash-durability boundary.
+// quiescent acknowledged writes crossed their crash-durability boundary.
 // Dirty bytes include queued and in-flight block flushes. Pending transaction
 // commits cover the interval between acknowledging a tagged write and
-// appending its commit decision.
+// appending its commit decision (and awaiting deferred/grouped decisions).
+// Completion requires !pending() && !failed_; snapshots during writes are
+// observations rather than a per-command durability barrier.
 struct StorageDurabilityStats {
   std::uint64_t dirty_staging_bytes_ = 0;
   // Active per-worker flush runners, not queued blocks or individual I/Os.
   unsigned flushes_pending_ = 0;
   std::uint64_t tx_commits_pending_ = 0;
+  // Latched for this engine's lifetime; zero pending alone is not success.
+  bool failed_ = false;
 
   bool pending() const noexcept {
     return dirty_staging_bytes_ != 0 || flushes_pending_ != 0 ||
@@ -281,6 +285,8 @@ struct TxCommitBatchTotals {
   std::uint64_t queue_peak_ = 0;
   // Enqueues that encountered the local watermark, not time spent waiting.
   std::uint64_t backpressure_waits_ = 0;
+  // Additional commit attempts after a foreground capacity failure.
+  std::uint64_t retries_ = 0;
   // Per-worker threshold: not a denominator for the process-wide depth.
   std::uint64_t queue_high_watermark_ = 0;
 };
@@ -2040,6 +2046,9 @@ class StorageEngine {
   // Transfers one successful transaction's receipts to the current worker's
   // commit coordinator. At most one coordinator coroutine runs per worker;
   // it merges durability fences and appends commit decisions in batches.
+  // Foreground capacity failures before commit append retain their receipts
+  // for retry ahead of later commits. Terminal failures latch durability
+  // failure; shutdown stops retries without certifying abandoned writes.
   // Returns true when the caller may reply immediately. A false result means
   // the worker-local queue crossed its high watermark; the command should
   // await WaitForTxCommitCapacity() before replying. The idle fast path does
@@ -2066,10 +2075,10 @@ class StorageEngine {
       std::uint64_t txid, std::span<TxShardWrites> writes,
       MutationPrecondition mutation_precondition = MutationPrecondition{});
 
-  // Bracket a queued commit: graceful shutdown waits for every accepted
-  // transaction to leave the worker-local coordinator.
-  void NoteTxCommitStarted() noexcept;
-  void NoteTxCommitFinished() noexcept;
+  // Stop background commit retries and release reply-side capacity waits.
+  // Call when request admission closes, before waiting for accepted requests.
+  // Thread-safe, irreversible, and does not start the final storage flush.
+  void BeginShutdown() noexcept;
 
   TxCommitBatchTotals TxCommitBatchStats() const noexcept;
 

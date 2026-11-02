@@ -769,10 +769,14 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
           return MakeDurable(copied, accumulator);
         });
   }
+  if (DurabilityFailed())
+    co_return absl::FailedPreconditionError("storage durability has failed");
   while (active_tx_commits_.load(std::memory_order_acquire) != 0) {
     absl::Status slept = co_await bycorf::SleepFor(
         *bycorf::ThisWorker().self_, std::chrono::milliseconds(1));
     if (!slept.ok()) co_return slept;
+    if (DurabilityFailed())
+      co_return absl::FailedPreconditionError("storage durability has failed");
   }
   // Keep each suspension in its own statement. GCC 13 can reuse the wrong
   // coroutine-frame slot when both arms of ?: contain co_await.
@@ -788,7 +792,9 @@ Task<absl::Status> StorageEngine::Impl::MakeDurable(
     }
     if (!durable.ok()) co_return durable;
   }
-  co_return absl::OkStatus();
+  co_return DurabilityFailed()
+      ? absl::FailedPreconditionError("storage durability has failed")
+      : absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::CommitPromotionBase(
