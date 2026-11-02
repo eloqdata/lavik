@@ -182,6 +182,18 @@ class RespClient {
     return ReadRawReply();
   }
 
+  void SendRaw(std::string_view bytes) { SendAll(fd_, bytes); }
+
+  void Disconnect(bool reset) {
+    if (reset) {
+      // SO_LINGER with zero timeout sends RST instead of an orderly FIN.
+      linger option{1, 0};
+      ASSERT_EQ(
+          ::setsockopt(fd_, SOL_SOCKET, SO_LINGER, &option, sizeof(option)), 0);
+    }
+    EXPECT_EQ(::close(std::exchange(fd_, -1)), 0);
+  }
+
  private:
   void SendCommand(const std::vector<std::string_view>& args) {
     std::string request = "*" + std::to_string(args.size()) + "\r\n";
@@ -1082,6 +1094,69 @@ TEST_F(CommandResultsE2eTest, SubscribedCommandsKeepSessionOutcomes) {
   EXPECT_TRUE(Stats("get").starts_with("cmdstat_get:calls=0,"));
   EXPECT_EQ(Successful("ping"), 1);
   EXPECT_EQ(Errors("ERR"), 1);
+}
+
+TEST_F(CommandResultsE2eTest, DisconnectsDoNotCreateRedisErrors) {
+  for (bool subscribed : {false, true}) {
+    for (bool partial_bulk : {false, true}) {
+      for (bool reset : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << "subscribed=" << subscribed
+                     << " partial_bulk=" << partial_bulk << " reset=" << reset);
+        RespClient peer(port_);
+        // Receive the complete reply so disconnect cannot race a pending write.
+        if (subscribed) {
+          ASSERT_TRUE(peer.RawCommand({"SUBSCRIBE", "metrics:disconnect"})
+                          .starts_with("*3\r\n"));
+        } else {
+          ASSERT_EQ(peer.Command({"PING"}), "+PONG");
+        }
+        if (partial_bulk) {
+          peer.SendRaw("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$1048576\r\nx");
+          // Wait for the direct bulk-read reservation before disconnecting,
+          // covering ReadSomeBuffered as well as the idle ReadSome path.
+          ASSERT_TRUE(WaitUntil([&] {
+            return MetricValue(HttpGet(metrics_port_, "/metrics"),
+                               "lavik_client_buffered_request_bytes") >= 65536;
+          }));
+        }
+        peer.Disconnect(reset);
+        // Observe server-side teardown before inspecting counters, rather
+        // than letting a late receive completion escape the assertion.
+        ASSERT_TRUE(WaitUntil([&] {
+          return MetricValue(HttpGet(metrics_port_, "/metrics"),
+                             "lavik_connected_clients") == 1;
+        }));
+        EXPECT_EQ(Errors("ERR"), 0);
+        EXPECT_EQ(client_->Command({"INFO", "errorstats"}).find("errorstat_"),
+                  std::string::npos);
+        EXPECT_EQ(Calls("set"), 0);
+        const auto metrics = HttpGet(metrics_port_, "/metrics");
+        for (const auto reason :
+             {"protocol", "query_buffer", "client_memory"}) {
+          EXPECT_EQ(MetricValue(metrics,
+                                "lavik_request_input_errors_total{reason=\"" +
+                                    std::string(reason) + "\"}"),
+                    0);
+        }
+        EXPECT_EQ(MetricValue(metrics, "lavik_client_buffered_request_bytes"),
+                  0);
+      }
+    }
+  }
+}
+
+TEST_F(CommandResultsE2eTest, ProtocolErrorsReachGlobalErrorStats) {
+  RespClient peer(port_);
+  EXPECT_TRUE(peer.RawRequest("*not-a-number\r\n").starts_with("-ERR"));
+  EXPECT_EQ(Errors("ERR"), 1);
+  EXPECT_NE(client_->Command({"INFO", "errorstats"})
+                .find("errorstat_ERR:count=1\r\n"),
+            std::string::npos);
+  EXPECT_EQ(
+      MetricValue(HttpGet(metrics_port_, "/metrics"),
+                  "lavik_request_input_errors_total{reason=\"protocol\"}"),
+      1);
 }
 
 TEST_F(CommandResultsE2eTest, SubscribedProtocolErrorsReachGlobalErrorStats) {

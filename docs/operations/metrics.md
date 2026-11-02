@@ -365,6 +365,11 @@ Replication application, recovery and background work do not enter these client
 counters. Parent and child command counts are logical executions, not network
 request counts.
 
+Transport EOF and socket read failures (including connection resets) close the
+session without constructing a RESP error or incrementing errorstats or input-error
+counters. Protocol and request-buffer admission failures still construct and count
+a RESP error, even if the peer disconnects before that reply can be written.
+
 Nil results, unsuccessful conditional writes and normal blocking timeouts are
 successful executions. An unfinished blocked or streamed command abandoned on
 disconnect does not add a completed call. Lazy producer completion or failure
