@@ -1119,7 +1119,7 @@ TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
   EXPECT_EQ(client.Command({"GET", "restored"}).text_, value);
 }
 
-TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
+void CheckExpirationRestoresBoundedDeviceCapacity(bool prime_ordinary) {
   // Grouped writes need a transaction stream in addition to ordinary cleaner
   // output/tombstones. Bound the device to three foreground blocks, then fill
   // it rather than assuming a byte count implies physical exhaustion.
@@ -1130,7 +1130,17 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
   Client client(server.port());
   const std::string value(900 * 1024, 'e');
   ASSERT_EQ(client.Command({"DEFRAG", "RESUME"}).text_, "OK");
-  for (unsigned i = 0; i < 7; ++i) {
+  if (prime_ordinary) {
+    // Create the ordinary stream and its prefetched successor before filling
+    // the transaction stream. Cleaner/expiration timing can produce the same
+    // layout; this order exposes stranded prefetch capacity deterministically.
+    ASSERT_EQ(client.Command({"SET", "{expiry-387}ordinary", "v", "PX", "2000"})
+                  .text_,
+              "OK");
+    client.Durable();
+  }
+  const unsigned initial_values = prime_ordinary ? 0 : 7;
+  for (unsigned i = 0; i < initial_values; ++i) {
     ASSERT_EQ(client
                   .Command({"SET", "{expiry-387}" + std::to_string(i), value,
                             "PX", "2000"})
@@ -1159,6 +1169,9 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
                                "{expiry-387}fill:" + std::to_string(i)})
                      .text_ == "0";
     }
+    if (prime_ordinary)
+      expired &=
+          client.Command({"EXISTS", "{expiry-387}ordinary"}).text_ == "0";
     // Defrag can make room before the TTLs elapse. A successful replacement
     // alone does not establish that the old keys should be absent on recovery.
     if (!expired) {
@@ -1184,12 +1197,22 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
     Client reader(recovered.port());
     EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
     EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+    if (prime_ordinary)
+      EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}ordinary"}).text_, "0");
   } catch (const std::exception& error) {
     // A startup exception otherwise loses the recovery process's log when
     // this second Server is destroyed, hiding whether it exited or stalled.
     recovered.RecordDiagnostics("expiration recovery startup/read failed");
     FAIL() << error.what() << '\n' << recovered.Log();
   }
+}
+
+TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
+  ASSERT_NO_FATAL_FAILURE(CheckExpirationRestoresBoundedDeviceCapacity(false));
+}
+
+TEST(GroupedStringWriteE2e, ExpirationCanUseOrdinaryPrefetchCapacity) {
+  ASSERT_NO_FATAL_FAILURE(CheckExpirationRestoresBoundedDeviceCapacity(true));
 }
 
 class GroupedStringCrashE2e : public testing::TestWithParam<const char*> {};

@@ -1593,6 +1593,15 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
       (shutdown_flush_requested_.load(std::memory_order_acquire) ||
        store.worker_->stop_requested()))
     co_return absl::UnavailableError("storage is shutting down");
+  if (!allocated.ok() && !for_defrag && store.standby_block_ &&
+      allocated.status().GetPayload(kDiskSpaceExhaustionTypeUrl).has_value()) {
+    // The ordinary successor is still unwritten foreground capacity. Keeping
+    // it private to that stream can strand a full transaction tail after
+    // expiration, even though this worker already owns a usable block.
+    // Transfer it under store state; no new allocation or reserve is needed.
+    allocated = *store.standby_block_;
+    store.standby_block_.reset();
+  }
   co_return allocated;
 }
 
