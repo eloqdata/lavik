@@ -1758,7 +1758,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // common writer; all reply allocation finishes before any mutation.
     auto deleted = co_await ExecuteGroupedSortedSetLocked(
         store, partition, db_id, key, digest,
-        SortedSetOperation{.kind_ = SortedSetOperationKind::kRemove,
+        SortedSetOperation{.diagnostics_ = operation.diagnostics_,
+                           .kind_ = SortedSetOperationKind::kRemove,
                            .members_ = removed},
         object, tx, replication, mutation_precondition, prepared,
         ordered_probe);

@@ -860,6 +860,14 @@ def generic_commands_case(binary):
                     )
                     == "1"
                 )
+                assert client.command("ZPOPMAX", "private-family-disk-zset") == [
+                    b"new-zset-member",
+                    b"100",
+                ]
+                assert (
+                    client.command("ZREMRANGEBYRANK", "private-family-disk-zset", 0, 0)
+                    == "1"
+                )
                 assert (
                     client.command(
                         "SET", "private-family-disk-string", b"s" * len(large_value)
@@ -1062,6 +1070,16 @@ def generic_commands_case(binary):
                         and max(stage.get("observations", 1) for stage in appends) >= 2
                     ), (command, appends)
                     assert all(stage["kind"] == "summary" for stage in appends), appends
+                for command in ("ZPOPMAX", "ZREMRANGEBYRANK"):
+                    stages = {
+                        stage["name"]: stage for stage in traces[command]["stages"]
+                    }
+                    assert {"value_process", "append"} <= stages.keys(), traces[command]
+                    # Selection reads the score page; nested removal also reads
+                    # the member index. Both physical reads belong to this command.
+                    assert stages["read_buffer"].get("observations", 1) >= 2, traces[
+                        command
+                    ]
                 queued = [
                     json.loads(value)
                     for value in raw

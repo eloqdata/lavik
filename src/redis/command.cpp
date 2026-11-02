@@ -13917,6 +13917,9 @@ Task<CommandReply> ExecuteCommandBody(
             }
             co_return reply;
           }
+          // A discarded remote result still consumed lookup/buffer/I/O work.
+          // Keep those observations; owner entry replaces routing boundaries
+          // and adds its own intervals to the same selected command.
         }
         if (target != ThisWorker().id_) {
           co_return co_await SubmitCommandTo(

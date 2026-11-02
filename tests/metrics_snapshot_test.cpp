@@ -27,6 +27,7 @@
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 #include "lavik/command_table.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/metrics.h"
 #include "lavik/storage/engine.h"
 
@@ -40,6 +41,7 @@ struct Snapshots {
   WorkerMetricsSnapshot errors_;
   std::array<std::string, 2> exposition_;
   std::array<double, 2> execution_seconds_;
+  std::array<double, 2> diagnostic_seconds_;
 };
 
 bycorf::Task<absl::Status> CollectSnapshots(
@@ -114,6 +116,17 @@ bycorf::Task<absl::Status> CollectSnapshots(
     snapshots.execution_seconds_[i] =
         static_cast<double>(initial_ticks + (i == 0 ? 0 : delta_ticks)) /
         frequency;
+    const std::array<std::string, 2> args{"GET", "precision-key"};
+    auto trace = SelectOnlineTrace(args);
+    if (!trace) co_return absl::InternalError("diagnostic sample not selected");
+    trace.get()->family_ = TraceCommandFamily::kGet;
+    constexpr std::uint64_t initial_ns = 1'234'567'891'000'000;
+    constexpr std::uint64_t delta_ns = 1'000'000;
+    RecordTraceInterval(trace.get(), TraceStage::kLookup, 1,
+                        1 + (i == 0 ? initial_ns : delta_ns));
+    trace.Complete(true);
+    snapshots.diagnostic_seconds_[i] =
+        (initial_ns + (i == 0 ? 0 : delta_ns)) / 1e9;
     const auto rendered = co_await RenderPrometheusMetrics(
         storage, true, &snapshots.exposition_[i]);
     if (!rendered.ok()) co_return rendered;
@@ -124,6 +137,30 @@ bycorf::Task<absl::Status> CollectSnapshots(
 
 TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   InitWorkerMetrics(2);
+  InitLatencyDiagnostics(2);
+  absl::Cleanup stop_diagnostics = [] {
+    ConfigureLatencyDiagnostics("latency-diagnostics-enabled", "no")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-log-enabled", "yes")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-sample-every", "64")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-slow-threshold-us",
+                                "10000")
+        .IgnoreError();
+    StopLatencyDiagnostics();
+  };
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-log-enabled", "no")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-sample-every", "1")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-slow-threshold-us", "0")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-enabled", "yes").ok());
   bycorf::Runtime runtime;
   std::array<std::promise<absl::Status>, 2> initialized;
   std::promise<Snapshots> completed;
@@ -226,6 +263,21 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
     }
     EXPECT_GT(seconds[1], seconds[0]) << family;
   }
+  const std::string prefix =
+      "lavik_latency_diagnostics_stage_seconds_sum{"
+      "command_family=\"get\",stage=\"lookup\"} ";
+  std::array<double, 2> seconds{};
+  for (std::size_t i = 0; i < snapshots.exposition_.size(); ++i) {
+    const auto& text = snapshots.exposition_[i];
+    const auto position = text.find(prefix);
+    ASSERT_NE(position, std::string::npos);
+    const auto first = position + prefix.size();
+    ASSERT_TRUE(absl::SimpleAtod(
+        std::string_view(text).substr(first, text.find('\n', first) - first),
+        &seconds[i]));
+    EXPECT_DOUBLE_EQ(seconds[i], snapshots.diagnostic_seconds_[i]);
+  }
+  EXPECT_GT(seconds[1], seconds[0]);
 }
 
 }  // namespace

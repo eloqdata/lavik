@@ -1401,15 +1401,17 @@ TEST_F(CommandResultsE2eTest, SparseCollectionPreservesIdleAndResetSamples) {
   EXPECT_EQ(Errors("WRONGTYPE"), 0);
 }
 
-TEST_F(CommandResultsE2eTest, OutcomeMetricFamiliesAreContiguous) {
+TEST_F(CommandResultsE2eTest, OutcomeAndWaitMetricFamiliesAreContiguous) {
   auto check_groups = [&] {
-    constexpr std::array<std::string_view, 6> families{
+    constexpr std::array<std::string_view, 8> families{
         "lavik_command_executions_total",
         "lavik_command_failed_calls_total",
         "lavik_command_rejected_calls_total",
         "lavik_command_execution_seconds_total",
         "lavik_errors_total",
-        "lavik_request_input_errors_total"};
+        "lavik_request_input_errors_total",
+        "lavik_wait_events_total",
+        "lavik_waiters"};
     std::array<unsigned, families.size()> groups{};
     std::istringstream response(HttpGet(metrics_port_, "/metrics"));
     std::string line, previous;
@@ -1859,6 +1861,11 @@ TEST(MetricsE2eTest, OnlineLatencyTraceLifecycleAndThreshold) {
   ServerProcess server(g_lavik_binary, port, metrics_port, prefix + ".data",
                        prefix + ".log");
   RespClient client(port);
+  EXPECT_EQ(client.Command({"LATENCY", "TRACE", "GET"}), "*0");
+  ASSERT_EQ(client.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(client.Command({"LATENCY", "TRACE", "GET"}),
+            "-ERR latency is not allowed in transactions");
+  EXPECT_TRUE(client.RawCommand({"EXEC"}).starts_with("-EXECABORT"));
   EXPECT_EQ(client.Command({"LATENCY", "TRACE", "GET"}), "*0");
   EXPECT_EQ(
       client.Command({"CONFIG", "SET", "latency-diagnostics-sample-every", "0"})

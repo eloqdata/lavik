@@ -524,7 +524,7 @@ constexpr CommandSpec kCommandTable[] = {
     {"monitor", CommandKind::kMonitor, 1, 1, 0, 0, 1,
      kCmdNoKeys | kCmdAdmin | kCmdSkipMonitor},
     {"latency", CommandKind::kLatency, 2, 5, 0, 0, 1,
-     kCmdNoKeys | kCmdReadOnly},
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"slowlog", CommandKind::kSlowLog, 2, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
     {"tombraider", CommandKind::kTombRaider, 2, 3, 0, 0, 1,

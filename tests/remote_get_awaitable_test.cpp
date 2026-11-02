@@ -194,6 +194,9 @@ class RemoteGetTestPeer : public testing::Test {
         EncodeRecordHeader(header_, key_, record.first(header_.header_bytes_)));
     std::memcpy(record.data() + header_.header_bytes_, value_.data(),
                 value_.size());
+    // This fixture skips SQ submission; seed its timestamp before exercising
+    // the production completion and population-validation paths.
+    if (read.trace_) read.trace_->io_submit_ns_ = read.trace_->NowNanos();
     // No awaiting handle was registered: Complete stores the result, and the
     // worker ignores the empty continuation. await_resume is otherwise real.
     read.io_->Complete(worker_, bytes == -1 ? read.read_bytes_ : bytes, 0);
@@ -435,11 +438,15 @@ TEST_F(RemoteGetTestPeer, PopulationChangesDiscardCompletedRead) {
   // fresh snapshot; production serving fences remain irreversible.
   for (unsigned which = 0; which < 6; ++which) {
     {
+      const auto completed_reads = trace_.io_timing_.count;
       auto read = Read();
       ASSERT_FALSE(read.await_ready()) << which;
       ASSERT_NO_FATAL_FAILURE(Complete(read));
       Invalidate(which);
       EXPECT_FALSE(read.await_resume().has_value()) << which;
+      // A discarded result still consumed one physical I/O. An owner retry
+      // must retain that cost rather than erase it from command diagnostics.
+      EXPECT_EQ(trace_.io_timing_.count, completed_reads + 1);
     }
     EXPECT_EQ(block_.pin_count(), 0);
     EXPECT_EQ(Pool().available_read_buffers(), 1);

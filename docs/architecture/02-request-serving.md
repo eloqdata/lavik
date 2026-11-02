@@ -491,23 +491,18 @@ quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
 Online command diagnosis is independent of SLOWLOG and command statistics.
-Ready batches own bounded worker-local trace leases through reply send completion;
-awaited owner execution borrows their pointers. Parallel shards and pages keep
-physical timing sidecars private and append observations only to their own
-worker's segment. Completion joins foreground children and freezes immutable
-stage data before publishing history or log records; transaction receipt
-handoff removes borrowed roots before background commit. Runtime selection has
-a deadline, sampling probability and server-total threshold. Owner-local snapshots expose
-conditional stage histograms and bounded recent JSON records through `LATENCY
-TRACE`; cancellation retires the lease. Fixed SPSC queues copy completed records
-to a logging thread that owns a separate rotating JSONL file sink, so diagnostic
-log backpressure drops output without blocking request workers or sharing their
-ordinary logging sink. Runtime output control leaves histograms and recent
-history active. Requests and replies do not embed diagnostic payloads. The shared
-RESP protocol library accepts a borrowed reply-timing observer without depending
-on the diagnostic runtime. The request lease owns that observer through awaited
-serialization and socket writes; session and detached-job handoffs retire or
-remove the borrow before the lease can end.
+Requests own bounded trace leases through reply send completion; cancellation
+retires the lease and detached work cannot outlive it with a diagnostic borrow.
+Parallel workers own their mutable timing state. Completion joins foreground
+work and freezes immutable snapshots before history or log publication.
+Runtime selection has a deadline, sampling probability and
+server-total threshold. Prometheus exposes conditional stage histograms, and
+`LATENCY TRACE` exposes bounded recent records. A separate logging thread owns
+the rotating diagnostic JSONL sink; output is lossy and never blocks request
+workers. Disabling log output leaves histograms and recent history active.
+The shared RESP library accepts reply-timing observers without depending on the
+diagnostic runtime. See the [diagnostics runbook](../operations/metrics.md#online-latency-diagnostics)
+for collection, retention and stage semantics.
 
 Redis commandstats and execution time are owned by the coordinating worker and
 snapshotted through `SubmitTo`. Static command/subcommand identities bound the

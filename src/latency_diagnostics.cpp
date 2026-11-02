@@ -747,13 +747,16 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
         "Remaining collection window.");
   absl::StrAppend(&out,
                   "# HELP lavik_wait_events_total Actual coroutine suspensions "
-                  "by resource.\n# TYPE lavik_wait_events_total counter\n# "
-                  "HELP lavik_waiters Suspended resource waiters, including "
-                  "maintenance.\n# TYPE lavik_waiters gauge\n");
+                  "by resource.\n# TYPE lavik_wait_events_total counter\n");
   for (unsigned i = 0; i < kResources.size(); ++i)
     absl::StrAppend(&out, "lavik_wait_events_total{resource=\"", kResources[i],
-                    "\"} ", total.events[i], "\n", "lavik_waiters{resource=\"",
-                    kResources[i], "\"} ", total.waiters[i], "\n");
+                    "\"} ", total.events[i], "\n");
+  absl::StrAppend(&out,
+                  "# HELP lavik_waiters Suspended resource waiters, including "
+                  "maintenance.\n# TYPE lavik_waiters gauge\n");
+  for (unsigned i = 0; i < kResources.size(); ++i)
+    absl::StrAppend(&out, "lavik_waiters{resource=\"", kResources[i], "\"} ",
+                    total.waiters[i], "\n");
   absl::StrAppend(
       &out,
       "# HELP lavik_latency_diagnostics_samples_total Diagnostic selection and "
@@ -795,8 +798,14 @@ bycorf::Task<std::string> RenderLatencyDiagnosticsMetrics() {
         absl::StrAppend(&out, "lavik_latency_diagnostics_stage_seconds_bucket{",
                         labels, ",le=\"", bound, "\"} ", cumulative, "\n");
       }
+      // Preserve small scrape deltas after long uptimes, as MetricText does.
+      char sum_text[32];
+      const auto [sum_end, error] =
+          std::to_chars(sum_text, sum_text + sizeof(sum_text), h.ns / 1e9);
+      assert(error == std::errc{});
       absl::StrAppend(&out, "lavik_latency_diagnostics_stage_seconds_sum{",
-                      labels, "} ", h.ns / 1e9, "\n",
+                      labels, "} ",
+                      std::string_view(sum_text, sum_end - sum_text), "\n",
                       "lavik_latency_diagnostics_stage_seconds_count{", labels,
                       "} ", cumulative, "\n");
     }

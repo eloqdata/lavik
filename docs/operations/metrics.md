@@ -472,6 +472,8 @@ increments `cancelled`. History overwrites increment `overwritten`. GET defaults
 to 10 records and accepts 0–1024; SHOW returns at most one record. These Lavik
 extensions return arrays of JSON bulk strings; RESET clears only recent history,
 not cumulative counters/histograms, and does not quiesce in-flight samples.
+LATENCY controls are rejected when queued inside MULTI, like other global
+diagnostic commands; EXEC then reports EXECABORT for the invalid transaction.
 Trace IDs are process-local and must not be used as metric or Loki stream labels.
 
 A `queued: true` record ends when the MULTI client's QUEUED reply is sent. Its
