@@ -67,6 +67,40 @@ void VerifyTransfer(Client& client, std::string_view type,
   EXPECT_GT(std::stoll(ttl.text_), 0);
 }
 
+TEST(GroupedTransferE2e, StorageBaselinePreservesWorkingHeadroom) {
+  constexpr std::uint64_t working = 128 * kMiB;
+  for (const unsigned workers : {2U, 3U, 4U}) {
+    SCOPED_TRACE(workers);
+    PrivateDisk disk;
+    Server server(disk, workers, {}, {}, false, 2,
+                  WithStorageBaseline(working, workers));
+    Client client(server.port());
+    const auto info = client.Command({"INFO", "MEMORY"}).text_;
+    const auto field = [&](std::string_view name) {
+      const std::string prefix = std::string(name) + ":";
+      const auto at = info.find(prefix);
+      Check(at != std::string::npos, "missing memory info field");
+      return std::stoull(info.substr(at + prefix.size()));
+    };
+    const auto maximum = field("maxmemory");
+    const auto used = field("used_memory");
+    ASSERT_LT(used, maximum - maximum / 10);
+    const auto headroom = maximum - maximum / 10 - used;
+    // The helper deliberately leaves index page directories in the working
+    // allowance. Compensating those too would weaken full-image OOM cases.
+    const auto directories =
+        workers * (std::uint64_t{ScanHashMapEntryArena::kMaximumPageId} + 1) *
+        sizeof(std::uint64_t);
+    const auto expected = working - working / 10 - directories;
+    // Small owner bookkeeping is outside the fixed allocations. This bound
+    // still catches missing read-arena metadata, not just large directories.
+    const auto tolerance = workers * 8 * kKiB;
+    EXPECT_GE(headroom, expected - tolerance) << info;
+    EXPECT_LE(headroom, expected + tolerance) << info;
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+}
+
 TEST(GroupedTransferE2e, FourTypesCopyRenameAcrossDatabasesAndWorkersRecover) {
   const std::string huge(9 * 1024 * 1024, 'T');
   // One owner covers the single-shard shortcut; three cover source pin

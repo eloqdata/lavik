@@ -1119,18 +1119,44 @@ TEST(GroupedStringWriteE2e, TransactionsTransferAndRdbKeepStringSemantics) {
   EXPECT_EQ(client.Command({"GET", "restored"}).text_, value);
 }
 
-TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
+void CheckExpirationRestoresBoundedDeviceCapacity(bool prime_ordinary) {
   // Grouped writes need a transaction stream in addition to ordinary cleaner
   // output/tombstones. Bound the device to three foreground blocks, then fill
   // it rather than assuming a byte count implies physical exhaustion.
   PrivateDisk disk(96ULL * 1024 * 1024);
   disk.PreserveOnFailure();
+  ScopedEnvironment trace_standby("LAVIK_TRACE_STANDBY_BLOCKS",
+                                  prime_ordinary ? "1" : "0");
+  ScopedEnvironment delay_standby("LAVIK_STANDBY_PREFETCH_PAUSE_MS",
+                                  prime_ordinary ? "200" : "0");
   Server server(disk, 1);
   server.PreserveOnFailure();
   Client client(server.port());
   const std::string value(900 * 1024, 'e');
+  std::string consumed_standby;
   ASSERT_EQ(client.Command({"DEFRAG", "RESUME"}).text_, "OK");
-  for (unsigned i = 0; i < 7; ++i) {
+  if (prime_ordinary) {
+    // Create the ordinary stream and its prefetched successor before filling
+    // the transaction stream. Cleaner/expiration timing can produce the same
+    // layout. Durability alone does not wait for the separate prefetch task.
+    ASSERT_EQ(client.Command({"SET", "{expiry-387}ordinary", "v", "PX", "2000"})
+                  .text_,
+              "OK");
+    client.Durable();
+    const std::string marker = "standby prefetch published block ";
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    std::string log;
+    while ((log = server.Log()).find(marker) == std::string::npos &&
+           server.Running() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(1ms);
+    const auto at = log.find(marker);
+    ASSERT_NE(at, std::string::npos) << log;
+    const auto block = std::stoull(log.substr(at + marker.size()));
+    consumed_standby = "foreground fallback consumed standby block " +
+                       std::to_string(block) + "\n";
+  }
+  const unsigned initial_values = prime_ordinary ? 0 : 7;
+  for (unsigned i = 0; i < initial_values; ++i) {
     ASSERT_EQ(client
                   .Command({"SET", "{expiry-387}" + std::to_string(i), value,
                             "PX", "2000"})
@@ -1159,6 +1185,9 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
                                "{expiry-387}fill:" + std::to_string(i)})
                      .text_ == "0";
     }
+    if (prime_ordinary)
+      expired &=
+          client.Command({"EXISTS", "{expiry-387}ordinary"}).text_ == "0";
     // Defrag can make room before the TTLs elapse. A successful replacement
     // alone does not establish that the old keys should be absent on recovery.
     if (!expired) {
@@ -1175,6 +1204,9 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
       << client.Command({"INFO", "KEYSPACE"}).text_ << server.Log();
   EXPECT_EQ(client.Command({"GET", "replacement"}).text_, value);
   client.Durable();
+  if (prime_ordinary)
+    EXPECT_NE(server.Log().find(consumed_standby), std::string::npos)
+        << server.Log();
   ASSERT_EQ(server.Wait(true), 0) << server.Log();
   EXPECT_EQ(server.Log().find("commit append failed"), std::string::npos)
       << server.Log();
@@ -1184,12 +1216,25 @@ TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
     Client reader(recovered.port());
     EXPECT_EQ(reader.Command({"GET", "replacement"}).text_, value);
     EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}0"}).text_, "0");
+    if (prime_ordinary)
+      EXPECT_EQ(reader.Command({"EXISTS", "{expiry-387}ordinary"}).text_, "0");
   } catch (const std::exception& error) {
     // A startup exception otherwise loses the recovery process's log when
     // this second Server is destroyed, hiding whether it exited or stalled.
     recovered.RecordDiagnostics("expiration recovery startup/read failed");
     FAIL() << error.what() << '\n' << recovered.Log();
   }
+}
+
+TEST(GroupedStringWriteE2e, ExpirationRestoresBoundedDeviceCapacity) {
+  ASSERT_NO_FATAL_FAILURE(CheckExpirationRestoresBoundedDeviceCapacity(false));
+}
+
+TEST(GroupedStringWriteE2e, ExpirationCanUseOrdinaryPrefetchCapacity) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires standby publication and consumption tracing";
+#endif
+  ASSERT_NO_FATAL_FAILURE(CheckExpirationRestoresBoundedDeviceCapacity(true));
 }
 
 class GroupedStringCrashE2e : public testing::TestWithParam<const char*> {};
