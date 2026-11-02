@@ -1771,11 +1771,25 @@ def full_tail_type_reuse(root):
         ready(meta)
         reader = Client(target, readonly=True)
         try:
-            assert reader.call("LRANGE", key, 0, -1) == ["7", "tx"]
-            assert reader.call("GET", counter) == "8"
-            assert reader.call("GET", other) == "7"
-            assert reader.call("GET", copied) == "8"
-            assert reader.call("PEXPIRETIME", key) == deadline
+            # Follow Owner may reconnect after Meta reports ready and briefly
+            # close read admission. Retry only that transient rejection; wrong
+            # values still fail immediately, and require the same single FULL.
+            read_deadline = time.monotonic() + 30
+            while True:
+                try:
+                    assert reader.call("LRANGE", key, 0, -1) == ["7", "tx"]
+                    assert reader.call("GET", counter) == "8"
+                    assert reader.call("GET", other) == "7"
+                    assert reader.call("GET", copied) == "8"
+                    assert reader.call("PEXPIRETIME", key) == deadline
+                    break
+                except H.Failure as error:
+                    if (
+                        not str(error).startswith("LOADING ")
+                        or time.monotonic() >= read_deadline
+                    ):
+                        raise
+                    time.sleep(0.01)
             assert writer.call("RPUSH", key, "online") == 3
             assert writer.call("WAIT", 1, 5000) == 1
             assert reader.call("LRANGE", key, 0, -1) == ["7", "tx", "online"]
