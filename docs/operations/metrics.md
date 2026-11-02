@@ -367,8 +367,11 @@ request counts.
 
 Transport EOF and socket read failures (including connection resets) close the
 session without constructing a RESP error or incrementing errorstats or input-error
-counters. Protocol and request-buffer admission failures still construct and count
-a RESP error, even if the peer disconnects before that reply can be written.
+counters. Protocol and request-buffer admission failures increment input-error
+counters when detected. Once the serving loop constructs their RESP error,
+errorstats counts it even if writing that error fails. A deferred parse error
+does not reach errorstats if an earlier reply write fails and ends the session
+before the deferred error is handled.
 
 Nil results, unsuccessful conditional writes and normal blocking timeouts are
 successful executions. An unfinished blocked or streamed command abandoned on
