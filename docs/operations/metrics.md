@@ -552,7 +552,8 @@ without suppressing history or histogram updates. Workers never call the
 diagnostic log sink. Its sink instance and file are independent of normal worker logging;
 rotation reuses the configured file-size and file-count limits. Diagnostic
 output stays in this file even when ordinary logging targets stderr. The consumer
-flushes its userspace buffer every 20 ms without fsync. Shutdown can discard
+waits for accepted records without periodic idle wakeups, then batches output
+for 20 ms and flushes its userspace buffer without fsync. Shutdown can discard
 queued output; recent history and counters are process memory, not durable storage.
 
 The optional [monitoring log profile](../../deploy/monitoring/README.md#online-latency-diagnostics)

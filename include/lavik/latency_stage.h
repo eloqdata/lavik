@@ -57,16 +57,23 @@ enum class TraceStage : std::uint8_t {
 // no clock or allocate a segment. Detached jobs must not borrow this scope.
 class TraceSpanScope {
  public:
-  TraceSpanScope(OnlineLatencyTrace* trace, TraceStage stage) noexcept;
+  TraceSpanScope(OnlineLatencyTrace* trace, TraceStage stage) noexcept {
+    if (trace) Begin(trace, stage);
+  }
   TraceSpanScope(const TraceSpanScope&) = delete;
   TraceSpanScope& operator=(const TraceSpanScope&) = delete;
   ~TraceSpanScope() { End(); }
-  void End() noexcept;
+  void End() noexcept {
+    if (recorder_) Finish();
+  }
 
  private:
+  void Begin(OnlineLatencyTrace* trace, TraceStage stage) noexcept;
+  void Finish() noexcept;
   void* recorder_ = nullptr;
-  std::uint64_t start_ns_ = 0;
-  TraceStage stage_{};
+  // Only the sampled path initializes or reads these fields.
+  std::uint64_t start_ns_;
+  TraceStage stage_;
 };
 
 // Worker-local TSC time anchored to the common monotonic epoch. A null root

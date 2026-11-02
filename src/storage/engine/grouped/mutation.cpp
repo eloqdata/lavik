@@ -589,7 +589,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         }
       } else {
         committed = co_await CommitTxWrites(batch.txid_, {&batch}, nullptr,
-                                            diagnostics);
+                                            nullptr, diagnostics);
       }
       co_await store.store_state_mutex_.Lock();
       if (!committed.ok()) {

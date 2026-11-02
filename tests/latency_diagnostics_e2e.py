@@ -705,6 +705,27 @@ def logging_case(binary, unavailable=False):
                 # The explicit PING above is also one completed selected command.
                 assert len(client.command("LATENCY", "TRACE", "GET", 128)) == 58
                 assert "lavik_latency_diagnostics_log_max_per_second 0" in metrics()
+                if not unavailable:
+                    # Repeatedly wake a parked consumer, including after
+                    # disabling collection; no timer may rescue a lost wakeup.
+                    for expected in range(34, 42):
+                        assert client.command("GET", "private-log-key") is None
+                        wait_for(
+                            lambda: len(diagnostic.read_text().splitlines()) == expected
+                        )
+                        assert (
+                            client.command(
+                                "CONFIG", "SET", "latency-diagnostics-enabled", "no"
+                            )
+                            == "OK"
+                        )
+                        time.sleep(0.06)
+                        assert (
+                            client.command(
+                                "CONFIG", "SET", "latency-diagnostics-enabled", "yes"
+                            )
+                            == "OK"
+                        )
                 print(
                     "PASS: log switch preserves history/histograms; sink unavailable="
                     + str(unavailable)

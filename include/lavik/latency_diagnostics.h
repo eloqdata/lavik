@@ -143,13 +143,25 @@ class OnlineTraceHandle {
   OnlineTraceHandle& operator=(const OnlineTraceHandle&) = delete;
   OnlineTraceHandle(OnlineTraceHandle&& other) noexcept
       : trace_(std::exchange(other.trace_, nullptr)) {}
-  OnlineTraceHandle& operator=(OnlineTraceHandle&& other) noexcept;
-  ~OnlineTraceHandle();
+  OnlineTraceHandle& operator=(OnlineTraceHandle&& other) noexcept {
+    if (this != &other) {
+      if (trace_) Cancel();
+      trace_ = std::exchange(other.trace_, nullptr);
+    }
+    return *this;
+  }
+  ~OnlineTraceHandle() {
+    if (trace_) Cancel();
+  }
   OnlineLatencyTrace* get() const { return trace_; }
   explicit operator bool() const { return trace_ != nullptr; }
-  void Complete(bool write_ok);
+  void Complete(bool write_ok) {
+    if (trace_) Finish(write_ok);
+  }
 
  private:
+  void Cancel() noexcept;
+  void Finish(bool write_ok);
   OnlineLatencyTrace* trace_ = nullptr;
 };
 

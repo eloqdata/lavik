@@ -189,6 +189,7 @@ std::atomic<std::uint64_t> g_deadline_ns{0};
 std::atomic<std::uint32_t> g_duration{300}, g_sample{64};
 std::atomic<std::uint64_t> g_threshold{10000};
 std::jthread g_logger;
+std::atomic<bool> g_log_pending{false};
 std::atomic<std::uint64_t> g_sink_dropped{0};
 std::atomic<bool> g_log_enabled{true};
 std::atomic<std::uint32_t> g_log_limit{20};
@@ -353,20 +354,23 @@ void Retain(OnlineLatencyTrace& t) {
   ++s.log_count;
   s.logs[head % kLogCapacity] = t;
   s.log_head.store(head + 1, std::memory_order_release);
+  // Only accepted log records touch this shared flag. The exchange must not
+  // become a load-then-store: a producer must observe the consumer's clear.
+  if (!g_log_pending.exchange(true, std::memory_order_release))
+    g_log_pending.notify_one();
 }
 }  // namespace
 
-TraceSpanScope::TraceSpanScope(OnlineLatencyTrace* trace,
-                               TraceStage stage) noexcept
-    : stage_(stage) {
-  if (!trace || !trace->session_) return;
+void TraceSpanScope::Begin(OnlineLatencyTrace* trace,
+                           TraceStage stage) noexcept {
+  if (!trace->session_) return;
+  stage_ = stage;
   auto* recorder = trace->session_->Local();
   recorder_ = recorder;
   start_ns_ = recorder->clock.NowNanos();
 }
 
-void TraceSpanScope::End() noexcept {
-  if (!recorder_) return;
+void TraceSpanScope::Finish() noexcept {
   auto* recorder = static_cast<TraceRecorder*>(recorder_);
   assert(recorder->worker == bycorf::ThisWorker().id_);
   recorder->stages[StageIndex(stage_)].Add(start_ns_,
@@ -401,6 +405,7 @@ void InitLatencyDiagnostics(unsigned workers, const LoggingOptions* options) {
   }
   const auto settings = options ? *options : LoggingOptions{};
   g_sink_dropped = 0;
+  g_log_pending = false;
   g_logger = std::jthread([settings](std::stop_token stop) {
     std::shared_ptr<spdlog::logger> logger;
     std::uint64_t retry_ns = 0;
@@ -417,6 +422,13 @@ void InitLatencyDiagnostics(unsigned workers, const LoggingOptions* options) {
       logger->set_error_handler([](const std::string&) { ++g_sink_dropped; });
     };
     while (!stop.stop_requested()) {
+      g_log_pending.wait(false, std::memory_order_acquire);
+      if (stop.stop_requested()) break;
+      // Keep batching while active; an idle consumer has no periodic wakeup.
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      // Clear before scanning. Publication before this exchange is acquired;
+      // publication after it rearms the next pass, so no wakeup can be lost.
+      g_log_pending.exchange(false, std::memory_order_acquire);
       for (unsigned w = 0; w < g_count; ++w) {
         auto& s = g_shards[w];
         auto tail = s.log_tail.load(std::memory_order_relaxed);
@@ -438,13 +450,14 @@ void InitLatencyDiagnostics(unsigned workers, const LoggingOptions* options) {
         }
       }
       if (logger) logger->flush();
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
   });
 }
 void StopLatencyDiagnostics() {
   if (g_logger.joinable()) {
     g_logger.request_stop();
+    g_log_pending.store(true, std::memory_order_release);
+    g_log_pending.notify_one();
     g_logger.join();
   }
 }
@@ -492,17 +505,8 @@ void BindOnlineTraceCommand(OnlineLatencyTrace* trace,
   trace->family_ = Family(request.spec_);
   trace->is_set_ = request.kind_ == CommandKind::kSet;
 }
-OnlineTraceHandle& OnlineTraceHandle::operator=(
-    OnlineTraceHandle&& other) noexcept {
-  if (trace_) Release(trace_, true);
-  trace_ = std::exchange(other.trace_, nullptr);
-  return *this;
-}
-OnlineTraceHandle::~OnlineTraceHandle() {
-  if (trace_) Release(trace_, true);
-}
-void OnlineTraceHandle::Complete(bool ok) {
-  if (!trace_) return;
+void OnlineTraceHandle::Cancel() noexcept { Release(trace_, true); }
+void OnlineTraceHandle::Finish(bool ok) {
   trace_->done_ns_ = LatencyMonotonicNanos();
   trace_->write_ok_ = ok;
   if (trace_->done_ns_ - trace_->ready_ns_ >= trace_->threshold_us_ * 1000 &&

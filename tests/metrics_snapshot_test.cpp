@@ -16,8 +16,12 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <set>
 #include <string>
+#include <thread>
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/numbers.h"
@@ -35,6 +39,41 @@ namespace lavik {
 namespace {
 
 using namespace std::chrono_literals;
+
+TEST(MetricsSnapshotTest, DiagnosticConsumerSleepsUntilWorkOrShutdown) {
+  std::set<std::filesystem::path> existing;
+  for (const auto& thread :
+       std::filesystem::directory_iterator("/proc/self/task"))
+    existing.insert(thread.path());
+  InitLatencyDiagnostics(1);
+  absl::Cleanup stop = [] { StopLatencyDiagnostics(); };
+  std::filesystem::path consumer;
+  for (const auto& thread :
+       std::filesystem::directory_iterator("/proc/self/task")) {
+    if (!existing.contains(thread.path())) {
+      ASSERT_TRUE(consumer.empty());
+      consumer = thread.path();
+    }
+  }
+  ASSERT_FALSE(consumer.empty());
+  const auto switches = [&]() {
+    std::ifstream status(consumer / "status");
+    std::string line;
+    while (std::getline(status, line)) {
+      constexpr std::string_view prefix = "voluntary_ctxt_switches:";
+      if (line.starts_with(prefix))
+        return std::stoull(line.substr(prefix.size()));
+    }
+    ADD_FAILURE() << "consumer thread status is unavailable";
+    return 0ULL;
+  };
+  std::this_thread::sleep_for(50ms);
+  const auto before = switches();
+  std::this_thread::sleep_for(250ms);
+  // A polling consumer wakes about 12 times here. Allow incidental scheduling
+  // without accepting its former 20 ms timer, then exercise stop while parked.
+  EXPECT_LE(switches() - before, 2u);
+}
 
 struct Snapshots {
   WorkerMetricsSnapshot empty_, full_, gauges_, totals_, info_, reset_, reused_;

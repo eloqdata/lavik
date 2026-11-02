@@ -499,7 +499,8 @@ Runtime selection has a deadline, sampling probability and
 server-total threshold. Prometheus exposes conditional stage histograms, and
 `LATENCY TRACE` exposes bounded recent records. A separate logging thread owns
 the rotating diagnostic JSONL sink; output is lossy and never blocks request
-workers. Disabling log output leaves histograms and recent history active.
+workers. The consumer sleeps until records are published or shutdown is
+requested. Disabling log output leaves histograms and recent history active.
 The shared RESP library is independent of the diagnostic runtime. See the
 [diagnostics runbook](../operations/metrics.md#online-latency-diagnostics)
 for collection, retention and stage semantics.
