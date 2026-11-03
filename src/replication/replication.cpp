@@ -582,7 +582,10 @@ bool HasCommaFlag(std::string_view flags, std::string_view wanted) {
   return false;
 }
 
-Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
+namespace {
+
+template <bool SkipKeepalives>
+Task<absl::StatusOr<std::string>> ReadLineImpl(TcpStream& stream) {
   std::string pending;
   std::array<std::byte, 1> input{};
   while (pending.size() <= 64 * 1024) {
@@ -596,10 +599,28 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
     if (*read == 0) {
       co_return absl::UnavailableError("replication peer closed connection");
     }
+    if constexpr (SkipKeepalives) {
+      // Redis sends bare LF while waiting for PSYNC or RDB generation. Discard
+      // these only before a line starts; leave embedded LF for caller
+      // validation.
+      if (pending.empty() && input[0] == std::byte{'\n'}) {
+        continue;
+      }
+    }
     pending.append(reinterpret_cast<const char*>(input.data()), *read);
   }
   co_return absl::ResourceExhaustedError(
       "replication handshake line exceeds 64 KiB");
+}
+
+}  // namespace
+
+Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
+  return ReadLineImpl<false>(stream);
+}
+
+Task<absl::StatusOr<std::string>> ReadRedisReplicationLine(TcpStream& stream) {
+  return ReadLineImpl<true>(stream);
 }
 
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(

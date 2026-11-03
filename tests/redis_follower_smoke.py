@@ -162,10 +162,11 @@ def process(
 
 
 class Forwarder:
-    """Change an endpoint between discovery and its consuming TCP connection."""
+    """Proxy replication traffic with endpoint changes and wire faults."""
 
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, *, keepalive_before=None):
         self.endpoint = endpoint
+        self.keepalive_before = keepalive_before
         self.accepted = 0
         self.cut_after = None
         self.listener = socket.socket()
@@ -201,11 +202,34 @@ class Forwarder:
                 ):
                     poll.register(incoming, selectors.EVENT_READ, outgoing)
                     poll.register(outgoing, selectors.EVENT_READ, incoming)
+                    keepalive_before = self.keepalive_before
+                    pending = b""
                     while not self.stopped.is_set():
                         for key, _ in poll.select(0.1):
                             data = key.fileobj.recv(65536)
                             if not data:
                                 return
+                            if key.fileobj is outgoing and keepalive_before:
+                                # Redis may send bare LF pings before FULLRESYNC
+                                # or while preparing its RDB. Buffer handshake
+                                # lines so injection is independent of TCP chunks.
+                                pending += data
+                                data = b""
+                                while b"\r\n" in pending:
+                                    line, pending = pending.split(b"\r\n", 1)
+                                    full = line.lstrip(b"\n").startswith(
+                                        b"+FULLRESYNC "
+                                    )
+                                    if full and keepalive_before == "psync":
+                                        data += b"\n\n"
+                                    data += line + b"\r\n"
+                                    if full:
+                                        if keepalive_before == "rdb":
+                                            data += b"\n\n"
+                                        data += pending
+                                        pending = b""
+                                        keepalive_before = None
+                                        break
                             if key.fileobj is outgoing and self.cut_after is not None:
                                 remaining = self.cut_after
                                 key.data.sendall(data[:remaining])
@@ -252,6 +276,38 @@ def fragmented_disconnect():
                     assert reader.read(11) == b"reconnected"
         finally:
             proxy.close()
+
+
+def replication_keepalives(lavik, redis, root):
+    with process(redis, root / "keepalive-source", "redis", redis=True) as (
+        source,
+        source_port,
+        _,
+    ):
+        source.call("SET", "snapshot-key", "snapshot-value")
+        for stage in ("rdb", "psync"):
+            proxy = Forwarder(lambda _: source_port, keepalive_before=stage)
+            try:
+                with process(lavik, root / f"keepalive-{stage}", "target") as (
+                    target,
+                    _,
+                    _,
+                ):
+                    target.call("REPLICAOF", "127.0.0.1", proxy.port)
+                    H.wait_until(
+                        f"full sync with {stage} keepalives",
+                        20,
+                        lambda: target.call("GET", "snapshot-key") == "snapshot-value",
+                    )
+                    source.call("SET", "tail-key", stage)
+                    H.wait_until(
+                        f"incremental replay after {stage} keepalives",
+                        10,
+                        lambda: target.call("GET", "tail-key") == stage,
+                    )
+                    assert proxy.accepted == 1, "keepalive interrupted full sync"
+            finally:
+                proxy.close()
 
 
 def changing_endpoint(lavik, redis, root, managed_port=None):
@@ -627,6 +683,7 @@ if __name__ == "__main__":
         mode_contract(sys.argv[1], Path(directory))
         exercise(sys.argv[1], sys.argv[2], Path(directory))
         authenticated_startup(sys.argv[1], sys.argv[2], Path(directory))
+        replication_keepalives(sys.argv[1], sys.argv[2], Path(directory))
         changing_endpoint(sys.argv[1], sys.argv[2], Path(directory))
         if len(sys.argv) >= 5:
             managed_native_rejection(
