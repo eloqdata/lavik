@@ -399,7 +399,8 @@ class CommandArgsHandle {
     Get().assign(first, last);
   }
   template <typename Iterator>
-  void insert(CommandArgsView::Iterator pos, Iterator first, Iterator last) {
+  void insert([[maybe_unused]] CommandArgsView::Iterator pos, Iterator first,
+              Iterator last) {
     // Synthesis only appends; arbitrary insertion would invalidate offsets and
     // borrow semantics. Rewriters build an independent command instead.
     assert(pos == end());

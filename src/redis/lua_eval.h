@@ -75,7 +75,7 @@ struct LuaExecutionStep {
   std::string reply_;
   CommandOutcome outcome_{};
   // Newly constructed errors only; forwarded child errors were already counted.
-  std::vector<LuaErrorCount> errors_;
+  std::vector<LuaErrorCount> errors_{};
   bool scheduler_yield_ = false;
 };
 
