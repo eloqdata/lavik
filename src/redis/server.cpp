@@ -57,6 +57,7 @@
 #if BYCORF_KERNEL_BYPASS
 #include "bycorf/io/dpdk_backend.h"
 #endif
+#include "bycorf/io/spdk_storage.h"
 #include "bycorf/net/server.h"
 #include "bycorf/net/tcp_service.h"
 #include "bycorf/net/tcp_stream.h"
