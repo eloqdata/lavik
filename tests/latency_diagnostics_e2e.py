@@ -762,6 +762,12 @@ def storage_path_coverage(client):
         found = next(t for t in records if t["command"] == command[0])
         return {s["name"] for s in found["stages"]}
 
+    # An indirect key makes an optimistic GET retry under the key lock even
+    # without contention. The retry must report that acquisition separately.
+    indirect_key = "coverage:indirect:" + "k" * (64 * 1024)
+    assert client.command("SET", indirect_key, "value") == "OK"
+    assert "key_lock" in trace("GET", indirect_key)
+
     for command in [
         ("GETRANGE", "coverage:string", 0, 20),
         ("GETBIT", "coverage:string", 0),

@@ -520,6 +520,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       if (optimistic_read) {
         // Verifying an out-of-index key suspends before we know this is the
         // requested key, so there is no lock-free linearization point yet.
+        lookup_scope.End();
+        TraceSpanScope retry_wait(trace ? trace->diagnostics_ : nullptr,
+                                  TraceStage::kKeyLock);
         key_lock = co_await tx::CurrentTxShard().AcquireKey(
             db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
             lavik::storage::RedisSlot(key));
@@ -564,6 +567,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       // The key existed at the optimistic lookup, but a concurrent writer may
       // retire its physical record before the I/O path pins it. Do not turn
       // that race into a spurious nil; take the original lock path and reread.
+      TraceSpanScope retry_wait(trace ? trace->diagnostics_ : nullptr,
+                                TraceStage::kKeyLock);
       key_lock = co_await tx::CurrentTxShard().AcquireKey(
           db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
           lavik::storage::RedisSlot(key));
