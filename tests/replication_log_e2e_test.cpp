@@ -3360,8 +3360,10 @@ class ReplicationLogService final : public bycorf::Service {
     for (const bool journal : {false, true}) {
       const std::string key = journal ? "canonical-on" : "canonical-off";
       const std::string stream = key + "-stream";
-      status =
-          co_await ExecuteClientCommand(0, {"SET", key, "value"}, "+OK\r\n");
+      // GCC 13 cannot reliably lower nonliteral initializer-list arguments
+      // inside co_await. Keep each argument vector alive in this frame.
+      std::vector<std::string> set_args{"SET", key, "value"};
+      status = co_await ExecuteClientCommand(0, std::move(set_args), "+OK\r\n");
       if (!status.ok()) co_return status;
       if (journal) {
         status = co_await storage_->EnableReplicationLog(37, 4 * 8 * kMiB);
@@ -3371,16 +3373,21 @@ class ReplicationLogService final : public bycorf::Service {
       // These standalone requests have no EXEC/Lua capture. Their canonical
       // arguments must still reach an active journal, while the same writes
       // must also work when neither journal nor capture consumes arguments.
-      status = co_await ExecuteClientCommand(
-          0, {"GETEX", key, "PXAT", deadline}, "$5\r\nvalue\r\n");
+      std::vector<std::string> getex_args{"GETEX", key, "PXAT", deadline};
+      status = co_await ExecuteClientCommand(0, std::move(getex_args),
+                                             "$5\r\nvalue\r\n");
       if (!status.ok()) co_return status;
-      status = co_await ExecuteClientCommand(0, {"PEXPIRETIME", key},
+      std::vector<std::string> expire_args{"PEXPIRETIME", key};
+      status = co_await ExecuteClientCommand(0, std::move(expire_args),
                                              ":" + deadline + "\r\n");
       if (!status.ok()) co_return status;
-      status = co_await ExecuteClientCommand(
-          0, {"XADD", stream, "1-*", "field", "value"}, "$3\r\n1-0\r\n");
+      std::vector<std::string> xadd_args{"XADD", stream, "1-*", "field",
+                                         "value"};
+      status = co_await ExecuteClientCommand(0, std::move(xadd_args),
+                                             "$3\r\n1-0\r\n");
       if (!status.ok()) co_return status;
-      status = co_await ExecuteClientCommand(0, {"XLEN", stream}, ":1\r\n");
+      std::vector<std::string> xlen_args{"XLEN", stream};
+      status = co_await ExecuteClientCommand(0, std::move(xlen_args), ":1\r\n");
       if (!status.ok()) co_return status;
       if (journal) {
         status = co_await WaitForReplicationTail(2);

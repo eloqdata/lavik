@@ -85,11 +85,13 @@ class StreamPageWindow {
 Task<absl::StatusOr<TransferValue>>
 StorageEngine::Impl::ReadValueForTransferLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::optional<StreamRangeAccess> stream_range) {
+    std::optional<StreamRangeAccess> stream_range,
+    OnlineLatencyTrace* diagnostics) {
   // Only the callback escapes this coroutine. Its shared owner pins the exact
   // source graph, so RENAME may delete the source on another shard while the
   // destination continues reading pages. It does not borrow an RDB session.
   struct Source {
+    OnlineLatencyTrace* diagnostics_ = nullptr;
     RetainedMemoryCharge charge_;
     WorkerStore* store_ = nullptr;
     WorkerStore::PartitionStore* partition_ = nullptr;
@@ -132,7 +134,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         if (!admission.ok()) co_return admission.status();
         auto page = co_await engine->LoadOrderedGroupSnapshot(
             *source.store_, *source.partition_, source.db_id_, source.key_,
-            source.digest_, object, id.prefix_);
+            source.digest_, object, id.prefix_, false, nullptr,
+            SortedSetMemberValidation::kVerifyUnique, source.diagnostics_);
         if (!page.ok()) co_return page.status();
         auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
         if (!max_key.ok()) co_return max_key.status();
@@ -256,10 +259,12 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           source.probe_reservation_.reset();
         } else {
           window->Start(
-              j, engine->LoadOrderedGroupSnapshot(
-                     *source.store_, *source.partition_, source.db_id_,
-                     source.key_, source.digest_, object, groups[index].id_,
-                     true, window->limiter()));
+              j,
+              engine->LoadOrderedGroupSnapshot(
+                  *source.store_, *source.partition_, source.db_id_,
+                  source.key_, source.digest_, object, groups[index].id_, true,
+                  window->limiter(), SortedSetMemberValidation::kVerifyUnique,
+                  source.diagnostics_));
         }
       }
       co_await window->Join();
@@ -385,7 +390,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         } else if (!window) {
           auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
               *source->store_, *source->partition_, source->db_id_,
-              source->key_, source->digest_, object, id.prefix_, true);
+              source->key_, source->digest_, object, id.prefix_, true, nullptr,
+              SortedSetMemberValidation::kVerifyUnique, source->diagnostics_);
           if (!from_disk.ok()) co_return from_disk.status();
           loaded.emplace(std::move(*from_disk));
         }
@@ -455,7 +461,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       } else {
         auto loaded = co_await engine->LoadHashGroupSnapshot(
             *source->store_, *source->partition_, source->db_id_, source->key_,
-            source->digest_, object, id, true);
+            source->digest_, object, id, true, nullptr, source->diagnostics_);
         if (!loaded.ok()) co_return loaded.status();
         const auto count = loaded->snapshot_.value_.entries_.size();
         if (page.value_type_ == ValueType::kHash)
@@ -506,10 +512,14 @@ StorageEngine::Impl::ReadValueForTransferLocked(
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
   for (;;) {
+    TraceSpanScope store_lock(diagnostics, TraceStage::kStoreLock);
     co_await store.store_state_mutex_.Lock();
+    store_lock.End();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
     auto found = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                             digest, key);
+    lookup.End();
     if (!found.ok()) co_return found.status();
     if (*found == nullptr || (*found)->value_.kind() != RecordKind::kValue)
       co_return absl::NotFoundError("key not found");
@@ -517,7 +527,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     if (!location.grouped() || location.value_type() == ValueType::kString) {
       if (IsExpiredNow(**found)) co_return absl::NotFoundError("key not found");
       unlock.Unlock();
-      auto raw = co_await ReadRawValueLocked(db_id, key, digest);
+      auto raw = co_await ReadRawValueLocked(db_id, key, digest, diagnostics);
       if (!raw.ok()) co_return raw.status();
       co_return TransferValue{.metadata_ = std::move(*raw), .reader_ = {}};
     }
@@ -553,10 +563,14 @@ StorageEngine::Impl::ReadValueForTransferLocked(
     // explicitly tracked release; it never modifies source pin state
     // remotely.
     auto raw_source = std::make_unique<Source>();
+    raw_source->diagnostics_ = diagnostics;
     raw_source->store_ = &store;
     raw_source->partition_ = &partition;
     active_settlements_.fetch_add(1, std::memory_order_acq_rel);
     std::shared_ptr<Source> source(raw_source.release(), [this](Source* value) {
+      // Reader calls have joined before the last owner reaches this deleter.
+      // Its asynchronous pin cleanup must not retain the diagnostic borrow.
+      value->diagnostics_ = nullptr;
       bycorf::ThisWorker().self_->Spawn(
           Source::Release(this, std::unique_ptr<Source>(value)));
     });
@@ -614,10 +628,14 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       // the captured blocks. Key intent preserves the logical ranks, not those
       // physical coordinates. Refresh the matching graph before materializing
       // its pin list, with no suspension between lookup and capture.
+      TraceSpanScope refresh_lock(diagnostics, TraceStage::kStoreLock);
       co_await store.store_state_mutex_.Lock();
+      refresh_lock.End();
       unlock.Adopt();
+      TraceSpanScope refresh_lookup(diagnostics, TraceStage::kLookup);
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[db_id], digest, key, location);
+      refresh_lookup.End();
       if (!resolved.ok()) co_return resolved.status();
       if (!source->Valid(*this))
         co_return absl::CancelledError(
@@ -693,8 +711,10 @@ Task<absl::Status> StorageEngine::Impl::WriteValueForTransferLocked(
 
 Task<absl::StatusOr<TransferValue>> StorageEngine::ReadValueForTransferLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::optional<StreamRangeAccess> stream_range) {
-  return impl_->ReadValueForTransferLocked(db_id, key, digest, stream_range);
+    std::optional<StreamRangeAccess> stream_range,
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->ReadValueForTransferLocked(db_id, key, digest, stream_range,
+                                           diagnostics);
 }
 
 Task<absl::Status> StorageEngine::WriteValueForTransferLocked(

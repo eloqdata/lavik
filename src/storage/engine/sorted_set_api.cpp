@@ -46,10 +46,12 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
       operation.kind_ != SortedSetOperationKind::kRemove &&
       operation.kind_ != SortedSetOperationKind::kPop &&
       operation.kind_ != SortedSetOperationKind::kRemoveRange;
+  TraceSpanScope key_wait(operation.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(key));
+  key_wait.End();
   co_return co_await ExecuteSortedSetLocked(db_id, key, digest, operation,
                                             nullptr, replication,
                                             mutation_precondition);

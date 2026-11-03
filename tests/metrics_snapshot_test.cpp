@@ -16,8 +16,12 @@
 
 #include <array>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <future>
+#include <set>
 #include <string>
+#include <thread>
 
 #include "absl/cleanup/cleanup.h"
 #include "absl/strings/numbers.h"
@@ -27,6 +31,7 @@
 #include "bycorf/runtime/worker.h"
 #include "gtest/gtest.h"
 #include "lavik/command_table.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/metrics.h"
 #include "lavik/storage/engine.h"
 
@@ -35,16 +40,54 @@ namespace {
 
 using namespace std::chrono_literals;
 
+TEST(MetricsSnapshotTest, DiagnosticConsumerSleepsUntilWorkOrShutdown) {
+  std::set<std::filesystem::path> existing;
+  for (const auto& thread :
+       std::filesystem::directory_iterator("/proc/self/task"))
+    existing.insert(thread.path());
+  InitLatencyDiagnostics(1);
+  absl::Cleanup stop = [] { StopLatencyDiagnostics(); };
+  std::filesystem::path consumer;
+  for (const auto& thread :
+       std::filesystem::directory_iterator("/proc/self/task")) {
+    if (!existing.contains(thread.path())) {
+      ASSERT_TRUE(consumer.empty());
+      consumer = thread.path();
+    }
+  }
+  ASSERT_FALSE(consumer.empty());
+  const auto switches = [&]() {
+    std::ifstream status(consumer / "status");
+    std::string line;
+    while (std::getline(status, line)) {
+      constexpr std::string_view prefix = "voluntary_ctxt_switches:";
+      if (line.starts_with(prefix))
+        return std::stoull(line.substr(prefix.size()));
+    }
+    ADD_FAILURE() << "consumer thread status is unavailable";
+    return 0ULL;
+  };
+  std::this_thread::sleep_for(50ms);
+  const auto before = switches();
+  std::this_thread::sleep_for(250ms);
+  // A polling consumer wakes about 12 times here. Allow incidental scheduling
+  // without accepting its former 20 ms timer, then exercise stop while parked.
+  EXPECT_LE(switches() - before, 2u);
+}
+
 struct Snapshots {
   WorkerMetricsSnapshot empty_, full_, gauges_, totals_, info_, reset_, reused_;
   WorkerMetricsSnapshot errors_;
   std::array<std::string, 2> exposition_;
   std::array<double, 2> execution_seconds_;
+  std::array<double, 2> diagnostic_seconds_;
+  std::string empty_diagnostics_;
 };
 
 bycorf::Task<absl::Status> CollectSnapshots(
     std::promise<Snapshots>* completed) {
   Snapshots snapshots;
+  snapshots.empty_diagnostics_ = co_await RenderLatencyDiagnosticsMetrics();
   snapshots.empty_ = co_await CollectWorkerMetrics();
   for (unsigned worker = 0; worker < 2; ++worker) {
     co_await bycorf::SubmitTo(worker, [worker] {
@@ -107,6 +150,17 @@ bycorf::Task<absl::Status> CollectSnapshots(
   const auto initial_ticks =
       static_cast<std::uint64_t>(1'234'567.891 * frequency);
   const auto delta_ticks = static_cast<std::uint64_t>(0.001 * frequency);
+  const bool selected = co_await bycorf::SubmitTo(1, [] {
+    const std::array<std::string, 3> args{"SET", "sparse-key", "value"};
+    auto trace = SelectOnlineTrace(args);
+    if (!trace) return false;
+    trace.get()->family_ = TraceCommandFamily::kSet;
+    // Zero-duration observations must survive a sparse snapshot too.
+    RecordTraceInterval(trace.get(), TraceStage::kValueProcess, 1, 1);
+    trace.Complete(true);
+    return true;
+  });
+  if (!selected) co_return absl::InternalError("worker sample not selected");
   for (std::size_t i = 0; i < snapshots.exposition_.size(); ++i) {
     const auto ticks = i == 0 ? initial_ticks : delta_ticks;
     RecordCommandMetric(CommandKind::kGet, ticks);
@@ -114,6 +168,17 @@ bycorf::Task<absl::Status> CollectSnapshots(
     snapshots.execution_seconds_[i] =
         static_cast<double>(initial_ticks + (i == 0 ? 0 : delta_ticks)) /
         frequency;
+    const std::array<std::string, 2> args{"GET", "precision-key"};
+    auto trace = SelectOnlineTrace(args);
+    if (!trace) co_return absl::InternalError("diagnostic sample not selected");
+    trace.get()->family_ = TraceCommandFamily::kGet;
+    constexpr std::uint64_t initial_ns = 1'234'567'891'000'000;
+    constexpr std::uint64_t delta_ns = 1'000'000;
+    RecordTraceInterval(trace.get(), TraceStage::kLookup, 1,
+                        1 + (i == 0 ? initial_ns : delta_ns));
+    trace.Complete(true);
+    snapshots.diagnostic_seconds_[i] =
+        (initial_ns + (i == 0 ? 0 : delta_ns)) / 1e9;
     const auto rendered = co_await RenderPrometheusMetrics(
         storage, true, &snapshots.exposition_[i]);
     if (!rendered.ok()) co_return rendered;
@@ -124,6 +189,30 @@ bycorf::Task<absl::Status> CollectSnapshots(
 
 TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   InitWorkerMetrics(2);
+  InitLatencyDiagnostics(2);
+  absl::Cleanup stop_diagnostics = [] {
+    ConfigureLatencyDiagnostics("latency-diagnostics-enabled", "no")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-log-enabled", "yes")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-sample-every", "64")
+        .IgnoreError();
+    ConfigureLatencyDiagnostics("latency-diagnostics-slow-threshold-us",
+                                "10000")
+        .IgnoreError();
+    StopLatencyDiagnostics();
+  };
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-log-enabled", "no")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-sample-every", "1")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-slow-threshold-us", "0")
+          .ok());
+  ASSERT_TRUE(
+      ConfigureLatencyDiagnostics("latency-diagnostics-enabled", "yes").ok());
   bycorf::Runtime runtime;
   std::array<std::promise<absl::Status>, 2> initialized;
   std::promise<Snapshots> completed;
@@ -150,6 +239,14 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
   }));
   ASSERT_EQ(result.wait_for(10s), std::future_status::ready);
   const auto snapshots = result.get();
+  EXPECT_EQ(snapshots.empty_diagnostics_.find("_bucket{"), std::string::npos);
+  for (const auto& text : snapshots.exposition_) {
+    EXPECT_NE(text.find("lavik_latency_diagnostics_stage_seconds_count{"
+                        "command_family=\"set\",stage=\"value_process\"} 1\n"),
+              std::string::npos);
+    EXPECT_EQ(text.find("command_family=\"set\",stage=\"decode\""),
+              std::string::npos);
+  }
   auto expect_empty_details = [](const CommandMetricsSnapshot& commands) {
     EXPECT_TRUE(commands.commands_.empty());
 
@@ -226,6 +323,21 @@ TEST(MetricsSnapshotTest, SparseOwnersPreserveTotalsProjectionAndReset) {
     }
     EXPECT_GT(seconds[1], seconds[0]) << family;
   }
+  const std::string prefix =
+      "lavik_latency_diagnostics_stage_seconds_sum{"
+      "command_family=\"get\",stage=\"lookup\"} ";
+  std::array<double, 2> seconds{};
+  for (std::size_t i = 0; i < snapshots.exposition_.size(); ++i) {
+    const auto& text = snapshots.exposition_[i];
+    const auto position = text.find(prefix);
+    ASSERT_NE(position, std::string::npos);
+    const auto first = position + prefix.size();
+    ASSERT_TRUE(absl::SimpleAtod(
+        std::string_view(text).substr(first, text.find('\n', first) - first),
+        &seconds[i]));
+    EXPECT_DOUBLE_EQ(seconds[i], snapshots.diagnostic_seconds_[i]);
+  }
+  EXPECT_GT(seconds[1], seconds[0]);
 }
 
 }  // namespace

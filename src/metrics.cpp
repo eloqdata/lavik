@@ -36,6 +36,7 @@
 #include "bycorf/runtime/cycle_clock.h"
 #include "bycorf/runtime/worker.h"
 #include "lavik/command_table.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/memory.h"
 #include "lavik/replication.h"
 #include "lavik/storage/engine.h"
@@ -987,6 +988,7 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
   RefreshMemoryDiagnostics();
   const WorkerMetricsSnapshot worker_metrics = co_await CollectWorkerMetrics();
   AppendCommandResults(worker_metrics, &output);
+  output.Add(co_await RenderLatencyDiagnosticsMetrics());
   const ClusterControlMetricsSnapshot control_metrics =
       GetClusterControlMetrics();
   const storage::StorageMetricsSnapshot storage_metrics =

@@ -98,12 +98,8 @@ class RemoteGetTestPeer : public testing::Test {
 
   RegisteredBufferPool& Pool() { return storage_.impl_->stores_[0]->buffers_; }
   auto Read() {
-    return storage_.TryRemoteRead(0, key_, 1, ValueType::kString, false
-#if LAVIK_ENABLE_TRACE
-                                  ,
-                                  &trace_
-#endif
-    );
+    return storage_.TryRemoteRead(0, key_, 1, ValueType::kString, false,
+                                  &trace_);
   }
 
   void Publish(ValueType type, bool grouped = false, bool staged = false,
@@ -198,6 +194,9 @@ class RemoteGetTestPeer : public testing::Test {
         EncodeRecordHeader(header_, key_, record.first(header_.header_bytes_)));
     std::memcpy(record.data() + header_.header_bytes_, value_.data(),
                 value_.size());
+    // This fixture skips SQ submission; seed its timestamp before exercising
+    // the production completion and population-validation paths.
+    if (read.trace_) read.trace_->io_submit_ns_ = read.trace_->NowNanos();
     // No awaiting handle was registered: Complete stores the result, and the
     // worker ignores the empty continuation. await_resume is otherwise real.
     read.io_->Complete(worker_, bytes == -1 ? read.read_bytes_ : bytes, 0);
@@ -245,28 +244,19 @@ class RemoteGetTestPeer : public testing::Test {
   std::string key_;
   std::string value_ = "remote value";
   RecordHeader header_;
-#if LAVIK_ENABLE_TRACE
   ReadLatencyTrace trace_;
-#endif
 };
 
 TEST_F(RemoteGetTestPeer, SynchronousMissAndClosedIndexFallback) {
   {
-    auto read = storage_.TryRemoteRead(0, "absent", 1, ValueType::kString, false
-#if LAVIK_ENABLE_TRACE
-                                       ,
-                                       &trace_
-#endif
-    );
+    auto read = storage_.TryRemoteRead(0, "absent", 1, ValueType::kString,
+                                       false, &trace_);
     ASSERT_TRUE(read.await_ready());
     auto result = read.await_resume();
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(absl::IsNotFound(result->status()));
-#if LAVIK_ENABLE_TRACE
     EXPECT_NE(trace_.lookup_done_ns_, 0);
-    EXPECT_FALSE(trace_.hit_);
     EXPECT_FALSE(trace_.disk_read_);
-#endif
   }
   auto writer = index_.CloseAllReaders();
   auto read = Read();
@@ -350,18 +340,13 @@ TEST_F(RemoteGetTestPeer, CompletionTransfersReplyLeaseAndReleasesPin) {
     auto read = Read();
     ASSERT_FALSE(read.await_ready());
     ASSERT_NO_FATAL_FAILURE(Complete(read));
-#if LAVIK_ENABLE_TRACE
     EXPECT_NE(trace_.lookup_done_ns_, 0);
-    EXPECT_TRUE(trace_.hit_);
     EXPECT_NE(trace_.buffer_acquired_ns_, 0);
     const auto completed = trace_.io_complete_ns_;
     EXPECT_NE(completed, 0);
-#endif
     result = read.await_resume();
-#if LAVIK_ENABLE_TRACE
     EXPECT_EQ(trace_.io_complete_ns_, completed);
     EXPECT_GE(trace_.decode_done_ns_, completed);
-#endif
     ASSERT_TRUE(result.has_value());
     ASSERT_TRUE(result->ok()) << result->status();
     EXPECT_EQ(result->value().view().encoded_, value_);
@@ -453,11 +438,15 @@ TEST_F(RemoteGetTestPeer, PopulationChangesDiscardCompletedRead) {
   // fresh snapshot; production serving fences remain irreversible.
   for (unsigned which = 0; which < 6; ++which) {
     {
+      const auto completed_reads = trace_.io_timing_.count;
       auto read = Read();
       ASSERT_FALSE(read.await_ready()) << which;
       ASSERT_NO_FATAL_FAILURE(Complete(read));
       Invalidate(which);
       EXPECT_FALSE(read.await_resume().has_value()) << which;
+      // A discarded result still consumed one physical I/O. An owner retry
+      // must retain that cost rather than erase it from command diagnostics.
+      EXPECT_EQ(trace_.io_timing_.count, completed_reads + 1);
     }
     EXPECT_EQ(block_.pin_count(), 0);
     EXPECT_EQ(Pool().available_read_buffers(), 1);

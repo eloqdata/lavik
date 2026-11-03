@@ -222,16 +222,19 @@ absl::Status AdmitSortWorking(RetainedMemoryCharge* charge, std::size_t extra) {
   return absl::OkStatus();
 }
 
-Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
-                                                      const LockedKey& key) {
+Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(
+    std::uint8_t db_id, const LockedKey& key, OnlineLatencyTrace* diagnostics) {
   auto read = [&]() -> Task<absl::StatusOr<SortSource>> {
+    TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
     const storage::ExpirationInfo info =
         co_await g_storage->GetExpirationLocked(db_id, key.name_, key.digest_);
+    lookup.End();
     SortSource source;
     if (!info.exists_) co_return source;
     source.type_ = info.value_type_;
     if (info.value_type_ == storage::ValueType::kList) {
       storage::ListOperation operation;
+      operation.diagnostics_ = diagnostics;
       operation.kind_ = storage::ListOperationKind::kRange;
       operation.first_ = 0;
       operation.second_ = -1;
@@ -244,6 +247,7 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
     }
     if (info.value_type_ == storage::ValueType::kSet) {
       storage::HashOperation operation;
+      operation.diagnostics_ = diagnostics;
       operation.kind_ = storage::HashOperationKind::kKeys;
       auto result = co_await g_storage->ExecuteSetLocked(
           db_id, key.name_, key.digest_, operation);
@@ -269,8 +273,8 @@ Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
       co_return source;
     }
     if (info.value_type_ == storage::ValueType::kSortedSet) {
-      auto members =
-          co_await ZSetMembersSnapshotLocked(db_id, key.name_, key.digest_);
+      auto members = co_await ZSetMembersSnapshotLocked(
+          db_id, key.name_, key.digest_, diagnostics);
       if (!members.ok()) co_return members.status();
       source.elements_ = std::move(*members);
       co_return source;
@@ -320,7 +324,7 @@ std::vector<std::string> CollectPatternKeys(
 
 Task<absl::StatusOr<std::optional<std::string>>> ReadPatternReferenceLocked(
     std::uint8_t db_id, const PatternReference& reference,
-    std::span<const LockedKey> keys) {
+    std::span<const LockedKey> keys, OnlineLatencyTrace* diagnostics) {
   const LockedKey* key = FindLockedKey(keys, reference.key_);
   if (key == nullptr) {
     co_return absl::FailedPreconditionError(
@@ -329,6 +333,7 @@ Task<absl::StatusOr<std::optional<std::string>>> ReadPatternReferenceLocked(
   auto read = [&]() -> Task<absl::StatusOr<std::optional<std::string>>> {
     if (reference.field_.has_value()) {
       storage::HashOperation operation;
+      operation.diagnostics_ = diagnostics;
       operation.kind_ = storage::HashOperationKind::kGet;
       operation.fields_.push_back(*reference.field_);
       auto result = co_await g_storage->ExecuteHashLocked(
@@ -344,8 +349,8 @@ Task<absl::StatusOr<std::optional<std::string>>> ReadPatternReferenceLocked(
       }
       co_return std::optional<std::string>{std::move(*result->values_.front())};
     }
-    auto raw =
-        co_await g_storage->ReadRawValueLocked(db_id, key->name_, key->digest_);
+    auto raw = co_await g_storage->ReadRawValueLocked(
+        db_id, key->name_, key->digest_, diagnostics);
     if (!raw.ok()) {
       if (raw.status().code() == absl::StatusCode::kNotFound) {
         co_return std::optional<std::string>{};
@@ -366,13 +371,14 @@ Task<absl::StatusOr<std::optional<std::string>>> ReadPatternReferenceLocked(
 Task<absl::StatusOr<const std::string*>> LookupPatternValue(
     std::uint8_t db_id, std::string_view pattern, std::string_view substitute,
     std::span<const LockedKey> keys, PatternCache* cache,
-    RetainedMemoryCharge* charge) {
+    RetainedMemoryCharge* charge, OnlineLatencyTrace* diagnostics) {
   auto reference = ResolvePattern(pattern, substitute);
   if (!reference.has_value()) co_return nullptr;
   auto cache_key = std::make_pair(reference->key_, reference->field_);
   auto cached = cache->find(cache_key);
   if (cached == cache->end()) {
-    auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys);
+    auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys,
+                                                     diagnostics);
     if (!value.ok()) co_return value.status();
     std::size_t bytes = 256;
     if (!AddSetWorkingBytes(&bytes, cache_key.first.capacity() + 1) ||
@@ -445,9 +451,9 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
     SortItem item{.value_ = &element};
     if (!dont_sort) {
       if (!compare_members) {
-        auto comparison =
-            co_await LookupPatternValue(request.db_id_, *options.by_, element,
-                                        keys, &cache, &product.working_charge_);
+        auto comparison = co_await LookupPatternValue(
+            request.db_id_, *options.by_, element, keys, &cache,
+            &product.working_charge_, request.latency_trace_);
         if (!comparison.ok()) co_return comparison.status();
         item.comparison_ = *comparison;
       }
@@ -463,6 +469,8 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
   }
 
   if (!dont_sort && begin != end) {
+    TraceSpanScope processing(request.latency_trace_,
+                              TraceStage::kValueProcess);
     auto ascending = [&](const SortItem& left, const SortItem& right) {
       int comparison = 0;
       if (alpha) {
@@ -501,6 +509,8 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
     }
     std::sort(items.begin() + begin, items.begin() + end, ascending);
   } else if (dont_sort && options.descending_) {
+    TraceSpanScope processing(request.latency_trace_,
+                              TraceStage::kValueProcess);
     std::reverse(items.begin(), items.end());
   }
 
@@ -540,9 +550,9 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
     for (std::string_view pattern : options.gets_) {
       const std::string* selected = items[i].value_;
       if (pattern != "#") {
-        auto value = co_await LookupPatternValue(request.db_id_, pattern,
-                                                 *items[i].value_, keys, &cache,
-                                                 &product.working_charge_);
+        auto value = co_await LookupPatternValue(
+            request.db_id_, pattern, *items[i].value_, keys, &cache,
+            &product.working_charge_, request.latency_trace_);
         if (!value.ok()) co_return value.status();
         selected = *value;
       }
@@ -567,6 +577,7 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     if (!deleted.ok()) co_return deleted.status();
     if (values.empty()) co_return *deleted;
     storage::ListOperation push;
+    push.diagnostics_ = request.latency_trace_;
     push.kind_ = storage::ListOperationKind::kPushRight;
     push.values_.reserve(values.size());
     for (const std::string& value : values) push.values_.push_back(value);
@@ -630,7 +641,7 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
   }
 
   for (;;) {
-    tx::Transaction transaction;
+    tx::Transaction transaction(request.latency_trace_);
     for (std::size_t i = 0; i < keys.size(); ++i) {
       transaction.AddKey(keys[i].owner_, request.db_id_, keys[i].digest_, i,
                          keys[i].mode_, storage::RedisSlot(keys[i].name_));
@@ -654,7 +665,8 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     }
 
     const LockedKey* source_key = FindLockedKey(keys, request.args_[1]);
-    auto source = co_await ReadSortSourceLocked(request.db_id_, *source_key);
+    auto source = co_await ReadSortSourceLocked(request.db_id_, *source_key,
+                                                request.latency_trace_);
     if (!source.ok()) {
       (void)co_await ReleaseSortTransaction(&transaction);
       co_return Built(AppendSortError(reply_builder, source.status()));
@@ -700,7 +712,8 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> writes(g_storage->worker_count());
     g_storage->InitializeTxWrites(txid, writes,
-                                  ClusterMutationPrecondition(request));
+                                  ClusterMutationPrecondition(request),
+                                  request.latency_trace_);
     writes[destination->owner_].collect_undo_ = true;
     auto replaced = co_await ReplaceDestinationLocked(
         request, *destination, product->stored_values_,
@@ -794,7 +807,8 @@ Task<EncodedCommandReply> ExecuteSortCommandLocked(
   const LockedKey* source_key = FindLockedKey(keys, request.args_[1]);
   if (source_key == nullptr)
     co_return EncodeCommandError("ERR SORT source is missing");
-  auto source = co_await ReadSortSourceLocked(request.db_id_, *source_key);
+  auto source = co_await ReadSortSourceLocked(request.db_id_, *source_key,
+                                              request.latency_trace_);
   if (!source.ok()) co_return EncodeSortError(source.status());
   for (const std::string& pattern_key :
        CollectPatternKeys(*options, source->elements_)) {
@@ -824,9 +838,10 @@ Task<EncodedCommandReply> ExecuteSortCommandLocked(
     co_return EncodeCommandError("ERR SORT destination is missing");
   }
   auto prior = co_await SubmitTaskTo(
-      destination->owner_, [db = request.db_id_, name = destination->name_,
-                            digest = destination->digest_]() {
-        return g_storage->ReadRawValueLocked(db, name, digest);
+      destination->owner_,
+      [db = request.db_id_, name = destination->name_,
+       digest = destination->digest_, diagnostics = request.latency_trace_]() {
+        return g_storage->ReadRawValueLocked(db, name, digest, diagnostics);
       });
   const bool prior_missing =
       !prior.ok() && prior.status().code() == absl::StatusCode::kNotFound;

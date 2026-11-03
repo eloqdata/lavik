@@ -174,8 +174,8 @@ and `libcrypto.a`).
 For a different local CPU target, configure CMake directly with
 `-DLAVIK_MARCH=<target>`. An empty value disables the explicit `-march` flag.
 
-Tracing is controlled by `LAVIK_ENABLE_TRACE`, which defaults to `OFF`. Enable it with
-`./scripts/configure_release.sh -DLAVIK_ENABLE_TRACE=ON`, then rebuild `lavik`.
+Command latency tracing is enabled at runtime through `CONFIG SET`; it needs
+no special build. See [online latency diagnostics](metrics.md#online-latency-diagnostics).
 
 Use `-DLAVIK_BYCORF_SOURCE_DIR=/absolute/path/to/bycorf-worktree` to build and
 test a separate Bycorf checkout without replacing the repository's submodule.

@@ -80,6 +80,7 @@ Task<CommandReply> ExecuteHashCommandImpl(
     MarkReplicationCommandHandled(request);
   }
   storage::HashOperation operation;
+  operation.diagnostics_ = request.latency_trace_;
   switch (request.kind_) {
     case CommandKind::kHSet:
     case CommandKind::kHMSet:

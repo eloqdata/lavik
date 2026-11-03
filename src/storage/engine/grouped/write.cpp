@@ -122,7 +122,8 @@ Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
       co_await GroupedDependencyTestWaiter(store.durability_progress_,
                                            decision->txid_);
 #else
-      co_await store.durability_progress_.Wait();
+      co_await LatencyWaitAwaiter(store.durability_progress_.Wait(),
+                                  LatencyResource::kDurability);
 #endif
       co_await store.store_state_mutex_.Lock();
       continue;

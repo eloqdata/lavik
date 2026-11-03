@@ -35,15 +35,14 @@
 #include "bycorf/runtime/task.h"
 #include "lavik/cluster/topology.h"
 #include "lavik/command_args.h"
-#include "lavik/read_trace.h"
 #include "lavik/resp_version.h"
 #include "lavik/retained_allocator.h"
-#include "lavik/set_trace.h"
 #include "lavik/storage/engine.h"
 
 namespace lavik {
 
 class BlockingWakeCascade;
+struct OnlineLatencyTrace;
 class CapturedPubSubPublication;
 
 namespace cluster {
@@ -385,6 +384,7 @@ enum class CommandKind {
   kLastSave,
   kMonitor,
   kSlowLog,
+  kLatency,
   kTombRaider,
   kDefrag,
   kUnknown,
@@ -399,6 +399,7 @@ struct CommandSpec;
 // extending the coroutine allocation contract and measuring its cost on
 // ordinary commands.
 struct alignas(std::max_align_t) CommandRequest {
+  OnlineLatencyTrace* latency_trace_ = nullptr;
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
   // Reply protocol for every nested/cross-core execution path. Replication
@@ -495,6 +496,7 @@ struct alignas(std::max_align_t) CommandRequest {
   // can start with an empty handle instead of copying arguments they replace.
   [[nodiscard]] CommandRequest WithArgs(CommandArgsHandle args) const {
     return CommandRequest{
+        .latency_trace_ = latency_trace_,
         .kind_ = kind_,
         .db_id_ = db_id_,
         .resp_version_ = resp_version_,
@@ -567,18 +569,13 @@ struct CommandReply {
   std::unique_ptr<ReplyContinuation> continuation_;
   bool close_connection_ = false;
   bool start_monitoring_ = false;
-  ReadLatencyTrace read_trace_;
-  SetLatencyTrace set_trace_;
   std::optional<std::uint8_t> selected_db_;
 };
 
 // The direct GET result is moved through several coroutine promises. Keep its
 // common representation at 72 bytes so adding rare reply state cannot silently
-// restore the former larger coroutine frames. Diagnostic builds deliberately
-// carry stage timestamps; this size contract applies only with tracing off.
-#if !LAVIK_ENABLE_TRACE
+// restore the former larger coroutine frames. Diagnostic state stays indirect.
 static_assert(sizeof(CommandReply) == 72);
-#endif
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id);

@@ -52,6 +52,7 @@ class Worker;
 
 namespace lavik {
 class ReplicationHistory;
+struct OnlineLatencyTrace;
 }  // namespace lavik
 
 namespace lavik::storage {
@@ -786,6 +787,8 @@ enum class ListOperationKind : std::uint8_t {
 // the lifetime of the awaited call.
 struct ListOperation {
   ListOperationKind kind_ = ListOperationKind::kLength;
+  // Borrowed by this awaited operation only; never retained by stored values.
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   // Single-element pushes need no separate operand allocation. Larger batches
   // spill normally; the bytes remain owned by the awaited command request.
   absl::InlinedVector<std::string_view, 1> values_;
@@ -866,6 +869,7 @@ enum class HashOperationKind : std::uint8_t {
 // fields_/values_ arrays; field-only operations leave values_ empty.
 struct HashOperation {
   HashOperationKind kind_ = HashOperationKind::kLength;
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   // Point commands dominate this interface. Inline the common operand pair
   // without retaining a worker-wide scratch buffer across coroutine waits.
   absl::InlinedVector<std::string_view, 1> fields_;
@@ -1102,6 +1106,8 @@ struct StreamInspectAccess {
 // metadata with empty entry/group arrays and must return exactly one new entry
 // without trimming or changing groups. Metadata-only callbacks cannot write.
 struct CompactAccessOptions {
+  // Optional request observer; must outlive this awaited operation.
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   std::optional<std::uint32_t> stream_append_node_max_entries_ = std::nullopt;
   bool metadata_only_ = false;
   bool stream_trim_ = false;
@@ -1159,6 +1165,8 @@ struct RdbSnapshotValue {
 // Byte offsets are zero-based. Read ranges use Redis' inclusive, signed bounds;
 // bit operations interpret start_ as a bit offset. Mutations preserve TTL.
 struct StringSegmentOperation {
+  // Optional request observer; must outlive this awaited operation.
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   enum class Kind { kReadRange, kWriteRange, kAppend, kGetBit, kSetBit };
   Kind kind_ = Kind::kReadRange;
   std::int64_t start_ = 0;
@@ -1256,6 +1264,9 @@ struct GroupedCommitDecision;
 struct GroupedCommitDependency;
 
 struct TxShardWrites {
+  // Foreground-only borrow; clear before transferring receipts to background
+  // commit.
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   // Command-lifetime cache only. It avoids rereading a large immutable key
   // for every auxiliary segment; no original long key stays in the registry.
   struct IndirectKeyCache {
@@ -1816,17 +1827,13 @@ class StorageEngine {
   // type selects the expected compact encoding. metadata_only returns length
   // and expiry from the index with an empty payload and no buffer/block pin.
   // Never use this for reads inside EXEC/Lua or a multi-key transaction.
-  // Trace builds optionally borrow caller-owned timing state through
+  // A selected online diagnostic may borrow caller-owned timing state through
   // completion.
   RemoteReadAwaitable TryRemoteRead(std::uint8_t db_id, std::string_view key,
                                     std::uint16_t slot,
                                     ValueType type = ValueType::kString,
-                                    bool metadata_only = false
-#if LAVIK_ENABLE_TRACE
-                                    ,
-                                    ReadLatencyTrace* trace = nullptr
-#endif
-  );
+                                    bool metadata_only = false,
+                                    ReadLatencyTrace* trace = nullptr);
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
@@ -1837,7 +1844,8 @@ class StorageEngine {
       ReadLatencyTrace* trace = nullptr,
       std::optional<std::uint16_t> routed_partition_id = std::nullopt);
   bycorf::Task<absl::StatusOr<std::uint64_t>> StringLength(
-      std::uint8_t db_id, std::string_view key);
+      std::uint8_t db_id, std::string_view key,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options = {}, ReplicationCommandAppend* replication = nullptr,
@@ -1885,11 +1893,13 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
       ExpirationCondition condition,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
@@ -1918,9 +1928,11 @@ class StorageEngine {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
   bycorf::Task<std::vector<BatchGetValue>> BatchGetLocked(
-      std::uint8_t db_id, std::span<const BatchGetRequest> requests);
+      std::uint8_t db_id, std::span<const BatchGetRequest> requests,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options = {},
@@ -1963,19 +1975,25 @@ class StorageEngine {
   // transaction is an error, never an invented absence or partial metadata.
   // The locked form requires the caller's shared/exclusive key intent.
   bycorf::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadata(
-      std::uint8_t db_id, std::string_view key);
+      std::uint8_t db_id, std::string_view key,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<ExpirationInfo>> ReadKeyMetadataLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
                                                       std::string_view key);
   // Captures a graph under the caller's key intent. The returned reader pins
   // that version until released. A Stream range selects message records and
   // reports its selected cardinality; other types ignore the range argument.
+  // A non-null diagnostics observer must outlive the reader and every awaited
+  // read; asynchronous pin cleanup does not retain or record through it.
   bycorf::Task<absl::StatusOr<TransferValue>> ReadValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::optional<StreamRangeAccess> stream_range = std::nullopt);
+      std::optional<StreamRangeAccess> stream_range = std::nullopt,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::Status> WriteValueForTransferLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const TransferValue& value, TxShardWrites* tx = nullptr,
@@ -2020,12 +2038,14 @@ class StorageEngine {
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   bycorf::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                   const Digest& digest);
 
@@ -2055,7 +2075,9 @@ class StorageEngine {
   // not create or await another coroutine.
   [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
                                      std::vector<TxShardWrites> writes);
-  bycorf::Task<absl::Status> WaitForTxCommitCapacity();
+  // diagnostics borrows only the foreground wait, never queued receipts.
+  bycorf::Task<absl::Status> WaitForTxCommitCapacity(
+      OnlineLatencyTrace* diagnostics = nullptr);
   // Settles a complete transaction's participant on its owning worker while
   // its key locks are still held. Success publishes FULL after-images before
   // discarding undo; rollback restores the journal without publishing them.
@@ -2073,7 +2095,8 @@ class StorageEngine {
   // transaction and gives every shard one shared lease.
   void InitializeTxWrites(
       std::uint64_t txid, std::span<TxShardWrites> writes,
-      MutationPrecondition mutation_precondition = MutationPrecondition{});
+      MutationPrecondition mutation_precondition = MutationPrecondition{},
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   // Stop background commit retries and release reply-side capacity waits.
   // Call when request admission closes, before waiting for accepted requests.
@@ -2213,12 +2236,8 @@ class StorageEngine::RemoteReadAwaitable {
   };
 
   RemoteReadAwaitable(Impl& engine, std::uint8_t db_id, std::string_view key,
-                      std::uint16_t slot, ValueType type, bool metadata_only
-#if LAVIK_ENABLE_TRACE
-                      ,
-                      ReadLatencyTrace* trace
-#endif
-  );
+                      std::uint16_t slot, ValueType type, bool metadata_only,
+                      ReadLatencyTrace* trace);
   bool Current(const Impl& engine) const noexcept;
 
   Result ready_;
@@ -2237,9 +2256,8 @@ class StorageEngine::RemoteReadAwaitable {
   // including when an admitted awaitable is destroyed without being awaited.
   Pin pin_;
   ReadBufferLease lease_;
-#if LAVIK_ENABLE_TRACE
   // Timestamp the actual CQE before the connection is scheduled again. This
-  // trace-only completion leaves the production I/O awaitable and frame intact.
+  // completion keeps CQE time separate from subsequent coroutine scheduling.
   class TracedReadIo : public bycorf::OneShotIoAwaitable {
    public:
     TracedReadIo(bycorf::Worker& worker, bycorf::FixedFile file,
@@ -2260,9 +2278,6 @@ class StorageEngine::RemoteReadAwaitable {
   };
   ReadLatencyTrace* trace_;
   std::optional<TracedReadIo> io_;
-#else
-  std::optional<bycorf::SizeIoAwaitable> io_;
-#endif
 };
 
 }  // namespace lavik::storage

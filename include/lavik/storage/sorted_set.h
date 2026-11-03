@@ -26,6 +26,10 @@
 #include "lavik/memory.h"
 #include "lavik/storage/packed_values.h"
 
+namespace lavik {
+struct OnlineLatencyTrace;
+}
+
 namespace lavik::storage {
 
 enum class SortedSetOperationKind : std::uint8_t {
@@ -67,6 +71,8 @@ struct ScoredMemberView {
 // uses the range bounds and atomically removes the selected members; it returns
 // changed_ without returning their contents to the caller.
 struct SortedSetOperation {
+  // Borrowed only through the awaited foreground operation.
+  OnlineLatencyTrace* diagnostics_ = nullptr;
   SortedSetOperationKind kind_ = SortedSetOperationKind::kLength;
   std::span<const ScoredMemberView> entries_{};
   std::span<const std::string_view> members_{};

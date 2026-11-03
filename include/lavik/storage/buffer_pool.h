@@ -15,7 +15,6 @@
  */
 
 #pragma once
-
 #include <array>
 #include <cassert>
 #include <coroutine>
@@ -29,6 +28,7 @@
 #include "absl/status/statusor.h"
 #include "bycorf/io/storage.h"
 #include "bycorf/runtime/sync.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/memory.h"
 #include "lavik/tlsf_range_allocator.h"
 
@@ -234,6 +234,7 @@ class RegisteredBufferPool {
 
    private:
     friend class RegisteredBufferPool;
+    LatencyWait wait_;
     RegisteredBufferPool* pool_;
     std::coroutine_handle<> awaiting_{};
     std::uint16_t assigned_buffer_id_ = 0;
@@ -274,6 +275,7 @@ class RegisteredBufferPool {
    private:
     friend class RegisteredBufferPool;
 
+    LatencyWait wait_;
     RegisteredBufferPool* pool_ = nullptr;
     std::size_t minimum_payload_bytes_ = 0;
     std::coroutine_handle<> awaiting_{};

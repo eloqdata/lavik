@@ -69,6 +69,24 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
+  loki:
+    image: ${LOKI_IMAGE:-grafana/loki:3.7.9}
+    profiles: [diagnostics-logs]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./loki/config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+  alloy:
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.21.3}
+    profiles: [diagnostics-logs]
+    restart: unless-stopped
+    depends_on: [loki]
+    command: ["run", "--storage.path=/var/lib/alloy", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ${LAVIK_LOG_DIR:-../../logs}:/var/log/lavik:ro
+      - alloy-data:/var/lib/alloy
   alertmanager:
     image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.34.1}
     profiles:
@@ -89,3 +107,5 @@ volumes:
   prometheus-data: null
   grafana-data: null
   alertmanager-data: null
+  loki-data: null
+  alloy-data: null

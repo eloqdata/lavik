@@ -387,3 +387,48 @@ The existing alert framework and rules are documented above. Request Health adds
 no command-error alert rules. Future rules must choose their error scope,
 minimum traffic and sustained window explicitly, and distinguish missing
 telemetry from a healthy zero.
+
+## Online latency diagnostics
+
+Open **Lavik Latency Breakdown** from the overview dashboard link. It includes
+ready queue and socket-write gauges, actual resource suspension rates/current
+waiters, full dispatch latency, runtime diagnostic status, sample/filter/drop
+rates and slow-subset stage histograms. The dashboard labels boundaries and
+stage overlap explicitly. See the [runtime controls and contracts](../../docs/operations/metrics.md#online-latency-diagnostics).
+
+Individual JSON records are optional. To collect the dedicated diagnostic JSONL log
+with the bundled Alloy/Loki profile, select the actual host log directory:
+
+```bash
+LAVIK_LOG_DIR=/absolute/path/to/lavik/logs docker compose --profile diagnostics-logs up -d
+```
+
+The additional **Lavik Slow Command Traces** dashboard uses the `lavik-loki`
+datasource and supports command/trace-ID filters and expandable log details.
+The native phase timeline shows the latest matching command in the selected
+time range, with command total elapsed time in its first row. Copy an exact trace
+ID from a log row into **Trace ID (regex)** to pin a command. Each row includes the full-stage cumulative duration, execution
+count and omitted interval count alongside its measured interval. Repeated
+stages retain up to eight exact intervals; totals include every observation.
+There is no separate enclosing-operation or cumulative-duration chart.
+Overlapping stages are not additive, and gaps can contain uninstrumented work.
+Rounded zero-microsecond intervals may be invisible. The timeline uses existing
+JSON logs and requires no additional server instrumentation or Grafana plugins.
+Keep the timeline's `start_us` series transparent when editing the dashboard.
+Do not apply `colorByField` to that panel: Grafana applies its opacity across
+numeric series, which would display offsets as measured intervals.
+Alloy forwards only `command_latency_trace` messages, uses their completion timestamp,
+and keeps trace IDs in the JSON body. The example labels one mounted node as
+`service_name="lavik-diagnostics"`; configure a bounded node identity when
+extending this to multiple nodes. Log times use the recorded server-completion timestamp. Loki uses
+local filesystem storage with seven-day retention; its API is internal to the
+Compose network. The profile adds no logging dependency to the Lavik server.
+
+Enable collection through Redis CONFIG, then inspect both recent history and
+logs. `CONFIG SET latency-diagnostics-log-enabled no` disables new file output
+while retaining metrics and recent history. Set `latency-diagnostics-log-max-per-second`
+to change the per-worker output budget; zero removes that rate limit while keeping
+the bounded queue. Output drops can omit records from Loki while histograms/history still
+include them. Stopping diagnostics stops new measurement but keeps retained
+records for inspection. The log dashboard requires this optional profile; the
+metrics dashboard works without it.

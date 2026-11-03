@@ -768,7 +768,8 @@ Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     // owner-local wait, so a flush cannot notify in between and get lost.
     // A wake may describe another block or an older snapshot of this block:
     // always recheck the full fence and failure state before returning.
-    co_await store.durability_progress_.Wait();
+    co_await LatencyWaitAwaiter(store.durability_progress_.Wait(),
+                                LatencyResource::kDurability);
   }
 }
 

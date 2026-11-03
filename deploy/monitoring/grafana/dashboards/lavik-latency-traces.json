@@ -1,0 +1,252 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "liveNow": false,
+  "schemaVersion": 41,
+  "timezone": "browser",
+  "uid": "lavik-latency-traces",
+  "title": "Lavik Slow Command Traces",
+  "tags": ["lavik", "latency"],
+  "version": 3,
+  "refresh": "",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "command",
+        "label": "Command (regex)",
+        "type": "textbox",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        }
+      },
+      {
+        "name": "trace_id",
+        "label": "Trace ID (regex)",
+        "type": "textbox",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        }
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Latency metrics",
+      "url": "/d/lavik-latency-breakdown"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Slow command detail",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Shows the **latest matching command** in the selected time range. Enter a **Command** regex or exact **Trace ID** to select it.\n\nThe first row is **total command elapsed time**. Other bars show measured phase intervals. Labels include full-stage **total duration**, **execution count** and **omitted intervals**; at most eight intervals per stage are retained. Phases can overlap, and gaps do not imply idle time. Phase durations do not add up to the command total. Sub-microsecond intervals may be invisible."
+      }
+    },
+    {
+      "id": 3,
+      "title": "Latest matching command \u2014 total and phase timeline",
+      "description": "The first row shows command total elapsed time. Other bars show retained phase intervals at their measured offsets; their labels include full-stage totals, execution counts and omitted intervals. Phases may overlap and do not add up to the command total. Gaps do not imply idle time.",
+      "type": "barchart",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 22
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lavik-loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format `{{ $sep := \",\" }}[{\"name\":\"command total ({{ .total_us }} \u00b5s)\",\"start_us\":0,\"duration_us\":{{ .total_us }}}{{ range $stage := fromJson .stages }}{{ if ne $stage.kind \"summary\" }}{{ if $stage.intervals }}{{ range $i, $span := $stage.intervals }}{{ $sep }}{\"name\":\"{{ $stage.name }}{{ if $stage.intervals }} #{{ add $i 1 }}{{ end }} (total {{ $stage.duration_us }} \u00b5s, count {{ or $stage.observations 1 }}, omitted {{ or $stage.intervals_dropped 0 }})\",\"start_us\":{{ $span.start_us }},\"duration_us\":{{ $span.duration_us }}}{{ $sep = \",\" }}{{ end }}{{ else }}{{ $sep }}{\"name\":\"{{ $stage.name }} (total {{ $stage.duration_us }} \u00b5s, count 1, omitted 0)\",\"start_us\":{{ $stage.start_us }},\"duration_us\":{{ $stage.duration_us }}}{{ $sep = \",\" }}{{ end }}{{ end }}{{ end }}]`",
+          "queryType": "range",
+          "direction": "backward",
+          "maxLines": 1
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "reduce",
+          "options": {
+            "reducers": ["last"],
+            "mode": "seriesToRows"
+          }
+        },
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Last",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": ["name", "start_us", "duration_us"]
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "\u00b5s",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "custom": {
+            "fillOpacity": 90,
+            "lineWidth": 0,
+            "axisLabel": "Time since command readiness",
+            "axisPlacement": "auto",
+            "axisGridShow": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "start_us"
+            },
+            "properties": [
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": true,
+                  "tooltip": true,
+                  "viz": false
+                }
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "transparent"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_us"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Measured interval"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xField": "name",
+        "stacking": "normal",
+        "showValue": "never",
+        "groupWidth": 0.75,
+        "barWidth": 0.8,
+        "barRadius": 0,
+        "fullHighlight": false,
+        "legend": {
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        },
+        "text": {
+          "valueSize": 14
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "Selected slow command traces",
+      "type": "logs",
+      "gridPos": {
+        "x": 0,
+        "y": 26,
+        "w": 24,
+        "h": 14
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "lavik-loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=\"lavik-diagnostics\"} | json | command=~\"$command\" | trace_id=~\"$trace_id\" | json stages=\"stages\" | line_format \"{{.command}} total={{.total_us}}us trace={{.trace_id}} worker={{.worker}} {{ __line__ }}\"",
+          "queryType": "range",
+          "maxLines": 200
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none",
+        "prettifyLogMessage": false
+      }
+    }
+  ]
+}

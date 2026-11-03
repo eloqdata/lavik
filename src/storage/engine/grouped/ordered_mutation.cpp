@@ -50,7 +50,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    SortedSetMemberMutation* prepared_members) {
+    SortedSetMemberMutation* prepared_members,
+    OnlineLatencyTrace* diagnostics) {
+  if (!diagnostics && tx) diagnostics = tx->diagnostics_;
   if (!plan.changed_) co_return absl::OkStatus();
   if (previous && (!previous->is_ordered() ||
                    plan.expected_sequence_ != previous->revision()))
@@ -59,10 +61,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     // The adapter already owns store_state_mutex_; DeleteLocked would try to
     // acquire it again. The tombstone append owns the same graph-retirement
     // and transaction/replication bookkeeping as the ordinary delete path.
-    co_return co_await AppendLocked(store, partition, db_id, key, digest, {},
-                                    RecordKind::kTombstone, ValueType::kNone, 0,
-                                    tx, 0, nullptr, nullptr, replication, true,
-                                    nullptr, mutation_precondition);
+    auto detail = MakeSetTrace(diagnostics);
+    co_return co_await AppendLocked(
+        store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
+        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication, true,
+        nullptr, mutation_precondition, nullptr, nullptr, detail.get());
   }
   const auto field_count = plan.root_.logical_size();
   const auto value_type = OrderedValueType(plan.root_.kind_);
@@ -99,6 +102,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                            : MutationPrecondition{});
     tx = &standalone;
   }
+  tx->diagnostics_ = diagnostics;
   GroupedDependencyGuard dependency_guard(*tx, outer_transaction);
   const auto dependency =
       co_await PrepareGroupedDependencyLocked(store, source_side, tx);
@@ -130,6 +134,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         "grouped mutation has a stale source command sequence");
   }
   TxShardWrites batch;
+  batch.diagnostics_ = diagnostics;
   if (outer_transaction) {
     batch.txid_ = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);
@@ -632,7 +637,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
               absl::InternalError("injected grouped batch commit I/O failure");
         }
       } else {
-        committed = co_await CommitTxWrites(batch.txid_, {&batch});
+        committed = co_await CommitTxWrites(batch.txid_, {&batch}, nullptr,
+                                            nullptr, diagnostics);
       }
       co_await store.store_state_mutex_.Lock();
       if (!committed.ok()) {
@@ -648,7 +654,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       const auto transaction_id = receipts.front().txid_;
       if (!EnqueueTxCommit(transaction_id, std::move(receipts))) {
         store.store_state_mutex_.Unlock(*store.worker_);
-        const auto capacity = co_await WaitForTxCommitCapacity();
+        const auto capacity = co_await WaitForTxCommitCapacity(diagnostics);
         co_await store.store_state_mutex_.Lock();
         if (!capacity.ok()) co_return capacity;
       }

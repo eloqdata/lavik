@@ -1,0 +1,641 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "liveNow": false,
+  "schemaVersion": 41,
+  "timezone": "browser",
+  "uid": "lavik-latency-breakdown",
+  "title": "Lavik Latency Breakdown",
+  "tags": ["lavik", "latency"],
+  "version": 2,
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(up{job=\"lavik\"}, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Lavik instance",
+        "multi": true,
+        "name": "instance",
+        "options": [],
+        "query": {
+          "query": "label_values(up{job=\"lavik\"}, instance)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "name": "command_family",
+        "label": "Diagnostic command family",
+        "type": "custom",
+        "query": "get,set,read,write,multi_key,transaction,script,blocking,replication,pubsub,admin,other",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "options": []
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Runtime diagnostics runbook",
+      "url": "https://github.com/eloqdata/lavik/blob/main/docs/operations/metrics.md#online-latency-diagnostics",
+      "targetBlank": true
+    },
+    {
+      "title": "Individual slow traces (optional Loki)",
+      "url": "/d/lavik-latency-traces",
+      "targetBlank": false
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Measurement boundaries",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Always-on command latency ends at reply construction. Online command traces start when a complete command enters the ready queue and end when the server socket write completes; this is **not client RTT**. Diagnostic histograms contain only selected commands exceeding the configured server-total threshold. Stages overlap: **never sum stage percentiles**. Pipelined commands share a batch send span. Runtime diagnostics auto-expire; N=1 selects every eligible command, with explicit capacity/output drops. Command identity is preserved in recent traces. Histograms use fixed command families and emit only observed stages. Background flush is not attributed to a completed command."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Ready request queue",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lavik_request_queue_length{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Socket writes in flight",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lavik_response_writes_inflight{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Actual resource suspensions / second",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(instance,resource)(rate(lavik_wait_events_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} {{resource}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Resource waiters",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lavik_waiters{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} {{resource}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Full command p99 / p99.9 \u2014 dispatch to reply construction",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by(le,command)(rate(lavik_command_duration_seconds_bucket{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{command}} p99"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.999, sum by(le,command)(rate(lavik_command_duration_seconds_bucket{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{command}} p99.9"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Diagnostic collection status",
+      "type": "stat",
+      "gridPos": {
+        "x": 12,
+        "y": 20,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lavik_latency_diagnostics_enabled{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "enabled"
+        },
+        {
+          "refId": "B",
+          "expr": "lavik_latency_diagnostics_remaining_seconds{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "seconds remaining"
+        },
+        {
+          "refId": "C",
+          "expr": "lavik_latency_diagnostics_sample_every{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "sample 1/N"
+        },
+        {
+          "refId": "D",
+          "expr": "lavik_latency_diagnostics_threshold_seconds{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "threshold seconds"
+        },
+        {
+          "refId": "E",
+          "expr": "lavik_latency_diagnostics_inflight{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "contexts in flight"
+        },
+        {
+          "refId": "F",
+          "expr": "lavik_latency_diagnostics_log_enabled{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "log output enabled"
+        },
+        {
+          "refId": "G",
+          "expr": "lavik_latency_diagnostics_log_max_per_second{job=\"lavik\",instance=~\"$instance\"}",
+          "legendFormat": "logs / worker / s (0=unlimited)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Selected / retained / filtered / drops",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(result)(rate(lavik_latency_diagnostics_samples_total{job=\"lavik\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Slow selected commands \u2014 stage sample counts",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Only above-threshold selected commands. Each stage counts only when actually observed; no synthetic zero-duration I/O for misses.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by(command_family,stage)(increase(lavik_latency_diagnostics_stage_seconds_count{job=\"lavik\",instance=~\"$instance\"}[$__range]))",
+          "legendFormat": "{{command_family}} {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Read commands \u2014 slow subset p99 stage durations",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Conditional distribution of the slow sampled subset, not the stage p99 of all requests. Parent and child spans overlap.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99,sum by(le,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command_family=~\"get|read\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Write commands \u2014 slow subset p99 stage durations",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Conditional distribution of the slow sampled subset, not the stage p99 of all requests. Parent and child spans overlap.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99,sum by(le,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command_family=~\"set|write\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Existing storage I/O rate",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(lavik_storage_io_operations_total{operation=\"read\",job=\"lavik\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "read"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(lavik_storage_io_operations_total{operation=\"write\",job=\"lavik\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "write"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "title": "Selected command families \u2014 slow subset p99 stage durations",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 24,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Conditional distribution of the slow sampled subset, not the stage p99 of all requests. Parent and child spans overlap.",
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99,sum by(le,command_family,stage)(rate(lavik_latency_diagnostics_stage_seconds_bucket{job=\"lavik\",instance=~\"$instance\",command_family=~\"$command_family\"}[$__rate_interval])))",
+          "legendFormat": "{{command_family}} / {{stage}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    }
+  ]
+}

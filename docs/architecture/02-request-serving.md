@@ -490,6 +490,21 @@ recorded after the reset traversal returns, but the traversal does not globally
 quiesce requests, so concurrent commands can also contribute post-reset
 samples.
 
+Online command diagnosis is independent of SLOWLOG and command statistics.
+Requests own bounded trace leases through reply send completion; cancellation
+retires the lease and detached work cannot outlive it with a diagnostic borrow.
+Parallel workers own their mutable timing state. Completion joins foreground
+work and freezes immutable snapshots before history or log publication.
+Runtime selection has a deadline, sampling probability and
+server-total threshold. Prometheus exposes conditional stage histograms, and
+`LATENCY TRACE` exposes bounded recent records. A separate logging thread owns
+the rotating diagnostic JSONL sink; output is lossy and never blocks request
+workers. The consumer sleeps until records are published or shutdown is
+requested. Disabling log output leaves histograms and recent history active.
+The shared RESP library is independent of the diagnostic runtime. See the
+[diagnostics runbook](../operations/metrics.md#online-latency-diagnostics)
+for collection, retention and stage semantics.
+
 Redis commandstats and execution time are owned by the coordinating worker and
 snapshotted through `SubmitTo`. Static command/subcommand identities bound the
 per-command counters. Global errorstats uses a separate fixed RESP-prefix

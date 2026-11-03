@@ -103,6 +103,12 @@ class BufferPoolWaitService final : public bycorf::Service {
       worker.RequestStop();
       co_return result_;
     }
+    const auto write_metrics = co_await RenderLatencyDiagnosticsMetrics();
+    EXPECT_NE(write_metrics.find(
+                  "lavik_wait_events_total{resource=\"write_buffer\"} 1"),
+              std::string::npos);
+    EXPECT_NE(write_metrics.find("lavik_waiters{resource=\"write_buffer\"} 1"),
+              std::string::npos);
     pool_.ReleaseWriteBuffer(held_storage);
     for (unsigned attempt = 0; attempt < 100 && !storage_waiter_acquired_;
          ++attempt) {
@@ -139,6 +145,13 @@ class BufferPoolWaitService final : public bycorf::Service {
         worker.RequestStop();
         co_return result_;
       }
+      const auto waiting_metrics = co_await RenderLatencyDiagnosticsMetrics();
+      EXPECT_NE(waiting_metrics.find(
+                    "lavik_wait_events_total{resource=\"read_buffer\"} 1"),
+                std::string::npos);
+      EXPECT_NE(
+          waiting_metrics.find("lavik_waiters{resource=\"read_buffer\"} 1"),
+          std::string::npos);
       held_reads.back().Reset();
       held_reads.pop_back();
       for (unsigned attempt = 0; attempt < 100 && !read_waiter_acquired_;
@@ -152,6 +165,13 @@ class BufferPoolWaitService final : public bycorf::Service {
         co_return result_;
       }
 
+      const auto resumed_metrics = co_await RenderLatencyDiagnosticsMetrics();
+      EXPECT_NE(
+          resumed_metrics.find("lavik_waiters{resource=\"read_buffer\"} 0"),
+          std::string::npos);
+      EXPECT_NE(
+          resumed_metrics.find("lavik_waiters{resource=\"write_buffer\"} 0"),
+          std::string::npos);
       auto oversized =
           co_await pool_.AcquireReadBuffer(pool_.read_capacity_bytes());
       if (!absl::IsResourceExhausted(oversized.status())) {
@@ -201,6 +221,8 @@ class BufferPoolWaitService final : public bycorf::Service {
 };
 
 TEST(BufferPoolTest, StorageWriteBufferWaiterIsReusable) {
+  InitLatencyDiagnostics(1);
+  absl::Cleanup stop_diagnostics = [] { StopLatencyDiagnostics(); };
   ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
   BufferPoolWaitService service;
   bycorf::Server server;
@@ -228,6 +250,8 @@ TEST(BufferPoolTest, RejectsFewerThanTwoWriteSlotsBeforeAllocation) {
 }
 
 TEST(BufferPoolTest, ReadAllocationFailureWaitsForFixedSlot) {
+  InitLatencyDiagnostics(1);
+  absl::Cleanup stop_diagnostics = [] { StopLatencyDiagnostics(); };
 #if !LAVIK_FAULTS_ENABLED
   GTEST_SKIP() << "requires read buffer allocation failure injection";
 #endif

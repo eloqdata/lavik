@@ -392,6 +392,181 @@ input errors use only the instance filter. `ERR` does not distinguish client
 mistakes from service faults, so this model does not expose a service-fault
 ratio. Existing QPS and latency panels retain the legacy dispatch boundary.
 
+## Online latency diagnostics
+
+The **Lavik Latency Breakdown** dashboard keeps always-on pressure signals
+separate from conditional command diagnostics. The existing command histogram
+and SLOWLOG retain their existing boundaries and configuration.
+
+| Signal | Semantics |
+|---|---|
+| `lavik_request_queue_length` | Complete parsed commands still in a connection's ready batch; excludes time queued inside MULTI. |
+| `lavik_response_writes_inflight` | Ordinary Redis reply writes awaiting completion; a pipeline batch counts as one write. Excludes replication and metrics HTTP. |
+| `lavik_wait_events_total{resource}` / `lavik_waiters{resource}` | Actual suspensions and current waiters for `key_lock`, `store_lock`, `read_buffer`, `write_buffer`, and `durability`. Counts include storage maintenance; they are not per-command counts. Fast acquisitions read no clock and add no event. |
+| `lavik_latency_diagnostics_stage_seconds{command_family,stage}` | Histogram of stages actually observed in selected commands whose server-total duration reaches the threshold. Missing stages do not contribute synthetic zero samples. |
+| `lavik_latency_diagnostics_samples_total{result}` | `eligible`, `selected`, `pool_dropped`, `filtered`, `retained`, `overwritten`, `cancelled`, and `log_dropped`. `eligible` counts complete parsed commands seen while enabled, before session/arity validation. LATENCY and diagnostic CONFIG controls are excluded to avoid observing the diagnostic reader itself; unsupported session handoffs are cancelled. These counters are cumulative and have different meanings, not disjoint command outcomes. |
+
+Recent records retain the canonical command/subcommand identity. Histograms use
+12 fixed families (`get`, `set`, `read`, `write`, `multi_key`, `transaction`,
+`script`, `blocking`, `replication`, `pubsub`, `admin`, `other`) and emit only
+observed family/stage combinations. Keys, child arguments and trace IDs never
+become metric labels.
+
+Resource coverage is TxShard key-set acquisitions, the storage-state mutex,
+read/write buffer awaiters, and storage durability-progress waits. Transaction
+coordination has additional admission/ordering queues; existing storage and
+transaction diagnostics remain useful alongside these signals. Queue and waiter
+snapshots are instantaneous and short spikes may fall between scrapes.
+
+Collection is disabled after every restart and needs no trace-specific binary.
+Use one `CONFIG SET` per setting:
+
+```text
+CONFIG SET latency-diagnostics-duration-seconds 120
+CONFIG SET latency-diagnostics-sample-every 64
+CONFIG SET latency-diagnostics-slow-threshold-us 10000
+CONFIG SET latency-diagnostics-enabled yes
+CONFIG GET latency-diagnostics-*
+LATENCY TRACE GET 20
+LATENCY TRACE SHOW 65536
+CONFIG SET latency-diagnostics-enabled no
+LATENCY TRACE RESET
+```
+
+`latency-diagnostics-duration-seconds` defaults to 300 (range 1–3600).
+`latency-diagnostics-sample-every` defaults to 64 (range 1–1000000), meaning
+independent pseudorandom selection probability 1/N, not Hz. Set N=1 to select
+all eligible commands. `latency-diagnostics-slow-threshold-us` defaults to
+10000 (range 0–3600000000); zero retains every completed selected command.
+`latency-diagnostics-enabled` accepts yes/no. Enabling again restarts the time
+window using the current duration; editing duration alone does not extend an
+active window. Sampling and threshold changes apply to newly selected commands.
+`latency-diagnostics-log-enabled` defaults to `yes` and accepts `yes/no`.
+Set it to `no` to stop offering new records to the diagnostic log queue while
+keeping sampling, histograms and recent history. Records already queued can
+still drain. `lavik_latency_diagnostics_log_enabled` exposes this switch.
+`latency-diagnostics-log-max-per-second` defaults to 20 (range 0–1000000),
+shared by command records offered to the log queue on each data worker.
+Zero removes the enqueue rate limit;
+it does not remove the bounded queue or guarantee delivery. Changes take
+immediate effect on new output attempts. Lowering a limit below the current
+window's usage suppresses output until its next reset. The budget permits
+bursts within each one-second window rather than spacing records evenly.
+A consumer recovering from a stalled sink may drain queued records together;
+this is not a strict per-second disk-write limit.
+`lavik_latency_diagnostics_log_max_per_second` exposes the configured limit.
+Settings are runtime-only and are not persisted by CONFIG REWRITE. They are
+independent of SLOWLOG.
+
+The deadline stops new selection automatically, including on an otherwise idle
+server. In-flight samples finish with their captured configuration. Above-threshold
+samples update the diagnostic histograms and recent history; below-threshold
+samples update only filtering counters. The threshold reduces retention/output
+cost, not the cost of measuring selected commands. Histograms describe the slow
+sampled subset, **not the full request population**.
+
+Each data worker has 256 trace contexts and retains its latest 128 slow traces.
+There is no hidden per-second acquisition cap: pool exhaustion increments
+`pool_dropped`, even at N=1. Connection cancellation releases its leases and
+increments `cancelled`. History overwrites increment `overwritten`. GET defaults
+to 10 records and accepts 0–1024; SHOW returns at most one record. These Lavik
+extensions return arrays of JSON bulk strings; RESET clears only recent history,
+not cumulative counters/histograms, and does not quiesce in-flight samples.
+LATENCY controls are rejected when queued inside MULTI, like other global
+diagnostic commands; EXEC then reports EXECABORT for the invalid transaction.
+Trace IDs are process-local and must not be used as metric or Loki stream labels.
+
+A `queued: true` record ends when the MULTI client's QUEUED reply is sent. Its
+storage work belongs to the later EXEC trace. EXEC and Lua child storage work
+contributes to the parent trace's phases. Child execution envelopes and outer
+command, transaction, script, append and reply-building spans are not collected.
+The record's `total_us` still measures readiness through socket write completion
+and controls threshold filtering; it is not a separate stage histogram.
+
+Stages are emitted only when the operation is observed. A write that reads its
+predecessor can include both read and write phases; a metadata-only read has no
+synthetic disk phase. These names are shared across command families:
+
+| Stages | Measured operation |
+| --- | --- |
+| `request_queue`, `response_queue` | Parsed-command wait before dispatch; reply wait before the socket write starts |
+| `route_to_owner`, `route_back` | Selected cross-worker queue/handoff intervals; same-worker and direct remote reads do not invent hops |
+| `admission_wait` | Actual publisher, database or Lua VM admission waits |
+| `key_lock`, `store_lock`, `lookup` | Key intent acquisition, store-state lock acquisition and index/metadata lookup |
+| `read_buffer`, `read_io`, `decode` | Physical read-buffer acquisition, submitted read through completion/resume, and value/page decoding |
+| `value_process` | Logical value inspection/modification and record encoding/copying |
+| `append_capacity`, `durability_wait` | Staging capacity/related flush waits and awaited durability fences |
+| `tx_schedule`, `commit_queue_wait` | Multi-key intent scheduling and commit-capacity admission |
+| `watch_check` | WATCH validation |
+| `script_prepare` | Script preparation/cache lookup |
+| `blocking_wait`, `wake_resume` | Blocking command sleep and wake-to-next-attempt admission |
+| `replication_fence`, `replica_ack_wait` | WAIT watermark capture and actual polling sleeps for replica acknowledgements |
+| `publish_fanout` | Foreground Pub/Sub subscriber fanout |
+| `snapshot_prepare` | Awaited snapshot cut preparation; detached snapshot writing does not borrow a command trace |
+| `socket_send` | Actual socket write calls |
+
+The timeline starts with the command total from `total_us`, followed by retained
+phase intervals at their measured offsets. Each row
+also shows the stage's cumulative duration, observation count and omitted
+interval count. Totals include every observation even when the eight-interval
+detail limit is reached. Stages can overlap; gaps can contain work without a
+phase timer, and durations are not exclusive CPU accounting. The record's
+`total_us` is server elapsed time, not client RTT.
+
+A read served by resident data has no `read_io`. GET key-lock timing exists only
+when optimistic reading falls back to locking. `durability_wait` does not mean
+every write waits for fsync. Detached flush, replication and pin cleanup are not
+assigned to an already-completed command. A streamed reply can build data and
+perform several socket writes; `socket_send` contains only the socket calls,
+not time spent waiting for its producer. Selected commands sharing a pipeline
+batch share its socket-write interval.
+
+Concurrent pages and shards own separate physical sidecars. Each worker records
+selected foreground intervals into its own segment; completion joins those
+segments and freezes an immutable snapshot for history and log output. No
+worker-wide current-command pointer survives a coroutine suspension. Selected
+contexts allocate segment storage only for participating workers; retained
+snapshots and the number of participating workers determine diagnostic memory.
+Temporary page sidecars exist only within the bounded read window.
+
+Repeated observations contribute their full summed duration to each command's
+stage histogram. Detail retains up to eight exact `intervals`, plus
+`observations`, `span_us`, and `intervals_dropped`; aggregate duration remains
+complete when detail is truncated. Gaps between intervals are not measured time.
+Parallel resource-time sums can exceed server-total wall time. Never add stage
+p99s or overlapping parent/child durations to infer total latency.
+
+Within a worker segment, sampled storage timings use TSC and the existing cached
+counter frequency. A new worker segment anchors TSC to steady_clock; worker hops
+use monotonic timestamps rather than subtracting raw counters from different
+cores. This does not calibrate inter-core TSC offsets. Timing is diagnostic,
+including host scheduling/preemption, not a CPU-time measurement.
+
+A background consumer writes `command_latency_trace` JSON messages to a dedicated
+`<log-dir>/latency-diagnostics.log` rotating JSONL sink, without keys, values,
+client addresses or arguments.
+Per-worker SPSC queues hold 64 copies; output has its own configurable rate
+limit, initially 20 records per second per worker. A full queue or output budget
+increments `log_dropped`
+without suppressing history or histogram updates. Workers never call the
+diagnostic log sink. Its sink instance and file are independent of normal worker logging;
+rotation reuses the configured file-size and file-count limits. Diagnostic
+output stays in this file even when ordinary logging targets stderr. The consumer
+waits for accepted records without periodic idle wakeups, then batches output
+for 20 ms and flushes its userspace buffer without fsync. Shutdown can discard
+queued output; recent history and counters are process memory, not durable storage.
+
+The optional [monitoring log profile](../../deploy/monitoring/README.md#online-latency-diagnostics)
+collects these messages with Alloy into Loki. **Lavik Slow Command Traces** shows
+expandable JSON records and filters by command/trace ID. Its single timeline
+shows the command total first, followed by measured phase intervals. Enter an
+exact trace ID to pin a command. Stage labels include full cumulative duration,
+execution count and omitted interval count even when only eight intervals are
+retained. Stages can overlap and gaps can contain uninstrumented work; phase
+durations are not additive. Zero-microsecond JSON durations can be invisible.
+The view queries existing logs and adds no server instrumentation or log volume.
+Ordinary metrics deployment continues to require only Prometheus/Grafana.
+
 ## Cluster control metrics
 
 Meta-managed Data nodes export process-level control health without node,

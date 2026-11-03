@@ -103,6 +103,7 @@ Task<CommandReply> ExecuteSetCommandImpl(
     MarkReplicationCommandHandled(request);
   }
   storage::HashOperation operation;
+  operation.diagnostics_ = request.latency_trace_;
   switch (request.kind_) {
     case CommandKind::kSAdd:
       operation.kind_ = storage::HashOperationKind::kSet;
@@ -335,6 +336,7 @@ Task<absl::Status> ComputeAggregate(SetMultiContext* context) {
     const std::size_t first_source = cardinality || store ? 2 : 1;
     auto read = [&](std::size_t argument, storage::HashOperation operation)
         -> Task<absl::StatusOr<storage::HashResult>> {
+      operation.diagnostics_ = request.latency_trace_;
       auto execute = [&]() -> Task<absl::StatusOr<storage::HashResult>> {
         auto result = co_await g_storage->ExecuteSetLocked(
             request.db_id_, request.args_[argument],
@@ -350,7 +352,8 @@ Task<absl::Status> ComputeAggregate(SetMultiContext* context) {
     };
     auto aggregated = co_await AggregateSetPages(
         request.args_, first_source, context->last_source_arg_,
-        context->aggregate_, cardinality, context->cardinality_limit_, read);
+        context->aggregate_, cardinality, context->cardinality_limit_, read,
+        request.latency_trace_);
     if (!aggregated.ok()) co_return aggregated.status();
     context->aggregate_charge_ = std::move(aggregated->charge_);
     context->output_ = std::move(aggregated->members_);
@@ -441,7 +444,8 @@ Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
     const std::string_view destination = request.args_[1];
     const storage::Digest digest = storage::ComputeDigest(destination);
     auto deleted = co_await g_storage->DeleteLocked(
-        request.db_id_, destination, digest, LocalWrites(*context));
+        request.db_id_, destination, digest, LocalWrites(*context), nullptr,
+        nullptr, request.latency_trace_);
     if (!deleted.ok()) co_return deleted.status();
     if (context->output_.empty()) {
       context->changed_ = *deleted;
@@ -473,6 +477,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
         if (context->validate_move_destination_) {
           if (key.arg_index_ != 2) continue;
           storage::HashOperation length;
+          length.diagnostics_ = request.latency_trace_;
           length.kind_ = storage::HashOperationKind::kLength;
           auto result = co_await g_storage->ExecuteSetLocked(
               request.db_id_, request.args_[2], key.digest_, length);
@@ -481,6 +486,7 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
         }
         if (key.arg_index_ != 1) continue;
         storage::HashOperation contains;
+        contains.diagnostics_ = request.latency_trace_;
         contains.kind_ = storage::HashOperationKind::kGet;
         contains.fields_.push_back(context->move_member_);
         auto result = co_await g_storage->ExecuteSetLocked(
@@ -604,6 +610,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
 
   SetMultiContext context;
   context.request_ = &request;
+  context.add_.diagnostics_ = request.latency_trace_;
+  context.remove_.diagnostics_ = request.latency_trace_;
   context.last_source_arg_ = key_view->last_;
   context.cardinality_limit_ = cardinality_limit;
   const bool store = request.kind_ == CommandKind::kSDiffStore ||
@@ -630,7 +638,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
     context.add_.values_.push_back({});
   }
 
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   for (std::size_t i = key_view->first_; i <= key_view->last_;
        i += key_view->step_) {
     const tx::LockMode lock_mode = move || (store && i == 1)
@@ -666,7 +674,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.tx_writes_.resize(g_storage->worker_count());
     g_storage->InitializeTxWrites(txid, context.tx_writes_,
-                                  ClusterMutationPrecondition(request));
+                                  ClusterMutationPrecondition(request),
+                                  request.latency_trace_);
     for (auto& shard : context.tx_writes_) {
       shard.collect_undo_ = true;
     }

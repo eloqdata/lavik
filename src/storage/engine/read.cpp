@@ -29,6 +29,8 @@ class BatchReadAwaiter;
 struct BatchReadOperation final : bycorf::IoCompletion {
   void Complete(Worker& worker, int result, unsigned flags) override;
 
+  ReadLatencyTrace* trace_ = nullptr;
+  std::uint64_t io_start_ns_ = 0;
   BatchReadAwaiter* batch_ = nullptr;
   Worker* worker_ = nullptr;
   FixedFile file_{};
@@ -51,6 +53,8 @@ class BatchReadAwaiter {
     remaining_ = operations_.size();
     for (BatchReadOperation* operation : operations_) {
       operation->batch_ = this;
+      if (operation->trace_)
+        operation->io_start_ns_ = operation->trace_->NowNanos();
       operation->submit_status_ =
           operation->registered_
               ? operation->worker_->SubmitReadFixed(
@@ -88,6 +92,7 @@ class BatchReadAwaiter {
 void BatchReadOperation::Complete(Worker& worker, int result, unsigned flags) {
   (void)flags;
   result_ = result;
+  if (trace_) trace_->RecordIo(io_start_ns_, trace_->NowNanos());
   batch_->Complete(worker);
 }
 
@@ -229,22 +234,13 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
 
 StorageEngine::RemoteReadAwaitable::RemoteReadAwaitable(
     Impl& engine, std::uint8_t db_id, std::string_view key, std::uint16_t slot,
-    ValueType type, bool metadata_only
-#if LAVIK_ENABLE_TRACE
-    ,
-    ReadLatencyTrace* trace
-#endif
-    )
+    ValueType type, bool metadata_only, ReadLatencyTrace* trace)
     : key_(key),
       slot_(slot),
       db_id_(db_id),
       type_(type),
-      metadata_only_(metadata_only)
-#if LAVIK_ENABLE_TRACE
-      ,
-      trace_(trace)
-#endif
-{
+      metadata_only_(metadata_only),
+      trace_(trace) {
   engine.PrepareRemoteRead(*this);
 }
 
@@ -271,15 +267,16 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   result.generation_ = generation;
   result.db_epoch_ = db_epoch;
   result.replication_epoch_ = replication_epoch;
+  TraceSpanScope lookup(result.trace_ ? result.trace_->diagnostics_ : nullptr,
+                        TraceStage::kLookup);
   auto& index = PartitionFor(source, slot).indexes_[db_id];
   index.PrefetchRead();
   const auto digest = ComputeDigest(key);
   auto reader = index.TryRead(digest);
   if (!reader) return;
   const auto* entry = std::as_const(index).Find(digest, key);
-#if LAVIK_ENABLE_TRACE
-  if (result.trace_) result.trace_->lookup_done_ns_ = ReadTraceNowNanos();
-#endif
+  if (result.trace_ && !result.trace_->diagnostics_)
+    result.trace_->lookup_done_ns_ = result.trace_->NowNanos();
   if (!result.Current(*this)) return;
   if (entry && !entry->key_complete()) return;
   if (entry == nullptr || entry->value_.kind() == RecordKind::kTombstone) {
@@ -346,12 +343,9 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
 
   // Admission is only an optimization. If the local arena cannot fit the
   // record immediately, let the owner reader stream it or wait for a chunk.
-#if LAVIK_ENABLE_TRACE
   if (result.trace_) {
-    result.trace_->hit_ = true;
-    result.trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
+    result.trace_->buffer_acquire_start_ns_ = result.trace_->NowNanos();
   }
-#endif
   auto acquired = local.buffers_.TryAcquireReadBuffer(result.read_bytes_);
   if (!acquired.ok()) {
     // The owner reader can stream a record through smaller arena ranges.
@@ -361,12 +355,11 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
     return;
   }
   result.lease_ = std::move(*acquired);
-#if LAVIK_ENABLE_TRACE
   if (result.trace_) {
-    result.trace_->buffer_acquired_ns_ = ReadTraceNowNanos();
-    result.trace_->heap_read_buffer_ = result.lease_.buffer_id() == 0;
+    result.trace_->buffer_acquired_ns_ = result.trace_->NowNanos();
+    result.trace_->RecordBuffer(result.trace_->buffer_acquire_start_ns_,
+                                result.trace_->buffer_acquired_ns_);
   }
-#endif
   auto buffer = result.lease_.io_buffer();
   assert(result.read_bytes_ <= buffer.size_);
   buffer.size_ = result.read_bytes_;
@@ -374,15 +367,10 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
                      aligned_offset,
                      result.lease_.registered()
                          ? bycorf::SizeIoAwaitable::Operation::kReadFixed
-                         : bycorf::SizeIoAwaitable::Operation::kRead
-#if LAVIK_ENABLE_TRACE
-                     ,
-                     result.trace_
-#endif
-  );
+                         : bycorf::SizeIoAwaitable::Operation::kRead,
+                     result.trace_);
 }
 
-#if LAVIK_ENABLE_TRACE
 StorageEngine::RemoteReadAwaitable::TracedReadIo::TracedReadIo(
     bycorf::Worker& worker, bycorf::FixedFile file, bycorf::FixedBuffer buffer,
     std::uint64_t offset, bycorf::SizeIoAwaitable::Operation operation,
@@ -398,19 +386,25 @@ bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
     std::coroutine_handle<> awaiting) {
   if (trace_) {
     trace_->disk_read_ = true;
-    trace_->io_submit_ns_ = ReadTraceNowNanos();
+    trace_->io_submit_ns_ = trace_->NowNanos();
   }
   auto status = fixed_ ? worker_.SubmitReadFixed(file_, buffer_, offset_, this)
                        : worker_.SubmitRead(
                              file_, std::span(buffer_.data_, buffer_.size_),
                              offset_, this);
-  if (!status.ok() && trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  if (!status.ok() && trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   return Suspend(awaiting, std::move(status));
 }
 
 void StorageEngine::RemoteReadAwaitable::TracedReadIo::Complete(
     bycorf::Worker& worker, int result, unsigned flags) {
-  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  if (trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   OneShotIoAwaitable::Complete(worker, result, flags);
 }
 
@@ -421,7 +415,6 @@ StorageEngine::RemoteReadAwaitable::TracedReadIo::await_resume() {
   worker_.RecordStorageReadCompletion(*result);
   return static_cast<std::size_t>(*result);
 }
-#endif
 
 StorageEngine::RemoteReadAwaitable::Pin::~Pin() {
   if (engine_ != nullptr) {
@@ -457,12 +450,12 @@ StorageEngine::RemoteReadAwaitable::await_resume() {
     return read.ok() ? absl::InternalError("short compact record read")
                      : read.status();
   }
+  TraceSpanScope decode_scope(trace_ ? trace_->diagnostics_ : nullptr,
+                              TraceStage::kDecode);
   auto loaded =
       engine.DecodeRemoteValue(std::move(lease_), db_id_, key_, location_,
                                replication_epoch_, record_headroom_, db_epoch_);
-#if LAVIK_ENABLE_TRACE
-  if (trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
-#endif
+  if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
   if (!Current(engine) || (!loaded.ok() && absl::IsAborted(loaded.status())))
     return std::nullopt;
   if (!loaded.ok()) return loaded.status();
@@ -504,21 +497,32 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
          *routed_partition_id == RedisSlot(key));
   tx::TxShard::Guard key_lock;
   if (acquire_key_lock) {
+    if (trace && !trace->diagnostics_)
+      trace->key_lock_start_ns_ = trace->NowNanos();
+    TraceSpanScope key_wait(trace ? trace->diagnostics_ : nullptr,
+                            TraceStage::kKeyLock);
     key_lock = co_await tx::CurrentTxShard().AcquireKey(
         db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
         lavik::storage::RedisSlot(key));
   }
+  if (acquire_key_lock && trace && !trace->diagnostics_)
+    trace->key_lock_acquired_ns_ = trace->NowNanos();
   WorkerStore& store = CurrentStore();
   auto& partition = routed_partition_id.has_value()
                         ? PartitionFor(store, *routed_partition_id)
                         : PartitionForKey(store, key);
   while (true) {
+    TraceSpanScope lookup_scope(trace ? trace->diagnostics_ : nullptr,
+                                TraceStage::kLookup);
     auto& index = partition.indexes_[db_id];
     auto* found = index.Find(digest, key);
     if (found != nullptr && !found->key_complete()) [[unlikely]] {
       if (optimistic_read) {
         // Verifying an out-of-index key suspends before we know this is the
         // requested key, so there is no lock-free linearization point yet.
+        lookup_scope.End();
+        TraceSpanScope retry_wait(trace ? trace->diagnostics_ : nullptr,
+                                  TraceStage::kKeyLock);
         key_lock = co_await tx::CurrentTxShard().AcquireKey(
             db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
             lavik::storage::RedisSlot(key));
@@ -532,8 +536,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       found = *resolved;
     }
     if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
-      if (trace != nullptr) {
-        trace->lookup_done_ns_ = ReadTraceNowNanos();
+      if (trace != nullptr && !trace->diagnostics_) {
+        trace->lookup_done_ns_ = trace->NowNanos();
       }
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
@@ -541,19 +545,19 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     if (!readable.ok()) co_return readable;
     if (IsExpiredNow(*found)) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
-      if (trace != nullptr) {
-        trace->lookup_done_ns_ = ReadTraceNowNanos();
+      if (trace != nullptr && !trace->diagnostics_) {
+        trace->lookup_done_ns_ = trace->NowNanos();
       }
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
     if (found->value_.value_type() != ValueType::kString) {
       co_return WrongTypeError();
     }
-    if (trace != nullptr) {
-      trace->hit_ = true;
-      trace->lookup_done_ns_ = ReadTraceNowNanos();
+    if (trace != nullptr && !trace->diagnostics_) {
+      trace->lookup_done_ns_ = trace->NowNanos();
     }
 
+    lookup_scope.End();
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      MaterializeIndexLocation(*found),
                                      ExtentsFor(store, found), trace);
@@ -563,6 +567,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       // The key existed at the optimistic lookup, but a concurrent writer may
       // retire its physical record before the I/O path pins it. Do not turn
       // that race into a spurious nil; take the original lock path and reread.
+      TraceSpanScope retry_wait(trace ? trace->diagnostics_ : nullptr,
+                                TraceStage::kKeyLock);
       key_lock = co_await tx::CurrentTxShard().AcquireKey(
           db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
           lavik::storage::RedisSlot(key));
@@ -578,8 +584,11 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
 }
 
 Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
-    std::uint8_t db_id, std::span<const BatchGetRequest> requests) {
+    std::uint8_t db_id, std::span<const BatchGetRequest> requests,
+    OnlineLatencyTrace* diagnostics) {
   assert(db_id < kLogicalDatabaseCount);
+  auto detail = MakeReadTrace(diagnostics);
+  TraceSpanScope lookup_scope(diagnostics, TraceStage::kLookup);
   WorkerStore& store = CurrentStore();
 
   std::vector<BatchGetValue> results;
@@ -643,6 +652,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
     });
   }
 
+  lookup_scope.End();
   struct PendingRead {
     PendingRead(WorkerStore* store, BlockState* state, Candidate candidate,
                 ReadBufferLease lease, std::size_t record_headroom,
@@ -696,7 +706,9 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
           (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
       // Never wait while this wave owns unsubmitted ranges. Submit/drain it
       // first; a record that cannot fit an empty wave uses the chunked reader.
+      TraceSpanScope buffer(diagnostics, TraceStage::kReadBuffer);
       auto acquired = store.buffers_.TryAcquireReadBuffer(read_bytes);
+      buffer.End();
       if (!acquired.ok()) {
         if (absl::IsResourceExhausted(acquired.status())) {
           if (!wave.empty()) break;
@@ -730,6 +742,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
       const auto [file_id, unused_block_offset] =
           FileOffset(location.block_id());
       (void)unused_block_offset;
+      pending->operation_.trace_ = detail.get();
       pending->operation_.worker_ = store.worker_;
       pending->operation_.file_ = store.files_[file_id];
       pending->operation_.buffer_ = io;
@@ -768,6 +781,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
         continue;
       }
 
+      TraceSpanScope decode(diagnostics, TraceStage::kDecode);
       const RecordLocation& location = pending->candidate_.location_;
       const FixedBuffer io = pending->lease_.io_buffer();
       const std::byte* record_data = io.data_ + pending->record_headroom_;
@@ -822,7 +836,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
   for (const std::size_t index : fallbacks) {
     const BatchGetRequest& request = requests[index];
     auto value =
-        co_await GetLocked(db_id, request.key_, request.digest_, nullptr);
+        co_await GetLocked(db_id, request.key_, request.digest_, detail.get());
     if (value.ok()) {
       const std::span<const std::byte> bytes = value->value_bytes();
       results[index] = std::optional<std::string>(
@@ -840,17 +854,21 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLength(
-    std::uint8_t db_id, std::string_view key) {
+    std::uint8_t db_id, std::string_view key, OnlineLatencyTrace* diagnostics) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  TraceSpanScope key_wait(diagnostics, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
       lavik::storage::RedisSlot(key));
-  co_return co_await StringLengthLocked(db_id, key, digest);
+  key_wait.End();
+  co_return co_await StringLengthLocked(db_id, key, digest, diagnostics);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
+  TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -880,32 +898,37 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
 }
 
 Task<absl::StatusOr<ExpirationInfo>> StorageEngine::ReadKeyMetadata(
-    std::uint8_t db_id, std::string_view key) {
-  return impl_->ReadKeyMetadata(db_id, key);
+    std::uint8_t db_id, std::string_view key, OnlineLatencyTrace* diagnostics) {
+  return impl_->ReadKeyMetadata(db_id, key, diagnostics);
 }
 
 Task<absl::StatusOr<ExpirationInfo>> StorageEngine::ReadKeyMetadataLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
-  return impl_->ReadKeyMetadataLocked(db_id, key, digest);
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
+  return impl_->ReadKeyMetadataLocked(db_id, key, digest, diagnostics);
 }
 
 Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadata(
-    std::uint8_t db_id, std::string_view key) {
+    std::uint8_t db_id, std::string_view key, OnlineLatencyTrace* diagnostics) {
   if (db_id >= options_.database_count_)
     co_return absl::InvalidArgumentError("invalid logical database");
   const auto digest = ComputeDigest(key);
+  TraceSpanScope key_wait(diagnostics, TraceStage::kKeyLock);
   auto hold = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kShared,
       lavik::storage::RedisSlot(key));
-  co_return co_await ReadKeyMetadataLocked(db_id, key, digest);
+  key_wait.End();
+  co_return co_await ReadKeyMetadataLocked(db_id, key, digest, diagnostics);
 }
 
 Task<absl::StatusOr<ExpirationInfo>> StorageEngine::Impl::ReadKeyMetadataLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
   if (db_id >= options_.database_count_ || digest != ComputeDigest(key))
     co_return absl::InvalidArgumentError("invalid metadata key identity");
   auto& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  TraceSpanScope lookup(diagnostics, TraceStage::kLookup);
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
@@ -974,11 +997,16 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
 }
 
 Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    OnlineLatencyTrace* diagnostics) {
   assert(db_id < kLogicalDatabaseCount);
+  auto detail = MakeReadTrace(diagnostics);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  TraceSpanScope store_wait(diagnostics, TraceStage::kStoreLock);
   co_await store.store_state_mutex_.Lock();
+  store_wait.End();
+  TraceSpanScope lookup_scope(diagnostics, TraceStage::kLookup);
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
   auto& index = partition.indexes_[db_id];
@@ -1006,9 +1034,10 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   const std::uint64_t db_epoch = DbEpoch(db_id);
   const std::uint64_t replication_epoch = partition.replication_epoch_;
   unlock.Unlock();
+  lookup_scope.End();
 
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                   location, extents);
+                                   location, extents, detail.get());
   if (!loaded.ok()) co_return loaded.status();
   if (store.index_generations_[db_id] != index_generation ||
       DbEpoch(db_id) != db_epoch ||
@@ -1243,16 +1272,19 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
 }
 
 StorageEngine::Impl::ReadExtentAwaitable StorageEngine::Impl::ReadExtentOnOwner(
-    ExtentRef ref, std::uint32_t extent_index, std::byte* destination) {
+    ExtentRef ref, std::uint32_t extent_index, std::byte* destination,
+    ReadLatencyTrace* trace) {
   return ReadExtentAwaitable(*this, CurrentStore(), ref, extent_index, 0,
-                             std::span(destination, ref.payload_bytes_), true);
+                             std::span(destination, ref.payload_bytes_), true,
+                             trace);
 }
 
 StorageEngine::Impl::ReadExtentAwaitable StorageEngine::Impl::ReadExtentSlice(
     WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::size_t source_offset, std::span<std::byte> destination) {
+    std::size_t source_offset, std::span<std::byte> destination,
+    ReadLatencyTrace* trace) {
   return ReadExtentAwaitable(*this, store, ref, extent_index, source_offset,
-                             destination);
+                             destination, false, trace);
 }
 
 Task<absl::Status>
@@ -1261,18 +1293,20 @@ StorageEngine::Impl::ReadExtentAwaitable::RemoteRead::operator()() {
   // below supplies the I/O and pool continuation without another loader frame.
   co_return co_await engine_->ReadExtentSlice(*engine_->stores_[owner_], ref_,
                                               extent_index_, source_offset_,
-                                              destination_);
+                                              destination_, trace_);
 }
 
 StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
     Impl& engine, WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
-    std::size_t source_offset, std::span<std::byte> destination, bool route)
+    std::size_t source_offset, std::span<std::byte> destination, bool route,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       ref_(ref),
       extent_index_(extent_index),
       source_offset_(source_offset),
-      destination_(destination) {
+      destination_(destination),
+      trace_(trace) {
   if (source_offset > ref.payload_bytes_ ||
       destination.size() > ref.payload_bytes_ - source_offset) {
     ready_ = absl::InvalidArgumentError("extent slice is out of range");
@@ -1287,7 +1321,7 @@ StorageEngine::Impl::ReadExtentAwaitable::ReadExtentAwaitable(
     if (owner != store.worker_->id()) {
       remote_.emplace(bycorf::SubmitTaskTo(
           owner, RemoteRead{&engine, owner, ref, extent_index, source_offset,
-                            destination}));
+                            destination, trace}));
       return;
     }
   }
@@ -1311,6 +1345,7 @@ StorageEngine::Impl::ReadExtentAwaitable::~ReadExtentAwaitable() {
 }
 
 void StorageEngine::Impl::ReadExtentAwaitable::PrepareBuffer() {
+  const auto started = trace_ ? trace_->NowNanos() : 0;
   auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
   // Force the extent's full-range probe to fail independently of record reads
   // so end-to-end recovery tests can exercise streaming without stalling it.
@@ -1322,6 +1357,7 @@ void StorageEngine::Impl::ReadExtentAwaitable::PrepareBuffer() {
       });
   if (acquired.ok()) {
     lease_ = std::move(*acquired);
+    if (trace_) trace_->RecordBuffer(started, trace_->NowNanos());
   } else if (absl::IsResourceExhausted(acquired.status()) &&
              store_.buffers_.read_capacity_bytes() != 0) {
     // Stream through a smaller arena range without any dynamic DMA allocation.
@@ -1359,6 +1395,7 @@ bool StorageEngine::Impl::ReadExtentAwaitable::SubmitRead(
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
   const auto [file_id, offset] = engine_.FileOffset(ref_.block_id_);
+  if (trace_) io_start_ns_ = trace_->NowNanos();
   return Suspend(
       awaiting, lease_.registered()
                     ? store_.worker_->SubmitReadFixed(store_.files_[file_id],
@@ -1372,12 +1409,15 @@ absl::Status StorageEngine::Impl::ReadExtentAwaitable::await_resume() {
   if (remote_) return remote_->await_resume();
   if (ready_) return std::move(*ready_);
   if (chunked_.valid()) return std::move(chunked_).TakeResult();
+  if (trace_) trace_->RecordIo(io_start_ns_, trace_->NowNanos());
   auto read =
       Resume(lease_.registered() ? "fixed-buffer read failed" : "read failed");
   if (!read.ok()) return read.status();
   store_.worker_->RecordStorageReadCompletion(*read);
   if (static_cast<std::size_t>(*read) != read_bytes_)
     return absl::InternalError("short extent block read");
+  TraceSpanScope decode_scope(trace_ ? trace_->diagnostics_ : nullptr,
+                              TraceStage::kDecode);
   const auto buffer = lease_.io_buffer();
   BlockHeader header{};
   if (!DecodeHeader(std::span<const std::byte, kBlockHeaderBytes>(
@@ -1408,7 +1448,9 @@ bool StorageEngine::Impl::ReadExtentAwaitable::DecodeHeader(
 }
 
 Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
+  const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
+  if (trace_) trace_->RecordBuffer(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   const auto capacity = chunk.io_buffer().size_;
@@ -1419,19 +1461,34 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
   for (std::size_t offset = 0; offset < header_bytes.size();) {
     auto buffer = chunk.io_buffer();
     buffer.size_ = std::min(capacity, header_bytes.size() - offset);
+    const auto io_start = trace_ ? trace_->NowNanos() : 0;
     auto read = co_await ReadStorageBuffer(
         *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
         block_offset + offset);
+    LAVIK_FAULT_INJECT(
+        if (trace_ &&
+            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+          auto delayed = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
+          if (!delayed.ok()) co_return delayed;
+        });
+    if (trace_) trace_->RecordIo(io_start, trace_->NowNanos());
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
       co_return absl::InternalError("short extent block read");
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
     std::memcpy(header_bytes.data() + offset, buffer.data_, buffer.size_);
     offset += buffer.size_;
   }
   BlockHeader header{};
-  if (!DecodeHeader(header_bytes, header))
-    co_return absl::InternalError("extent header does not match manifest");
+  {
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
+    if (!DecodeHeader(header_bytes, header))
+      co_return absl::InternalError("extent header does not match manifest");
+  }
 
   // Preserve the full-read contract: no caller-visible bytes change on I/O or
   // checksum failure, including corruption outside a requested slice. Only
@@ -1444,13 +1501,24 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
     auto buffer = chunk.io_buffer();
     const auto remaining = ref_.payload_bytes_ - offset;
     buffer.size_ = std::min(capacity, AlignDirect(remaining));
+    const auto io_start = trace_ ? trace_->NowNanos() : 0;
     auto read = co_await ReadStorageBuffer(
         *store_.worker_, store_.files_[file_id], buffer, chunk.registered(),
         block_offset + kBlockHeaderBytes + offset);
+    LAVIK_FAULT_INJECT(
+        if (trace_ &&
+            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+          auto delayed = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
+          if (!delayed.ok()) co_return delayed;
+        });
+    if (trace_) trace_->RecordIo(io_start, trace_->NowNanos());
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
       co_return absl::InternalError("short extent block read");
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
     const auto payload_bytes = std::min(remaining, buffer.size_);
     if (!header.extent_no_crc_) {
       checksum = absl::ExtendCrc32c(
@@ -1466,6 +1534,8 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentAwaitable::ReadInChunks() {
                   buffer.data_ + begin - offset, end - begin);
     offset += payload_bytes;
   }
+  TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                        TraceStage::kDecode);
   if (!header.extent_no_crc_ &&
       static_cast<std::uint32_t>(checksum) != ref_.payload_checksum_)
     co_return absl::InternalError("extent payload checksum mismatch");
@@ -1616,7 +1686,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                            "external string length does not match metadata");
   }
   if (trace != nullptr) {
-    trace->buffer_acquire_start_ns_ = ReadTraceNowNanos();
+    trace->buffer_acquire_start_ns_ = trace->NowNanos();
   }
   // Extents are read into their own I/O leases and copied here. The output
   // needs neither DMA memory nor a fixed slot; holding a slot while awaiting
@@ -1632,12 +1702,13 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                            "external value exceeds read buffer capacity");
   }
   if (trace != nullptr) {
-    trace->buffer_acquired_ns_ = ReadTraceNowNanos();
-    trace->heap_read_buffer_ = output.buffer_id() == 0;
+    trace->buffer_acquired_ns_ = trace->NowNanos();
+    trace->RecordBuffer(trace->buffer_acquire_start_ns_,
+                        trace->buffer_acquired_ns_);
     trace->disk_read_ = true;
   }
   if (trace != nullptr) {
-    trace->io_submit_ns_ = ReadTraceNowNanos();
+    trace->io_submit_ns_ = trace->NowNanos();
   }
   // Validate the complete manifest before reading into the output buffer.
   std::size_t checked_bytes = 0;
@@ -1658,7 +1729,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     const ExtentRef& ref = extents->at(index);
     const absl::Status read =
         co_await ReadExtentOnOwner(ref, static_cast<std::uint32_t>(index),
-                                   destination.data_ + output_offset);
+                                   destination.data_ + output_offset, trace);
     if (!read.ok()) co_return read;
     output_offset += ref.payload_bytes_;
   }
@@ -1667,7 +1738,8 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                            "external value length does not match manifest");
   }
   if (trace != nullptr) {
-    trace->io_complete_ns_ = ReadTraceNowNanos();
+    trace->io_complete_ns_ = trace->NowNanos();
+
     trace->decode_done_ns_ = trace->io_complete_ns_;
   }
   const std::size_t value_offset =
@@ -1712,9 +1784,10 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
   if (location.grouped()) {
     // The grouped task owns its graph/version protocol. Keep its borrowed
     // digest in this awaitable, not in the constructor's argument lifetime.
-    slow_ = engine.LoadGroupedValue(store, partition, db_id, key, digest_,
-                                    location, std::move(grouped_snapshot),
-                                    GroupedValueEncoding::kLogicalStream);
+    slow_ =
+        engine.LoadGroupedValue(store, partition, db_id, key, digest_, location,
+                                std::move(grouped_snapshot),
+                                GroupedValueEncoding::kLogicalStream, trace);
   } else if (location.external() ||
              location.block_owner() != store.worker_->id()) {
     slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
@@ -1770,7 +1843,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
       (record_headroom_ + location_.total_disk_bytes() + mask) & ~mask;
   bool chunked = false;
   if (!lease_.valid()) {
-    if (trace_) trace_->buffer_acquire_start_ns_ = ReadTraceNowNanos();
+    if (trace_) trace_->buffer_acquire_start_ns_ = trace_->NowNanos();
     auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
     if (!acquired.ok() && absl::IsResourceExhausted(acquired.status()) &&
         read_bytes_ <= engine_.direct_io_alignment_) {
@@ -1798,8 +1871,9 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
     lease_ = std::move(*acquired);
   }
   if (trace_) {
-    trace_->buffer_acquired_ns_ = ReadTraceNowNanos();
-    trace_->heap_read_buffer_ = lease_.buffer_id() == 0;
+    trace_->buffer_acquired_ns_ = trace_->NowNanos();
+    trace_->RecordBuffer(trace_->buffer_acquire_start_ns_,
+                         trace_->buffer_acquired_ns_);
   }
   // Resolve staging memory only after acquiring the buffer: waiting can let
   // flush/defrag retire it. The staged copy itself never suspends, so only
@@ -1852,22 +1926,35 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
   // PrepareLocal pins the physical incarnation before this task can wait.
   // Keep the pin across every chunk, and validate the complete private image
   // with the same decoder/checksum rules as a single read before publishing it.
+  const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
+  if (trace_) trace_->RecordBuffer(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   if (PopulationChanged()) co_return absl::NotFoundError("key not found");
-  if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
+  if (trace_) trace_->io_submit_ns_ = trace_->NowNanos();
   for (std::size_t offset = 0; offset < read_bytes_;) {
     auto buffer = chunk.io_buffer();
     buffer.size_ = std::min(buffer.size_, read_bytes_ - offset);
+    const auto io_start = trace_ ? trace_->NowNanos() : 0;
     auto read = co_await ReadStorageBuffer(
         *store_.worker_, store_.files_[file_id_], buffer, chunk.registered(),
         aligned_offset_ + offset);
-    if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+    LAVIK_FAULT_INJECT(
+        if (trace_ &&
+            LAVIK_FAULT_MATCHES("LAVIK_LATENCY_PAUSE_READ_COMPLETION", "1")) {
+          auto delayed = co_await fault_injection::PauseWhileFileExists(
+              "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
+          if (!delayed.ok()) co_return delayed;
+        });
+    if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
+    if (trace_) trace_->RecordIo(io_start, trace_->io_complete_ns_);
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
       co_return absl::InternalError("short compact record read");
+    TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                          TraceStage::kDecode);
     std::memcpy(lease_.io_buffer().data_ + offset, buffer.data_, buffer.size_);
     offset += buffer.size_;
   }
@@ -1958,7 +2045,7 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
   if (ready_) return awaiting;
   auto buffer = lease_.io_buffer();
   buffer.size_ = read_bytes_;
-  if (trace_) trace_->io_submit_ns_ = ReadTraceNowNanos();
+  if (trace_) trace_->io_submit_ns_ = trace_->NowNanos();
   auto status =
       lease_.registered()
           ? store_.worker_->SubmitReadFixed(store_.files_[file_id_], buffer,
@@ -1967,7 +2054,10 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
                                        std::span(buffer.data_, buffer.size_),
                                        aligned_offset_, this);
   if (Suspend(awaiting, status)) return std::noop_coroutine();
-  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  if (trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   if (partition_ && absl::IsAborted(status)) {
     Retry(std::move(status));
     return SuspendRead(awaiting);
@@ -1978,7 +2068,10 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
 void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
                                                        int bytes,
                                                        unsigned flags) {
-  if (trace_) trace_->io_complete_ns_ = ReadTraceNowNanos();
+  if (trace_) {
+    trace_->io_complete_ns_ = trace_->NowNanos();
+    trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
+  }
   if (bytes >= 0) worker.RecordStorageReadCompletion(bytes);
   if (partition_ && bytes >= 0 &&
       static_cast<std::size_t>(bytes) == read_bytes_) {
@@ -2027,6 +2120,8 @@ StorageEngine::Impl::LoadValueAwaitable::await_resume() {
 absl::StatusOr<StorageEngine::Impl::LoadValueAwaitable::Payload>
 StorageEngine::Impl::LoadValueAwaitable::ParseRecord(
     const std::byte* data) const {
+  TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                        TraceStage::kDecode);
   RecordHeader record{};
   std::string_view disk_key;
   if (!DecodeRecordHeader(std::span(data, location_.total_disk_bytes()),
@@ -2059,6 +2154,9 @@ StorageEngine::Impl::LoadValueAwaitable::Result
 StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
                                                       Payload payload,
                                                       bool staged) {
+  // Staged and chunked reads finish before await_resume; time the work here.
+  TraceSpanScope decode(trace_ ? trace_->diagnostics_ : nullptr,
+                        TraceStage::kDecode);
   const auto* value = data + payload.offset_;
   if (!payload.no_crc_ &&
       Crc32c(std::span(value, payload.bytes_)) != payload.checksum_)
@@ -2068,7 +2166,7 @@ StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
     value = lease_.io_buffer().data_;
   }
   const auto offset = static_cast<std::size_t>(value - lease_.bytes().data());
-  if (trace_) trace_->decode_done_ns_ = ReadTraceNowNanos();
+  if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
   return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
 }
 

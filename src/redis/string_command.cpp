@@ -31,6 +31,7 @@
 #include "cluster_gate.h"
 #include "lavik/error_detail.h"
 #include "lavik/expiration.h"
+#include "lavik/latency_diagnostics.h"
 #include "lavik/memory.h"
 #include "lavik/redis_parse.h"
 #include "lavik/resp.h"
@@ -71,8 +72,10 @@ absl::Status WrongType() { return WrongTypeError(); }
 
 bycorf::Task<absl::StatusOr<std::optional<storage::RawValue>>>
 ReadOptionalStringLocked(std::uint8_t db_id, std::string_view key,
-                         const storage::Digest& digest) {
-  auto value = co_await g_storage->ReadRawValueLocked(db_id, key, digest);
+                         const storage::Digest& digest,
+                         OnlineLatencyTrace* diagnostics = nullptr) {
+  auto value =
+      co_await g_storage->ReadRawValueLocked(db_id, key, digest, diagnostics);
   if (!value.ok()) {
     if (value.status().code() == absl::StatusCode::kNotFound) {
       co_return std::optional<storage::RawValue>{};
@@ -491,6 +494,7 @@ bycorf::Task<EncodedCommandReply> RunBitmapLocked(
       request.kind_ == CommandKind::kSetBit) {
     const bool write = request.kind_ == CommandKind::kSetBit;
     storage::StringSegmentOperation operation{
+        .diagnostics_ = request.latency_trace_,
         .kind_ = write ? storage::StringSegmentOperation::Kind::kSetBit
                        : storage::StringSegmentOperation::Kind::kGetBit,
         .start_ = static_cast<std::int64_t>(bit_offset),
@@ -652,7 +656,8 @@ bycorf::Task<EncodedCommandReply> RunBitmapLocked(
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db, key, digest, storage::ValueType::kString, read_only, callback, tx, 0,
-      replication ? &*replication : nullptr, mutation_precondition);
+      replication ? &*replication : nullptr, mutation_precondition,
+      {.diagnostics_ = request.latency_trace_});
   co_return status.ok() ? reply : StorageError(status);
 }
 
@@ -702,6 +707,16 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
           : std::nullopt;
   std::optional<std::uint64_t> getex_deadline;
 
+  // Conditional/return-old SET variants bypass the ordinary SET handler.
+  // Their physical sidecar must remain private to this owner invocation.
+  std::unique_ptr<SetLatencyTrace> set_detail;
+  if (request.latency_trace_ && (request.kind_ == CommandKind::kSetEx ||
+                                 request.kind_ == CommandKind::kPSetEx ||
+                                 request.kind_ == CommandKind::kSetNx ||
+                                 request.kind_ == CommandKind::kGetSet)) {
+    set_detail = std::make_unique<SetLatencyTrace>();
+    set_detail->diagnostics_ = request.latency_trace_;
+  }
   if (request.kind_ == CommandKind::kSetEx ||
       request.kind_ == CommandKind::kPSetEx) {
     const bool seconds = request.kind_ == CommandKind::kSetEx;
@@ -714,9 +729,10 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
     }
     storage::SetOptions options;
     options.expire_at_ms_ = *expire_at;
-    auto result = co_await g_storage->SetLocked(
-        db, key, digest, args[3], options, tx,
-        replication ? &*replication : nullptr, nullptr, mutation_precondition);
+    auto result =
+        co_await g_storage->SetLocked(db, key, digest, args[3], options, tx,
+                                      replication ? &*replication : nullptr,
+                                      set_detail.get(), mutation_precondition);
     if (result.ok() && result->applied_ &&
         request.replication_capture_ != nullptr) {
       CaptureReplicationCommand(request, {"SET", args[1], args[3], "PXAT",
@@ -729,9 +745,10 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
   if (request.kind_ == CommandKind::kSetNx) {
     storage::SetOptions options;
     options.condition_ = storage::SetCondition::kIfAbsent;
-    auto result = co_await g_storage->SetLocked(
-        db, key, digest, args[2], options, tx,
-        replication ? &*replication : nullptr, nullptr, mutation_precondition);
+    auto result =
+        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
+                                      replication ? &*replication : nullptr,
+                                      set_detail.get(), mutation_precondition);
     if (result.ok() && result->applied_ &&
         request.replication_capture_ != nullptr) {
       CaptureReplicationCommand(request, {"SET", args[1], args[2]});
@@ -743,9 +760,10 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
   if (request.kind_ == CommandKind::kGetSet) {
     storage::SetOptions options;
     options.return_old_value_ = true;
-    auto result = co_await g_storage->SetLocked(
-        db, key, digest, args[2], options, tx,
-        replication ? &*replication : nullptr, nullptr, mutation_precondition);
+    auto result =
+        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
+                                      replication ? &*replication : nullptr,
+                                      set_detail.get(), mutation_precondition);
     if (!result.ok()) co_return StorageError(result.status());
     if (request.replication_capture_ != nullptr)
       CaptureReplicationCommand(request, {"SET", args[1], args[2]});
@@ -772,6 +790,7 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
       request.kind_ == CommandKind::kAppend) {
     const bool append = request.kind_ == CommandKind::kAppend;
     storage::StringSegmentOperation operation{
+        .diagnostics_ = request.latency_trace_,
         .kind_ = append ? storage::StringSegmentOperation::Kind::kAppend
                         : storage::StringSegmentOperation::Kind::kWriteRange,
         .start_ = first_integer,
@@ -986,7 +1005,8 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db, key, digest, storage::ValueType::kString, false, callback, tx, 0,
-      replication ? &*replication : nullptr, mutation_precondition);
+      replication ? &*replication : nullptr, mutation_precondition,
+      {.diagnostics_ = request.latency_trace_});
   if (status.ok() && !captured_args.empty()) {
     CaptureReplicationCommand(request, std::move(captured_args));
   }
@@ -1176,7 +1196,7 @@ bycorf::Task<absl::Status> LcsReadCallback(void* opaque,
   for (const tx::TxKey& key : slice.keys_) {
     auto value = co_await ReadOptionalStringLocked(
         context->request_->db_id_, context->request_->args_[key.arg_index_],
-        key.digest_);
+        key.digest_, context->request_->latency_trace_);
     if (!value.ok()) {
       if (value.status().message().starts_with("WRONGTYPE ")) {
         co_return absl::InvalidArgumentError(
@@ -1317,7 +1337,7 @@ bycorf::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
     if (key.arg_index_ < 3) continue;
     auto value = co_await ReadOptionalStringLocked(
         context->request_->db_id_, context->request_->args_[key.arg_index_],
-        key.digest_);
+        key.digest_, context->request_->latency_trace_);
     if (!value.ok()) co_return value.status();
     context->inputs_[key.arg_index_] =
         value->has_value() ? std::move((**value).encoded_) : std::string{};
@@ -1339,12 +1359,15 @@ bycorf::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,
   if (context->output_.empty()) {
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, request.args_[2], digest, tx, nullptr,
-        mutation_precondition);
+        mutation_precondition, request.latency_trace_);
     co_return deleted.ok() ? absl::OkStatus() : deleted.status();
   }
+  auto detail =
+      request.latency_trace_ ? std::make_unique<SetLatencyTrace>() : nullptr;
+  if (detail) detail->diagnostics_ = request.latency_trace_;
   auto written = co_await g_storage->SetLocked(
       request.db_id_, request.args_[2], digest, context->output_, {}, tx,
-      nullptr, nullptr, mutation_precondition);
+      nullptr, detail.get(), mutation_precondition);
   co_return written.ok() ? absl::OkStatus() : written.status();
 }
 
@@ -1386,10 +1409,12 @@ bycorf::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
   const storage::Digest digest = storage::ComputeDigest(request.args_[1]);
   const bool read_only = request.kind_ == CommandKind::kGetRange ||
                          request.kind_ == CommandKind::kSubstr;
+  TraceSpanScope key_wait(request.latency_trace_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       request.db_id_, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(request.args_[1]));
+  key_wait.End();
   const storage::MutationPrecondition mutation_precondition =
       ClusterMutationPrecondition(request);
   co_return co_await ExecuteStringCommandLocked(
@@ -1412,7 +1437,8 @@ bycorf::Task<CommandReply> ExecuteStringCommandLocked(
     }
     auto result = co_await g_storage->ExecuteStringSegmentLocked(
         request.db_id_, request.args_[1], digest,
-        {.kind_ = storage::StringSegmentOperation::Kind::kReadRange,
+        {.diagnostics_ = request.latency_trace_,
+         .kind_ = storage::StringSegmentOperation::Kind::kReadRange,
          .start_ = start,
          .stop_ = stop,
          .value_ = {}});
@@ -1431,10 +1457,12 @@ bycorf::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
   const storage::Digest digest = storage::ComputeDigest(request.args_[1]);
   const bool read_only = request.kind_ != CommandKind::kSetBit &&
                          request.kind_ != CommandKind::kBitField;
+  TraceSpanScope key_wait(request.latency_trace_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       request.db_id_, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(request.args_[1]));
+  key_wait.End();
   const storage::MutationPrecondition mutation_precondition =
       ClusterMutationPrecondition(request);
   co_return co_await ExecuteBitmapCommandLocked(
@@ -1458,7 +1486,7 @@ bycorf::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
         CommandErrorReasonForStatus(operation.status()),
         absl::StrCat("ERR ", operation.status().message())));
   }
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   transaction.AddKey(g_storage->OwnerForKey(request.args_[2]), request.db_id_,
                      storage::ComputeDigest(request.args_[2]), 2,
                      tx::LockMode::kExclusive,
@@ -1564,7 +1592,7 @@ bycorf::Task<EncodedCommandReply> ExecuteBitOpLocked(
       co_return EncodeCommandError("ERR BITOP source key is missing");
     auto read = [&request, key, argument]() {
       return ReadOptionalStringLocked(request.db_id_, request.args_[argument],
-                                      key->digest_);
+                                      key->digest_, request.latency_trace_);
     };
     absl::StatusOr<std::optional<storage::RawValue>> value{
         absl::UnknownError("BITOP source read was not dispatched")};
@@ -1604,7 +1632,7 @@ bycorf::Task<EncodedCommandReply> ExecuteBitOpLocked(
 
 bycorf::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
                                              ReplyBuilder& reply_builder) {
-  tx::Transaction transaction;
+  tx::Transaction transaction(request.latency_trace_);
   for (std::size_t argument = 1; argument <= 2; ++argument) {
     transaction.AddKey(
         g_storage->OwnerForKey(request.args_[argument]), request.db_id_,
@@ -1656,7 +1684,7 @@ bycorf::Task<EncodedCommandReply> ExecuteLcsLocked(
     if (key == nullptr) co_return EncodeCommandError("ERR LCS key is missing");
     auto read = [&request, key, argument]() {
       return ReadOptionalStringLocked(request.db_id_, request.args_[argument],
-                                      key->digest_);
+                                      key->digest_, request.latency_trace_);
     };
     absl::StatusOr<std::optional<storage::RawValue>> value{
         absl::UnknownError("LCS source read was not dispatched")};
