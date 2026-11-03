@@ -103,8 +103,9 @@ class Transaction {
               std::uint32_t arg_index, LockMode mode,
               std::uint16_t slot = storage::kLogicalStorageShards);
 
-  // Groups keys by shard and builds the deduplicated lock sets. No keys may
-  // be added afterwards (spans into the internal vectors are handed out).
+  // Groups keys by shard and builds deduplicated lock sets using MergeLockModes
+  // so repeated keys retain every access requirement. No keys may be added
+  // afterwards (spans into the internal vectors are handed out).
   void Seal();
 
   bool single_shard() const { return shards_.size() == 1; }

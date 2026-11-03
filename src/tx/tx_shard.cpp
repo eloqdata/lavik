@@ -135,8 +135,15 @@ void TxShard::Poll() {
     queue_.PopFront();
     if (worker_ != nullptr) {
       worker_->Enqueue(resume);
-      // The resumed head releases through its Guard, which re-polls; later
-      // entries wait for its holds anyway.
+      // A reader drain or an earlier X can queue compatible S/IS/IX holders.
+      // Grant the compatible prefix before their queued resumptions, rather
+      // than making each wait for its predecessor's IO and release. CanHoldAll
+      // still stops at the first conflicting waiter (including a queued X).
+      if (head->keys_.size() == 1 &&
+          head->keys_.front().mode_ != LockMode::kExclusive)
+        continue;
+      // X and key-set acquisitions retain their existing wake scheduling:
+      // the resumed head releases through its Guard, which re-polls.
       break;
     }
     // Unbound (test) mode: run inline. The guard's release re-enters Poll and

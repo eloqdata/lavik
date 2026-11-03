@@ -39,10 +39,24 @@ struct LockFpIdentityHash {
   std::size_t operator()(LockFp fp) const noexcept { return fp; }
 };
 
+// S protects the complete key from writes. IS and IX allow partial readers
+// and writers, whose callers must separately arbitrate sub-key conflicts.
+// IS is compatible with IS, S and IX; S with S; IX with IX. X excludes every
+// mode. Modes apply to queued intents and executing holds, including IO waits.
 enum class LockMode : std::uint8_t {
   kShared,
   kExclusive,
+  kIntentExclusive,
+  kIntentShared,
 };
+
+// Combine requirements for one deduplicated key. Every mode subsumes IS.
+// S and IX together conservatively require X: there is no separate SIX mode.
+constexpr LockMode MergeLockModes(LockMode left, LockMode right) noexcept {
+  if (left == LockMode::kIntentShared) return right;
+  if (right == LockMode::kIntentShared) return left;
+  return left == right ? left : LockMode::kExclusive;
+}
 
 // One key of a transaction's lock set: fingerprint, requested mode, and the
 // logical database whose lock table arbitrates it. Carrying the database per

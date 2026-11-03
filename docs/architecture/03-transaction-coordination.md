@@ -60,11 +60,13 @@ The caller-facing interfaces are:
 
 `Seal` groups keys by owner while preserving their argument order within each
 owner's slice. Callback slices retain duplicate arguments and full digests.
-The lock set is separately deduplicated by `(database, fingerprint)`, with an
-exclusive occurrence upgrading a shared occurrence. The fingerprint is the
-64-bit storage SipHash under the runtime's random seed, which a clean-shutdown
-checkpoint may retain across restart; callbacks still access storage by digest
-and full key, so a collision can add contention but cannot alias records.
+The lock set is separately deduplicated by `(database, fingerprint)`, combining
+all occurrences' requirements. Every mode subsumes IS; combining S with IX
+conservatively requires X, since there is no separate SIX mode. The fingerprint
+is the 64-bit storage SipHash under the runtime's random seed, which a
+clean-shutdown checkpoint may retain across restart; callbacks still access
+storage by digest and full key, so a collision can add contention but cannot
+alias records.
 
 Each logical database has a separate lock table on every worker. A lock entry
 has two counter layers:
@@ -73,6 +75,20 @@ has two counter layers:
   conflicting operation from barging;
 - holds cover callbacks that are currently executing or suspended and tell the
   queue when a conflicting predecessor has actually drained.
+
+The lock API supports shared (S), exclusive (X), intent-shared (IS), and
+intent-exclusive (IX) modes. IS is compatible with IS, S and IX; S with S;
+IX with IX. All other pairs conflict. IS/IX permit partial readers and writers
+to overlap; callers must separately arbitrate their sub-key conflicts. Storage
+command paths currently request only S or X. IS/IX are distinct from the
+scheduling-intent counter layer: all modes register intents, and conflicting
+queued intents prevent later arrivals from barging. In particular, a queued
+S or X blocks new IX arrivals, while only a queued X blocks new IS arrivals.
+After a conflicting hold or remote-reader drain clears, the compatible prefix
+of single-key S/IS/IX waiters can be granted before their coroutines resume;
+the first conflicting waiter stops that drain. Cancelling a queued acquisition
+repolls eligibility so compatible successors need not wait for unrelated IO
+to finish.
 
 Storage binds admission hooks to each shard. Recording a key intent closes its
 index reader stripe before hold acquisition, and releasing or cancelling that
