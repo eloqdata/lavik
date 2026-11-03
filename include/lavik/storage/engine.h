@@ -1112,7 +1112,7 @@ struct CompactAccessOptions {
   bool metadata_only_ = false;
   bool stream_trim_ = false;
   bool stream_header_ = false;
-  std::optional<StreamInspectAccess> stream_inspect_;
+  std::optional<StreamInspectAccess> stream_inspect_ = std::nullopt;
   std::optional<StreamRangeAccess> stream_range_ = std::nullopt;
   std::optional<StreamDeleteAccess> stream_delete_ = std::nullopt;
   std::optional<StreamAckAccess> stream_ack_ = std::nullopt;
