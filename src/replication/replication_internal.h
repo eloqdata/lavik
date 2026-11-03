@@ -402,7 +402,10 @@ Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     TcpStream& stream);
 
-Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream);
+// Read a CRLF-terminated line without consuming bytes from the next payload.
+// Only Redis PSYNC replies and RDB headers permit leading bare-LF keepalives.
+Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream,
+                                           bool skip_keepalives = false);
 
 Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream);
 

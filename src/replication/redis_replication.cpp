@@ -55,7 +55,7 @@ absl::StatusOr<RedisPsyncReply> ParseRedisPsyncReply(std::string_view line) {
 }
 
 Task<absl::StatusOr<std::string>> ReceiveRedisRdb(TcpStream& stream) {
-  auto header = co_await ReadLine(stream);
+  auto header = co_await ReadLine(stream, /*skip_keepalives=*/true);
   if (!header.ok()) co_return header.status();
   if (header->empty() || header->front() != '$' ||
       header->starts_with("$EOF:")) {
@@ -1728,7 +1728,7 @@ auto ReplicationManager::ReplicationGroup::StartRedisPsync(
   const std::string encoded = EncodeRespCommand(command);
   status = co_await WriteText(stream, encoded);
   if (!status.ok()) co_return status;
-  auto response = co_await ReadLine(stream);
+  auto response = co_await ReadLine(stream, /*skip_keepalives=*/true);
   if (!response.ok()) co_return response.status();
   auto parsed = ParseRedisPsyncReply(*response);
   if (!parsed.ok()) co_return parsed.status();
