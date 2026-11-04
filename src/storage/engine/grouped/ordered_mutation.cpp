@@ -135,34 +135,25 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   }
   TxShardWrites batch;
   batch.diagnostics_ = diagnostics;
-  if (outer_transaction) {
+  const bool own_batch =
+      outer_transaction && tx->grouped_ingest_batch_ == nullptr;
+  if (own_batch) {
     batch.txid_ = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);
     batch.transaction_lease_ = tx->transaction_lease_;
-    if (tx->grouped_ingest_batch_ == nullptr) {
-      // The child commit may live on another worker from the outer decision.
-      // A distinct decision forces its own durable fence without marking the
-      // still-uncommitted outer transaction durable prematurely.
-      const auto child_decision = PrepareGroupedDecision(batch);
-      if (!child_decision.ok()) co_return child_decision.status();
-    }
+    // The child commit may live on another worker from the outer decision.
+    // A distinct decision forces its own durable fence without marking the
+    // still-uncommitted outer transaction durable prematurely.
+    const auto child_decision = PrepareGroupedDecision(batch);
+    if (!child_decision.ok()) co_return child_decision.status();
   }
-  const auto revision = outer_transaction ? batch.txid_ : tx->txid_;
   // A multi-page restore has one command decision, but each intermediate
   // graph still receives a unique revision. Committing individual pages would
   // resurrect a failed restore's auxiliaries if its enclosing EXEC commits.
   const auto command_batch = tx->grouped_ingest_batch_ != nullptr
                                  ? tx->grouped_ingest_batch_->txid_
                                  : batch.txid_;
-  if (revision == 0 || (previous && revision <= previous->revision())) {
-    co_return absl::OutOfRangeError(
-        "group revision allocation did not advance");
-  }
-  plan.root_.revision_ = revision;
-  if (!previous) {
-    plan.root_.incarnation_ = revision;
-    for (auto& page : plan.writes_) page.incarnation_ = revision;
-  } else if (plan.root_.incarnation_ != previous->incarnation()) {
+  if (previous && plan.root_.incarnation_ != previous->incarnation()) {
     co_return absl::InvalidArgumentError(
         "ordered mutation changes incarnation");
   }
@@ -178,17 +169,31 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   if (!member_mutation.ok()) co_return member_mutation.status();
   auto& member_plan = member_mutation->plan_;
   if (value_type == ValueType::kSortedSet) {
-    if (!previous && prepared_members != nullptr) {
-      if (member_plan.expected_sequence_ != 0)
-        co_return absl::AbortedError("prepared member creation is stale");
+    if (!previous && member_plan.expected_sequence_ != 0)
+      co_return absl::AbortedError("prepared member creation is stale");
+    if ((previous &&
+         member_plan.root_.incarnation_ != plan.root_.incarnation_) ||
+        member_plan.root_.field_count_ != plan.root_.item_count_)
+      co_return absl::AbortedError("prepared member index is stale");
+  }
+  // Member preparation can suspend on page IO. Allocate only after both
+  // logical plans are ready, independently of the earlier transaction and
+  // batch IDs. Existing key X protection orders the remaining staging waits.
+  const auto revision = AllocateGroupedRevision();
+  if (revision == 0 || (previous && revision <= previous->revision())) {
+    co_return absl::OutOfRangeError(
+        "group revision allocation did not advance");
+  }
+  plan.root_.revision_ = revision;
+  if (!previous) {
+    plan.root_.incarnation_ = revision;
+    for (auto& page : plan.writes_) page.incarnation_ = revision;
+  }
+  if (value_type == ValueType::kSortedSet) {
+    if (!previous) {
       member_plan.root_.incarnation_ = revision;
       for (auto& page : member_plan.writes_) page.incarnation_ = revision;
     }
-    // Prepared pages keep the predecessor incarnation; the durable revision
-    // is assigned only after reacquiring store state and admitting this batch.
-    if (member_plan.root_.incarnation_ != plan.root_.incarnation_ ||
-        member_plan.root_.field_count_ != plan.root_.item_count_)
-      co_return absl::AbortedError("prepared member index is stale");
     // An ordered-only topology rewrite may leave the member graph untouched;
     // keep its existing root/revision instead of manufacturing a new version.
     if (member_plan.changed_) member_plan.root_.revision_ = revision;
@@ -362,7 +367,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   }
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
   if (!decision.ok()) co_return decision.status();
-  if (outer_transaction) {
+  if (own_batch) {
     // Auxiliary records retain the outer transaction tag AND this command's
     // independent batch tag. An errored EXEC command never commits its batch,
     // even if the surrounding EXEC later commits all its successful commands.

@@ -69,8 +69,9 @@ struct GroupedHashRoot {
   std::uint32_t group_count_ = 0;
   // Local logical group order, distinct from the source command sequence in
   // the containing root record. One replay envelope may write this key more
-  // than once. Every mutation allocates a fresh global command-batch id;
-  // physical relocation preserves it and cold recovery raises that id floor.
+  // than once. Every mutation allocates a fresh global revision separately
+  // from its transaction/batch decisions. Physical relocation preserves it
+  // and cold recovery raises the shared allocator's floor above it.
   std::uint64_t revision_ = 0;
 
   bool operator==(const GroupedHashRoot&) const noexcept = default;

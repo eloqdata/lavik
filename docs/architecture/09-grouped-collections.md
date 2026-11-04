@@ -124,9 +124,15 @@ or compensating root may retain an older, unchanged member graph.
 The outer root record retains source command order; its payload separately
 persists a local group revision. One native replay envelope may therefore
 change the same key repeatedly without treating distinct group versions as
-relocation copies. Every group mutation uses a fresh globally allocated
-command-batch identifier as its revision; promotion uses that identifier as
-the new incarnation. Auxiliary mutation sequences name these local revisions.
+relocation copies. Every group mutation allocates its revision independently
+after logical page preparation, including both Sorted Set indexes. Revisions
+and transaction/batch decision IDs share one recovery-seeded global allocator,
+but use separate allocations. Promotion uses the fresh revision as the new
+incarnation. Changed auxiliaries and their new root share that revision;
+unchanged groups retain their earlier revisions. Auxiliary mutation sequences
+name these local revisions, while transaction and batch tags alone identify
+the required commit decisions. Streaming ingest retains one command batch
+across its independently versioned intermediate roots.
 Recovery bounds candidates by the winning root revision, preserves strict
 same-revision consistency, and advances the identifier allocator from root
 and auxiliary metadata even after transaction cleaning removed their tags.
@@ -320,6 +326,10 @@ native candidate ingestion. Plans retain their page admission through commit.
 Reacquisition checks population and logical root identity even for no-ops and
 last-element deletion; physical relocation alone is allowed. The writer
 refreshes GC coordinates and assigns durable revisions under store state.
+Exclusive key protection remains held across subsequent encoding, resource and
+append waits through publication; it orders same-key revisions while store state
+may be released. Separate revision allocation alone does not permit concurrent
+publication under IX.
 Full-image, promotion and random Set-pop adapters retain
 their separate preparation paths and share the same publication boundary.
 
@@ -328,7 +338,7 @@ including the Sorted Set member graph. Private plans own their scratch admission
 and contain placeholder incarnations, never published identities. The command
 keeps missing-key intent and database admission; before commit it validates
 population and command-time logical absence, allowing expired/tombstone
-predecessors to be reclaimed. Durable batch admission assigns one fresh
+predecessors to be reclaimed. Publication revision allocation assigns one fresh
 incarnation to the root and every initial page in both graphs. Transactional
 creation and promotion of an existing compact value retain their separate
 preparation contracts.
