@@ -16,12 +16,15 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "bycorf/runtime/worker.h"
 #include "lavik/tx/intent_lock.h"
 #include "lavik/tx/tx_queue.h"
 #include "lavik/tx/tx_shard.h"
@@ -113,6 +116,114 @@ TEST(TxLockTest, IntentAndHoldCompatibility) {
   EXPECT_CHECK(table.size() == 0, "held entry erased after full release");
 }
 
+TEST(TxLockTest, AllModesHonorCompatibilityOnFastAndQueuedPaths) {
+  constexpr std::array modes{LockMode::kShared, LockMode::kExclusive,
+                             LockMode::kIntentExclusive,
+                             LockMode::kIntentShared};
+  constexpr bool compatible[4][4] = {{true, false, false, true},
+                                     {false, false, false, false},
+                                     {false, false, true, true},
+                                     {true, false, true, true}};
+  for (std::size_t first = 0; first < modes.size(); ++first) {
+    for (std::size_t second = 0; second < modes.size(); ++second) {
+      for (bool fast : {false, true}) {
+        SCOPED_TRACE(::testing::Message()
+                     << first << "," << second << ", fast=" << fast);
+        LockTable table;
+        constexpr LockFp fp = 42;
+        ASSERT_TRUE(table.AcquireIntentAndHoldIfGranted(fp, modes[first]));
+        const bool granted =
+            fast ? table.AcquireIntentAndHoldIfGranted(fp, modes[second])
+                 : table.AcquireIntent(fp, modes[second]);
+        EXPECT_EQ(granted, compatible[first][second]);
+        EXPECT_EQ(table.CanHold(fp, modes[second]), compatible[first][second]);
+        if (granted) {
+          if (!fast) table.AcquireHold(fp, modes[second]);
+          table.ReleaseHoldAndIntent(fp, modes[second]);
+        } else {
+          // Once the predecessor drains, the queued mode must be granted
+          // based on holds, not blocked by its own recorded intent.
+          table.ReleaseHoldAndIntent(fp, modes[first]);
+          ASSERT_TRUE(table.CanHold(fp, modes[second]));
+          table.AcquireHold(fp, modes[second]);
+          table.ReleaseHold(fp, modes[second]);
+          table.ReleaseIntent(fp, modes[second]);
+          EXPECT_EQ(table.size(), 0);
+          continue;
+        }
+        table.ReleaseHoldAndIntent(fp, modes[first]);
+        EXPECT_EQ(table.size(), 0);
+      }
+    }
+  }
+}
+
+TEST(TxLockTest, DuplicateModesPreserveAllAccessRequirements) {
+  constexpr std::array modes{LockMode::kShared, LockMode::kExclusive,
+                             LockMode::kIntentExclusive,
+                             LockMode::kIntentShared};
+  constexpr LockMode expected[4][4] = {
+      {LockMode::kShared, LockMode::kExclusive, LockMode::kExclusive,
+       LockMode::kShared},
+      {LockMode::kExclusive, LockMode::kExclusive, LockMode::kExclusive,
+       LockMode::kExclusive},
+      {LockMode::kExclusive, LockMode::kExclusive, LockMode::kIntentExclusive,
+       LockMode::kIntentExclusive},
+      {LockMode::kShared, LockMode::kExclusive, LockMode::kIntentExclusive,
+       LockMode::kIntentShared}};
+  for (std::size_t first = 0; first < modes.size(); ++first) {
+    for (std::size_t second = 0; second < modes.size(); ++second) {
+      EXPECT_EQ(lavik::tx::MergeLockModes(modes[first], modes[second]),
+                expected[first][second]);
+      for (const auto third : modes) {
+        // Deduplication must not depend on argument order or grouping.
+        EXPECT_EQ(
+            lavik::tx::MergeLockModes(expected[first][second], third),
+            lavik::tx::MergeLockModes(
+                modes[first], lavik::tx::MergeLockModes(modes[second], third)));
+      }
+    }
+  }
+}
+
+TEST(TxLockTest, IntentSharedHoldsSurviveTheLastSharedOrPartialWriter) {
+  for (const auto other : {LockMode::kShared, LockMode::kIntentExclusive}) {
+    for (bool release_is_first : {false, true}) {
+      SCOPED_TRACE(::testing::Message()
+                   << static_cast<int>(other)
+                   << ", release IS first=" << release_is_first);
+      LockTable table;
+      ASSERT_TRUE(
+          table.AcquireIntentAndHoldIfGranted(1, LockMode::kIntentShared));
+      ASSERT_TRUE(table.AcquireIntentAndHoldIfGranted(1, other));
+      ASSERT_TRUE(
+          table.AcquireIntentAndHoldIfGranted(1, LockMode::kIntentShared));
+      const auto opposite = other == LockMode::kShared
+                                ? LockMode::kIntentExclusive
+                                : LockMode::kShared;
+      EXPECT_FALSE(table.CanHold(1, opposite));
+      table.ReleaseHoldAndIntent(1, LockMode::kIntentShared);
+      EXPECT_FALSE(table.CanHold(1, LockMode::kExclusive));
+      const auto first = release_is_first ? LockMode::kIntentShared : other;
+      const auto last = release_is_first ? other : LockMode::kIntentShared;
+      table.ReleaseHoldAndIntent(1, first);
+      EXPECT_FALSE(table.CanHold(1, LockMode::kExclusive));
+      EXPECT_EQ(table.size(), 1);
+      EXPECT_TRUE(table.CanHold(1, last));
+      if (!release_is_first) {
+        EXPECT_TRUE(table.CanHold(1, LockMode::kShared));
+        EXPECT_TRUE(table.CanHold(1, LockMode::kIntentExclusive));
+        ASSERT_TRUE(table.AcquireIntentAndHoldIfGranted(1, opposite));
+        EXPECT_FALSE(table.CanHold(1, other));
+        table.ReleaseHoldAndIntent(1, opposite);
+      }
+      table.ReleaseHoldAndIntent(1, last);
+      EXPECT_TRUE(table.CanHold(1, LockMode::kExclusive));
+      EXPECT_EQ(table.size(), 0);
+    }
+  }
+}
+
 TEST(TxLockTest, QueueOrdersByTransactionId) {
   TxQueue queue;
   TxWaiter a{.txid_ = 5};
@@ -143,6 +254,242 @@ TestTask RunImmediate(TxShard& shard, LockFp fp, LockMode mode,
   auto guard = co_await shard.AcquireKey(0, fp, mode);
   order.push_back(std::string(name) + ":start");
   order.push_back(std::string(name) + ":done");
+}
+
+TestTask RunKeysWithIo(TxShard& shard, std::span<const KeyRef> keys,
+                       ManualEvent& io, std::vector<std::string>& order) {
+  auto guard = co_await shard.AcquireKeys(keys);
+  order.push_back("keys:start");
+  co_await io;
+  order.push_back("keys:done");
+}
+
+TEST(TxLockTest, PartialWriteKeySetWaitsWithoutTakingPartialHolds) {
+  TxShard shard;
+  std::atomic<std::uint64_t> counter{1};
+  shard.BindTxidCounter(&counter);
+  std::vector<std::string> order;
+  ManualEvent io_blocker, io_keys;
+  RunWithIo(shard, 1, LockMode::kExclusive, io_blocker, order, "blocker");
+  const std::array keys{KeyRef{.fp_ = 1, .mode_ = LockMode::kIntentExclusive},
+                        KeyRef{.fp_ = 2, .mode_ = LockMode::kIntentExclusive}};
+  RunKeysWithIo(shard, keys, io_keys, order);
+  EXPECT_EQ(order, (std::vector<std::string>{"blocker:start"}));
+  EXPECT_TRUE(shard.locks(0).CanHold(2, LockMode::kExclusive));
+  // The pending key-set intent must still stop a later conflicting writer.
+  RunImmediate(shard, 2, LockMode::kExclusive, order, "later");
+  EXPECT_EQ(order.size(), 1);
+  io_blocker.Fire();
+  EXPECT_EQ(order.back(), "keys:start");
+  EXPECT_FALSE(shard.locks(0).CanHold(1, LockMode::kShared));
+  EXPECT_FALSE(shard.locks(0).CanHold(2, LockMode::kShared));
+  io_keys.Fire();
+  EXPECT_EQ(order, (std::vector<std::string>{"blocker:start", "blocker:done",
+                                             "keys:start", "keys:done",
+                                             "later:start", "later:done"}));
+  EXPECT_EQ(shard.locks(0).size(), 0);
+}
+
+TEST(TxLockTest, PartialWritersOverlapIoButCannotBargePastReadersOrWriters) {
+  for (const auto blocker : {LockMode::kShared, LockMode::kExclusive}) {
+    SCOPED_TRACE(static_cast<int>(blocker));
+    TxShard shard;
+    std::atomic<std::uint64_t> counter{1};
+    shard.BindTxidCounter(&counter);
+    std::vector<std::string> order;
+    ManualEvent io_a, io_b, io_blocker;
+    RunWithIo(shard, 1, LockMode::kIntentExclusive, io_a, order, "A");
+    RunWithIo(shard, 1, LockMode::kIntentExclusive, io_b, order, "B");
+    EXPECT_EQ(order, (std::vector<std::string>{"A:start", "B:start"}));
+    EXPECT_EQ(counter.load(), 1);  // Compatible fast paths allocate no txid.
+
+    RunWithIo(shard, 1, blocker, io_blocker, order, "barrier");
+    RunImmediate(shard, 1, LockMode::kIntentExclusive, order, "C");
+    EXPECT_EQ(order.size(), 2);
+    RunImmediate(shard, 2, LockMode::kExclusive, order, "unrelated");
+    EXPECT_EQ(order.back(), "unrelated:done");
+
+    io_a.Fire();
+    EXPECT_EQ(order.back(), "A:done");
+    io_b.Fire();
+    EXPECT_EQ(order.back(), "barrier:start");
+    io_blocker.Fire();
+    EXPECT_EQ(order, (std::vector<std::string>{
+                         "A:start", "B:start", "unrelated:start",
+                         "unrelated:done", "A:done", "B:done", "barrier:start",
+                         "barrier:done", "C:start", "C:done"}));
+    EXPECT_EQ(shard.locks(0).size(), 0);
+    EXPECT_EQ(shard.queued_runs(), 2);
+  }
+}
+
+TEST(TxLockTest, CancelledBarrierWakesCompatibleSuccessorBeforeHolderFinishes) {
+  constexpr std::array modes{LockMode::kShared, LockMode::kExclusive,
+                             LockMode::kIntentExclusive};
+  for (const auto holder : {LockMode::kShared, LockMode::kIntentExclusive,
+                            LockMode::kIntentShared}) {
+    for (const auto barrier : modes) {
+      if (holder == barrier || (holder == LockMode::kIntentShared &&
+                                barrier != LockMode::kExclusive))
+        continue;
+      SCOPED_TRACE(::testing::Message() << static_cast<int>(holder) << ","
+                                        << static_cast<int>(barrier));
+      TxShard shard;
+      std::atomic<std::uint64_t> counter{1};
+      shard.BindTxidCounter(&counter);
+      std::vector<std::string> order;
+      ManualEvent io;
+      RunWithIo(shard, 1, holder, io, order, "holder");
+      {
+        auto cancelled = shard.AcquireKey(0, 1, barrier);
+        ASSERT_FALSE(cancelled.await_ready());
+        cancelled.await_suspend(std::noop_coroutine());
+        RunImmediate(shard, 1, holder, order, "successor");
+        EXPECT_EQ(order, (std::vector<std::string>{"holder:start"}));
+      }
+      EXPECT_EQ(order,
+                (std::vector<std::string>{"holder:start", "successor:start",
+                                          "successor:done"}));
+      io.Fire();
+      EXPECT_EQ(shard.locks(0).size(), 0);
+      EXPECT_TRUE(shard.queue().Empty());
+    }
+  }
+}
+
+TEST(TxLockTest, IntentSharedOverlapsQueuedNonExclusiveModesButNotQueuedX) {
+  for (const auto holder : {LockMode::kShared, LockMode::kIntentExclusive}) {
+    SCOPED_TRACE(static_cast<int>(holder));
+    const auto waiter = holder == LockMode::kShared ? LockMode::kIntentExclusive
+                                                    : LockMode::kShared;
+    TxShard shard;
+    std::atomic<std::uint64_t> counter{1};
+    shard.BindTxidCounter(&counter);
+    std::vector<std::string> order;
+    ManualEvent io_holder, io_waiter, io_is;
+    RunWithIo(shard, 1, holder, io_holder, order, "holder");
+    RunWithIo(shard, 1, waiter, io_waiter, order, "waiter");
+    RunWithIo(shard, 1, LockMode::kIntentShared, io_is, order, "IS");
+    EXPECT_EQ(order, (std::vector<std::string>{"holder:start", "IS:start"}));
+    EXPECT_EQ(counter.load(), 2);  // IS is compatible with both modes.
+
+    RunImmediate(shard, 1, LockMode::kExclusive, order, "X");
+    RunImmediate(shard, 1, LockMode::kIntentShared, order, "later IS");
+    EXPECT_EQ(order.size(), 2);
+    io_holder.Fire();
+    EXPECT_EQ(order.back(), "waiter:start");
+    io_waiter.Fire();
+    EXPECT_EQ(order.back(), "waiter:done");
+    EXPECT_FALSE(shard.locks(0).CanHold(1, LockMode::kExclusive));
+    io_is.Fire();
+    EXPECT_EQ(order, (std::vector<std::string>{
+                         "holder:start", "IS:start", "holder:done",
+                         "waiter:start", "waiter:done", "IS:done", "X:start",
+                         "X:done", "later IS:start", "later IS:done"}));
+    EXPECT_EQ(shard.locks(0).size(), 0);
+    EXPECT_TRUE(shard.queue().Empty());
+  }
+}
+
+TEST(TxLockTest, QueuedCompatibleHoldersReceiveHoldsBeforeWorkerResumption) {
+  constexpr std::array modes{LockMode::kShared, LockMode::kIntentExclusive,
+                             LockMode::kIntentShared};
+  for (const auto first_mode : modes) {
+    for (const auto second_mode : modes) {
+      if (first_mode != second_mode && first_mode != LockMode::kIntentShared &&
+          second_mode != LockMode::kIntentShared)
+        continue;
+      SCOPED_TRACE(::testing::Message() << static_cast<int>(first_mode) << ","
+                                        << static_cast<int>(second_mode));
+      // Use a bound worker without starting its loop: queued noop continuations
+      // let us inspect grants independently of when request bodies resume.
+      bycorf::Worker worker;
+      TxShard shard;
+      shard.Bind(worker);
+      std::atomic<std::uint64_t> counter{1};
+      shard.BindTxidCounter(&counter);
+      auto initial = shard.AcquireKey(0, 1, LockMode::kExclusive);
+      ASSERT_TRUE(initial.await_ready());
+      auto initial_guard = initial.await_resume();
+      auto first = shard.AcquireKey(0, 1, first_mode);
+      ASSERT_FALSE(first.await_ready());
+      first.await_suspend(std::noop_coroutine());
+      std::optional<TxShard::Awaiter> second;
+      second.emplace(&shard, KeyRef{.fp_ = 1, .mode_ = second_mode});
+      ASSERT_FALSE(second->await_ready());
+      second->await_suspend(std::noop_coroutine());
+      auto exclusive = shard.AcquireKey(0, 1, LockMode::kExclusive);
+      ASSERT_FALSE(exclusive.await_ready());
+      exclusive.await_suspend(std::noop_coroutine());
+
+      initial_guard.Reset();
+      EXPECT_EQ(shard.queued_runs(), 2);
+      ASSERT_NE(shard.queue().Front(), nullptr);
+      EXPECT_EQ(shard.queue().Front()->txid_, 3);
+      auto first_guard = first.await_resume();
+      first_guard.Reset();
+      EXPECT_FALSE(shard.locks(0).CanHold(1, LockMode::kExclusive));
+      EXPECT_EQ(shard.queued_runs(), 2);
+      // Cancellation after grant, before await_resume, releases the second hold
+      // and permits the queued X without leaving a pointer to the awaiter.
+      second.reset();
+      EXPECT_EQ(shard.queued_runs(), 3);
+      EXPECT_TRUE(shard.queue().Empty());
+      auto exclusive_guard = exclusive.await_resume();
+      exclusive_guard.Reset();
+      EXPECT_EQ(shard.locks(0).size(), 0);
+    }
+  }
+}
+
+TEST(TxLockTest, MixedIntentHoldersRetainReaderClosuresUntilEveryHoldDrains) {
+  struct Admission {
+    unsigned closures = 0;
+    unsigned readers = 1;
+  } state;
+  TxShard shard;
+  std::atomic<std::uint64_t> counter{1};
+  shard.BindTxidCounter(&counter);
+  shard.BindReadAdmission({&state,
+                           [](void* ctx, const KeyRef&) {
+                             ++static_cast<Admission*>(ctx)->closures;
+                           },
+                           [](void* ctx, const KeyRef&) {
+                             --static_cast<Admission*>(ctx)->closures;
+                           },
+                           [](void* ctx, const KeyRef&) {
+                             return static_cast<Admission*>(ctx)->readers == 0;
+                           }});
+  std::vector<std::string> order;
+  ManualEvent io_a, io_b;
+  RunWithIo(shard, 1, LockMode::kIntentShared, io_a, order, "A");
+  RunWithIo(shard, 1, LockMode::kIntentExclusive, io_b, order, "B");
+  RunImmediate(shard, 1, LockMode::kShared, order, "reader");
+  EXPECT_TRUE(order.empty());
+  EXPECT_EQ(state.closures, 3);
+  for (const auto mode :
+       {LockMode::kIntentExclusive, LockMode::kIntentShared}) {
+    auto cancelled = shard.AcquireKey(0, 1, mode);
+    ASSERT_FALSE(cancelled.await_ready());
+    cancelled.await_suspend(std::noop_coroutine());
+    EXPECT_EQ(state.closures, 4);
+  }
+  EXPECT_EQ(state.closures, 3);
+  EXPECT_TRUE(order.empty());
+  state.readers = 0;
+  shard.ReadersDrained();
+  EXPECT_EQ(order, (std::vector<std::string>{"A:start", "B:start"}));
+  io_a.Fire();
+  EXPECT_EQ(state.closures, 2);
+  EXPECT_EQ(order.back(), "A:done");
+  EXPECT_FALSE(shard.CanReadOptimistically(0));
+  io_b.Fire();
+  EXPECT_EQ(order,
+            (std::vector<std::string>{"A:start", "B:start", "A:done", "B:done",
+                                      "reader:start", "reader:done"}));
+  EXPECT_EQ(state.closures, 0);
+  EXPECT_EQ(shard.locks(0).size(), 0);
+  EXPECT_TRUE(shard.CanReadOptimistically(0));
 }
 
 TEST(TxLockTest, ReaderDrainResumesQueueAndRetainsAllIntentClosures) {

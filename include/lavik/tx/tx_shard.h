@@ -115,6 +115,8 @@ class TxShard {
       } else {
         if (waiter_.txid_ != 0) shard_->queue_.Remove(&waiter_);
         shard_->ReleaseIntents(keys_);
+        // Removing a conflicting intent can unblock compatible successors
+        // even while another holder is suspended on IO.
         shard_->Poll();
       }
     }

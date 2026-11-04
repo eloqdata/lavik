@@ -65,17 +65,15 @@ void Transaction::Seal() {
       }
     }
     sd.key_count_ = static_cast<std::uint16_t>(grouped.size() - sd.key_begin_);
-    // Deduplicate the lock set: one ref per (db, fingerprint), exclusive if
-    // any occurrence writes.
+    // Deduplicate the lock set without weakening any occurrence's protection.
+    // In particular, a complete-key read combined with a partial write needs X.
     sd.lock_begin_ = static_cast<std::uint16_t>(lock_refs_.size());
     for (std::size_t i = sd.key_begin_; i < grouped.size(); ++i) {
       const TxKey& key = grouped[i];
       bool merged = false;
       for (std::size_t j = sd.lock_begin_; j < lock_refs_.size(); ++j) {
         if (lock_refs_[j].fp_ == key.fp_ && lock_refs_[j].db_ == key.db_) {
-          if (key.mode_ == LockMode::kExclusive) {
-            lock_refs_[j].mode_ = LockMode::kExclusive;
-          }
+          lock_refs_[j].mode_ = MergeLockModes(lock_refs_[j].mode_, key.mode_);
           if (lock_refs_[j].slot_ != key.slot_)
             lock_refs_[j].slot_ = storage::kLogicalStorageShards;
           merged = true;
