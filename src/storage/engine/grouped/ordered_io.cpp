@@ -27,7 +27,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
     Decode decode, GroupReadLimiter* limiter, ReadLatencyTrace* trace,
-    OnlineLatencyTrace* diagnostics) {
+    OnlineLatencyTrace* diagnostics, bool group_locked) {
   if (object == nullptr || !object->is_ordered()) {
     co_return absl::DataLossError("missing ordered collection view");
   }
@@ -61,7 +61,11 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
         partition.grouped_generations_[db_id] != original.index_generation_) {
       co_return absl::NotFoundError("ordered population changed before read");
     }
-    if (!pinned) {
+    if (group_locked) {
+      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      if (!refreshed.ok()) co_return refreshed.status();
+      object = std::move(*refreshed);
+    } else if (!pinned) {
       auto resolved = co_await FindVerifiedEntry(
           store, partition.indexes_[db_id], digest, key, original.root_);
       if (!resolved.ok()) co_return resolved.status();
@@ -193,7 +197,8 @@ StorageEngine::Impl::LoadEncodedSortedSetGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
-    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics) {
+    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics,
+    bool group_locked) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [](std::string_view payload, std::uint64_t sequence,
@@ -208,7 +213,7 @@ StorageEngine::Impl::LoadEncodedSortedSetGroupSnapshot(
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
       },
-      limiter, nullptr, diagnostics);
+      limiter, nullptr, diagnostics, group_locked);
 }
 
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::LoadOrderedListRange(

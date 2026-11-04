@@ -237,8 +237,24 @@ readers at the head are granted together, while queued writers fence later
 readers. Cancelling an ungranted waiter unlinks it and rechecks its successors.
 Once a coroutine has entered the worker's ready queue, it must resume before
 its frame can be destroyed. Group lock state has no durable representation and
-does not allocate transaction IDs or revisions. Collection command paths still
-use whole-key S/X protection and do not yet call this sub-key API.
+does not allocate transaction IDs or revisions.
+
+Standalone single-member ZADD, ZREM and ZINCRBY inspect owner-local key state
+without suspension to choose IX for an existing grouped Sorted Set, then
+recheck its representation after acquisition. The worker lazily owns one group
+lock table. Writers acquire the member leaf exclusively, resolve source and
+destination ordered pages, and acquire those pages exclusively and their
+immediate routing neighbours shared, in identity order. Routes are rechecked
+after waits. Group holds span page IO, private preparation and publication;
+unrelated groups can perform IO concurrently. Page reads refresh physical
+coordinates and validate the protected group's revision instead of rejecting
+an unrelated root publication.
+
+Batch commands, EXEC/Lua, structural changes and ambiguous resident routing
+use whole-key X. An ineligible point plan releases every group hold and IX
+before one X acquisition and replans from current state. It never upgrades
+while retaining groups or repeatedly retries IX. Whole-key S readers and X
+writers wait for active IX holders; the key queue fences later IX arrivals.
 
 ## Durable graph and publication
 
@@ -323,10 +339,11 @@ Sorted Set and Stream writers retain key intent and database admission while
 releasing worker store state for page reads and private mutation planning.
 This includes both Sorted Set graphs and retained EXEC/Lua key holds, but not
 native candidate ingestion. Plans retain their page admission through commit.
-Reacquisition checks population and logical root identity even for no-ops and
-last-element deletion; physical relocation alone is allowed. The writer
-refreshes GC coordinates under store state. Command adapters still retain
-exclusive key protection through publication.
+Reacquisition checks population and the protected logical state even for
+no-ops and last-element deletion; physical relocation alone is allowed.
+Whole-key writers validate root identity, while concurrent Sorted Set point
+writers validate their locked groups. The writer refreshes GC coordinates
+under store state.
 
 Existing standalone Sorted Set updates that preserve page topology and fit
 all changed inline groups plus their root in one append range use a prepared
@@ -343,8 +360,10 @@ carry the sequence and cardinality of that final publication.
 
 Structural changes, demotion, external/oversized batches, replay and EXEC/Lua
 retain the multi-append path, with X ordering revisions across its resource
-and extent waits. Prepared publication alone does not enable command-level IX:
-those callers also need group arbitration and routing revalidation.
+and extent waits. IX point writers require bounded prepared publication;
+ineligible plans fall back before staging any records. The locked pages also
+bound the minimum remaining primary payload, so distant concurrent removals
+cannot force a compact conversion during the append wait.
 Full-image, promotion and random Set-pop adapters retain
 their separate preparation paths and share the same publication boundary.
 

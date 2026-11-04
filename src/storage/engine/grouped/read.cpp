@@ -23,6 +23,35 @@
 
 namespace lavik::storage {
 
+absl::StatusOr<GroupedObject::Handle> StorageEngine::Impl::RefreshLockedGroup(
+    WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+    std::string_view key, const GroupedObject::Handle& source,
+    GroupedRecordId id) {
+  const auto current =
+      partition.grouped_objects_[db_id].CurrentForMutation(key);
+  if (!source || !current || !current->has_member_index() ||
+      current->incarnation() != source->incarnation())
+    return absl::AbortedError("locked group incarnation changed");
+  const auto& old = source->version();
+  const auto& now = current->version();
+  if (old.db_epoch_ != now.db_epoch_ ||
+      old.replication_epoch_ != now.replication_epoch_ ||
+      old.index_generation_ != now.index_generation_ ||
+      old.root_.expire_at_ms_ != now.root_.expire_at_ms_ ||
+      EffectiveRecordDbEpoch(partition, db_id) != old.db_epoch_ ||
+      partition.replication_epoch_ != old.replication_epoch_ ||
+      partition.grouped_generations_[db_id] != old.index_generation_)
+    return absl::AbortedError("locked group population changed");
+  const auto* before = source->FindGroup(id);
+  const auto* after = current->FindGroup(id);
+  if (!before || !after ||
+      before->mutation_sequence_ != after->mutation_sequence_)
+    return absl::AbortedError("locked group logical version changed");
+  const auto readable = current->ReadStatus();
+  if (!readable.ok()) return readable;
+  return current;
+}
+
 absl::Status StorageEngine::Impl::ValidateGroupedRead(
     WorkerStore::PartitionStore& partition, std::uint8_t db_id,
     std::string_view key, const RecordIndex::Entry* entry) {
@@ -41,7 +70,8 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, GroupedRecordId id, bool pinned,
-    Decode decode, GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics) {
+    Decode decode, GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics,
+    bool group_locked) {
   auto detail = diagnostics ? std::make_unique<ReadLatencyTrace>() : nullptr;
   if (detail) detail->diagnostics_ = diagnostics;
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
@@ -58,7 +88,11 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
         partition.grouped_generations_[db_id] != original.index_generation_) {
       co_return absl::NotFoundError("grouped population changed before read");
     }
-    if (!pinned) {
+    if (group_locked) {
+      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      if (!refreshed.ok()) co_return refreshed.status();
+      object = std::move(*refreshed);
+    } else if (!pinned) {
       // The caller may have read another group since capturing this view.
       // Refresh before materializing compact locations, not only after IO
       // fails: otherwise a reused block could lend an old entry a new epoch.
@@ -169,6 +203,15 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     if (pinned || loaded.status().code() != absl::StatusCode::kAborted) {
       co_return loaded.status();
     }
+    if (group_locked) {
+      auto current = RefreshLockedGroup(partition, db_id, key, object, id);
+      if (!current.ok()) co_return current.status();
+      if (MaterializeIndexLocation(*(*current)->FindGroup(id))
+              .SamePhysicalRecord(location))
+        co_return absl::DataLossError(loaded.status().message());
+      object = std::move(*current);
+      continue;
+    }
     auto resolved = co_await FindVerifiedEntry(store, partition.indexes_[db_id],
                                                digest, key);
     if (!resolved.ok()) co_return resolved.status();
@@ -206,7 +249,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, GroupedRecordId id, bool pinned,
-    OnlineLatencyTrace* diagnostics) {
+    OnlineLatencyTrace* diagnostics, bool group_locked) {
   return LoadHashGroup<LoadedHashGroupPayload>(
       store, partition, db_id, key, digest, std::move(object), id, pinned,
       [](std::string_view, std::uint64_t sequence, std::uint32_t field_count,
@@ -215,7 +258,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
                                       .sequence_ = sequence,
                                       .field_count_ = field_count};
       },
-      nullptr, diagnostics);
+      nullptr, diagnostics, group_locked);
 }
 
 Task<absl::StatusOr<LoadedHashGroup>>

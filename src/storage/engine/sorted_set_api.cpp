@@ -46,12 +46,45 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
       operation.kind_ != SortedSetOperationKind::kRemove &&
       operation.kind_ != SortedSetOperationKind::kPop &&
       operation.kind_ != SortedSetOperationKind::kRemoveRange;
+  // This lookup never suspends and touches only this worker's index. It is a
+  // lock-mode hint, not a retained pointer or a validated read. Key admission
+  // closes/drains remote direct readers before IX is granted; the callee
+  // checks the current representation again after every acquisition wait.
+  const bool point = operation.prepare_unlocked_ &&
+                     ((operation.kind_ == SortedSetOperationKind::kAdd &&
+                       operation.entries_.size() == 1) ||
+                      (operation.kind_ == SortedSetOperationKind::kRemove &&
+                       operation.members_.size() == 1));
+  bool concurrent = false;
+  if (point) {
+    auto& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
+    const auto* found = partition.indexes_[db_id].Find(digest, key);
+    concurrent = CanPrepareGroupedWriteUnlocked(partition) && found &&
+                 found->key_complete() && found->value_.grouped() &&
+                 found->value_.value_type() == ValueType::kSortedSet;
+  }
   TraceSpanScope key_wait(operation.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
-      read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
+      read_only    ? tx::LockMode::kShared
+      : concurrent ? tx::LockMode::kIntentExclusive
+                   : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(key));
   key_wait.End();
+  if (concurrent) {
+    auto result = co_await TryConcurrentSortedSetPoint(
+        db_id, key, digest, operation, replication, mutation_precondition);
+    if (!result.ok()) co_return result.status();
+    if (*result) co_return std::move(**result);
+    // The nested task has destroyed every group hold. Never upgrade IX in
+    // place: another IX holder can be waiting for one of those groups.
+    key_lock.Reset();
+    TraceSpanScope fallback_wait(operation.diagnostics_, TraceStage::kKeyLock);
+    key_lock = co_await tx::CurrentTxShard().AcquireKey(
+        db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+        lavik::storage::RedisSlot(key));
+  }
   co_return co_await ExecuteSortedSetLocked(db_id, key, digest, operation,
                                             nullptr, replication,
                                             mutation_precondition);

@@ -767,6 +767,16 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
   PrivateDisk disk;
   const std::string key = "dense-probe-fallback";
   std::map<std::string, double> expected;
+  // This optional source cache belongs to the whole-key planner. EXEC keeps
+  // that path under X; standalone bounded points have no optional page cache.
+  auto point_under_x = [](Client& client, std::vector<std::string> command) {
+    Check(client.Command({"MULTI"}).text_ == "OK",
+          "starting probe transaction");
+    Check(client.Command(command).text_ == "QUEUED", "queueing probe command");
+    auto reply = client.Command({"EXEC"});
+    Check(reply.items_.size() == 1, "invalid probe transaction response");
+    return std::move(reply.items_.front());
+  };
   auto rejections = [](Client& client) {
     const auto info = client.Command({"INFO", "MEMORY"}).text_;
     const std::string_view field = "oom_rejected_commands:";
@@ -805,16 +815,18 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
     // retry still uses the real nonzero memory limit. Same-page edits reach
     // final-plan admission; a tied destination first needs another probe.
     ASSERT_EQ(
-        client.Command({"ZINCRBY", key, "0.5", DenseZSetMember(10)}).text_,
+        point_under_x(client, {"ZINCRBY", key, "0.5", DenseZSetMember(10)})
+            .text_,
         "10.5");
     expected[DenseZSetMember(10)] = 10.5;
-    const auto moved =
-        client.Command({"ZINCRBY", key, std::to_string(boundary_score - 500),
-                        DenseZSetMember(500)});
+    const auto moved = point_under_x(
+        client, {"ZINCRBY", key, std::to_string(boundary_score - 500),
+                 DenseZSetMember(500)});
     ASSERT_EQ(moved.kind_, '$') << moved.text_;
     EXPECT_EQ(std::stod(moved.text_), boundary_score);
     expected[DenseZSetMember(500)] = boundary_score;
-    ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(12)}).text_, "1");
+    ASSERT_EQ(point_under_x(client, {"ZREM", key, DenseZSetMember(12)}).text_,
+              "1");
     expected.erase(DenseZSetMember(12));
     ExpectDenseZSet(client, key, expected);
     EXPECT_EQ(rejections(client), rejected_before);
@@ -831,7 +843,7 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
     Client client(server.port());
     const auto rejected_before = rejections(client);
     const auto failed =
-        client.Command({"ZINCRBY", key, "0.5", DenseZSetMember(10)});
+        point_under_x(client, {"ZINCRBY", key, "0.5", DenseZSetMember(10)});
     EXPECT_EQ(failed.kind_, '-');
     EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
     EXPECT_EQ(rejections(client), rejected_before);
@@ -1052,6 +1064,132 @@ ZSetMemberLayout InspectZSetMembers(const PrivateDisk& disk,
   Check(result.leaves_.size() == result.root_.group_count_,
         "incomplete fixture member directory");
   return result;
+}
+
+TEST(GroupedSortedSetWriteE2e, ConcurrentGroupsWaitWakeAndRecover) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "concurrent-groups";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+  }
+  const auto layout = InspectZSetMembers(disk, key);
+  const auto a = DenseZSetMember(10);
+  auto leaf_for = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (const auto& [id, leaf] : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture member route");
+  };
+  unsigned b_index = 900;
+  while (b_index < 1000 && leaf_for(DenseZSetMember(b_index)) == leaf_for(a))
+    ++b_index;
+  ASSERT_LT(b_index, 1000);
+  const auto b = DenseZSetMember(b_index);
+  {
+    const std::string gate = disk.path() + ".group-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment member("LAVIK_ZSET_GROUP_PAUSE_MEMBER", a.c_str());
+    ScopedEnvironment file("LAVIK_ZSET_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, disjoint, conflict, reader;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZINCRBY", key, "0.25", a});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("zset group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    disjoint = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZINCRBY", key, "0.5", b});
+    });
+    ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(std::stod(disjoint.get().text_), b_index + 0.5);
+    EXPECT_EQ(first.wait_for(0ms), std::future_status::timeout);
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZINCRBY", key, "0.5", a});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    reader = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZRANGE", key, "0", "-1", "WITHSCORES"});
+    });
+    EXPECT_EQ(reader.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    ASSERT_EQ(first.get().text_, "10.25") << server.Log();
+    ASSERT_EQ(conflict.get().text_, "10.75") << server.Log();
+    ASSERT_EQ(reader.get().items_.size(), 2048);
+    expected[a] = 10.75;
+    expected[b] = b_index + 0.5;
+    Client client(server.port());
+    ExpectDenseZSet(client, key, expected);
+    // Structural/multi-member operations still acquire X after all IX/group
+    // holders drain. Exercise those fences before a cold recovery as well.
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZREM", key, a}).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"ZADD", key, "10.75", a}).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"EXEC"}).items_.size(), 2);
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e, ConcurrentPointCommandsPreserveBothIndexes) {
+  PrivateDisk disk;
+  const std::string key = "concurrent-point-stress";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 2);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    std::vector<std::future<void>> writers;
+    for (unsigned connection = 0; connection < 8; ++connection) {
+      writers.push_back(std::async(std::launch::async, [&, connection] {
+        Client writer(server.port());
+        const auto member =
+            DenseZSetMember(connection < 2 ? 10 : 100 * connection);
+        for (unsigned i = 0; i < 64; ++i) {
+          const auto reply =
+              writer.Command({"ZINCRBY", key, "0.00390625", member});
+          Check(reply.kind_ == '$',
+                "concurrent increment failed: " + reply.text_);
+          const auto removed = DenseZSetMember(100 * connection + 50);
+          auto reply2 = writer.Command({"ZREM", key, removed});
+          Check(reply2.text_ == "1",
+                "concurrent removal failed: " + reply2.text_);
+          reply2 = writer.Command(
+              {"ZADD", key, std::to_string(100 * connection + 50), removed});
+          Check(reply2.text_ == "1",
+                "concurrent insertion failed: " + reply2.text_);
+        }
+      }));
+    }
+    for (auto& writer : writers) writer.get();
+    expected[DenseZSetMember(10)] += 0.5;
+    for (unsigned connection = 2; connection < 8; ++connection)
+      expected[DenseZSetMember(100 * connection)] += 0.25;
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
 }
 
 TEST(GroupedSortedSetWriteE2e,

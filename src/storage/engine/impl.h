@@ -64,6 +64,7 @@
 #include "lavik/memory.h"
 #include "lavik/replication_history.h"
 #include "lavik/storage/detail/compact_write.h"
+#include "lavik/storage/detail/grouped/lock.h"
 #include "lavik/storage/detail/grouped/object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/ordered_index.h"
@@ -1713,6 +1714,9 @@ class StorageEngine::Impl {
               {.owner_shard_ = memory_owner, .externally_admitted_ = true})) {}
 
     Impl* engine_ = nullptr;
+    // Created only by grouped point writers; all access and waiter wakeups
+    // stay on this key owner. The store outlives every request lock set.
+    std::unique_ptr<GroupedLockTable> group_locks_;
     bycorf::AsyncNotification block_pin_progress_;
     // Only genuinely exhausted foreground allocations wait here. Notification
     // delivery remains on this owner; producers inspect just the atomic count.
@@ -2588,8 +2592,9 @@ class StorageEngine::Impl {
   // assigns its fresh incarnation/revision before staging any auxiliary.
   // Existing non-structural standalone ZSET plans use a bounded prepared batch;
   // supplied member plans can merge disjoint changes into the current root.
-  // Command callers still retain key X; enabling IX also requires group holds
-  // through planning and a whole-key fallback for ineligible/stale plans.
+  // IX callers retain changed groups and routing neighbours through commit,
+  // and retry_exclusive forbids the yielding whole-key writer fallback. A
+  // true output certifies rejection before publication, allowing one X retry.
   struct SortedSetMemberMutation;
   Task<absl::Status> CommitGroupedOrderedMutationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2599,7 +2604,8 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
       SortedSetMemberMutation* prepared_members = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr,
+      bool* retry_exclusive = nullptr);
   struct SortedSetMemberMutation {
     MemoryReservation scratch_;
     MemoryReservation leaves_;
@@ -2696,6 +2702,16 @@ class StorageEngine::Impl {
       const MutationPrecondition* mutation_precondition = nullptr,
       PreparedOrderedMutation* prepared = nullptr,
       SortedSetOrderedProbe* ordered_probe = nullptr);
+
+  // Caller holds key IX and database admission. A disengaged result requests
+  // one X retry after releasing all groups and IX; errors are never retried.
+  // Only bounded, topology-preserving single-member writes publish here.
+  Task<absl::StatusOr<std::optional<SortedSetResult>>>
+  TryConcurrentSortedSetPoint(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   // Read-only score projection. The shared key intent stays with the caller;
   // each checked member leaf is decoded into owned scalar scores before
@@ -4229,14 +4245,21 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+  // Requires parent IX plus this group's S/X hold. Refresh physical metadata
+  // across GC without rejecting publications to unrelated groups. No pin is
+  // implied: each physical read still owns its usual allocation lease.
+  absl::StatusOr<GroupedObject::Handle> RefreshLockedGroup(
+      WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+      std::string_view key, const GroupedObject::Handle& source,
+      GroupedRecordId id);
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
   Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4642,7 +4665,7 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
       ReadLatencyTrace* trace = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
   Task<absl::StatusOr<ListResult>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4670,7 +4693,7 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
   enum class SortedSetPageReadMode : bool { kFullDecode, kIndexedProjection };
   // Indexed projection applies only to v2 pages with kTrustStored; v1 and
   // kVerifyUnique retain full decoding. Both modes check identity/CRC and
