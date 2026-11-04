@@ -2194,11 +2194,11 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         *replica_mutation_sequence != grouped->sequence_))) {
     co_return absl::InvalidArgumentError("invalid grouped mutation sequence");
   }
-  const std::uint64_t mutation_sequence =
-      grouped != nullptr                      ? grouped->sequence_
-      : replica_mutation_sequence.has_value() ? *replica_mutation_sequence
-                                              : ++partition.mutation_sequence_;
-  std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
+  std::uint64_t mutation_sequence = grouped != nullptr ? grouped->sequence_
+                                    : replica_mutation_sequence.has_value()
+                                        ? *replica_mutation_sequence
+                                        : ++partition.mutation_sequence_;
+  std::shared_ptr<ReplicationCommandAppend> fullsync_command;
   if (replication != nullptr) {
     AppendReplicationExpirationEffect(
         &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
@@ -2308,6 +2308,13 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     };
     status = co_await WriteRecordLocked(store, record_write, nullptr,
                                         std::move(commit_retirements), trace);
+  }
+  if (status.ok() && grouped && grouped->root_->batch_) {
+    mutation_sequence = grouped->root_->batch_->sequence_;
+    logical_size = grouped->root_->batch_->logical_size_;
+    if (replication) replication->partition_sequence_ = mutation_sequence;
+    if (fullsync_command)
+      fullsync_command->partition_sequence_ = mutation_sequence;
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -2820,6 +2827,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
           ? request.inline_payload_->encoded_bytes()
           : request.value_.size();
   std::uint64_t logical_size = request.logical_size_;
+  std::uint64_t mutation_sequence = request.mutation_sequence_;
   std::uint64_t txid = 0;
   if (store.write_failed_ || RuntimeFailureLatched() ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
@@ -2845,6 +2853,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       request.group_ != nullptr && request.group_->auxiliary_;
   const bool grouped_root =
       request.group_ != nullptr && !request.group_->auxiliary_;
+  auto* batch = grouped_root ? request.group_->batch_ : nullptr;
+  if (batch && (request.for_defrag_ || request.external_ || !request.tx_ ||
+                request.tx_->collect_undo_ || batch->records_.empty()))
+    co_return absl::InvalidArgumentError("invalid prepared group batch");
   if (request.inline_payload_ != nullptr &&
       (request.external_ || !request.value_.empty() ||
        (!auxiliary &&
@@ -2927,6 +2939,14 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record payload does not fit an inline block");
   }
+
+  const std::size_t append_bytes =
+      total_disk_bytes + (batch ? batch->disk_bytes_ : 0);
+  if (append_bytes < total_disk_bytes ||
+      append_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
+      append_bytes > options_.buffers_.write_buffer_bytes_)
+    co_return absl::OutOfRangeError(
+        "prepared group batch exceeds append capacity");
 
   // Logical partitions route keys, but physical append streams are per
   // worker. This keeps foreground writes local and bounds active 8 MiB
@@ -3029,7 +3049,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   std::unique_ptr<GroupedRetirementPins> grouped_dependency_pins;
   const auto fits = [&] {
     return active_stream() &&
-           active_stream()->committed_bytes_ + total_disk_bytes <= append_limit;
+           active_stream()->committed_bytes_ + append_bytes <= append_limit;
   };
   const auto append_ready = [&] {
     return fits() && active_stream()->write_buffer_id_ != 0;
@@ -3138,7 +3158,7 @@ acquire_active_stream:
     // Recheck after allocation released the store lock: a maintenance path
     // may have installed a successor, or another writer consumed the tail.
     if (active_stream().has_value() &&
-        active_stream()->committed_bytes_ + total_disk_bytes <= append_limit) {
+        active_stream()->committed_bytes_ + append_bytes <= append_limit) {
       absl::Status returned = co_await return_reserved(*allocated);
       if (!returned.ok()) co_return returned;
       continue;
@@ -3262,10 +3282,9 @@ acquire_active_stream:
   if (request.explicit_root_ != nullptr &&
       request.explicit_root_->reject_older_sequence_ &&
       previous_entry != nullptr &&
-      (previous_entry->value_.mutation_sequence_ > request.mutation_sequence_ ||
+      (previous_entry->value_.mutation_sequence_ > mutation_sequence ||
        (!request.explicit_root_->allow_equal_sequence_ &&
-        previous_entry->value_.mutation_sequence_ ==
-            request.mutation_sequence_))) {
+        previous_entry->value_.mutation_sequence_ == mutation_sequence))) {
     co_return absl::OkStatus();
   }
   if (!auxiliary && !request.for_defrag_ && partition_ptr != nullptr &&
@@ -3288,11 +3307,9 @@ acquire_active_stream:
     if (request.explicit_root_ != nullptr &&
         request.explicit_root_->reject_older_sequence_ &&
         previous_entry != nullptr &&
-        (previous_entry->value_.mutation_sequence_ >
-             request.mutation_sequence_ ||
+        (previous_entry->value_.mutation_sequence_ > mutation_sequence ||
          (!request.explicit_root_->allow_equal_sequence_ &&
-          previous_entry->value_.mutation_sequence_ ==
-              request.mutation_sequence_))) {
+          previous_entry->value_.mutation_sequence_ == mutation_sequence))) {
       co_return absl::OkStatus();
     }
   }
@@ -3368,6 +3385,32 @@ acquire_active_stream:
       goto acquire_active_stream;
     }
   }
+  if (batch && previous_entry && previous_entry->value_.grouped()) {
+    // Pinning may have yielded to physical relocation. Retry its owner hops
+    // before assigning a revision, so the prepared-batch cut cannot jump back
+    // into an IO wait after it has fixed publication order.
+    const auto current =
+        partition_ptr->grouped_objects_[request.db_id_].CurrentForMutation(
+            request.key_);
+    if (!current) co_return absl::AbortedError("prepared graph disappeared");
+    const auto pinned = [&](const RecordLocation& location) {
+      return !location.tx_tagged() ||
+             (grouped_dependency_pins &&
+              grouped_dependency_pins->Contains(RetiredRecordOf(location)));
+    };
+    if (!pinned(current->version().root_)) goto acquire_active_stream;
+    for (const auto id : request.group_->changed_groups_) {
+      const auto* entry = current->FindGroup(id);
+      if (entry && !pinned(MaterializeIndexLocation(*entry)))
+        goto acquire_active_stream;
+    }
+  }
+  if (batch) {
+    const auto prepared = batch->prepare_();
+    if (!prepared.ok()) co_return prepared;
+    logical_size = batch->logical_size_;
+    mutation_sequence = batch->sequence_;
+  }
   const bool has_index_extra = request.expire_at_ms_ != 0;
   const unsigned index_logical_bytes = RecordIndexPrefix::LogicalBytesFor(
       static_cast<std::uint32_t>(logical_size));
@@ -3423,9 +3466,10 @@ acquire_active_stream:
       previous_extents, request.external_ ? extents : nullptr);
   const ExtentManifest previous_dependent_extents = ExtentManifest{};
   ActiveBlock updated = *active_stream();
-  const std::uint32_t record_offset = updated.committed_bytes_;
-  updated.committed_bytes_ += static_cast<std::uint32_t>(total_disk_bytes);
-  ++updated.record_count_;
+  const std::uint32_t record_offset =
+      updated.committed_bytes_ + (batch ? batch->disk_bytes_ : 0);
+  updated.committed_bytes_ += static_cast<std::uint32_t>(append_bytes);
+  updated.record_count_ += 1 + (batch ? batch->records_.size() : 0);
 
   BlockState* state_ptr = FindBlockState(store, updated.block_id_);
   if (state_ptr == nullptr) {
@@ -3444,11 +3488,24 @@ acquire_active_stream:
     co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid active staging block");
   }
+  if (batch) {
+    std::uint32_t offset = record_offset - batch->disk_bytes_;
+    for (auto& page : batch->records_) {
+      page.location_ = RecordLocation(
+          updated.block_id_, batch->revision_, updated.allocation_epoch_, 0,
+          static_cast<std::uint32_t>(page.logical_size_),
+          RecordLocation::PackedMetadata::Encode(
+              offset, static_cast<std::uint32_t>(page.disk_bytes_), writer_id,
+              true, false, request.key_indirect_, false, false, true,
+              RecordKind::kValue, request.value_type_, false, false));
+      offset += page.disk_bytes_;
+    }
+    assert(offset == record_offset);
+  }
   if (grouped_root && request.group_->prepare_root_) {
     const RecordLocation provisional(
-        updated.block_id_, request.mutation_sequence_,
-        updated.allocation_epoch_, request.expire_at_ms_,
-        static_cast<std::uint32_t>(logical_size),
+        updated.block_id_, mutation_sequence, updated.allocation_epoch_,
+        request.expire_at_ms_, static_cast<std::uint32_t>(logical_size),
         RecordLocation::PackedMetadata::Encode(
             record_offset, static_cast<std::uint32_t>(total_disk_bytes),
             writer_id, true, request.external_, request.key_indirect_, false,
@@ -3496,6 +3553,8 @@ acquire_active_stream:
       // The physical root can move independently of every unchanged child,
       // including during a TTL-only write. Re-enter the pre-stage owner-hop
       // protocol instead of borrowing the new block's transaction identity.
+      if (batch)
+        co_return absl::InternalError("prepared root lost its dependency pin");
       goto acquire_active_stream;
     }
     if (request.tx_ != nullptr) {
@@ -3516,6 +3575,9 @@ acquire_active_stream:
         // A physical-only relocation won during pinning/index resolution.
         // Nothing is staged yet; re-pin the new identity before re-entering
         // this non-suspending root publication section.
+        if (batch)
+          co_return absl::InternalError(
+              "prepared page lost its dependency pin");
         goto acquire_active_stream;
       }
     }
@@ -3626,7 +3688,8 @@ acquire_active_stream:
   TraceSpanScope value_process(trace ? trace->diagnostics_ : nullptr,
                                TraceStage::kValueProcess);
   const std::size_t encoded_record_bytes = record_header_bytes + payload_bytes;
-  grouped_root_guard.armed_ = grouped_root || previous_grouped != nullptr;
+  if (!batch)
+    grouped_root_guard.armed_ = grouped_root || previous_grouped != nullptr;
   std::fill_n(staging.data_ + record_offset + encoded_record_bytes,
               total_disk_bytes - encoded_record_bytes, std::byte{0});
   RecordHeader record{
@@ -3668,7 +3731,7 @@ acquire_active_stream:
                                      ? EffectiveRecordDbEpoch(*partition_ptr,
                                                               request.db_id_)
                                      : DbEpoch(request.db_id_))),
-      .mutation_sequence_ = request.mutation_sequence_,
+      .mutation_sequence_ = mutation_sequence,
       .expire_at_ms_ = request.expire_at_ms_,
       .lsn_ = lsn,
       .allocation_epoch_ = updated.allocation_epoch_,
@@ -3697,11 +3760,67 @@ acquire_active_stream:
                   staging.data_ + record_offset + record_header_bytes,
                   payload_bytes));
   }
+  if (batch) {
+    // All pages stay in the private append tail until the root and every
+    // auxiliary have encoded successfully. No buffer acquisition, extent IO,
+    // key lookup or coroutine handoff is permitted in this section.
+    const auto header_bytes = RecordHeaderBytes(
+        request.key_.size(), request.key_indirect_, true, false, true);
+    for (std::size_t i = 0; i < batch->records_.size(); ++i) {
+      const auto& page = batch->records_[i];
+      if (LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_GROUP_AUX_KEY", request.key_,
+                                  "LAVIK_FAIL_GROUP_AUX_NTH", i + 1))
+        co_return MemoryLimitError(
+            "OOM injected grouped auxiliary admission failure");
+      const auto offset = page.location_.record_offset();
+      auto output = std::span<std::byte>(staging.data_ + offset + header_bytes,
+                                         page.payload_.encoded_bytes());
+      auto encoded = page.payload_.WriteTo(output);
+      LAVIK_FAULT_INJECT(if (LAVIK_FAULT_MATCHES(
+                                 "LAVIK_FAIL_INLINE_GROUP_ENCODE_KEY",
+                                 request.key_)) {
+        static std::atomic<bool> injected{false};
+        if (!injected.exchange(true, std::memory_order_relaxed))
+          encoded = absl::DataLossError("injected inline group encoding fault");
+      });
+      if (!encoded.ok()) co_return encoded;
+      auto page_lsn = AllocateLsn(store);
+      if (!page_lsn.ok()) co_return page_lsn.status();
+      updated.max_lsn_ = std::max(updated.max_lsn_, *page_lsn);
+      RecordHeader auxiliary_header = record;
+      auxiliary_header.header_bytes_ = header_bytes;
+      auxiliary_header.grouped_ = false;
+      auxiliary_header.auxiliary_group_ = true;
+      auxiliary_header.group_incarnation_ = request.group_->root_incarnation_;
+      auxiliary_header.group_prefix_ = page.id_.prefix_;
+      auxiliary_header.group_prefix_bits_ = page.id_.bits_;
+      auxiliary_header.logical_size_ = page.logical_size_;
+      auxiliary_header.payload_bytes_ = output.size();
+      auxiliary_header.total_disk_bytes_ = page.disk_bytes_;
+      auxiliary_header.mutation_sequence_ = batch->revision_;
+      auxiliary_header.expire_at_ms_ = 0;
+      auxiliary_header.lsn_ = *page_lsn;
+      auxiliary_header.payload_checksum_ = record.no_crc_ ? 0 : Crc32c(output);
+      if (!EncodeRecordHeader(auxiliary_header, request.key_,
+                              {staging.data_ + offset, header_bytes}))
+        co_return absl::InternalError("prepared group header encoding failed");
+      std::fill_n(staging.data_ + offset + header_bytes + output.size(),
+                  page.disk_bytes_ - header_bytes - output.size(),
+                  std::byte{0});
+      if (indirect_key)
+        store
+            .indirect_key_references_[{updated.block_id_,
+                                       updated.allocation_epoch_}]
+            .emplace(offset, indirect_key);
+    }
+  }
   if (!EncodeRecordHeader(record, request.key_, record_output)) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
   }
   value_process.End();
+
+  grouped_root_guard.armed_ = grouped_root || previous_grouped != nullptr;
 
   // No suspension separates append validation from publication. The buffer
   // remains attached until its full dirty tail and outstanding readers drain.
@@ -3716,7 +3835,7 @@ acquire_active_stream:
   }
 
   const RecordLocation location(
-      updated.block_id_, request.mutation_sequence_, updated.allocation_epoch_,
+      updated.block_id_, mutation_sequence, updated.allocation_epoch_,
       request.expire_at_ms_, static_cast<std::uint32_t>(logical_size),
       // A relocation rewrites the same logical version, so it carries the
       // bit unchanged. A real overwrite shields what its predecessor was
@@ -3757,6 +3876,11 @@ acquire_active_stream:
                                          location.total_disk_bytes())
             : 0,
         request.group_ != nullptr ? request.group_->batch_txid_ : 0);
+  }
+  if (batch) {
+    for (const auto& page : batch->records_)
+      NoteTxRecordLocal(store, updated.block_id_, updated.allocation_epoch_,
+                        txid, page.disk_bytes_, false, request.tx_, 0, 0);
   }
   const bool was_live =
       previous.has_value() && previous->kind() == RecordKind::kValue;
@@ -3912,6 +4036,10 @@ acquire_active_stream:
           std::make_move_iterator(commit_retirements->end()));
     }
   }
+  if (batch) {
+    for (std::size_t i = 0; i < batch->records_.size(); ++i)
+      staged.identities_.push_back(RecordIdentity{});
+  }
   staged.identities_.push_back(RecordIdentity{
       .entry_address_ = reinterpret_cast<std::uintptr_t>(inserted_entry),
       .index_generation_ = store.index_generations_[request.db_id_],
@@ -4025,7 +4153,7 @@ acquire_active_stream:
   staging_state->committed_bytes_ = updated.committed_bytes_;
   staging_state->record_count_ = updated.record_count_;
   staging_state->max_lsn_ = updated.max_lsn_;
-  state.live_bytes_ += location.total_disk_bytes();
+  state.live_bytes_ += append_bytes;
   // Queued partial flushes remain queued across later appends. Queue ownership
   // belongs to RequestFlush/the flusher; it does not mean the stream is sealed.
   if (transaction_append && updated.committed_bytes_ == kStorageBlockBytes)

@@ -25,6 +25,7 @@ namespace lavik::storage {
 class WriteBufferTestPeer {
  public:
   enum class Scenario {
+    kGroupedPublication,
     kProgress,
     kEpochChanged,
     kSourceChanged,
@@ -718,7 +719,156 @@ class WriteBufferTestPeer {
     co_return absl::OkStatus();
   }
 
+  static Task<absl::Status> RunGroupedPublication(StorageEngine& storage) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    constexpr std::string_view key = "prepared-same-key";
+    std::vector<std::string> names;
+    names.reserve(1024);
+    std::vector<ScoredMemberView> seed;
+    for (unsigned i = 0; i < 1024; ++i) {
+      names.push_back(std::to_string(i) + std::string(128, 'm'));
+      seed.push_back({names.back(), double(i)});
+    }
+    auto seeded = co_await storage.ExecuteSortedSet(
+        0, key, {.kind_ = SortedSetOperationKind::kAdd, .entries_ = seed});
+    if (!seeded.ok()) co_return seeded.status();
+    const auto digest = ComputeDigest(key);
+    std::array<std::string, 2> changed_members;
+    std::array<double, 2> expected;
+    {
+      auto lock = co_await tx::CurrentTxShard().AcquireKey(
+          0, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      co_await store.store_state_mutex_.Lock();
+      UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+      auto& partition = impl.PartitionForKey(store, key);
+      const auto before = partition.grouped_objects_[0].CurrentForMutation(key);
+      if (!before || before->ordered_directory().groups().size() < 4)
+        co_return absl::InternalError(
+            "fixture did not create separate ordered pages");
+      const auto& directory = before->ordered_directory();
+      std::array<OrderedCollectionMutationPlan, 2> plans;
+      std::array<StorageEngine::Impl::SortedSetMemberMutation, 2> members;
+      for (unsigned i = 0; i < 2; ++i) {
+        const auto id = i == 0 ? directory.root().first_group_
+                               : directory.root().last_group_;
+        auto loaded = co_await impl.LoadOrderedGroupSnapshot(
+            store, partition, 0, key, digest, before, id, false);
+        if (!loaded.ok()) co_return loaded.status();
+        auto& page = loaded->snapshot_;
+        auto selected = page.entries_.begin();
+        if (i != 0) {
+          const auto first =
+              directory.member_directory()->Find(changed_members[0])->id_;
+          selected = std::find_if(
+              page.entries_.begin(), page.entries_.end(),
+              [&](const auto& entry) {
+                return directory.member_directory()->Find(entry.value_)->id_ !=
+                       first;
+              });
+          if (selected == page.entries_.end())
+            co_return absl::InternalError(
+                "fixture has no independent member leaf");
+        }
+        selected->score_ += 0.125;
+        changed_members[i] = selected->value_;
+        expected[i] = selected->score_;
+        plans[i].root_ = directory.root();
+        plans[i].expected_sequence_ = before->revision();
+        plans[i].changed_ = true;
+        plans[i].writes_.push_back(std::move(page));
+        auto prepared = co_await impl.PrepareSortedSetMembers(
+            store, partition, 0, key, digest, before, plans[i]);
+        if (!prepared.ok()) co_return prepared.status();
+        members[i] = std::move(*prepared);
+      }
+      // Both private plans name the same old root. Publish the second first;
+      // the first must retain its changed page and decision in the final root.
+      std::uint64_t revision = before->revision();
+      for (unsigned i : {1, 0}) {
+        absl::Status status;
+        if (i == 1) {
+          store.store_state_mutex_.Unlock(*store.worker_);
+          while (store.tx_commit_runner_)
+            co_await bycorf::Yield(*store.worker_);
+          co_await store.store_state_mutex_.Lock();
+          impl.YieldActiveWriteBuffers(store);
+          store.store_state_mutex_.Unlock(*store.worker_);
+          while (store.flush_running_ || !store.flush_queue_.empty())
+            co_await bycorf::Yield(*store.worker_);
+          co_await store.store_state_mutex_.Lock();
+          std::vector<std::uint16_t> held;
+          std::uint16_t slot = 0;
+          while (store.buffers_.TryAcquireWriteBuffer(&slot))
+            held.push_back(slot);
+          if (held.empty())
+            co_return absl::InternalError("fixture has no free write slots");
+          const auto next_id = tx::TxRuntime::Get()->next_txid_.load();
+          auto pending = impl.CommitGroupedOrderedMutationLocked(
+              store, partition, 0, key, digest, before, std::move(plans[i]), 0,
+              nullptr, nullptr, nullptr, &members[i]);
+          auto handle = std::move(pending).ReleaseHandle();
+          pending = decltype(pending)(handle);
+          handle.resume();
+          const bool waited =
+              !pending.done() && store.buffers_.has_write_waiters();
+          // Admission allocated the transaction ID, but the unavailable staging
+          // slot must keep revision allocation and all graph changes pending.
+          const bool deferred_revision =
+              tx::TxRuntime::Get()->next_txid_.load() == next_id + 1;
+          const bool unchanged = partition.grouped_objects_[0]
+                                     .CurrentForMutation(key)
+                                     ->revision() == revision;
+          for (auto id : held) store.buffers_.ReleaseWriteBuffer(id);
+          while (!pending.done()) co_await bycorf::Yield(*store.worker_);
+          status = std::move(pending).TakeResult();
+          if (!waited || !deferred_revision || !unchanged)
+            co_return absl::InternalError(
+                "prepared batch assigned publication order before capacity");
+        } else {
+          status = co_await impl.CommitGroupedOrderedMutationLocked(
+              store, partition, 0, key, digest, before, std::move(plans[i]), 0,
+              nullptr, nullptr, nullptr, &members[i]);
+        }
+        if (!status.ok()) co_return status;
+        const auto current =
+            partition.grouped_objects_[0].CurrentForMutation(key);
+        if (current->revision() <= revision ||
+            current->ordered_directory().root().item_count_ != 1024)
+          co_return absl::InternalError(
+              "merged publication lost version/count");
+        revision = current->revision();
+      }
+    }
+    std::array<std::string_view, 2> requested{changed_members[0],
+                                              changed_members[1]};
+    auto result = co_await storage.ExecuteSortedSet(
+        0, key,
+        {.kind_ = SortedSetOperationKind::kScores, .members_ = requested});
+    if (!result.ok()) co_return result.status();
+    if (result->scores_.size() != 2 || result->scores_[0] != expected[0] ||
+        result->scores_[1] != expected[1])
+      co_return absl::InternalError("merged publication lost a member update");
+    auto range = co_await storage.ExecuteSortedSet(
+        0, key, {.kind_ = SortedSetOperationKind::kRange});
+    if (!range.ok()) co_return range.status();
+    for (unsigned i = 0; i < 2; ++i) {
+      auto found = std::find_if(
+          range->members_.begin(), range->members_.end(),
+          [&](const auto& item) { return item.member_ == changed_members[i]; });
+      if (found == range->members_.end() || found->score_ != expected[i])
+        co_return absl::InternalError(
+            "merged publication lost an ordered update");
+    }
+    while (store.tx_commit_runner_) co_await bycorf::Yield(*store.worker_);
+    if (impl.RuntimeFailureLatched())
+      co_return absl::InternalError("merged publication commit failed");
+    co_return absl::OkStatus();
+  }
+
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
+    if (scenario == Scenario::kGroupedPublication)
+      co_return co_await RunGroupedPublication(storage);
     if (scenario == Scenario::kResumeActiveStreams)
       co_return co_await RunResumeActiveStreams(storage);
     if (scenario == Scenario::kRetirementSnapshots)
@@ -1034,6 +1184,11 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
 TEST_P(StorageWriteBufferTest,
        RelocationWaitsWithoutHoldingStoreOrAllocationGate) {
   RunWriteBufferScenario(GetParam());
+}
+
+TEST(StorageWriteBufferResumeTest,
+     PreparedSameKeyPlansMergeWithoutLosingEitherGraph) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedPublication);
 }
 
 TEST(StorageWriteBufferResumeTest, ThreeStreamsReuseTwoBuffersWithoutSealing) {

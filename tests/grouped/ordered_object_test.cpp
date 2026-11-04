@@ -126,6 +126,163 @@ TEST(SortedSetDirectoryTest, PageBoundariesFollowLogicalPageVersions) {
   EXPECT_EQ(unchanged->groups()[1].max_key_.LessThan("z"), false);
 }
 
+// Four ordered pages and two member leaves let independent endpoint edits
+// share a root while changing cardinality in opposite directions.
+struct PublicationFixture {
+  OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kSortedSet,
+                             .incarnation_ = 17,
+                             .item_count_ = 8,
+                             .first_group_ = 1,
+                             .last_group_ = 4,
+                             .next_group_id_ = 5,
+                             .group_count_ = 4,
+                             .revision_ = 10};
+  std::vector<RecoveredOrderedGroup> pages;
+  std::vector<RecoveredGroupedRecord> members;
+  OrderedGroupDirectory directory;
+
+  PublicationFixture() {
+    root.member_index_ = GroupedHashRoot{.incarnation_ = 17,
+                                         .field_count_ = 8,
+                                         .group_count_ = 2,
+                                         .revision_ = 10};
+    for (std::uint64_t id = 1; id <= 4; ++id)
+      pages.push_back({{.incarnation_ = 17,
+                        .id_ = id,
+                        .previous_ = id - 1,
+                        .next_ = id == 4 ? 0 : id + 1,
+                        .sequence_ = 10,
+                        .lsn_ = id,
+                        .item_count_ = 2,
+                        .encoded_bytes_ = 8192,
+                        .record_token_ = id,
+                        .min_score_ = double(id * 10),
+                        .max_score_ = double(id * 10 + 1)}});
+    for (std::uint64_t prefix : {std::uint64_t{0}, std::uint64_t{1} << 63})
+      members.push_back({.incarnation_ = 17,
+                         .id_ = {prefix, 1},
+                         .sequence_ = 10,
+                         .lsn_ = 10,
+                         .field_count_ = 4,
+                         .encoded_bytes_ = 8192,
+                         .record_token_ = 1});
+    auto member_directory =
+        HashGroupDirectory::Recover(*root.member_index_, 10, members, {});
+    directory = OrderedGroupDirectory::Recover(root, 10, pages, {}, 10,
+                                               *member_directory)
+                    .value();
+  }
+  OrderedGroupSnapshot Page(unsigned i) const {
+    const auto& page = pages[i];
+    return {.kind_ = root.kind_,
+            .incarnation_ = 17,
+            .id_ = page.id_,
+            .previous_ = page.previous_,
+            .next_ = page.next_};
+  }
+  HashGroupSnapshot Member(unsigned i) const {
+    return {.incarnation_ = 17, .id_ = members[i].id_};
+  }
+};
+
+TEST(SortedSetPublicationTest, DisjointCountChangesMergeInEitherOrder) {
+  for (bool reverse : {false, true}) {
+    PublicationFixture f;
+    auto current = f.directory;
+    unsigned ordinal = 0;
+    for (unsigned i : reverse ? std::array<unsigned, 2>{1, 0}
+                              : std::array<unsigned, 2>{0, 1}) {
+      auto planned = f.root;
+      planned.item_count_ = i == 0 ? 9 : 7;
+      planned.member_index_->field_count_ = planned.item_count_;
+      auto page = f.Page(i == 0 ? 0 : 3);
+      auto member = f.Member(i);
+      auto root =
+          MergeSortedSetPublication(f.directory, current, planned,
+                                    std::span(&page, 1), std::span(&member, 1));
+      ASSERT_TRUE(root.ok()) << root.status();
+      EXPECT_EQ(root->revision_, 0);
+      EXPECT_EQ(root->item_count_, ordinal == 0 ? planned.item_count_ : 8);
+      root->revision_ = root->member_index_->revision_ = 11 + ordinal++;
+      auto replacement = f.pages[i == 0 ? 0 : 3];
+      replacement.sequence_ = replacement.lsn_ = root->revision_;
+      replacement.item_count_ = i == 0 ? 3 : 1;
+      auto leaf = f.members[i];
+      leaf.sequence_ = leaf.lsn_ = root->revision_;
+      leaf.field_count_ = i == 0 ? 5 : 3;
+      auto next =
+          current.Apply(*root, root->revision_, std::span(&replacement, 1),
+                        root->revision_, std::span(&leaf, 1));
+      ASSERT_TRUE(next.ok()) << next.status();
+      current = std::move(*next);
+    }
+    EXPECT_EQ(current.root().item_count_, 8);
+    EXPECT_EQ(current.CountBefore(1), 3);
+    EXPECT_EQ(current.CountBefore(4), 8);
+    EXPECT_EQ(current.Find(1)->item_count_, 3);
+    EXPECT_EQ(current.Find(4)->item_count_, 1);
+    EXPECT_EQ(current.member_directory()->groups().Get(0)->field_count_, 5);
+    EXPECT_EQ(current.member_directory()
+                  ->groups()
+                  .Get(std::uint64_t{1} << 63)
+                  ->field_count_,
+              3);
+    EXPECT_EQ(f.directory.root().item_count_, 8);
+    EXPECT_EQ(f.directory.Find(1)->item_count_, 2);
+  }
+}
+
+TEST(SortedSetPublicationTest, ConflictingPagesAndRoutingNeighboursAbort) {
+  PublicationFixture f;
+  auto page = f.Page(0);
+  auto member = f.Member(0);
+  for (unsigned changed : {0, 1}) {
+    auto root = f.root;
+    root.revision_ = 11;
+    auto replacement = f.pages[changed];
+    replacement.sequence_ = replacement.lsn_ = 11;
+    auto current = f.directory.Apply(root, 11, std::span(&replacement, 1), 11);
+    ASSERT_TRUE(current.ok()) << current.status();
+    const auto merged =
+        MergeSortedSetPublication(f.directory, *current, f.root,
+                                  std::span(&page, 1), std::span(&member, 1));
+    EXPECT_TRUE(absl::IsAborted(merged.status()));
+  }
+  auto root = f.root;
+  root.revision_ = root.member_index_->revision_ = 11;
+  auto leaf = f.members[0];
+  leaf.sequence_ = leaf.lsn_ = 11;
+  auto current = f.directory.Apply(root, 11, {}, 11, std::span(&leaf, 1));
+  ASSERT_TRUE(current.ok()) << current.status();
+  EXPECT_TRUE(absl::IsAborted(
+      MergeSortedSetPublication(f.directory, *current, f.root,
+                                std::span(&page, 1), std::span(&member, 1))
+          .status()));
+}
+
+TEST(SortedSetPublicationTest, StructuralPlansRequireWholeKeyProtection) {
+  PublicationFixture f;
+  auto page = f.Page(0);
+  auto member = f.Member(0);
+  auto check = [&](const OrderedCollectionRoot& root) {
+    EXPECT_TRUE(absl::IsFailedPrecondition(
+        MergeSortedSetPublication(f.directory, f.directory, root,
+                                  std::span(&page, 1), std::span(&member, 1))
+            .status()));
+  };
+  auto root = f.root;
+  ++root.next_group_id_;
+  check(root);
+  root = f.root;
+  ++root.member_index_->group_count_;
+  check(root);
+  page.retired_ = true;
+  check(f.root);
+  page.retired_ = false;
+  member.id_.bits_ = 2;
+  check(f.root);
+}
+
 TEST(StreamDirectoryTest, RetainsUnchangedHeaderAndInvalidatesReplacement) {
   OrderedCollectionRoot root{.kind_ = OrderedCollectionKind::kStream,
                              .incarnation_ = 17,

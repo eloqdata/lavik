@@ -1497,6 +1497,76 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
   return result;
 }
 
+absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
+    const OrderedGroupDirectory& base, const OrderedGroupDirectory& current,
+    const OrderedCollectionRoot& planned,
+    std::span<const OrderedGroupSnapshot> ordered,
+    std::span<const HashGroupSnapshot> members) {
+  const auto& before = base.root();
+  const auto same_topology = [&](const OrderedCollectionRoot& root) {
+    return root.kind_ == OrderedCollectionKind::kSortedSet &&
+           root.incarnation_ == before.incarnation_ &&
+           root.first_group_ == before.first_group_ &&
+           root.last_group_ == before.last_group_ &&
+           root.next_group_id_ == before.next_group_id_ &&
+           root.group_count_ == before.group_count_ && root.member_index_ &&
+           before.member_index_ &&
+           root.member_index_->incarnation_ == before.incarnation_ &&
+           root.member_index_->seed_ == before.member_index_->seed_ &&
+           root.member_index_->group_count_ ==
+               before.member_index_->group_count_;
+  };
+  if (!same_topology(planned) || ordered.empty() || planned.item_count_ == 0 ||
+      planned.member_index_->field_count_ != planned.item_count_)
+    return absl::FailedPreconditionError("Sorted Set plan needs key X");
+  if (!same_topology(current.root()) || current.sequence() < base.sequence())
+    return absl::AbortedError("Sorted Set topology changed during preparation");
+  const auto unchanged = [&](std::uint64_t id) {
+    if (id == 0) return true;
+    const auto* a = base.Find(id);
+    const auto* b = current.Find(id);
+    return a && b && a->sequence_ == b->sequence_ &&
+           a->previous_ == b->previous_ && a->next_ == b->next_;
+  };
+  for (const auto& page : ordered) {
+    const auto* old = base.Find(page.id_);
+    if (!old || page.retired_ || page.incarnation_ != before.incarnation_ ||
+        page.previous_ != old->previous_ || page.next_ != old->next_)
+      return absl::FailedPreconditionError("Sorted Set page topology changed");
+    // Neighbours bound routing even if this command did not rewrite them.
+    // Reject their logical changes; comparing physical addresses would also
+    // reject harmless GC moves while page IO was outstanding.
+    if (!unchanged(page.id_) || !unchanged(page.previous_) ||
+        !unchanged(page.next_))
+      return absl::AbortedError("Sorted Set page or routing boundary changed");
+  }
+  for (const auto& page : members) {
+    const auto* a = base.member_directory()->groups().Get(page.id_.prefix_);
+    const auto* b = current.member_directory()->groups().Get(page.id_.prefix_);
+    if (!a || a->id_ != page.id_ || page.retired_ ||
+        page.incarnation_ != before.incarnation_)
+      return absl::FailedPreconditionError(
+          "Sorted Set member topology changed");
+    if (!b || b->id_ != a->id_ || b->sequence_ != a->sequence_)
+      return absl::AbortedError("Sorted Set member page changed");
+  }
+  const absl::int128 count = absl::int128(current.root().item_count_) +
+                             planned.item_count_ - before.item_count_;
+  if (count <= 0 || count > UINT32_MAX)
+    return absl::FailedPreconditionError("Sorted Set count needs key X");
+  auto result = current.root();
+  result.item_count_ = static_cast<std::uint64_t>(count);
+  result.revision_ = 0;
+  if (!members.empty()) {
+    result.member_index_->field_count_ = result.item_count_;
+    result.member_index_->revision_ = 0;
+  } else if (planned.item_count_ != before.item_count_) {
+    return absl::InvalidArgumentError(
+        "Sorted Set count changed without members");
+  }
+  return result;
+}
+
 absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::Apply(
     const OrderedCollectionRoot& root, std::uint64_t revision,
     std::span<const RecoveredOrderedGroup> changed,

@@ -17,11 +17,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <future>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 
+#include "absl/cleanup/cleanup.h"
 #include "lavik/storage/detail/grouped/collection.h"
 #include "write_e2e_support.h"
 
@@ -62,6 +64,124 @@ std::vector<std::string> ZSetSeed(std::string key) {
     command.push_back(std::to_string(i) + std::string(128, 'm'));
   }
   return command;
+}
+
+TEST(GroupedSortedSetWriteE2e, PreparedPublicationAssignsRevisionAfterWaiting) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic preparation pause";
+#endif
+  ScopedEnvironment cleaner("LAVIK_TX_CLEANER_START_PAUSED", "1");
+  PrivateDisk disk;
+  const std::string a = "prepared-a";
+  const std::string b = "prepared-b";
+  const std::string member = "100" + std::string(128, 'm');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(a)).text_, "256");
+    ASSERT_EQ(client.Command(ZSetSeed(b)).text_, "256");
+    client.Durable();
+  }
+  {
+    const std::string gate = disk.path() + ".publication-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment key("LAVIK_GROUP_PREPARE_PAUSE_KEY", a.c_str());
+    ScopedEnvironment file("LAVIK_GROUP_PREPARE_PAUSE_FILE", gate.c_str());
+    const std::array<std::string_view, 1> crc{"--record-crc"};
+    Server server(disk, 1, {}, {}, false, 2, "2G", {}, {}, 0, 20, crc);
+    auto waiting = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZINCRBY", a, "0.25", member});
+    });
+    // Unblock before the future joins on every assertion/error exit.
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    bool prepared = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      prepared =
+          server.Log().find("grouped publication prepared before revision") !=
+          std::string::npos;
+      if (prepared) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    ASSERT_TRUE(prepared) << server.Log();
+    Client other(server.port());
+    ASSERT_EQ(other.Command({"ZINCRBY", b, "0.5", member}).text_, "100.5");
+    other.Durable();
+    ::unlink(gate.c_str());
+    ASSERT_EQ(waiting.get().text_, "100.25") << server.Log();
+    other.Durable();
+  }
+  struct Published {
+    std::uint64_t revision = 0;
+    std::uint64_t txid = 0;
+    std::uint64_t block = 0;
+  };
+  std::map<std::string, Published> latest;
+  std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, RecordHeader>>>
+      groups;
+  disk.VisitRecords([&](const BlockHeader& block, const RecordHeader& record,
+                        std::string_view key, std::string_view payload) {
+    if (key != a && key != b) return;
+    if (record.grouped_) {
+      auto root = DecodeOrderedCollectionRoot(payload);
+      ASSERT_TRUE(root.ok()) << root.status();
+      if (root->revision_ > latest[std::string(key)].revision)
+        latest[std::string(key)] = {root->revision_, record.txid_,
+                                    block.block_id_};
+    } else if (record.auxiliary_group_) {
+      groups[record.mutation_sequence_].emplace_back(block.block_id_, record);
+    }
+  });
+  ASSERT_EQ(latest.size(), 2);
+  EXPECT_LT(latest[a].txid, latest[b].txid);
+  EXPECT_GT(latest[a].revision, latest[b].revision);
+  for (const auto& [key, root] : latest) {
+    ASSERT_GE(groups[root.revision].size(), 2);
+    for (const auto& [block, group] : groups[root.revision]) {
+      EXPECT_EQ(block, root.block);
+      EXPECT_EQ(group.txid_, root.txid);
+      EXPECT_EQ(group.group_batch_txid_, 0);
+      EXPECT_FALSE(group.no_crc_);
+    }
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZSCORE", a, member}).text_, "100.25");
+  EXPECT_EQ(client.Command({"ZSCORE", b, member}).text_, "100.5");
+  EXPECT_EQ(client.Command({"ZCARD", a}).text_, "256");
+  EXPECT_EQ(client.Command({"ZRANK", a, member}).text_, "100");
+}
+
+TEST(GroupedSortedSetWriteE2e, PreparedBatchFailureLeavesNoPartialPublication) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires auxiliary-write failure injection";
+#endif
+  PrivateDisk disk;
+  const std::string key = "prepared-failure";
+  const std::string member = "100" + std::string(128, 'm');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+  }
+  {
+    Server server(disk, 1, {}, key, false, 2);
+    Client client(server.port());
+    auto failed = client.Command({"ZINCRBY", key, "0.25", member});
+    ASSERT_EQ(failed.kind_, '-') << failed.text_;
+    EXPECT_TRUE(failed.text_.starts_with("OOM")) << failed.text_;
+    EXPECT_EQ(client.Command({"ZSCORE", key, member}).text_, "100");
+    EXPECT_EQ(client.Command({"ZRANK", key, member}).text_, "100");
+    EXPECT_EQ(client.Command({"SET", "healthy", "yes"}).text_, "OK");
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"ZSCORE", key, member}).text_, "100");
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "256");
+  EXPECT_EQ(client.Command({"GET", "healthy"}).text_, "yes");
+  EXPECT_EQ(client.Command({"ZINCRBY", key, "0.25", member}).text_, "100.25");
 }
 
 TEST(GroupedSortedSetWriteE2e, PublicationRevisionsHaveIndependentDecisions) {
