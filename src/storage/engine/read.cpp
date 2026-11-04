@@ -280,7 +280,9 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   if (!result.Current(*this)) return;
   if (entry && !entry->key_complete()) return;
   if (entry == nullptr || entry->value_.kind() == RecordKind::kTombstone) {
-    result.ready_.emplace(absl::NotFoundError("key not found"));
+    // Ordinary absence needs only a code; a message allocates an Abseil
+    // StatusRep.
+    result.ready_.emplace(absl::NotFoundError(""));
     return;
   }
   // Cold representations and expiration retain the complete owner state
@@ -539,7 +541,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       if (trace != nullptr && !trace->diagnostics_) {
         trace->lookup_done_ns_ = trace->NowNanos();
       }
-      co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
+      // GET maps absence to nil by code, so avoid allocating a diagnostic
+      // message.
+      co_return absl::NotFoundError("");
     }
     const auto readable = ValidateGroupedRead(partition, db_id, key, found);
     if (!readable.ok()) co_return readable;
@@ -548,7 +552,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
       if (trace != nullptr && !trace->diagnostics_) {
         trace->lookup_done_ns_ = trace->NowNanos();
       }
-      co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
+      co_return absl::NotFoundError("");
     }
     if (found->value_.value_type() != ValueType::kString) {
       co_return WrongTypeError();
