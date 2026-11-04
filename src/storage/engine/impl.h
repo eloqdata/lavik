@@ -2999,14 +2999,27 @@ class StorageEngine::Impl {
   Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                           const Digest& digest);
 
+  // Owned by one commit drain. Only decisions already appended by that drain
+  // may bypass a predecessor wait, and only within the same physical prefix.
+  struct DeferredCommitBatch {
+    absl::flat_hash_map<const GroupedCommitDecision*, RelocationDurabilityFence>
+        decisions_;
+    std::optional<RelocationDurabilityFence> append_prefix_;
+    bool flush_required_ = false;
+  };
+
   // A non-null retryable_capacity opts the queue into retaining grouped
   // decisions on pre-append foreground exhaustion. It is set false for all
   // other outcomes; direct callers retain the default terminal policy.
+  // deferred_batch requires deferred_decision. An aborted append with
+  // flush_required_ set retains the decision and has written no bytes; the
+  // drain must flush its appended prefix before retrying the same receipt.
   Task<absl::Status> CommitTxWrites(
       std::uint64_t txid, std::vector<TxShardWrites*> shards,
       RelocationDurabilityFence* deferred_decision = nullptr,
       bool* retryable_capacity = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr,
+      DeferredCommitBatch* deferred_batch = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
@@ -4789,12 +4802,15 @@ class StorageEngine::Impl {
 
   // Keep owning handles in the callee so success, failure and cancellation
   // retain the same release/transfer boundary as the awaited write. Tracing
-  // stays last and is absent from non-tracing builds.
+  // is absent from non-tracing builds. deferred_batch is only for a keyless
+  // commit: its append_prefix_ forbids yielding or rolling the append stream
+  // before the drain has completed the predecessor decisions.
   Task<absl::Status> WriteRecordLocked(
       WorkerStore& store, const RecordWriteRequest& request,
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr,
+      DeferredCommitBatch* deferred_batch = nullptr);
 
   Task<absl::StatusOr<IndirectKeyHandle>> EnsureIndirectKey(
       WorkerStore& store, std::string_view key, const Digest& digest,

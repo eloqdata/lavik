@@ -596,22 +596,18 @@ Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
   });
 }
 
-namespace {
-template <typename Callback>
-void ForEachGroupedPredecessor(const TxShardWrites& shard, Callback callback) {
-  if (shard.grouped_predecessor_) callback(shard.grouped_predecessor_);
-  for (auto link = shard.grouped_dependencies_; link; link = link->next_)
-    callback(link->decision_);
-}
-}  // namespace
-
 Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards,
     RelocationDurabilityFence* deferred_decision, bool* retryable_capacity,
-    OnlineLatencyTrace* diagnostics) {
+    OnlineLatencyTrace* diagnostics, DeferredCommitBatch* deferred_batch) {
   // Only the queue retains receipts across attempts. Direct callers still
   // fail their decisions on every error, including allocation exhaustion.
   if (retryable_capacity != nullptr) *retryable_capacity = false;
+  if (deferred_batch) {
+    assert(deferred_decision != nullptr);
+    deferred_batch->append_prefix_.reset();
+    deferred_batch->flush_required_ = false;
+  }
   for (auto* shard : shards)
     if (shard) shard->diagnostics_ = nullptr;
   struct FailUncommittedDependencies {
@@ -647,8 +643,8 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     }
     // No foreground key/store lock is retained here. Local predecessors have
     // earlier queue receipts; command-local batches can wait on the owner's
-    // separate drain. The queued batch flushes appended predecessors before
-    // entering this wait, avoiding a wait on its own deferred decision flush.
+    // separate drain. Already-appended local predecessors can share a block's
+    // recoverable prefix; defer their wait to the actual append boundary.
     auto predecessor = shard->grouped_predecessor_;
     auto next_predecessor = shard->grouped_dependencies_;
     while (predecessor) {
@@ -659,6 +655,25 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
             CurrentStore().write_failed_ || RuntimeFailureLatched())
           co_return absl::FailedPreconditionError(
               "prior grouped transaction did not commit");
+        if (deferred_batch) {
+          const auto found = deferred_batch->decisions_.find(predecessor.get());
+          if (found != deferred_batch->decisions_.end()) {
+            auto& prefix = deferred_batch->append_prefix_;
+            const auto& fence = found->second;
+            if (prefix &&
+                (prefix->block_id_ != fence.block_id_ ||
+                 prefix->allocation_epoch_ != fence.allocation_epoch_ ||
+                 prefix->block_owner_ != fence.block_owner_)) {
+              deferred_batch->flush_required_ = true;
+              dependency_guard.completed_ = true;
+              co_return absl::AbortedError(
+                  "commit predecessors span physical blocks");
+            }
+            if (!prefix || prefix->committed_bytes_ < fence.committed_bytes_)
+              prefix = fence;
+            break;
+          }
+        }
         if (CurrentStore().worker_->stop_requested())
           co_return absl::CancelledError(
               "worker stopped before grouped commit");
@@ -730,6 +745,17 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   });
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  LAVIK_FAULT_INJECT({
+    // Force a rollover after dependency/data waits, exactly where a stale
+    // earlier active-block check would let a successor escape its prefix.
+    static thread_local bool rolled_commit_prefix = false;
+    if (deferred_batch && deferred_batch->append_prefix_ &&
+        TxCommitTestGate(".rollover") && !rolled_commit_prefix) {
+      rolled_commit_prefix = true;
+      SealAppendStream(store, store.active_tx_block_);
+      spdlog::info("tx commit test forced prefix rollover");
+    }
+  });
   RecordLocation commit_location;
   const RecordWriteRequest record_write{
       .digest_ = ComputeDigest({}),
@@ -742,8 +768,15 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       written = TxCommitAppendFaultForTest(txid, kDiskSpaceExhaustionTypeUrl););
   if (written.ok())
     written = co_await WriteRecordLocked(store, record_write, nullptr,
-                                         std::move(retirements));
+                                         std::move(retirements), nullptr,
+                                         deferred_batch);
   if (!written.ok()) {
+    if (deferred_batch && deferred_batch->flush_required_) {
+      // No bytes were appended. Flush the retained prefix and rebuild this
+      // receipt's retirement list before retrying, without a capacity backoff.
+      dependency_guard.completed_ = true;
+      co_return written;
+    }
     if (retryable_capacity != nullptr && absl::IsResourceExhausted(written) &&
         GetErrorDetail(written) == ErrorDetail::kDiskSpace &&
         written.GetPayload(kDiskSpaceExhaustionTypeUrl).has_value()) {
@@ -755,7 +788,13 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     co_return written;
   }
   std::uint64_t dataset_changes = 0;
-  LAVIK_FAULT_INJECT(TraceTxCommitForTest(txid, "appended"););
+  LAVIK_FAULT_INJECT({
+    TraceTxCommitForTest(txid, "appended");
+    if (std::getenv("LAVIK_TX_COMMIT_TEST_GATE") != nullptr)
+      spdlog::info("tx commit test location txid={} block={} epoch={}", txid,
+                   commit_location.block_id(),
+                   commit_location.allocation_epoch());
+  });
   for (const TxShardWrites* shard : shards) {
     if (shard != nullptr) dataset_changes += shard->dataset_changes_;
   }
@@ -1006,7 +1045,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
     const bool defer_decisions = batch.size() > 1;
     std::vector<RelocationDurabilityFence> decision_fences;
     std::vector<WorkerStore::PendingTxCommit*> deferred_pending;
-    absl::flat_hash_set<const GroupedCommitDecision*> deferred_decisions;
+    DeferredCommitBatch deferred_batch;
     const bool has_predecessors =
         std::any_of(batch.begin(), batch.end(), [](const auto& pending) {
           return std::any_of(pending.writes_.begin(), pending.writes_.end(),
@@ -1017,11 +1056,12 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
     if (defer_decisions) {
       decision_fences.reserve(batch.size());
       deferred_pending.reserve(batch.size());
-      if (has_predecessors) deferred_decisions.reserve(batch.size());
+      if (has_predecessors) deferred_batch.decisions_.reserve(batch.size());
     }
     auto flush_decisions = [&]() -> Task<absl::Status> {
       absl::Status decisions_durable = absl::OkStatus();
       if (!decision_fences.empty()) {
+        LAVIK_MAYBE_CRASH_AT("tx-commit-batch-before-flush");
         co_await store->store_state_mutex_.Lock();
         UnlockGuard unlock(&store->store_state_mutex_, store->worker_);
         for (const RelocationDurabilityFence& decision : decision_fences)
@@ -1057,23 +1097,13 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
       }
       decision_fences.clear();
       deferred_pending.clear();
-      deferred_decisions.clear();
+      deferred_batch.decisions_.clear();
+      deferred_batch.append_prefix_.reset();
+      deferred_batch.flush_required_ = false;
       store->durability_progress_.NotifyAll(*store->worker_);
       co_return decisions_durable;
     };
     for (WorkerStore::PendingTxCommit& pending : batch) {
-      bool inherits_deferred = false;
-      for (const auto& shard : pending.writes_) {
-        ForEachGroupedPredecessor(shard, [&](const auto& predecessor) {
-          inherits_deferred |= deferred_decisions.contains(predecessor.get());
-        });
-      }
-      // A later root can refer to an earlier transaction's untouched pages.
-      // Flush that earlier commit frontier before appending the later commit,
-      // including when rollover puts them on different physical blocks. Data
-      // staging and unrelated commits still share the opportunistic batch.
-      if (inherits_deferred && batch_status.ok())
-        batch_status = co_await flush_decisions();
       if (batch_status.ok() && DurabilityFailed())
         batch_status =
             absl::FailedPreconditionError("transaction durability has failed");
@@ -1092,9 +1122,11 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
             bool retryable_capacity = false;
             committed = co_await CommitTxWrites(
                 pending.txid_, std::move(shards),
-                defer_decisions ? &decision : nullptr, &retryable_capacity);
-            if (!retryable_capacity) break;
-            if (first_attempt)
+                defer_decisions ? &decision : nullptr, &retryable_capacity,
+                nullptr, defer_decisions ? &deferred_batch : nullptr);
+            const bool prefix_boundary = deferred_batch.flush_required_;
+            if (!retryable_capacity && !prefix_boundary) break;
+            if (!prefix_boundary && first_attempt)
               spdlog::warn("transaction {} commit append failed: {}; retrying",
                            pending.txid_, committed.message());
             first_attempt = false;
@@ -1105,19 +1137,27 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
               committed = flushed;
               break;
             }
-            if (shutdown_started_.load(std::memory_order_acquire) ||
-                DurabilityFailed())
+            // Crossing a prefix boundary is ordinary drain progress, including
+            // during shutdown. Only capacity retries stop when admission
+            // closes.
+            if (DurabilityFailed() ||
+                (!prefix_boundary &&
+                 shutdown_started_.load(std::memory_order_acquire)))
               break;
-            const auto waited =
-                co_await bycorf::SleepFor(*store->worker_, kTxCommitRetryDelay);
-            if (!waited.ok()) {
-              committed = waited;
-              break;
+            if (!prefix_boundary) {
+              const auto waited = co_await bycorf::SleepFor(
+                  *store->worker_, kTxCommitRetryDelay);
+              if (!waited.ok()) {
+                committed = waited;
+                break;
+              }
             }
-            if (shutdown_started_.load(std::memory_order_acquire) ||
-                DurabilityFailed())
+            if (DurabilityFailed() ||
+                (!prefix_boundary &&
+                 shutdown_started_.load(std::memory_order_acquire)))
               break;
-            tx_commit_retries_.fetch_add(1, std::memory_order_relaxed);
+            if (!prefix_boundary)
+              tx_commit_retries_.fetch_add(1, std::memory_order_relaxed);
             // Rebuild only after a failed attempt; the normal path transfers
             // its pointer vector without an additional allocation or copy.
             for (auto& shard : pending.writes_)
@@ -1135,7 +1175,8 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
             if (has_predecessors)
               for (const auto& shard : pending.writes_)
                 if (shard.grouped_decision_)
-                  deferred_decisions.insert(shard.grouped_decision_.get());
+                  deferred_batch.decisions_.insert_or_assign(
+                      shard.grouped_decision_.get(), decision);
           } else {
             finish(pending, absl::OkStatus());
           }
@@ -2801,7 +2842,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, const RecordWriteRequest& request,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    SetLatencyTrace* trace) {
+    SetLatencyTrace* trace, DeferredCommitBatch* deferred_batch) {
   auto private_trace =
       !trace && request.tx_ ? MakeSetTrace(request.tx_->diagnostics_) : nullptr;
   if (!trace) trace = private_trace.get();
@@ -3055,6 +3096,23 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     return fits() && active_stream()->write_buffer_id_ != 0;
   };
 acquire_active_stream:
+  if (deferred_batch && deferred_batch->append_prefix_) {
+    assert(request.kind_ == RecordKind::kTxCommit);
+    const auto& prefix = *deferred_batch->append_prefix_;
+    // A block header exposes only a durable contiguous prefix. Extending the
+    // predecessor's block is therefore safe without a decision flush between
+    // records. Check at the final append site: earlier data waits can rotate
+    // the active stream. Do not allocate/yield and accidentally append the
+    // dependent decision to a different block before the predecessor lands.
+    if (!append_ready() || active_stream()->block_id_ != prefix.block_id_ ||
+        active_stream()->allocation_epoch_ != prefix.allocation_epoch_ ||
+        writer_id != prefix.block_owner_ ||
+        active_stream()->committed_bytes_ < prefix.committed_bytes_) {
+      deferred_batch->flush_required_ = true;
+      co_return absl::AbortedError(
+          "commit requires durable predecessor prefix");
+    }
+  }
   if (trace != nullptr) trace->block_wait_start_ns_ = trace->NowNanos();
   while (!append_ready()) {
     // The gate elects one normal writer per stream. Maintenance can bypass it

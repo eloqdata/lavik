@@ -223,9 +223,15 @@ the remaining batch metadata alive does not keep completed writers active.
 
 Owner-local grouped successors retain predecessor decisions in their receipts
 and may publish staged versions before those predecessors become durable. The
-drain completes an appended commit frontier before appending any dependent
-successor decision, preserving ancestor-before-successor durability even when
-commit records cross physical blocks. A terminal commit failure fail-stops
+drain appends dependent decisions in order within one physical block and
+flushes them together. The block header exposes a durable contiguous prefix,
+so recovering a successor also recovers its earlier decisions. The append
+path rechecks the block identity and capacity after data waits; when it cannot
+extend that prefix without waiting or switching blocks, the drain completes
+the appended frontier before retrying the successor. Dependencies outside the
+drain's appended batch still require their prior durable decision. This keeps
+ancestor-before-successor recovery without a flush per dependent commit.
+A terminal commit failure fail-stops
 storage and fails remaining queue-owned decisions. Cross-coordinator
 grouped predecessors retain their existing foreground ordering boundary.
 

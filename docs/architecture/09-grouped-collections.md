@@ -207,10 +207,10 @@ ordinary suspended storage operations.
 Owner-local standalone predecessors enter the commit queue before releasing
 key locks. Successors may stage changed pages and publish readable in-memory
 roots while those decisions are pending. Receipts retain the predecessor
-failure decisions, so the background commit waits for predecessor durability
-before appending the successor decision. A shared commit batch flushes its
-appended predecessor frontier before processing a dependent successor,
-including across block rollover. Failed ancestors prevent descendant commits;
+decisions, so the background commit preserves their recovery order. A shared
+commit batch appends dependent decisions in order within one physical block
+and flushes them together; it completes the predecessor frontier before a
+dependent append can switch blocks. Failed ancestors prevent descendant commits;
 recovery cannot accept a root inheriting pages from an uncommitted ancestor.
 Borrowed EXEC/Lua predecessors whose coordinator is not known to be the local
 queue retain the foreground dependency wait. Standalone compact demotion also
@@ -409,17 +409,20 @@ expiry cannot disguise that failure as an absent key. Internal compensation
 alone may inspect the failed physical view to restore or retire it; snapshot
 page readers independently recheck the decision after storage waits.
 
-An incremental successor from another transaction waits for its predecessor's
-durable decision before inheriting untouched groups. Same-transaction commands
-can reuse their view. This causal dependency is separate from the physical
-pins that keep prior transaction blocks allocated until retirement.
+An incremental successor retains owner-local predecessor decisions while
+inheriting untouched groups. The commit coordinator preserves their recovery
+order, allowing dependent decisions in one physical block to share a flush;
+cross-coordinator predecessors still require a durable decision before reuse.
+Same-transaction commands can reuse their view. This causal dependency is
+separate from the physical pins that keep prior transaction blocks allocated
+until retirement. See [durable commit handoff](03-transaction-coordination.md#durable-commit-handoff).
 
 Before acquiring a standalone transaction's append lease, grouped writes
-sample foreground space and coordinate transaction-block cleaning under pressure.
-The predecessor decision is durable before that cleaning can run. Borrowed
-EXEC/Lua transactions do not wait for their own still-active blocks to
-retire. This pressure signal bypasses the periodic cooldown, not explicit
-cleaner disabling or the allocator's authoritative capacity checks.
+request transaction-block cleaning when enabled.
+They do not wait for live transaction blocks while holding key intents;
+writer leases and dependency pins protect pending graphs from reclamation.
+This pressure signal bypasses the periodic cooldown, not explicit cleaner
+disabling or the allocator's authoritative capacity checks.
 
 ## Command access paths
 
