@@ -212,6 +212,28 @@ retains that boundary because it appends an untagged complete value without a
 queued receipt. Ordinary compact SET/GET and
 pending-buffer reads do not acquire grouped predecessor dependencies.
 
+## Sub-key arbitration
+
+`GroupedLockTable` provides owner-local shared/exclusive group locks scoped by
+logical database, parent-key fingerprint, incarnation, graph and group identity.
+Callers retain parent-key protection and database admission for the entire
+lock-set lifetime, including group waits and IO. Each set acquires member groups
+before ordered groups and uses the total order of `GroupedRecordId` within each
+graph. Earlier holds remain
+owned while the next group waits; descending acquisitions and shared-to-exclusive
+upgrades fail without releasing existing holds. Callers revalidate routing after
+waiting and release the set before replanning or acquiring a stronger key lock.
+
+Each group has its own FIFO. These queues are independent of the transaction
+shard's key queue, so a waiting operation cannot block an unrelated group needed
+by its predecessor. Ownership transfers before deferred resumption; compatible
+readers at the head are granted together, while queued writers fence later
+readers. Cancelling an ungranted waiter unlinks it and rechecks its successors.
+Once a coroutine has entered the worker's ready queue, it must resume before
+its frame can be destroyed. Group lock state has no durable representation and
+does not allocate transaction IDs or revisions. Collection command paths still
+use whole-key S/X protection and do not yet call this sub-key API.
+
 ## Durable graph and publication
 
 A small keyed root and auxiliary keyed group records preserve the user-visible
@@ -728,6 +750,7 @@ the reusable containers have independent tests under `tests/containers/`.
 | Responsibility | Source |
 |---|---|
 | Prefix snapshots, mutation planning and persistent routing | `include/lavik/storage/detail/grouped/hash.h`, `src/storage/engine/grouped/hash.cpp` |
+| Owner-local group arbitration, ordered lock sets and waiter lifetime | `include/lavik/storage/detail/grouped/lock.h`, `src/storage/engine/grouped/lock.cpp`, `tests/grouped/lock_test.cpp` |
 | Logical collection encodings, shared indexed v2 bodies and per-element validation | `include/lavik/storage/detail/hash_codec.h`, `ordered_compact_codec.h`, `ordered_index.h`; `src/storage/engine/hash_codec.cpp`, `ordered_compact_codec.cpp`, `list_tree.cpp`, `src/redis/zset_command.cpp` |
 | Bounded Hash/Set random reads and deterministic sparse Set pops | `src/storage/engine/grouped/hash_random.cpp`, `hash_tree.cpp` |
 | Reusable metadata maps, ordinal counts and shared array storage | `include/lavik/containers/cow_map.h`, `include/lavik/containers/fenwick_tree.h`, `include/lavik/containers/cow_array.h` |

@@ -407,6 +407,7 @@ add_library(lavik_module
   src/storage/engine/hash_api.cpp
   src/storage/engine/hash_codec.cpp
   src/storage/engine/grouped/hash.cpp
+  src/storage/engine/grouped/lock.cpp
   src/storage/engine/grouped/collection.cpp
   src/storage/engine/grouped/sorted_rewrite.cpp
   src/storage/engine/grouped/stream.cpp
@@ -1802,6 +1803,7 @@ if (BUILD_TESTING)
     tests/device_affinity_test.cpp
     tests/foreign_executor_test.cpp
     tests/grouped/hash_test.cpp
+    tests/grouped/lock_test.cpp
     tests/packed_list_read_test.cpp
     tests/grouped/commit_decision_test.cpp
     tests/grouped/collection_test.cpp
