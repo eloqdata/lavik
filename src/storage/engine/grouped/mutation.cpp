@@ -42,24 +42,28 @@ bool SameLogicalView(const GroupedObject::Handle& before,
 
 }  // namespace
 
+std::uint64_t StorageEngine::Impl::AllocateGroupedRevision() noexcept {
+  return tx::TxRuntime::Get()->next_txid_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+}
+
 absl::StatusOr<HashGroupMutationPlan>
 StorageEngine::Impl::PrepareGroupedHashMutation(
     const GroupedObject::Handle& previous, HashValue after_image,
-    std::span<const GroupedRecordId> changed_groups, std::uint64_t field_count,
-    std::uint64_t sequence) {
+    std::span<const GroupedRecordId> changed_groups,
+    std::uint64_t field_count) {
   HashGroupMutationPlan plan;
   plan.changed_ = true;
-  plan.root_.revision_ = sequence;
   if (!previous) {
     if (after_image.entries_.size() != field_count) {
       return absl::DataLossError("promotion after-image cardinality mismatch");
     }
-    // This is the fresh local command-batch id, NOT the source command
-    // sequence. A replay envelope may delete and recreate the same key.
-    plan.root_.incarnation_ = sequence;
+    // Private pages need an incarnation for validation. Commit stamps their
+    // durable identity only after the complete logical plan is ready.
+    plan.root_.incarnation_ = 1;
     plan.root_.seed_ = CurrentDigestSeed();
-    auto groups =
-        GroupHashValue(std::move(after_image), sequence, plan.root_.seed_);
+    auto groups = GroupHashValue(std::move(after_image),
+                                 plan.root_.incarnation_, plan.root_.seed_);
     if (!groups.ok()) return groups.status();
     if (groups->size() > std::numeric_limits<std::uint32_t>::max()) {
       return absl::OutOfRangeError(
@@ -74,7 +78,7 @@ StorageEngine::Impl::PrepareGroupedHashMutation(
     return absl::InvalidArgumentError("grouped mutation has no changed groups");
   }
   plan.root_ = previous->directory().root();
-  plan.root_.revision_ = sequence;
+  plan.root_.revision_ = 0;
   plan.root_.field_count_ = field_count;
   plan.expected_sequence_ = previous->directory().sequence();
   std::map<GroupedRecordId, HashGroupSnapshot> changed;
@@ -204,35 +208,28 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   }
   TxShardWrites batch;
   batch.diagnostics_ = diagnostics;
-  if (outer_transaction) {
+  const bool own_batch =
+      outer_transaction && tx->grouped_ingest_batch_ == nullptr;
+  if (own_batch) {
     batch.txid_ = tx::TxRuntime::Get()->next_txid_.fetch_add(
         1, std::memory_order_relaxed);
     batch.transaction_lease_ = tx->transaction_lease_;
-    if (tx->grouped_ingest_batch_ == nullptr) {
-      // The child commit may live on another worker from the outer decision.
-      // A distinct decision forces its own durable fence without marking the
-      // still-uncommitted outer transaction durable prematurely.
-      const auto child_decision = PrepareGroupedDecision(batch);
-      if (!child_decision.ok()) co_return child_decision.status();
-    }
+    // The child commit may live on another worker from the outer decision.
+    // A distinct decision forces its own durable fence without marking the
+    // still-uncommitted outer transaction durable prematurely.
+    const auto child_decision = PrepareGroupedDecision(batch);
+    if (!child_decision.ok()) co_return child_decision.status();
   }
-  const auto revision = outer_transaction ? batch.txid_ : tx->txid_;
   // A multi-page restore has one command decision, but each intermediate
   // graph still receives a unique revision. Committing individual pages would
   // resurrect a failed restore's auxiliaries if its enclosing EXEC commits.
   const auto command_batch = tx->grouped_ingest_batch_ != nullptr
                                  ? tx->grouped_ingest_batch_->txid_
                                  : batch.txid_;
-  if (revision == 0 ||
-      (previous && revision <= previous->directory().sequence())) {
-    co_return absl::OutOfRangeError(
-        "group revision allocation did not advance");
-  }
-  auto plan =
-      prepared != nullptr
-          ? absl::StatusOr<HashGroupMutationPlan>(std::move(*prepared))
-          : PrepareGroupedHashMutation(previous, std::move(after_image),
-                                       changed_groups, field_count, revision);
+  auto plan = prepared != nullptr
+                  ? absl::StatusOr<HashGroupMutationPlan>(std::move(*prepared))
+                  : PrepareGroupedHashMutation(previous, std::move(after_image),
+                                               changed_groups, field_count);
   if (!plan.ok()) co_return plan.status();
   if (prepared != nullptr) {
     if (plan->root_.field_count_ != field_count ||
@@ -241,12 +238,18 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                 plan->root_.incarnation_ != previous->incarnation())
              : plan->expected_sequence_ != 0))
       co_return absl::AbortedError("prepared Hash mutation is stale");
-    if (!previous) {
-      // Creation plans have only private placeholder identities until this
-      // batch is admitted. Every page must share the newly allocated root C.
-      plan->root_.incarnation_ = revision;
-      for (auto& page : plan->writes_) page.incarnation_ = revision;
-    }
+  }
+  const auto revision = AllocateGroupedRevision();
+  if (revision == 0 ||
+      (previous && revision <= previous->directory().sequence())) {
+    co_return absl::OutOfRangeError(
+        "group revision allocation did not advance");
+  }
+  if (!previous) {
+    // Both prepared and full-image creation plans carry private placeholders.
+    // Every new page shares the independently allocated root incarnation.
+    plan->root_.incarnation_ = revision;
+    for (auto& page : plan->writes_) page.incarnation_ = revision;
   }
   plan->root_.revision_ = revision;
   auto root_payload = EncodeGroupedHashRoot(plan->root_);
@@ -390,7 +393,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   }
   auto decision = PrepareGroupedDecision(*tx, !outer_transaction);
   if (!decision.ok()) co_return decision.status();
-  if (outer_transaction) {
+  if (own_batch) {
     // Auxiliary records retain the outer transaction tag AND this command's
     // independent batch tag. An errored EXEC command never commits its batch,
     // even if the surrounding EXEC later commits all its successful commands.

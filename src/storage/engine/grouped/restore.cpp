@@ -56,8 +56,7 @@ Task<absl::Status> StorageEngine::Impl::RestoreGroupedViewLocked(
   } else {
     sequence = ++partition.mutation_sequence_;
   }
-  const auto revision =
-      tx::TxRuntime::Get()->next_txid_.fetch_add(1, std::memory_order_relaxed);
+  const auto revision = AllocateGroupedRevision();
   if (sequence == 0 || sequence < previous->command_sequence() ||
       (replaced && sequence < replaced->command_sequence()) || revision == 0 ||
       revision <= previous->revision() ||

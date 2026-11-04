@@ -1604,6 +1604,53 @@ TEST(GroupedRecoveryE2e, SameCommandRootsUseRevisionBeforePhysicalLsn) {
   EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}), "after-restart");
 }
 
+TEST(GroupedRecoveryE2e, RevisionOrderAndAllocatorFloorAreIndependentOfTxids) {
+  RecordImage image;
+  constexpr std::uint64_t revision = std::uint64_t{1} << 40;
+  auto group = SingleGroup();
+  group.value_.entries_[0].value_.assign(20 * 1024, 'a');
+  image.Group("hash", group, revision, 80);
+  auto root = GroupedHashRoot{.incarnation_ = group.incarnation_,
+                              .field_count_ = 1,
+                              .group_count_ = 1,
+                              .revision_ = revision};
+  // An earlier-allocated transaction can prepare later and publish a newer
+  // revision. Neither its lower txid nor the older root's later physical copy
+  // may reverse that order, even within one replay command sequence.
+  group.value_.entries_[0].value_.assign(20 * 1024, 'b');
+  image.Group("hash", group, revision + 1, 70);
+  auto newer = root;
+  newer.revision_ = revision + 1;
+  image.Root("hash", newer, 10, 70);
+  image.Root("hash", root, 10, 80);
+  image.Commit(80);
+  image.Commit(70);
+  image.Finish();
+  {
+    ChildServer server(image, true);
+    EXPECT_EQ(server.Command({"HGET", "hash", "field"}),
+              std::string(20 * 1024, 'b'));
+    // This stays grouped. A counter seeded from transaction IDs alone would
+    // allocate a stale revision and reject the mutation.
+    EXPECT_EQ(
+        server.Command({"HSET", "hash", "field", std::string(20 * 1024, 'c')}),
+        ":0");
+    EXPECT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ChildServer checkpoint(image, true);
+    EXPECT_EQ(checkpoint.Command({"HGET", "hash", "field"}),
+              std::string(20 * 1024, 'c'));
+    EXPECT_EQ(checkpoint.Command(
+                  {"HSET", "hash", "field", std::string(20 * 1024, 'd')}),
+              ":0");
+    EXPECT_EQ(checkpoint.Wait(true), 0) << checkpoint.Log();
+  }
+  ChildServer recovered(image);
+  EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}),
+            std::string(20 * 1024, 'd'));
+}
+
 TEST(GroupedRecoveryE2e,
      PublicationLsnFollowsGcDuringForegroundAllocationWait) {
 #if defined(NDEBUG) && !LAVIK_TEST_FAULTS_AVAILABLE

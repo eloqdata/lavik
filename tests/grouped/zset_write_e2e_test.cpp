@@ -18,7 +18,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 
 #include "lavik/storage/detail/grouped/collection.h"
 #include "write_e2e_support.h"
@@ -60,6 +62,135 @@ std::vector<std::string> ZSetSeed(std::string key) {
     command.push_back(std::to_string(i) + std::string(128, 'm'));
   }
   return command;
+}
+
+TEST(GroupedSortedSetWriteE2e, PublicationRevisionsHaveIndependentDecisions) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP()
+      << "requires pausing transaction cleaning to inspect decision tags";
+#endif
+  ScopedEnvironment pause_cleaner("LAVIK_TX_CLEANER_START_PAUSED", "1");
+  PrivateDisk disk;
+  const std::string zset = "revision-zset";
+  const std::string hash = "revision-hash";
+  const auto member = [](unsigned i) {
+    return std::to_string(i) + std::string(128, 'm');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(zset)).text_, "256");
+    std::vector<std::string> seed{"HSET", hash};
+    for (unsigned i = 0; i < 256; ++i) {
+      seed.push_back(std::to_string(i));
+      seed.push_back(std::string(128, 'v'));
+    }
+    ASSERT_EQ(client.Command(seed).text_, "256");
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZADD", zset, "CH", "900", member(0)}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"HSET", hash, "0", std::string(128, 'x')}).text_,
+              "QUEUED");
+    ASSERT_EQ(client.Command({"ZINCRBY", zset, "2", member(1)}).text_,
+              "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 3);
+    EXPECT_EQ(executed.items_[0].text_, "1");
+    EXPECT_EQ(executed.items_[1].text_, "0");
+    EXPECT_EQ(executed.items_[2].text_, "3");
+    client.Durable();
+    // RAII kills the quiescent child. Graceful shutdown would clean the tags
+    // whose separation from revisions this test needs to inspect on disk.
+  }
+
+  struct Root {
+    std::uint64_t txid_;
+    std::uint64_t incarnation_;
+  };
+  std::map<std::pair<std::string, std::uint64_t>, Root> roots;
+  std::vector<std::pair<std::string, RecordHeader>> auxiliaries;
+  std::set<std::uint64_t> decisions;
+  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+                        std::string_view key, std::string_view payload) {
+    if (record.kind_ == RecordKind::kTxCommit) {
+      decisions.insert(record.txid_);
+      return;
+    }
+    if (key != zset && key != hash) return;
+    if (record.auxiliary_group_) {
+      auxiliaries.emplace_back(key, record);
+    } else if (record.grouped_) {
+      if (key == zset) {
+        const auto root = DecodeOrderedCollectionRoot(payload);
+        ASSERT_TRUE(root.ok()) << root.status();
+        ASSERT_TRUE(root->member_index_);
+        EXPECT_EQ(root->member_index_->revision_, root->revision_);
+        roots[{std::string(key), root->revision_}] = {record.txid_,
+                                                      root->incarnation_};
+      } else {
+        const auto root = DecodeGroupedHashRoot(payload);
+        ASSERT_TRUE(root.ok()) << root.status();
+        roots[{std::string(key), root->revision_}] = {record.txid_,
+                                                      root->incarnation_};
+      }
+    }
+  });
+  ASSERT_GE(roots.size(), 5);
+  ASSERT_FALSE(auxiliaries.empty());
+  std::map<std::uint64_t, std::set<std::uint64_t>> zset_revisions_by_tx;
+  std::uint64_t highest_revision = 0;
+  bool saw_batch = false;
+  bool saw_standalone = false;
+  for (const auto& [identity, root] : roots) {
+    const auto& [key, revision] = identity;
+    ASSERT_NE(root.txid_, 0);
+    EXPECT_GT(revision, root.txid_);
+    EXPECT_LE(root.incarnation_, revision);
+    EXPECT_TRUE(decisions.contains(root.txid_));
+    EXPECT_FALSE(decisions.contains(revision));
+    highest_revision = std::max(highest_revision, revision);
+    if (key == zset) zset_revisions_by_tx[root.txid_].insert(revision);
+  }
+  EXPECT_TRUE(
+      std::any_of(zset_revisions_by_tx.begin(), zset_revisions_by_tx.end(),
+                  [](const auto& tx) { return tx.second.size() >= 2; }));
+  for (const auto& [key, record] : auxiliaries) {
+    const auto root = roots.find({key, record.mutation_sequence_});
+    ASSERT_NE(root, roots.end());
+    EXPECT_EQ(record.txid_, root->second.txid_);
+    EXPECT_EQ(record.group_incarnation_, root->second.incarnation_);
+    EXPECT_GT(record.mutation_sequence_, record.txid_);
+    if (record.group_batch_txid_ != 0) {
+      saw_batch = true;
+      EXPECT_GT(record.mutation_sequence_, record.group_batch_txid_);
+      EXPECT_TRUE(decisions.contains(record.group_batch_txid_));
+    } else {
+      saw_standalone = true;
+    }
+  }
+  EXPECT_TRUE(saw_batch);
+  EXPECT_TRUE(saw_standalone);
+  {
+    Server recovered(disk, 2);
+    Client client(recovered.port());
+    EXPECT_EQ(client.Command({"ZCARD", zset}).text_, "256");
+    EXPECT_EQ(client.Command({"ZSCORE", zset, member(0)}).text_, "900");
+    EXPECT_EQ(client.Command({"ZSCORE", zset, member(1)}).text_, "3");
+    EXPECT_EQ(client.Command({"HLEN", hash}).text_, "256");
+    EXPECT_EQ(client.Command({"HGET", hash, "0"}).text_, std::string(128, 'x'));
+    ASSERT_EQ(client.Command({"ZADD", zset, "CH", "901", member(0)}).text_,
+              "1");
+    client.Durable();
+  }
+  std::uint64_t recovered_revision = 0;
+  disk.VisitRecords([&](const BlockHeader&, const RecordHeader& record,
+                        std::string_view key, std::string_view payload) {
+    if (key != zset || !record.grouped_ || record.auxiliary_group_) return;
+    const auto root = DecodeOrderedCollectionRoot(payload);
+    ASSERT_TRUE(root.ok()) << root.status();
+    recovered_revision = std::max(recovered_revision, root->revision_);
+  });
+  EXPECT_GT(recovered_revision, highest_revision);
 }
 
 TEST(GroupedSortedSetWriteE2e, TypedChangesDoNotRereadOrderedMemberDiff) {

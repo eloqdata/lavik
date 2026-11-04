@@ -2557,11 +2557,18 @@ class StorageEngine::Impl {
 
   // Pure private-page planning; no store lock is needed. The after-image owns
   // selected groups for point operations or all groups for full-image callers.
-  // Only changed_groups are rewritten. Null previous builds a fresh graph.
+  // Only changed_groups are rewritten. Null previous builds a fresh graph
+  // with a private placeholder incarnation; no durable revision is assigned.
   absl::StatusOr<HashGroupMutationPlan> PrepareGroupedHashMutation(
       const GroupedObject::Handle& previous, HashValue after_image,
       std::span<const GroupedRecordId> changed_groups,
-      std::uint64_t field_count, std::uint64_t revision);
+      std::uint64_t field_count);
+  // Allocate separately from transaction/batch decisions after logical page
+  // preparation. The same recovery-seeded counter supplies both namespaces,
+  // but a revision never doubles as a commit decision. Callers retain key X
+  // through staging/publication; store state alone cannot order publications
+  // across the remaining append/extent IO waits.
+  static std::uint64_t AllocateGroupedRevision() noexcept;
   // Caller retains exclusive key intent and store state. A prepared plan must
   // name the validated predecessor or a validated creation; commit assigns
   // its durable revision and stamps every page of a fresh incarnation.

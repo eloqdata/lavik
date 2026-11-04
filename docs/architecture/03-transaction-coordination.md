@@ -30,15 +30,18 @@ This subsystem owns runtime ordering, not stored values or durable commit
 decisions. A `tx::Transaction` scheduling id orders queue entries only. Atomic
 multi-key writes separately use `storage::TxShardWrites`, undo journals,
 durability fences, and `kTxCommit` records owned by the command and storage
-subsystems. Both kinds of identifier currently come from
-`TxRuntime::next_txid_`, but one allocation does not serve both roles.
+subsystems. Both kinds of identifier come from `TxRuntime::next_txid_`, but
+one allocation does not serve both roles. Grouped storage independently
+allocates publication revisions from the same counter after logical page
+preparation; those revisions do not identify commit decisions.
 
 ## Interfaces and state
 
 `TxRuntime` is created once with one `TxShard` per Bycorf worker before the
 workers start. Each worker binds its shard during `RedisService::Run`; recovery
-on worker 0 later advances the shared id counter above every transaction id
-found on disk. The shard's lock tables, queue, WATCH table, committed-id
+on worker 0 later advances the shared id counter above recovered transaction
+IDs, batch IDs, grouped incarnations and revisions. The shard's lock tables,
+queue, WATCH table, committed-id
 watermark, and counters are mutable only on its owning worker.
 
 The caller-facing interfaces are:
@@ -297,9 +300,9 @@ passive expiration or creation of the other key.
   above and below this module: the command layer keeps transaction locks across
   read/write/finish hops, while storage restores undo state or later validates
   tagged records against a durable commit record.
-- The shared id counter also supplies durable write ids and is recovery-seeded;
-  consequently the `tx_ids_allocated` INFO field counts both scheduling and
-  storage allocations.
+- The shared id counter supplies scheduling IDs, durable write/batch IDs and
+  independently allocated grouped revisions, and is recovery-seeded;
+  consequently the `tx_ids_allocated` INFO field includes all these allocations.
 
 ## Verification and known gaps
 

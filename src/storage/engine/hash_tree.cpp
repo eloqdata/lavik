@@ -1731,9 +1731,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!grouped_plan && result.changed_ && result.key_exists_) {
       const std::vector<GroupedRecordId> changed(changed_groups.begin(),
                                                  changed_groups.end());
-      auto prepared =
-          PrepareGroupedHashMutation(grouped, std::move(compact), changed,
-                                     result.length_, grouped->revision());
+      auto prepared = PrepareGroupedHashMutation(grouped, std::move(compact),
+                                                 changed, result.length_);
       if (!prepared.ok()) co_return prepared.status();
       grouped_plan.emplace(std::move(*prepared));
     }
@@ -1753,7 +1752,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       compact_write_promotes = !compact_edit && NeedsGroupedHash(compact);
       if (unlocked_create && compact_write_promotes) {
         auto prepared = PrepareGroupedHashMutation(nullptr, std::move(compact),
-                                                   {}, result.length_, 1);
+                                                   {}, result.length_);
         if (!prepared.ok()) co_return prepared.status();
         grouped_plan.emplace(std::move(*prepared));
       } else if (!compact_write_promotes && !compact_edit) {
