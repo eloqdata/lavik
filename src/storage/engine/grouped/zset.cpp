@@ -1240,16 +1240,39 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
     if (!score) return 0;
     const auto& directory = source->ordered_directory();
     const auto& pages = directory.groups();
-    auto i = std::min(directory.LowerBoundScore(*score), pages.size() - 1);
-    for (; i + 1 < pages.size(); ++i) {
-      if (*score < pages[i].max_score_) break;
-      if (*score == pages[i].max_score_) {
-        const auto less = pages[i].max_key_.LessThan(member);
-        if (!less) return std::nullopt;
-        if (!*less) break;
+    if (pages.empty()) return std::nullopt;
+#if LAVIK_FAULTS_ENABLED
+    std::size_t probes = 0;
+    const auto trace_route = [&](bool fallback) {
+      if (LAVIK_FAULT_MATCHES("LAVIK_TRACE_ZSET_POINT_ROUTE_KEY", key))
+        spdlog::info("zset point route pages={} probes={} fallback={}",
+                     pages.size(), probes, unsigned(fallback));
+    };
+#endif
+    // Page maxima are ordered by (score, binary member). Search the resident
+    // bounds directly so a long equal-score run remains O(log G), both before
+    // locking and during revalidation. The last page also accepts appends past
+    // the current maximum; its member bound need not be compared.
+    std::size_t first = 0, last = pages.size() - 1;
+    while (first < last) {
+      const auto mid = first + (last - first) / 2;
+      LAVIK_FAULT_INJECT(++probes;);
+      bool less = pages[mid].max_score_ < *score;
+      if (pages[mid].max_score_ == *score) {
+        const auto cached = pages[mid].max_key_.LessThan(member);
+        if (!cached) {
+          LAVIK_FAULT_INJECT(trace_route(true););
+          return std::nullopt;
+        }
+        less = *cached;
       }
+      if (less)
+        first = mid + 1;
+      else
+        last = mid;
     }
-    return pages[i].id_;
+    LAVIK_FAULT_INJECT(trace_route(false););
+    return pages[first].id_;
   };
   const auto source_id = locate(object, state.before_);
   const auto destination_id = locate(object, state.after_);

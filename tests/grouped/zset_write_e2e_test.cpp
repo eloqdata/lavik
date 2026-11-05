@@ -15,7 +15,9 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <future>
 #include <limits>
@@ -1064,6 +1066,89 @@ ZSetMemberLayout InspectZSetMembers(const PrivateDisk& disk,
   Check(result.leaves_.size() == result.root_.group_count_,
         "incomplete fixture member directory");
   return result;
+}
+
+void CheckConcurrentEqualScoreRouting(bool ambiguous) {
+  PrivateDisk disk;
+  const std::string key = "concurrent-equal-score-routing";
+  ScopedEnvironment trace("LAVIK_TRACE_ZSET_POINT_ROUTE_KEY", key.c_str());
+  const unsigned count = ambiguous ? 1024 : 16384;
+  const auto member = [ambiguous](unsigned i) {
+    auto suffix = std::to_string(i);
+    suffix.insert(0, 6 - suffix.size(), '0');
+    auto value = (ambiguous ? std::string(OrderedPageMaxKey::kPrefixBytes, 'p')
+                            : std::string{}) +
+                 suffix;
+    value.resize(256, 'm');
+    return value;
+  };
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"ZADD", key};
+    for (unsigned i = 0; i < count; ++i) {
+      seed.insert(seed.end(), {"7", member(i)});
+      expected.emplace(member(i), 7);
+    }
+    ASSERT_EQ(client.Command(seed).text_, std::to_string(count));
+    // Probe near the end of a run spanning hundreds of pages. Check work
+    // directly instead of a wall-clock limit that depends on the CI device.
+    ASSERT_EQ(client.Command({"ZREM", key, member(count - 128)}).text_, "1");
+    expected.erase(member(count - 128));
+    ASSERT_EQ(client.Command({"ZINCRBY", key, "0.25", member(count - 2)}).text_,
+              "7.25");
+    expected[member(count - 2)] = 7.25;
+    // Reinsert at the old score to exercise destination member routing too.
+    ASSERT_EQ(
+        client.Command({"ZINCRBY", key, "-0.25", member(count - 2)}).text_,
+        "7");
+    expected[member(count - 2)] = 7;
+    ExpectDenseZSet(client, key, expected);
+    const auto log = server.Log();
+    std::size_t position = 0, routes = 0, fallbacks = 0;
+    while ((position = log.find("zset point route pages=", position)) !=
+           std::string::npos) {
+      std::size_t pages = 0, probes = 0;
+      unsigned fallback = 0;
+      ASSERT_EQ(std::sscanf(log.c_str() + position,
+                            "zset point route pages=%zu probes=%zu fallback=%u",
+                            &pages, &probes, &fallback),
+                3);
+      ASSERT_GT(pages, 1);
+      if (!ambiguous) EXPECT_GE(pages, 256);
+      EXPECT_LE(probes, std::bit_width(pages - 1));
+      ++routes;
+      fallbacks += fallback;
+      ++position;
+    }
+    if (ambiguous) {
+      EXPECT_GE(fallbacks, 3) << log;
+    } else {
+      // ZREM routes its source twice; each score move routes both endpoints
+      // before and after acquiring the group locks.
+      EXPECT_GE(routes, 10) << log;
+      EXPECT_EQ(fallbacks, 0) << log;
+    }
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e, ConcurrentEqualScoreRoutesUseLogarithmicProbes) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires point-route probe tracing";
+#endif
+  CheckConcurrentEqualScoreRouting(false);
+}
+
+TEST(GroupedSortedSetWriteE2e, ConcurrentAmbiguousMemberBoundsFallBackToX) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires point-route fallback tracing";
+#endif
+  CheckConcurrentEqualScoreRouting(true);
 }
 
 TEST(GroupedSortedSetWriteE2e, ConcurrentGroupsWaitWakeAndRecover) {
