@@ -588,6 +588,13 @@ TEST(GroupedHashWriteE2e, StructuralRetryReleasesGroupsBeforeTakingKeyX) {
   EXPECT_EQ(client.Command({"HGET", key, field}).text_, large);
 }
 
+TEST(GroupedSetIntentE2e, RetryDiscardsPreviousIncarnationReplicationTTL) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic prepared replication pause";
+#endif
+  CheckHashLikeRetryReplication(true);
+}
+
 TEST(GroupedSetIntentE2e, WritesMergeDisjointCountsAndWakeConflicts) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires a deterministic group-lock pause";
