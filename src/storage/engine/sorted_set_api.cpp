@@ -65,7 +65,9 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
       operation.kind_ == SortedSetOperationKind::kLength ||
       operation.kind_ == SortedSetOperationKind::kRange ||
       operation.kind_ == SortedSetOperationKind::kCount ||
-      operation.kind_ == SortedSetOperationKind::kRank;
+      operation.kind_ == SortedSetOperationKind::kRank ||
+      operation.kind_ == SortedSetOperationKind::kRandom ||
+      operation.kind_ == SortedSetOperationKind::kScan;
   bool concurrent = false;
   if (point || partial_read) {
     auto& store = CurrentStore();

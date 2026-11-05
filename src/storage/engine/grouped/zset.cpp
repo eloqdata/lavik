@@ -1147,7 +1147,7 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
 
   if (operation.kind_ != SortedSetOperationKind::kScores) {
     unlock.Unlock();
-    auto read = co_await TryConcurrentSortedSetRangeRead(
+    auto read = co_await TryConcurrentSortedSetPageRead(
         store, partition, db_id, key, digest, operation, object);
     if (!read.ok() &&
         (EffectiveRecordDbEpoch(partition, db_id) !=
@@ -1240,7 +1240,7 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
 }
 
 Task<absl::StatusOr<std::optional<SortedSetResult>>>
-StorageEngine::Impl::TryConcurrentSortedSetRangeRead(
+StorageEngine::Impl::TryConcurrentSortedSetPageRead(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, GroupedObject::Handle object) {
@@ -1248,6 +1248,15 @@ StorageEngine::Impl::TryConcurrentSortedSetRangeRead(
     store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
   auto holds = store.group_locks_->MakeLockSet(
       {db_id, tx::FingerprintOf(digest), object->incarnation()});
+  RandomSelection random;
+  SortedSetResult random_result;
+  if (operation.kind_ == SortedSetOperationKind::kRandom) {
+    random_result.key_exists_ = true;
+    random_result.length_ = object->ordered_directory().root().item_count_;
+    const auto selected = random.Prepare(
+        random_result.length_, operation.count_, false, &random_result);
+    if (!selected.ok()) co_return selected;
+  }
   std::optional<double> member_score;
   if (operation.kind_ == SortedSetOperationKind::kRank) {
     const auto* route = object->directory().Find(operation.members_.front());
@@ -1277,10 +1286,46 @@ StorageEngine::Impl::TryConcurrentSortedSetRangeRead(
   // Enumerate only payloads used by the operation. Counts for complete score
   // pages come from one immutable directory, so ZCOUNT needs just boundary
   // holds. Mixed-score BYLEX has no lexical page index and requires all pages.
-  const auto visit = [&](const GroupedObject::Handle& source, auto emit) {
+  const auto visit = [&](const GroupedObject::Handle& source, auto emit_lock) {
+    const auto emit = [&](std::uint64_t id) {
+      emit_lock(GroupedLockId{GroupedLockIndex::kOrdered, {id, 0}});
+    };
+    if (operation.kind_ == SortedSetOperationKind::kScan &&
+        source->directory().root().seed_ == CurrentDigestSeed()) {
+      const auto& leaves = source->directory().groups();
+      const auto* first = leaves.Floor(operation.scan_cursor_);
+      if (!first) return false;
+      auto route = leaves.find(first->id_.prefix_);
+      auto remaining = operation.scan_count_;
+      bool boundary = true;
+      while (route != leaves.end() && remaining) {
+        emit_lock(GroupedLockId{GroupedLockIndex::kMember, route->second.id_});
+        // A cursor inside the first leaf has an unknown remaining count.
+        // Later leaves are entirely after it, so their resident counts bound
+        // this call's examination window even with MATCH misses/collisions.
+        const auto count = boundary && operation.scan_cursor_ != route->first
+                               ? 0
+                               : route->second.field_count_;
+        remaining -= std::min(remaining, count);
+        boundary = false;
+        ++route;
+      }
+      return true;
+    }
     const auto& directory = source->ordered_directory();
     const auto& pages = directory.groups();
     const auto length = directory.root().item_count_;
+    if (operation.kind_ == SortedSetOperationKind::kRandom) {
+      // Preserve the sampled population. A changed cardinality gets a clean
+      // S fallback, instead of biasing or indexing old draws into a new set.
+      if (length != random_result.length_) return false;
+      for (const auto& [rank, slot] : random.draws_) {
+        const auto position = directory.FindRank(rank);
+        if (!position) return false;
+        emit(pages[position->group_index_].id_);
+      }
+      return true;
+    }
     std::size_t first = 0, end = pages.size();
     if (operation.kind_ == SortedSetOperationKind::kRank) {
       if (!member_score) return true;
@@ -1370,21 +1415,20 @@ StorageEngine::Impl::TryConcurrentSortedSetRangeRead(
   };
   std::size_t count = 0;
   if (!visit(object, [&](auto) { ++count; })) co_return std::nullopt;
-  if (count > SIZE_MAX / sizeof(std::uint64_t))
+  if (count > SIZE_MAX / sizeof(GroupedLockId))
     co_return absl::ResourceExhaustedError(
         "Sorted Set read lock plan overflow");
-  auto admission = TryReserveMemory(count * sizeof(std::uint64_t));
+  auto admission = TryReserveMemory(count * sizeof(GroupedLockId));
   if (!admission) co_return MemoryLimitError("OOM Sorted Set read lock plan");
-  std::vector<std::uint64_t> groups;
+  std::vector<GroupedLockId> groups;
   groups.reserve(count);
-  if (groups.capacity() > admission->bytes() / sizeof(std::uint64_t))
+  if (groups.capacity() > admission->bytes() / sizeof(GroupedLockId))
     co_return MemoryLimitError("OOM Sorted Set read lock plan");
   visit(object, [&](auto id) { groups.push_back(id); });
   std::sort(groups.begin(), groups.end());
   groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
   for (const auto id : groups) {
-    const auto locked = co_await holds.Acquire(
-        {GroupedLockIndex::kOrdered, {id, 0}}, GroupedLockMode::kShared);
+    const auto locked = co_await holds.Acquire(id, GroupedLockMode::kShared);
     if (!locked.ok()) co_return locked;
   }
   auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
@@ -1414,15 +1458,25 @@ StorageEngine::Impl::TryConcurrentSortedSetRangeRead(
     co_return std::nullopt;
   LAVIK_FAULT_INJECT({
     if (LAVIK_FAULT_MATCHES("LAVIK_ZSET_RANGE_PAUSE_KEY", key)) {
+      for (const auto id : groups)
+        spdlog::info("zset read hold index={} prefix={} bits={}",
+                     unsigned(id.index_), id.record_.prefix_,
+                     unsigned(id.record_.bits_));
       spdlog::info("zset range read locks held before page IO");
       const auto paused = co_await fault_injection::PauseWhileFileExists(
           "LAVIK_ZSET_RANGE_PAUSE_FILE");
       if (!paused.ok()) co_return paused;
     }
   });
-  auto read = co_await ExecuteGroupedSortedSetLocked(
-      store, partition, db_id, key, digest, operation, current, nullptr,
-      nullptr, nullptr, nullptr, nullptr, true);
+  auto read = co_await [&]() {
+    if (operation.kind_ == SortedSetOperationKind::kRandom)
+      return ReadGroupedSortedSetRandom(store, partition, db_id, key, digest,
+                                        operation, current, random.draws_,
+                                        std::move(random_result), true);
+    return ExecuteGroupedSortedSetLocked(store, partition, db_id, key, digest,
+                                         operation, current, nullptr, nullptr,
+                                         nullptr, nullptr, nullptr, true);
+  }();
   if (!read.ok()) {
     if (EffectiveRecordDbEpoch(partition, db_id) !=
             current->version().db_epoch_ ||
@@ -2010,10 +2064,88 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
 }
 
 Task<absl::StatusOr<SortedSetResult>>
+StorageEngine::Impl::ReadGroupedSortedSetRandom(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object,
+    std::span<const std::pair<std::uint64_t, std::size_t>> draws,
+    SortedSetResult result, bool group_locked) {
+  const auto& directory = object->ordered_directory();
+  const auto& metadata = directory.groups();
+  std::size_t draw = 0;
+  while (draw < draws.size()) {
+    const auto position = directory.FindRank(draws[draw].first);
+    if (!position)
+      co_return absl::DataLossError("Sorted Set random rank missing");
+    const auto i = position->group_index_;
+    const GroupedRecordId id{metadata[i].id_, 0};
+    auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
+    if (group_locked) {
+      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      if (!refreshed.ok()) co_return refreshed.status();
+      current = std::move(*refreshed);
+    } else if (!current || !current->SameLogicalRoot(*object) ||
+               current->version().db_epoch_ != object->version().db_epoch_ ||
+               current->version().replication_epoch_ !=
+                   object->version().replication_epoch_ ||
+               current->version().index_generation_ !=
+                   object->version().index_generation_) {
+      co_return absl::NotFoundError("Sorted Set random source changed");
+    }
+    const auto readable = current->ReadStatus();
+    if (!readable.ok()) co_return readable;
+    LAVIK_FAULT_INJECT(
+        if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key) &&
+            (std::getenv("LAVIK_FAIL_ZSET_ORDERED_READ_PAGE") == nullptr ||
+             LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_ZSET_ORDERED_READ_KEY", key,
+                                     "LAVIK_FAIL_ZSET_ORDERED_READ_PAGE",
+                                     i + 1))) co_return absl::
+            UnavailableError("injected ordered-page read failure"););
+    const auto* entry = current->FindGroup(id);
+    if (!entry) co_return absl::DataLossError("missing Sorted Set random page");
+    GroupedScratchBudget budget;
+    auto checked = budget.AddGroup(*entry, current->ExtentsFor(id));
+    if (!checked.ok()) co_return checked;
+    auto admission = budget.Reserve(2);
+    if (!admission.ok()) co_return admission.status();
+    if (shutdown_flush_requested_)
+      co_return absl::CancelledError(
+          "Sorted Set random read cancelled by shutdown");
+    auto page = co_await LoadSortedSetPage(
+        store, partition, db_id, key, digest, object, metadata[i].id_,
+        SortedSetMemberValidation::kTrustStored,
+        SortedSetPageReadMode::kIndexedProjection, group_locked,
+        operation.diagnostics_);
+    if (!page.ok()) co_return page.status();
+    const auto& entries = page->entries_;
+    do {
+      const auto [rank, slot] = draws[draw];
+      const auto at = directory.FindRank(rank);
+      if (!at || at->group_index_ != i) break;
+      const auto size =
+          page->indexed_ ? page->indexed_->size() : entries.size();
+      if (at->offset_ >= size)
+        co_return absl::DataLossError(
+            "Sorted Set random page cardinality mismatch");
+      auto entry = page->indexed_ ? page->indexed_->At(at->offset_)
+                                  : absl::StatusOr<OrderedCollectionEntryView>(
+                                        entries[at->offset_]);
+      if (!entry.ok()) co_return entry.status();
+      auto copied = MakeOutput(*entry);
+      if (!copied.ok()) co_return copied.status();
+      result.members_[slot] = std::move(*copied);
+      ++draw;
+    } while (draw < draws.size());
+  }
+  co_return result;
+}
+
+Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ScanGroupedSortedSetMembers(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const SortedSetOperation& operation, GroupedObject::Handle object) {
+    const SortedSetOperation& operation, GroupedObject::Handle object,
+    bool group_locked) {
   SortedSetResult result;
   result.key_exists_ = true;
   result.length_ = object->ordered_directory().root().item_count_;
@@ -2030,9 +2162,13 @@ StorageEngine::Impl::ScanGroupedSortedSetMembers(
     // An old logical directory does not pin physical records across reads.
     // Resolve the current allocation before scratch admission; the loader
     // revalidates the same logical root after any suspension.
-    const auto current =
-        partition.grouped_objects_[db_id].CurrentForMutation(key);
-    if (!current || !current->SameLogicalRoot(*object) ||
+    auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
+    if (group_locked) {
+      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      if (!refreshed.ok()) co_return refreshed.status();
+      current = std::move(*refreshed);
+    }
+    if (!current || (!group_locked && !current->SameLogicalRoot(*object)) ||
         current->version().db_epoch_ != object->version().db_epoch_ ||
         current->version().replication_epoch_ !=
             object->version().replication_epoch_ ||
@@ -2048,9 +2184,9 @@ StorageEngine::Impl::ScanGroupedSortedSetMembers(
     if (!admission.ok()) co_return admission.status();
     if (shutdown_flush_requested_)
       co_return absl::CancelledError("member scan cancelled by shutdown");
-    auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                              digest, object, id, false, false,
-                                              operation.diagnostics_);
+    auto leaf = co_await LoadHashGroupPayload(
+        store, partition, db_id, key, digest, object, id, false, group_locked,
+        operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -2101,7 +2237,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   if (operation.kind_ == SortedSetOperationKind::kScan &&
       object->directory().root().seed_ == CurrentDigestSeed())
     co_return co_await ScanGroupedSortedSetMembers(
-        store, partition, db_id, key, digest, operation, std::move(object));
+        store, partition, db_id, key, digest, operation, std::move(object),
+        group_locked);
   auto input_admission = ReserveInputs(operation);
   if (!input_admission.ok()) co_return input_admission.status();
   Members members;
@@ -2421,37 +2558,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto selected =
         selection.Prepare(result.length_, operation.count_, false, &result);
     if (!selected.ok()) co_return selected;
-    std::size_t draw = 0;
-    while (draw < selection.draws_.size()) {
-      const auto position = directory.FindRank(selection.draws_[draw].first);
-      if (!position)
-        co_return absl::DataLossError("Sorted Set random rank missing");
-      const auto i = position->group_index_;
-      auto page =
-          co_await read_page(i, SortedSetPageReadMode::kIndexedProjection);
-      if (!page.ok()) co_return page.status();
-      const auto& entries = page->page_.entries_;
-      do {
-        const auto [rank, slot] = selection.draws_[draw];
-        const auto at = directory.FindRank(rank);
-        if (!at || at->group_index_ != i) break;
-        const auto size = page->page_.indexed_ ? page->page_.indexed_->size()
-                                               : entries.size();
-        if (at->offset_ >= size)
-          co_return absl::DataLossError(
-              "Sorted Set random page cardinality mismatch");
-        auto entry = page->page_.indexed_
-                         ? page->page_.indexed_->At(at->offset_)
-                         : absl::StatusOr<OrderedCollectionEntryView>(
-                               entries[at->offset_]);
-        if (!entry.ok()) co_return entry.status();
-        auto copied = MakeOutput(*entry);
-        if (!copied.ok()) co_return copied.status();
-        result.members_[slot] = std::move(*copied);
-        ++draw;
-      } while (draw < selection.draws_.size());
-    }
-    co_return result;
+    co_return co_await ReadGroupedSortedSetRandom(
+        store, partition, db_id, key, digest, operation, object,
+        selection.draws_, std::move(result), group_locked);
   }
   if (operation.kind_ == SortedSetOperationKind::kScan) {
     ScanBoundary boundary;

@@ -2738,19 +2738,29 @@ class StorageEngine::Impl {
   // Caller owns IS. Acquire selected payload S holds in identity order, then
   // validate routing and capture the common directory before projecting it.
   Task<absl::StatusOr<std::optional<SortedSetResult>>>
-  TryConcurrentSortedSetRangeRead(WorkerStore& store,
-                                  WorkerStore::PartitionStore& partition,
-                                  std::uint8_t db_id, std::string_view key,
-                                  const Digest& digest,
-                                  const SortedSetOperation& operation,
-                                  GroupedObject::Handle object);
+  TryConcurrentSortedSetPageRead(WorkerStore& store,
+                                 WorkerStore::PartitionStore& partition,
+                                 std::uint8_t db_id, std::string_view key,
+                                 const Digest& digest,
+                                 const SortedSetOperation& operation,
+                                 GroupedObject::Handle object);
+
+  // Projects already sampled ranks. Draws and caller-owned S group holds
+  // (when group_locked) must outlive the awaited task and its reply copies.
+  Task<absl::StatusOr<SortedSetResult>> ReadGroupedSortedSetRandom(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedObject::Handle object,
+      std::span<const std::pair<std::uint64_t, std::size_t>> draws,
+      SortedSetResult result, bool group_locked = false);
 
   // Requires the member directory's seed to match the public scan cursor
   // seed. Retains one checked member leaf and admitted owned output at a time.
   Task<absl::StatusOr<SortedSetResult>> ScanGroupedSortedSetMembers(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const SortedSetOperation& operation, GroupedObject::Handle object);
+      const SortedSetOperation& operation, GroupedObject::Handle object,
+      bool group_locked = false);
 
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
