@@ -29,7 +29,8 @@ absl::StatusOr<GroupedObject::Handle> StorageEngine::Impl::RefreshLockedGroup(
     GroupedRecordId id) {
   const auto current =
       partition.grouped_objects_[db_id].CurrentForMutation(key);
-  if (!source || !current || !current->has_member_index() ||
+  if (!source || !current ||
+      (current->is_ordered() && !current->has_member_index()) ||
       current->incarnation() != source->incarnation())
     return absl::AbortedError("locked group incarnation changed");
   const auto& old = source->version();
@@ -38,6 +39,7 @@ absl::StatusOr<GroupedObject::Handle> StorageEngine::Impl::RefreshLockedGroup(
       old.replication_epoch_ != now.replication_epoch_ ||
       old.index_generation_ != now.index_generation_ ||
       old.root_.expire_at_ms_ != now.root_.expire_at_ms_ ||
+      old.root_.value_type() != now.root_.value_type() ||
       EffectiveRecordDbEpoch(partition, db_id) != old.db_epoch_ ||
       partition.replication_epoch_ != old.replication_epoch_ ||
       partition.grouped_generations_[db_id] != old.index_generation_)

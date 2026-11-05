@@ -565,6 +565,57 @@ std::vector<RecoveredGroupedRecord> Candidates(
   return candidates;
 }
 
+TEST(GroupedHashTest,
+     MergePublicationPreservesDisjointChangesAndRejectsConflicts) {
+  auto pages = GroupHashValue(Value(128), 17, Seed(), 1024);
+  ASSERT_TRUE(pages.ok());
+  ASSERT_GT(pages->size(), 2);
+  auto records = Candidates(*pages);
+  auto base = Recover(Root(128, pages->size()), 1, records, {});
+  ASSERT_TRUE(base.ok()) << base.status();
+  auto plan_root = base->root();
+  --plan_root.field_count_;
+  auto changed = pages->front();
+  ASSERT_FALSE(changed.value_.entries_.empty());
+  changed.value_.entries_.pop_back();
+  const auto writes = std::span(&changed, 1);
+
+  auto other = records.back();
+  ASSERT_GT(other.field_count_, 0);
+  --other.field_count_;
+  other.sequence_ = other.lsn_ = 2;
+  auto current_root = base->root();
+  current_root.revision_ = 2;
+  --current_root.field_count_;
+  auto current = base->Apply(current_root, 2, std::span(&other, 1));
+  ASSERT_TRUE(current.ok()) << current.status();
+  auto merged = MergeHashPublication(*base, *current, plan_root, writes);
+  ASSERT_TRUE(merged.ok()) << merged.status();
+  EXPECT_EQ(merged->field_count_, 126);
+  EXPECT_EQ(merged->revision_, 0);
+  EXPECT_EQ(merged->group_count_, base->root().group_count_);
+
+  auto overlap = records.front();
+  overlap.sequence_ = overlap.lsn_ = 2;
+  auto overlap_root = base->root();
+  overlap_root.revision_ = 2;
+  auto conflicting = base->Apply(overlap_root, 2, std::span(&overlap, 1));
+  ASSERT_TRUE(conflicting.ok());
+  EXPECT_TRUE(absl::IsAborted(
+      MergeHashPublication(*base, *conflicting, plan_root, writes).status()));
+  ++plan_root.group_count_;
+  EXPECT_TRUE(absl::IsFailedPrecondition(
+      MergeHashPublication(*base, *current, plan_root, writes).status()));
+  --plan_root.group_count_;
+  ++plan_root.field_count_;
+  EXPECT_TRUE(absl::IsInvalidArgument(
+      MergeHashPublication(*base, *current, plan_root, writes).status()));
+  --plan_root.field_count_;
+  changed.retired_ = true;
+  EXPECT_TRUE(absl::IsFailedPrecondition(
+      MergeHashPublication(*base, *current, plan_root, writes).status()));
+}
+
 TEST(GroupedHashTest, PrefixBoundsIncludeZeroAndFullWidth) {
   const auto maximum = std::numeric_limits<std::uint64_t>::max();
   EXPECT_TRUE((GroupedRecordId{}).ContainsHash(0));

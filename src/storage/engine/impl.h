@@ -2560,12 +2560,27 @@ class StorageEngine::Impl {
       const MutationPrecondition* mutation_precondition = nullptr,
       CompactAccessOptions access = {});
 
+  // Standalone adapters choose IS/IX only for grouped operations whose group
+  // set is known. Externally locked EXEC/Lua and multi-key calls bypass this.
+  Task<absl::StatusOr<HashResult>> ExecuteHashLike(
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+      ValueType value_type, ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+  // nullopt means every group hold has been released before one S/X fallback.
+  Task<absl::StatusOr<std::optional<HashResult>>> TryConcurrentHashLike(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const HashOperation& operation, ValueType value_type,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+  // With retry_exclusive, the caller holds IS/IX and all selected groups;
+  // true certifies that no mutation was staged and permits a whole-key retry.
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, ValueType value_type,
       TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      bool* retry_exclusive = nullptr);
 
   // Pure private-page planning; no store lock is needed. The after-image owns
   // selected groups for point operations or all groups for full-image callers.
@@ -2581,9 +2596,10 @@ class StorageEngine::Impl {
   // it after their resource waits and publish without yielding; ordinary
   // multi-append/extent writers retain key X through the remaining waits.
   static std::uint64_t AllocateGroupedRevision() noexcept;
-  // Caller retains exclusive key intent and store state. A prepared plan must
-  // name the validated predecessor or a validated creation; commit assigns
-  // its durable revision and stamps every page of a fresh incarnation.
+  // Caller retains store state and key X, or IX plus X on changed groups.
+  // retry_exclusive requires a prepared topology-preserving bounded batch;
+  // true rejects before staging so the adapter can release groups and take X.
+  // Such batches merge with the latest root and assign revision after waits.
   Task<absl::Status> CommitGroupedHashMutationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -2593,6 +2609,7 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition = nullptr,
       HashGroupMutationPlan* prepared = nullptr,
+      bool* retry_exclusive = nullptr,
       OnlineLatencyTrace* diagnostics = nullptr);
 
   // The plan contains complete changed ordered pages, not an append-only
@@ -2815,7 +2832,7 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::span<const std::string_view> fields,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
 
   // Full read-only replies retain only projected output under bounded owner
   // windows. Pages release their leases before joins, which recheck the view.
@@ -4331,7 +4348,7 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, GroupedRecordId id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
       bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
-  // Requires parent IX plus this group's S/X hold. Refresh physical metadata
+  // Requires parent IS/IX plus this group's S/X hold. Refresh physical metadata
   // across GC without rejecting publications to unrelated groups. No pin is
   // implied: each physical read still owns its usual allocation lease.
   absl::StatusOr<GroupedObject::Handle> RefreshLockedGroup(

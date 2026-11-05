@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 
+#include "absl/cleanup/cleanup.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "write_e2e_support.h"
 
@@ -37,6 +38,7 @@ std::vector<std::string> HashCommand(std::string key, char value = 'v') {
 struct HashDiskLayout {
   GroupedHashRoot root_;
   bool empty_tail_ = false;
+  std::vector<GroupedRecordId> leaves_;
 };
 
 TEST(CompactHashWriteE2e, ColdUpdateKeepsCompactEncodingAndRecovers) {
@@ -166,6 +168,10 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
     auto& winner = newest[{record.group_prefix_, record.group_prefix_bits_}];
     if (winner.mutation_sequence_ <= record.mutation_sequence_) winner = record;
   }
+  for (const auto& [id, record] : newest)
+    if (!record.group_retired_)
+      result.leaves_.push_back(
+          {id.first, static_cast<std::uint8_t>(id.second)});
   for (auto it = newest.rbegin(); it != newest.rend(); ++it) {
     if (!it->second.group_retired_) {
       result.empty_tail_ = it->second.logical_size_ == 0;
@@ -173,6 +179,269 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
     }
   }
   return result;
+}
+
+// A paused page operation must retain its group while other groups can publish
+// a new root. Decode routes from the durable fixture, not the process seed.
+void CheckHashLikeIntent(bool set, bool read) {
+  PrivateDisk disk;
+  const std::string key = set ? "set-intent" : "hash-intent";
+  constexpr unsigned count = 1024;
+  auto field = [](unsigned i) {
+    return "field-" + std::to_string(i) + std::string(128, 'f');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{set ? "SADD" : "HSET", key};
+    for (unsigned i = 0; i < count; ++i) {
+      seed.push_back(field(i));
+      if (!set) seed.push_back("0");
+    }
+    ASSERT_EQ(client.Command(seed).text_, std::to_string(count));
+    client.Durable();
+  }
+  const auto layout = InspectHashLayout(disk, key);
+  ASSERT_GT(layout.leaves_.size(), 2);
+  const auto route = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (auto id : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture Hash route");
+  };
+  auto a = field(read ? 0 : count);
+  if (!read) {
+    // A structural retry drops IX before acquiring key X, allowing the
+    // queued remover to run before this insertion. This case tests ordinary
+    // group-lock handoff, so choose a leaf with room under the persisted seed.
+    std::map<std::uint64_t, std::size_t> entry_bytes;
+    for (unsigned i = 0; i < count; ++i) {
+      const auto member = field(i);
+      entry_bytes[route(member).prefix_] += 8 + member.size() + (set ? 0 : 1);
+    }
+    unsigned candidate = count;
+    for (; candidate < 2 * count; ++candidate) {
+      a = field(candidate);
+      if (kHashValueHeaderBytes + entry_bytes[route(a).prefix_] + 8 + a.size() +
+              (set ? 0 : 1) <=
+          kCollectionGroupTargetBytes)
+        break;
+    }
+    ASSERT_LT(candidate, 2 * count);
+  }
+  unsigned other = 1;
+  while (other < count && route(field(other)) == route(a)) ++other;
+  ASSERT_LT(other, count);
+  const auto b = field(other);
+  const auto expected_count =
+      count - 1 - (read ? 1 : 0) + (!read && !set ? 1 : 0);
+  {
+    const std::string gate = disk.path() + ".intent-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD", a.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+    const std::array<std::string_view, 1> crc{"--record-crc"};
+    Server server(disk, 1, {}, {}, false, 2, "2G", {}, {}, 0, 20, crc);
+    std::future<Reply> first, disjoint, conflicting;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      if (read)
+        return client.Command({set ? "SMISMEMBER" : "HMGET", key, a, a});
+      if (set) return client.Command({"SADD", key, a, a});
+      return client.Command({"HSET", key, a, "1", a, "2"});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    disjoint = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, b});
+    });
+    ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(disjoint.get().text_, "1");
+    Client observer(server.port());
+    EXPECT_EQ(observer.Command({set ? "SCARD" : "HLEN", key}).text_,
+              std::to_string(count - 1));
+    // Scan a different leaf while the first request still owns its group.
+    const auto scan =
+        observer.Command({set ? "SSCAN" : "HSCAN", key,
+                          std::to_string(route(b).prefix_), "COUNT", "1"});
+    EXPECT_EQ(scan.kind_, '*') << scan.text_;
+    conflicting = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      if (read || set) return client.Command({set ? "SREM" : "HDEL", key, a});
+      return client.Command({"HINCRBY", key, a, "1"});
+    });
+    EXPECT_EQ(conflicting.wait_for(100ms), std::future_status::timeout);
+    EXPECT_EQ(first.wait_for(0ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    const auto result = first.get();
+    if (read) {
+      ASSERT_EQ(result.items_.size(), 2) << result.text_ << server.Log();
+      EXPECT_EQ(result.items_[0].text_, set ? "1" : "0");
+      EXPECT_EQ(result.items_[1].text_, set ? "1" : "0");
+    } else {
+      EXPECT_EQ(result.text_, "1") << server.Log();
+    }
+    ASSERT_EQ(conflicting.get().text_, read || set ? "1" : "3") << server.Log();
+    EXPECT_EQ(observer.Command({set ? "SCARD" : "HLEN", key}).text_,
+              std::to_string(expected_count));
+    observer.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({set ? "SCARD" : "HLEN", key}).text_,
+            std::to_string(expected_count));
+  EXPECT_EQ(client.Command({set ? "SISMEMBER" : "HEXISTS", key, b}).text_, "0");
+  if (!read && !set) {
+    EXPECT_EQ(client.Command({"HGET", key, a}).text_, "3");
+    EXPECT_EQ(client.Command({"HSETNX", key, a, "9"}).text_, "0");
+    EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, a, "0.5"}).text_, "3.5");
+    EXPECT_EQ(client.Command({"HSTRLEN", key, a}).text_, "3");
+  } else {
+    EXPECT_EQ(client.Command({set ? "SISMEMBER" : "HEXISTS", key, a}).text_,
+              "0");
+  }
+}
+
+void CheckHashLikeLastDeletion(bool set) {
+  PrivateDisk disk;
+  const std::string key = "intent-final-delete";
+  const std::string a(18000, 'a'), b(18000, 'b');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    const auto seed =
+        set ? std::vector<std::string>{"SADD", key, a, b}
+            : std::vector<std::string>{"HSET", key, a, "0", b, "0"};
+    ASSERT_EQ(client.Command(seed).text_, "2");
+    client.Durable();
+  }
+  ASSERT_GT(InspectHashLayout(disk, key).root_.group_count_, 1);
+  {
+    const std::string gate = disk.path() + ".delete-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD", a.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, other;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, a});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    other = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, b});
+    });
+    ASSERT_EQ(other.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(other.get().text_, "1");
+    ::unlink(gate.c_str());
+    ASSERT_EQ(first.wait_for(5s), std::future_status::ready) << server.Log();
+    EXPECT_EQ(first.get().text_, "1") << server.Log();
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+    client.Durable();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+}
+
+TEST(GroupedHashWriteE2e, ConcurrentFinalDeletionRetriesUnderKeyX) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeLastDeletion(false);
+}
+
+TEST(GroupedHashWriteE2e, StructuralRetryReleasesGroupsBeforeTakingKeyX) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "hash-structural-retry";
+  const std::string field = "field0";
+  const std::string large(70000, 'x');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(HashCommand(key)).text_, "256");
+    client.Durable();
+  }
+  {
+    const std::string gate = disk.path() + ".structural-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD",
+                                  field.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, conflict;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"HSET", key, field, large});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"HDEL", key, field});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    ASSERT_EQ(conflict.wait_for(5s), std::future_status::ready) << server.Log();
+    EXPECT_EQ(conflict.get().text_, "1");
+    ASSERT_EQ(first.wait_for(5s), std::future_status::ready) << server.Log();
+    // The waiting IX delete runs before the released writer can get key X.
+    // Re-execution must observe that deletion and report an insertion.
+    EXPECT_EQ(first.get().text_, "1") << server.Log();
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"HLEN", key}).text_, "256");
+    EXPECT_EQ(client.Command({"HGET", key, field}).text_, large);
+    client.Durable();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HLEN", key}).text_, "256");
+  EXPECT_EQ(client.Command({"HGET", key, field}).text_, large);
+}
+
+TEST(GroupedHashWriteE2e, IntentWritesMergeDisjointCountsAndWakeConflicts) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeIntent(false, false);
+}
+
+TEST(GroupedHashWriteE2e, IntentReadsProtectOnlyRequestedLeaves) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeIntent(false, true);
 }
 
 TEST(GroupedHashWriteE2e,
