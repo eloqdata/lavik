@@ -2278,7 +2278,7 @@ endforeach()
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/tx_commit_retry_e2e.py
           $<TARGET_FILE:lavik> --case ${retry_case})
       set_tests_properties(lavik_tx_commit_retry_e2e.${retry_case} PROPERTIES
-        TIMEOUT 600 RUN_SERIAL TRUE
+        TIMEOUT 600 RUN_SERIAL TRUE SKIP_RETURN_CODE 77
         ENVIRONMENT "LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>")
     endforeach()
 

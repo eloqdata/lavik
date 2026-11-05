@@ -682,6 +682,14 @@ def main():
         default="all",
     )
     args = parser.parse_args()
+    if (
+        args.case in ("injected", "superseded", "matrix", "dependent")
+        and os.environ.get("LAVIK_TEST_FAULTS_AVAILABLE", "1") != "1"
+    ):
+        # Standalone fault cases have no coverage without the hooks. Keep the
+        # combined run available for its natural and shutdown scenarios.
+        print(f"SKIP {args.case}: test faults are unavailable", flush=True)
+        raise SystemExit(77)
     root = Path(
         tempfile.mkdtemp(
             prefix="lavik-tx-commit-retry-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
