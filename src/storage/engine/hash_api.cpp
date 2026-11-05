@@ -86,11 +86,29 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLike(
       lavik::storage::RedisSlot(key));
   key_wait.End();
   if (concurrent) {
+    // The speculative writer can canonicalize increments/pops and append TTL
+    // effects before its final batch admission requests key X. Preserve the
+    // original command: after IX is released, X may observe another incarnation
+    // with different contents and expiry. Only replicated intent writers need
+    // this copy; ordinary compact operations retain their existing fast path.
+    std::optional<ReplicationCommandAppend> retry_replication;
+    if (write && replication) {
+      retry_replication.emplace(*replication);
+      // The snapshot owns distinct argument buffers, not the original charge.
+      retry_replication->retained_owner_.reset();
+      AccountReplicationCommand(&*retry_replication);
+    }
     auto result = co_await TryConcurrentHashLike(db_id, key, digest, operation,
                                                  value_type, replication,
                                                  mutation_precondition);
     if (!result.ok()) co_return result.status();
     if (*result) co_return std::move(**result);
+    if (retry_replication) {
+      // Discard every attempt-derived effect and publication coordinate. The
+      // retry accounts its newly canonicalized buffers at append admission.
+      retry_replication->retained_owner_.reset();
+      *replication = std::move(*retry_replication);
+    }
     // The nested task has released every group. Upgrading an intent while
     // retaining groups could deadlock another intent holder waiting for them.
     key_lock.Reset();

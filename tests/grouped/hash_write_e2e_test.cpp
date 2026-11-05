@@ -181,6 +181,164 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
   return result;
 }
 
+// A late IX rejection must not carry its captured expiration into the next
+// incarnation. Use a real native replica and a same-partition barrier so an
+// expired stale PEXPIREAT cannot hide behind replication lag.
+void CheckHashLikeRetryReplication(bool set) {
+  PrivateDisk primary_disk, replica_disk;
+  const std::string key = "collection{retry-ttl}";
+  const std::string barrier = "barrier{retry-ttl}";
+  const std::string a = set ? std::string(10000, 'a') : "a";
+  const std::string b = set ? std::string(10000, 'b') : "b";
+  {
+    Server seed(primary_disk, 1);
+    Client client(seed.port());
+    const auto reply =
+        set ? client.Command({"SADD", key, a, b, "keep"})
+            : client.Command({"HSET", key, a, std::string(10000, 'a'), b,
+                              std::string(10000, 'b'), "keep", "old"});
+    ASSERT_EQ(reply.text_, "3");
+    client.Durable();
+    ASSERT_EQ(seed.Wait(true), 0) << seed.Log();
+  }
+  const auto layout = InspectHashLayout(primary_disk, key);
+  const auto route = [&](std::string_view field) {
+    const auto digest = ComputeDigest(field, layout.root_.seed_).value_;
+    for (const auto id : layout.leaves_)
+      if (id.ContainsHash(digest)) return id;
+    throw std::runtime_error("missing TTL fixture route");
+  };
+  ASSERT_NE(route(a), route(b));
+  const std::string gate = primary_disk.path() + ".replication-gate";
+  std::ofstream(gate).put('1');
+  std::ofstream(gate + ".arm").put('1');
+  std::unique_ptr<Server> primary;
+  {
+    // Only the primary inherits the fault; replica replay uses its normal path.
+    ScopedEnvironment pause_key("LAVIK_GROUP_REPLICATION_PAUSE_KEY",
+                                key.c_str());
+    ScopedEnvironment pause_file("LAVIK_GROUP_REPLICATION_PAUSE_FILE",
+                                 gate.c_str());
+    primary = std::make_unique<Server>(primary_disk, 1);
+  }
+  Server replica(replica_disk, 1);
+  Client source(primary->port()), follower(replica.port());
+  std::future<Reply> deleting, disjoint, rebuilding;
+  absl::Cleanup release = [&] {
+    ::unlink(gate.c_str());
+    ::unlink((gate + ".arm").c_str());
+  };
+  ASSERT_EQ(follower
+                .Command({"LAVIK.REPLICAOF", "127.0.0.1",
+                          std::to_string(primary->port())})
+                .text_,
+            "OK");
+  ASSERT_EQ(follower.Command({"READONLY"}).text_, "OK");
+  auto await_barrier = [&](std::string_view expected) {
+    for (unsigned i = 0; i < 600; ++i) {
+      const auto reply = follower.Command({"GET", barrier});
+      if (reply.kind_ == '$' && reply.text_ == expected) return true;
+      std::this_thread::sleep_for(25ms);
+    }
+    return false;
+  };
+  ASSERT_EQ(source.Command({"SET", barrier, "before"}).text_, "OK");
+  ASSERT_TRUE(await_barrier("before")) << primary->Log() << replica.Log();
+  const auto expires = std::chrono::system_clock::now() + 10s;
+  const auto expires_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              expires.time_since_epoch())
+                              .count();
+  ASSERT_EQ(
+      source.Command({"PEXPIREAT", key, std::to_string(expires_ms)}).text_,
+      "1");
+  deleting = std::async(std::launch::async, [&] {
+    Client client(primary->port());
+    return client.Command({set ? "SREM" : "HDEL", key, a});
+  });
+  bool paused = false;
+  for (unsigned i = 0; i < 200; ++i) {
+    paused = primary->Log().find(
+                 "grouped replication prepared before publication") !=
+             std::string::npos;
+    if (paused) break;
+    std::this_thread::sleep_for(25ms);
+  }
+  ASSERT_TRUE(paused) << primary->Log();
+  // Each deletion alone stays above demotion. Their combined image drops
+  // below the demotion threshold, so A must fail its final prepared admission.
+  disjoint = std::async(std::launch::async, [&] {
+    Client client(primary->port());
+    return client.Command({set ? "SREM" : "HDEL", key, b});
+  });
+  ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << primary->Log();
+  ASSERT_EQ(disjoint.get().text_, "1");
+  ASSERT_LT(std::chrono::system_clock::now(), expires);
+  rebuilding = std::async(std::launch::async, [&] {
+    Client client(primary->port());
+    Check(client.Command({"MULTI"}).text_ == "OK", "MULTI failed");
+    Check(client.Command({"DEL", key}).text_ == "QUEUED", "DEL not queued");
+    const auto write =
+        set ? client.Command({"SADD", key, "keep", a})
+            : client.Command({"HSET", key, "keep", "safe", a, "remove-me"});
+    Check(write.text_ == "QUEUED", "recreation not queued");
+    return client.Command({"EXEC"});
+  });
+  EXPECT_EQ(rebuilding.wait_for(100ms), std::future_status::timeout);
+  // The queued key-X recreation wins when A releases IX. Make the old TTL
+  // already expired so a leaked effect destroys the fresh non-expiring key.
+  std::this_thread::sleep_until(expires + 50ms);
+  ::unlink(gate.c_str());
+  ASSERT_EQ(rebuilding.wait_for(5s), std::future_status::ready)
+      << primary->Log();
+  const auto rebuilt = rebuilding.get();
+  ASSERT_EQ(rebuilt.items_.size(), 2) << rebuilt.text_ << primary->Log();
+  EXPECT_EQ(rebuilt.items_[1].text_, "2");
+  ASSERT_EQ(deleting.wait_for(5s), std::future_status::ready) << primary->Log();
+  EXPECT_EQ(deleting.get().text_, "1");
+  EXPECT_EQ(source.Command({set ? "SCARD" : "HLEN", key}).text_, "1");
+  EXPECT_EQ(source.Command({set ? "SISMEMBER" : "HGET", key, "keep"}).text_,
+            set ? "1" : "safe");
+  EXPECT_EQ(source.Command({"PTTL", key}).text_, "-1");
+  ASSERT_EQ(source.Command({"SET", barrier, "after"}).text_, "OK");
+  ASSERT_TRUE(await_barrier("after")) << primary->Log() << replica.Log();
+  EXPECT_EQ(follower.Command({set ? "SCARD" : "HLEN", key}).text_, "1")
+      << replica.Log();
+  EXPECT_EQ(follower.Command({set ? "SISMEMBER" : "HGET", key, "keep"}).text_,
+            set ? "1" : "safe");
+  EXPECT_EQ(follower.Command({"PTTL", key}).text_, "-1");
+
+  // The successful IX path must still publish its current TTL. Re-promote,
+  // then remove one large field while the other keeps the graph grouped.
+  const auto expanded =
+      set ? source.Command({"SADD", key, a, b})
+          : source.Command({"HSET", key, a, std::string(10000, 'a'), b,
+                            std::string(10000, 'b')});
+  ASSERT_EQ(expanded.text_, "2");
+  const auto new_expiry =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          (std::chrono::system_clock::now() + 60s).time_since_epoch())
+          .count();
+  ASSERT_EQ(
+      source.Command({"PEXPIREAT", key, std::to_string(new_expiry)}).text_,
+      "1");
+  ASSERT_EQ(source.Command({set ? "SREM" : "HDEL", key, b}).text_, "1");
+  ASSERT_EQ(source.Command({"SET", barrier, "retained"}).text_, "OK");
+  ASSERT_TRUE(await_barrier("retained")) << primary->Log() << replica.Log();
+  EXPECT_EQ(source.Command({"PEXPIRETIME", key}).text_,
+            std::to_string(new_expiry));
+  EXPECT_EQ(follower.Command({"PEXPIRETIME", key}).text_,
+            std::to_string(new_expiry));
+  EXPECT_EQ(follower.Command({set ? "SCARD" : "HLEN", key}).text_, "2");
+}
+
+TEST(GroupedHashWriteE2e,
+     IntentRetryDiscardsPreviousIncarnationReplicationTTL) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic prepared replication pause";
+#endif
+  CheckHashLikeRetryReplication(false);
+}
+
 // A paused page operation must retain its group while other groups can publish
 // a new root. Decode routes from the durable fixture, not the process seed.
 void CheckHashLikeIntent(bool set, bool read) {

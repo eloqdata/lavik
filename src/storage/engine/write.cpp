@@ -2281,6 +2281,23 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
       fullsync_command = std::move(owned_copy);
     }
   }
+  LAVIK_FAULT_INJECT({
+    if (replication && grouped && grouped->root_ && grouped->root_->batch_ &&
+        LAVIK_FAULT_MATCHES("LAVIK_GROUP_REPLICATION_PAUSE_KEY", key)) {
+      const char* file = std::getenv("LAVIK_GROUP_REPLICATION_PAUSE_FILE");
+      // One prepared attempt pauses after canonical TTL capture. Other groups
+      // must still publish so its final batch admission can require key X.
+      if (file && ::unlink((std::string(file) + ".arm").c_str()) == 0) {
+        spdlog::info("grouped replication prepared before publication key={}",
+                     key);
+        store.store_state_mutex_.Unlock(*store.worker_);
+        const auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_GROUP_REPLICATION_PAUSE_FILE");
+        co_await store.store_state_mutex_.Lock();
+        if (!paused.ok()) co_return paused;
+      }
+    }
+  });
   absl::Status status = absl::OkStatus();
   const bool key_indirect = key.size() > kInlineKeyMaxBytes;
   const std::uint64_t logical_payload_bytes =
