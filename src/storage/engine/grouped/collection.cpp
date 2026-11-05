@@ -91,6 +91,22 @@ bool ValidRoot(const OrderedCollectionRoot& root) {
          ((root.group_count_ == 1) == (root.first_group_ == root.last_group_));
 }
 
+// The base comes from a validated directory. Counts and revisions can differ:
+// non-structural changes to disjoint pages must remain mergeable.
+bool SameSortedSetTopology(const OrderedCollectionRoot& root,
+                           const OrderedCollectionRoot& base) {
+  return root.kind_ == OrderedCollectionKind::kSortedSet &&
+         root.incarnation_ == base.incarnation_ &&
+         root.first_group_ == base.first_group_ &&
+         root.last_group_ == base.last_group_ &&
+         root.next_group_id_ == base.next_group_id_ &&
+         root.group_count_ == base.group_count_ && root.member_index_ &&
+         base.member_index_ &&
+         root.member_index_->incarnation_ == base.incarnation_ &&
+         root.member_index_->seed_ == base.member_index_->seed_ &&
+         root.member_index_->group_count_ == base.member_index_->group_count_;
+}
+
 bool EntryLess(const auto& left, const auto& right) noexcept {
   return left.score_ < right.score_ ||
          (left.score_ == right.score_ && left.value_ < right.value_);
@@ -1503,23 +1519,12 @@ absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
     std::span<const OrderedGroupSnapshot> ordered,
     std::span<const HashGroupSnapshot> members) {
   const auto& before = base.root();
-  const auto same_topology = [&](const OrderedCollectionRoot& root) {
-    return root.kind_ == OrderedCollectionKind::kSortedSet &&
-           root.incarnation_ == before.incarnation_ &&
-           root.first_group_ == before.first_group_ &&
-           root.last_group_ == before.last_group_ &&
-           root.next_group_id_ == before.next_group_id_ &&
-           root.group_count_ == before.group_count_ && root.member_index_ &&
-           before.member_index_ &&
-           root.member_index_->incarnation_ == before.incarnation_ &&
-           root.member_index_->seed_ == before.member_index_->seed_ &&
-           root.member_index_->group_count_ ==
-               before.member_index_->group_count_;
-  };
-  if (!same_topology(planned) || ordered.empty() || planned.item_count_ == 0 ||
+  if (!SameSortedSetTopology(planned, before) || ordered.empty() ||
+      planned.item_count_ == 0 ||
       planned.member_index_->field_count_ != planned.item_count_)
     return absl::FailedPreconditionError("Sorted Set plan needs key X");
-  if (!same_topology(current.root()) || current.sequence() < base.sequence())
+  if (!SameSortedSetTopology(current.root(), before) ||
+      current.sequence() < base.sequence())
     return absl::AbortedError("Sorted Set topology changed during preparation");
   const auto unchanged = [&](std::uint64_t id) {
     if (id == 0) return true;
