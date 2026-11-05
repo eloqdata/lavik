@@ -260,6 +260,15 @@ before one X acquisition and replans from current state. It never upgrades
 while retaining groups or repeatedly retries IX. Whole-key S readers and X
 writers wait for active IX holders; the key queue fences later IX arrivals.
 
+Standalone member-score projections (ZSCORE, ZMSCORE and the GEO member
+queries using that projection) acquire IS for grouped values and S only on
+the requested member leaves. Multi-member queries acquire all leaf holds in
+identity order before capturing their common logical view. The holds span
+page IO and score decoding, while unrelated leaves may change. Representation
+or population changes trigger one whole-key S fallback after releasing every
+group hold. Compact and externally locked transaction paths retain their
+existing key protection.
+
 ## Durable graph and publication
 
 A small keyed root and auxiliary keyed group records preserve the user-visible

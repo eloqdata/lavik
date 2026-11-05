@@ -1253,6 +1253,109 @@ TEST(GroupedSortedSetWriteE2e, ConcurrentGroupsWaitWakeAndRecover) {
   ExpectDenseZSet(client, key, expected);
 }
 
+TEST(GroupedSortedSetWriteE2e, MemberReadsLockOnlyRequestedLeaves) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "member-read-locks";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+  }
+  const auto layout = InspectZSetMembers(disk, key);
+  const auto a = DenseZSetMember(10);
+  auto leaf_for = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (const auto& [id, leaf] : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture member route");
+  };
+  unsigned b_index = 900;
+  while (b_index < 1000 && leaf_for(DenseZSetMember(b_index)) == leaf_for(a))
+    ++b_index;
+  ASSERT_LT(b_index, 1000);
+  const auto b = DenseZSetMember(b_index);
+  // Exercise both directions: a held writer permits a disjoint reader, and a
+  // held reader permits a disjoint writer. Conflicting groups wait and wake.
+  for (bool pause_read : {false, true}) {
+    const std::string gate = disk.path() + ".read-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment target(pause_read ? "LAVIK_ZSET_READ_PAUSE_KEY"
+                                        : "LAVIK_ZSET_GROUP_PAUSE_MEMBER",
+                             pause_read ? key.c_str() : a.c_str());
+    ScopedEnvironment file(pause_read ? "LAVIK_ZSET_READ_PAUSE_FILE"
+                                      : "LAVIK_ZSET_GROUP_PAUSE_FILE",
+                           gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> holder, disjoint, conflict;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    const auto before = expected[a];
+    holder = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return pause_read ? client.Command({"ZMSCORE", key, a, a})
+                        : client.Command({"ZINCRBY", key, "0.25", a});
+    });
+    bool held = false;
+    const auto marker = pause_read
+                            ? "zset member read locks held before page IO"
+                            : "zset group locks held before page IO";
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find(marker) != std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    disjoint = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return pause_read ? client.Command({"ZINCRBY", key, "0.5", b})
+                        : client.Command({"ZMSCORE", key, b, b});
+    });
+    ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+    auto separate = disjoint.get();
+    if (pause_read) {
+      expected[b] += 0.5;
+      EXPECT_EQ(std::stod(separate.text_), expected[b]);
+    } else {
+      ASSERT_EQ(separate.items_.size(), 2);
+      EXPECT_EQ(std::stod(separate.items_[0].text_), expected[b]);
+      EXPECT_EQ(separate.items_[0].text_, separate.items_[1].text_);
+    }
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return pause_read ? client.Command({"ZINCRBY", key, "0.5", a})
+                        : client.Command({"ZMSCORE", key, b, a, a});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    const auto first = holder.get();
+    const auto second = conflict.get();
+    if (pause_read) {
+      ASSERT_EQ(first.items_.size(), 2);
+      EXPECT_EQ(std::stod(first.items_[0].text_), before);
+      EXPECT_EQ(first.items_[0].text_, first.items_[1].text_);
+      expected[a] += 0.5;
+      EXPECT_EQ(std::stod(second.text_), expected[a]);
+    } else {
+      expected[a] += 0.25;
+      EXPECT_EQ(std::stod(first.text_), expected[a]);
+      ASSERT_EQ(second.items_.size(), 3);
+      EXPECT_EQ(std::stod(second.items_[0].text_), expected[b]);
+      EXPECT_EQ(std::stod(second.items_[1].text_), expected[a]);
+      EXPECT_EQ(second.items_[1].text_, second.items_[2].text_);
+    }
+    Client client(server.port());
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
 TEST(GroupedSortedSetWriteE2e, ConcurrentPointCommandsPreserveBothIndexes) {
   PrivateDisk disk;
   const std::string key = "concurrent-point-stress";
