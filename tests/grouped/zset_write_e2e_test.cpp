@@ -184,6 +184,49 @@ TEST(GroupedSortedSetWriteE2e, PreparedBatchFailureLeavesNoPartialPublication) {
   EXPECT_EQ(client.Command({"ZINCRBY", key, "0.25", member}).text_, "100.25");
 }
 
+TEST(GroupedSortedSetWriteE2e,
+     PreparedBatchFailureDoesNotLeakIndirectKeyReferences) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires auxiliary-write failure injection";
+#endif
+  ScopedEnvironment cleaner("LAVIK_TX_CLEANER_START_PAUSED", "1");
+  PrivateDisk disk;
+  const std::string key = "failed-" + std::string(kInlineKeyMaxBytes, 'k');
+  const std::string healthy = "reused-" + std::string(kInlineKeyMaxBytes, 'k');
+  const std::string member = "100" + std::string(128, 'm');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(ZSetSeed(key)).text_, "256");
+    client.Durable();
+  }
+  {
+    Server server(disk, 1, {}, key);
+    Client client(server.port());
+    auto failed = client.Command({"ZINCRBY", key, "0.25", member});
+    ASSERT_EQ(failed.kind_, '-') << failed.text_;
+    ASSERT_TRUE(failed.text_.starts_with("OOM")) << failed.text_;
+    // The second auxiliary fails after the first has encoded. EXEC reuses
+    // that private tail in the transaction stream for a different long key;
+    // a leaked reference at its offset would make key verification miss it.
+    ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(client.Command({"SET", healthy, "yes"}).text_, "QUEUED");
+    const auto executed = client.Command({"EXEC"});
+    ASSERT_EQ(executed.items_.size(), 1);
+    ASSERT_EQ(executed.items_[0].text_, "OK");
+    EXPECT_EQ(client.Command({"GET", healthy}).text_, "yes");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member}).text_, "100");
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_, "256");
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"GET", healthy}).text_, "yes");
+  EXPECT_EQ(client.Command({"ZSCORE", key, member}).text_, "100");
+  EXPECT_EQ(client.Command({"ZCARD", key}).text_, "256");
+  EXPECT_EQ(client.Command({"ZINCRBY", key, "0.25", member}).text_, "100.25");
+}
+
 TEST(GroupedSortedSetWriteE2e, PublicationRevisionsHaveIndependentDecisions) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP()

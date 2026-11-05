@@ -3659,22 +3659,6 @@ acquire_active_stream:
         });
     if (!encoded.ok()) co_return encoded;
   }
-  // Admit exceptional reference-directory allocations before publishing any
-  // staging bytes. Ordinary keys do not touch these maps. A later header
-  // encoding failure retains conservative dependencies until the containing
-  // allocation is retired; inline producer failures above own no such entry.
-  if (indirect_key) {
-    store
-        .indirect_key_references_[{updated.block_id_,
-                                   updated.allocation_epoch_}]
-        .emplace(record_offset, indirect_key);
-  }
-  if (request.indirect_key_record_) {
-    IndirectKeyId id;
-    std::memcpy(id.data(), request.key_.data(), sizeof(id));
-    store.indirect_key_records_[{updated.block_id_, updated.allocation_epoch_}]
-        .emplace_back(id, record_offset);
-  }
   // WATCH invalidation belongs to the same linearization cut as publication:
   // rejected authority checks must not invalidate it, while an observer must
   // never see the new index value before the watch fingerprint changes.
@@ -3807,11 +3791,6 @@ acquire_active_stream:
       std::fill_n(staging.data_ + offset + header_bytes + output.size(),
                   page.disk_bytes_ - header_bytes - output.size(),
                   std::byte{0});
-      if (indirect_key)
-        store
-            .indirect_key_references_[{updated.block_id_,
-                                       updated.allocation_epoch_}]
-            .emplace(offset, indirect_key);
     }
   }
   if (!EncodeRecordHeader(record, request.key_, record_output)) {
@@ -3819,6 +3798,27 @@ acquire_active_stream:
                            "record checksum encoding failed");
   }
   value_process.End();
+
+  // Register physical key dependencies only after every payload and header
+  // has encoded. A failed prepared batch leaves this tail reusable; even its
+  // root reference would otherwise outlive the failed append and make a later
+  // record at the same offset resolve to the wrong key. No recoverable failure
+  // or suspension remains before publishing the append boundary below.
+  if (indirect_key) {
+    auto& references = store.indirect_key_references_[{
+        updated.block_id_, updated.allocation_epoch_}];
+    references.emplace(record_offset, indirect_key);
+    if (batch) {
+      for (const auto& page : batch->records_)
+        references.emplace(page.location_.record_offset(), indirect_key);
+    }
+  }
+  if (request.indirect_key_record_) {
+    IndirectKeyId id;
+    std::memcpy(id.data(), request.key_.data(), sizeof(id));
+    store.indirect_key_records_[{updated.block_id_, updated.allocation_epoch_}]
+        .emplace_back(id, record_offset);
+  }
 
   grouped_root_guard.armed_ = grouped_root || previous_grouped != nullptr;
 
