@@ -1133,6 +1133,18 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
   if (!view.ok()) co_return view.status();
   auto object = std::move(*view);
   if (!object || !object->has_member_index()) co_return std::nullopt;
+  if (operation.kind_ == SortedSetOperationKind::kLength) {
+    // Publication replaces the resident root without yielding. IS excludes
+    // structural replacement; the store lock makes this metadata projection
+    // a complete logical read without taking any payload-group holds.
+    const auto readable = object->ReadStatus();
+    if (!readable.ok()) co_return readable;
+    SortedSetResult result;
+    result.key_exists_ = true;
+    result.length_ = object->ordered_directory().root().item_count_;
+    co_return std::optional(std::move(result));
+  }
+
   if (operation.members_.size() > SIZE_MAX / sizeof(GroupedRecordId)) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("Sorted Set lock plan overflow");

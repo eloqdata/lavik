@@ -267,7 +267,8 @@ identity order before capturing their common logical view. The holds span
 page IO and score decoding, while unrelated leaves may change. Representation
 or population changes trigger one whole-key S fallback after releasing every
 group hold. Compact and externally locked transaction paths retain their
-existing key protection.
+existing key protection. ZCARD uses IS and reads the atomically published
+resident cardinality without acquiring payload-group locks.
 
 ## Durable graph and publication
 

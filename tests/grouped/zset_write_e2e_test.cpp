@@ -1312,6 +1312,16 @@ TEST(GroupedSortedSetWriteE2e, MemberReadsLockOnlyRequestedLeaves) {
       std::this_thread::sleep_for(25ms);
     }
     ASSERT_TRUE(held) << server.Log();
+    auto cardinality = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZCARD", key});
+    });
+    // Keep the future alive only after arranging gate cleanup on failure.
+    const auto ready = cardinality.wait_for(3s);
+    if (ready != std::future_status::ready) ::unlink(gate.c_str());
+    ASSERT_EQ(ready, std::future_status::ready) << server.Log();
+    EXPECT_EQ(cardinality.get().text_, "1024");
+
     disjoint = std::async(std::launch::async, [&] {
       Client client(server.port());
       return pause_read ? client.Command({"ZINCRBY", key, "0.5", b})
