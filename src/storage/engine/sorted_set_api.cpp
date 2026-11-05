@@ -62,7 +62,10 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
                        operation.members_.size() == 1));
   const bool partial_read =
       operation.kind_ == SortedSetOperationKind::kScores ||
-      operation.kind_ == SortedSetOperationKind::kLength;
+      operation.kind_ == SortedSetOperationKind::kLength ||
+      operation.kind_ == SortedSetOperationKind::kRange ||
+      operation.kind_ == SortedSetOperationKind::kCount ||
+      operation.kind_ == SortedSetOperationKind::kRank;
   bool concurrent = false;
   if (point || partial_read) {
     auto& store = CurrentStore();

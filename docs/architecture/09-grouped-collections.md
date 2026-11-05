@@ -270,6 +270,15 @@ group hold. Compact and externally locked transaction paths retain their
 existing key protection. ZCARD uses IS and reads the atomically published
 resident cardinality without acquiring payload-group locks.
 
+Standalone range, rank and count projections use IS and acquire the required
+ordered-page S holds in identity order. Rank first protects its member leaf.
+After all holds are acquired, routing is checked again and a common immutable
+root supplies aggregate counts and bounds; selected payloads remain protected
+through reply construction. Unrelated groups may publish newer roots during
+IO. Complete score-page counts need no payload holds; lexical queries spanning
+mixed scores protect all ordered pages because there is no lexical directory.
+Ambiguous member boundaries or newly required pages use one whole-key S fallback.
+
 ## Durable graph and publication
 
 A small keyed root and auxiliary keyed group records preserve the user-visible

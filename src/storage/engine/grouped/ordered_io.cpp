@@ -173,7 +173,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id, bool pinned,
     GroupReadLimiter* limiter, SortedSetMemberValidation validation,
-    OnlineLatencyTrace* diagnostics) {
+    OnlineLatencyTrace* diagnostics, bool group_locked) {
   return LoadOrderedGroup<LoadedOrderedGroup>(
       store, partition, db_id, key, digest, std::move(object), page_id, pinned,
       [validation](std::string_view payload, std::uint64_t sequence,
@@ -189,7 +189,7 @@ StorageEngine::Impl::LoadOrderedGroupSnapshot(
         return LoadedOrderedGroup{.sequence_ = sequence,
                                   .snapshot_ = std::move(*decoded)};
       },
-      limiter, nullptr, diagnostics);
+      limiter, nullptr, diagnostics, group_locked);
 }
 
 Task<absl::StatusOr<LoadedOrderedGroup>>
@@ -252,7 +252,7 @@ StorageEngine::Impl::LoadSortedSetPage(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
     SortedSetMemberValidation validation, SortedSetPageReadMode mode,
-    OnlineLatencyTrace* diagnostics) {
+    OnlineLatencyTrace* diagnostics, bool group_locked) {
   return LoadOrderedGroup<LoadedSortedSetPage>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [validation, mode](
@@ -285,7 +285,7 @@ StorageEngine::Impl::LoadSortedSetPage(
         return LoadedSortedSetPage{std::move(loaded), std::move(*entries),
                                    std::nullopt};
       },
-      nullptr, nullptr, diagnostics);
+      nullptr, nullptr, diagnostics, group_locked);
 }
 
 absl::StatusOr<PackedSortedSetValues> StorageEngine::Impl::PackSortedSetPage(
@@ -318,7 +318,8 @@ StorageEngine::Impl::LoadPackedSortedSetPage(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::uint64_t page_id,
-    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics) {
+    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics,
+    bool group_locked) {
   return LoadOrderedGroup<PackedSortedSetValues>(
       store, partition, db_id, key, digest, std::move(object), page_id, false,
       [](std::string_view payload, std::uint64_t,
@@ -332,7 +333,7 @@ StorageEngine::Impl::LoadPackedSortedSetPage(
           return absl::DataLossError("ordered page score bounds mismatch");
         return PackSortedSetPage(*entries);
       },
-      limiter, nullptr, diagnostics);
+      limiter, nullptr, diagnostics, group_locked);
 }
 
 Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
