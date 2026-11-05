@@ -232,7 +232,9 @@ TEST(SortedSetPublicationTest, DisjointCountChangesMergeInEitherOrder) {
   }
 }
 
-TEST(SortedSetPublicationTest, ConflictingPagesAndRoutingNeighboursAbort) {
+#ifndef NDEBUG
+TEST(SortedSetPublicationDeathTest,
+     ConflictingPagesAndRoutingNeighboursViolateLockContract) {
   PublicationFixture f;
   auto page = f.Page(0);
   auto member = f.Member(0);
@@ -243,10 +245,14 @@ TEST(SortedSetPublicationTest, ConflictingPagesAndRoutingNeighboursAbort) {
     replacement.sequence_ = replacement.lsn_ = 11;
     auto current = f.directory.Apply(root, 11, std::span(&replacement, 1), 11);
     ASSERT_TRUE(current.ok()) << current.status();
-    const auto merged =
-        MergeSortedSetPublication(f.directory, *current, f.root,
-                                  std::span(&page, 1), std::span(&member, 1));
-    EXPECT_TRUE(absl::IsAborted(merged.status()));
+    EXPECT_DEATH(
+        {
+          const auto merged = MergeSortedSetPublication(
+              f.directory, *current, f.root, std::span(&page, 1),
+              std::span(&member, 1));
+          (void)merged;
+        },
+        "Sorted Set page or routing boundary changed while protected");
   }
   auto root = f.root;
   root.revision_ = root.member_index_->revision_ = 11;
@@ -254,11 +260,16 @@ TEST(SortedSetPublicationTest, ConflictingPagesAndRoutingNeighboursAbort) {
   leaf.sequence_ = leaf.lsn_ = 11;
   auto current = f.directory.Apply(root, 11, {}, 11, std::span(&leaf, 1));
   ASSERT_TRUE(current.ok()) << current.status();
-  EXPECT_TRUE(absl::IsAborted(
-      MergeSortedSetPublication(f.directory, *current, f.root,
-                                std::span(&page, 1), std::span(&member, 1))
-          .status()));
+  EXPECT_DEATH(
+      {
+        const auto merged = MergeSortedSetPublication(
+            f.directory, *current, f.root, std::span(&page, 1),
+            std::span(&member, 1));
+        (void)merged;
+      },
+      "Sorted Set member page changed while protected");
 }
+#endif
 
 TEST(SortedSetPublicationTest, StructuralPlansRequireWholeKeyProtection) {
   PublicationFixture f;

@@ -331,14 +331,15 @@ exclusive key protection through publication.
 Existing standalone Sorted Set updates that preserve page topology and fit
 all changed inline groups plus their root in one append range use a prepared
 batch. Page preparation and append capacity, index-reader and retirement-pin
-waits finish before publication order is assigned. At the final owner-local
-boundary, the writer checks affected member pages, ordered pages and their
-routing neighbours by logical revision, merges count changes into the current
-root, and retains the current predecessor decision. It then assigns revision
-and command sequence and stages both graphs and their root without yielding.
-Physical GC moves are allowed. A failed merge or encoding leaves the append
-boundary and logical graph unchanged. Replication and full-sync effects carry
-the sequence and cardinality of that final publication.
+waits finish before publication order is assigned. The caller refreshes its
+base after locking and protects affected member pages, ordered pages and their
+routing neighbours through publication, keeping their logical versions stable.
+At the final owner-local boundary, the writer merges count changes into the
+current root and retains the current predecessor decision. It then assigns
+revision and command sequence and stages both graphs and their root without
+yielding. Physical GC moves are allowed. A failed merge or encoding leaves the
+append boundary and logical graph unchanged. Replication and full-sync effects
+carry the sequence and cardinality of that final publication.
 
 Structural changes, demotion, external/oversized batches, replay and EXEC/Lua
 retain the multi-append path, with X ordering revisions across its resource

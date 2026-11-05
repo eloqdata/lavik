@@ -769,11 +769,13 @@ struct OrderedCollectionMutationPlan {
 };
 
 // Merge an existing Sorted Set's non-structural page replacements into the
-// latest directory. The caller protects affected member/ordered groups and
-// keeps the owner from yielding between this check and publication. Physical
-// relocation is allowed; changed logical pages and routing neighbours are not.
-// FailedPrecondition means the plan requires whole-key serialization; Aborted
-// means its base changed. The returned root has no publication revision yet.
+// latest directory. The caller refreshes the base after locking and protects
+// affected member/ordered groups and routing neighbours through publication.
+// Their logical versions must stay unchanged (asserted in Debug); physical
+// relocation is allowed. The owner must not yield between merge and
+// publication. FailedPrecondition means the plan requires whole-key
+// serialization; Aborted means the current root is incompatible with the base.
+// The returned root has no publication revision yet.
 absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
     const OrderedGroupDirectory& base, const OrderedGroupDirectory& current,
     const OrderedCollectionRoot& planned,

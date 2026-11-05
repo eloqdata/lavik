@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -1526,6 +1527,12 @@ absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
   if (!SameSortedSetTopology(current.root(), before) ||
       current.sequence() < base.sequence())
     return absl::AbortedError("Sorted Set topology changed during preparation");
+#ifndef NDEBUG
+  // The caller refreshes its base after taking key X or the required group
+  // locks, then protects changed pages and routing neighbours until
+  // publication. Their logical versions cannot change; GC may still move
+  // physical records. Keep these contract checks and their directory lookups
+  // out of Release.
   const auto unchanged = [&](std::uint64_t id) {
     if (id == 0) return true;
     const auto* a = base.Find(id);
@@ -1533,27 +1540,27 @@ absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
     return a && b && a->sequence_ == b->sequence_ &&
            a->previous_ == b->previous_ && a->next_ == b->next_;
   };
+#endif
   for (const auto& page : ordered) {
     const auto* old = base.Find(page.id_);
     if (!old || page.retired_ || page.incarnation_ != before.incarnation_ ||
         page.previous_ != old->previous_ || page.next_ != old->next_)
       return absl::FailedPreconditionError("Sorted Set page topology changed");
-    // Neighbours bound routing even if this command did not rewrite them.
-    // Reject their logical changes; comparing physical addresses would also
-    // reject harmless GC moves while page IO was outstanding.
-    if (!unchanged(page.id_) || !unchanged(page.previous_) ||
-        !unchanged(page.next_))
-      return absl::AbortedError("Sorted Set page or routing boundary changed");
+    assert(unchanged(page.id_) && unchanged(page.previous_) &&
+           unchanged(page.next_) &&
+           "Sorted Set page or routing boundary changed while protected");
   }
   for (const auto& page : members) {
     const auto* a = base.member_directory()->groups().Get(page.id_.prefix_);
-    const auto* b = current.member_directory()->groups().Get(page.id_.prefix_);
     if (!a || a->id_ != page.id_ || page.retired_ ||
         page.incarnation_ != before.incarnation_)
       return absl::FailedPreconditionError(
           "Sorted Set member topology changed");
-    if (!b || b->id_ != a->id_ || b->sequence_ != a->sequence_)
-      return absl::AbortedError("Sorted Set member page changed");
+#ifndef NDEBUG
+    const auto* b = current.member_directory()->groups().Get(page.id_.prefix_);
+    assert(b && b->id_ == a->id_ && b->sequence_ == a->sequence_ &&
+           "Sorted Set member page changed while protected");
+#endif
   }
   const absl::int128 count = absl::int128(current.root().item_count_) +
                              planned.item_count_ - before.item_count_;
