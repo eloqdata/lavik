@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -89,6 +90,22 @@ bool ValidRoot(const OrderedCollectionRoot& root) {
          root.first_group_ < root.next_group_id_ &&
          root.last_group_ < root.next_group_id_ &&
          ((root.group_count_ == 1) == (root.first_group_ == root.last_group_));
+}
+
+// The base comes from a validated directory. Counts and revisions can differ:
+// non-structural changes to disjoint pages must remain mergeable.
+bool SameSortedSetTopology(const OrderedCollectionRoot& root,
+                           const OrderedCollectionRoot& base) {
+  return root.kind_ == OrderedCollectionKind::kSortedSet &&
+         root.incarnation_ == base.incarnation_ &&
+         root.first_group_ == base.first_group_ &&
+         root.last_group_ == base.last_group_ &&
+         root.next_group_id_ == base.next_group_id_ &&
+         root.group_count_ == base.group_count_ && root.member_index_ &&
+         base.member_index_ &&
+         root.member_index_->incarnation_ == base.incarnation_ &&
+         root.member_index_->seed_ == base.member_index_->seed_ &&
+         root.member_index_->group_count_ == base.member_index_->group_count_;
 }
 
 bool EntryLess(const auto& left, const auto& right) noexcept {
@@ -1494,6 +1511,71 @@ absl::StatusOr<OrderedGroupDirectory> OrderedGroupDirectory::ApplyList(
   std::sort(count_changes.begin(), count_changes.end());
   auto status = result.ranks_.ApplyCounts(count_changes, root.item_count_);
   if (!status.ok()) return status;
+  return result;
+}
+
+absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
+    const OrderedGroupDirectory& base, const OrderedGroupDirectory& current,
+    const OrderedCollectionRoot& planned,
+    std::span<const OrderedGroupSnapshot> ordered,
+    std::span<const HashGroupSnapshot> members) {
+  const auto& before = base.root();
+  if (!SameSortedSetTopology(planned, before) || ordered.empty() ||
+      planned.item_count_ == 0 ||
+      planned.member_index_->field_count_ != planned.item_count_)
+    return absl::FailedPreconditionError("Sorted Set plan needs key X");
+  if (!SameSortedSetTopology(current.root(), before) ||
+      current.sequence() < base.sequence())
+    return absl::AbortedError("Sorted Set topology changed during preparation");
+#ifndef NDEBUG
+  // The caller refreshes its base after taking key X or the required group
+  // locks, then protects changed pages and routing neighbours until
+  // publication. Their logical versions cannot change; GC may still move
+  // physical records. Keep these contract checks and their directory lookups
+  // out of Release.
+  const auto unchanged = [&](std::uint64_t id) {
+    if (id == 0) return true;
+    const auto* a = base.Find(id);
+    const auto* b = current.Find(id);
+    return a && b && a->sequence_ == b->sequence_ &&
+           a->previous_ == b->previous_ && a->next_ == b->next_;
+  };
+#endif
+  for (const auto& page : ordered) {
+    const auto* old = base.Find(page.id_);
+    if (!old || page.retired_ || page.incarnation_ != before.incarnation_ ||
+        page.previous_ != old->previous_ || page.next_ != old->next_)
+      return absl::FailedPreconditionError("Sorted Set page topology changed");
+    assert(unchanged(page.id_) && unchanged(page.previous_) &&
+           unchanged(page.next_) &&
+           "Sorted Set page or routing boundary changed while protected");
+  }
+  for (const auto& page : members) {
+    const auto* a = base.member_directory()->groups().Get(page.id_.prefix_);
+    if (!a || a->id_ != page.id_ || page.retired_ ||
+        page.incarnation_ != before.incarnation_)
+      return absl::FailedPreconditionError(
+          "Sorted Set member topology changed");
+#ifndef NDEBUG
+    const auto* b = current.member_directory()->groups().Get(page.id_.prefix_);
+    assert(b && b->id_ == a->id_ && b->sequence_ == a->sequence_ &&
+           "Sorted Set member page changed while protected");
+#endif
+  }
+  const absl::int128 count = absl::int128(current.root().item_count_) +
+                             planned.item_count_ - before.item_count_;
+  if (count <= 0 || count > UINT32_MAX)
+    return absl::FailedPreconditionError("Sorted Set count needs key X");
+  auto result = current.root();
+  result.item_count_ = static_cast<std::uint64_t>(count);
+  result.revision_ = 0;
+  if (!members.empty()) {
+    result.member_index_->field_count_ = result.item_count_;
+    result.member_index_->revision_ = 0;
+  } else if (planned.item_count_ != before.item_count_) {
+    return absl::InvalidArgumentError(
+        "Sorted Set count changed without members");
+  }
   return result;
 }
 

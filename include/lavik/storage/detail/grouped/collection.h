@@ -768,6 +768,20 @@ struct OrderedCollectionMutationPlan {
   std::vector<OrderedGroupSnapshot> writes_;
 };
 
+// Merge an existing Sorted Set's non-structural page replacements into the
+// latest directory. The caller refreshes the base after locking and protects
+// affected member/ordered groups and routing neighbours through publication.
+// Their logical versions must stay unchanged (asserted in Debug); physical
+// relocation is allowed. The owner must not yield between merge and
+// publication. FailedPrecondition means the plan requires whole-key
+// serialization; Aborted means the current root is incompatible with the base.
+// The returned root has no publication revision yet.
+absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
+    const OrderedGroupDirectory& base, const OrderedGroupDirectory& current,
+    const OrderedCollectionRoot& planned,
+    std::span<const OrderedGroupSnapshot> ordered,
+    std::span<const HashGroupSnapshot> members);
+
 // Atomically replaces [rank, rank + erase_count) by entries. This is the
 // storage primitive for List push/pop/insert/remove and Sorted Set insertion,
 // deletion or score repositioning. The caller supplies all intersected pages

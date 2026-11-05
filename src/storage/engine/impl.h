@@ -2565,9 +2565,9 @@ class StorageEngine::Impl {
       std::uint64_t field_count);
   // Allocate separately from transaction/batch decisions after logical page
   // preparation. The same recovery-seeded counter supplies both namespaces,
-  // but a revision never doubles as a commit decision. Callers retain key X
-  // through staging/publication; store state alone cannot order publications
-  // across the remaining append/extent IO waits.
+  // but a revision never doubles as a commit decision. Prepared batches assign
+  // it after their resource waits and publish without yielding; ordinary
+  // multi-append/extent writers retain key X through the remaining waits.
   static std::uint64_t AllocateGroupedRevision() noexcept;
   // Caller retains exclusive key intent and store state. A prepared plan must
   // name the validated predecessor or a validated creation; commit assigns
@@ -2586,6 +2586,10 @@ class StorageEngine::Impl {
   // The plan contains complete changed ordered pages, not an append-only
   // mutation log. Null previous creates/promotes a collection; the adapter
   // assigns its fresh incarnation/revision before staging any auxiliary.
+  // Existing non-structural standalone ZSET plans use a bounded prepared batch;
+  // supplied member plans can merge disjoint changes into the current root.
+  // Command callers still retain key X; enabling IX also requires group holds
+  // through planning and a whole-key fallback for ineligible/stale plans.
   struct SortedSetMemberMutation;
   Task<absl::Status> CommitGroupedOrderedMutationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -4532,6 +4536,28 @@ class StorageEngine::Impl {
   // compete in its top-level RecordIndex or affect Redis key/expiry counts.
   // The caller owns their publication and retirement through the grouped
   // object view. All foreground auxiliaries require a transaction receipt.
+  // A bounded, existing-incarnation update stages all auxiliaries and its root
+  // in one append range. Encoders borrow command-owned pages until publication;
+  // nothing in this batch is durable or visible while append capacity waits.
+  struct PreparedGroupRecord {
+    GroupedRecordId id_;
+    std::uint64_t logical_size_ = 0;
+    InlineRecordPayload payload_;
+    std::size_t disk_bytes_ = 0;
+    RecordLocation location_;
+  };
+  struct PreparedGroupBatch {
+    std::vector<PreparedGroupRecord> records_;
+    std::size_t disk_bytes_ = 0;
+    std::uint64_t revision_ = 0;
+    std::uint64_t sequence_ = 0;
+    std::uint64_t logical_size_ = 0;
+    // Runs after the last resource wait, before index admission and encoding.
+    // Revalidates touched pages, merges into the current root, attaches its
+    // decision dependency and assigns publication order. May be retried before
+    // any bytes are staged; must not consume the encoders.
+    std::function<absl::Status()> prepare_;
+  };
   struct GroupRecordWrite {
     bool auxiliary_ = false;
     std::uint64_t incarnation_ = 0;
@@ -4553,6 +4579,7 @@ class StorageEngine::Impl {
     // A new incarnation replaces the complete prior graph, even when its
     // newly written ids happen to match a subset of the old directory.
     std::uint64_t root_incarnation_ = 0;
+    PreparedGroupBatch* batch_ = nullptr;
   };
 
   struct GroupMutationWrite {
@@ -4572,6 +4599,11 @@ class StorageEngine::Impl {
   Task<absl::Status> PrepareGroupedDependencyLocked(
       WorkerStore& store, const GroupedObject::Handle& object,
       TxShardWrites* successor);
+  // Owner-local dependency attachment without suspension. A pending remote
+  // coordinator needs the ordinary awaited path before publication begins.
+  absl::Status RetainGroupedDependency(WorkerStore& store,
+                                       const GroupedObject::Handle& object,
+                                       TxShardWrites* successor);
 
   Task<absl::Status> AwaitGroupedDependencyLocked(
       WorkerStore& store, const GroupedObject::Handle& object,

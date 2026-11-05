@@ -66,15 +66,32 @@ Task<absl::Status> StorageEngine::Impl::PrepareGroupedDependencyLocked(
     co_return co_await AwaitGroupedDependencyLocked(
         store, object, successor ? successor->txid_ : 0);
   }
+  co_return RetainGroupedDependency(store, object, successor);
+}
+
+absl::Status StorageEngine::Impl::RetainGroupedDependency(
+    WorkerStore& store, const GroupedObject::Handle& object,
+    TxShardWrites* successor) {
+  auto decision = object ? object->version().decision_ : nullptr;
+  if (!decision || (successor && decision->txid_ == successor->txid_))
+    return absl::OkStatus();
+  const auto state = decision->state_.load(std::memory_order_acquire);
+  if (state == GroupedCommitDecision::State::kDurable) return absl::OkStatus();
+  if (state == GroupedCommitDecision::State::kFailed || store.write_failed_)
+    return absl::FailedPreconditionError(
+        "prior grouped transaction did not commit");
+  if (decision->completion_owner_ != store.worker_->id())
+    return absl::AbortedError(
+        "grouped publication needs a remote decision wait");
   // A standalone predecessor enqueues without suspending before releasing its
   // key lock. It is therefore ahead of us in the same owner's commit queue.
   // Data/root staging is independent; only our later commit depends on it.
-  if (!successor) co_return absl::OkStatus();
+  if (!successor) return absl::OkStatus();
   if (!successor->grouped_predecessor_) {
     successor->grouped_predecessor_ = std::move(decision);
-    co_return absl::OkStatus();
+    return absl::OkStatus();
   }
-  if (successor->grouped_predecessor_ == decision) co_return absl::OkStatus();
+  if (successor->grouped_predecessor_ == decision) return absl::OkStatus();
   // Do not scan all earlier commands to deduplicate extra edges: a large
   // multi-key transaction would do quadratic work. Repeated edges are safe;
   // each terminal decision check is constant time during commit.
@@ -82,7 +99,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareGroupedDependencyLocked(
       AllocatorUsableSizeForRequest(sizeof(GroupedCommitDependency) + 1024));
   if (!admitted) {
     RecordMemoryRejection();
-    co_return MemoryLimitError("OOM retaining commit predecessors");
+    return MemoryLimitError("OOM retaining commit predecessors");
   }
   auto link = std::allocate_shared<GroupedCommitDependency>(
       RetainedAllocator<GroupedCommitDependency>(RetainedAllocationDomain{
@@ -92,7 +109,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareGroupedDependencyLocked(
   link->decision_ = std::move(decision);
   link->next_ = successor->grouped_dependencies_;
   successor->grouped_dependencies_ = std::move(link);
-  co_return absl::OkStatus();
+  return absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::AwaitGroupedDependencyLocked(
