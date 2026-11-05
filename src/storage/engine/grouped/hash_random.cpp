@@ -32,12 +32,18 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     const HashOperation& operation, GroupedObject::Handle object,
     ValueType value_type, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition, bool* retry_exclusive) {
   const bool pop = operation.kind_ == HashOperationKind::kPopRandom;
   if (!object || object->is_ordered() ||
       (pop && (value_type != ValueType::kSet || operation.count_ < 0 ||
                operation.with_values_)))
     co_return absl::InvalidArgumentError("invalid grouped random operation");
+  const auto needs_key_lock = [&] {
+    assert(retry_exclusive);
+    *retry_exclusive = true;
+    return absl::AbortedError("Hash sampling requires whole-key lock");
+  };
+  const auto observed = CaptureCompactWriteSnapshot(store, partition, db_id);
   HashResult result;
   result.key_exists_ = true;
   result.length_ = object->version().root_.logical_size_;
@@ -50,6 +56,8 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
                                                            : operation.count_);
   if (!repeat) requested = std::min(requested, result.length_);
   if (requested == 0 || result.length_ == 0) co_return result;
+  if (retry_exclusive && pop && requested == result.length_)
+    co_return needs_key_lock();
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
   if (requested > (max_size - 4096) / 256)
     co_return absl::ResourceExhaustedError("random sample count overflow");
@@ -103,6 +111,51 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
   if (base != result.length_ || cursor != samples.size())
     co_return absl::DataLossError("random sample directory count mismatch");
 
+  std::unique_ptr<GroupedLockTable::LockSet> holds;
+  if (retry_exclusive) {
+    assert(tx == nullptr);
+    if (!store.group_locks_)
+      store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
+    holds.reset(new GroupedLockTable::LockSet(store.group_locks_->MakeLockSet(
+        {db_id, tx::FingerprintOf(digest), object->incarnation()})));
+    std::vector<GroupedRecordId> ids;
+    ids.reserve(selected.size());
+    for (const auto& selection : selected) ids.push_back(selection.id_);
+    std::sort(ids.begin(), ids.end());
+    for (const auto id : ids) {
+      const auto locked = co_await holds->Acquire(
+          {GroupedLockIndex::kMember, id},
+          pop ? GroupedLockMode::kExclusive : GroupedLockMode::kShared);
+      if (!locked.ok()) co_return locked;
+    }
+    const auto current =
+        partition.grouped_objects_[db_id].CurrentForMutation(key);
+    // Ranks depend on counts in unselected leaves too. A logical publication
+    // during acquisition invalidates the draw; take one whole-key retry rather
+    // than repeatedly resampling under contention. Physical GC is harmless.
+    if (!current || !object->SameLogicalRoot(*current) ||
+        current->version().db_epoch_ != object->version().db_epoch_ ||
+        current->version().replication_epoch_ !=
+            object->version().replication_epoch_ ||
+        current->version().index_generation_ !=
+            object->version().index_generation_ ||
+        current->version().root_.expire_at_ms_ !=
+            object->version().root_.expire_at_ms_)
+      co_return needs_key_lock();
+    object = current;
+    LAVIK_FAULT_INJECT({
+      if (LAVIK_FAULT_MATCHES("LAVIK_HASH_SAMPLE_PAUSE_KEY", key)) {
+        for (const auto id : ids)
+          spdlog::info("hash sample group held prefix={} bits={}", id.prefix_,
+                       id.bits_);
+        spdlog::info("hash sample groups held before page IO pop={}", pop);
+        const auto paused = co_await fault_injection::PauseWhileFileExists(
+            "LAVIK_HASH_SAMPLE_PAUSE_FILE");
+        if (!paused.ok()) co_return paused;
+      }
+    });
+  }
+
   auto add_page = [&](GroupedScratchBudget* budget, GroupedRecordId id) {
     const auto* record = object->FindGroup(id);
     return record == nullptr
@@ -132,7 +185,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     if (!pop) {
       auto loaded = co_await LoadHashGroupPayload(
           store, partition, db_id, key, digest, object, selection.id_, false,
-          false, operation.diagnostics_);
+          retry_exclusive != nullptr, operation.diagnostics_);
       if (!loaded.ok()) co_return loaded.status();
       TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
       const auto bytes = loaded->loaded_.value();
@@ -153,7 +206,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     }
     auto loaded = co_await LoadHashGroupSnapshot(
         store, partition, db_id, key, digest, object, selection.id_, false,
-        nullptr, false, operation.diagnostics_);
+        nullptr, retry_exclusive != nullptr, operation.diagnostics_);
     if (!loaded.ok()) co_return loaded.status();
     TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
     auto& entries = loaded->snapshot_.value_.entries_;
@@ -190,6 +243,26 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
   result.length_ -= requested;
   result.key_exists_ = result.length_ != 0;
   result.changed_ = true;
+  std::optional<HashGroupMutationPlan> prepared;
+  std::optional<UnlockGuard> unlock;
+  if (retry_exclusive) {
+    auto plan = PrepareGroupedHashMutation(object, std::move(remaining),
+                                           changed, result.length_);
+    if (!plan.ok()) co_return plan.status();
+    prepared.emplace(std::move(*plan));
+    co_await store.store_state_mutex_.Lock();
+    unlock.emplace(&store.store_state_mutex_, store.worker_);
+    auto validated = object;
+    for (const auto id : changed) {
+      auto current = RefreshLockedGroup(partition, db_id, key, object, id);
+      if (!current.ok()) co_return current.status();
+      validated = std::move(*current);
+    }
+    const auto valid =
+        ValidateGroupedWriteSnapshot(store, partition, db_id, key, validated,
+                                     observed, mutation_precondition);
+    if (!valid.ok()) co_return valid;
+  }
   if (replication != nullptr) {
     // Replica replay must remove the selected members, never draw again.
     replication->args_.clear();
@@ -209,7 +282,8 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
         store, partition, db_id, key, digest, object, std::move(remaining),
         std::move(changed), result.length_, value_type,
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition, nullptr, nullptr, operation.diagnostics_);
+        mutation_precondition, prepared ? &*prepared : nullptr, retry_exclusive,
+        operation.diagnostics_);
   } else {
     auto detail = MakeSetTrace(operation.diagnostics_);
     status = co_await AppendLocked(

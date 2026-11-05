@@ -1009,15 +1009,14 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       !exists && !read_only && IsPointOperation(operation.kind_) &&
       operation.kind_ != HashOperationKind::kDelete &&
       CanPrepareCollectionCreateUnlocked(partition, tx);
-  // Point writers retain their key hold even inside EXEC/Lua. Random pops use
-  // a separate selection/publication adapter and retain its existing
-  // contract.
+  // Random pops acquire their own selected leaves when using IX. Externally
+  // locked pops retain their existing store-state contract.
   const bool unlocked_grouped_write =
       !read_only && grouped != nullptr &&
       operation.kind_ != HashOperationKind::kPopRandom &&
       CanPrepareGroupedWriteUnlocked(partition);
   if (read_only || unlocked_compact_write || unlocked_grouped_write ||
-      unlocked_create) {
+      unlocked_create || retry_exclusive) {
     found = nullptr;
     unlock.Unlock();
   }
@@ -1070,6 +1069,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
 
   LAVIK_FAULT_INJECT({
     if (retry_exclusive &&
+        operation.kind_ != HashOperationKind::kRandomFields &&
+        operation.kind_ != HashOperationKind::kPopRandom &&
         LAVIK_FAULT_MATCHES("LAVIK_HASH_GROUP_PAUSE_KEY", key) &&
         (operation.fields_.empty()
              ? std::getenv("LAVIK_HASH_GROUP_PAUSE_FIELD") == nullptr
@@ -1142,7 +1143,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
        operation.kind_ == HashOperationKind::kPopRandom)) {
     co_return co_await ExecuteGroupedHashRandomLocked(
         store, partition, db_id, key, digest, operation, std::move(grouped),
-        value_type, tx, replication, mutation_precondition);
+        value_type, tx, replication, mutation_precondition, retry_exclusive);
   }
   if (grouped != nullptr && (operation.kind_ == HashOperationKind::kScan ||
                              operation.kind_ == HashOperationKind::kReadPage)) {

@@ -2327,13 +2327,12 @@ endforeach()
     target_compile_definitions(lavik_grouped_hash_write_e2e_test PRIVATE
       LAVIK_TEST_FAULTS_AVAILABLE=$<OR:$<CONFIG:Debug>,$<BOOL:${LAVIK_ENABLE_TEST_FAULTS}>>
     )
-    add_test(
-      NAME lavik_grouped_hash_write_e2e
-      COMMAND lavik_grouped_hash_write_e2e_test $<TARGET_FILE:lavik>
-    )
-    # The complete crash/restart matrix can exceed four minutes in Debug.
-    set_tests_properties(lavik_grouped_hash_write_e2e PROPERTIES
-      TIMEOUT 600 RUN_SERIAL TRUE
+    # Keep new concurrency cases out of a growing aggregate restart budget.
+    # Like the ordered suite, discover every case for isolated CI scheduling.
+    gtest_discover_tests(lavik_grouped_hash_write_e2e_test
+      TEST_PREFIX lavik_grouped_hash_write_e2e.
+      EXTRA_ARGS $<TARGET_FILE:lavik>
+      PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE
     )
 
     add_executable(lavik_compact_collection_write_e2e_test
