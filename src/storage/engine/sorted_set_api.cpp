@@ -55,11 +55,9 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
   // lock-mode hint, not a retained pointer or a validated read. Key admission
   // closes/drains remote direct readers before IX is granted; the callee
   // checks the current representation again after every acquisition wait.
-  const bool point = operation.prepare_unlocked_ &&
-                     ((operation.kind_ == SortedSetOperationKind::kAdd &&
-                       operation.entries_.size() == 1) ||
-                      (operation.kind_ == SortedSetOperationKind::kRemove &&
-                       operation.members_.size() == 1));
+  const bool mutation = operation.prepare_unlocked_ &&
+                        (operation.kind_ == SortedSetOperationKind::kAdd ||
+                         operation.kind_ == SortedSetOperationKind::kRemove);
   const bool partial_read =
       operation.kind_ == SortedSetOperationKind::kScores ||
       operation.kind_ == SortedSetOperationKind::kLength ||
@@ -69,7 +67,7 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
       operation.kind_ == SortedSetOperationKind::kRandom ||
       operation.kind_ == SortedSetOperationKind::kScan;
   bool concurrent = false;
-  if (point || partial_read) {
+  if (mutation || partial_read) {
     auto& store = CurrentStore();
     auto& partition = PartitionForKey(store, key);
     const auto* found = partition.indexes_[db_id].Find(digest, key);
@@ -90,6 +88,12 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
     auto result = co_await [&]() {
       if (read_only)
         return TryConcurrentSortedSetRead(db_id, key, digest, operation);
+      const auto count = operation.kind_ == SortedSetOperationKind::kAdd
+                             ? operation.entries_.size()
+                             : operation.members_.size();
+      if (count != 1)
+        return TryConcurrentSortedSetBatch(db_id, key, digest, operation,
+                                           replication, mutation_precondition);
       return TryConcurrentSortedSetPoint(db_id, key, digest, operation,
                                          replication, mutation_precondition);
     }();

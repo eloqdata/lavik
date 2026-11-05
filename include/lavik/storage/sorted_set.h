@@ -111,8 +111,8 @@ struct SortedSetOperation {
   // Explicit permission from a single-key ZADD/ZREM/ZINCRBY caller to prepare
   // a new collection or small compact update without the store-state mutex.
   // New grouped values include preparation of both indexes. Standalone bounded
-  // grouped point writes may use IX and group holds; other writes retain X.
-  // Key protection and database admission remain owned through publication;
+  // grouped member writes may use IX and group holds; structural writes retain
+  // X. Key protection and database admission remain owned through publication;
   // storage independently checks physical eligibility and revalidates before
   // publishing or returning a no-op.
   // Internal/multi-key operations and GEOADD leave this disabled.

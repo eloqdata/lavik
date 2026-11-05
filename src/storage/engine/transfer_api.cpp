@@ -463,7 +463,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
       } else {
         auto loaded = co_await engine->LoadHashGroupSnapshot(
             *source->store_, *source->partition_, source->db_id_, source->key_,
-            source->digest_, object, id, true, nullptr, source->diagnostics_);
+            source->digest_, object, id, true, nullptr, false,
+            source->diagnostics_);
         if (!loaded.ok()) co_return loaded.status();
         const auto count = loaded->snapshot_.value_.entries_.size();
         if (page.value_type_ == ValueType::kHash)

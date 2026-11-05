@@ -1569,6 +1569,100 @@ TEST(GroupedSortedSetWriteE2e, SamplingReadsLockOnlyTheirWindow) {
   }
 }
 
+TEST(GroupedSortedSetWriteE2e, BatchWritesOrderAllGroupsAndPublishAtomically) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic batch-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "batch-group-locks";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+  }
+  const auto layout = InspectZSetMembers(disk, key);
+  const auto a = DenseZSetMember(10), c = DenseZSetMember(11);
+  auto leaf_for = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (const auto& [id, leaf] : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture member route");
+  };
+  unsigned b_index = 900;
+  while (b_index < 1000 && (leaf_for(DenseZSetMember(b_index)) == leaf_for(a) ||
+                            leaf_for(DenseZSetMember(b_index)) == leaf_for(c)))
+    ++b_index;
+  ASSERT_LT(b_index, 1000);
+  const auto b = DenseZSetMember(b_index);
+  {
+    const std::string gate = disk.path() + ".batch-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment target("LAVIK_ZSET_GROUP_PAUSE_MEMBER", a.c_str());
+    ScopedEnvironment file("LAVIK_ZSET_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, disjoint, conflict, reader;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZADD", key, "CH", "10.25", a, "11.25", c});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("zset batch group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    disjoint = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZINCRBY", key, "0.5", b});
+    });
+    ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+    EXPECT_EQ(std::stod(disjoint.get().text_), b_index + 0.5);
+    // Opposite operand order still acquires identical groups in one global
+    // order. A waiting batch keeps earlier holds without an upgrade cycle.
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZREM", key, c, a, a});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    reader = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZMSCORE", key, c, a});
+    });
+    EXPECT_EQ(reader.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    EXPECT_EQ(first.get().text_, "2");
+    EXPECT_EQ(conflict.get().text_, "2");
+    const auto scores = reader.get();
+    ASSERT_EQ(scores.items_.size(), 2);
+    EXPECT_EQ(scores.items_[0].text_, "-1");
+    EXPECT_EQ(scores.items_[1].text_, "-1");
+    expected.erase(a);
+    expected.erase(c);
+    expected[b] += 0.5;
+    Client client(server.port());
+    ExpectDenseZSet(client, key, expected);
+    ASSERT_EQ(client.Command({"ZADD", key, "10", a, "11", c}).text_, "2");
+    expected[a] = 10;
+    expected[c] = 11;
+    Client watcher(server.port());
+    ASSERT_EQ(watcher.Command({"WATCH", key}).text_, "OK");
+    ASSERT_EQ(client.Command({"ZADD", key, "CH", "20", a, "10", a}).text_, "2");
+    ASSERT_EQ(watcher.Command({"MULTI"}).text_, "OK");
+    ASSERT_EQ(watcher.Command({"GET", "unused"}).text_, "QUEUED");
+    EXPECT_EQ(watcher.Command({"EXEC"}).text_, "-1");
+    ExpectDenseZSet(client, key, expected);
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
 TEST(GroupedSortedSetWriteE2e, ConcurrentPointCommandsPreserveBothIndexes) {
   PrivateDisk disk;
   const std::string key = "concurrent-point-stress";

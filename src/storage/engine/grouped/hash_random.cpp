@@ -153,7 +153,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     }
     auto loaded = co_await LoadHashGroupSnapshot(
         store, partition, db_id, key, digest, object, selection.id_, false,
-        nullptr, operation.diagnostics_);
+        nullptr, false, operation.diagnostics_);
     if (!loaded.ok()) co_return loaded.status();
     TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
     auto& entries = loaded->snapshot_.value_.entries_;

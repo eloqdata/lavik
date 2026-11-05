@@ -2639,6 +2639,8 @@ class StorageEngine::Impl {
   // Full-image writers derive changes from complete ordered before/after
   // pages. Typed writers may supply exact changes after checking old members
   // against both graphs and generating the ordered plan from those changes.
+  // group_locked requires IX and X on every changed member leaf, plus
+  // checked_changes; unchanged root publications are resolved per group.
   // Borrowed names must outlive this coroutine; the result owns all index
   // writes. Only touched prefix leaves are loaded and retained scratch is
   // admitted. A probe must belong to this exact immutable predecessor and
@@ -2650,7 +2652,7 @@ class StorageEngine::Impl {
       const OrderedCollectionMutationPlan& ordered, bool unlocked = false,
       std::optional<std::span<const SortedSetMemberChange>> checked_changes =
           std::nullopt,
-      SortedSetMemberProbe* probe = nullptr);
+      SortedSetMemberProbe* probe = nullptr, bool group_locked = false);
   Task<absl::Status> UpdateGroupedExpirationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -2712,6 +2714,16 @@ class StorageEngine::Impl {
   // Only bounded, topology-preserving single-member writes publish here.
   Task<absl::StatusOr<std::optional<SortedSetResult>>>
   TryConcurrentSortedSetPoint(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+
+  // Caller owns IX. Acquire all member X holds before routing ordered X/S
+  // holds; prepare both graphs privately, then publish once. Structural plans
+  // return nullopt only before any externally visible mutation.
+  Task<absl::StatusOr<std::optional<SortedSetResult>>>
+  TryConcurrentSortedSetBatch(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation,
       ReplicationCommandAppend* replication,
@@ -4311,7 +4323,7 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
-      GroupReadLimiter* limiter = nullptr,
+      GroupReadLimiter* limiter = nullptr, bool group_locked = false,
       OnlineLatencyTrace* diagnostics = nullptr);
   // Strict full materialization for mutation, import and legacy raw-value
   // consumers. Callers admit the decoded image; query replies instead consume
