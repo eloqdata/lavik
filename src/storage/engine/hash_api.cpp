@@ -202,10 +202,9 @@ StorageEngine::Impl::TryConcurrentHashLike(
   unlock.Unlock();
   const bool write = IsHashLikeWrite(operation);
   for (const auto id : groups) {
-    const auto locked = co_await holds.Acquire(
+    co_await holds.Acquire(
         {GroupedLockIndex::kMember, id},
         write ? GroupedLockMode::kExclusive : GroupedLockMode::kShared);
-    if (!locked.ok()) co_return locked;
   }
   // All leaves must be held before the adapter captures its common read view.
   // IS/IX excludes topology edits, but population replacement still needs the

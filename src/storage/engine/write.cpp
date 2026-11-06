@@ -2912,9 +2912,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   const bool grouped_root =
       request.group_ != nullptr && !request.group_->auxiliary_;
   auto* batch = grouped_root ? request.group_->batch_ : nullptr;
-  if (batch && (request.for_defrag_ || request.external_ || !request.tx_ ||
-                request.tx_->collect_undo_ || batch->records_.empty()))
-    co_return absl::InvalidArgumentError("invalid prepared group batch");
+  assert((!batch || (!request.for_defrag_ && !request.external_ &&
+                     request.tx_ && !request.tx_->collect_undo_ &&
+                     !batch->records_.empty() && batch->prepare_)) &&
+         "invalid prepared group batch");
   if (request.inline_payload_ != nullptr &&
       (request.external_ || !request.value_.empty() ||
        (!auxiliary &&
@@ -3628,8 +3629,9 @@ acquire_active_stream:
       // The physical root can move independently of every unchanged child,
       // including during a TTL-only write. Re-enter the pre-stage owner-hop
       // protocol instead of borrowing the new block's transaction identity.
-      if (batch)
-        co_return absl::InternalError("prepared root lost its dependency pin");
+      // Prepared batches checked this pin before prepare_ and cannot suspend
+      // afterwards, so losing it violates their publication contract.
+      assert(!batch && "prepared root lost its dependency pin");
       goto acquire_active_stream;
     }
     if (request.tx_ != nullptr) {
@@ -3650,9 +3652,8 @@ acquire_active_stream:
         // A physical-only relocation won during pinning/index resolution.
         // Nothing is staged yet; re-pin the new identity before re-entering
         // this non-suspending root publication section.
-        if (batch)
-          co_return absl::InternalError(
-              "prepared page lost its dependency pin");
+        // Prepared batches have already passed their final pin check.
+        assert(!batch && "prepared page lost its dependency pin");
         goto acquire_active_stream;
       }
     }
@@ -3860,9 +3861,12 @@ acquire_active_stream:
       auxiliary_header.expire_at_ms_ = 0;
       auxiliary_header.lsn_ = *page_lsn;
       auxiliary_header.payload_checksum_ = record.no_crc_ ? 0 : Crc32c(output);
-      if (!EncodeRecordHeader(auxiliary_header, request.key_,
-                              {staging.data_ + offset, header_bytes}))
-        co_return absl::InternalError("prepared group header encoding failed");
+      // The admitted batch fixes every header field and output bound. Encoding
+      // must still run in Release; rejection indicates a batch-builder bug.
+      [[maybe_unused]] const bool header_encoded =
+          EncodeRecordHeader(auxiliary_header, request.key_,
+                             {staging.data_ + offset, header_bytes});
+      assert(header_encoded && "prepared group header encoding failed");
       std::fill_n(staging.data_ + offset + header_bytes + output.size(),
                   page.disk_bytes_ - header_bytes - output.size(),
                   std::byte{0});

@@ -229,9 +229,9 @@ logical database, parent-key fingerprint, incarnation, graph and group identity.
 Callers retain parent-key protection and database admission for the entire
 lock-set lifetime, including group waits and IO. Each set acquires member groups
 before ordered groups and uses the total order of `GroupedRecordId` within each
-graph. Earlier holds remain
-owned while the next group waits; descending acquisitions and shared-to-exclusive
-upgrades fail without releasing existing holds. Callers revalidate routing after
+graph. Earlier holds remain owned while the next group waits. Descending
+acquisitions, shared-to-exclusive upgrades and simultaneous acquisitions on one
+set violate the caller's lock-order contract. Callers revalidate routing after
 waiting and release the set before replanning or acquiring a stronger key lock.
 
 Each group has its own FIFO. These queues are independent of the transaction

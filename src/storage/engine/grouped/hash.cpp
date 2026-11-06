@@ -1000,14 +1000,18 @@ absl::StatusOr<GroupedHashRoot> MergeHashPublication(
     if (!old || old->id_ != page.id_ || page.retired_ ||
         page.incarnation_ != before.incarnation_)
       return absl::FailedPreconditionError("Hash page topology needs key X");
+#ifndef NDEBUG
+    // The base was captured after taking X on this leaf (or the whole key).
+    // Only unrelated leaves may publish while its private plan is prepared.
     const auto* now = current.groups().Get(page.id_.prefix_);
-    if (!now || now->id_ != old->id_ || now->sequence_ != old->sequence_)
-      return absl::AbortedError("protected Hash page changed");
+    assert(now && now->id_ == old->id_ && now->sequence_ == old->sequence_ &&
+           "Hash page changed while protected");
+#endif
     delta += static_cast<absl::int128>(page.field_count()) - old->field_count_;
   }
-  if (static_cast<absl::int128>(before.field_count_) + delta !=
-      planned.field_count_)
-    return absl::InvalidArgumentError("Hash plan count disagrees with pages");
+  assert(static_cast<absl::int128>(before.field_count_) + delta ==
+             planned.field_count_ &&
+         "Hash plan count disagrees with pages");
   const auto count =
       static_cast<absl::int128>(current.root().field_count_) + delta;
   if (count <= 0 || count > UINT32_MAX)

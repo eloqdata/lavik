@@ -34,9 +34,8 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     std::optional<std::span<const SortedSetMemberChange>> checked_changes,
     SortedSetMemberProbe* probe, bool group_locked) {
   SortedSetMemberMutation result;
-  if (group_locked && !checked_changes)
-    co_return absl::InvalidArgumentError(
-        "group-locked member preparation requires checked changes");
+  assert((!group_locked || checked_changes.has_value()) &&
+         "group-locked member preparation requires checked changes");
   SortedSetPageWorkBudget page_work;
   if (ordered.root_.kind_ != OrderedCollectionKind::kSortedSet)
     co_return result;

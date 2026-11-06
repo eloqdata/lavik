@@ -123,10 +123,9 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     for (const auto& selection : selected) ids.push_back(selection.id_);
     std::sort(ids.begin(), ids.end());
     for (const auto id : ids) {
-      const auto locked = co_await holds->Acquire(
+      co_await holds->Acquire(
           {GroupedLockIndex::kMember, id},
           pop ? GroupedLockMode::kExclusive : GroupedLockMode::kShared);
-      if (!locked.ok()) co_return locked;
     }
     const auto current =
         partition.grouped_objects_[db_id].CurrentForMutation(key);

@@ -379,6 +379,8 @@ struct HashGroupMutationPlan {
 // Merge topology-preserving leaf replacements into the latest root. The caller
 // holds parent IX and X on every changed leaf, or parent X. Unrelated leaves
 // may publish while pages are prepared; their counts and revisions survive.
+// The base is captured after locking. Protected leaf versions and the plan's
+// own count delta must agree.
 // Structural edits and deletion of the final field require whole-key X.
 // The returned root has no revision; assign one at the publication boundary.
 absl::StatusOr<GroupedHashRoot> MergeHashPublication(

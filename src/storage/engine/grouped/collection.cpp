@@ -1521,9 +1521,10 @@ absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
     std::span<const HashGroupSnapshot> members) {
   const auto& before = base.root();
   if (!SameSortedSetTopology(planned, before) || ordered.empty() ||
-      planned.item_count_ == 0 ||
-      planned.member_index_->field_count_ != planned.item_count_)
+      planned.item_count_ == 0)
     return absl::FailedPreconditionError("Sorted Set plan needs key X");
+  assert(planned.member_index_->field_count_ == planned.item_count_ &&
+         "Sorted Set plan counts disagree between indexes");
   if (!SameSortedSetTopology(current.root(), before) ||
       current.sequence() < base.sequence())
     return absl::AbortedError("Sorted Set topology changed during preparation");
@@ -1572,9 +1573,9 @@ absl::StatusOr<OrderedCollectionRoot> MergeSortedSetPublication(
   if (!members.empty()) {
     result.member_index_->field_count_ = result.item_count_;
     result.member_index_->revision_ = 0;
-  } else if (planned.item_count_ != before.item_count_) {
-    return absl::InvalidArgumentError(
-        "Sorted Set count changed without members");
+  } else {
+    assert(planned.item_count_ == before.item_count_ &&
+           "Sorted Set count changed without members");
   }
   return result;
 }

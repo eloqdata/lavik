@@ -147,8 +147,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     *retry_exclusive = true;
     return absl::AbortedError("Hash plan requires key X");
   };
-  if (prepared_publication && (!previous || !prepared || tx))
-    co_return needs_x();
+  assert((!prepared_publication || (previous && prepared && !tx)) &&
+         "group-locked publication requires a prepared standalone update");
   if (!diagnostics && tx) diagnostics = tx->diagnostics_;
   if (field_count == 0 ||
       field_count > std::numeric_limits<std::uint32_t>::max() ||
@@ -165,12 +165,15 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                                                changed_groups, field_count);
   if (!plan.ok()) co_return plan.status();
   if (prepared != nullptr) {
-    if (plan->root_.field_count_ != field_count ||
-        (previous
-             ? (plan->expected_sequence_ != previous->directory().sequence() ||
-                plan->root_.incarnation_ != previous->incarnation())
-             : plan->expected_sequence_ != 0))
-      co_return absl::AbortedError("prepared Hash mutation is stale");
+    // This compares two command-owned inputs, not the live root that may
+    // change during IO. The caller must pass the predecessor it planned from.
+    assert(plan->root_.field_count_ == field_count &&
+           "prepared Hash mutation count disagrees with the command");
+    assert((previous ? (plan->expected_sequence_ ==
+                            previous->directory().sequence() &&
+                        plan->root_.incarnation_ == previous->incarnation())
+                     : plan->expected_sequence_ == 0) &&
+           "prepared Hash mutation has the wrong predecessor");
   }
   const auto planned_root = plan->root_;
   if (prepared_publication &&
@@ -602,8 +605,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       if (!encoded.ok()) return encoded.status();
       // AppendLocked retains a view of this fixed-width allocation across
       // resource waits. Update its bytes without invalidating that view.
-      if (encoded->size() != root_payload->size())
-        return absl::InternalError("Hash root encoded size changed");
+      assert(encoded->size() == root_payload->size() &&
+             "Hash root encoded size changed");
       std::memcpy(root_payload->data(), encoded->data(), encoded->size());
       plan->root_ = *merged;
       prepared_batch.revision_ = revision;
