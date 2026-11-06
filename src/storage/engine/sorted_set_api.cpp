@@ -35,6 +35,11 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::ExecuteSortedSetLocked(
                                        replication, mutation_precondition);
 }
 
+/// Executes a standalone operation on its owner worker and owns key admission.
+/// Eligible grouped operations try IS/IX using a revalidated state hint. A
+/// declined plan has released its groups before this caller drops the intent
+/// and acquires whole-key S/X once; operation errors propagate without retry.
+/// All borrowed inputs must outlive the coroutine, including its lock/IO waits.
 Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
     std::uint8_t db_id, std::string_view key,
     const SortedSetOperation& operation, ReplicationCommandAppend* replication,
@@ -55,8 +60,9 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
                        operation.entries_.size() == 1) ||
                       (operation.kind_ == SortedSetOperationKind::kRemove &&
                        operation.members_.size() == 1));
+  const bool partial_read = operation.kind_ == SortedSetOperationKind::kScores;
   bool concurrent = false;
-  if (point) {
+  if (point || partial_read) {
     auto& store = CurrentStore();
     auto& partition = PartitionForKey(store, key);
     const auto* found = partition.indexes_[db_id].Find(digest, key);
@@ -67,22 +73,28 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
   TraceSpanScope key_wait(operation.diagnostics_, TraceStage::kKeyLock);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
-      read_only    ? tx::LockMode::kShared
-      : concurrent ? tx::LockMode::kIntentExclusive
-                   : tx::LockMode::kExclusive,
+      concurrent && read_only ? tx::LockMode::kIntentShared
+      : read_only             ? tx::LockMode::kShared
+      : concurrent            ? tx::LockMode::kIntentExclusive
+                              : tx::LockMode::kExclusive,
       lavik::storage::RedisSlot(key));
   key_wait.End();
   if (concurrent) {
-    auto result = co_await TryConcurrentSortedSetPoint(
-        db_id, key, digest, operation, replication, mutation_precondition);
+    auto result = co_await [&]() {
+      if (read_only)
+        return TryConcurrentSortedSetRead(db_id, key, digest, operation);
+      return TryConcurrentSortedSetPoint(db_id, key, digest, operation,
+                                         replication, mutation_precondition);
+    }();
     if (!result.ok()) co_return result.status();
     if (*result) co_return std::move(**result);
-    // The nested task has destroyed every group hold. Never upgrade IX in
-    // place: another IX holder can be waiting for one of those groups.
+    // The nested task has destroyed every group hold. Never strengthen an
+    // intent in place: another intent holder can be waiting for those groups.
     key_lock.Reset();
     TraceSpanScope fallback_wait(operation.diagnostics_, TraceStage::kKeyLock);
     key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive,
+        db_id, tx::FingerprintOf(digest),
+        read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive,
         lavik::storage::RedisSlot(key));
   }
   co_return co_await ExecuteSortedSetLocked(db_id, key, digest, operation,

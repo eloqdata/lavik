@@ -1102,6 +1102,118 @@ absl::StatusOr<SortedSetResult> ReadCompactSortedSet(
   return result;
 }
 
+/// Attempts a grouped read on the owner worker while the caller retains key IS.
+/// Member-score projections acquire leaf S holds in identity order before
+/// capturing a common view and retain them through waits and IO. Store state is
+/// released before group waits. A disengaged result requests one whole-key S
+/// attempt after the caller drops IS; error results propagate without retry.
+/// Every exit releases the group holds and admission owned by this coroutine.
+Task<absl::StatusOr<std::optional<SortedSetResult>>>
+StorageEngine::Impl::TryConcurrentSortedSetRead(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation) {
+  const auto valid = Validate(operation);
+  if (!valid.ok()) co_return valid;
+  auto& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto now = operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis();
+  if (!found || !found->key_complete() || !found->value_.grouped() ||
+      found->value_.value_type() != ValueType::kSortedSet ||
+      IsExpired(*found, now))
+    co_return std::nullopt;
+  auto view = partition.grouped_objects_[db_id].Lookup(
+      key, GroupedObjectVersion{
+               .root_ = MaterializeIndexLocation(*found),
+               .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+               .replication_epoch_ = partition.replication_epoch_,
+               .index_generation_ = partition.grouped_generations_[db_id]});
+  if (!view.ok()) co_return view.status();
+  auto object = std::move(*view);
+  if (!object || !object->has_member_index()) co_return std::nullopt;
+  if (operation.members_.size() > SIZE_MAX / sizeof(GroupedRecordId)) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError("Sorted Set lock plan overflow");
+  }
+  auto admission =
+      TryReserveMemory(operation.members_.size() * sizeof(GroupedRecordId));
+  if (!admission) {
+    RecordMemoryRejection();
+    co_return MemoryLimitError("OOM Sorted Set group read plan");
+  }
+  std::vector<GroupedRecordId> groups;
+  groups.reserve(operation.members_.size());
+  // Before InitMemoryLimit, a successful reservation is unmetered and carries
+  // zero bytes. Only a metered reservation bounds the allocated capacity.
+  if (admission->bytes() &&
+      groups.capacity() > admission->bytes() / sizeof(GroupedRecordId)) {
+    RecordMemoryRejection();
+    co_return MemoryLimitError("OOM Sorted Set group read plan");
+  }
+  for (const auto member : operation.members_) {
+    const auto* route = object->directory().Find(member);
+    if (!route) co_return absl::DataLossError("missing member prefix route");
+    groups.push_back(route->id_);
+  }
+  std::sort(groups.begin(), groups.end());
+  groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+  if (!store.group_locks_)
+    store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
+  auto holds = store.group_locks_->MakeLockSet(
+      {db_id, tx::FingerprintOf(digest), object->incarnation()});
+  unlock.Unlock();
+  for (const auto id : groups) {
+    const auto locked = co_await holds.Acquire({GroupedLockIndex::kMember, id},
+                                               GroupedLockMode::kShared);
+    if (!locked.ok()) co_return locked;
+  }
+  // Acquiring a later group can yield to writers. Capture the common logical
+  // cut only after all holds exist; never combine scores read before and after
+  // a conflicting multi-member mutation. Unrelated leaves may keep changing.
+  const auto current =
+      partition.grouped_objects_[db_id].CurrentForMutation(key);
+  if (!current || current->incarnation() != object->incarnation() ||
+      current->version().db_epoch_ != object->version().db_epoch_ ||
+      current->version().replication_epoch_ !=
+          object->version().replication_epoch_ ||
+      current->version().index_generation_ !=
+          object->version().index_generation_)
+    co_return std::nullopt;
+  for (const auto member : operation.members_) {
+    const auto* route = current->directory().Find(member);
+    if (!route || !std::binary_search(groups.begin(), groups.end(), route->id_))
+      co_return std::nullopt;
+  }
+  const auto readable = current->ReadStatus();
+  if (!readable.ok()) co_return readable;
+  const auto expires = current->version().root_.expire_at_ms_;
+  if (expires &&
+      expires <= (operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis()))
+    co_return std::nullopt;
+  LAVIK_FAULT_INJECT({
+    if (LAVIK_FAULT_MATCHES("LAVIK_ZSET_READ_PAUSE_KEY", key)) {
+      spdlog::info("zset member read locks held before page IO");
+      const auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_ZSET_READ_PAUSE_FILE");
+      if (!paused.ok()) co_return paused;
+    }
+  });
+  auto read = co_await ReadGroupedSortedSetScores(
+      store, partition, db_id, key, digest, operation, current, true);
+  if (!read.ok()) {
+    if (EffectiveRecordDbEpoch(partition, db_id) !=
+            current->version().db_epoch_ ||
+        partition.replication_epoch_ != current->version().replication_epoch_ ||
+        partition.grouped_generations_[db_id] !=
+            current->version().index_generation_)
+      co_return std::nullopt;
+    co_return read.status();
+  }
+  co_return std::optional(std::move(*read));
+}
+
 Task<absl::StatusOr<std::optional<SortedSetResult>>>
 StorageEngine::Impl::TryConcurrentSortedSetPoint(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1558,11 +1670,18 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   co_return result;
 }
 
+/// Reads scores from a caller-protected view without acquiring key/group locks.
+/// The caller retains key S/X, or IS plus every requested member S when
+/// group_locked is true, through completion. Each checked leaf is decoded into
+/// owned scores before its read lease ends, preserving request order,
+/// duplicates and missing members. Admission, IO and validation failures return
+/// an error instead of a partial reply.
 Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ReadGroupedSortedSetScores(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const SortedSetOperation& operation, GroupedObject::Handle object) {
+    const SortedSetOperation& operation, GroupedObject::Handle object,
+    bool group_locked) {
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -1582,9 +1701,9 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
   if (fields.size() == 1) {
     const auto* route = object->directory().Find(fields.front());
     if (!route) co_return absl::DataLossError("missing member prefix route");
-    auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                              digest, object, route->id_, false,
-                                              operation.diagnostics_);
+    auto leaf = co_await LoadHashGroupPayload(
+        store, partition, db_id, key, digest, object, route->id_, false,
+        operation.diagnostics_, group_locked);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -1611,7 +1730,8 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
   }
   std::vector<HashFieldLookup> requests;
   requests.reserve(fields.size());
-  if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
+  if (scratch->bytes() &&
+      requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Sorted Set lookup plan");
   }
@@ -1638,7 +1758,7 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
       co_return absl::CancelledError("member read cancelled by shutdown");
     auto leaf = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, requests[begin].group_,
-        false, operation.diagnostics_);
+        false, operation.diagnostics_, group_locked);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
