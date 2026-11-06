@@ -28,7 +28,7 @@ class BatchReadAwaiter;
 // coroutine. A shared producer owns the DMA tag independently of this object.
 struct BatchReadOperation final : ReadFlightWaiter {
   void Complete(Worker& worker, int result, unsigned flags) override;
-  void ReceiveRead(Worker& worker, ReadResultBuffer buffer, int result,
+  void ReceiveRead(Worker& worker, ReadResultBuffer&& buffer, int result,
                    unsigned flags) override;
   void Finish(Worker& worker, int result);
   absl::Status Submit();
@@ -161,7 +161,7 @@ void BatchReadOperation::Complete(Worker& worker, int result, unsigned) {
   Finish(worker, result);
 }
 
-void BatchReadOperation::ReceiveRead(Worker& worker, ReadResultBuffer buffer,
+void BatchReadOperation::ReceiveRead(Worker& worker, ReadResultBuffer&& buffer,
                                      int result, unsigned) {
   result_buffer_ = std::move(buffer);
   Finish(worker, result);
@@ -569,7 +569,7 @@ void StorageEngine::RemoteReadAwaitable::TracedReadIo::Complete(
   OneShotIoAwaitable::Complete(worker, result, flags);
 }
 void StorageEngine::RemoteReadAwaitable::TracedReadIo::ReceiveRead(
-    bycorf::Worker& worker, ReadResultBuffer buffer, int result,
+    bycorf::Worker& worker, ReadResultBuffer&& buffer, int result,
     unsigned flags) {
   // This slot holds only ownership until await_resume independently validates
   // the record. No request inherits another request's success conclusion.
@@ -2419,7 +2419,7 @@ void StorageEngine::Impl::LoadValueAwaitable::Complete(bycorf::Worker& worker,
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::ReceiveRead(
-    bycorf::Worker& worker, ReadResultBuffer buffer, int bytes,
+    bycorf::Worker& worker, ReadResultBuffer&& buffer, int bytes,
     unsigned flags) {
   completed_buffer_ = std::move(buffer);
   FinishCompletion(worker, bytes, flags);

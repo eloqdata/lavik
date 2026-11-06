@@ -142,7 +142,7 @@ static_assert(sizeof(ReadBufferLease) == 32);
 class ReadResultBuffer {
  public:
   ReadResultBuffer() = default;
-  ReadResultBuffer(ReadBufferLease lease) noexcept;
+  ReadResultBuffer(ReadBufferLease&& lease) noexcept;
   ReadResultBuffer(const ReadResultBuffer&) = delete;
   ReadResultBuffer& operator=(const ReadResultBuffer&) = delete;
   ReadResultBuffer(ReadResultBuffer&& other) noexcept;

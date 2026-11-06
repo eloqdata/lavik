@@ -3861,7 +3861,7 @@ class StorageEngine::Impl {
     void PrepareLocal();
     ReadFlightKey FlightKey() const;
     void Joined();
-    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer buffer,
+    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer&& buffer,
                      int result, unsigned flags) override;
     void FinishCompletion(bycorf::Worker& worker, int result, unsigned flags);
     void FinishBufferWait();

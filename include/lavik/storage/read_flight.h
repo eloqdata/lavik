@@ -53,7 +53,10 @@ class ReadFlightWaiter : public bycorf::OneShotIoAwaitable {
   bool flight_attached() const noexcept { return flight_ != nullptr; }
 
  protected:
-  virtual void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer buffer,
+  // The callback consumes the offered handle synchronously. Borrowing its
+  // rvalue avoids another owner-carrier move/destructor at virtual dispatch;
+  // no reference to this stack argument may survive the callback.
+  virtual void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer&& buffer,
                            int result, unsigned flags) = 0;
   bool delivered_ = false;
 

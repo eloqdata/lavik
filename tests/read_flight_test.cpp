@@ -24,7 +24,7 @@ struct Waiter : ReadFlightWaiter {
   int result = 0;
   unsigned calls = 0;
   std::function<void()> on_receive;
-  void ReceiveRead(bycorf::Worker&, ReadResultBuffer value, int bytes,
+  void ReceiveRead(bycorf::Worker&, ReadResultBuffer&& value, int bytes,
                    unsigned) override {
     buffer = std::move(value);
     result = bytes;

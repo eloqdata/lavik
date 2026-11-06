@@ -564,7 +564,7 @@ class DiskValue {
   // Exclusive offsets describe an already framed RESP reply. Shared offsets
   // describe only immutable payload; network_parts supplies each sender's
   // header. Keeping the result handle avoids converting exclusive leases twice.
-  DiskValue(ReadResultBuffer buffer, std::size_t offset,
+  DiskValue(ReadResultBuffer&& buffer, std::size_t offset,
             std::size_t size) noexcept
       : lease_(std::move(buffer)),
         network_offset_(static_cast<std::uint32_t>(offset)),
@@ -2327,7 +2327,7 @@ class StorageEngine::RemoteReadAwaitable {
    private:
     friend class RemoteGetTestPeer;
     ReadFlightKey Key() const;
-    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer buffer,
+    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer&& buffer,
                      int result, unsigned flags) override;
     void FinishTrace();
     void Joined();
