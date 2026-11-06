@@ -1368,7 +1368,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         if (unlocked_grouped_write) co_await bycorf::Yield(*store.worker_);
         auto loaded = co_await LoadHashGroupSnapshot(
             store, partition, db_id, key, digest, grouped, id, false, nullptr,
-            operation.diagnostics_);
+            false, operation.diagnostics_);
         if (!loaded.ok()) {
           if (read_epoch_changed()) co_return HashResult{};
           co_return loaded.status();

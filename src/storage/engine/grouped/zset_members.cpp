@@ -32,8 +32,11 @@ StorageEngine::Impl::PrepareSortedSetMembers(
     GroupedObject::Handle previous,
     const OrderedCollectionMutationPlan& ordered, bool unlocked,
     std::optional<std::span<const SortedSetMemberChange>> checked_changes,
-    SortedSetMemberProbe* probe) {
+    SortedSetMemberProbe* probe, bool group_locked) {
   SortedSetMemberMutation result;
+  if (group_locked && !checked_changes)
+    co_return absl::InvalidArgumentError(
+        "group-locked member preparation requires checked changes");
   SortedSetPageWorkBudget page_work;
   if (ordered.root_.kind_ != OrderedCollectionKind::kSortedSet)
     co_return result;
@@ -98,6 +101,12 @@ StorageEngine::Impl::PrepareSortedSetMembers(
                        GroupedRecordId id) -> absl::Status {
     // Prior IO may have allowed physical relocation. Never use an old
     // manifest to admit the next read; the loader refreshes again before IO.
+    if (group_locked) {
+      auto current = RefreshLockedGroup(partition, db_id, key, previous, id);
+      if (!current.ok()) return current.status();
+      return budget.AddGroup(*(*current)->FindGroup(id),
+                             (*current)->ExtentsFor(id));
+    }
     const auto current =
         partition.grouped_objects_[db_id].CurrentForMutation(key);
     if (!current || !current->SameLogicalRoot(*previous) ||
@@ -338,8 +347,14 @@ StorageEngine::Impl::PrepareSortedSetMembers(
           if (LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_LEAF_READ_KEY",
                                   key)) co_return absl::
               UnavailableError("injected member-index leaf read failure"););
-      auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                   digest, previous, id);
+      LAVIK_FAULT_INJECT(
+          if (group_locked &&
+              LAVIK_FAULT_MATCHES("LAVIK_FAIL_ZSET_MEMBER_DECODE_KEY",
+                                  key)) co_return absl::
+              UnavailableError("injected member-index owned decode failure"););
+      auto loaded = co_await LoadHashGroupSnapshot(
+          store, partition, db_id, key, digest, previous, id, false, nullptr,
+          group_locked, nullptr);
       if (!loaded.ok()) co_return loaded.status();
       leaf = std::move(loaded->snapshot_);
     }

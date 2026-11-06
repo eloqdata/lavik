@@ -266,7 +266,8 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, GroupedRecordId id, bool pinned,
-    GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics) {
+    GroupReadLimiter* limiter, bool group_locked,
+    OnlineLatencyTrace* diagnostics) {
   return LoadHashGroup<LoadedHashGroup>(
       store, partition, db_id, key, digest, object, id, pinned,
       [object, id](std::string_view payload, std::uint64_t sequence,
@@ -286,7 +287,7 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
         return LoadedHashGroup{.sequence_ = sequence,
                                .snapshot_ = std::move(*decoded)};
       },
-      limiter, false, diagnostics);
+      limiter, group_locked, diagnostics);
 }
 
 Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
@@ -297,9 +298,9 @@ Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
   HashValue result;
   for (const auto& [prefix, metadata] : object->directory().groups()) {
-    auto loaded = co_await LoadHashGroupSnapshot(store, partition, db_id, key,
-                                                 digest, object, metadata.id_,
-                                                 pinned, nullptr, diagnostics);
+    auto loaded = co_await LoadHashGroupSnapshot(
+        store, partition, db_id, key, digest, object, metadata.id_, pinned,
+        nullptr, false, diagnostics);
     if (!loaded.ok()) co_return loaded.status();
     for (auto& field : loaded->snapshot_.value_.entries_)
       result.entries_.push_back(std::move(field));

@@ -243,10 +243,10 @@ Once a coroutine has entered the worker's ready queue, it must resume before
 its frame can be destroyed. Group lock state has no durable representation and
 does not allocate transaction IDs or revisions.
 
-Standalone single-member ZADD, ZREM and ZINCRBY inspect owner-local key state
+Standalone ZADD, ZREM and ZINCRBY inspect owner-local key state
 without suspension to choose IX for an existing grouped Sorted Set, then
 recheck its representation after acquisition. The worker lazily owns one group
-lock table. Writers acquire the member leaf exclusively, resolve source and
+lock table. Writers acquire all requested member leaves exclusively, resolve source and
 destination ordered pages, and acquire those pages exclusively and their
 immediate routing neighbours shared, in identity order. Routes are rechecked
 after waits. Group holds span page IO, private preparation and publication;
@@ -254,8 +254,8 @@ unrelated groups can perform IO concurrently. Page reads refresh physical
 coordinates and validate the protected group's revision instead of rejecting
 an unrelated root publication.
 
-Batch commands, EXEC/Lua, structural changes and ambiguous resident routing
-use whole-key X. An ineligible point plan releases every group hold and IX
+EXEC/Lua, structural changes and ambiguous resident routing
+use whole-key X. An ineligible mutation plan releases every group hold and IX
 before one X acquisition and replans from current state. It never upgrades
 while retaining groups or repeatedly retries IX. Whole-key S readers and X
 writers wait for active IX holders; the key queue fences later IX arrivals.
