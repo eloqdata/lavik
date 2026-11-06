@@ -103,7 +103,24 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
                             ? nullptr
                             : &replication_logs->emplace_back();
     const auto dirty = co_await bycorf::SubmitTo(
-        target, [this, target, replication]() -> std::optional<std::uint64_t> {
+        target,
+        [this, target, replication, &result]() -> std::optional<std::uint64_t> {
+          // SubmitTo serializes these observations on each state owner. Only
+          // this collector writes the result, and it awaits each callback.
+          const auto& store = CurrentStore();
+          if (store.read_flights_) {
+            const auto& local = store.read_flights_->stats();
+            auto& total = result.read_flights_;
+            total.leaders += local.leaders;
+            total.joins += local.joins;
+            total.cancellations += local.cancellations;
+            total.rejected += local.rejected;
+            total.table_full += local.table_full;
+            total.waiter_full += local.waiter_full;
+            total.shared_budget += local.shared_budget;
+            result.read_flights_pending_ += store.read_flights_->size();
+          }
+          result.shared_read_bytes_ += store.buffers_.shared_read_bytes();
           if (replication != nullptr) {
             const ReplicationLogInfo log = LocalReplicationLogInfo();
             *replication = StorageReplicationLogMetrics{

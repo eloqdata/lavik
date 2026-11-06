@@ -1618,10 +1618,9 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
   ReplyBuilder& builder = ctx.reply_builder_;
   auto enqueue_command_reply = [&](CommandReply reply) -> Task<absl::Status> {
     if (reply.disk_value_.valid()) {
-      const auto bytes = reply.disk_value_.network_bytes();
-      EnqueuePubSubReply(
-          session, std::string(reinterpret_cast<const char*>(bytes.data()),
-                               bytes.size()));
+      std::string encoded;
+      reply.disk_value_.AppendNetworkBytes(encoded);
+      EnqueuePubSubReply(session, std::move(encoded));
       co_return absl::OkStatus();
     }
     if (!reply.encoded_.empty()) {
@@ -2100,8 +2099,21 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         if (buffered.trace_)
           buffered.trace_.get()->send_ns_ = LatencyMonotonicNanos();
         TraceSpanScope send(buffered.trace_.get(), TraceStage::kSocketSend);
-        write_status = co_await ResponseWriteAwaiter(
-            stream.WriteAll(reply.disk_value_.network_bytes()));
+        if (!reply.disk_value_.shared()) {
+          write_status = co_await ResponseWriteAwaiter(
+              stream.WriteAll(reply.disk_value_.network_bytes()));
+        } else {
+          // These objects live in this coroutine across every partial write;
+          // none of the senders writes into the shared record or its margins.
+          std::array<std::byte, 32> header;
+          const auto parts = reply.disk_value_.network_parts(header);
+          std::array<iovec, 3> vectors;
+          for (unsigned i = 0; i < parts.size(); ++i)
+            vectors[i] = {const_cast<std::byte*>(parts[i].data()),
+                          parts[i].size()};
+          write_status =
+              co_await ResponseWriteAwaiter(stream.WriteAllV(vectors));
+        }
       }
     } else if (reply.continuation_) {
       if (!pending_replies.empty()) {

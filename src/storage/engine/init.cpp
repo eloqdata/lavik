@@ -2259,6 +2259,11 @@ void StorageEngine::Impl::FinalizeWorker(unsigned worker_id) noexcept {
   tx::CurrentTxShard().BindReadAdmission({});
   stores_[worker_id]->remote_reads_ready_.store(false,
                                                 std::memory_order_release);
+  // Bycorf has quiesced every backend and destroyed all request frames on all
+  // workers. No foreign result can now post another return to these objects.
+  auto& store = *stores_[worker_id];
+  if (store.read_flights_) store.read_flights_->FinalizeQuiesced();
+  store.buffers_.FinalizeReadSharing();
   if (abandon_worker_state_on_finalize_.load(std::memory_order_acquire)) {
     // Worker::Shutdown has already drained IO and closed io_uring/SPDK state,
     // and detached coroutine frames were destroyed before this callback. The

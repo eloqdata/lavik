@@ -769,9 +769,9 @@ bycorf::Task<EncodedCommandReply> RunStringLocked(
       CaptureReplicationCommand(request, {"SET", args[1], args[2]});
     if (!result->old_value_)
       co_return EncodeSemanticNull(request.resp_version_);
-    const auto bytes = result->old_value_->network_bytes();
-    co_return std::string(reinterpret_cast<const char*>(bytes.data()),
-                          bytes.size());
+    std::string encoded;
+    result->old_value_->AppendNetworkBytes(encoded);
+    co_return encoded;
   }
 
   std::int64_t first_integer = 0;

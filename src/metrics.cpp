@@ -715,7 +715,7 @@ std::array<CommandText, kCommandKindCount> g_command_text;
 std::array<WaitText, 2> g_wait_text;
 std::vector<std::string> g_worker_text;
 std::vector<std::string> g_worker_labels;
-std::array<std::string, 22> g_storage_diagnostic_text;
+std::array<std::string, 31> g_storage_diagnostic_text;
 void AppendStorageDiagnostics(
     const storage::StorageDiagnosticsSnapshot& diagnostics, MetricText* output);
 
@@ -793,6 +793,36 @@ void AppendStorageDiagnostics(
     output->append(prefix);
     AppendMetricText(output, value, "\n");
   };
+  const auto& flights = diagnostics.read_flights_;
+  append("read_flight_leaders_total", "counter",
+         "Remote compact producers admitted, including synchronous submission "
+         "rejection.",
+         flights.leaders);
+  append("read_flight_joins_total", "counter",
+         "Remote compact requests joining an in-flight physical read.",
+         flights.joins);
+  append("read_flight_cancellations_total", "counter",
+         "Waiters detached before physical completion.", flights.cancellations);
+  append("read_flight_rejections_total", "counter",
+         "Producer submissions synchronously rejected by the backend.",
+         flights.rejected);
+  append(
+      "read_flight_table_full_total", "counter",
+      "Producer admission attempts bypassed because the local table is full.",
+      flights.table_full);
+  append("read_flight_waiter_full_total", "counter",
+         "Join attempts bypassed because the producer's waiter limit is full.",
+         flights.waiter_full);
+  append("read_flight_shared_budget_total", "counter",
+         "Join attempts bypassed because shared-buffer admission failed.",
+         flights.shared_budget);
+  append("read_flights_pending", "gauge",
+         "Physical producers still present in worker-local registries.",
+         diagnostics.read_flights_pending_);
+  append("shared_read_bytes", "gauge",
+         "Reserved or retained shared read arena bytes, including framing, "
+         "until the final return.",
+         diagnostics.shared_read_bytes_);
   const auto& cleaner = diagnostics.tx_cleaner_;
   append("tx_backlog_bytes", "gauge",
          "Occupied record bytes in sealed unreclaimed Tx blocks summed across "

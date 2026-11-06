@@ -402,7 +402,13 @@ TEST_P(TcpStreamCloseTest, PendingReceiveDoesNotKeepPeerConnected) {
       ::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)),
       0);
   char byte;
-  const ssize_t received = ::recv(client, &byte, 1, 0);
+  // Retry an interrupted wait within the original deadline; only EOF proves
+  // that the peer observed close while the server's worker was still running.
+  ssize_t received;
+  do {
+    received = ::recv(client, &byte, 1, 0);
+  } while (received < 0 && errno == EINTR &&
+           std::chrono::steady_clock::now() < deadline);
   const int receive_errno = errno;
   EXPECT_EQ(received, 0) << "local close did not reach peer: "
                          << std::strerror(receive_errno);

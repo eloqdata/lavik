@@ -44,6 +44,7 @@
 #include "lavik/storage/detail/record_location.h"
 #include "lavik/storage/format.h"
 #include "lavik/storage/packed_values.h"
+#include "lavik/storage/read_flight.h"
 #include "lavik/storage/sorted_set.h"
 
 namespace bycorf {
@@ -300,6 +301,9 @@ struct StorageDiagnosticsSnapshot {
   TxCleanerTotals tx_cleaner_;
   TxCommitBatchTotals tx_commit_batches_;
   StorageDurabilityStats durability_;
+  ReadFlightStats read_flights_;
+  std::uint64_t read_flights_pending_ = 0;
+  std::uint64_t shared_read_bytes_ = 0;
   // Current nesting depth of explicit expiration pauses, not pause events.
   std::uint32_t expiration_pause_count_ = 0;
 };
@@ -518,8 +522,9 @@ struct ReplicationLogInfo {
 };
 
 // A value backed by a storage read buffer or a heap assembly output.
-// network_bytes() contains a complete RESP bulk-string frame and remains valid
-// until this move-only object is destroyed after the network send CQE.
+// Exclusive results retain a contiguous RESP frame. Shared results retain an
+// immutable payload and use per-send framing via network_parts(). Ownership
+// lasts through all partial writes and the final network send CQE.
 class DiskValue {
  public:
   DiskValue() = default;
@@ -544,13 +549,29 @@ class DiskValue {
 
   // Whether this object owns a read buffer and can be sent as a direct reply.
   bool valid() const noexcept { return lease_.valid(); }
+  bool shared() const noexcept { return lease_.shared(); }
 
+  // Exclusive offsets describe an already framed RESP reply. Shared offsets
+  // describe only immutable payload; network_parts supplies each sender's
+  // header. Keeping the result handle avoids converting exclusive leases twice.
+  DiskValue(ReadResultBuffer buffer, std::size_t offset,
+            std::size_t size) noexcept
+      : lease_(std::move(buffer)),
+        network_offset_(static_cast<std::uint32_t>(offset)),
+        network_size_(static_cast<std::uint32_t>(size)) {
+    assert(offset <= std::numeric_limits<std::uint32_t>::max());
+    assert(size <= std::numeric_limits<std::uint32_t>::max());
+  }
+
+  // Exclusive contiguous-frame fast path. Shared consumers use network_parts.
   std::span<const std::byte> network_bytes() const noexcept {
+    assert(!shared());
     auto bytes = lease_.bytes();
     return {bytes.data() + network_offset_, network_size_};
   }
 
   std::span<const std::byte> value_bytes() const noexcept {
+    if (shared()) return lease_.bytes().subspan(network_offset_, network_size_);
     const std::span<const std::byte> frame = network_bytes();
     assert(frame.size() >= 6 && frame.front() == std::byte{'$'});
     std::size_t value_offset = 1;
@@ -566,15 +587,22 @@ class DiskValue {
     return frame.subspan(value_offset, frame.size() - value_offset - 2);
   }
 
+  // The caller keeps header, these views, and this DiskValue alive until the
+  // entire vectored write finishes. Exclusive results return one nonempty span.
+  std::array<std::span<const std::byte>, 3> network_parts(
+      std::span<std::byte, 32> header) const noexcept;
+  // Aggregating consumers explicitly own a copy; direct GET never uses this.
+  void AppendNetworkBytes(std::string& output) const;
+
  private:
-  ReadBufferLease lease_;
+  ReadResultBuffer lease_;
   std::uint32_t network_offset_ = 0;
   std::uint32_t network_size_ = 0;
 };
 
-// The value span is recoverable from the RESP frame and has no hot-path
-// caller. Do not duplicate its offset and size in every direct GET result:
-// this object crosses several coroutine frames before the socket write.
+// The two offsets describe an exclusive frame or a shared payload. Keep this
+// move-only carrier small as it crosses GET's coroutine chain; framing a shared
+// reply uses storage in the send coroutine instead of enlarging every result.
 static_assert(sizeof(DiskValue) == 40);
 
 // One string lookup in a pre-locked, worker-local batch. BatchGetLocked keeps
@@ -963,7 +991,7 @@ struct CompactValueView {
 // An immutable compact payload whose buffer can outlive its physical block
 // pin. Moving it transfers the lease without copying the encoded collection.
 struct CompactReadValue {
-  ReadBufferLease lease_;
+  ReadResultBuffer lease_;
   std::uint32_t value_offset_ = 0;
   std::uint32_t value_bytes_ = 0;
   std::uint64_t logical_size_ = 0;
@@ -979,8 +1007,8 @@ struct CompactReadValue {
             .logical_size_ = logical_size_,
             .expire_at_ms_ = expire_at_ms_};
   }
-  // Adds RESP bulk framing in the same buffer and transfers its lease to the
-  // reply. Only String GET uses this; collections interpret view() instead.
+  // Exclusive results add in-buffer framing; shared results retain a const
+  // payload for segmented sending. Collections interpret view() instead.
   absl::StatusOr<DiskValue> IntoDiskValue() &&;
 };
 
@@ -2228,7 +2256,9 @@ class StorageEngine::RemoteReadAwaitable {
   RemoteReadAwaitable(const RemoteReadAwaitable&) = delete;
   RemoteReadAwaitable& operator=(const RemoteReadAwaitable&) = delete;
 
-  bool await_ready() const noexcept { return !io_.has_value(); }
+  bool await_ready() const noexcept {
+    return !io_.has_value() || io_->flight_completed();
+  }
   bool await_suspend(std::coroutine_handle<> awaiting) {
     return io_->await_suspend(awaiting);
   }
@@ -2243,6 +2273,8 @@ class StorageEngine::RemoteReadAwaitable {
     Impl* engine_ = nullptr;
     std::uint64_t block_id_ = 0;
     unsigned owner_ = 0;
+    bool owns_ = false;
+    void Reset();
     ~Pin();
   };
 
@@ -2269,22 +2301,34 @@ class StorageEngine::RemoteReadAwaitable {
   ReadBufferLease lease_;
   // Timestamp the actual CQE before the connection is scheduled again. This
   // completion keeps CQE time separate from subsequent coroutine scheduling.
-  class TracedReadIo : public bycorf::OneShotIoAwaitable {
+  class TracedReadIo : public ReadFlightWaiter {
    public:
-    TracedReadIo(bycorf::Worker& worker, bycorf::FixedFile file,
-                 bycorf::FixedBuffer buffer, std::uint64_t offset,
-                 bycorf::SizeIoAwaitable::Operation operation,
-                 ReadLatencyTrace* trace);
+    TracedReadIo(RemoteReadAwaitable& read, bycorf::Worker& worker,
+                 bycorf::FixedFile file, std::uint64_t offset,
+                 ReadFlightRegistry* registry);
+    // Admission can join before a payload buffer is acquired. Publishing a
+    // producer is deferred until await_suspend can submit without yielding.
+    bool TryJoin();
+    void SetBuffer();
     bool await_suspend(std::coroutine_handle<> awaiting);
     absl::StatusOr<std::size_t> await_resume();
     void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
 
    private:
+    friend class RemoteGetTestPeer;
+    ReadFlightKey Key() const;
+    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer buffer,
+                     int result, unsigned flags) override;
+    void FinishTrace();
+    void Joined();
+    RemoteReadAwaitable& read_;
+    ReadFlightRegistry* registry_;
+    std::size_t hash_ = 0;
     bycorf::Worker& worker_;
     bycorf::FixedFile file_;
-    bycorf::FixedBuffer buffer_;
+    bycorf::FixedBuffer buffer_{};
     std::uint64_t offset_;
-    bool fixed_;
+    bool fixed_ = false;
     ReadLatencyTrace* trace_;
   };
   ReadLatencyTrace* trace_;

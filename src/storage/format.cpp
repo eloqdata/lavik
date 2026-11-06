@@ -738,7 +738,9 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
     std::memcpy(output.data() + fixed_header_bytes, header.key_id_.data(),
                 sizeof(IndirectKeyId));
     encoded_bytes += sizeof(IndirectKeyId);
-  } else {
+  } else if (!key.empty()) {
+    // System records can carry a default-constructed empty key. Avoid passing
+    // its null data pointer to memcpy even when the requested length is zero.
     std::memcpy(output.data() + fixed_header_bytes, key.data(), key.size());
     encoded_bytes += key.size();
   }

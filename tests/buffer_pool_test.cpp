@@ -49,6 +49,15 @@
 #include "support/read_buffer_fault.h"
 
 namespace lavik::storage {
+class SharedReadBufferTestPeer {
+ public:
+  static std::uint64_t Ticket(const ReadResultBuffer& buffer) {
+    return buffer.return_ticket_ & ~ReadResultBuffer::kSharedBit;
+  }
+  static void Return(RegisteredBufferPool& pool, std::uint64_t ticket) {
+    pool.ReleaseSharedReadLocal(ticket);
+  }
+};
 namespace {
 
 class BufferPoolWaitService final : public bycorf::Service {
@@ -941,6 +950,141 @@ TEST_F(BufferPoolMemlockTest, DifferentSizeReadWaitersCannotBarge) {
   auto smaller = std::move(second).TakeResult();
   ASSERT_TRUE(smaller.ok());
   EXPECT_EQ(order, (std::vector<unsigned>{1, 2}));
+}
+
+TEST_F(BufferPoolMemlockTest, ImmutableResultPreservesExclusiveLeaseLayout) {
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto capacity = pool_->available_read_bytes();
+  for (bool output : {false, true}) {
+    auto lease = output ? pool_->AllocateReadOutputBuffer(1234)
+                        : pool_->TryAcquireReadBuffer(1234);
+    ASSERT_TRUE(lease.ok());
+    auto* address = lease->bytes().data();
+    const auto size = lease->bytes().size();
+    const auto token = lease->buffer_id();
+    const auto registered = lease->registered();
+    ReadResultBuffer result(std::move(*lease));
+    EXPECT_FALSE(lease->valid());
+    EXPECT_FALSE(result.shared());
+    EXPECT_EQ(result.bytes().data(), address);
+    EXPECT_EQ(result.exclusive_bytes().data(), address);
+    auto restored = result.TakeExclusive();
+    EXPECT_FALSE(result.valid());
+    EXPECT_EQ(restored.bytes().data(), address);
+    EXPECT_EQ(restored.bytes().size(), size);
+    EXPECT_EQ(restored.buffer_id(), token);
+    EXPECT_EQ(restored.registered(), registered);
+    ReadResultBuffer direct_return(std::move(restored));
+    direct_return.Reset();
+    EXPECT_EQ(pool_->available_read_bytes(), capacity);
+    EXPECT_EQ(pool_->output_buffer_count(), 0);
+  }
+  EXPECT_EQ(pool_->available_read_bytes(), capacity);
+  EXPECT_EQ(pool_->output_buffer_count(), 0);
+}
+
+TEST_F(BufferPoolMemlockTest, SharedReadTicketsRetireOnlyOnOwnerAndFenceReuse) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0, 2));
+  const auto capacity = pool_->available_read_bytes();
+  auto lease = pool_->TryAcquireReadBuffer(4096);
+  ASSERT_TRUE(lease.ok());
+  auto* address = lease->bytes().data();
+  const auto bytes = lease->bytes().size();
+  auto reservation = pool_->TryReserveSharedRead(bytes);
+  ASSERT_TRUE(reservation.valid());
+  EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+  auto first = std::move(reservation).Publish(std::move(*lease));
+  EXPECT_TRUE(first.shared());
+  EXPECT_TRUE(first.exclusive_bytes().empty());
+  EXPECT_FALSE(first.TakeExclusive().valid());
+  auto second = first.CloneOnOwner();
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(second->bytes().data(), address);
+  const auto old_ticket = SharedReadBufferTestPeer::Ticket(*second);
+  second->Reset();
+  SharedReadBufferTestPeer::Return(*pool_, old_ticket);
+  auto replacement = first.CloneOnOwner();
+  ASSERT_TRUE(replacement.has_value());
+  EXPECT_NE(SharedReadBufferTestPeer::Ticket(*replacement), old_ticket);
+  SharedReadBufferTestPeer::Return(*pool_, old_ticket);
+  first.Reset();
+  EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+  bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+  EXPECT_FALSE(replacement->CloneOnOwner().has_value());
+  replacement->Reset();
+  bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+  EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (pool_->shared_read_bytes() &&
+         std::chrono::steady_clock::now() < deadline)
+    worker_->RunOnce(false);
+  ASSERT_EQ(pool_->shared_read_bytes(), 0);
+  EXPECT_EQ(pool_->available_read_bytes(), capacity);
+  lease = pool_->TryAcquireReadBuffer(4096);
+  ASSERT_TRUE(lease.ok());
+  reservation = pool_->TryReserveSharedRead(lease->bytes().size());
+  ASSERT_TRUE(reservation.valid());
+  auto reused = std::move(reservation).Publish(std::move(*lease));
+  EXPECT_NE(SharedReadBufferTestPeer::Ticket(reused) >> 15, old_ticket >> 15);
+  SharedReadBufferTestPeer::Return(*pool_, old_ticket);
+  EXPECT_EQ(pool_->shared_read_bytes(), bytes);
+  reused.Reset();
+  EXPECT_EQ(pool_->available_read_bytes(), capacity);
+}
+
+TEST_F(BufferPoolMemlockTest, SharedReadQuotaAndConsumerLimitAreBounded) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0));
+  const auto limit = pool_->read_capacity_bytes() / 4;
+  EXPECT_FALSE(pool_->TryReserveSharedRead(limit + 1).valid());
+  {
+    auto reservation = pool_->TryReserveSharedRead(limit);
+    ASSERT_TRUE(reservation.valid());
+    EXPECT_FALSE(pool_->TryReserveSharedRead(1).valid());
+  }
+  EXPECT_EQ(pool_->shared_read_bytes(), 0);
+  auto lease = pool_->TryAcquireReadBuffer(4096);
+  ASSERT_TRUE(lease.ok());
+  auto reservation = pool_->TryReserveSharedRead(lease->bytes().size());
+  ASSERT_TRUE(reservation.valid());
+  auto first = std::move(reservation).Publish(std::move(*lease));
+  for (unsigned i = 1; i < 32; ++i) {
+    auto consumer = first.CloneOnOwner();
+    ASSERT_TRUE(consumer.has_value());
+    consumer->Reset();
+  }
+  // Returned consumer numbers cannot be recycled within one generation.
+  EXPECT_FALSE(first.CloneOnOwner().has_value());
+  first.Reset();
+  EXPECT_EQ(pool_->shared_read_bytes(), 0);
+}
+
+TEST_F(BufferPoolMemlockTest, SharedReadShutdownReclaimsUndeliveredReturns) {
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  ASSERT_NO_FATAL_FAILURE(Init(0, 2));
+  const auto capacity = pool_->available_read_bytes();
+  auto lease = pool_->TryAcquireReadBuffer(4096);
+  ASSERT_TRUE(lease.ok());
+  auto reservation = pool_->TryReserveSharedRead(lease->bytes().size());
+  ASSERT_TRUE(reservation.valid());
+  auto first = std::move(reservation).Publish(std::move(*lease));
+  auto last = first.CloneOnOwner();
+  ASSERT_TRUE(last.has_value());
+  bycorf::SetThisWorker(1, cross_core_.get(), nullptr);
+  last->Reset();
+  bycorf::SetThisWorker(0, cross_core_.get(), worker_.get());
+  worker_->RequestStop();
+  worker_->Shutdown();
+  first.Reset();
+  EXPECT_GT(pool_->shared_read_bytes(), 0);
+  // Model the all-worker destruction barrier: all handles are gone, while a
+  // foreign return remains queued on a mailbox that will never run again.
+  pool_->FinalizeReadSharing();
+  EXPECT_EQ(pool_->shared_read_bytes(), 0);
+  EXPECT_EQ(pool_->available_read_bytes(), capacity);
+  pool_->FinalizeReadSharing();
 }
 
 TEST_F(BufferPoolMemlockTest, RemoteRangeReturnWaitsForItsOwner) {

@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -67,6 +68,8 @@ struct RegisteredBufferPoolOptions {
 };
 
 class RegisteredBufferPool;
+class ReadResultBuffer;
+class SharedReadReservation;
 
 // A read or assembly buffer remains owned by its storage worker. Moving it to a
 // connection worker only loans the memory; Reset()/destruction returns
@@ -108,6 +111,7 @@ class ReadBufferLease {
 
  private:
   friend class RegisteredBufferPool;
+  friend class ReadResultBuffer;
   ReadBufferLease(RegisteredBufferPool* pool, bycorf::FixedBuffer buffer,
                   std::size_t headroom_bytes, std::size_t tailroom_bytes,
                   std::uint32_t release_token) noexcept;
@@ -130,6 +134,76 @@ class ReadBufferLease {
 };
 
 static_assert(sizeof(ReadBufferLease) == 32);
+
+// Move-only result ownership. An exclusive result allows in-place framing or
+// recovery of its DMA lease; a shared result never exposes writable bytes.
+// Shared handles carry distinct return tickets. Only the buffer owner changes
+// their reference state; foreign destruction sends its ticket to that owner.
+class ReadResultBuffer {
+ public:
+  ReadResultBuffer() = default;
+  ReadResultBuffer(ReadBufferLease lease) noexcept;
+  ReadResultBuffer(const ReadResultBuffer&) = delete;
+  ReadResultBuffer& operator=(const ReadResultBuffer&) = delete;
+  ReadResultBuffer(ReadResultBuffer&& other) noexcept;
+  ReadResultBuffer& operator=(ReadResultBuffer&& other) noexcept;
+  ~ReadResultBuffer();
+
+  bool valid() const noexcept { return data_ != nullptr; }
+  bool shared() const noexcept { return (return_ticket_ & kSharedBit) != 0; }
+  std::span<const std::byte> bytes() const noexcept { return {data_, size_}; }
+  // Checked writable view for exclusive framing. Shared handles always return
+  // an empty span, including in release builds; ownership stays in this handle.
+  std::span<std::byte> exclusive_bytes() noexcept {
+    return shared()
+               ? std::span<std::byte>{}
+               : std::span<std::byte>{const_cast<std::byte*>(data_), size_};
+  }
+  const std::byte* io_data() const noexcept {
+    return data_ ? data_ + headroom_ : nullptr;
+  }
+  // Returns empty for a shared result, leaving that result untouched.
+  ReadBufferLease TakeExclusive() noexcept;
+  // Owner-only fanout of an already shared result, bounded to 32 consumers.
+  // Failure leaves the original reference intact; never call on a foreign core.
+  std::optional<ReadResultBuffer> CloneOnOwner() const noexcept;
+  void Reset() noexcept;
+
+ private:
+  friend class RegisteredBufferPool;
+  friend class SharedReadBufferTestPeer;
+  static constexpr std::uint64_t kSharedBit = std::uint64_t{1} << 63;
+  RegisteredBufferPool* pool_ = nullptr;
+  const std::byte* data_ = nullptr;
+  std::uint32_t size_ = 0;
+  std::uint32_t headroom_ = 0;
+  // Exclusive: the original 32-bit arena/output token. Shared: generation,
+  // slot and distinct consumer bit. No pointer tagging or union aliasing.
+  std::uint64_t return_ticket_ = 0;
+};
+
+static_assert(sizeof(ReadResultBuffer) == sizeof(ReadBufferLease));
+
+// Reserves shared retention capacity before admitting the first follower.
+// It owns metadata/budget, not the DMA target: the independent I/O producer
+// retains its exclusive lease until physical completion calls Publish().
+class SharedReadReservation {
+ public:
+  SharedReadReservation() = default;
+  SharedReadReservation(const SharedReadReservation&) = delete;
+  SharedReadReservation& operator=(const SharedReadReservation&) = delete;
+  SharedReadReservation(SharedReadReservation&& other) noexcept;
+  SharedReadReservation& operator=(SharedReadReservation&& other) noexcept;
+  ~SharedReadReservation();
+  bool valid() const noexcept { return pool_ != nullptr; }
+  ReadResultBuffer Publish(ReadBufferLease lease) && noexcept;
+  void Reset() noexcept;
+
+ private:
+  friend class RegisteredBufferPool;
+  RegisteredBufferPool* pool_ = nullptr;
+  std::uint64_t ticket_ = 0;
+};
 
 enum class MaintenanceReadKind { kDefrag, kTxCleaner, kTombRaider };
 
@@ -199,6 +273,11 @@ class RegisteredBufferPool {
     return available_read_bytes() / options_.read_slot_bytes_;
   }
   std::size_t read_capacity_bytes() const noexcept { return read_arena_.size_; }
+  // Sharing is restricted to one preferred read chunk, leaving large-record
+  // admission and streaming on their existing exclusive paths.
+  std::size_t preferred_read_payload_bytes() const noexcept {
+    return options_.read_payload_bytes();
+  }
   std::size_t available_read_bytes() const noexcept {
     return std::size_t{read_allocator_.free_units()} << read_unit_shift_;
   }
@@ -312,8 +391,55 @@ class RegisteredBufferPool {
   absl::StatusOr<ReadBufferLease> AllocateReadOutputBuffer(
       std::size_t minimum_payload_bytes);
 
+  // Optional sharing never waits or rejects the read. Budget includes framing
+  // and remains charged through the final return, including after map erasure.
+  // The payload is already charged to the fixed arena, so only metadata adds
+  // retained physical memory. Returns empty on quota/allocation/admission
+  // failure.
+  SharedReadReservation TryReserveSharedRead(std::size_t leased_bytes) noexcept;
+  std::size_t shared_read_bytes() const noexcept { return shared_read_bytes_; }
+  std::size_t shared_read_peak_bytes() const noexcept {
+    return shared_read_peak_bytes_;
+  }
+  // Only after backend quiescence AND the all-worker frame-reclamation barrier.
+  // Pending foreign tickets are no longer dispatched; reclaim all retained
+  // leases without waking destroyed arena waiters before destroying the pool.
+  void FinalizeReadSharing() noexcept;
+  // Same quiescence/barrier precondition, for an independent producer whose
+  // backend stopped without delivering a CQE. Never wakes arena waiters.
+  void ReclaimReadAfterQuiesce(ReadBufferLease lease) noexcept;
+
  private:
   friend class ReadBufferLease;
+  friend class ReadResultBuffer;
+  friend class SharedReadReservation;
+  friend class SharedReadBufferTestPeer;
+
+  static constexpr std::size_t kSharedReadSlots = 1024;
+  static constexpr std::uint64_t kSharedGenerationMax =
+      (std::uint64_t{1} << 48) - 1;
+  struct SharedReadState {
+    ReadBufferLease lease_;
+    std::uint64_t generation_ = 0;
+    std::size_t reserved_bytes_ = 0;
+    // Consumer numbers are never reissued within one slot generation, so a
+    // delayed duplicate return cannot release a later consumer of this buffer.
+    std::uint32_t issued_consumers_ = 0;
+    std::uint32_t live_consumers_ = 0;
+    std::uint16_t next_free_ = 0;
+    bool active_ = false;
+  };
+  SharedReadState* SharedState(std::uint64_t ticket) noexcept;
+  void CancelSharedRead(std::uint64_t ticket) noexcept;
+  ReadResultBuffer PublishSharedRead(std::uint64_t ticket,
+                                     ReadBufferLease lease) noexcept;
+  std::optional<ReadResultBuffer> CloneSharedRead(
+      const ReadResultBuffer& source) noexcept;
+  void ReleaseSharedRead(std::uint64_t ticket) noexcept;
+  void ReleaseSharedReadLocal(std::uint64_t ticket) noexcept;
+  void RetireSharedRead(SharedReadState& state, unsigned slot) noexcept;
+  static void HandleSharedReadRelease(void* context,
+                                      std::uint64_t ticket) noexcept;
 
   ReadBufferLease TakeReadBuffer(std::size_t payload_bytes, bool chunk);
   std::uint32_t ReadUnits(std::size_t payload_bytes) const noexcept;
@@ -361,6 +487,14 @@ class RegisteredBufferPool {
   // reused after local or remote return; the backing arena never grows.
   std::vector<bycorf::FixedBuffer> output_buffers_;
   std::vector<std::size_t> free_output_buffers_;
+  // Lazily allocated on the first actual join, and stable for this pool's
+  // runtime lifetime. No atomics are needed for these owner-only fields.
+  RetainedMemoryCharge shared_metadata_memory_;
+  std::unique_ptr<SharedReadState[]> shared_reads_;
+  std::uint16_t shared_free_ = kSharedReadSlots;
+  std::size_t shared_read_bytes_ = 0;
+  std::size_t shared_read_peak_bytes_ = 0;
+  bool read_sharing_finalized_ = false;
 };
 
 // Keep address and registration checks in the read coroutine: GCC can

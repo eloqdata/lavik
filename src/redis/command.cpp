@@ -5249,6 +5249,18 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             "\r\n\r\n";
     info += "storage_dirty_staging_bytes:" +
             std::to_string(durability.dirty_staging_bytes_) + "\r\n";
+    const auto& flights = diagnostics.read_flights_;
+    absl::StrAppend(
+        &info, "storage_read_flight_leaders:", flights.leaders,
+        "\r\nstorage_read_flight_joins:", flights.joins,
+        "\r\nstorage_read_flight_cancellations:", flights.cancellations,
+        "\r\nstorage_read_flight_rejections:", flights.rejected,
+        "\r\nstorage_read_flight_table_full:", flights.table_full,
+        "\r\nstorage_read_flight_waiter_full:", flights.waiter_full,
+        "\r\nstorage_read_flight_shared_budget:", flights.shared_budget,
+        "\r\nstorage_read_flights_pending:", diagnostics.read_flights_pending_,
+        "\r\nstorage_shared_read_bytes:", diagnostics.shared_read_bytes_,
+        "\r\n");
     info += "storage_expiration_pause_count:" +
             std::to_string(diagnostics.expiration_pause_count_) + "\r\n";
     info += "storage_flushes_pending:" +
@@ -5565,9 +5577,9 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
       auto value =
           co_await g_storage->GetLocked(db_id, args[1], digest, detail.get());
       if (value.ok()) {
-        const auto bytes = value->network_bytes();
-        co_return std::string(reinterpret_cast<const char*>(bytes.data()),
-                              bytes.size());
+        std::string encoded;
+        value->AppendNetworkBytes(encoded);
+        co_return encoded;
       }
       co_return value.status().code() == absl::StatusCode::kNotFound
           ? EncodeSemanticNull(request.resp_version_)
@@ -5663,9 +5675,9 @@ Task<EncodedCommandReply> RunSingleKeyLocked(std::uint8_t db_id,
       }
       if (options->return_old_value_) {
         if (result->old_value_.has_value()) {
-          const auto bytes = result->old_value_->network_bytes();
-          co_return std::string(reinterpret_cast<const char*>(bytes.data()),
-                                bytes.size());
+          std::string encoded;
+          result->old_value_->AppendNetworkBytes(encoded);
+          co_return encoded;
         }
         co_return EncodeSemanticNull(request.resp_version_);
       }

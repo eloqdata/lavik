@@ -249,7 +249,10 @@ unchanged. See [Cluster data plane](06-cluster-data-plane.md).
 Standalone collection reads can use a command-table opt-in to capture one
 compact value on the connection worker before the owner hop. Their existing
 handlers parse arguments and evaluate that immutable payload without accessing
-owner-local state; GET frames its String payload directly. Ineligible records
+owner-local state. Exclusive GET results frame their String payload in place;
+shared immutable results keep per-request headers and tails through partial
+vectored writes and release their handle on send completion or disconnect.
+Ineligible records
 fall back to the owner, while EXEC/Lua and multi-key operations keep their
 transactional paths. The shared admission and physical lifetime contract is
 specified in [Storage reads and pins](04-storage-and-recovery.md#reads-and-pins).

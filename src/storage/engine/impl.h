@@ -2049,6 +2049,10 @@ class StorageEngine::Impl {
     // by worker_count, so allocation is local and needs no atomic operation.
     std::uint64_t next_lsn_ = 0;
     RegisteredBufferPool buffers_;
+    // Owner-local producers outlive cancelled request frames, but are reclaimed
+    // after backend quiescence and before their buffer pool is destroyed.
+    std::unique_ptr<ReadFlightRegistry> read_flights_;
+    bool read_flights_attempted_ = false;
     // Startup prefetch may outlive its decoder on checkpoint fallback. A
     // delegated SPDK completion can run on another worker; drain this count
     // before reusing the borrowed maintenance buffers in the next phase.
@@ -3957,8 +3961,8 @@ class StorageEngine::Impl {
 
   // Validates the pinned remote record in the connection task after I/O.
   // Remote admission/fallback is separate from owner-local relocation retries.
-  absl::StatusOr<LoadedValue> DecodeRemoteValue(
-      ReadBufferLease lease, std::uint8_t db_id, std::string_view key,
+  absl::StatusOr<CompactReadValue> DecodeRemoteValue(
+      ReadResultBuffer lease, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       std::size_t record_headroom, std::uint64_t expected_db_epoch);
 
