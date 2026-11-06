@@ -2252,11 +2252,11 @@ class StorageEngine {
   std::unique_ptr<Impl> impl_;
 };
 
-// Owns a remote block pin and the I/O completion inline in the caller's frame.
-// No child coroutine or separately allocated continuation is needed. Like the
-// runtime's one-shot I/O awaitables, it cannot move after publishing its
-// address to the device, and shutdown must drain I/O before destroying its
-// parent.
+// Embeds the connection-worker continuation without a child coroutine. An
+// admitted flight owns its pin, DMA lease and device completion independently;
+// destroying a waiter detaches it without cancelling that producer. Exclusive
+// bypass keeps the inline completion and its existing drain-before-frame-
+// destruction contract. Neither mode permits moving a published awaitable.
 class StorageEngine::RemoteReadAwaitable {
  public:
   using Result = std::optional<absl::StatusOr<CompactReadValue>>;

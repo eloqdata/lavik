@@ -847,9 +847,10 @@ an aligned lease. `LoadValue` and its single-location `LoadValueLocal` share an
 awaitable embedded in the caller's task. Local inline reads, including staged
 copies, use that task directly. Buffer contention retains the pool's FIFO
 handoff and schedules an owner-local continuation under the caller's task class;
-it does not require a waiter coroutine. The awaitable owns the disk-read pin
-and buffer through completion and validates record identity, checksums, and
-population before returning it. Grouped reads enter their graph reader directly;
+it does not require a waiter coroutine. An exclusive awaitable retains its pin
+and buffer through completion; an admitted immutable read transfers them to
+the independent producer. Each awaitable validates record identity, checksums,
+and population before returning its result. Grouped reads enter their graph reader directly;
 cross-owner, external, and relocation flows use lazy helper tasks. A stale
 logical read resolves the current same-mutation location before resuming its
 caller, while a single-location read returns the stale status to its enclosing
