@@ -20,17 +20,20 @@
 
 namespace lavik::storage {
 
-// All collection kinds share promotion and group growth thresholds. Split
-// filling is a separate policy so new pages can retain growth headroom.
+// All collection kinds share promotion and group growth thresholds. Demotion
+// has a lower threshold so small edits cannot repeatedly rebuild the layout.
+// Split filling is a separate policy so new pages retain growth headroom.
 // Indivisible entries and hash collisions may exceed the group target; this
 // is not a hard record or allocation limit.
 inline constexpr std::size_t kCollectionGroupTargetBytes = 8 * 1024;
-inline constexpr std::size_t kCollectionPromotionBytes = 16 * 1024;
+inline constexpr std::size_t kCollectionPromotionBytes = 8 * 1024;
+inline constexpr std::size_t kCollectionDemotionBytes = 4 * 1024;
 
 // Bound the input to compact callback work independently of storage layout.
 // The byte and entry bounds cap decoding overhead; they are not the resulting
 // allocation size. Raising promotion size must not widen the small-inline
 // cleanup allowance when the database is already above maxmemory.
+// Existing compact records from the 16 KiB promotion policy remain readable.
 inline constexpr std::size_t kCompactWorkspaceInputBytes = 16 * 1024;
 inline constexpr std::size_t kCompactWorkspaceInputEntries = 1024;
 

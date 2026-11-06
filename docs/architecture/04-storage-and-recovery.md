@@ -307,8 +307,9 @@ retains the complete keys and physical UUID dependencies so startup can skip
 user-record bodies; the KeyRecord pass still rebuilds the UUID registry and
 its physical copies before those dependencies are attached.
 
-User Strings of at least 16 KiB split their value into fixed 8 KiB group records,
-regardless of key length; smaller Strings retain their compact representation.
+User String writes of at least 8 KiB use fixed 8 KiB group records, regardless
+of key length. Existing larger compact Strings remain readable and can promote
+on subsequent writes; representation thresholds do not constrain decoding.
 Dedicated KeyRecords retain their whole-value representation independently of
 this user-value rule.
 Grouped String roots carry byte length and graph identity. The grouped lifecycle,

@@ -64,7 +64,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
     co_return absl::OutOfRangeError("invalid grouped String length");
   // Whole-value shrink can bypass segment preparation altogether. A String
   // compact image is its raw bytes, so this threshold has no codec step.
-  if (previous && value.size() < kCollectionGroupTargetBytes) {
+  if (previous && value.size() < kCollectionDemotionBytes) {
     co_return co_await AppendLocked(
         store, partition, db_id, key, digest, value, RecordKind::kValue,
         ValueType::kString, expire_at_ms, tx, value.size(), nullptr, nullptr,

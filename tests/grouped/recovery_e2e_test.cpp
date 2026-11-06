@@ -661,6 +661,94 @@ TEST(GroupedRecoveryE2e, RestoresRootAndAuxiliaryWithoutExposingExtraKeys) {
   EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
 }
 
+TEST(GroupedRecoveryE2e, LegacyCompactAboveEightKiBReadsMutatesAndRecovers) {
+  RecordImage image(64);
+  const std::string large(12 * 1024, 'v');
+  const auto expires =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          (std::chrono::system_clock::now() + 10min).time_since_epoch())
+          .count();
+  std::map<std::string, std::vector<std::string>> mutations;
+  auto add = [&](std::string key, ValueType type, const std::string& payload,
+                 std::vector<std::string> mutation) {
+    // Persist a legal old compact record directly: current foreground writes
+    // would promote it. Threshold changes must not make these images
+    // unreadable.
+    Check(payload.size() >= 8 * 1024 && payload.size() < 16 * 1024,
+          "legacy compact fixture is outside the old promotion window");
+    image.GroupPayload(
+        key, payload,
+        RecordHeader{
+            .value_type_ = type,
+            .logical_size_ = type == ValueType::kString
+                                 ? static_cast<std::uint32_t>(large.size())
+                                 : 1,
+            .mutation_sequence_ = 1,
+            .expire_at_ms_ = static_cast<std::uint64_t>(expires)});
+    mutations.emplace(std::move(key), std::move(mutation));
+  };
+  add("string", ValueType::kString, large, {"APPEND", "string", "tail"});
+  auto hash = EncodeHashValue(SingleGroup(large.size()).value_);
+  ASSERT_TRUE(hash.ok());
+  add("hash", ValueType::kHash, *hash, {"HSET", "hash", "tail", "added"});
+  HashValue set;
+  set.entries_.push_back({.field_ = large});
+  auto encoded_set = EncodeHashValue(set);
+  ASSERT_TRUE(encoded_set.ok());
+  add("set", ValueType::kSet, *encoded_set, {"SADD", "set", "tail"});
+  const std::vector<OrderedCollectionEntry> entries{{large}};
+  for (const std::uint16_t version : {1, 2}) {
+    const auto list_key = "list-v" + std::to_string(version);
+    const auto zset_key = "zset-v" + std::to_string(version);
+    auto list = EncodeOrderedCompactValue(OrderedCollectionKind::kList, entries,
+                                          version);
+    auto zset = EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet,
+                                          entries, version);
+    ASSERT_TRUE(list.ok()) << list.status();
+    ASSERT_TRUE(zset.ok()) << zset.status();
+    add(list_key, ValueType::kList, *list, {"RPUSH", list_key, "tail"});
+    add(zset_key, ValueType::kSortedSet, *zset,
+        {"ZADD", zset_key, "2", "tail"});
+  }
+  image.Finish();
+  std::map<std::string, std::string> before, after;
+  {
+    ChildServer server(image, true);
+    grouped_e2e::Client client(server.port());
+    for (const auto& [key, mutation] : mutations) {
+      const auto dump = client.Command({"DUMP", key});
+      ASSERT_EQ(dump.kind_, '$') << key << dump.text_;
+      before.emplace(key, dump.text_);
+      EXPECT_EQ(client.Command({"PEXPIRETIME", key}).text_,
+                std::to_string(expires));
+    }
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    ChildServer server(image, true);
+    grouped_e2e::Client client(server.port());
+    for (const auto& [key, mutation] : mutations) {
+      EXPECT_EQ(client.Command({"DUMP", key}).text_, before.at(key)) << key;
+      const auto changed = client.Command(mutation);
+      ASSERT_NE(changed.kind_, '-') << key << changed.text_;
+      const auto dump = client.Command({"DUMP", key});
+      ASSERT_EQ(dump.kind_, '$') << key << dump.text_;
+      EXPECT_NE(dump.text_, before.at(key));
+      after.emplace(key, dump.text_);
+    }
+    client.Durable();
+    // Crash recovery must select the promoted graph without a fresh checkpoint.
+  }
+  ChildServer recovered(image);
+  grouped_e2e::Client client(recovered.port());
+  for (const auto& [key, dump] : after) {
+    EXPECT_EQ(client.Command({"DUMP", key}).text_, dump) << key;
+    EXPECT_EQ(client.Command({"PEXPIRETIME", key}).text_,
+              std::to_string(expires))
+        << key;
+  }
+}
+
 TEST(GroupedRecoveryE2e, IgnoresUncommittedAndFutureGroupVersions) {
   RecordImage image;
   auto group = SingleGroup();

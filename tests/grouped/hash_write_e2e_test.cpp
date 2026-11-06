@@ -191,13 +191,15 @@ TEST(GroupedHashWriteE2e,
   ASSERT_EQ(disk.LatestRootGrouped("demote-hash"), true);
   // One Hash page is 48-byte group envelope, 32-byte compact header,
   // 8-byte entry framing, one field byte and the value bytes.
+  constexpr auto boundary_value_bytes = kCollectionDemotionBytes - 89;
   {
     Server server(disk);
     Client client(server.port());
-    ASSERT_EQ(
-        client.Command({"HSET", "demote-hash", "f", std::string(8103, 'b')})
-            .text_,
-        "0");
+    ASSERT_EQ(client
+                  .Command({"HSET", "demote-hash", "f",
+                            std::string(boundary_value_bytes, 'b')})
+                  .text_,
+              "0");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -206,15 +208,16 @@ TEST(GroupedHashWriteE2e,
     Server server(disk);
     Client client(server.port());
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
-    ASSERT_EQ(
-        client.Command({"HSET", "demote-hash", "f", std::string(8102, 'c')})
-            .text_,
-        "QUEUED");
+    ASSERT_EQ(client
+                  .Command({"HSET", "demote-hash", "f",
+                            std::string(boundary_value_bytes - 1, 'c')})
+                  .text_,
+              "QUEUED");
     const auto executed = client.Command({"EXEC"});
     ASSERT_EQ(executed.items_.size(), 1);
     ASSERT_EQ(executed.items_[0].text_, "0");
     ASSERT_EQ(client.Command({"HGET", "demote-hash", "f"}).text_,
-              std::string(8102, 'c'));
+              std::string(boundary_value_bytes - 1, 'c'));
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -222,7 +225,7 @@ TEST(GroupedHashWriteE2e,
   Server recovered(disk);
   Client client(recovered.port());
   EXPECT_EQ(client.Command({"HGET", "demote-hash", "f"}).text_,
-            std::string(8102, 'c'));
+            std::string(boundary_value_bytes - 1, 'c'));
 }
 
 TEST(GroupedHashWriteE2e, BatchedFieldsPreserveOrderAcrossGrowthAndRecovery) {

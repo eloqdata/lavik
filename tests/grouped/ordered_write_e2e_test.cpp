@@ -20,6 +20,7 @@
 #include <tuple>
 
 #include "lavik/rdb.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
 #include "write_e2e_support.h"
@@ -200,6 +201,107 @@ TEST(GroupedListWriteE2e, SuspendedReadersReleaseWorkerState) {
   }
 }
 
+TEST(GroupedPromotionE2e, AllTypesPromoteAtEightKiBAndRecover) {
+  PrivateDisk disk;
+  // One-entry compact framing: raw String, Hash with field "f", Set,
+  // indexed List/Sorted Set, and Stream with one message and logical node.
+  const std::vector<std::pair<std::vector<std::string>, std::size_t>> cases{
+      {{"SET"}, 0},    {{"HSET", "f"}, 41}, {{"SADD"}, 40},
+      {{"RPUSH"}, 16}, {{"ZADD", "1"}, 24}, {{"XADD", "1-0", "f"}, 89}};
+  std::map<std::string, std::string> dumps;
+  std::map<std::string, bool> layouts;
+  {
+    Server server(disk);
+    Client client(server.port());
+    for (const auto& [prefix, framing] : cases) {
+      for (int delta : {-1, 0, 1}) {
+        const auto key = prefix.front() + "-" + std::to_string(delta);
+        SCOPED_TRACE(key);
+        const auto size = 8 * 1024 + delta - framing;
+        auto command = prefix;
+        command.insert(command.begin() + 1, key);
+        command.emplace_back(size, 'v');
+        const auto created = client.Command(command);
+        ASSERT_NE(created.kind_, '-') << created.text_;
+        ASSERT_EQ(client.Command({"PEXPIRE", key, "600000"}).text_, "1");
+        const auto dump = client.Command({"DUMP", key});
+        ASSERT_EQ(dump.kind_, '$');
+        dumps.emplace(key, dump.text_);
+        layouts.emplace(key, delta >= 0);
+      }
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  for (const auto& [key, grouped] : layouts)
+    EXPECT_EQ(disk.LatestRootGrouped(key), grouped) << key;
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  for (const auto& [key, dump] : dumps) {
+    EXPECT_EQ(client.Command({"DUMP", key}).text_, dump) << key;
+    EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0) << key;
+  }
+}
+
+TEST(GroupedDemotionE2e, RetainsGroupedLayoutBetweenFourAndEightKiB) {
+  PrivateDisk disk;
+  const std::string keep(3000, 'a'), middle(3000, 'b'), last(4000, 'c');
+  const std::array<std::string, 5> keys{"hash", "set", "list", "zset",
+                                        "stream"};
+  {
+    Server server(disk);
+    Client client(server.port());
+    ASSERT_EQ(
+        client.Command({"HSET", "hash", "a", keep, "b", middle, "c", last})
+            .text_,
+        "3");
+    ASSERT_EQ(client.Command({"SADD", "set", keep, middle, last}).text_, "3");
+    ASSERT_EQ(client.Command({"RPUSH", "list", keep, middle, last}).text_, "3");
+    ASSERT_EQ(
+        client.Command({"ZADD", "zset", "1", keep, "2", middle, "3", last})
+            .text_,
+        "3");
+    for (const auto& [id, value] :
+         {std::pair{"1-0", keep}, {"2-0", middle}, {"3-0", last}})
+      ASSERT_EQ(client.Command({"XADD", "stream", id, "f", value}).text_, id);
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  for (const auto& key : keys) ASSERT_EQ(disk.LatestRootGrouped(key), true);
+  for (const bool demote : {false, true}) {
+    SCOPED_TRACE(demote);
+    {
+      Server server(disk);
+      Client client(server.port());
+      ASSERT_EQ(client.Command({"HDEL", "hash", demote ? "b" : "c"}).text_,
+                "1");
+      ASSERT_EQ(client.Command({"SREM", "set", demote ? middle : last}).text_,
+                "1");
+      ASSERT_EQ(client.Command({"RPOP", "list"}).text_, demote ? middle : last);
+      ASSERT_EQ(client.Command({"ZREM", "zset", demote ? middle : last}).text_,
+                "1");
+      ASSERT_EQ(
+          client.Command({"XDEL", "stream", demote ? "2-0" : "3-0"}).text_,
+          "1");
+      client.Durable();
+      ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    }
+    for (const auto& key : keys)
+      EXPECT_EQ(disk.LatestRootGrouped(key), !demote) << key;
+  }
+  Server recovered(disk, 3);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HGET", "hash", "a"}).text_, keep);
+  EXPECT_EQ(client.Command({"SISMEMBER", "set", keep}).text_, "1");
+  EXPECT_EQ(client.Command({"LINDEX", "list", "0"}).text_, keep);
+  EXPECT_EQ(client.Command({"ZSCORE", "zset", keep}).text_, "1");
+  const auto range = client.Command({"XRANGE", "stream", "-", "+"});
+  ASSERT_EQ(range.items_.size(), 1);
+  ASSERT_EQ(range.items_[0].items_.size(), 2);
+  ASSERT_EQ(range.items_[0].items_[1].items_.size(), 2);
+  EXPECT_EQ(range.items_[0].items_[1].items_[1].text_, keep);
+}
+
 TEST(GroupedDemotionE2e, StringListSetSortedSetGeoAndStreamRecoverCompact) {
   PrivateDisk disk;
   std::string stream_id;
@@ -209,9 +311,11 @@ TEST(GroupedDemotionE2e, StringListSetSortedSetGeoAndStreamRecoverCompact) {
     ASSERT_EQ(
         client.Command({"SET", "demote-string", std::string(17000, 's')}).text_,
         "OK");
-    ASSERT_EQ(
-        client.Command({"SET", "demote-string", std::string(8191, 't')}).text_,
-        "OK");
+    ASSERT_EQ(client
+                  .Command({"SET", "demote-string",
+                            std::string(kCollectionDemotionBytes - 1, 't')})
+                  .text_,
+              "OK");
 
     ASSERT_EQ(
         client.Command({"RPUSH", "demote-list", std::string(17000, 'l')}).text_,
@@ -259,7 +363,7 @@ TEST(GroupedDemotionE2e, StringListSetSortedSetGeoAndStreamRecoverCompact) {
   Server recovered(disk);
   Client client(recovered.port());
   EXPECT_EQ(client.Command({"GET", "demote-string"}).text_,
-            std::string(8191, 't'));
+            std::string(kCollectionDemotionBytes - 1, 't'));
   EXPECT_EQ(client.Command({"LINDEX", "demote-list", "0"}).text_, "short");
   const auto members = client.Command({"SMEMBERS", "demote-set"});
   ASSERT_EQ(members.items_.size(), 1);

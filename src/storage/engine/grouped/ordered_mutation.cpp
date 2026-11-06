@@ -375,7 +375,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           total += ordered_sizes[i];
         }
       }
-      if (total < kCollectionGroupTargetBytes) {
+      if (total < kCollectionDemotionBytes) {
         if (retry_exclusive) co_return needs_x();
         if (!SameLogicalView(previous, side.CurrentForMutation(key)))
           co_return absl::AbortedError(
@@ -393,7 +393,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
           const auto added = budget.AddGroup(*entry, previous->ExtentsFor(id));
           if (!added.ok()) co_return added;
         }
-        auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +
+        auto added = budget.AddBytes(2 * kCollectionDemotionBytes +
                                      plan.root_.item_count_ *
                                          sizeof(OrderedCollectionEntry));
         if (!added.ok()) co_return added;
@@ -446,7 +446,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
             plan.root_.kind_, compact,
             HasOrderedIndex(plan.root_.kind_) ? 2 : 1);
         if (!encoded.ok()) co_return encoded.status();
-        if (encoded->size() >= kCollectionGroupTargetBytes)
+        if (encoded->size() >= kCollectionDemotionBytes)
           co_return absl::InternalError("ordered demotion byte bound failed");
         compact_payload = std::move(*encoded);
       }
@@ -650,7 +650,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                      ->encoded_bytes_;
         total += ordered_sizes[i];
       }
-      if (total < kCollectionGroupTargetBytes)
+      if (total < kCollectionDemotionBytes)
         return absl::AbortedError("Sorted Set demotion needs key X");
       auto retained = RetainGroupedDependency(store, current, tx);
       if (!retained.ok()) return retained;

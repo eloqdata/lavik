@@ -243,7 +243,7 @@ TEST(CompactStringWriteE2e, ColdRangeWriteYieldsStateAndRetainsKey) {
   GTEST_SKIP() << "requires compact write pause hook";
 #endif
   PrivateDisk disk(kPrivateDiskBytes);
-  std::string expected(8192, 'a');
+  std::string expected(6144, 'a');
   {
     Server server(disk, 1);
     Client client(server.port());
@@ -267,8 +267,8 @@ TEST(CompactStringWriteE2e, ColdRangeWriteYieldsStateAndRetainsKey) {
     EXPECT_FALSE(first.HasReply());
     EXPECT_FALSE(second.HasReply());
     gate.Release();
-    EXPECT_EQ(first.Read().text_, "8192");
-    EXPECT_EQ(second.Read().text_, "8192");
+    EXPECT_EQ(first.Read().text_, std::to_string(expected.size()));
+    EXPECT_EQ(second.Read().text_, std::to_string(expected.size()));
     expected.replace(2048, 256, 256, 'b');
     expected.replace(4096, 256, 256, 'c');
     EXPECT_EQ(client.Command({"GET", "target"}).text_, expected);
@@ -283,12 +283,12 @@ TEST(CompactStringWriteE2e, ColdRangeWriteYieldsStateAndRetainsKey) {
   ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
 }
 
-TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
+TEST(CompactPointWriteE2e, MixedSmallEditsMatchModelsAndRecover) {
   PrivateDisk disk;
   std::deque<std::string> list;
   std::set<std::string> set;
   std::map<std::string, double> zset;
-  std::string value(8192, 's');
+  std::string value(4096, 's');
   auto member = [](unsigned i) {
     auto text = std::to_string(i);
     text.resize(32, static_cast<char>(i));
@@ -321,12 +321,12 @@ TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
     Client client(server.port());
     std::vector<std::string> push{"RPUSH", "list"};
     for (unsigned i = 0; i < 32; ++i) {
-      list.emplace_back(256, static_cast<char>(i));
+      list.emplace_back(128, static_cast<char>(i));
       push.push_back(list.back());
     }
     ASSERT_EQ(client.Command(push).text_, "32");
     std::vector<std::string> sadd{"SADD", "set"}, zadd{"ZADD", "zset"};
-    for (unsigned i = 0; i < 256; ++i) {
+    for (unsigned i = 0; i < 128; ++i) {
       const auto name = member(i);
       set.insert(name);
       zset[name] = i % 8;
@@ -334,12 +334,12 @@ TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
       zadd.push_back(std::to_string(i % 8));
       zadd.push_back(name);
     }
-    ASSERT_EQ(client.Command(sadd).text_, "256");
-    ASSERT_EQ(client.Command(zadd).text_, "256");
+    ASSERT_EQ(client.Command(sadd).text_, "128");
+    ASSERT_EQ(client.Command(zadd).text_, "128");
     ASSERT_EQ(client.Command({"SET", "string", value}).text_, "OK");
     for (unsigned i = 0; i < 128; ++i) {
-      const std::string a(256, static_cast<char>(i)),
-          b(256, static_cast<char>(i + 1));
+      const std::string a(128, static_cast<char>(i)),
+          b(128, static_cast<char>(i + 1));
       const bool left = i % 2 == 0;
       ASSERT_EQ(client.Command({left ? "LPUSH" : "RPUSH", "list", a, b}).text_,
                 "34");
@@ -359,7 +359,7 @@ TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
         else
           list.pop_front();
       }
-      const auto name = member((i * 37) % 256);
+      const auto name = member((i * 37) % 128);
       const int delta = i % 2 == 0 ? 32768 : -32768;
       const auto incremented =
           client.Command({"ZINCRBY", "zset", std::to_string(delta), name});
@@ -373,7 +373,7 @@ TEST(CompactPointWriteE2e, MixedEightKiBEditsMatchModelsAndRecover) {
       }
       ASSERT_EQ(client.Command({"SREM", "set", name, name}).text_, "1");
       ASSERT_EQ(client.Command({"SADD", "set", name, name}).text_, "1");
-      const auto offset = (i * 317) % 8192;
+      const auto offset = (i * 317) % 4096;
       value.resize(std::max(value.size(), offset + a.size()), '\0');
       value.replace(offset, a.size(), a);
       EXPECT_EQ(
@@ -494,7 +494,7 @@ TEST(CompactPointWriteE2e, FailedInlineEncodingKeepsValueAndWatch) {
 #endif
   const std::vector<
       std::pair<std::vector<std::string>, std::vector<std::string>>>
-      cases{{{"SET", "target", std::string(8192, 'a')},
+      cases{{{"SET", "target", std::string(4096, 'a')},
              {"SETRANGE", "target", "3", "changed"}},
             {{"HSET", "target", "a", "before", "b", "keep"},
              {"HSET", "target", "a", "after"}},
@@ -561,8 +561,8 @@ TEST(CompactPointWriteE2e, SingleReadSlotUsesOwnedFallback) {
   Server server(disk, 1, {}, {}, false, 2, "1G", {}, {}, 0, 20, options);
   Client client(server.port());
   for (const auto& key : {std::string("target"), std::string(3072, 'k')}) {
-    ASSERT_EQ(client.Command({"SET", key, std::string(8192, 'a')}).text_, "OK");
-    EXPECT_EQ(client.Command({"SETRANGE", key, "0", "b"}).text_, "8192");
+    ASSERT_EQ(client.Command({"SET", key, std::string(4096, 'a')}).text_, "OK");
+    EXPECT_EQ(client.Command({"SETRANGE", key, "0", "b"}).text_, "4096");
     EXPECT_EQ(client.Command({"GETRANGE", key, "0", "1"}).text_, "ba");
     ASSERT_EQ(client.Command({"DEL", key}).text_, "1");
     ASSERT_EQ(client.Command({"HSET", key, "a", "old", "b", "keep"}).text_,
@@ -952,7 +952,14 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
     first.Send(commands.First(key));
     const auto& armed = gate.marker();
     ASSERT_TRUE(AwaitMarker(server, armed)) << server.Log();
+    // The first writer may hold IX and allow a disjoint group writer through.
+    // EXEC requests key X, so it must wait for the retained parent intent in
+    // every layout and preparation phase exercised here.
+    second.Send({"MULTI"});
+    ASSERT_EQ(second.Read().text_, "OK");
     second.Send(commands.Second(key));
+    ASSERT_EQ(second.Read().text_, "QUEUED");
+    second.Send({"EXEC"});
     // SET/HSET need store state; PING or GET alone would not prove the writer
     // actually released it. Both must finish before the selected pause ends.
     EXPECT_EQ(client.Command({"SET", "other-string", "progress"}).text_, "OK");
@@ -968,7 +975,9 @@ TEST_P(GroupedWriteConcurrencyE2e, ColdWriteYieldsWorkerButRetainsKey) {
     const auto a = first.Read();
     ASSERT_NE(a.kind_, '-') << a.text_ << server.Log();
     const auto b = second.Read();
-    ASSERT_NE(b.kind_, '-') << b.text_ << server.Log();
+    ASSERT_EQ(b.kind_, '*') << b.text_ << server.Log();
+    ASSERT_EQ(b.items_.size(), 1);
+    ASSERT_NE(b.items_[0].kind_, '-') << b.items_[0].text_ << server.Log();
     commands.CheckResult(client, key);
     EXPECT_GT(std::stoll(client.Command({"PTTL", key}).text_), 0);
     client.Durable();

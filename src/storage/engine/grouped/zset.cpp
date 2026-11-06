@@ -1375,7 +1375,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
       std::uint64_t{kOrderedGroupHeaderBytes};
   // This bound prevents a late compact conversion from needing an X retry
   // after AppendLocked has canonicalized the replication command.
-  if (protected_bytes < kCollectionGroupTargetBytes) co_return std::nullopt;
+  if (protected_bytes < kCollectionDemotionBytes) co_return std::nullopt;
   const SortedSetMemberChange change{member, state.before_, state.after_};
   auto member_plan = co_await PrepareSortedSetMembers(
       store, partition, db_id, key, digest, object, plan, true,

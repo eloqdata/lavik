@@ -21,16 +21,20 @@ limitations under the License.
 Grouped storage is a representation inside the storage engine, not a new
 Redis keyspace or a separate database. String, Hash, Set, List, Sorted Set and
 Stream support compact values and complete, independently addressed group snapshots. Writes
-automatically promote compact collections at 16 KiB of encoded size, with an
+automatically promote compact collections at 8 KiB of encoded size, with an
 8 KiB target per group shared by all six types. Indivisible entries and Hash
 collisions can exceed that target. A complete update returns to compact storage
-when active primary group payloads total less than 8 KiB; deletion and whole
+when active primary group payloads total less than 4 KiB; deletion and whole
 replacement can also end the grouped incarnation. The payload sum bounds the
 compact encoding size, so the writer selects that representation before
-staging replacement groups.
+staging replacement groups. The gap between promotion and demotion avoids
+repeated representation changes near the promotion boundary. These thresholds
+select write layouts; reads and recovery also accept existing compact values
+above the promotion threshold, and later mutations can promote them using the
+same durable encodings.
 Streaming collection imports and grouped key transfers construct graphs directly.
 Intermediate ingest mutations retain grouped roots. Once an import is complete,
-active primary group payloads below 8 KiB are compacted to one root in the
+active primary group payloads below 4 KiB are compacted to one root in the
 ingest transaction.
 Stream RDB and native receiving also ingest logical records page by page. Both
 ordinary and Debug builds use the same read, mutation, recovery and maintenance
@@ -48,7 +52,7 @@ metadata, groups, consumers and individual pending entries. Their externally
 visible length is independent of the internal record count. See
 [Streams](12-streams.md) for their access and logical-format contracts.
 
-String writes promote at the same 16 KiB encoded-size threshold as collections,
+String writes promote at the same 8 KiB encoded-size threshold as collections,
 regardless of key length. Parent keys of at most 2 KiB are inline; longer keys
 share one immutable KeyRecord through a UUID in each root and auxiliary header.
 Segment payloads never contain copies of the parent key. See
