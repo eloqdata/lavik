@@ -41,6 +41,8 @@
 #include <utility>
 #include <vector>
 
+#include "../include/lavik/storage/detail/collection_limits.h"
+#include "../include/lavik/storage/format.h"
 #include "support/test_data_path.h"
 
 namespace {
@@ -1379,7 +1381,14 @@ int main(int argc, char** argv) {
                                  false, 4, {}, "5000");
     RespClient standby_control = ConnectReady(port);
     // Compact values fill ordinary record blocks without String promotion.
-    const std::string standby_payload(16 * 1024 - 1, 's');
+    constexpr std::size_t kStandbyPayloadBytes =
+        lavik::storage::kCollectionPromotionBytes - 1;
+    constexpr unsigned kBlockPayloads =
+        lavik::storage::kStorageBlockBytes / kStandbyPayloadBytes;
+    // Cross one block boundary even as the compact promotion size changes.
+    // The lower progress bound leaves room for record headers and flush pads.
+    constexpr unsigned kStandbyWrites = kBlockPayloads + 64;
+    const std::string standby_payload(kStandbyPayloadBytes, 's');
     const std::string standby_leader = "leader{standby}";
     Expect(standby_control.Command({"SET", standby_leader, standby_payload}),
            "+OK", "create ordinary stream and request its standby");
@@ -1396,7 +1405,7 @@ int main(int argc, char** argv) {
     std::atomic<unsigned> completed{0};
     auto standby_waiter = std::async(std::launch::async, [&] {
       RespClient client = Connect(port);
-      for (unsigned i = 0; i < 600; ++i) {
+      for (unsigned i = 0; i < kStandbyWrites; ++i) {
         Expect(client.Command({"SET", "fill{standby}:" + std::to_string(i),
                                standby_payload}),
                "+OK", "fill ordinary stream");
@@ -1409,7 +1418,7 @@ int main(int argc, char** argv) {
            standby_waiter.wait_for(0ms) != std::future_status::ready) {
       const unsigned before = completed.load(std::memory_order_acquire);
       std::this_thread::sleep_for(200ms);
-      if (before >= 400 &&
+      if (before >= kBlockPayloads * 3 / 4 &&
           completed.load(std::memory_order_acquire) == before) {
         rollover_waited = true;
         break;
@@ -1421,10 +1430,14 @@ int main(int argc, char** argv) {
       Fail("standby prefetch stranded an ordinary rollover");
     }
     standby_waiter.get();
-    Expect(standby_control.Command({"STRLEN", standby_leader}), ":16383",
+    Expect(standby_control.Command({"STRLEN", standby_leader}),
+           ":" + std::to_string(standby_payload.size()),
            "standby leader value length");
-    Expect(standby_control.Command({"STRLEN", "fill{standby}:599"}), ":16383",
-           "standby final value length");
+    Expect(
+        standby_control.Command(
+            {"STRLEN", "fill{standby}:" + std::to_string(kStandbyWrites - 1)}),
+        ":" + std::to_string(standby_payload.size()),
+        "standby final value length");
     standby_server.Stop();
 #endif
 

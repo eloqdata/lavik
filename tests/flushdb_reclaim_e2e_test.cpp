@@ -40,6 +40,7 @@
 #include <utility>
 #include <vector>
 
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/format.h"
 #include "support/test_data_path.h"
 
@@ -513,7 +514,9 @@ int main(int argc, char** argv) {
 
   try {
     const std::uint16_t port = FindFreePort();
-    const std::string value(15 * 1024, 'v');
+    constexpr std::size_t kValueBytes =
+        lavik::storage::kCollectionPromotionBytes - 1;
+    const std::string value(kValueBytes, 'v');
     CreateDataFile(data_path, 96ULL * 1024 * 1024);
 
     {
@@ -523,7 +526,9 @@ int main(int argc, char** argv) {
 
       unsigned inserted = 0;
       bool observed_full = false;
-      for (unsigned i = 0; i < 4096; ++i) {
+      constexpr unsigned kFillAttempts =
+          4 * lavik::storage::kStorageBlockBytes / kValueBytes + 1;
+      for (unsigned i = 0; i < kFillAttempts; ++i) {
         const std::string key = OrdinaryKey("old-" + std::to_string(i));
         const std::string response = client.Command({"SET", key, value});
         if (response == "+OK") {
@@ -586,7 +591,8 @@ int main(int argc, char** argv) {
         RespClient client = Connect(port);
         // Expiring records occupy roughly 6 MiB of the 8 MiB block, leaving
         // its live ratio below the defrag threshold once those keys expire.
-        constexpr unsigned kExpiringKeys = 400;
+        constexpr unsigned kExpiringKeys =
+            (6 * 1024 * 1024 + kValueBytes - 1) / kValueBytes;
         for (unsigned i = 0; i < kExpiringKeys; ++i) {
           // Keep the keys in one low-numbered partition so the assertion
           // measures retirement and reclaim, not a complete partition sweep.
@@ -596,7 +602,8 @@ int main(int argc, char** argv) {
                  "full-device expiring SET");
         }
         bool observed_full = false;
-        for (unsigned i = 0; i < 1024; ++i) {
+        for (unsigned i = 0;
+             i <= lavik::storage::kStorageBlockBytes / kValueBytes; ++i) {
           const std::string key = OrdinaryKey("full-live-" + std::to_string(i));
           const std::string response = client.Command({"SET", key, value});
           if (response == "+OK") continue;

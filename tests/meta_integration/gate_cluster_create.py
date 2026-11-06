@@ -350,10 +350,11 @@ def run_unrelated_commit_case(workdir):
         proxy.release.set()
         if proxy.error is not None:
             raise H.Failure(f"initial FDS barrier failed: {proxy.error}")
-        H.wait_until(
+        # READY may precede the root operation's durable completion.
+        wait_cluster_ready(
+            meta,
             "creation with an unrelated commit reaches READY",
             15,
-            lambda: cluster_status(meta)["result"] == "ready",
         )
         if meta.getop(operation_id) != "OK completed cluster-created":
             raise H.Failure("creation did not durably complete its operation")
