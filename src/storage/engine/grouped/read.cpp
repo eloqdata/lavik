@@ -146,6 +146,9 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     }
     // The synchronous decoder and page lease finish before handing the permit
     // to another child. Queued reads reacquire it for every relocation retry.
+    // Only the concrete group's physical record joins on its block owner.
+    // The root may publish unrelated groups while this record is unchanged;
+    // every caller retains its own locks, view and post-I/O envelope checks.
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents, true,

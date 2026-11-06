@@ -108,6 +108,9 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     }
     // The read lease must be released before handing this owner's permit to
     // another child. Completed children retain owned results, not read leases.
+    // Only the concrete group's physical record joins on its block owner.
+    // The root may publish unrelated groups while this record is unchanged;
+    // every caller retains its own locks, view and post-I/O envelope checks.
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents, true,
