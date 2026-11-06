@@ -1127,15 +1127,25 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
   if (!view.ok()) co_return view.status();
   auto object = std::move(*view);
   if (!object || !object->has_member_index()) co_return std::nullopt;
-  if (operation.members_.size() > SIZE_MAX / sizeof(GroupedRecordId))
+  if (operation.members_.size() > SIZE_MAX / sizeof(GroupedRecordId)) {
+    RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("Sorted Set lock plan overflow");
+  }
   auto admission =
       TryReserveMemory(operation.members_.size() * sizeof(GroupedRecordId));
-  if (!admission) co_return MemoryLimitError("OOM Sorted Set group read plan");
+  if (!admission) {
+    RecordMemoryRejection();
+    co_return MemoryLimitError("OOM Sorted Set group read plan");
+  }
   std::vector<GroupedRecordId> groups;
   groups.reserve(operation.members_.size());
-  if (groups.capacity() > admission->bytes() / sizeof(GroupedRecordId))
+  // Before InitMemoryLimit, a successful reservation is unmetered and carries
+  // zero bytes. Only a metered reservation bounds the allocated capacity.
+  if (admission->bytes() &&
+      groups.capacity() > admission->bytes() / sizeof(GroupedRecordId)) {
+    RecordMemoryRejection();
     co_return MemoryLimitError("OOM Sorted Set group read plan");
+  }
   for (const auto member : operation.members_) {
     const auto* route = object->directory().Find(member);
     if (!route) co_return absl::DataLossError("missing member prefix route");
@@ -1708,7 +1718,8 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
   }
   std::vector<HashFieldLookup> requests;
   requests.reserve(fields.size());
-  if (requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
+  if (scratch->bytes() &&
+      requests.capacity() > scratch->bytes() / sizeof(HashFieldLookup)) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("OOM Sorted Set lookup plan");
   }

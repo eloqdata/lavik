@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -16,6 +17,7 @@
 #include "absl/cleanup/cleanup.h"
 #include "bycorf/net/server.h"
 #include "gtest/gtest.h"
+#include "lavik/error_detail.h"
 #include "lavik/metrics.h"
 #include "lavik/tx/tx_shard.h"
 #include "support/test_data_path.h"
@@ -26,6 +28,9 @@ class WriteBufferTestPeer {
  public:
   enum class Scenario {
     kGroupedPublication,
+    kGroupedReadUnmetered,
+    kGroupedReadAdmissionFailure,
+    kGroupedReadCommonView,
     kProgress,
     kEpochChanged,
     kSourceChanged,
@@ -866,9 +871,172 @@ class WriteBufferTestPeer {
     co_return absl::OkStatus();
   }
 
+  static Task<absl::Status> RunGroupedRead(StorageEngine& storage,
+                                           Scenario scenario) {
+    auto& impl = *storage.impl_;
+    auto& store = impl.CurrentStore();
+    constexpr std::string_view key = "grouped-score-read";
+    std::vector<std::string> names;
+    names.reserve(1024);
+    std::vector<ScoredMemberView> seed;
+    for (unsigned i = 0; i < 1024; ++i) {
+      names.push_back(std::to_string(i) + std::string(128, 'm'));
+      seed.push_back({names.back(), double(i)});
+    }
+    auto seeded = co_await storage.ExecuteSortedSet(
+        0, key, {.kind_ = SortedSetOperationKind::kAdd, .entries_ = seed});
+    if (!seeded.ok()) co_return seeded.status();
+    while (store.tx_commit_runner_) co_await bycorf::Yield(*store.worker_);
+    const auto digest = ComputeDigest(key);
+    const auto object = impl.PartitionForKey(store, key)
+                            .grouped_objects_[0]
+                            .CurrentForMutation(key);
+    if (!object || !object->has_member_index())
+      co_return absl::InternalError("fixture did not create member leaves");
+
+    if (scenario == Scenario::kGroupedReadCommonView) {
+      unsigned other = 900;
+      auto first = object->directory().Find(names[0])->id_;
+      while (other < names.size() &&
+             object->directory().Find(names[other])->id_ == first)
+        ++other;
+      if (other == names.size())
+        co_return absl::InternalError("fixture has no disjoint member leaf");
+      std::array<std::string_view, 2> members{names[0], names[other]};
+      std::array<double, 2> scores{0, double(other)};
+      auto last = object->directory().Find(members[1])->id_;
+      if (last < first) {
+        std::swap(first, last);
+        std::swap(members[0], members[1]);
+        std::swap(scores[0], scores[1]);
+      }
+      auto parent = co_await tx::CurrentTxShard().AcquireKey(
+          0, tx::FingerprintOf(digest), tx::LockMode::kIntentExclusive);
+      if (!store.group_locks_)
+        store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
+      const GroupedLockObject identity{0, tx::FingerprintOf(digest),
+                                       object->incarnation()};
+      auto gate = store.group_locks_->MakeLockSet(identity);
+      auto locked = co_await gate.Acquire({GroupedLockIndex::kMember, last},
+                                          GroupedLockMode::kExclusive);
+      if (!locked.ok()) co_return locked;
+      const std::array<ScoredMemberView, 1> later{
+          {{members[1], scores[1] + 0.25}}};
+      const std::array<ScoredMemberView, 1> earlier{
+          {{members[0], scores[0] + 0.5}}};
+      // Reverse request order also checks identity sorting and duplicate
+      // projection. Named operations outlive every suspended coroutine.
+      const std::array<std::string_view, 3> requested{members[1], members[0],
+                                                      members[1]};
+      SortedSetOperation later_op{.kind_ = SortedSetOperationKind::kAdd,
+                                  .entries_ = later,
+                                  .prepare_unlocked_ = true};
+      SortedSetOperation earlier_op{.kind_ = SortedSetOperationKind::kAdd,
+                                    .entries_ = earlier,
+                                    .prepare_unlocked_ = true};
+      SortedSetOperation read_op{.kind_ = SortedSetOperationKind::kScores,
+                                 .members_ = requested};
+      auto start = [](auto task) {
+        auto handle = std::move(task).ReleaseHandle();
+        task = decltype(task)(handle);
+        handle.resume();
+        return task;
+      };
+      // Queue the later writer before the reader. Neither can reach page IO
+      // while the gate holds that leaf. The reader must retain the earlier
+      // leaf while waiting, fencing a second real point writer on it.
+      co_await store.store_state_mutex_.Lock();
+      store.store_state_mutex_.Unlock(*store.worker_);
+      auto later_write = start(storage.ExecuteSortedSet(0, key, later_op));
+      auto read = start(storage.ExecuteSortedSet(0, key, read_op));
+      EXPECT_FALSE(later_write.done());
+      EXPECT_FALSE(read.done());
+      {
+        auto probe = store.group_locks_->MakeLockSet(identity);
+        auto acquire = probe.Acquire({GroupedLockIndex::kMember, first},
+                                     GroupedLockMode::kExclusive);
+        const bool available = acquire.await_ready();
+        EXPECT_FALSE(available) << "reader released its earlier leaf";
+        if (available) EXPECT_TRUE(acquire.await_resume().ok());
+      }
+      auto earlier_write = start(storage.ExecuteSortedSet(0, key, earlier_op));
+      EXPECT_FALSE(earlier_write.done());
+      gate.Reset();
+      while (!later_write.done() || !read.done() || !earlier_write.done())
+        co_await bycorf::Yield(*store.worker_);
+      auto later_result = std::move(later_write).TakeResult();
+      auto read_result = std::move(read).TakeResult();
+      auto earlier_result = std::move(earlier_write).TakeResult();
+      if (!later_result.ok()) co_return later_result.status();
+      if (!read_result.ok()) co_return read_result.status();
+      if (!earlier_result.ok()) co_return earlier_result.status();
+      const std::vector<std::optional<double>> expected{
+          scores[1] + 0.25, scores[0], scores[1] + 0.25};
+      EXPECT_EQ(read_result->scores_, expected);
+      parent.Reset();
+      auto current = co_await storage.ExecuteSortedSet(0, key, read_op);
+      if (!current.ok()) co_return current.status();
+      EXPECT_EQ(current->scores_,
+                (std::vector<std::optional<double>>{
+                    scores[1] + 0.25, scores[0] + 0.5, scores[1] + 0.25}));
+      co_return absl::OkStatus();
+    }
+
+    const std::array<std::string_view, 4> members{names[0], names[900],
+                                                  names[0], "missing"};
+    if (scenario == Scenario::kGroupedReadAdmissionFailure) {
+      // Acquire the parent first so the only failing admission is the real
+      // member-lock plan, not key-lock or fixture construction.
+      auto parent = co_await tx::CurrentTxShard().AcquireKey(
+          0, tx::FingerprintOf(digest), tx::LockMode::kIntentShared);
+      const auto before = GetMemoryStats();
+      absl::Status rejected;
+      {
+        absl::Cleanup restore = [&] {
+          (void)InitMemoryLimit(before.max_bytes_, 1);
+        };
+        const auto limited = InitMemoryLimit(1, 1);
+        if (!limited.ok()) co_return limited;
+        auto result = co_await impl.TryConcurrentSortedSetRead(
+            0, key, digest,
+            {.kind_ = SortedSetOperationKind::kScores, .members_ = members});
+        if (result.ok())
+          co_return absl::InternalError("read plan ignored its memory limit");
+        rejected = result.status();
+      }
+      EXPECT_EQ(GetErrorDetail(rejected), ErrorDetail::kMemoryLimit)
+          << rejected;
+      EXPECT_EQ(rejected.message(), "OOM Sorted Set group read plan");
+      const auto after = GetMemoryStats();
+      EXPECT_EQ(after.rejected_commands_, before.rejected_commands_ + 1);
+      EXPECT_EQ(after.admission_pending_bytes_,
+                before.admission_pending_bytes_);
+    }
+    // Exercise both the direct ZSCORE projection and the batched lookup plan.
+    // The retry after failed admission also proves key/store state was
+    // released.
+    for (std::size_t count : {1u, 4u}) {
+      auto read = co_await storage.ExecuteSortedSet(
+          0, key,
+          {.kind_ = SortedSetOperationKind::kScores,
+           .members_ = std::span(members).first(count)});
+      if (!read.ok()) co_return read.status();
+      const std::vector<std::optional<double>> expected{0, 900, 0,
+                                                        std::nullopt};
+      EXPECT_EQ(read->scores_,
+                (std::vector<std::optional<double>>{expected.begin(),
+                                                    expected.begin() + count}));
+    }
+    co_return absl::OkStatus();
+  }
+
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
     if (scenario == Scenario::kGroupedPublication)
       co_return co_await RunGroupedPublication(storage);
+    if (scenario == Scenario::kGroupedReadUnmetered ||
+        scenario == Scenario::kGroupedReadAdmissionFailure ||
+        scenario == Scenario::kGroupedReadCommonView)
+      co_return co_await RunGroupedRead(storage, scenario);
     if (scenario == Scenario::kResumeActiveStreams)
       co_return co_await RunResumeActiveStreams(storage);
     if (scenario == Scenario::kRetirementSnapshots)
@@ -1136,7 +1304,10 @@ void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
     ASSERT_EQ(sized, 0);
   }
   InitWorkerMetrics(1);
-  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
+  if (scenario == WriteBufferTestPeer::Scenario::kGroupedReadUnmetered)
+    ASSERT_EQ(GetMemoryStats().max_bytes_, 0);
+  else
+    ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 1).ok());
   if (tx::TxRuntime::Get() == nullptr) tx::TxRuntime::Create(1);
   StorageEngineOptions options;
   options.data_files_ = paths;
@@ -1189,6 +1360,34 @@ TEST_P(StorageWriteBufferTest,
 TEST(StorageWriteBufferResumeTest,
      PreparedSameKeyPlansMergeWithoutLosingEitherGraph) {
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedPublication);
+}
+
+TEST(StorageGroupedReadDeathTest, UnmeteredScoreReads) {
+  // Re-exec keeps the global memory limiter uninitialized even when other
+  // tests in this binary have already installed a process-wide limit.
+  GTEST_FLAG_SET(death_test_style, "threadsafe");
+  ASSERT_EXIT(
+      {
+        RunWriteBufferScenario(
+            WriteBufferTestPeer::Scenario::kGroupedReadUnmetered);
+        const auto* result =
+            testing::UnitTest::GetInstance()->current_test_info()->result();
+        for (int i = 0; i < result->total_part_count(); ++i)
+          if (result->GetTestPartResult(i).failed())
+            std::fprintf(stderr, "%s\n",
+                         result->GetTestPartResult(i).message());
+        _exit(testing::Test::HasFailure() ? 1 : 0);
+      },
+      testing::ExitedWithCode(0), "");
+}
+
+TEST(StorageGroupedReadTest, FailedPlanCountsRejectionAndReleasesState) {
+  RunWriteBufferScenario(
+      WriteBufferTestPeer::Scenario::kGroupedReadAdmissionFailure);
+}
+
+TEST(StorageGroupedReadTest, RetainsEarlierLeafWhileWaitingForLaterWriter) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedReadCommonView);
 }
 
 TEST(StorageWriteBufferResumeTest, ThreeStreamsReuseTwoBuffersWithoutSealing) {
