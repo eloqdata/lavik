@@ -48,6 +48,7 @@
 #include "lavik/replication_history.h"
 #include "lavik/resp.h"
 #include "lavik/session.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/engine.h"
 #include "lavik/storage/format.h"
 #include "lavik/storage/scan_hash_map.h"
@@ -1927,8 +1928,11 @@ class ReplicationLogService final : public bycorf::Service {
     absl::Status queue_capacity =
         co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
     if (!queue_capacity.ok()) co_return queue_capacity;
+    constexpr std::size_t kCompactValueBytes =
+        lavik::storage::kCollectionPromotionBytes - 1;
     for (unsigned i = 0; i < 32; ++i) {
-      std::vector<std::string> args{"SET", key, std::string(15 * 1024, 'q')};
+      std::vector<std::string> args{"SET", key,
+                                    std::string(kCompactValueBytes, 'q')};
       written = co_await ExecuteClientCommand(kDb, std::move(args), "+OK\r\n");
       if (!written.ok()) co_return written;
     }
@@ -1939,7 +1943,9 @@ class ReplicationLogService final : public bycorf::Service {
     const auto queued_info = storage_->LocalReplicationLogInfo();
     Check(
         queued_info.fullsync_session_count_ == 1 &&
-            queued_info.fullsync_publish_queue_bytes_ >= 700 * 1024 &&
+            queued_info.fullsync_publish_queue_bytes_ >=
+                32 * kCompactValueBytes &&
+            queued_info.fullsync_publish_queue_bytes_ <= kMiB &&
             queued_info.fullsync_publish_queue_capacity_bytes_ == kMiB,
         "full-sync queue occupancy metrics do not describe the active "
         "session: sessions=" +
@@ -1947,6 +1953,10 @@ class ReplicationLogService final : public bycorf::Service {
             std::to_string(queued_info.fullsync_publish_queue_bytes_) +
             " capacity=" +
             std::to_string(queued_info.fullsync_publish_queue_capacity_bytes_));
+    // Exceed the remaining credit without depending on allocator rounding or
+    // the number of retained copies of each compact command's payload.
+    const std::size_t blocked_bytes =
+        kMiB - queued_info.fullsync_publish_queue_bytes_ + 1;
     std::uint16_t unstarted_partition =
         static_cast<std::uint16_t>((partition_id + storage_->worker_count()) %
                                    lavik::storage::kLogicalStorageShards);
@@ -1955,25 +1965,27 @@ class ReplicationLogService final : public bycorf::Service {
           (partition_id + 1) % lavik::storage::kLogicalStorageShards);
     }
     auto unrelated = co_await storage_->AcquireReplicationPublisherAdmission(
-        700 * 1024, lavik::storage::ReplicationPublisherTarget{
-                        .partition_id_ = unstarted_partition, .db_id_ = kDb});
+        blocked_bytes,
+        lavik::storage::ReplicationPublisherTarget{
+            .partition_id_ = unstarted_partition, .db_id_ = kDb});
     if (!unrelated.ok()) co_return unrelated.status();
     Check(unrelated->fullsync_session_ids_.empty() &&
               unrelated->fullsync_unstarted_guards_.size() == 1,
           "UNSTARTED partition reserved queue credit or lost its phase guard");
-    storage_->ReleaseReplicationPublisherAdmission(*unrelated, 700 * 1024);
+    storage_->ReleaseReplicationPublisherAdmission(*unrelated, blocked_bytes);
 
     bool admission_finished = false;
     absl::Status admission_status =
         absl::UnknownError("full-sync admission waiter did not run");
     auto wait_for_fullsync_admission = [&]() -> bycorf::Task<absl::Status> {
       auto admission = co_await storage_->AcquireReplicationPublisherAdmission(
-          700 * 1024, lavik::storage::ReplicationPublisherTarget{
-                          .partition_id_ = partition_id, .db_id_ = kDb});
+          blocked_bytes, lavik::storage::ReplicationPublisherTarget{
+                             .partition_id_ = partition_id, .db_id_ = kDb});
       if (!admission.ok()) {
         admission_status = admission.status();
       } else {
-        storage_->ReleaseReplicationPublisherAdmission(*admission, 700 * 1024);
+        storage_->ReleaseReplicationPublisherAdmission(*admission,
+                                                       blocked_bytes);
         admission_status = absl::OkStatus();
       }
       admission_finished = true;
@@ -1996,7 +2008,8 @@ class ReplicationLogService final : public bycorf::Service {
     // later small requests. Otherwise sustained small writes can keep the
     // queue nonempty and starve a large key forever.
     for (unsigned i = 0; i < 32; ++i) {
-      std::vector<std::string> args{"SET", key, std::string(15 * 1024, 'r')};
+      std::vector<std::string> args{"SET", key,
+                                    std::string(kCompactValueBytes, 'r')};
       written = co_await ExecuteClientCommand(kDb, std::move(args), "+OK\r\n");
       if (!written.ok()) co_return written;
     }
@@ -2071,7 +2084,8 @@ class ReplicationLogService final : public bycorf::Service {
                                              expiring_command->front().id_);
 
     for (unsigned i = 0; i < 32; ++i) {
-      std::vector<std::string> args{"SET", key, std::string(15 * 1024, 'e')};
+      std::vector<std::string> args{"SET", key,
+                                    std::string(kCompactValueBytes, 'e')};
       written = co_await ExecuteClientCommand(kDb, std::move(args), "+OK\r\n");
       if (!written.ok()) co_return written;
     }

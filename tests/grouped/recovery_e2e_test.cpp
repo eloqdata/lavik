@@ -41,6 +41,7 @@
 #include "gtest/gtest.h"
 #include "lavik/fault_injection.h"
 #include "lavik/rdb.h"
+#include "lavik/storage/detail/collection_limits.h"
 #include "lavik/storage/detail/grouped/collection.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/storage/detail/ordered_compact_codec.h"
@@ -747,6 +748,94 @@ TEST(GroupedRecoveryE2e, LegacyCompactAboveEightKiBReadsMutatesAndRecovers) {
               std::to_string(expires))
         << key;
   }
+}
+
+TEST(GroupedRecoveryE2e, LegacyCompactWorkspaceRemainsBoundedUnderOom) {
+  RecordImage image;
+  const std::string zset_key(128, 'k');
+  constexpr std::string_view kStreamKey = "large-inline-stream";
+  const std::string large(16 * 1024 - 90, 'v');
+  const std::vector<OrderedCollectionEntry> entries{{large, 1}};
+  auto zset =
+      EncodeOrderedCompactValue(OrderedCollectionKind::kSortedSet, entries);
+  ASSERT_TRUE(zset.ok()) << zset.status();
+
+  // One LXS1 message (1-0), field "f", one logical node and no consumers.
+  // Construct the old compact image directly: foreground writes now promote
+  // these payloads, which would stop exercising the compact scratch boundary.
+  std::string stream("LXS1");
+  auto put = [&](std::uint64_t value, unsigned width) {
+    for (unsigned i = 0; i < width; ++i)
+      stream.push_back(static_cast<char>(value >> (8 * i)));
+  };
+  put(1, 8);
+  put(0, 8);
+  stream.append(16, '\0');
+  put(1, 8);
+  put(1, 4);
+  put(1, 8);
+  put(0, 8);
+  put(2, 4);
+  put(1, 4);
+  stream.append("f");
+  put(large.size(), 4);
+  stream.append(large);
+  put(1, 4);
+  put(1, 4);
+  put(0, 4);
+  auto add = [&](std::string_view key, ValueType type,
+                 const std::string& payload) {
+    ASSERT_GE(payload.size(), kCollectionPromotionBytes);
+    ASSERT_LT(payload.size(), 16 * 1024);
+    ASSERT_GE(AlignRecord(RecordHeaderBytes(key.size()) + payload.size()),
+              kCompactWorkspaceInputBytes);
+    image.GroupPayload(
+        key, payload,
+        RecordHeader{
+            .value_type_ = type, .logical_size_ = 1, .mutation_sequence_ = 1});
+  };
+  ASSERT_NO_FATAL_FAILURE(add(zset_key, ValueType::kSortedSet, *zset));
+  ASSERT_NO_FATAL_FAILURE(add(kStreamKey, ValueType::kStream, stream));
+  image.Finish();
+  {
+    ChildServer server(image);
+    grouped_e2e::Client client(server.port());
+    const auto range = client.Command({"ZRANGE", zset_key, "0", "-1"});
+    ASSERT_EQ(range.items_.size(), 1);
+    EXPECT_EQ(range.items_[0].text_, large);
+    const auto messages =
+        client.Command({"XRANGE", std::string(kStreamKey), "-", "+"});
+    ASSERT_EQ(messages.items_.size(), 1);
+    ASSERT_EQ(messages.items_[0].items_.size(), 2);
+    ASSERT_EQ(messages.items_[0].items_[1].items_.size(), 2);
+    EXPECT_EQ(messages.items_[0].items_[1].items_[1].text_, large);
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  {
+    grouped_e2e::ScopedEnvironment oom("LAVIK_TEST_OOM_AFTER_RECOVERY", "1");
+    ChildServer server(image);
+    EXPECT_TRUE(server.Command({"SET", "must-be-rejected", "v"})
+                    .starts_with("-OOM command not allowed"));
+    for (const auto& args : {std::initializer_list<std::string_view>{
+                                 "ZREMRANGEBYRANK", zset_key, "0", "-1"},
+                             {"ZREMRANGEBYSCORE", zset_key, "-inf", "+inf"},
+                             {"ZREMRANGEBYLEX", zset_key, "-", "+"}}) {
+      const auto reply = server.Command(args);
+      EXPECT_TRUE(reply.starts_with("-OOM grouped operation scratch admission"))
+          << reply;
+    }
+    EXPECT_EQ(server.Command({"ZCARD", zset_key}), ":1");
+    const auto trimmed = server.Command({"XTRIM", kStreamKey, "MAXLEN", "0"});
+    EXPECT_TRUE(
+        trimmed.starts_with("-ERR OOM grouped operation scratch admission"))
+        << trimmed;
+    EXPECT_EQ(server.Command({"XLEN", kStreamKey}), ":1");
+    EXPECT_EQ(server.Command({"DEL", kStreamKey}), ":1");
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  ChildServer recovered(image);
+  EXPECT_EQ(recovered.Command({"ZCARD", zset_key}), ":1");
+  EXPECT_EQ(recovered.Command({"EXISTS", kStreamKey}), ":0");
 }
 
 TEST(GroupedRecoveryE2e, IgnoresUncommittedAndFutureGroupVersions) {
