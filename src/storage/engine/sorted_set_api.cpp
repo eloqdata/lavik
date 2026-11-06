@@ -55,9 +55,12 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
   // lock-mode hint, not a retained pointer or a validated read. Key admission
   // closes/drains remote direct readers before IX is granted; the callee
   // checks the current representation again after every acquisition wait.
-  const bool mutation = operation.prepare_unlocked_ &&
-                        (operation.kind_ == SortedSetOperationKind::kAdd ||
-                         operation.kind_ == SortedSetOperationKind::kRemove);
+  const bool mutation =
+      operation.prepare_unlocked_ &&
+      (operation.kind_ == SortedSetOperationKind::kAdd ||
+       operation.kind_ == SortedSetOperationKind::kRemove ||
+       operation.kind_ == SortedSetOperationKind::kPop ||
+       operation.kind_ == SortedSetOperationKind::kRemoveRange);
   const bool partial_read =
       operation.kind_ == SortedSetOperationKind::kScores ||
       operation.kind_ == SortedSetOperationKind::kLength ||
@@ -88,6 +91,10 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
     auto result = co_await [&]() {
       if (read_only)
         return TryConcurrentSortedSetRead(db_id, key, digest, operation);
+      if (operation.kind_ == SortedSetOperationKind::kPop ||
+          operation.kind_ == SortedSetOperationKind::kRemoveRange)
+        return TryConcurrentSortedSetSelection(
+            db_id, key, digest, operation, replication, mutation_precondition);
       const auto count = operation.kind_ == SortedSetOperationKind::kAdd
                              ? operation.entries_.size()
                              : operation.members_.size();

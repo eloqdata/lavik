@@ -286,6 +286,16 @@ window. When the persisted member seed differs from the public cursor seed,
 the compatibility scan protects all ordered pages. Both retain their selected
 S holds through the complete reply and allow unrelated groups to publish.
 
+Standalone ZPOPMIN/ZPOPMAX and ZREMRANGE variants select with temporary S
+groups, release those holds, then acquire member X and merged ordered X/S
+requirements in the global order. Before preparation they validate the
+selection's relevant ordered revisions. Predicate holds remain through
+publication: score ranges and endpoint pops protect their candidate interval
+and neighbours; rank and mixed-score lexical removal protect the whole ordered
+graph because changes elsewhere can change the selected set. Stale selections
+fall back once to key X. Multi-key aggregation, STORE, blocking/multi-key pops,
+and externally locked transactions retain their existing key locks.
+
 ## Durable graph and publication
 
 A small keyed root and auxiliary keyed group records preserve the user-visible

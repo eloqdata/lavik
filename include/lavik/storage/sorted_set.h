@@ -108,10 +108,10 @@ struct SortedSetOperation {
   std::uint64_t scan_cursor_ = 0;
   std::uint64_t scan_count_ = 10;
   std::string_view scan_pattern_ = "*";
-  // Explicit permission from a single-key ZADD/ZREM/ZINCRBY caller to prepare
+  // Explicit permission from a standalone single-key mutation caller to prepare
   // a new collection or small compact update without the store-state mutex.
   // New grouped values include preparation of both indexes. Standalone bounded
-  // grouped member writes may use IX and group holds; structural writes retain
+  // grouped mutations may use IX and group holds; structural writes retain
   // X. Key protection and database admission remain owned through publication;
   // storage independently checks physical eligibility and revalidates before
   // publishing or returning a no-op.

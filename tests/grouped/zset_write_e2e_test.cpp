@@ -1240,7 +1240,7 @@ TEST(GroupedSortedSetWriteE2e, ConcurrentGroupsWaitWakeAndRecover) {
     expected[b] = b_index + 0.5;
     Client client(server.port());
     ExpectDenseZSet(client, key, expected);
-    // Structural/multi-member operations still acquire X after all IX/group
+    // Structural changes and EXEC still acquire X after all IX/group
     // holders drain. Exercise those fences before a cold recovery as well.
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
     ASSERT_EQ(client.Command({"ZREM", key, a}).text_, "QUEUED");
@@ -1661,6 +1661,212 @@ TEST(GroupedSortedSetWriteE2e, BatchWritesOrderAllGroupsAndPublishAtomically) {
   Server recovered(disk, 2);
   Client client(recovered.port());
   ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e,
+     SelectedWritesProtectPredicatesAndAllowMemberReads) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic batch-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "selected-write-locks";
+  std::map<std::string, double> expected;
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    client.Durable();
+  }
+  const auto layout = InspectZSetMembers(disk, key);
+  auto leaf_for = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (const auto& [id, leaf] : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture member route");
+  };
+  const std::vector<std::vector<std::string>> commands{
+      {"ZPOPMIN", key},
+      {"ZPOPMAX", key},
+      {"ZREMRANGEBYSCORE", key, "10", "10"},
+      {"ZREMRANGEBYRANK", key, "10", "10"},
+      {"ZREMRANGEBYLEX", key, "[" + DenseZSetMember(10),
+       "[" + DenseZSetMember(10)}};
+  for (std::size_t test = 0; test < commands.size(); ++test) {
+    SCOPED_TRACE(test);
+    const unsigned a_index = test == 0 ? 0 : test == 1 ? 1023 : 10;
+    const auto a = DenseZSetMember(a_index);
+    unsigned b_index = 600;
+    while (b_index < 800 && leaf_for(DenseZSetMember(b_index)) == leaf_for(a))
+      ++b_index;
+    ASSERT_LT(b_index, 800);
+    const auto b = DenseZSetMember(b_index);
+    const std::string gate = disk.path() + ".selected-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment target("LAVIK_ZSET_GROUP_PAUSE_MEMBER", a.c_str());
+    ScopedEnvironment file("LAVIK_ZSET_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> selected, reader, writer, conflict;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    selected = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command(commands[test]);
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("zset batch group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    reader = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZSCORE", key, b});
+    });
+    ASSERT_EQ(reader.wait_for(3s), std::future_status::ready) << server.Log();
+    EXPECT_EQ(std::stod(reader.get().text_), expected[b]);
+    writer = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZINCRBY", key, "0.03125", b});
+    });
+    if (test < 3) {
+      ASSERT_EQ(writer.wait_for(3s), std::future_status::ready) << server.Log();
+    } else {
+      // Rank/lex selection depends on the full ordered graph, even though
+      // unrelated member projections can continue under IS.
+      EXPECT_EQ(writer.wait_for(100ms), std::future_status::timeout);
+    }
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"ZSCORE", key, a});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    const auto reply = selected.get();
+    expected[b] += 0.03125;
+    EXPECT_EQ(std::stod(writer.get().text_), expected[b]);
+    EXPECT_EQ(conflict.get().text_, "-1");
+    if (test < 2) {
+      ASSERT_EQ(reply.items_.size(), 2) << reply.text_;
+      EXPECT_EQ(reply.items_[0].text_, a);
+      EXPECT_EQ(reply.items_[1].text_, std::to_string(a_index));
+    } else {
+      EXPECT_EQ(reply.text_, "1");
+    }
+    expected.erase(a);
+    Client client(server.port());
+    ExpectDenseZSet(client, key, expected);
+    EXPECT_EQ(client.Command({"ZADD", key, std::to_string(a_index), a}).text_,
+              "1");
+    expected[a] = a_index;
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  ExpectDenseZSet(client, key, expected);
+}
+
+TEST(GroupedSortedSetWriteE2e, PopRevalidatesSelectionAfterReleasingReadLocks) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic selection pause";
+#endif
+  for (unsigned mode : {0U, 1U, 2U}) {
+    SCOPED_TRACE(mode);
+    const bool stale = mode != 0;
+    PrivateDisk disk;
+    const std::string key = "selection-revalidation";
+    std::map<std::string, double> expected;
+    {
+      Server server(disk, 1);
+      Client client(server.port());
+      ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+      client.Durable();
+    }
+    const auto layout = InspectZSetMembers(disk, key);
+    const auto a = DenseZSetMember(0);
+    auto leaf_for = [&](const std::string& member) {
+      const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+      for (const auto& [id, leaf] : layout.leaves_)
+        if (id.ContainsHash(hash)) return id;
+      throw std::runtime_error("missing fixture member route");
+    };
+    unsigned b_index = 900;
+    while (b_index < 1000 && leaf_for(DenseZSetMember(b_index)) == leaf_for(a))
+      ++b_index;
+    ASSERT_LT(b_index, 1000);
+    const auto b = DenseZSetMember(b_index);
+    const std::string selection_gate = disk.path() + ".selection-gate";
+    const std::string batch_gate = disk.path() + ".batch-gate";
+    std::ofstream(selection_gate).put('1');
+    if (!stale) std::ofstream(batch_gate).put('1');
+    ScopedEnvironment select_key("LAVIK_ZSET_SELECTION_PAUSE_KEY", key.c_str());
+    ScopedEnvironment select_file("LAVIK_ZSET_SELECTION_PAUSE_FILE",
+                                  selection_gate.c_str());
+    ScopedEnvironment batch_member("LAVIK_ZSET_GROUP_PAUSE_MEMBER", a.c_str());
+    ScopedEnvironment batch_file("LAVIK_ZSET_GROUP_PAUSE_FILE",
+                                 batch_gate.c_str());
+    {
+      Server server(disk, 1);
+      std::future<Reply> pop, first, second;
+      absl::Cleanup release = [&] {
+        ::unlink(selection_gate.c_str());
+        ::unlink(batch_gate.c_str());
+      };
+      pop = std::async(std::launch::async, [&] {
+        Client client(server.port());
+        return client.Command({"ZPOPMIN", key});
+      });
+      auto wait_for_log = [&](std::string_view marker) {
+        for (unsigned i = 0; i < 200; ++i) {
+          if (server.Log().find(marker) != std::string::npos) return true;
+          std::this_thread::sleep_for(25ms);
+        }
+        return false;
+      };
+      ASSERT_TRUE(wait_for_log("zset selection released before mutation locks"))
+          << server.Log();
+      first = std::async(std::launch::async, [&] {
+        Client client(server.port());
+        if (mode == 2) return client.Command({"ZREM", key, a});
+        return mode == 1 ? client.Command({"ZINCRBY", key, "2", a})
+                         : client.Command({"ZINCRBY", key, "0.25", b});
+      });
+      ASSERT_EQ(first.wait_for(3s), std::future_status::ready) << server.Log();
+      EXPECT_EQ(std::stod(first.get().text_), mode == 2   ? 1
+                                              : mode == 1 ? 2
+                                                          : b_index + 0.25);
+      ::unlink(selection_gate.c_str());
+      if (!stale) {
+        ASSERT_TRUE(wait_for_log("zset batch group locks held before page IO"))
+            << server.Log();
+        // An unrelated root revision must not force key X. A second distant
+        // mutation still completes while the validated pop keeps its groups.
+        second = std::async(std::launch::async, [&] {
+          Client client(server.port());
+          return client.Command({"ZINCRBY", key, "0.25", b});
+        });
+        ASSERT_EQ(second.wait_for(3s), std::future_status::ready)
+            << server.Log();
+        EXPECT_EQ(std::stod(second.get().text_), b_index + 0.5);
+        expected[b] = b_index + 0.5;
+      }
+      ::unlink(batch_gate.c_str());
+      const auto reply = pop.get();
+      ASSERT_EQ(reply.items_.size(), 2) << reply.text_;
+      EXPECT_EQ(reply.items_[0].text_, DenseZSetMember(stale ? 1 : 0));
+      if (mode == 1)
+        expected[a] = 2;
+      else
+        expected.erase(a);
+      if (stale) expected.erase(DenseZSetMember(1));
+      Client client(server.port());
+      ExpectDenseZSet(client, key, expected);
+      client.Durable();
+    }
+    Server recovered(disk, 2);
+    Client client(recovered.port());
+    ExpectDenseZSet(client, key, expected);
+  }
 }
 
 TEST(GroupedSortedSetWriteE2e, ConcurrentPointCommandsPreserveBothIndexes) {

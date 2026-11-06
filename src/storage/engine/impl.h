@@ -2727,6 +2727,23 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition);
 
+  // Immutable predecessor and predicate for a select-then-delete operation.
+  // Relevant ordered revisions must still match after mutation locks are held;
+  // those predicate holds survive through publication to prevent phantoms.
+  struct SortedSetSelectionGuard {
+    GroupedObject::Handle source_;
+    SortedSetOperation operation_;
+  };
+  // Caller owns IX. Select with temporary S groups, release them, then acquire
+  // mutation/predicate groups in the global order. Stale selections use one X
+  // fallback; they are never retried in a loop or published partially.
+  Task<absl::StatusOr<std::optional<SortedSetResult>>>
+  TryConcurrentSortedSetSelection(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
+
   // Caller owns IX. Acquire all member X holds before routing ordered X/S
   // holds; prepare both graphs privately, then publish once. Structural plans
   // return nullopt only before any externally visible mutation.
@@ -2735,7 +2752,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition);
+      const MutationPrecondition* mutation_precondition,
+      const SortedSetSelectionGuard* selection = nullptr);
 
   /// Projects owned scores in request order, preserving duplicates and misses.
   /// The caller retains key S/X, or key IS and every requested member-group S

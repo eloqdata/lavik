@@ -1791,7 +1791,8 @@ Task<absl::StatusOr<std::optional<SortedSetResult>>>
 StorageEngine::Impl::TryConcurrentSortedSetBatch(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition,
+    const SortedSetSelectionGuard* selection) {
   const auto valid = Validate(operation);
   if (!valid.ok()) co_return valid;
   auto& store = CurrentStore();
@@ -1902,6 +1903,7 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
   }
   object = partition.grouped_objects_[db_id].CurrentForMutation(key);
   if (!object || object->incarnation() != incarnation) co_return std::nullopt;
+  if (selection && changes.size() != members.size()) co_return std::nullopt;
   if (changes.empty()) {
     co_await store.store_state_mutex_.Lock();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
@@ -1955,6 +1957,48 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
           ordered_groups.try_emplace(neighbour, GroupedLockMode::kShared);
     }
   }
+  // Selection predicates need protection too. Rank and mixed-score lexical
+  // removal depend on the whole ordered graph. Score removal and endpoint
+  // pops can fence their candidate interval plus neighbouring boundaries.
+  MemoryReservation predicate_admission;
+  std::vector<std::uint64_t> predicate_groups;
+  if (selection) {
+    const auto& source = selection->source_;
+    if (source->incarnation() != object->incarnation()) co_return std::nullopt;
+    const auto& directory = source->ordered_directory();
+    const auto& pages = directory.groups();
+    const auto& selected = selection->operation_;
+    std::size_t first = 0, end = pages.size();
+    if (selected.kind_ == SortedSetOperationKind::kPop) {
+      const auto length = directory.root().item_count_;
+      const auto count = std::min(selected.pop_count_, length);
+      if (!count) co_return std::nullopt;
+      first = directory.FindRank(selected.reverse_ ? length - count : 0)
+                  ->group_index_;
+      end = directory.FindRank(selected.reverse_ ? length - 1 : count - 1)
+                ->group_index_ +
+            1;
+    } else if (selected.range_mode_ == SortedSetRangeMode::kScore) {
+      first = directory.LowerBoundScore(selected.minimum_score_.value_,
+                                        selected.minimum_score_.exclusive_);
+      end = directory.UpperBoundScore(selected.maximum_score_.value_,
+                                      selected.maximum_score_.exclusive_);
+      if (first >= end) co_return std::nullopt;
+    }
+    if (first) --first;
+    if (end < pages.size()) ++end;
+    if (end - first > SIZE_MAX / 128)
+      co_return absl::ResourceExhaustedError(
+          "Sorted Set predicate locks overflow");
+    auto reserved = TryReserveMemory((end - first) * 128);
+    if (!reserved) co_return MemoryLimitError("OOM Sorted Set predicate locks");
+    predicate_admission = std::move(*reserved);
+    predicate_groups.reserve(end - first);
+    for (auto i = first; i < end; ++i) {
+      predicate_groups.push_back(pages[i].id_);
+      ordered_groups.try_emplace(pages[i].id_, GroupedLockMode::kShared);
+    }
+  }
   for (const auto& [id, mode] : ordered_groups) {
     status =
         co_await holds.Acquire({GroupedLockIndex::kOrdered, {id, 0}}, mode);
@@ -1971,6 +2015,20 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
     if (locate(object, member, state.before_) != state.source_ ||
         locate(object, member, state.after_) != state.destination_)
       co_return std::nullopt;
+  }
+  if (selection) {
+    for (const auto id : predicate_groups) {
+      const auto checked = RefreshLockedGroup(partition, db_id, key,
+                                              selection->source_, {id, 0});
+      if (!checked.ok()) {
+        if (absl::IsAborted(checked.status())) co_return std::nullopt;
+        co_return checked.status();
+      }
+    }
+    // The selection's relevant pages still describe exactly the values we
+    // selected. Retaining their S/X holds also prevents phantoms until commit,
+    // so replaying the original predicate in publication order selects the
+    // same members. Unrelated root revisions do not force a retry.
   }
   LAVIK_FAULT_INJECT({
     for (const auto& [member, state] : members) {
@@ -2093,6 +2151,135 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
       operation.diagnostics_);
   if (retry_exclusive) co_return std::nullopt;
   if (!status.ok()) co_return status;
+  co_return std::optional(std::move(result));
+}
+
+Task<absl::StatusOr<std::optional<SortedSetResult>>>
+StorageEngine::Impl::TryConcurrentSortedSetSelection(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
+  const auto valid = Validate(operation);
+  if (!valid.ok()) co_return valid;
+  auto& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  if (!CanPrepareGroupedWriteUnlocked(partition)) co_return std::nullopt;
+  const auto population = CaptureCompactWriteSnapshot(store, partition, db_id);
+  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  if (!found || !found->key_complete() || !found->value_.grouped() ||
+      found->value_.value_type() != ValueType::kSortedSet ||
+      IsExpired(*found,
+                operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis()))
+    co_return std::nullopt;
+  auto view = partition.grouped_objects_[db_id].Lookup(
+      key, GroupedObjectVersion{
+               .root_ = MaterializeIndexLocation(*found),
+               .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+               .replication_epoch_ = partition.replication_epoch_,
+               .index_generation_ = partition.grouped_generations_[db_id]});
+  if (!view.ok()) co_return view.status();
+  if (!*view || !(*view)->has_member_index()) co_return std::nullopt;
+  SortedSetSelectionGuard selection{*view, operation};
+  auto query = operation;
+  query.kind_ = SortedSetOperationKind::kRange;
+  query.packed_output_ = false;
+  if (operation.kind_ == SortedSetOperationKind::kPop) {
+    const auto count = std::min(
+        operation.pop_count_, (*view)->ordered_directory().root().item_count_);
+    if (!count) co_return std::nullopt;
+    query.range_mode_ = SortedSetRangeMode::kRank;
+    query.first_ = 0;
+    query.last_ = count - 1;
+  }
+  // A guaranteed empty ordered page requires topology changes and key X.
+  // Detect it from resident counts/bounds before copying a potentially large
+  // selection that the exclusive planner would then have to read again.
+  const auto& directory = (*view)->ordered_directory();
+  const auto& pages = directory.groups();
+  if (query.range_mode_ == SortedSetRangeMode::kRank) {
+    auto [low, high] =
+        RankSlice(query.first_, query.last_, directory.root().item_count_);
+    if (low < high) {
+      if (query.reverse_) {
+        const auto length = directory.root().item_count_;
+        const auto first = length - high;
+        high = length - low;
+        low = first;
+      }
+      const auto first = *directory.FindRank(low);
+      const auto last = *directory.FindRank(high - 1);
+      const bool starts_page = first.offset_ == 0;
+      const bool ends_page =
+          last.offset_ + 1 == pages[last.group_index_].item_count_;
+      if (first.group_index_ == last.group_index_
+              ? starts_page && ends_page
+              : starts_page || ends_page ||
+                    last.group_index_ > first.group_index_ + 1)
+        co_return std::nullopt;
+    }
+  } else if (query.range_mode_ == SortedSetRangeMode::kScore) {
+    const auto first = directory.LowerBoundScore(
+        query.minimum_score_.value_, query.minimum_score_.exclusive_);
+    const auto end = directory.UpperBoundScore(query.maximum_score_.value_,
+                                               query.maximum_score_.exclusive_);
+    const auto whole = [&](std::size_t i) {
+      const auto low = query.minimum_score_, high = query.maximum_score_;
+      return (low.exclusive_ ? pages[i].min_score_ > low.value_
+                             : pages[i].min_score_ >= low.value_) &&
+             (high.exclusive_ ? pages[i].max_score_ < high.value_
+                              : pages[i].max_score_ <= high.value_);
+    };
+    if (first < end && (end - first > 2 || whole(first) || whole(end - 1)))
+      co_return std::nullopt;
+  }
+  // Selection owns S groups only inside this awaited task. Release all of
+  // them before acquiring member X followed by ordered X/S: no S->X upgrade,
+  // descending acquisition, or retained selection lock can form a cycle.
+  auto selected =
+      co_await TryConcurrentSortedSetRead(db_id, key, digest, query);
+  if (!selected.ok()) co_return selected.status();
+  if (!*selected) co_return std::nullopt;
+  auto result = std::move(**selected);
+  if (result.members_.empty()) {
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    const auto current =
+        partition.grouped_objects_[db_id].CurrentForMutation(key);
+    const auto checked =
+        ValidateGroupedWriteSnapshot(store, partition, db_id, key, current,
+                                     population, mutation_precondition);
+    if (!checked.ok()) co_return checked;
+    co_return std::optional(std::move(result));
+  }
+  LAVIK_FAULT_INJECT({
+    if (LAVIK_FAULT_MATCHES("LAVIK_ZSET_SELECTION_PAUSE_KEY", key)) {
+      spdlog::info("zset selection released before mutation locks");
+      const auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_ZSET_SELECTION_PAUSE_FILE");
+      if (!paused.ok()) co_return paused;
+    }
+  });
+  if (result.members_.size() > SIZE_MAX / sizeof(std::string_view))
+    co_return absl::ResourceExhaustedError("Sorted Set selection overflow");
+  auto admission =
+      TryReserveMemory(result.members_.size() * sizeof(std::string_view));
+  if (!admission) co_return MemoryLimitError("OOM Sorted Set selected members");
+  std::vector<std::string_view> members;
+  members.reserve(result.members_.size());
+  for (const auto& member : result.members_) members.push_back(member.member_);
+  SortedSetOperation remove{.diagnostics_ = operation.diagnostics_,
+                            .kind_ = SortedSetOperationKind::kRemove,
+                            .members_ = members};
+  remove.now_ms_ = operation.now_ms_;
+  auto deleted = co_await TryConcurrentSortedSetBatch(
+      db_id, key, digest, remove, replication, mutation_precondition,
+      &selection);
+  if (!deleted.ok()) co_return deleted.status();
+  if (!*deleted) co_return std::nullopt;
+  result.changed_ = (**deleted).changed_;
+  result.length_ = (**deleted).length_;
+  if (operation.kind_ == SortedSetOperationKind::kRemoveRange)
+    result.members_.clear();
   co_return std::optional(std::move(result));
 }
 

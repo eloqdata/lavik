@@ -1598,6 +1598,7 @@ Task<CommandReply> ExecuteImpl(
       operation.kind_ = storage::SortedSetOperationKind::kPop;
       operation.reverse_ = request.kind_ == CommandKind::kZPopMax;
       operation.pop_count_ = count;
+      operation.prepare_unlocked_ = true;
     }
     auto result =
         co_await RunSortedSet(request, digest, tx, operation, compact);
@@ -1638,9 +1639,10 @@ Task<CommandReply> ExecuteImpl(
     if (range_read || range_remove) {
       auto normalized = ValidateRangeSyntax(request, &operation, &with_scores);
       if (!normalized.ok()) co_return Built(StorageError(builder, normalized));
-      if (range_remove)
+      if (range_remove) {
         operation.kind_ = storage::SortedSetOperationKind::kRemoveRange;
-      else
+        operation.prepare_unlocked_ = true;
+      } else
         operation.packed_output_ = true;
     } else if (request.kind_ == CommandKind::kZRank ||
                request.kind_ == CommandKind::kZRevRank) {
