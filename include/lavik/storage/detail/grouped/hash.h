@@ -364,7 +364,8 @@ struct LoadedHashGroup {
 
 struct HashGroupMutationPlan {
   GroupedHashRoot root_;
-  // Publication must revalidate this version under the exclusive key lock.
+  // Publication revalidates this version under key X, or merges a bounded
+  // plan after validating its protected leaves under IX.
   // It must also preserve the preceding root's transaction dependency until
   // that decision is durable; an uncommitted structural write is not a base
   // on which an independently durable update may be built.
@@ -374,6 +375,15 @@ struct HashGroupMutationPlan {
   bool delete_key_ = false;
   std::vector<HashGroupSnapshot> writes_;
 };
+
+// Merge topology-preserving leaf replacements into the latest root. The caller
+// holds parent IX and X on every changed leaf, or parent X. Unrelated leaves
+// may publish while pages are prepared; their counts and revisions survive.
+// Structural edits and deletion of the final field require whole-key X.
+// The returned root has no revision; assign one at the publication boundary.
+absl::StatusOr<GroupedHashRoot> MergeHashPublication(
+    const HashGroupDirectory& base, const HashGroupDirectory& current,
+    const GroupedHashRoot& planned, std::span<const HashGroupSnapshot> pages);
 
 // Plans a command using only its affected, validated group snapshots. Inputs
 // are scratch owned by this call; failure cannot mutate the current directory.

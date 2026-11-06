@@ -243,6 +243,20 @@ Once a coroutine has entered the worker's ready queue, it must resume before
 its frame can be destroyed. Group lock state has no durable representation and
 does not allocate transaction IDs or revisions.
 
+Standalone grouped Hash point reads and writes use IS/IX with shared/exclusive
+holds on their requested prefix leaves. HSCAN protects its cursor leaf; HLEN
+reads the atomically published cardinality under IS without payload holds.
+Multi-field commands acquire all leaves in identity order before capturing one
+logical view. Holds span IO, private preparation and publication. Physical
+loads validate protected leaf revisions while allowing disjoint root updates.
+Bounded topology-preserving writes merge changed leaves and their count delta
+into the latest root after append resource waits, then allocate a revision and
+stage the complete batch without yielding. The current predecessor decision
+remains a recovery dependency. Splits, demotion, final-field deletion and plans
+exceeding one append range release their groups and IX before one key-X retry.
+Compact values, full projections, random operations and externally locked
+commands retain their whole-key paths.
+
 Standalone ZADD, ZREM and ZINCRBY inspect owner-local key state
 without suspension to choose IX for an existing grouped Sorted Set, then
 recheck its representation after acquisition. The worker lazily owns one group
@@ -381,19 +395,20 @@ This includes both Sorted Set graphs and retained EXEC/Lua key holds, but not
 native candidate ingestion. Plans retain their page admission through commit.
 Reacquisition checks population and the protected logical state even for
 no-ops and last-element deletion; physical relocation alone is allowed.
-Whole-key writers validate root identity, while concurrent Sorted Set point
+Whole-key writers validate root identity, while concurrent Hash and Sorted Set
 writers validate their locked groups. The writer refreshes GC coordinates
 under store state.
 
-Existing standalone Sorted Set updates that preserve page topology and fit
+Existing standalone Hash and Sorted Set updates that preserve page topology and fit
 all changed inline groups plus their root in one append range use a prepared
 batch. Page preparation and append capacity, index-reader and retirement-pin
 waits finish before publication order is assigned. The caller refreshes its
-base after locking and protects affected member pages, ordered pages and their
-routing neighbours through publication, keeping their logical versions stable.
+base after locking and protects affected prefix leaves and, for Sorted Sets,
+ordered pages and their routing neighbours through publication, keeping their
+logical versions stable.
 At the final owner-local boundary, the writer merges count changes into the
 current root and retains the current predecessor decision. It then assigns
-revision and command sequence and stages both graphs and their root without
+revision and command sequence and stages changed pages and their root without
 yielding. Physical GC moves are allowed. A failed merge or encoding leaves the
 append boundary and logical graph unchanged. Replication and full-sync effects
 carry the sequence and cardinality of that final publication.
@@ -403,8 +418,9 @@ retain the multi-append path, with X ordering revisions across its resource
 and extent waits. IX point writers require bounded prepared publication;
 ineligible plans fall back before staging any records. Sorted Set writers bound
 the minimum remaining primary payload using locked page contents and the
-headers of untouched pages, whose retirement requires key X. Distant concurrent
-removals cannot force a compact conversion during the append wait.
+headers of untouched pages, whose retirement requires key X. Hash batches
+recheck their merged byte total after resource waits and request key X if
+disjoint removals make demotion or final-field deletion necessary.
 Full-image, promotion and random Set-pop adapters retain
 their separate preparation paths and share the same publication boundary.
 

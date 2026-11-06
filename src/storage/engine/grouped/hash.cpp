@@ -23,6 +23,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
+#include "absl/numeric/int128.h"
 
 namespace lavik::storage {
 namespace {
@@ -978,6 +979,43 @@ absl::StatusOr<HashGroupDirectory> HashGroupDirectory::Apply(
         "group directory update has gaps or count mismatch");
   }
   return next;
+}
+
+absl::StatusOr<GroupedHashRoot> MergeHashPublication(
+    const HashGroupDirectory& base, const HashGroupDirectory& current,
+    const GroupedHashRoot& planned, std::span<const HashGroupSnapshot> pages) {
+  const auto& before = base.root();
+  const auto same_topology = [&](const GroupedHashRoot& root) {
+    return root.incarnation_ == before.incarnation_ &&
+           root.seed_ == before.seed_ &&
+           root.group_count_ == before.group_count_;
+  };
+  if (!same_topology(planned) || pages.empty())
+    return absl::FailedPreconditionError("Hash plan needs key X");
+  if (!same_topology(current.root()) || current.sequence() < base.sequence())
+    return absl::AbortedError("Hash topology changed during preparation");
+  absl::int128 delta = 0;
+  for (const auto& page : pages) {
+    const auto* old = base.groups().Get(page.id_.prefix_);
+    if (!old || old->id_ != page.id_ || page.retired_ ||
+        page.incarnation_ != before.incarnation_)
+      return absl::FailedPreconditionError("Hash page topology needs key X");
+    const auto* now = current.groups().Get(page.id_.prefix_);
+    if (!now || now->id_ != old->id_ || now->sequence_ != old->sequence_)
+      return absl::AbortedError("protected Hash page changed");
+    delta += static_cast<absl::int128>(page.field_count()) - old->field_count_;
+  }
+  if (static_cast<absl::int128>(before.field_count_) + delta !=
+      planned.field_count_)
+    return absl::InvalidArgumentError("Hash plan count disagrees with pages");
+  const auto count =
+      static_cast<absl::int128>(current.root().field_count_) + delta;
+  if (count <= 0 || count > UINT32_MAX)
+    return absl::FailedPreconditionError("Hash cardinality needs key X");
+  auto merged = current.root();
+  merged.field_count_ = static_cast<std::uint64_t>(count);
+  merged.revision_ = 0;
+  return merged;
 }
 
 absl::StatusOr<HashGroupMutationPlan> PlanHashGroupMutation(

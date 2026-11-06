@@ -209,7 +209,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
         store, partition, db_id, key, digest, object, std::move(remaining),
         std::move(changed), result.length_, value_type,
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition, nullptr, operation.diagnostics_);
+        mutation_precondition, nullptr, nullptr, operation.diagnostics_);
   } else {
     auto detail = MakeSetTrace(operation.diagnostics_);
     status = co_await AppendLocked(

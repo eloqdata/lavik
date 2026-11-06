@@ -138,7 +138,17 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     ValueType value_type, std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    HashGroupMutationPlan* prepared, OnlineLatencyTrace* diagnostics) {
+    HashGroupMutationPlan* prepared, bool* retry_exclusive,
+    OnlineLatencyTrace* diagnostics) {
+  if (retry_exclusive) *retry_exclusive = false;
+  const bool prepared_publication = retry_exclusive != nullptr;
+  const auto needs_x = [&]() {
+    assert(retry_exclusive);
+    *retry_exclusive = true;
+    return absl::AbortedError("Hash plan requires key X");
+  };
+  if (prepared_publication && (!previous || !prepared || tx))
+    co_return needs_x();
   if (!diagnostics && tx) diagnostics = tx->diagnostics_;
   if (field_count == 0 ||
       field_count > std::numeric_limits<std::uint32_t>::max() ||
@@ -149,13 +159,48 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   if (previous && previous->version().root_.value_type() != value_type) {
     co_return absl::InvalidArgumentError("grouped mutation changes value type");
   }
+  auto plan = prepared != nullptr
+                  ? absl::StatusOr<HashGroupMutationPlan>(std::move(*prepared))
+                  : PrepareGroupedHashMutation(previous, std::move(after_image),
+                                               changed_groups, field_count);
+  if (!plan.ok()) co_return plan.status();
+  if (prepared != nullptr) {
+    if (plan->root_.field_count_ != field_count ||
+        (previous
+             ? (plan->expected_sequence_ != previous->directory().sequence() ||
+                plan->root_.incarnation_ != previous->incarnation())
+             : plan->expected_sequence_ != 0))
+      co_return absl::AbortedError("prepared Hash mutation is stale");
+  }
+  const auto planned_root = plan->root_;
+  if (prepared_publication &&
+      !MergeHashPublication(previous->directory(), previous->directory(),
+                            planned_root, plan->writes_)
+           .ok())
+    co_return needs_x();
   const auto db_epoch = EffectiveRecordDbEpoch(partition, db_id);
   const auto replication_epoch = partition.replication_epoch_;
   const auto index_generation = store.index_generations_[db_id];
   const auto grouped_generation = partition.grouped_generations_[db_id];
   auto& side = partition.grouped_objects_[db_id];
   auto source_side = side.CurrentForMutation(key);
-  if (previous && !SameLogicalView(previous, source_side)) {
+  const auto source_matches = [&](const GroupedObject::Handle& current) {
+    if (SameLogicalView(previous, current)) return true;
+    if (!prepared_publication || !current || current->is_ordered())
+      return false;
+    const auto& before = previous->version();
+    const auto& now = current->version();
+    return before.db_epoch_ == now.db_epoch_ &&
+           before.replication_epoch_ == now.replication_epoch_ &&
+           before.index_generation_ == now.index_generation_ &&
+           before.root_.value_type() == now.root_.value_type() &&
+           before.root_.expire_at_ms_ == now.root_.expire_at_ms_ &&
+           MergeHashPublication(previous->directory(), current->directory(),
+                                planned_root, plan->writes_)
+               .ok();
+  };
+  if (previous && !source_matches(source_side)) {
+    if (prepared_publication) co_return needs_x();
     co_return absl::AbortedError("grouped mutation source changed");
   }
   const bool outer_transaction = tx != nullptr;
@@ -182,16 +227,23 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   if (!dependency.ok()) co_return dependency;
   if (EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
       partition.replication_epoch_ != replication_epoch ||
-      store.index_generations_[db_id] != index_generation ||
-      !SameLogicalView(source_side, side.CurrentForMutation(key))) {
+      store.index_generations_[db_id] != index_generation) {
     co_return absl::AbortedError("grouped population changed before mutation");
+  }
+  if (!SameLogicalView(source_side, side.CurrentForMutation(key)) &&
+      !source_matches(side.CurrentForMutation(key))) {
+    if (prepared_publication) co_return needs_x();
+    co_return absl::AbortedError("grouped source changed before mutation");
   }
   // Admission and cross-coordinator dependency waits release the store lock.
   // GC may publish another physical view of this same logical root meanwhile;
   // the publication reservation compares handle identity, not just C/R.
   // Refresh only after the population/logical checks, while the lock is held.
   source_side = side.CurrentForMutation(key);
-  std::uint64_t sequence = 0;
+  // Append admission needs a nonzero placeholder. A prepared batch replaces
+  // it with publication order after the final resource wait.
+  std::uint64_t sequence =
+      prepared_publication ? source_side->command_sequence() : 0;
   if (replica_loading_.load(std::memory_order_acquire)) {
     const auto* sync = partition.replica_sync_.get();
     if (!sync || !sync->command_sequence_) {
@@ -199,10 +251,12 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           "grouped replay has no command sequence");
     }
     sequence = *sync->command_sequence_;
-  } else {
+  } else if (!prepared_publication) {
     sequence = ++partition.mutation_sequence_;
   }
-  if (sequence == 0 || (previous && sequence < previous->command_sequence())) {
+  if (!prepared_publication &&
+      (sequence == 0 ||
+       (previous && sequence < previous->command_sequence()))) {
     co_return absl::FailedPreconditionError(
         "grouped mutation has a stale source command sequence");
   }
@@ -226,22 +280,11 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   const auto command_batch = tx->grouped_ingest_batch_ != nullptr
                                  ? tx->grouped_ingest_batch_->txid_
                                  : batch.txid_;
-  auto plan = prepared != nullptr
-                  ? absl::StatusOr<HashGroupMutationPlan>(std::move(*prepared))
-                  : PrepareGroupedHashMutation(previous, std::move(after_image),
-                                               changed_groups, field_count);
-  if (!plan.ok()) co_return plan.status();
-  if (prepared != nullptr) {
-    if (plan->root_.field_count_ != field_count ||
-        (previous
-             ? (plan->expected_sequence_ != previous->directory().sequence() ||
-                plan->root_.incarnation_ != previous->incarnation())
-             : plan->expected_sequence_ != 0))
-      co_return absl::AbortedError("prepared Hash mutation is stale");
-  }
-  const auto revision = AllocateGroupedRevision();
-  if (revision == 0 ||
-      (previous && revision <= previous->directory().sequence())) {
+  auto revision =
+      prepared_publication ? previous->revision() : AllocateGroupedRevision();
+  if (!prepared_publication &&
+      (revision == 0 ||
+       (previous && revision <= previous->directory().sequence()))) {
     co_return absl::OutOfRangeError(
         "group revision allocation did not advance");
   }
@@ -260,7 +303,9 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   // unmoved and immutable through all writes, including extent IO waits.
   GroupedScratchBudget encoder_budget;
   for (std::size_t i = 0; i < plan->writes_.size(); ++i) {
-    auto added = encoder_budget.AddBytes(sizeof(HashGroupEncoder));
+    auto added = encoder_budget.AddBytes(
+        sizeof(HashGroupEncoder) +
+        (prepared_publication ? sizeof(PreparedGroupRecord) : 0));
     if (!added.ok()) co_return added;
   }
   auto encoder_admission = encoder_budget.Reserve(1);
@@ -289,6 +334,34 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
       encoders.push_back(std::move(*encoder));
     }
   }
+  PreparedGroupBatch prepared_batch;
+  if (prepared_publication) {
+    const auto header_bytes = RecordHeaderBytes(
+        key.size(), key.size() > kInlineKeyMaxBytes, true, false, true);
+    std::size_t bytes = AlignRecord(
+        RecordHeaderBytes(key.size(), key.size() > kInlineKeyMaxBytes, true,
+                          expire_at_ms != 0) +
+        root_payload->size());
+    const auto limit =
+        std::min<std::size_t>(kStorageBlockBytes - kBlockHeaderBytes,
+                              options_.buffers_.write_buffer_bytes_);
+    for (const auto size : encoded_sizes) {
+      const auto added = AlignRecord(header_bytes + size);
+      if (bytes > limit || added > limit - bytes) co_return needs_x();
+      bytes += added;
+    }
+    prepared_batch.records_.reserve(encoders.size());
+    for (std::size_t i = 0; i < encoders.size(); ++i) {
+      const auto size = AlignRecord(header_bytes + encoded_sizes[i]);
+      prepared_batch.records_.push_back(
+          PreparedGroupRecord{.id_ = plan->writes_[i].id_,
+                              .logical_size_ = plan->writes_[i].field_count(),
+                              .payload_ = InlineRecordPayload(encoders[i]),
+                              .disk_bytes_ = size,
+                              .location_ = {}});
+      prepared_batch.disk_bytes_ += size;
+    }
+  }
   // Group payloads include a per-group envelope (and a compact Hash header
   // for each nonempty group). Their sum is therefore an upper bound on the
   // one-header compact image. Decide before staging any auxiliary record.
@@ -311,6 +384,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         }
       }
       if (total < kCollectionDemotionBytes) {
+        if (prepared_publication) co_return needs_x();
         GroupedScratchBudget budget;
         for (const auto& [prefix, metadata] : previous->directory().groups()) {
           (void)prefix;
@@ -410,6 +484,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
   // outer commit retires them. Its existing fence must not point at a block we
   // recycled early; the absent batch decision makes those bytes invisible.
   auto abandon = [&]() -> Task<absl::Status> {
+    // Prepared locations are private predictions until the root is staged.
+    if (prepared_publication) co_return absl::OkStatus();
     for (const auto& record : written) {
       const auto& location = record.location_;
       if (outer_transaction) {
@@ -435,7 +511,17 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
     }
     co_return absl::OkStatus();
   };
-  for (const auto& snapshot : plan->writes_) {
+  if (prepared_publication) {
+    for (const auto& page : prepared_batch.records_) {
+      GroupedRecordLocation record{
+          .id_ = page.id_, .location_ = {}, .extents_ = nullptr};
+      record.location_.logical_size_ = page.logical_size_;
+      written.push_back(std::move(record));
+    }
+  }
+  for (std::size_t i = 0; !prepared_publication && i < plan->writes_.size();
+       ++i) {
+    const auto& snapshot = plan->writes_[i];
     // Fail before the selected auxiliary begins. Already staged earlier
     // auxiliaries exercise command-local batch abort inside an outer EXEC.
     // The key is explicit so unrelated client/maintenance writes are untouched.
@@ -475,6 +561,59 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
                           .encoded_bytes_ = encoded_sizes[i],
                           .retired_ = group.retired_});
   }
+  if (prepared_publication) {
+    prepared_batch.prepare_ = [&]() -> absl::Status {
+      const auto current = side.CurrentForMutation(key);
+      if (!current || current->is_ordered() ||
+          EffectiveRecordDbEpoch(partition, db_id) != db_epoch ||
+          partition.replication_epoch_ != replication_epoch ||
+          store.index_generations_[db_id] != index_generation ||
+          partition.grouped_generations_[db_id] != grouped_generation ||
+          current->version().root_.expire_at_ms_ != expire_at_ms)
+        return absl::AbortedError("Hash population changed before publication");
+      auto merged =
+          MergeHashPublication(previous->directory(), current->directory(),
+                               planned_root, plan->writes_);
+      if (!merged.ok()) {
+        if (absl::IsFailedPrecondition(merged.status())) return needs_x();
+        return merged.status();
+      }
+      // Other groups can shrink while append resources are awaited. Recheck
+      // the demotion threshold before any bytes become visible or durable.
+      absl::int128 total = current->directory().total_group_bytes();
+      for (std::size_t i = 0; i < plan->writes_.size(); ++i) {
+        total -= current->directory()
+                     .groups()
+                     .Get(plan->writes_[i].id_.prefix_)
+                     ->encoded_bytes_;
+        total += encoded_sizes[i];
+      }
+      if (total < kCollectionDemotionBytes) return needs_x();
+      const auto retained = RetainGroupedDependency(store, current, tx);
+      if (!retained.ok()) return retained;
+      revision = AllocateGroupedRevision();
+      if (revision == 0 || revision <= current->revision())
+        return absl::OutOfRangeError("Hash revision did not advance");
+      sequence = ++partition.mutation_sequence_;
+      if (sequence == 0 || sequence < current->command_sequence())
+        return absl::OutOfRangeError("Hash command sequence did not advance");
+      merged->revision_ = revision;
+      auto encoded = EncodeGroupedHashRoot(*merged);
+      if (!encoded.ok()) return encoded.status();
+      // AppendLocked retains a view of this fixed-width allocation across
+      // resource waits. Update its bytes without invalidating that view.
+      if (encoded->size() != root_payload->size())
+        return absl::InternalError("Hash root encoded size changed");
+      std::memcpy(root_payload->data(), encoded->data(), encoded->size());
+      plan->root_ = *merged;
+      prepared_batch.revision_ = revision;
+      prepared_batch.sequence_ = sequence;
+      prepared_batch.logical_size_ = merged->field_count_;
+      for (auto& page : candidates) page.sequence_ = revision;
+      source_side = current;
+      return absl::OkStatus();
+    };
+  }
   GroupedObject::PreparedHandle builder;
   GroupRecordWrite root_write{
       .prepared_root_ = &builder,
@@ -492,6 +631,10 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         if (!SameLogicalView(source_side, current)) {
           return absl::AbortedError(
               "grouped source changed before publication");
+        }
+        if (prepared_publication) {
+          for (std::size_t i = 0; i < written.size(); ++i)
+            written[i].location_ = prepared_batch.records_[i].location_;
         }
         GroupedObjectVersion version = physical;
         version.decision_ = *decision;
@@ -522,8 +665,19 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
         return absl::OkStatus();
       },
       .changed_groups_ = written_ids,
-      .root_incarnation_ = plan->root_.incarnation_};
+      .root_incarnation_ = plan->root_.incarnation_,
+      .batch_ = prepared_publication ? &prepared_batch : nullptr};
   GroupMutationWrite mutation{.sequence_ = sequence, .root_ = &root_write};
+  LAVIK_FAULT_INJECT(if (prepared_publication &&
+                         LAVIK_FAULT_MATCHES("LAVIK_GROUP_PREPARE_PAUSE_KEY",
+                                             key)) {
+    spdlog::info("grouped publication prepared before revision key={}", key);
+    store.store_state_mutex_.Unlock(*store.worker_);
+    auto paused = co_await fault_injection::PauseWhileFileExists(
+        "LAVIK_GROUP_PREPARE_PAUSE_FILE");
+    co_await store.store_state_mutex_.Lock();
+    if (!paused.ok()) co_return paused;
+  });
   LAVIK_MAYBE_CRASH_AT("group-batch-before-root");
   const auto appended = co_await AppendLocked(
       store, partition, db_id, key, digest, *root_payload, RecordKind::kValue,

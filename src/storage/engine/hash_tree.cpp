@@ -774,7 +774,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, std::span<const std::string_view> fields,
-    OnlineLatencyTrace* diagnostics) {
+    bool group_locked, OnlineLatencyTrace* diagnostics) {
   // Keep multi-field planning in its own coroutine so single-field reads do
   // not pay for the plan's allocations or coroutine-frame storage.
   constexpr auto max_size = std::numeric_limits<std::size_t>::max();
@@ -840,7 +840,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
       ++end;
     auto loaded = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, requests[begin].group_,
-        false, false, diagnostics);
+        false, group_locked, diagnostics);
     if (!loaded.ok()) [[unlikely]]
       co_return loaded.status();
     const auto bytes = loaded->loaded_.value();
@@ -875,10 +875,19 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashOperation& operation, ValueType value_type, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
-    const MutationPrecondition* mutation_precondition) {
+    const MutationPrecondition* mutation_precondition, bool* retry_exclusive) {
   // Private preparation allocations must unwind here: Bycorf terminates on
   // exceptions escaping a coroutine body, even when its caller has a catch.
   assert(db_id < kLogicalDatabaseCount);
+  if (retry_exclusive) {
+    assert(tx == nullptr);
+    *retry_exclusive = false;
+  }
+  const auto needs_key_lock = [&]() {
+    assert(retry_exclusive);
+    *retry_exclusive = true;
+    return absl::AbortedError("Hash operation requires whole-key lock");
+  };
   const bool replace = operation.kind_ == HashOperationKind::kReplaceOnly;
   if (replace && (value_type != ValueType::kHash || operation.fields_.empty() ||
                   operation.fields_.size() != operation.values_.size())) {
@@ -913,6 +922,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const std::uint64_t now_ms =
       operation.now_ms_ == 0 ? UnixTimeMillis() : operation.now_ms_;
   const bool exists = stored_value && !IsExpired(*found, now_ms);
+  if (retry_exclusive &&
+      (!exists || !found->key_complete() || !found->value_.grouped() ||
+       found->value_.value_type() != value_type ||
+       !CanPrepareGroupedWriteUnlocked(partition)))
+    co_return needs_key_lock();
   if (!exists && stored_value && found->value_.grouped()) {
     auto metadata = co_await ReadKeyMetadataLocked(db_id, key, digest);
     if (!metadata.ok()) co_return metadata.status();
@@ -1054,6 +1068,20 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
   });
 
+  LAVIK_FAULT_INJECT({
+    if (retry_exclusive &&
+        LAVIK_FAULT_MATCHES("LAVIK_HASH_GROUP_PAUSE_KEY", key) &&
+        (operation.fields_.empty()
+             ? std::getenv("LAVIK_HASH_GROUP_PAUSE_FIELD") == nullptr
+             : LAVIK_FAULT_MATCHES("LAVIK_HASH_GROUP_PAUSE_FIELD",
+                                   operation.fields_.front()))) {
+      spdlog::info("hash group locks held before page IO write={}", !read_only);
+      const auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_HASH_GROUP_PAUSE_FILE");
+      if (!paused.ok()) co_return paused;
+    }
+  });
+
   if (grouped != nullptr && IsCompactPointRead(operation.kind_) &&
       operation.fields_.empty())
     co_return result;
@@ -1070,8 +1098,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (route == nullptr) [[unlikely]]
       co_return absl::DataLossError("missing Hash field route");
     auto loaded = co_await LoadHashGroupPayload(
-        store, partition, db_id, key, digest, grouped, route->id_, false, false,
-        operation.diagnostics_);
+        store, partition, db_id, key, digest, grouped, route->id_, false,
+        retry_exclusive != nullptr, operation.diagnostics_);
     if (!loaded.ok()) [[unlikely]] {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1103,7 +1131,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                              operation.kind_ == HashOperationKind::kGetMany)) {
     auto values = co_await ReadGroupedHashFields(
         store, partition, db_id, key, digest, grouped, operation.fields_,
-        operation.diagnostics_);
+        retry_exclusive != nullptr, operation.diagnostics_);
     if (!values.ok() && read_epoch_changed()) [[unlikely]]
       co_return HashResult{};
     co_return values;
@@ -1132,8 +1160,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (entry == nullptr)
       co_return absl::DataLossError("grouped scan has no physical page");
     auto loaded = co_await LoadHashGroupPayload(
-        store, partition, db_id, key, digest, grouped, route->id_, false, false,
-        operation.diagnostics_);
+        store, partition, db_id, key, digest, grouped, route->id_, false,
+        retry_exclusive != nullptr, operation.diagnostics_);
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1330,8 +1358,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         edits.push_back(leaf_edits[begin++].view_);
       } while (begin < leaf_edits.size() && leaf_edits[begin].id_ == id);
       auto loaded = co_await LoadHashGroupPayload(
-          store, partition, db_id, key, digest, grouped, id, false, false,
-          operation.diagnostics_);
+          store, partition, db_id, key, digest, grouped, id, false,
+          retry_exclusive != nullptr, operation.diagnostics_);
       if (!loaded.ok()) co_return loaded.status();
       const auto bytes = loaded->loaded_.value();
       auto edited = ApplyHashGroupEdits(
@@ -1368,7 +1396,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         if (unlocked_grouped_write) co_await bycorf::Yield(*store.worker_);
         auto loaded = co_await LoadHashGroupSnapshot(
             store, partition, db_id, key, digest, grouped, id, false, nullptr,
-            false, operation.diagnostics_);
+            retry_exclusive != nullptr, operation.diagnostics_);
         if (!loaded.ok()) {
           if (read_epoch_changed()) co_return HashResult{};
           co_return loaded.status();
@@ -1727,6 +1755,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                        : location.logical_size_ - selected_field_count +
                              compact.entries_.size();
   result.key_exists_ = result.length_ != 0;
+  if (retry_exclusive && result.changed_ && !result.key_exists_)
+    co_return needs_key_lock();
   if (unlocked_grouped_write) {
     if (!grouped_plan && result.changed_ && result.key_exists_) {
       const std::vector<GroupedRecordId> changed(changed_groups.begin(),
@@ -1738,8 +1768,23 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     }
     co_await store.store_state_mutex_.Lock();
     unlock.Adopt();
+    auto validated = grouped;
+    if (retry_exclusive) {
+      // Keep the original root for the plan's count delta; validate only the
+      // protected leaves against current state. Disjoint publications and GC
+      // can change the root while these page reads and preparations suspend.
+      for (const auto field : operation.fields_) {
+        const auto* route = grouped->directory().Find(field);
+        if (!route)
+          co_return absl::DataLossError("missing protected Hash route");
+        auto refreshed =
+            RefreshLockedGroup(partition, db_id, key, grouped, route->id_);
+        if (!refreshed.ok()) co_return refreshed.status();
+        validated = std::move(*refreshed);
+      }
+    }
     const auto valid = ValidateGroupedWriteSnapshot(
-        store, partition, db_id, key, grouped, observed_write,
+        store, partition, db_id, key, validated, observed_write,
         mutation_precondition != nullptr
             ? mutation_precondition
             : (tx != nullptr ? &tx->mutation_precondition_ : nullptr));
@@ -1833,7 +1878,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
                                      changed_groups.end()),
         result.length_, value_type, expire_at_ms, tx, replication,
         mutation_precondition, grouped_plan ? &*grouped_plan : nullptr,
-        operation.diagnostics_);
+        retry_exclusive, operation.diagnostics_);
     if (!written.ok()) co_return written;
     co_return result;
   }

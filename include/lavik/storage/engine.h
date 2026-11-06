@@ -1879,6 +1879,9 @@ class StorageEngine {
       const SortedSetOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
+  // Standalone grouped Hash point/scan operations use parent IS/IX and hold
+  // all selected groups through IO. Structural writes retry under whole-key X;
+  // compact and externally locked operations retain their existing paths.
   bycorf::Task<absl::StatusOr<HashResult>> ExecuteHash(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr,

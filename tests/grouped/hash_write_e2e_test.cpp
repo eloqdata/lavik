@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 
+#include "absl/cleanup/cleanup.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "write_e2e_support.h"
 
@@ -37,6 +38,7 @@ std::vector<std::string> HashCommand(std::string key, char value = 'v') {
 struct HashDiskLayout {
   GroupedHashRoot root_;
   bool empty_tail_ = false;
+  std::vector<GroupedRecordId> leaves_;
 };
 
 TEST(CompactHashWriteE2e, ColdUpdateKeepsCompactEncodingAndRecovers) {
@@ -166,6 +168,10 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
     auto& winner = newest[{record.group_prefix_, record.group_prefix_bits_}];
     if (winner.mutation_sequence_ <= record.mutation_sequence_) winner = record;
   }
+  for (const auto& [id, record] : newest)
+    if (!record.group_retired_)
+      result.leaves_.push_back(
+          {id.first, static_cast<std::uint8_t>(id.second)});
   for (auto it = newest.rbegin(); it != newest.rend(); ++it) {
     if (!it->second.group_retired_) {
       result.empty_tail_ = it->second.logical_size_ == 0;
@@ -173,6 +179,427 @@ HashDiskLayout InspectHashLayout(const PrivateDisk& disk,
     }
   }
   return result;
+}
+
+// A late IX rejection must not carry its captured expiration into the next
+// incarnation. Use a real native replica and a same-partition barrier so an
+// expired stale PEXPIREAT cannot hide behind replication lag.
+void CheckHashLikeRetryReplication(bool set) {
+  PrivateDisk primary_disk, replica_disk;
+  const std::string key = "collection{retry-ttl}";
+  const std::string barrier = "barrier{retry-ttl}";
+  const std::string a = set ? std::string(10000, 'a') : "a";
+  const std::string b = set ? std::string(10000, 'b') : "b";
+  {
+    Server seed(primary_disk, 1);
+    Client client(seed.port());
+    const auto reply =
+        set ? client.Command({"SADD", key, a, b, "keep"})
+            : client.Command({"HSET", key, a, std::string(10000, 'a'), b,
+                              std::string(10000, 'b'), "keep", "old"});
+    ASSERT_EQ(reply.text_, "3");
+    client.Durable();
+    ASSERT_EQ(seed.Wait(true), 0) << seed.Log();
+  }
+  const auto layout = InspectHashLayout(primary_disk, key);
+  const auto route = [&](std::string_view field) {
+    const auto digest = ComputeDigest(field, layout.root_.seed_).value_;
+    for (const auto id : layout.leaves_)
+      if (id.ContainsHash(digest)) return id;
+    throw std::runtime_error("missing TTL fixture route");
+  };
+  ASSERT_NE(route(a), route(b));
+  const std::string gate = primary_disk.path() + ".replication-gate";
+  std::ofstream(gate).put('1');
+  std::ofstream(gate + ".arm").put('1');
+  std::unique_ptr<Server> primary;
+  {
+    // Only the primary inherits the fault; replica replay uses its normal path.
+    ScopedEnvironment pause_key("LAVIK_GROUP_REPLICATION_PAUSE_KEY",
+                                key.c_str());
+    ScopedEnvironment pause_file("LAVIK_GROUP_REPLICATION_PAUSE_FILE",
+                                 gate.c_str());
+    primary = std::make_unique<Server>(primary_disk, 1);
+  }
+  Server replica(replica_disk, 1);
+  Client source(primary->port()), follower(replica.port());
+  std::future<Reply> deleting, disjoint, rebuilding;
+  absl::Cleanup release = [&] {
+    ::unlink(gate.c_str());
+    ::unlink((gate + ".arm").c_str());
+  };
+  ASSERT_EQ(follower
+                .Command({"LAVIK.REPLICAOF", "127.0.0.1",
+                          std::to_string(primary->port())})
+                .text_,
+            "OK");
+  ASSERT_EQ(follower.Command({"READONLY"}).text_, "OK");
+  auto await_barrier = [&](std::string_view expected) {
+    for (unsigned i = 0; i < 600; ++i) {
+      const auto reply = follower.Command({"GET", barrier});
+      if (reply.kind_ == '$' && reply.text_ == expected) return true;
+      std::this_thread::sleep_for(25ms);
+    }
+    return false;
+  };
+  ASSERT_EQ(source.Command({"SET", barrier, "before"}).text_, "OK");
+  ASSERT_TRUE(await_barrier("before")) << primary->Log() << replica.Log();
+  const auto expires = std::chrono::system_clock::now() + 10s;
+  const auto expires_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              expires.time_since_epoch())
+                              .count();
+  ASSERT_EQ(
+      source.Command({"PEXPIREAT", key, std::to_string(expires_ms)}).text_,
+      "1");
+  deleting = std::async(std::launch::async, [&] {
+    Client client(primary->port());
+    return client.Command({set ? "SREM" : "HDEL", key, a});
+  });
+  bool paused = false;
+  for (unsigned i = 0; i < 200; ++i) {
+    paused = primary->Log().find(
+                 "grouped replication prepared before publication") !=
+             std::string::npos;
+    if (paused) break;
+    std::this_thread::sleep_for(25ms);
+  }
+  ASSERT_TRUE(paused) << primary->Log();
+  // Each deletion alone stays above demotion. Their combined image drops
+  // below the demotion threshold, so A must fail its final prepared admission.
+  disjoint = std::async(std::launch::async, [&] {
+    Client client(primary->port());
+    return client.Command({set ? "SREM" : "HDEL", key, b});
+  });
+  ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << primary->Log();
+  ASSERT_EQ(disjoint.get().text_, "1");
+  ASSERT_LT(std::chrono::system_clock::now(), expires);
+  rebuilding = std::async(std::launch::async, [&] {
+    Client client(primary->port());
+    Check(client.Command({"MULTI"}).text_ == "OK", "MULTI failed");
+    Check(client.Command({"DEL", key}).text_ == "QUEUED", "DEL not queued");
+    const auto write =
+        set ? client.Command({"SADD", key, "keep", a})
+            : client.Command({"HSET", key, "keep", "safe", a, "remove-me"});
+    Check(write.text_ == "QUEUED", "recreation not queued");
+    return client.Command({"EXEC"});
+  });
+  EXPECT_EQ(rebuilding.wait_for(100ms), std::future_status::timeout);
+  // The queued key-X recreation wins when A releases IX. Make the old TTL
+  // already expired so a leaked effect destroys the fresh non-expiring key.
+  std::this_thread::sleep_until(expires + 50ms);
+  ::unlink(gate.c_str());
+  ASSERT_EQ(rebuilding.wait_for(5s), std::future_status::ready)
+      << primary->Log();
+  const auto rebuilt = rebuilding.get();
+  ASSERT_EQ(rebuilt.items_.size(), 2) << rebuilt.text_ << primary->Log();
+  EXPECT_EQ(rebuilt.items_[1].text_, "2");
+  ASSERT_EQ(deleting.wait_for(5s), std::future_status::ready) << primary->Log();
+  EXPECT_EQ(deleting.get().text_, "1");
+  EXPECT_EQ(source.Command({set ? "SCARD" : "HLEN", key}).text_, "1");
+  EXPECT_EQ(source.Command({set ? "SISMEMBER" : "HGET", key, "keep"}).text_,
+            set ? "1" : "safe");
+  EXPECT_EQ(source.Command({"PTTL", key}).text_, "-1");
+  ASSERT_EQ(source.Command({"SET", barrier, "after"}).text_, "OK");
+  ASSERT_TRUE(await_barrier("after")) << primary->Log() << replica.Log();
+  EXPECT_EQ(follower.Command({set ? "SCARD" : "HLEN", key}).text_, "1")
+      << replica.Log();
+  EXPECT_EQ(follower.Command({set ? "SISMEMBER" : "HGET", key, "keep"}).text_,
+            set ? "1" : "safe");
+  EXPECT_EQ(follower.Command({"PTTL", key}).text_, "-1");
+
+  // The successful IX path must still publish its current TTL. Re-promote,
+  // then remove one large field while the other keeps the graph grouped.
+  const auto expanded =
+      set ? source.Command({"SADD", key, a, b})
+          : source.Command({"HSET", key, a, std::string(10000, 'a'), b,
+                            std::string(10000, 'b')});
+  ASSERT_EQ(expanded.text_, "2");
+  const auto new_expiry =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          (std::chrono::system_clock::now() + 60s).time_since_epoch())
+          .count();
+  ASSERT_EQ(
+      source.Command({"PEXPIREAT", key, std::to_string(new_expiry)}).text_,
+      "1");
+  ASSERT_EQ(source.Command({set ? "SREM" : "HDEL", key, b}).text_, "1");
+  ASSERT_EQ(source.Command({"SET", barrier, "retained"}).text_, "OK");
+  ASSERT_TRUE(await_barrier("retained")) << primary->Log() << replica.Log();
+  EXPECT_EQ(source.Command({"PEXPIRETIME", key}).text_,
+            std::to_string(new_expiry));
+  EXPECT_EQ(follower.Command({"PEXPIRETIME", key}).text_,
+            std::to_string(new_expiry));
+  EXPECT_EQ(follower.Command({set ? "SCARD" : "HLEN", key}).text_, "2");
+}
+
+TEST(GroupedHashWriteE2e,
+     IntentRetryDiscardsPreviousIncarnationReplicationTTL) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic prepared replication pause";
+#endif
+  CheckHashLikeRetryReplication(false);
+}
+
+// A paused page operation must retain its group while other groups can publish
+// a new root. Decode routes from the durable fixture, not the process seed.
+void CheckHashLikeIntent(bool set, bool read) {
+  PrivateDisk disk;
+  const std::string key = set ? "set-intent" : "hash-intent";
+  constexpr unsigned count = 1024;
+  auto field = [](unsigned i) {
+    return "field-" + std::to_string(i) + std::string(128, 'f');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{set ? "SADD" : "HSET", key};
+    for (unsigned i = 0; i < count; ++i) {
+      seed.push_back(field(i));
+      if (!set) seed.push_back("0");
+    }
+    ASSERT_EQ(client.Command(seed).text_, std::to_string(count));
+    client.Durable();
+  }
+  const auto layout = InspectHashLayout(disk, key);
+  ASSERT_GT(layout.leaves_.size(), 2);
+  const auto route = [&](const std::string& member) {
+    const auto hash = ComputeDigest(member, layout.root_.seed_).value_;
+    for (auto id : layout.leaves_)
+      if (id.ContainsHash(hash)) return id;
+    throw std::runtime_error("missing fixture Hash route");
+  };
+  auto a = field(read ? 0 : count);
+  if (!read) {
+    // A structural retry drops IX before acquiring key X, allowing the
+    // queued remover to run before this insertion. This case tests ordinary
+    // group-lock handoff, so choose a leaf with room under the persisted seed.
+    std::map<std::uint64_t, std::size_t> entry_bytes;
+    for (unsigned i = 0; i < count; ++i) {
+      const auto member = field(i);
+      entry_bytes[route(member).prefix_] += 8 + member.size() + (set ? 0 : 1);
+    }
+    unsigned candidate = count;
+    for (; candidate < 2 * count; ++candidate) {
+      a = field(candidate);
+      if (kHashValueHeaderBytes + entry_bytes[route(a).prefix_] + 8 + a.size() +
+              (set ? 0 : 1) <=
+          kCollectionGroupTargetBytes)
+        break;
+    }
+    ASSERT_LT(candidate, 2 * count);
+  }
+  unsigned other = 1;
+  while (other < count && route(field(other)) == route(a)) ++other;
+  ASSERT_LT(other, count);
+  const auto b = field(other);
+  const auto expected_count =
+      count - 1 - (read ? 1 : 0) + (!read && !set ? 1 : 0);
+  {
+    const std::string gate = disk.path() + ".intent-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD", a.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+    const std::array<std::string_view, 1> crc{"--record-crc"};
+    Server server(disk, 1, {}, {}, false, 2, "2G", {}, {}, 0, 20, crc);
+    std::future<Reply> first, disjoint, conflicting;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      if (read)
+        return client.Command({set ? "SMISMEMBER" : "HMGET", key, a, a});
+      if (set) return client.Command({"SADD", key, a, a});
+      return client.Command({"HSET", key, a, "1", a, "2"});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    disjoint = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, b});
+    });
+    ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(disjoint.get().text_, "1");
+    Client observer(server.port());
+    EXPECT_EQ(observer.Command({set ? "SCARD" : "HLEN", key}).text_,
+              std::to_string(count - 1));
+    // Scan a different leaf while the first request still owns its group.
+    const auto scan =
+        observer.Command({set ? "SSCAN" : "HSCAN", key,
+                          std::to_string(route(b).prefix_), "COUNT", "1"});
+    EXPECT_EQ(scan.kind_, '*') << scan.text_;
+    conflicting = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      if (read || set) return client.Command({set ? "SREM" : "HDEL", key, a});
+      return client.Command({"HINCRBY", key, a, "1"});
+    });
+    EXPECT_EQ(conflicting.wait_for(100ms), std::future_status::timeout);
+    EXPECT_EQ(first.wait_for(0ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    const auto result = first.get();
+    if (read) {
+      ASSERT_EQ(result.items_.size(), 2) << result.text_ << server.Log();
+      EXPECT_EQ(result.items_[0].text_, set ? "1" : "0");
+      EXPECT_EQ(result.items_[1].text_, set ? "1" : "0");
+    } else {
+      EXPECT_EQ(result.text_, "1") << server.Log();
+    }
+    ASSERT_EQ(conflicting.get().text_, read || set ? "1" : "3") << server.Log();
+    EXPECT_EQ(observer.Command({set ? "SCARD" : "HLEN", key}).text_,
+              std::to_string(expected_count));
+    observer.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({set ? "SCARD" : "HLEN", key}).text_,
+            std::to_string(expected_count));
+  EXPECT_EQ(client.Command({set ? "SISMEMBER" : "HEXISTS", key, b}).text_, "0");
+  if (!read && !set) {
+    EXPECT_EQ(client.Command({"HGET", key, a}).text_, "3");
+    EXPECT_EQ(client.Command({"HSETNX", key, a, "9"}).text_, "0");
+    EXPECT_EQ(client.Command({"HINCRBYFLOAT", key, a, "0.5"}).text_, "3.5");
+    EXPECT_EQ(client.Command({"HSTRLEN", key, a}).text_, "3");
+  } else {
+    EXPECT_EQ(client.Command({set ? "SISMEMBER" : "HEXISTS", key, a}).text_,
+              "0");
+  }
+}
+
+void CheckHashLikeLastDeletion(bool set) {
+  PrivateDisk disk;
+  const std::string key = "intent-final-delete";
+  const std::string a(18000, 'a'), b(18000, 'b');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    const auto seed =
+        set ? std::vector<std::string>{"SADD", key, a, b}
+            : std::vector<std::string>{"HSET", key, a, "0", b, "0"};
+    ASSERT_EQ(client.Command(seed).text_, "2");
+    client.Durable();
+  }
+  ASSERT_GT(InspectHashLayout(disk, key).root_.group_count_, 1);
+  {
+    const std::string gate = disk.path() + ".delete-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD", a.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, other;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, a});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    other = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, b});
+    });
+    ASSERT_EQ(other.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(other.get().text_, "1");
+    ::unlink(gate.c_str());
+    ASSERT_EQ(first.wait_for(5s), std::future_status::ready) << server.Log();
+    EXPECT_EQ(first.get().text_, "1") << server.Log();
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+    client.Durable();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"EXISTS", key}).text_, "0");
+}
+
+TEST(GroupedHashWriteE2e, ConcurrentFinalDeletionRetriesUnderKeyX) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeLastDeletion(false);
+}
+
+TEST(GroupedHashWriteE2e, StructuralRetryReleasesGroupsBeforeTakingKeyX) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "hash-structural-retry";
+  const std::string field = "field0";
+  const std::string large(70000, 'x');
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    ASSERT_EQ(client.Command(HashCommand(key)).text_, "256");
+    client.Durable();
+  }
+  {
+    const std::string gate = disk.path() + ".structural-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD",
+                                  field.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, conflict;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"HSET", key, field, large});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash group locks held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({"HDEL", key, field});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    ASSERT_EQ(conflict.wait_for(5s), std::future_status::ready) << server.Log();
+    EXPECT_EQ(conflict.get().text_, "1");
+    ASSERT_EQ(first.wait_for(5s), std::future_status::ready) << server.Log();
+    // The waiting IX delete runs before the released writer can get key X.
+    // Re-execution must observe that deletion and report an insertion.
+    EXPECT_EQ(first.get().text_, "1") << server.Log();
+    Client client(server.port());
+    EXPECT_EQ(client.Command({"HLEN", key}).text_, "256");
+    EXPECT_EQ(client.Command({"HGET", key, field}).text_, large);
+    client.Durable();
+  }
+  Server recovered(disk, 1);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({"HLEN", key}).text_, "256");
+  EXPECT_EQ(client.Command({"HGET", key, field}).text_, large);
+}
+
+TEST(GroupedHashWriteE2e, IntentWritesMergeDisjointCountsAndWakeConflicts) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeIntent(false, false);
+}
+
+TEST(GroupedHashWriteE2e, IntentReadsProtectOnlyRequestedLeaves) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeIntent(false, true);
 }
 
 TEST(GroupedHashWriteE2e,
