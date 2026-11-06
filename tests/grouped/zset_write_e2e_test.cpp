@@ -489,6 +489,21 @@ std::vector<std::string> DenseZSetSeed(
   return command;
 }
 
+void FillDenseZSetHead(Client& client, const std::string& key,
+                       std::map<std::string, double>& expected) {
+  // Probe-retention regressions need more than 128 members on the source
+  // page. Consume split headroom without changing the page's upper boundary
+  // or the separately probed member 500.
+  std::vector<std::string> command{"ZADD", key, "CH"};
+  for (unsigned i = 0; i < 64; ++i) {
+    const auto score = i + 0.5;
+    const auto member = DenseZSetMember(800 + i);
+    command.insert(command.end(), {std::to_string(score), member});
+    expected[member] = score;
+  }
+  ASSERT_EQ(client.Command(command).text_, "64");
+}
+
 void ExpectDenseZSet(Client& client, std::string_view key,
                      const std::map<std::string, double>& expected) {
   EXPECT_EQ(client.Command({"ZCARD", std::string(key)}).text_,
@@ -634,10 +649,10 @@ TEST(GroupedSortedSetWriteE2e, EncodedPointEditsPreserveExpiryAndDemote) {
     expected.erase(erased);
     ASSERT_EQ(client.Command({"ZADD", key, "12", erased}).text_, "1");
     expected[erased] = 12;
-    // Walk a coprime permutation so no ordered page becomes empty. The final
-    // point deletion crosses the aggregate demotion threshold with encoded
-    // after-images, exercising the publication path's compact materialization.
-    for (unsigned i = 0; i < 854; ++i) {
+    // Walk a coprime permutation so no ordered page becomes empty before
+    // crossing the aggregate demotion threshold with encoded after-images.
+    // Leave enough margin for the headers of the less densely filled pages.
+    for (unsigned i = 0; i < 1024 - 128; ++i) {
       const auto member = DenseZSetMember((i * 17) % 1024);
       ASSERT_EQ(client.Command({"ZREM", key, member}).text_, "1") << i;
       expected.erase(member);
@@ -666,6 +681,7 @@ TEST(GroupedSortedSetWriteE2e, DensePointSourceAvoidsSecondPlanRead) {
                   WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    FillDenseZSetHead(client, key, expected);
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -723,6 +739,7 @@ TEST(GroupedSortedSetWriteE2e,
                   WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    FillDenseZSetHead(client, key, expected);
     // Make room without changing the first page's upper score. The point
     // move then tests source+boundary reuse, independently of split policy.
     ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(20)}).text_, "1");
@@ -791,6 +808,7 @@ TEST(GroupedSortedSetWriteE2e, DensePointProbeRetentionFallsBackWithoutOOM) {
                   WithStorageBaseline(128 * kMiB, 1));
     Client client(server.port());
     ASSERT_EQ(client.Command(DenseZSetSeed(key, &expected)).text_, "1024");
+    FillDenseZSetHead(client, key, expected);
     ASSERT_EQ(client.Command({"ZREM", key, DenseZSetMember(20)}).text_, "1");
     expected.erase(DenseZSetMember(20));
     client.Durable();
@@ -1509,15 +1527,17 @@ TEST(GroupedSortedSetWriteE2e, DuplicateMemberInputsKeepSequentialConditions) {
 
 TEST(GroupedSortedSetWriteE2e, AdjacentScoreMovesReusePagesAcrossRecovery) {
   PrivateDisk disk;
-  auto member = [](unsigned i) { return std::string(1024, 'a' + i); };
+  // One large member fills each page even with split headroom. Moving one
+  // into its neighbour must redistribute the pair without retiring either id.
+  auto member = [](unsigned i) { return std::string(4096, 'a' + i); };
   auto verify = [&](Client& client, bool moved) {
-    EXPECT_EQ(client.Command({"ZCARD", "adjacent"}).text_, "21");
+    EXPECT_EQ(client.Command({"ZCARD", "adjacent"}).text_, "6");
     auto reply =
         client.Command({"ZRANGE", "adjacent", "0", "-1", "WITHSCORES"});
-    ASSERT_EQ(reply.items_.size(), 42);
+    ASSERT_EQ(reply.items_.size(), 12);
     std::vector<std::pair<double, std::string>> expected;
-    for (unsigned i = 0; i < 21; ++i) {
-      const double score = i == 6 && moved ? 7.5 : double(i);
+    for (unsigned i = 0; i < 6; ++i) {
+      const double score = i == 0 && moved ? 0.5 : double(i);
       expected.emplace_back(score, member(i));
       EXPECT_EQ(
           std::stod(client.Command({"ZSCORE", "adjacent", member(i)}).text_),
@@ -1540,24 +1560,24 @@ TEST(GroupedSortedSetWriteE2e, AdjacentScoreMovesReusePagesAcrossRecovery) {
     Server server(disk);
     Client client(server.port());
     std::vector<std::string> seed{"ZADD", "adjacent"};
-    for (unsigned i = 0; i < 21; ++i)
+    for (unsigned i = 0; i < 6; ++i)
       seed.insert(seed.end(), {std::to_string(i), member(i)});
-    ASSERT_EQ(client.Command(seed).text_, "21");
+    ASSERT_EQ(client.Command(seed).text_, "6");
     verify(client, false);
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   const auto ids = page_ids();
-  ASSERT_EQ(ids.size(), 3);
+  ASSERT_EQ(ids.size(), 6);
   {
     Server server(disk, 3);
     Client client(server.port());
     for (unsigned i = 0; i < 12; ++i) {
-      ASSERT_EQ(client.Command({"ZINCRBY", "adjacent", "1.5", member(6)}).text_,
-                "7.5");
+      ASSERT_EQ(client.Command({"ZINCRBY", "adjacent", "0.5", member(0)}).text_,
+                "0.5");
       verify(client, true);
       ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
-      ASSERT_EQ(client.Command({"ZADD", "adjacent", "6", member(6)}).text_,
+      ASSERT_EQ(client.Command({"ZADD", "adjacent", "0", member(0)}).text_,
                 "QUEUED");
       ASSERT_EQ(client.Command({"EXEC"}).items_.size(), 1);
       verify(client, false);
@@ -1616,7 +1636,8 @@ TEST(GroupedSortedSetWriteE2e, HeadInsertionsReuseNeighborCapacityAndRecover) {
     Server server(disk, 1);
     Client client(server.port());
     std::vector<std::string> seed{"ZADD", key};
-    // Exactly 30 framed 256-byte members fit each 8 KiB ordered page.
+    // Each 8 KiB page can hold 30 members; splitting leaves 15 in the
+    // preceding pages, while a fitting final remainder stays whole.
     for (unsigned i = 0; i < 90; ++i) {
       seed.insert(seed.end(), {std::to_string(i), member(i)});
       expected[member(i)] = i;
@@ -1625,11 +1646,35 @@ TEST(GroupedSortedSetWriteE2e, HeadInsertionsReuseNeighborCapacityAndRecover) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  ASSERT_EQ(latest_root().group_count_, 3);
+  const auto initial = latest_root();
+  ASSERT_EQ(initial.group_count_, 5);
+  const auto initial_head = FirstDenseOrderedPage(disk, key);
+  ASSERT_TRUE(initial_head.has_value());
+  ASSERT_EQ(initial_head->entries_.size(), 15);
   {
     Server server(disk, 3);
     Client client(server.port());
-    for (unsigned i = 90; i < 150; ++i) {
+    for (unsigned i = 90; i < 105; ++i) {
+      const auto score = 89 - static_cast<int>(i);
+      ASSERT_EQ(
+          client.Command({"ZADD", key, std::to_string(score), member(i)}).text_,
+          "1");
+      expected[member(i)] = score;
+    }
+    client.Durable();
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+  }
+  // The next 15 inserts consume the head's free space without allocating a
+  // page or moving members into a neighbour.
+  EXPECT_EQ(latest_root().group_count_, initial.group_count_);
+  EXPECT_EQ(latest_root().next_group_id_, initial.next_group_id_);
+  const auto filled_head = FirstDenseOrderedPage(disk, key);
+  ASSERT_TRUE(filled_head.has_value());
+  EXPECT_EQ(filled_head->entries_.size(), 30);
+  {
+    Server server(disk, 3);
+    Client client(server.port());
+    for (unsigned i = 105; i < 150; ++i) {
       const auto score = 89 - static_cast<int>(i);
       ASSERT_EQ(
           client.Command({"ZADD", key, std::to_string(score), member(i)}).text_,
@@ -1640,10 +1685,10 @@ TEST(GroupedSortedSetWriteE2e, HeadInsertionsReuseNeighborCapacityAndRecover) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  // Each first overflow needs one new page; the next 29 inserts must fill it
-  // by redistribution instead of creating a succession of one-member pages.
-  EXPECT_EQ(latest_root().group_count_, 5);
-  EXPECT_EQ(latest_root().next_group_id_, 6);
+  // Once the head fills, reuse its neighbour before splitting. Continued
+  // inserts must consume that split's headroom instead of making tiny pages.
+  EXPECT_EQ(latest_root().group_count_, 6);
+  EXPECT_EQ(latest_root().next_group_id_, 7);
   {
     Server server(disk, 2);
     Client client(server.port());
@@ -1676,7 +1721,7 @@ TEST(GroupedSortedSetWriteE2e, HeadInsertionsReuseNeighborCapacityAndRecover) {
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
-  EXPECT_LE(latest_root().group_count_, 6);
+  EXPECT_LE(latest_root().group_count_, 7);
   Server recovered(disk, 4);
   Client client(recovered.port());
   verify(client);
@@ -1693,23 +1738,26 @@ TEST(GroupedSortedSetWriteE2e, OverflowNeighborReadFailureKeepsBothIndexes) {
     value.resize(256, 'x');
     return value;
   };
+  std::map<std::string, double> expected;
   auto verify = [&](Client& client, bool inserted) {
-    EXPECT_EQ(client.Command({"ZCARD", key}).text_, inserted ? "90" : "89");
+    auto wanted = expected;
+    wanted[member(1)] = 1.5;
+    if (inserted) wanted[member(90)] = -16;
+    EXPECT_EQ(client.Command({"ZCARD", key}).text_,
+              std::to_string(wanted.size()));
     auto reply = client.Command({"ZRANGE", key, "0", "-1", "WITHSCORES"});
-    ASSERT_EQ(reply.items_.size(), inserted ? 180 : 178);
-    std::size_t offset = 0;
-    if (inserted) {
-      EXPECT_EQ(reply.items_[offset++].text_, member(90));
-      EXPECT_EQ(reply.items_[offset++].text_, "-1");
+    ASSERT_EQ(reply.items_.size(), wanted.size() * 2);
+    std::vector<std::pair<double, std::string>> ordered;
+    for (const auto& [value, score] : wanted) {
+      ordered.emplace_back(score, value);
+      EXPECT_EQ(std::stod(client.Command({"ZSCORE", key, value}).text_), score);
     }
-    for (unsigned i = 0; i < 90; ++i) {
-      if (i == 30) continue;
-      const auto score = i == 1 ? "1.5" : std::to_string(i);
-      EXPECT_EQ(reply.items_[offset++].text_, member(i));
-      EXPECT_EQ(reply.items_[offset++].text_, score);
-      EXPECT_EQ(client.Command({"ZSCORE", key, member(i)}).text_, score);
+    std::sort(ordered.begin(), ordered.end());
+    for (std::size_t i = 0; i < ordered.size(); ++i) {
+      EXPECT_EQ(reply.items_[2 * i].text_, ordered[i].second);
+      EXPECT_EQ(std::stod(reply.items_[2 * i + 1].text_), ordered[i].first);
     }
-    EXPECT_EQ(client.Command({"ZSCORE", key, member(30)}).text_, "-1");
+    EXPECT_EQ(client.Command({"ZSCORE", key, member(15)}).text_, "-1");
     EXPECT_EQ(client.Command({"ZSCORE", key, member(91)}).text_, "-1");
   };
   auto ordered_ids = [&] {
@@ -1723,16 +1771,27 @@ TEST(GroupedSortedSetWriteE2e, OverflowNeighborReadFailureKeepsBothIndexes) {
     Server server(disk, 1);
     Client client(server.port());
     std::vector<std::string> seed{"ZADD", key};
-    for (unsigned i = 0; i < 90; ++i)
+    for (unsigned i = 0; i < 90; ++i) {
       seed.insert(seed.end(), {std::to_string(i), member(i)});
+      expected[member(i)] = i;
+    }
     ASSERT_EQ(client.Command(seed).text_, "90");
-    // Page two has room for exactly one entry from the still-full head.
-    ASSERT_EQ(client.Command({"ZREM", key, member(30)}).text_, "1");
+    // Exhaust the head's split headroom before injecting an overflow. The
+    // next page still has capacity and must be read for redistribution.
+    std::vector<std::string> fill{"ZADD", key};
+    for (unsigned i = 0; i < 15; ++i) {
+      const auto score = -1 - static_cast<int>(i);
+      fill.insert(fill.end(), {std::to_string(score), member(100 + i)});
+      expected[member(100 + i)] = score;
+    }
+    ASSERT_EQ(client.Command(fill).text_, "15");
+    ASSERT_EQ(client.Command({"ZREM", key, member(15)}).text_, "1");
+    expected.erase(member(15));
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   const auto ids = ordered_ids();
-  ASSERT_EQ(ids.size(), 3);
+  ASSERT_EQ(ids.size(), 5);
   {
     ScopedEnvironment fault_key("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key.c_str());
     ScopedEnvironment fault_page("LAVIK_FAIL_ZSET_PLAN_READ_PAGE", "2");
@@ -1740,11 +1799,11 @@ TEST(GroupedSortedSetWriteE2e, OverflowNeighborReadFailureKeepsBothIndexes) {
     Client client(server.port());
     // No overflow: page two must remain unread despite its spare capacity.
     ASSERT_EQ(client.Command({"ZINCRBY", key, "0.5", member(1)}).text_, "1.5");
-    auto failed = client.Command({"ZADD", key, "-1", member(90)});
+    auto failed = client.Command({"ZADD", key, "-16", member(90)});
     EXPECT_EQ(failed.kind_, '-');
     EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
     ASSERT_EQ(client.Command({"MULTI"}).text_, "OK");
-    ASSERT_EQ(client.Command({"ZADD", key, "-2", member(91)}).text_, "QUEUED");
+    ASSERT_EQ(client.Command({"ZADD", key, "-17", member(91)}).text_, "QUEUED");
     ASSERT_EQ(client.Command({"SET", "independent", "after-failure"}).text_,
               "QUEUED");
     const auto executed = client.Command({"EXEC"});
@@ -1762,7 +1821,7 @@ TEST(GroupedSortedSetWriteE2e, OverflowNeighborReadFailureKeepsBothIndexes) {
     Client client(recovered.port());
     verify(client, false);
     EXPECT_EQ(client.Command({"GET", "independent"}).text_, "after-failure");
-    ASSERT_EQ(client.Command({"ZADD", key, "-1", member(90)}).text_, "1");
+    ASSERT_EQ(client.Command({"ZADD", key, "-16", member(90)}).text_, "1");
     verify(client, true);
     client.Durable();
     ASSERT_EQ(recovered.Wait(true), 0) << recovered.Log();
@@ -1778,15 +1837,16 @@ TEST(GroupedSortedSetWriteE2e, PlannerSkipsUnchangedNeighborButChecksNewLinks) {
   GTEST_SKIP() << "requires plan-page read failure injection";
 #endif
   PrivateDisk disk;
-  const std::string new_member(1024, 'z');
-  auto member = [](unsigned i) { return std::string(1024, 'a' + i); };
+  // Each indivisible member occupies one full page under either fill ratio.
+  const std::string new_member(4096, 'z');
+  auto member = [](unsigned i) { return std::string(4096, 'a' + i); };
   {
     Server server(disk);
     Client client(server.port());
     std::vector<std::string> seed{"ZADD", "lazy-neighbor"};
-    for (unsigned i = 0; i < 21; ++i)
+    for (unsigned i = 0; i < 6; ++i)
       seed.insert(seed.end(), {std::to_string(i), member(i)});
-    ASSERT_EQ(client.Command(seed).text_, "21");
+    ASSERT_EQ(client.Command(seed).text_, "6");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -1804,8 +1864,8 @@ TEST(GroupedSortedSetWriteE2e, PlannerSkipsUnchangedNeighborButChecksNewLinks) {
     Server server(disk, 3);
     Client client(server.port());
     EXPECT_EQ(
-        client.Command({"ZINCRBY", "lazy-neighbor", "1.5", member(6)}).text_,
-        "7.5");
+        client.Command({"ZINCRBY", "lazy-neighbor", "0.5", member(0)}).text_,
+        "0.5");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
@@ -1819,21 +1879,21 @@ TEST(GroupedSortedSetWriteE2e, PlannerSkipsUnchangedNeighborButChecksNewLinks) {
         client.Command({"ZADD", "lazy-neighbor", "-1", new_member});
     EXPECT_EQ(failed.kind_, '-');
     EXPECT_NE(failed.text_.find("plan page read failure"), std::string::npos);
-    EXPECT_EQ(client.Command({"ZCARD", "lazy-neighbor"}).text_, "21");
+    EXPECT_EQ(client.Command({"ZCARD", "lazy-neighbor"}).text_, "6");
     EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", new_member}).text_,
               "-1");
-    EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", member(6)}).text_,
-              "7.5");
+    EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", member(0)}).text_,
+              "0.5");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
   }
   Server recovered(disk, 2);
   Client client(recovered.port());
-  EXPECT_EQ(client.Command({"ZCARD", "lazy-neighbor"}).text_, "21");
+  EXPECT_EQ(client.Command({"ZCARD", "lazy-neighbor"}).text_, "6");
   EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", new_member}).text_,
             "-1");
-  EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", member(6)}).text_,
-            "7.5");
+  EXPECT_EQ(client.Command({"ZSCORE", "lazy-neighbor", member(0)}).text_,
+            "0.5");
 }
 
 TEST(GroupedSortedSetWriteE2e, BatchedMemberIndexChangesMatchOrderedPages) {

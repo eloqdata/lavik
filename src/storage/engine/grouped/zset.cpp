@@ -1365,8 +1365,15 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
     protected_bytes += encoder->encoded_bytes();
     plan.writes_.push_back(std::move(**edited));
   }
-  // Other IX writers may shrink distant pages during our append wait. This
-  // lower bound prevents a late compact conversion from needing an X retry
+  // Other IX writers may shrink distant payloads during our append wait,
+  // but retiring a page requires key X. Include their persistent headers in
+  // the lower bound: half-filled protected pages alone can fall just short
+  // of the threshold even for a large collection. The common header size
+  // also covers older page layouts without the v2 offset sentinel.
+  protected_bytes +=
+      (object->ordered_directory().groups().size() - selected.size()) *
+      std::uint64_t{kOrderedGroupHeaderBytes};
+  // This bound prevents a late compact conversion from needing an X retry
   // after AppendLocked has canonicalized the replication command.
   if (protected_bytes < kCollectionGroupTargetBytes) co_return std::nullopt;
   const SortedSetMemberChange change{member, state.before_, state.after_};

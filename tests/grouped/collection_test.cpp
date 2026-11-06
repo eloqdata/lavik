@@ -1213,7 +1213,7 @@ TEST(GroupedCollectionTest, UnsplitPagePreservesStorageAndIdentity) {
       const auto target =
           exact_fit ? encoded->size() : kCollectionGroupTargetBytes;
 
-      auto split = SplitOrderedGroup(std::move(page), 20, target);
+      auto split = SplitOrderedGroup(std::move(page), 20, target, 0.5);
       ASSERT_TRUE(split.ok()) << split.status();
       ASSERT_EQ(split->groups_.size(), 1);
       const auto& kept = split->groups_.front();
@@ -1227,6 +1227,105 @@ TEST(GroupedCollectionTest, UnsplitPagePreservesStorageAndIdentity) {
       EXPECT_EQ(kept.next_, 9);
       EXPECT_EQ(split->next_group_id_, 20);
     }
+  }
+}
+
+TEST(GroupedCollectionTest, SplitFillLeavesGrowthRoomAndKeepsFittingRemainder) {
+  constexpr auto target = kCollectionGroupTargetBytes;
+  for (const double ratio : {0.25, 0.5, 0.75, 1.0}) {
+    SCOPED_TRACE(ratio);
+    // One member beyond a full page. A half-filled split must produce two
+    // useful pages, not two half pages followed by a one-member third page.
+    auto page = Page(7, 185, OrderedCollectionKind::kSortedSet);
+    page.previous_ = 3;
+    page.next_ = 9;
+    for (auto& entry : page.entries_) entry.value_.resize(32, 'x');
+    const auto expected = page.entries_;
+    auto split = SplitOrderedGroup(std::move(page), 20, target, ratio);
+    ASSERT_TRUE(split.ok()) << split.status();
+    ASSERT_EQ(split->groups_.size(), 2);
+    EXPECT_EQ(split->next_group_id_, 21);
+    EXPECT_EQ(split->groups_[0].id_, 7);
+    EXPECT_EQ(split->groups_[0].previous_, 3);
+    EXPECT_EQ(split->groups_[0].next_, 20);
+    EXPECT_EQ(split->groups_[1].id_, 20);
+    EXPECT_EQ(split->groups_[1].previous_, 7);
+    EXPECT_EQ(split->groups_[1].next_, 9);
+    std::vector<OrderedCollectionEntry> actual;
+    for (auto& part : split->groups_) {
+      auto encoded = EncodeOrderedGroup(part);
+      ASSERT_TRUE(encoded.ok()) << encoded.status();
+      EXPECT_LE(encoded->size(), target);
+      if (part.id_ == 7) {
+        EXPECT_LE(encoded->size(), target * ratio);
+        EXPECT_GT(encoded->size(), target * ratio - 44);
+      }
+      actual.insert(actual.end(), part.entries_.begin(), part.entries_.end());
+      if (ratio < 1) {
+        // Both sides accept a subsequent growing write without another split.
+        part.entries_.push_back(
+            {std::string(32, 'z'), part.entries_.back().score_ + 0.5});
+        const auto* storage = part.entries_.data();
+        auto grown = SplitOrderedGroup(std::move(part), 21, target, ratio);
+        ASSERT_TRUE(grown.ok()) << grown.status();
+        ASSERT_EQ(grown->groups_.size(), 1);
+        EXPECT_EQ(grown->groups_.front().entries_.data(), storage);
+        EXPECT_EQ(grown->next_group_id_, 21);
+      }
+    }
+    EXPECT_EQ(actual, expected);
+  }
+}
+
+TEST(GroupedCollectionTest, SplitFillUsesBytesAndKeepsIndivisibleMembers) {
+  auto page = Page(7, 30, OrderedCollectionKind::kSortedSet);
+  page.previous_ = 3;
+  page.next_ = 9;
+  for (std::size_t i = 0; i < page.entries_.size(); ++i)
+    page.entries_[i].value_.resize(i % 3 == 0 ? 3000 : 32, 'x');
+  page.entries_[15].value_.resize(16000, 'x');
+  const auto expected = page.entries_;
+  auto split =
+      SplitOrderedGroup(std::move(page), 20, kCollectionGroupTargetBytes, 0.5);
+  ASSERT_TRUE(split.ok()) << split.status();
+  std::vector<OrderedCollectionEntry> actual;
+  std::size_t oversized = 0;
+  for (std::size_t i = 0; i < split->groups_.size(); ++i) {
+    const auto& part = split->groups_[i];
+    auto encoded = EncodeOrderedGroup(part);
+    ASSERT_TRUE(encoded.ok()) << encoded.status();
+    if (encoded->size() > kCollectionGroupTargetBytes) {
+      ASSERT_EQ(part.entries_.size(), 1);
+      EXPECT_EQ(part.entries_.front().value_.size(), 16000);
+      ++oversized;
+    }
+    if (i != 0)
+      EXPECT_TRUE(
+          ValidateOrderedGroupBoundary(split->groups_[i - 1], part).ok());
+    actual.insert(actual.end(), part.entries_.begin(), part.entries_.end());
+  }
+  EXPECT_EQ(oversized, 1);
+  EXPECT_EQ(actual, expected);
+  EXPECT_EQ(split->groups_.front().id_, 7);
+  EXPECT_EQ(split->groups_.front().previous_, 3);
+  EXPECT_EQ(split->groups_.back().next_, 9);
+}
+
+TEST(GroupedCollectionTest, SplitFillRejectsInvalidRatios) {
+  for (const double ratio :
+       {0.0, -0.5, 1.01, std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()}) {
+    SCOPED_TRACE(ratio);
+    EXPECT_EQ(SplitOrderedGroup(Page(), 20, kCollectionGroupTargetBytes, ratio)
+                  .status()
+                  .code(),
+              absl::StatusCode::kInvalidArgument);
+    EXPECT_EQ(SplitCheckedSortedSetGroup(
+                  Page(7, 3, OrderedCollectionKind::kSortedSet), 20,
+                  kCollectionGroupTargetBytes, ratio)
+                  .status()
+                  .code(),
+              absl::StatusCode::kInvalidArgument);
   }
 }
 
@@ -1283,7 +1382,9 @@ TEST(GroupedCollectionTest, CheckedSortedSetSplitMatchesOrdinarySplit) {
   for (auto& entry : page.entries_) entry.value_.resize(32, 'x');
   // Include an indivisible oversized member between ordinary pages.
   page.entries_[15].value_.resize(4096, 'x');
-  auto ordinary = SplitOrderedGroup(page, 20, 256);
+  auto ordinary = SplitOrderedGroup(
+      page, 20, 256,
+      OrderedGroupSplitFillRatio(OrderedCollectionKind::kSortedSet));
   auto checked = SplitCheckedSortedSetGroup(std::move(page), 20, 256);
   ASSERT_TRUE(ordinary.ok()) << ordinary.status();
   ASSERT_TRUE(checked.ok()) << checked.status();
@@ -1381,7 +1482,8 @@ TEST(GroupedCollectionTest, UnsplitOversizedMemberPreservesStorageAndIdentity) {
   const auto* member = page.entries_.front().value_.data();
   const auto expected = page.entries_;
 
-  auto split = SplitOrderedGroup(std::move(page), 20);
+  auto split =
+      SplitOrderedGroup(std::move(page), 20, kCollectionGroupTargetBytes, 0.5);
   ASSERT_TRUE(split.ok()) << split.status();
   ASSERT_EQ(split->groups_.size(), 1);
   const auto& kept = split->groups_.front();

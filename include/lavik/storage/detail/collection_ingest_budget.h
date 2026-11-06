@@ -51,13 +51,19 @@ struct InitialSortedSetIngestGroups {
 inline InitialSortedSetIngestGroups BoundInitialSortedSetIngestGroups(
     std::size_t bytes, std::size_t count) {
   if (count == 0) return {0, 0};
-  // Greedy ordered splitting fills each consecutive pair beyond one page's
-  // entry allowance; an indivisible large member remains one page.
+  // Each consecutive ordered pair exceeds the split fill's entry allowance,
+  // even when the final remainder stays whole at the larger growth threshold.
+  // An indivisible large member remains one page.
+  constexpr auto ordered_fill_bytes = static_cast<std::size_t>(
+      kCollectionGroupTargetBytes *
+      OrderedGroupSplitFillRatio(OrderedCollectionKind::kSortedSet));
   const auto ordered = std::min(
-      count, SaturatingIngestAdd(1, SaturatingIngestMultiply(
-                                        bytes / (kCollectionGroupTargetBytes -
-                                                 kOrderedGroupHeaderBytes),
-                                        2)));
+      count, SaturatingIngestAdd(
+                 1, SaturatingIngestMultiply(
+                        bytes / (ordered_fill_bytes -
+                                 OrderedGroupFixedBytes(
+                                     OrderedCollectionKind::kSortedSet)),
+                        2)));
   // The member graph uses member + 8-byte score + 8-byte framing. At each
   // prefix depth, splitting nodes are disjoint and each has more than target
   // minus compact-header entry bytes. There are at most 64 depths. A full

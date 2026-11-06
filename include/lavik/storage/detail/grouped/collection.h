@@ -80,6 +80,14 @@ constexpr OrderedCollectionKind OrderedKind(ValueType type) noexcept {
                                       : OrderedCollectionKind::kSortedSet;
 }
 
+// Random score/member edits need room on both sides of a Sorted Set split.
+// End-grown layouts pack the side away from the insertion point instead;
+// List prepends select that side through the splitter's reverse traversal.
+constexpr double OrderedGroupSplitFillRatio(
+    OrderedCollectionKind kind) noexcept {
+  return kind == OrderedCollectionKind::kSortedSet ? 0.5 : 1.0;
+}
+
 struct OrderedCollectionEntry {
   std::string value_;
   double score_ =
@@ -119,7 +127,7 @@ class CheckedSortedSetEntries {
  private:
   friend absl::StatusOr<OrderedGroupSplit> SplitCheckedSortedSetGroup(
       OrderedGroupSnapshot group, std::uint64_t next_group_id,
-      std::size_t target_bytes);
+      std::size_t target_bytes, double split_fill_ratio);
   explicit CheckedSortedSetEntries(std::vector<OrderedCollectionEntry> entries)
       : entries_(std::move(entries)) {}
 
@@ -741,9 +749,15 @@ absl::StatusOr<bool> RebalanceSortedSetGroupPair(
 // later pages. An indivisible 512 MiB item is allowed to exceed target_bytes;
 // the ordinary extent layer stores it. The caller must update the following
 // neighbour's previous link if this returns more than one page.
+// split_fill_ratio must be in (0, 1]. When the remaining entries exceed
+// target_bytes, cut at that fraction of the encoded page size, keeping at
+// least one complete entry. A remainder that fits target_bytes stays whole:
+// the ratio neither lowers the growth threshold nor creates a tiny last page
+// just to enforce the fill target. Fitting inputs retain their entry storage.
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
-    std::size_t target_bytes = kCollectionGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes,
+    double split_fill_ratio = 1.0);
 
 // Fully validates a mutable Sorted Set after-image before partitioning, then
 // freezes each resulting member sequence. Subsequent encoders can reuse that
@@ -753,7 +767,9 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(
 // frozen pages and all default codec entry points keep their ordinary paths.
 absl::StatusOr<OrderedGroupSplit> SplitCheckedSortedSetGroup(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
-    std::size_t target_bytes = kCollectionGroupTargetBytes);
+    std::size_t target_bytes = kCollectionGroupTargetBytes,
+    double split_fill_ratio =
+        OrderedGroupSplitFillRatio(OrderedCollectionKind::kSortedSet));
 
 struct LoadedOrderedGroup {
   std::uint64_t sequence_ = 0;

@@ -430,7 +430,9 @@ Task<absl::Status> StorageEngine::Impl::WriteReplicaCollectionPage(
                                  .incarnation_ = 1,
                                  .id_ = 1,
                                  .entries_ = std::move(entries)};
-    auto split = SplitOrderedGroup(std::move(initial), 2);
+    auto split =
+        SplitOrderedGroup(std::move(initial), 2, kCollectionGroupTargetBytes,
+                          OrderedGroupSplitFillRatio(kind));
     if (!split.ok()) co_return split.status();
     plan.root_ = {
         .kind_ = kind,

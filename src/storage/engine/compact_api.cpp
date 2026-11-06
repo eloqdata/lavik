@@ -33,7 +33,9 @@ absl::StatusOr<OrderedCollectionMutationPlan> PrepareOrderedGroups(
                                .incarnation_ = 1,
                                .id_ = 1,
                                .entries_ = std::move(*entries)};
-  auto split = SplitOrderedGroup(std::move(initial), 2);
+  auto split =
+      SplitOrderedGroup(std::move(initial), 2, kCollectionGroupTargetBytes,
+                        OrderedGroupSplitFillRatio(collection_kind));
   if (!split.ok()) return split.status();
   return OrderedCollectionMutationPlan{
       .root_ = {.kind_ = collection_kind,

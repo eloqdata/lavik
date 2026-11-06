@@ -2129,9 +2129,10 @@ namespace {
 
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
-    std::size_t target_bytes, bool pack_from_back) {
+    std::size_t target_bytes, double split_fill_ratio, bool pack_from_back) {
   if (target_bytes <= kOrderedGroupHeaderBytes ||
       target_bytes > kMaxRecordPayloadBytes ||
+      !(split_fill_ratio > 0 && split_fill_ratio <= 1) ||
       next_group_id <= std::max({group.id_, group.previous_, group.next_}) ||
       group.retired_ || group.checked_sorted_set_ ||
       group.encoded_sorted_set_ || group.entries_.empty()) {
@@ -2146,6 +2147,24 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
   }
   auto valid = ValidateEntries(group.kind_, group.entries_);
   if (!valid.ok()) return valid;
+  const auto fixed_bytes = OrderedGroupFixedBytes(group.kind_);
+  const auto entry_overhead = OrderedEntryOverhead(group.kind_);
+  const auto split_bytes = std::max(
+      fixed_bytes, static_cast<std::size_t>(target_bytes * split_fill_ratio));
+  std::size_t remaining_bytes = fixed_bytes;
+  if (split_fill_ratio < 1) {
+    // Count once so each cut can keep a fitting remainder whole without
+    // rescanning it. Full packing, including List pushes, needs no size pass.
+    for (const auto& entry : group.entries_) {
+      const auto bytes = entry_overhead + entry.value_.size();
+      if (bytes > std::numeric_limits<std::size_t>::max() - remaining_bytes)
+        return absl::OutOfRangeError("ordered split size overflow");
+      remaining_bytes += bytes;
+    }
+  }
+  const auto page_target = [&] {
+    return remaining_bytes > target_bytes ? split_bytes : target_bytes;
+  };
   absl::InlinedVector<std::size_t, 2> ends;
   if (pack_from_back) {
     // A prepend must leave spare capacity at the head. Filling the first
@@ -2156,16 +2175,17 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
     for (std::size_t end = group.entries_.size(); end != 0;) {
       ends.push_back(end);
       std::size_t begin = end;
-      std::size_t bytes = OrderedGroupFixedBytes(group.kind_);
+      std::size_t bytes = fixed_bytes;
+      const auto limit = page_target();
       while (begin != 0) {
-        const auto item_bytes = OrderedEntryOverhead(group.kind_) +
-                                group.entries_[begin - 1].value_.size();
-        if (begin != end &&
-            (bytes > target_bytes || item_bytes > target_bytes - bytes))
+        const auto item_bytes =
+            entry_overhead + group.entries_[begin - 1].value_.size();
+        if (begin != end && (bytes > limit || item_bytes > limit - bytes))
           break;
         bytes += item_bytes;
         --begin;
       }
+      if (split_fill_ratio < 1) remaining_bytes -= bytes - fixed_bytes;
       end = begin;
     }
     std::reverse(ends.begin(), ends.end());
@@ -2177,16 +2197,17 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
     if (pack_from_back) {
       end = ends[result.groups_.size()];
     } else {
-      std::size_t bytes = OrderedGroupFixedBytes(group.kind_);
+      std::size_t bytes = fixed_bytes;
+      const auto limit = page_target();
       while (end != group.entries_.size()) {
-        const auto item_bytes = OrderedEntryOverhead(group.kind_) +
-                                group.entries_[end].value_.size();
-        if (end != begin &&
-            (bytes > target_bytes || item_bytes > target_bytes - bytes))
+        const auto item_bytes =
+            entry_overhead + group.entries_[end].value_.size();
+        if (end != begin && (bytes > limit || item_bytes > limit - bytes))
           break;
         bytes += item_bytes;
         ++end;
       }
+      if (split_fill_ratio < 1) remaining_bytes -= bytes - fixed_bytes;
     }
     if (begin == 0 && end == group.entries_.size()) {
       // The checked page already fits (or is one indivisible oversized
@@ -2225,19 +2246,20 @@ absl::StatusOr<OrderedGroupSplit> SplitOrderedGroupImpl(
 
 absl::StatusOr<OrderedGroupSplit> SplitOrderedGroup(OrderedGroupSnapshot group,
                                                     std::uint64_t next_group_id,
-                                                    std::size_t target_bytes) {
+                                                    std::size_t target_bytes,
+                                                    double split_fill_ratio) {
   return SplitOrderedGroupImpl(std::move(group), next_group_id, target_bytes,
-                               false);
+                               split_fill_ratio, false);
 }
 
 absl::StatusOr<OrderedGroupSplit> SplitCheckedSortedSetGroup(
     OrderedGroupSnapshot group, std::uint64_t next_group_id,
-    std::size_t target_bytes) {
+    std::size_t target_bytes, double split_fill_ratio) {
   if (group.kind_ != OrderedCollectionKind::kSortedSet ||
       group.borrowed_string_)
     return absl::InvalidArgumentError("checked split requires a Sorted Set");
   auto split = SplitOrderedGroupImpl(std::move(group), next_group_id,
-                                     target_bytes, false);
+                                     target_bytes, split_fill_ratio, false);
   if (!split.ok()) return split.status();
   for (auto& page : split->groups_) {
     // Splitting only partitions the fully validated input. Freezing the
@@ -2399,6 +2421,7 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanOrderedCollectionSplice(
   if (!replacement.entries_.empty()) {
     auto split = SplitOrderedGroupImpl(
         std::move(replacement), root.next_group_id_, target_bytes,
+        OrderedGroupSplitFillRatio(root.kind_),
         root.kind_ == OrderedCollectionKind::kList && rank == 0 &&
             erase_count == 0);
     if (!split.ok()) return split.status();
