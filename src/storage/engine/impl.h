@@ -4358,10 +4358,12 @@ class StorageEngine::Impl {
   // Requires parent IS/IX plus this group's S/X hold. Refresh physical metadata
   // across GC without rejecting publications to unrelated groups. No pin is
   // implied: each physical read still owns its usual allocation lease.
+  // On success, entry optionally borrows the checked record from the returned
+  // handle so immediate admission/loading need not repeat its index lookup.
   absl::StatusOr<GroupedObject::Handle> RefreshLockedGroup(
       WorkerStore::PartitionStore& partition, std::uint8_t db_id,
       std::string_view key, const GroupedObject::Handle& source,
-      GroupedRecordId id);
+      GroupedRecordId id, const RecordIndexValue** entry = nullptr);
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
   Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(

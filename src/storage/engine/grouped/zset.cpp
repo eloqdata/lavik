@@ -1411,20 +1411,37 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
     for (auto i = first; i < end; ++i) emit(pages[i].id_);
     return true;
   };
+  // Boundary counts, small ranges and scan windows usually need only a few
+  // holds. Retain their plan in the coroutine; wide plans still pre-admit
+  // heap storage before filling it, including when memory is unmetered.
+  std::array<GroupedLockId, 4> local_groups;
   std::size_t count = 0;
-  if (!visit(object, [&](auto) { ++count; })) co_return std::nullopt;
-  if (count > SIZE_MAX / sizeof(GroupedLockId))
-    co_return absl::ResourceExhaustedError(
-        "Sorted Set read lock plan overflow");
-  auto admission = TryReserveMemory(count * sizeof(GroupedLockId));
-  if (!admission) co_return MemoryLimitError("OOM Sorted Set read lock plan");
-  std::vector<GroupedLockId> groups;
-  groups.reserve(count);
-  if (groups.capacity() > admission->bytes() / sizeof(GroupedLockId))
-    co_return MemoryLimitError("OOM Sorted Set read lock plan");
-  visit(object, [&](auto id) { groups.push_back(id); });
+  if (!visit(object, [&](auto id) {
+        if (count < local_groups.size()) local_groups[count] = id;
+        ++count;
+      }))
+    co_return std::nullopt;
+  std::optional<MemoryReservation> admission;
+  std::vector<GroupedLockId> allocated_groups;
+  std::span<GroupedLockId> groups;
+  if (count <= local_groups.size()) {
+    groups = std::span(local_groups).first(count);
+  } else {
+    if (count > SIZE_MAX / sizeof(GroupedLockId))
+      co_return absl::ResourceExhaustedError(
+          "Sorted Set read lock plan overflow");
+    admission = TryReserveMemory(count * sizeof(GroupedLockId));
+    if (!admission) co_return MemoryLimitError("OOM Sorted Set read lock plan");
+    allocated_groups.reserve(count);
+    if (admission->bytes() && allocated_groups.capacity() >
+                                  admission->bytes() / sizeof(GroupedLockId))
+      co_return MemoryLimitError("OOM Sorted Set read lock plan");
+    visit(object, [&](auto id) { allocated_groups.push_back(id); });
+    groups = allocated_groups;
+  }
   std::sort(groups.begin(), groups.end());
-  groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+  groups =
+      groups.first(std::unique(groups.begin(), groups.end()) - groups.begin());
   for (const auto id : groups) {
     co_await holds.Acquire(id, GroupedLockMode::kShared);
   }
@@ -1436,13 +1453,19 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
       current->version().index_generation_ !=
           object->version().index_generation_)
     co_return std::nullopt;
-  bool covered = true;
-  if (!visit(current,
-             [&](auto id) {
-               covered &= std::binary_search(groups.begin(), groups.end(), id);
-             }) ||
-      !covered)
-    co_return std::nullopt;
+  // Published directories are immutable. An unchanged handle preserves the
+  // original routes even if a lock wait yielded; changed views still need
+  // full coverage validation before becoming the read's common cut.
+  if (current.get() != object.get()) {
+    bool covered = true;
+    if (!visit(current,
+               [&](auto id) {
+                 covered &=
+                     std::binary_search(groups.begin(), groups.end(), id);
+               }) ||
+        !covered)
+      co_return std::nullopt;
+  }
   // This final directory is the logical cut: all selected payloads are now
   // frozen, while preceding counts and unrelated bounds belong to this root.
   // A route change while waiting gets one S fallback, never an IX/IS retry
@@ -2651,11 +2674,15 @@ StorageEngine::Impl::ScanGroupedSortedSetMembers(
     // An old logical directory does not pin physical records across reads.
     // Resolve the current allocation before scratch admission; the loader
     // revalidates the same logical root after any suspension.
-    auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
+    GroupedObject::Handle current;
+    const RecordIndexValue* physical = nullptr;
     if (group_locked) {
-      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      auto refreshed =
+          RefreshLockedGroup(partition, db_id, key, object, id, &physical);
       if (!refreshed.ok()) co_return refreshed.status();
       current = std::move(*refreshed);
+    } else {
+      current = partition.grouped_objects_[db_id].CurrentForMutation(key);
     }
     if (!current || (!group_locked && !current->SameLogicalRoot(*object)) ||
         current->version().db_epoch_ != object->version().db_epoch_ ||
@@ -2664,10 +2691,12 @@ StorageEngine::Impl::ScanGroupedSortedSetMembers(
         current->version().index_generation_ !=
             object->version().index_generation_)
       co_return absl::NotFoundError("member-index scan population changed");
-    const auto* physical = current->FindGroup(id);
+    if (!group_locked) physical = current->FindGroup(id);
     if (!physical) co_return absl::DataLossError("missing member scan page");
     GroupedScratchBudget budget;
-    auto status = budget.AddGroup(*physical, current->ExtentsFor(id));
+    auto status = budget.AddGroup(*physical, physical->external()
+                                                 ? current->ExtentsFor(id)
+                                                 : ExtentManifest{});
     if (!status.ok()) co_return status;
     auto admission = budget.Reserve(2);
     if (!admission.ok()) co_return admission.status();
@@ -2754,12 +2783,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // without suspending before inspecting its immutable size fields for
     // admission; the loader refreshes again before resolving physical IO.
     if (group_locked) {
+      const RecordIndexValue* entry = nullptr;
       auto current = RefreshLockedGroup(partition, db_id, key, object,
-                                        {metadata[i].id_, 0});
+                                        {metadata[i].id_, 0}, &entry);
       if (!current.ok()) return current.status();
-      const auto* entry = (*current)->FindGroup({metadata[i].id_, 0});
       return budget->AddGroup(*entry,
-                              (*current)->ExtentsFor({metadata[i].id_, 0}));
+                              entry->external()
+                                  ? (*current)->ExtentsFor({metadata[i].id_, 0})
+                                  : ExtentManifest{});
     }
     const auto& expected = object->version();
     auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
@@ -2784,7 +2815,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     if (!readable.ok()) return readable;
     const auto* entry = current->FindGroup({metadata[i].id_, 0});
     if (!entry) return absl::DataLossError("missing Sorted Set physical page");
-    return budget->AddGroup(*entry, current->ExtentsFor({metadata[i].id_, 0}));
+    return budget->AddGroup(
+        *entry, entry->external() ? current->ExtentsFor({metadata[i].id_, 0})
+                                  : ExtentManifest{});
   };
   // A serial scan retains one physical read lease and borrowed member views.
   // Keep scratch admitted until both disappear; replies own separate copies.

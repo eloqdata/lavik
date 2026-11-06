@@ -32,6 +32,8 @@ class WriteBufferTestPeer {
     kGroupedReadAdmissionFailure,
     kGroupedReadCommonView,
     kGroupedRankSingleRead,
+    kGroupedReadPlanWait,
+    kGroupedReadPlanChanged,
     kProgress,
     kEpochChanged,
     kSourceChanged,
@@ -899,6 +901,61 @@ class WriteBufferTestPeer {
     if (!object || !object->has_member_index())
       co_return absl::InternalError("fixture did not create member leaves");
 
+    if (scenario == Scenario::kGroupedReadPlanWait ||
+        scenario == Scenario::kGroupedReadPlanChanged) {
+      const auto& directory = object->ordered_directory();
+      const auto middle = directory.groups().size() / 2;
+      if (middle < 3)
+        co_return absl::InternalError("fixture needs separate range pages");
+      const auto rank = directory.CountBefore(middle + 1) - 1;
+      auto parent = co_await tx::CurrentTxShard().AcquireKey(
+          0, tx::FingerprintOf(digest), tx::LockMode::kIntentExclusive);
+      if (!store.group_locks_)
+        store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
+      auto gate = store.group_locks_->MakeLockSet(
+          {0, tx::FingerprintOf(digest), object->incarnation()});
+      co_await gate.Acquire(
+          {GroupedLockIndex::kOrdered, {directory.groups()[middle].id_, 0}},
+          GroupedLockMode::kExclusive);
+      SortedSetOperation query{.kind_ = SortedSetOperationKind::kRange,
+                               .first_ = static_cast<std::int64_t>(rank),
+                               .last_ = static_cast<std::int64_t>(rank)};
+      auto read = storage.ExecuteSortedSet(0, key, query);
+      auto handle = std::move(read).ReleaseHandle();
+      read = decltype(read)(handle);
+      handle.resume();
+      EXPECT_FALSE(read.done());
+      const bool changed = scenario == Scenario::kGroupedReadPlanChanged;
+      absl::Status mutation_status;
+      if (changed) {
+        // Removing an unrelated prefix member moves this rank from the
+        // locked page's last entry to the next page. The resumed reader must
+        // reject its old coverage and obtain the current whole-key view.
+        const std::array<std::string_view, 1> removed{names.front()};
+        auto result = co_await storage.ExecuteSortedSet(
+            0, key,
+            {.kind_ = SortedSetOperationKind::kRemove,
+             .members_ = removed,
+             .prepare_unlocked_ = true});
+        if (!result.ok())
+          mutation_status = result.status();
+        else
+          EXPECT_EQ(result->changed_, 1);
+      }
+      gate.Reset();
+      parent.Reset();
+      while (!read.done()) co_await bycorf::Yield(*store.worker_);
+      auto result = std::move(read).TakeResult();
+      if (!mutation_status.ok()) co_return mutation_status;
+      if (!result.ok()) co_return result.status();
+      EXPECT_EQ(result->length_, names.size() - changed);
+      EXPECT_EQ(result->member_count(), 1);
+      if (result->member_count() == 1)
+        EXPECT_EQ(result->member_view(0).member_, names[rank + changed]);
+      EXPECT_EQ(store.group_locks_->size(), 0);
+      co_return absl::OkStatus();
+    }
+
     if (scenario == Scenario::kGroupedRankSingleRead) {
       auto paused = co_await storage.ConfigureDefrag(
           {.action_ = DefragConfigAction::kPause});
@@ -1073,6 +1130,16 @@ class WriteBufferTestPeer {
                 (std::vector<std::optional<double>>{expected.begin(),
                                                     expected.begin() + count}));
     }
+    if (scenario == Scenario::kGroupedReadUnmetered) {
+      // Exercise both inline and heap-backed lock plans before the memory
+      // limiter is initialized; an unmetered reservation reports zero bytes.
+      for (std::int64_t last : {1, 1023}) {
+        auto range = co_await storage.ExecuteSortedSet(
+            0, key, {.kind_ = SortedSetOperationKind::kRange, .last_ = last});
+        if (!range.ok()) co_return range.status();
+        EXPECT_EQ(range->member_count(), last + 1);
+      }
+    }
     co_return absl::OkStatus();
   }
 
@@ -1085,7 +1152,9 @@ class WriteBufferTestPeer {
     if (scenario == Scenario::kGroupedReadUnmetered ||
         scenario == Scenario::kGroupedReadAdmissionFailure ||
         scenario == Scenario::kGroupedReadCommonView ||
-        scenario == Scenario::kGroupedRankSingleRead)
+        scenario == Scenario::kGroupedRankSingleRead ||
+        scenario == Scenario::kGroupedReadPlanWait ||
+        scenario == Scenario::kGroupedReadPlanChanged)
       co_return co_await RunGroupedRead(storage, scenario);
     if (scenario == Scenario::kResumeActiveStreams)
       co_return co_await RunResumeActiveStreams(storage);
@@ -1419,7 +1488,7 @@ TEST(StorageWriteBufferResumeTest,
 /// Re-exec keeps the global memory limiter uninitialized even if earlier tests
 /// installed a process-wide limit. The child reports assertion failures before
 /// exiting so an unexpected OOM remains diagnosable by the parent.
-TEST(StorageGroupedReadDeathTest, UnmeteredScoreReads) {
+TEST(StorageGroupedReadDeathTest, UnmeteredScoreAndRangeReads) {
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   ASSERT_EXIT(
       {
@@ -1451,6 +1520,15 @@ TEST(StorageGroupedReadTest, RetainsEarlierLeafWhileWaitingForLaterWriter) {
 
 TEST(StorageGroupedReadTest, RanksReadEachRequiredPayloadOnce) {
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedRankSingleRead);
+}
+
+TEST(StorageGroupedReadTest, RangeLockWaitRetainsUnchangedPlan) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedReadPlanWait);
+}
+
+TEST(StorageGroupedReadTest, RangeLockWaitRevalidatesChangedCoverage) {
+  RunWriteBufferScenario(
+      WriteBufferTestPeer::Scenario::kGroupedReadPlanChanged);
 }
 
 TEST(StorageWriteBufferResumeTest, ThreeStreamsReuseTwoBuffersWithoutSealing) {

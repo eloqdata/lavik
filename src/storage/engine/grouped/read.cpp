@@ -26,7 +26,7 @@ namespace lavik::storage {
 absl::StatusOr<GroupedObject::Handle> StorageEngine::Impl::RefreshLockedGroup(
     WorkerStore::PartitionStore& partition, std::uint8_t db_id,
     std::string_view key, const GroupedObject::Handle& source,
-    GroupedRecordId id) {
+    GroupedRecordId id, const RecordIndexValue** entry) {
   const auto current =
       partition.grouped_objects_[db_id].CurrentForMutation(key);
   if (!source || !current ||
@@ -45,12 +45,14 @@ absl::StatusOr<GroupedObject::Handle> StorageEngine::Impl::RefreshLockedGroup(
       partition.grouped_generations_[db_id] != old.index_generation_)
     return absl::AbortedError("locked group population changed");
   const auto* before = source->FindGroup(id);
-  const auto* after = current->FindGroup(id);
+  const auto* after =
+      current.get() == source.get() ? before : current->FindGroup(id);
   if (!before || !after ||
       before->mutation_sequence_ != after->mutation_sequence_)
     return absl::AbortedError("locked group logical version changed");
   const auto readable = current->ReadStatus();
   if (!readable.ok()) return readable;
+  if (entry) *entry = after;
   return current;
 }
 
@@ -90,8 +92,10 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
         partition.grouped_generations_[db_id] != original.index_generation_) {
       co_return absl::NotFoundError("grouped population changed before read");
     }
+    const RecordIndexValue* entry = nullptr;
     if (group_locked) {
-      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      auto refreshed =
+          RefreshLockedGroup(partition, db_id, key, object, id, &entry);
       if (!refreshed.ok()) co_return refreshed.status();
       object = std::move(*refreshed);
     } else if (!pinned) {
@@ -122,7 +126,7 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
       }
       object = std::move(*current);
     }
-    const auto* entry = object->FindGroup(id);
+    if (!group_locked) entry = object->FindGroup(id);
     if (entry == nullptr) co_return absl::DataLossError("missing Hash group");
     // Materialize BEFORE the first suspension. An old compact entry cannot
     // borrow a subsequently reused block's current epoch. Snapshot callers

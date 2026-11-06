@@ -61,8 +61,10 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
         partition.grouped_generations_[db_id] != original.index_generation_) {
       co_return absl::NotFoundError("ordered population changed before read");
     }
+    const RecordIndexValue* entry = nullptr;
     if (group_locked) {
-      auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);
+      auto refreshed =
+          RefreshLockedGroup(partition, db_id, key, object, id, &entry);
       if (!refreshed.ok()) co_return refreshed.status();
       object = std::move(*refreshed);
     } else if (!pinned) {
@@ -88,13 +90,16 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
       }
       object = std::move(*current);
     }
-    const auto* entry = object->FindGroup(id);
+    if (!group_locked) entry = object->FindGroup(id);
     if (entry == nullptr) co_return absl::DataLossError("missing ordered page");
     // A retained side view owns metadata, not allocation lifetime. Capture the
     // current physical epoch before suspending, and retry a GC move only while
     // the logical root is unchanged. Historical snapshots instead own pins.
     const auto location = MaterializeIndexLocation(*entry);
-    const auto extents = object->ExtentsFor(id);
+    // Inline records carry their full layout; only external pages need the
+    // separate manifest lookup and ownership across suspension.
+    const auto extents =
+        location.external() ? object->ExtentsFor(id) : ExtentManifest{};
     GroupReadLimiter::Permit permit;
     if (limiter != nullptr) {
       if (location.block_owner() >= worker_count_)
