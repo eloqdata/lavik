@@ -871,6 +871,10 @@ class WriteBufferTestPeer {
     co_return absl::OkStatus();
   }
 
+  /// Seeds a multi-leaf ZSET on the fixture's owner worker to check unmetered
+  /// reads, rejected admission followed by retry, or one view across lock
+  /// waits. Manually started coroutines are drained before their borrowed
+  /// inputs die.
   static Task<absl::Status> RunGroupedRead(StorageEngine& storage,
                                            Scenario scenario) {
     auto& impl = *storage.impl_;
@@ -1030,6 +1034,9 @@ class WriteBufferTestPeer {
     co_return absl::OkStatus();
   }
 
+  /// Runs on the prepared storage owner's worker; failures reach the service
+  /// result. Specialized scenarios manage their own holds, while the relocation
+  /// cases below deliberately exhaust buffers and hold the allocation gate.
   static Task<absl::Status> Run(StorageEngine& storage, Scenario scenario) {
     if (scenario == Scenario::kGroupedPublication)
       co_return co_await RunGroupedPublication(storage);
@@ -1247,6 +1254,10 @@ class WriteBufferService final : public bycorf::Service {
 class StorageWriteBufferTest
     : public testing::TestWithParam<WriteBufferTestPeer::Scenario> {};
 
+/// Owns disposable disk files and a single-worker service through shutdown.
+/// The unmetered scenario requires a fresh process with no installed limit;
+/// other scenarios initialize accounting. Restores injected environment state
+/// and removes fixture files only after the service has stopped.
 void RunWriteBufferScenario(WriteBufferTestPeer::Scenario scenario,
                             unsigned devices = 1) {
   constexpr const char* fault = "LAVIK_FAIL_CHECKPOINT_AFTER_SUBMIT";
@@ -1362,9 +1373,10 @@ TEST(StorageWriteBufferResumeTest,
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedPublication);
 }
 
+/// Re-exec keeps the global memory limiter uninitialized even if earlier tests
+/// installed a process-wide limit. The child reports assertion failures before
+/// exiting so an unexpected OOM remains diagnosable by the parent.
 TEST(StorageGroupedReadDeathTest, UnmeteredScoreReads) {
-  // Re-exec keeps the global memory limiter uninitialized even when other
-  // tests in this binary have already installed a process-wide limit.
   GTEST_FLAG_SET(death_test_style, "threadsafe");
   ASSERT_EXIT(
       {
@@ -1381,11 +1393,15 @@ TEST(StorageGroupedReadDeathTest, UnmeteredScoreReads) {
       testing::ExitedWithCode(0), "");
 }
 
+/// A rejected lock plan counts once and releases its resources so a subsequent
+/// score read can acquire the same key and store state successfully.
 TEST(StorageGroupedReadTest, FailedPlanCountsRejectionAndReleasesState) {
   RunWriteBufferScenario(
       WriteBufferTestPeer::Scenario::kGroupedReadAdmissionFailure);
 }
 
+/// A reader waiting behind the later-leaf writer must fence an earlier-leaf
+/// writer until it has captured both scores from the same protected view.
 TEST(StorageGroupedReadTest, RetainsEarlierLeafWhileWaitingForLaterWriter) {
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedReadCommonView);
 }

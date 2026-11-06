@@ -1102,6 +1102,12 @@ absl::StatusOr<SortedSetResult> ReadCompactSortedSet(
   return result;
 }
 
+/// Attempts a grouped read on the owner worker while the caller retains key IS.
+/// Member-score projections acquire leaf S holds in identity order before
+/// capturing a common view and retain them through waits and IO. Store state is
+/// released before group waits. A disengaged result requests one whole-key S
+/// attempt after the caller drops IS; error results propagate without retry.
+/// Every exit releases the group holds and admission owned by this coroutine.
 Task<absl::StatusOr<std::optional<SortedSetResult>>>
 StorageEngine::Impl::TryConcurrentSortedSetRead(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1664,6 +1670,12 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
   co_return result;
 }
 
+/// Reads scores from a caller-protected view without acquiring key/group locks.
+/// The caller retains key S/X, or IS plus every requested member S when
+/// group_locked is true, through completion. Each checked leaf is decoded into
+/// owned scores before its read lease ends, preserving request order,
+/// duplicates and missing members. Admission, IO and validation failures return
+/// an error instead of a partial reply.
 Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ReadGroupedSortedSetScores(
     WorkerStore& store, WorkerStore::PartitionStore& partition,

@@ -1253,6 +1253,9 @@ TEST(GroupedSortedSetWriteE2e, ConcurrentGroupsWaitWakeAndRecover) {
   ExpectDenseZSet(client, key, expected);
 }
 
+/// Uses recovered leaf identities and paused commands to verify disjoint
+/// read/write progress in both directions, conflicting waiters waking,
+/// duplicate score replies and durable recovery of the final score map.
 TEST(GroupedSortedSetWriteE2e, MemberReadsLockOnlyRequestedLeaves) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires a deterministic group-lock pause";

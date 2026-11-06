@@ -2713,18 +2713,19 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition);
 
-  // Read-only score projection. The caller retains key S, or key IS and
-  // every requested member-group S when group_locked is true. Each checked
-  // leaf is decoded into owned scalar scores before release.
+  /// Projects owned scores in request order, preserving duplicates and misses.
+  /// The caller retains key S/X, or key IS and every requested member-group S
+  /// when group_locked is true. Borrowed leaf bytes never escape a read lease.
   Task<absl::StatusOr<SortedSetResult>> ReadGroupedSortedSetScores(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, GroupedObject::Handle object,
       bool group_locked = false);
 
-  // Caller holds IS. Capture all member S holds before reading any values so
-  // multi-member replies describe one logical cut. Nullopt requests a clean
-  // fallback to whole-key S after destroying every group hold.
+  /// Caller retains IS. Member-score reads take all leaf S holds before their
+  /// common view and retain them through IO. Nullopt requests whole-key S after
+  /// releasing IS. Every exit destroys group holds; error results are not
+  /// retried.
   Task<absl::StatusOr<std::optional<SortedSetResult>>>
   TryConcurrentSortedSetRead(std::uint8_t db_id, std::string_view key,
                              const Digest& digest,

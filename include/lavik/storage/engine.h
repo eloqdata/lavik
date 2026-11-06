@@ -1863,11 +1863,17 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const ListOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
+  /// Executes on OwnerForKey(key), retaining its own key protection through IO.
+  /// The caller keeps key, operation, its referenced inputs and any optional
+  /// replication/precondition state alive until the returned task completes.
+  /// Callers already holding key protection use ExecuteSortedSetLocked instead.
   bycorf::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSet(
       std::uint8_t db_id, std::string_view key,
       const SortedSetOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
+  /// Uses caller-held key S for reads or X for mutations on OwnerForKey(key).
+  /// Retain that protection and the borrowed inputs through task completion.
   bycorf::Task<absl::StatusOr<SortedSetResult>> ExecuteSortedSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, TxShardWrites* tx = nullptr,

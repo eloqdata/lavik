@@ -35,6 +35,11 @@ Task<absl::StatusOr<SortedSetResult>> StorageEngine::ExecuteSortedSetLocked(
                                        replication, mutation_precondition);
 }
 
+/// Executes a standalone operation on its owner worker and owns key admission.
+/// Eligible grouped operations try IS/IX using a revalidated state hint. A
+/// declined plan has released its groups before this caller drops the intent
+/// and acquires whole-key S/X once; operation errors propagate without retry.
+/// All borrowed inputs must outlive the coroutine, including its lock/IO waits.
 Task<absl::StatusOr<SortedSetResult>> StorageEngine::Impl::ExecuteSortedSet(
     std::uint8_t db_id, std::string_view key,
     const SortedSetOperation& operation, ReplicationCommandAppend* replication,
