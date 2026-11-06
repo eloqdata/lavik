@@ -1102,6 +1102,297 @@ absl::StatusOr<SortedSetResult> ReadCompactSortedSet(
   return result;
 }
 
+Task<absl::StatusOr<std::optional<SortedSetResult>>>
+StorageEngine::Impl::TryConcurrentSortedSetPoint(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, ReplicationCommandAppend* replication,
+    const MutationPrecondition* mutation_precondition) {
+  const auto valid = Validate(operation);
+  if (!valid.ok()) co_return valid;
+  auto& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  if (!CanPrepareGroupedWriteUnlocked(partition)) co_return std::nullopt;
+  const auto population = CaptureCompactWriteSnapshot(store, partition, db_id);
+  const auto* found = partition.indexes_[db_id].Find(digest, key);
+  const auto now = operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis();
+  if (!found || !found->key_complete() || !found->value_.grouped() ||
+      found->value_.value_type() != ValueType::kSortedSet ||
+      IsExpired(*found, now))
+    co_return std::nullopt;
+  auto view = partition.grouped_objects_[db_id].Lookup(
+      key, GroupedObjectVersion{
+               .root_ = MaterializeIndexLocation(*found),
+               .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+               .replication_epoch_ = partition.replication_epoch_,
+               .index_generation_ = partition.grouped_generations_[db_id]});
+  if (!view.ok()) co_return view.status();
+  auto object = std::move(*view);
+  const auto member = operation.kind_ == SortedSetOperationKind::kAdd
+                          ? operation.entries_.front().member_
+                          : operation.members_.front();
+  const auto* route = object->directory().Find(member);
+  if (!route) co_return absl::DataLossError("missing member prefix route");
+  const auto member_id = route->id_;
+  if (!store.group_locks_)
+    store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
+  auto holds = store.group_locks_->MakeLockSet(
+      {db_id, tx::FingerprintOf(digest), object->incarnation()});
+  auto status = co_await holds.Acquire({GroupedLockIndex::kMember, member_id},
+                                       GroupedLockMode::kExclusive);
+  if (!status.ok()) co_return status;
+  // A preceding holder may have updated this leaf while we waited. Rebase
+  // before reading, rather than mistaking its revision for a failed read.
+  auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
+  if (!current || current->incarnation() != object->incarnation() ||
+      !current->has_member_index())
+    co_return std::nullopt;
+  route = current->directory().Find(member);
+  if (!route || route->id_ != member_id) co_return std::nullopt;
+  object = std::move(current);
+  if (route->encoded_bytes_ >
+      kCollectionGroupTargetBytes + kHashGroupHeaderBytes)
+    co_return std::nullopt;
+  auto input_admission = ReserveInputs(operation);
+  if (!input_admission.ok()) co_return input_admission.status();
+  Members members;
+  status = PrepareMembers(operation, &members);
+  if (!status.ok()) co_return status;
+  auto& state = members.begin()->second;
+  SortedSetResult result;
+  result.key_exists_ = true;
+  result.length_ = object->ordered_directory().root().item_count_;
+  GroupedScratchBudget leaf_budget;
+  const auto* physical = object->FindGroup(member_id);
+  if (!physical) co_return absl::DataLossError("missing member prefix page");
+  status = leaf_budget.AddGroup(*physical, object->ExtentsFor(member_id));
+  if (!status.ok()) co_return status;
+  auto leaf_admission = leaf_budget.Reserve(2);
+  if (!leaf_admission.ok()) co_return leaf_admission.status();
+  std::optional<SortedSetMemberProbe> probe;
+  {
+    auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
+                                              digest, object, member_id, false,
+                                              operation.diagnostics_, true);
+    if (!leaf.ok()) co_return leaf.status();
+    const auto bytes = leaf->loaded_.value();
+    const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
+                                   bytes.size());
+    auto point = HashGroupPointProbe::Create(
+        payload, object->directory().root().seed_, member);
+    if (!point.ok()) co_return point.status();
+    if (*point) {
+      auto score = DecodeSortedSetMemberScore((**point).value());
+      if (!score.ok()) co_return score.status();
+      state.before_ = state.after_ = *score;
+      probe.emplace(std::move(*leaf_admission), object, HashGroupSnapshot{},
+                    std::move(*point));
+    }
+    status = ApplyInputs(operation, &members, &result);
+    if (!status.ok()) co_return status;
+    if (state.touched_ && !state.before_) {
+      constexpr auto overhead = 8 + sizeof(double);
+      const auto base_bytes = std::max(payload.size() - kHashGroupHeaderBytes,
+                                       std::size_t(kHashValueHeaderBytes));
+      if (member.size() > kCollectionGroupTargetBytes - overhead ||
+          base_bytes > kCollectionGroupTargetBytes - overhead - member.size())
+        co_return std::nullopt;
+      GroupedScratchBudget incoming;
+      status = incoming.AddBytes(member.size() + 256);
+      if (!status.ok()) co_return status;
+      auto incoming_admission = incoming.Reserve(1);
+      if (!incoming_admission.ok()) co_return incoming_admission.status();
+      const auto score = EncodeSortedSetMemberScore(*state.after_);
+      const HashEntryView edit{member, score};
+      auto inserted =
+          ApplyHashGroupEdits(payload, object->directory().root().seed_,
+                              HashGroupEditKind::kSetIfAbsent, {&edit, 1});
+      if (!inserted.ok()) co_return inserted.status();
+      if (inserted->leaves_.size() != 1 ||
+          !inserted->leaves_.front().prepared_ ||
+          inserted->leaves_.front().id_ != member_id)
+        co_return std::nullopt;
+      probe.emplace(std::move(*leaf_admission), object, HashGroupSnapshot{},
+                    std::nullopt,
+                    SortedSetMemberInsertion{
+                        std::move(*incoming_admission), member, *state.after_,
+                        std::move(inserted->leaves_.front())});
+    }
+  }
+  auto refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
+  if (!refreshed.ok()) co_return refreshed.status();
+  object = std::move(*refreshed);
+  if (!state.touched_) {
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
+    if (!refreshed.ok()) co_return refreshed.status();
+    status =
+        ValidateGroupedWriteSnapshot(store, partition, db_id, key, *refreshed,
+                                     population, mutation_precondition);
+    if (!status.ok()) co_return status;
+    co_return std::optional(std::move(result));
+  }
+  // Resident bounds can route ordinary point edits without speculative reads
+  // of unlocked pages. Ambiguous equal-score/long-member boundaries use X.
+  const auto locate =
+      [&](const GroupedObject::Handle& source,
+          std::optional<double> score) -> std::optional<std::uint64_t> {
+    if (!score) return 0;
+    const auto& directory = source->ordered_directory();
+    const auto& pages = directory.groups();
+    if (pages.empty()) return std::nullopt;
+#if LAVIK_FAULTS_ENABLED
+    std::size_t probes = 0;
+    const auto trace_route = [&](bool fallback) {
+      if (LAVIK_FAULT_MATCHES("LAVIK_TRACE_ZSET_POINT_ROUTE_KEY", key))
+        spdlog::info("zset point route pages={} probes={} fallback={}",
+                     pages.size(), probes, unsigned(fallback));
+    };
+#endif
+    // Page maxima are ordered by (score, binary member). Search the resident
+    // bounds directly so a long equal-score run remains O(log G), both before
+    // locking and during revalidation. The last page also accepts appends past
+    // the current maximum; its member bound need not be compared.
+    std::size_t first = 0, last = pages.size() - 1;
+    while (first < last) {
+      const auto mid = first + (last - first) / 2;
+      LAVIK_FAULT_INJECT(++probes;);
+      bool less = pages[mid].max_score_ < *score;
+      if (pages[mid].max_score_ == *score) {
+        const auto cached = pages[mid].max_key_.LessThan(member);
+        if (!cached) {
+          LAVIK_FAULT_INJECT(trace_route(true););
+          return std::nullopt;
+        }
+        less = *cached;
+      }
+      if (less)
+        first = mid + 1;
+      else
+        last = mid;
+    }
+    LAVIK_FAULT_INJECT(trace_route(false););
+    return pages[first].id_;
+  };
+  const auto source_id = locate(object, state.before_);
+  const auto destination_id = locate(object, state.after_);
+  if (!source_id || !destination_id) co_return std::nullopt;
+  std::map<std::uint64_t, GroupedLockMode> selected;
+  for (const auto id : {*source_id, *destination_id}) {
+    if (!id) continue;
+    const auto* page = object->ordered_directory().Find(id);
+    if (!page) co_return absl::DataLossError("missing point route");
+    selected[id] = GroupedLockMode::kExclusive;
+    for (const auto neighbour : {page->previous_, page->next_})
+      if (neighbour) selected.try_emplace(neighbour, GroupedLockMode::kShared);
+  }
+  // Merge both routes before locking: a destination can also be a source's
+  // neighbour, and S-to-X upgrades would invalidate the global lock order.
+  for (const auto& [id, mode] : selected) {
+    status =
+        co_await holds.Acquire({GroupedLockIndex::kOrdered, {id, 0}}, mode);
+    if (!status.ok()) co_return status;
+  }
+  refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
+  if (!refreshed.ok()) co_return refreshed.status();
+  object = std::move(*refreshed);
+  if (locate(object, state.before_) != source_id ||
+      locate(object, state.after_) != destination_id)
+    co_return std::nullopt;
+  LAVIK_FAULT_INJECT({
+    if (LAVIK_FAULT_MATCHES("LAVIK_ZSET_GROUP_PAUSE_MEMBER", member)) {
+      spdlog::info("zset group locks held before page IO member={}", member);
+      auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_ZSET_GROUP_PAUSE_FILE");
+      if (!paused.ok()) co_return paused;
+    }
+  });
+  // Topology changes require X, so the selected neighbours still bound these
+  // pages. Their shared holds protect boundary validation until publication.
+  probe->source_ = object;
+  const auto delta =
+      int(state.after_.has_value()) - int(state.before_.has_value());
+  result.length_ = object->ordered_directory().root().item_count_ + delta;
+  if (result.length_ == 0) co_return std::nullopt;
+  OrderedCollectionMutationPlan plan{
+      .root_ = object->ordered_directory().root(),
+      .expected_sequence_ = object->revision(),
+      .changed_ = true,
+      .writes_ = {}};
+  plan.root_.item_count_ = result.length_;
+  GroupedScratchBudget pages_budget;
+  for (const auto& [id, mode] : selected) {
+    if (mode != GroupedLockMode::kExclusive) continue;
+    physical = object->FindGroup({id, 0});
+    if (!physical) co_return absl::DataLossError("missing ordered point page");
+    status = pages_budget.AddGroup(*physical, object->ExtentsFor({id, 0}));
+    if (!status.ok()) co_return status;
+  }
+  status = pages_budget.AddBytes(member.size() + 256);
+  if (!status.ok()) co_return status;
+  auto pages_admission = pages_budget.Reserve(4);
+  if (!pages_admission.ok()) co_return pages_admission.status();
+  std::uint64_t protected_bytes = 0;
+  for (const auto& [id, mode] : selected) {
+    if (mode == GroupedLockMode::kShared) {
+      protected_bytes += object->ordered_directory().Find(id)->encoded_bytes_;
+      continue;
+    }
+    LAVIK_FAULT_INJECT({
+      // The ordinary planner already owns its source probe at this boundary;
+      // keep this hook specific to additional destination-page reads.
+      const auto ordinal = object->ordered_directory().FindIndex(id);
+      if (id != *source_id &&
+          LAVIK_FAULT_MATCHES_NTH("LAVIK_FAIL_ZSET_PLAN_READ_KEY", key,
+                                  "LAVIK_FAIL_ZSET_PLAN_READ_PAGE",
+                                  *ordinal + 1))
+        co_return absl::UnavailableError(
+            "injected Sorted Set plan page read failure");
+    });
+    auto page = co_await LoadEncodedSortedSetGroupSnapshot(
+        store, partition, db_id, key, digest, object, id, nullptr,
+        operation.diagnostics_, true);
+    if (!page.ok()) co_return page.status();
+    auto edited = EditEncodedSortedSetGroup(
+        page->snapshot_, member,
+        id == *source_id ? state.before_ : std::nullopt,
+        id == *destination_id ? state.after_ : std::nullopt,
+        kCollectionGroupTargetBytes, SortedSetMemberAbsence::kVerified);
+    if (!edited.ok()) co_return edited.status();
+    if (!*edited) co_return std::nullopt;
+    auto encoder = OrderedGroupEncoder::Create(**edited);
+    if (!encoder.ok()) co_return encoder.status();
+    protected_bytes += encoder->encoded_bytes();
+    plan.writes_.push_back(std::move(**edited));
+  }
+  // Other IX writers may shrink distant pages during our append wait. This
+  // lower bound prevents a late compact conversion from needing an X retry
+  // after AppendLocked has canonicalized the replication command.
+  if (protected_bytes < kCollectionGroupTargetBytes) co_return std::nullopt;
+  const SortedSetMemberChange change{member, state.before_, state.after_};
+  auto member_plan = co_await PrepareSortedSetMembers(
+      store, partition, db_id, key, digest, object, plan, true,
+      std::span(&change, 1), &*probe);
+  if (!member_plan.ok()) co_return member_plan.status();
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
+  if (!refreshed.ok()) co_return refreshed.status();
+  status =
+      ValidateGroupedWriteSnapshot(store, partition, db_id, key, *refreshed,
+                                   population, mutation_precondition);
+  if (!status.ok()) co_return status;
+  bool retry_exclusive = false;
+  status = co_await CommitGroupedOrderedMutationLocked(
+      store, partition, db_id, key, digest, object, std::move(plan),
+      object->version().root_.expire_at_ms_, nullptr, replication,
+      mutation_precondition, &*member_plan, operation.diagnostics_,
+      &retry_exclusive);
+  if (retry_exclusive) co_return std::nullopt;
+  if (!status.ok()) co_return status;
+  co_return std::optional(std::move(result));
+}
+
 Task<absl::StatusOr<SortedSetResult>>
 StorageEngine::Impl::ExecuteSortedSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,

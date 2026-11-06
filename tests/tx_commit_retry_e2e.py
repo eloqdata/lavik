@@ -555,21 +555,170 @@ def backpressure_shutdown(binary, path):
             observer.close()
 
 
+def dependent_batch(
+    binary, path, *, rollover=False, crash=False, failure=None, shutdown=False
+):
+    """Dependent roots share a durable prefix, including the rollover retry."""
+    path.mkdir()
+    with (path / "data").open("wb") as disk:
+        disk.truncate(512 * 1024 * 1024)
+    base = path / "commit"
+    pause = Path(str(base) + ".pause")
+    environment = {
+        "LAVIK_TX_COMMIT_TEST_GATE": str(base),
+        "LAVIK_TX_CLEANER_START_PAUSED": "1",
+    }
+    if crash:
+        environment["LAVIK_CRASH_POINT"] = "tx-commit-batch-before-flush"
+    members = [f"{i:04d}-".encode() + b"m" * 251 for i in range(128)]
+    changed = (0, 64, 127)
+
+    def verify(client, count):
+        scores = [
+            str(i + 0.25).encode() if i in changed[:count] else str(i).encode()
+            for i in range(128)
+        ]
+        assert command(client, "ZMSCORE", "target", *members) == scores
+        assert command(client, "ZRANGE", "target", 0, -1, "WITHSCORES") == [
+            part for member, score in zip(members, scores) for part in (member, score)
+        ]
+
+    with server(binary, path, checkpoint=False, environment=environment) as (
+        client,
+        process,
+    ):
+        command(
+            client,
+            "ZADD",
+            "target",
+            *(part for i, member in enumerate(members) for part in (i, member)),
+        )
+        drain(client)
+        pause.touch()
+        if rollover:
+            Path(str(base) + ".rollover").touch()
+        log_start = len((path / "server.log").read_text())
+        for i in changed:
+            assert (
+                command(client, "ZINCRBY", "target", "0.25", members[i])
+                == str(i + 0.25).encode()
+            )
+        assert stats(client)[b"storage_tx_commits_pending"] == b"3"
+        verify(client, 3)
+        if failure:
+            Path(str(base) + "." + failure).touch()
+        if not shutdown:
+            pause.unlink()
+        if shutdown:
+            # Shutdown releases the paused drain itself. A prefix-boundary
+            # retry must still finish accepted work when admission has closed.
+            process.send_signal(signal.SIGTERM)
+            assert process.wait(timeout=30) == 0, (path / "server.log").read_text()
+        elif crash:
+            assert process.wait(timeout=30) == 86, (path / "server.log").read_text()
+        elif failure:
+            wait_for(
+                lambda: stats(client)[b"storage_durability_failed"] == b"1",
+                "dependent batch failure did not fence serving",
+            )
+            assert stats(client)[b"storage_tx_commits_pending"] == b"0"
+            process.kill()
+            process.wait(timeout=30)
+        else:
+            drain(client)
+            assert stats(client)[b"tx_commit_retries"] == b"0"
+            verify(client, 3)
+            process.kill()
+            process.wait(timeout=30)
+        log = (path / "server.log").read_text()[log_start:]
+        events = re.findall(r"tx commit test (appended|durable) txid=(\d+)", log)
+        locations = re.findall(
+            r"tx commit test location txid=(\d+) block=(\d+) epoch=(\d+)", log
+        )
+        if not crash and not failure:
+            ids = [txid for phase, txid in events if phase == "appended"]
+            assert len(ids) == 3, events
+            if rollover:
+                assert "tx commit test forced prefix rollover" in log
+                assert events.index(("durable", ids[0])) < events.index(
+                    ("appended", ids[1])
+                ), events
+                assert locations[0][1:] != locations[1][1:], locations
+            else:
+                assert events[:3] == [("appended", txid) for txid in ids], events
+                assert len({location[1:] for location in locations}) == 1, locations
+        elif crash:
+            # Same-block batching must reach the boundary with all decisions
+            # appended. Rollover must stop before appending its first successor.
+            assert len(locations) == (1 if rollover else 3), log
+
+    with server(binary, path, checkpoint=False) as (client, process):
+        recovered = command(client, "ZMSCORE", "target", *(members[i] for i in changed))
+        count = sum(
+            score == str(i + 0.25).encode() for i, score in zip(changed, recovered)
+        )
+        if not crash and not failure:
+            assert count == 3, recovered
+        # An interrupted flush may expose an old prefix or the complete batch,
+        # but never a successor whose inherited page versions are uncommitted.
+        verify(client, count)
+    assert process.returncode == 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
     parser.add_argument(
         "--case",
-        choices=("all", "natural", "shutdown", "injected", "matrix", "superseded"),
+        choices=(
+            "all",
+            "natural",
+            "shutdown",
+            "injected",
+            "matrix",
+            "superseded",
+            "dependent",
+        ),
         default="all",
     )
     args = parser.parse_args()
+    if (
+        args.case in ("injected", "superseded", "matrix", "dependent")
+        and os.environ.get("LAVIK_TEST_FAULTS_AVAILABLE", "1") != "1"
+    ):
+        # Standalone fault cases have no coverage without the hooks. Keep the
+        # combined run available for its natural and shutdown scenarios.
+        print(f"SKIP {args.case}: test faults are unavailable", flush=True)
+        raise SystemExit(77)
     root = Path(
         tempfile.mkdtemp(
             prefix="lavik-tx-commit-retry-", dir=os.environ.get("LAVIK_TEST_DATA_DIR")
         )
     )
     print(f"artifacts: {root}", flush=True)
+    if (
+        args.case in ("all", "dependent")
+        and os.environ.get("LAVIK_TEST_FAULTS_AVAILABLE", "1") == "1"
+    ):
+        for rollover in (False, True):
+            for crash in (False, True):
+                dependent_batch(
+                    args.binary,
+                    root / f"dependent-{rollover}-{crash}",
+                    rollover=rollover,
+                    crash=crash,
+                )
+                print(f"PASS dependent rollover={rollover} crash={crash}", flush=True)
+            dependent_batch(
+                args.binary,
+                root / f"dependent-shutdown-{rollover}",
+                rollover=rollover,
+                shutdown=True,
+            )
+            print(f"PASS dependent shutdown rollover={rollover}", flush=True)
+        for failure in ("terminal", "flush-fail"):
+            dependent_batch(args.binary, root / f"dependent-{failure}", failure=failure)
+            print(f"PASS dependent failure={failure}", flush=True)
     for checkpoint in (False, True):
         if args.case in ("all", "natural"):
             for kind in ("mset", "exec", "lua"):

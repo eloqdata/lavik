@@ -50,14 +50,21 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    SortedSetMemberMutation* prepared_members,
-    OnlineLatencyTrace* diagnostics) {
+    SortedSetMemberMutation* prepared_members, OnlineLatencyTrace* diagnostics,
+    bool* retry_exclusive) {
+  if (retry_exclusive) *retry_exclusive = false;
+  const auto needs_x = [&]() {
+    assert(retry_exclusive);
+    *retry_exclusive = true;
+    return absl::AbortedError("Sorted Set plan requires key X");
+  };
   if (!diagnostics && tx) diagnostics = tx->diagnostics_;
   if (!plan.changed_) co_return absl::OkStatus();
   if (previous && (!previous->is_ordered() ||
                    plan.expected_sequence_ != previous->revision()))
     co_return absl::AbortedError("ordered mutation plan is stale");
   if (plan.delete_key_) {
+    if (retry_exclusive) co_return needs_x();
     // The adapter already owns store_state_mutex_; DeleteLocked would try to
     // acquire it again. The tombstone append owns the same graph-retirement
     // and transaction/replication bookkeeping as the ordinary delete path.
@@ -217,6 +224,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
                                 previous->ordered_directory(), planned_root,
                                 plan.writes_, member_plan.writes_)
           .ok();
+  if (retry_exclusive && !prepared_publication) co_return needs_x();
   // Member preparation can suspend on page IO. Allocate only after both
   // logical plans are ready, independently of the earlier transaction and
   // batch IDs. Existing key X protection orders the remaining staging waits.
@@ -335,6 +343,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         prepared_batch.disk_bytes_ += size;
       }
     } else {
+      if (retry_exclusive) co_return needs_x();
       revision = AllocateGroupedRevision();
       if (revision == 0 || revision <= previous->revision())
         co_return absl::OutOfRangeError(
@@ -367,6 +376,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         }
       }
       if (total < kCollectionGroupTargetBytes) {
+        if (retry_exclusive) co_return needs_x();
         if (!SameLogicalView(previous, side.CurrentForMutation(key)))
           co_return absl::AbortedError(
               "Sorted Set demotion needs current key X");

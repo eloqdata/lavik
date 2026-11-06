@@ -207,10 +207,10 @@ ordinary suspended storage operations.
 Owner-local standalone predecessors enter the commit queue before releasing
 key locks. Successors may stage changed pages and publish readable in-memory
 roots while those decisions are pending. Receipts retain the predecessor
-failure decisions, so the background commit waits for predecessor durability
-before appending the successor decision. A shared commit batch flushes its
-appended predecessor frontier before processing a dependent successor,
-including across block rollover. Failed ancestors prevent descendant commits;
+decisions, so the background commit preserves their recovery order. A shared
+commit batch appends dependent decisions in order within one physical block
+and flushes them together; it completes the predecessor frontier before a
+dependent append can switch blocks. Failed ancestors prevent descendant commits;
 recovery cannot accept a root inheriting pages from an uncommitted ancestor.
 Borrowed EXEC/Lua predecessors whose coordinator is not known to be the local
 queue retain the foreground dependency wait. Standalone compact demotion also
@@ -237,8 +237,24 @@ readers at the head are granted together, while queued writers fence later
 readers. Cancelling an ungranted waiter unlinks it and rechecks its successors.
 Once a coroutine has entered the worker's ready queue, it must resume before
 its frame can be destroyed. Group lock state has no durable representation and
-does not allocate transaction IDs or revisions. Collection command paths still
-use whole-key S/X protection and do not yet call this sub-key API.
+does not allocate transaction IDs or revisions.
+
+Standalone single-member ZADD, ZREM and ZINCRBY inspect owner-local key state
+without suspension to choose IX for an existing grouped Sorted Set, then
+recheck its representation after acquisition. The worker lazily owns one group
+lock table. Writers acquire the member leaf exclusively, resolve source and
+destination ordered pages, and acquire those pages exclusively and their
+immediate routing neighbours shared, in identity order. Routes are rechecked
+after waits. Group holds span page IO, private preparation and publication;
+unrelated groups can perform IO concurrently. Page reads refresh physical
+coordinates and validate the protected group's revision instead of rejecting
+an unrelated root publication.
+
+Batch commands, EXEC/Lua, structural changes and ambiguous resident routing
+use whole-key X. An ineligible point plan releases every group hold and IX
+before one X acquisition and replans from current state. It never upgrades
+while retaining groups or repeatedly retries IX. Whole-key S readers and X
+writers wait for active IX holders; the key queue fences later IX arrivals.
 
 ## Durable graph and publication
 
@@ -323,10 +339,11 @@ Sorted Set and Stream writers retain key intent and database admission while
 releasing worker store state for page reads and private mutation planning.
 This includes both Sorted Set graphs and retained EXEC/Lua key holds, but not
 native candidate ingestion. Plans retain their page admission through commit.
-Reacquisition checks population and logical root identity even for no-ops and
-last-element deletion; physical relocation alone is allowed. The writer
-refreshes GC coordinates under store state. Command adapters still retain
-exclusive key protection through publication.
+Reacquisition checks population and the protected logical state even for
+no-ops and last-element deletion; physical relocation alone is allowed.
+Whole-key writers validate root identity, while concurrent Sorted Set point
+writers validate their locked groups. The writer refreshes GC coordinates
+under store state.
 
 Existing standalone Sorted Set updates that preserve page topology and fit
 all changed inline groups plus their root in one append range use a prepared
@@ -343,8 +360,10 @@ carry the sequence and cardinality of that final publication.
 
 Structural changes, demotion, external/oversized batches, replay and EXEC/Lua
 retain the multi-append path, with X ordering revisions across its resource
-and extent waits. Prepared publication alone does not enable command-level IX:
-those callers also need group arbitration and routing revalidation.
+and extent waits. IX point writers require bounded prepared publication;
+ineligible plans fall back before staging any records. The locked pages also
+bound the minimum remaining primary payload, so distant concurrent removals
+cannot force a compact conversion during the append wait.
 Full-image, promotion and random Set-pop adapters retain
 their separate preparation paths and share the same publication boundary.
 
@@ -390,17 +409,20 @@ expiry cannot disguise that failure as an absent key. Internal compensation
 alone may inspect the failed physical view to restore or retire it; snapshot
 page readers independently recheck the decision after storage waits.
 
-An incremental successor from another transaction waits for its predecessor's
-durable decision before inheriting untouched groups. Same-transaction commands
-can reuse their view. This causal dependency is separate from the physical
-pins that keep prior transaction blocks allocated until retirement.
+An incremental successor retains owner-local predecessor decisions while
+inheriting untouched groups. The commit coordinator preserves their recovery
+order, allowing dependent decisions in one physical block to share a flush;
+cross-coordinator predecessors still require a durable decision before reuse.
+Same-transaction commands can reuse their view. This causal dependency is
+separate from the physical pins that keep prior transaction blocks allocated
+until retirement. See [durable commit handoff](03-transaction-coordination.md#durable-commit-handoff).
 
 Before acquiring a standalone transaction's append lease, grouped writes
-sample foreground space and coordinate transaction-block cleaning under pressure.
-The predecessor decision is durable before that cleaning can run. Borrowed
-EXEC/Lua transactions do not wait for their own still-active blocks to
-retire. This pressure signal bypasses the periodic cooldown, not explicit
-cleaner disabling or the allocator's authoritative capacity checks.
+request transaction-block cleaning when enabled.
+They do not wait for live transaction blocks while holding key intents;
+writer leases and dependency pins protect pending graphs from reclamation.
+This pressure signal bypasses the periodic cooldown, not explicit cleaner
+disabling or the allocator's authoritative capacity checks.
 
 ## Command access paths
 

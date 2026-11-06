@@ -84,7 +84,10 @@ intent-exclusive (IX) modes. IS is compatible with IS, S and IX; S with S;
 IX with IX. All other pairs conflict. IS/IX permit partial readers and writers
 to overlap; callers must separately arbitrate their sub-key conflicts. Grouped
 storage provides an independent [sub-key lock API](09-grouped-collections.md#sub-key-arbitration).
-Storage command paths currently request only S or X. IS/IX are distinct from the
+Standalone bounded grouped Sorted Set point writes request IX and arbitrate
+their member and ordered groups separately. Whole-key readers retain S;
+structural writes, batch commands and EXEC/Lua retain X. IS is available to
+partial readers but is not yet selected by command adapters. IS/IX are distinct from the
 scheduling-intent counter layer: all modes register intents, and conflicting
 queued intents prevent later arrivals from barging. In particular, a queued
 S or X blocks new IX arrivals, while only a queued X blocks new IS arrivals.
@@ -220,9 +223,15 @@ the remaining batch metadata alive does not keep completed writers active.
 
 Owner-local grouped successors retain predecessor decisions in their receipts
 and may publish staged versions before those predecessors become durable. The
-drain completes an appended commit frontier before appending any dependent
-successor decision, preserving ancestor-before-successor durability even when
-commit records cross physical blocks. A terminal commit failure fail-stops
+drain appends dependent decisions in order within one physical block and
+flushes them together. The block header exposes a durable contiguous prefix,
+so recovering a successor also recovers its earlier decisions. The append
+path rechecks the block identity and capacity after data waits; when it cannot
+extend that prefix without waiting or switching blocks, the drain completes
+the appended frontier before retrying the successor. Dependencies outside the
+drain's appended batch still require their prior durable decision. This keeps
+ancestor-before-successor recovery without a flush per dependent commit.
+A terminal commit failure fail-stops
 storage and fails remaining queue-owned decisions. Cross-coordinator
 grouped predecessors retain their existing foreground ordering boundary.
 

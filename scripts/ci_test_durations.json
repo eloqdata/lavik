@@ -1,5 +1,5 @@
 {
-  "_comment": "Scheduling estimates in seconds, not a coverage allowlist. Based on AMD64/ARM64 runs 36996503221, 37016095192 and PR run 37127284322 (2026-10-02/03); grouped ordered case estimates use ARM64 run 41089524542 (2026-10-30). Reduced scenario matrices use conservative proportional estimates until the next complete run; mapped Sentinel omits repeated HA. Update estimates when a suite changes substantially; unseen tests use family defaults and remain mandatory.",
+  "_comment": "Scheduling estimates in seconds, not a coverage allowlist. Based on AMD64/ARM64 runs 36996503221, 37016095192 and PR run 37127284322 (2026-10-02/03); grouped ordered case estimates use ARM64 run 41089524542 (2026-10-30). Transaction retry cases include headroom over local ARM64 Debug measurements (2026-11-05). Reduced scenario matrices use conservative proportional estimates until the next complete run; mapped Sentinel omits repeated HA. Update estimates when a suite changes substantially; unseen tests use family defaults and remain mandatory.",
   "default_seconds": 0.2,
   "prefix_seconds": {
     "meta_integration.": 30,
@@ -20,6 +20,12 @@
     "lavik_redis_export_ha_cluster": 190,
     "lavik_redis_export_ha_single": 195,
     "lavik_tomb_raider_e2e": 80,
+    "lavik_tx_commit_retry_e2e.dependent": 60,
+    "lavik_tx_commit_retry_e2e.injected": 80,
+    "lavik_tx_commit_retry_e2e.matrix": 420,
+    "lavik_tx_commit_retry_e2e.natural": 100,
+    "lavik_tx_commit_retry_e2e.shutdown": 20,
+    "lavik_tx_commit_retry_e2e.superseded": 90,
     "meta_integration.admin_slow_reader": 55,
     "meta_integration.gate_automatic_failover_leader_proposal": 65,
     "meta_integration.gate_cluster_client": 85,

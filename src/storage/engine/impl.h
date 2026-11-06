@@ -64,6 +64,7 @@
 #include "lavik/memory.h"
 #include "lavik/replication_history.h"
 #include "lavik/storage/detail/compact_write.h"
+#include "lavik/storage/detail/grouped/lock.h"
 #include "lavik/storage/detail/grouped/object_index.h"
 #include "lavik/storage/detail/hash_codec.h"
 #include "lavik/storage/detail/ordered_index.h"
@@ -1713,6 +1714,9 @@ class StorageEngine::Impl {
               {.owner_shard_ = memory_owner, .externally_admitted_ = true})) {}
 
     Impl* engine_ = nullptr;
+    // Created only by grouped point writers; all access and waiter wakeups
+    // stay on this key owner. The store outlives every request lock set.
+    std::unique_ptr<GroupedLockTable> group_locks_;
     bycorf::AsyncNotification block_pin_progress_;
     // Only genuinely exhausted foreground allocations wait here. Notification
     // delivery remains on this owner; producers inspect just the atomic count.
@@ -2588,8 +2592,9 @@ class StorageEngine::Impl {
   // assigns its fresh incarnation/revision before staging any auxiliary.
   // Existing non-structural standalone ZSET plans use a bounded prepared batch;
   // supplied member plans can merge disjoint changes into the current root.
-  // Command callers still retain key X; enabling IX also requires group holds
-  // through planning and a whole-key fallback for ineligible/stale plans.
+  // IX callers retain changed groups and routing neighbours through commit,
+  // and retry_exclusive forbids the yielding whole-key writer fallback. A
+  // true output certifies rejection before publication, allowing one X retry.
   struct SortedSetMemberMutation;
   Task<absl::Status> CommitGroupedOrderedMutationLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2599,7 +2604,8 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
       SortedSetMemberMutation* prepared_members = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr,
+      bool* retry_exclusive = nullptr);
   struct SortedSetMemberMutation {
     MemoryReservation scratch_;
     MemoryReservation leaves_;
@@ -2696,6 +2702,16 @@ class StorageEngine::Impl {
       const MutationPrecondition* mutation_precondition = nullptr,
       PreparedOrderedMutation* prepared = nullptr,
       SortedSetOrderedProbe* ordered_probe = nullptr);
+
+  // Caller holds key IX and database admission. A disengaged result requests
+  // one X retry after releasing all groups and IX; errors are never retried.
+  // Only bounded, topology-preserving single-member writes publish here.
+  Task<absl::StatusOr<std::optional<SortedSetResult>>>
+  TryConcurrentSortedSetPoint(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation,
+      ReplicationCommandAppend* replication,
+      const MutationPrecondition* mutation_precondition);
 
   // Read-only score projection. The shared key intent stays with the caller;
   // each checked member leaf is decoded into owned scalar scores before
@@ -2983,14 +2999,27 @@ class StorageEngine::Impl {
   Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                           const Digest& digest);
 
+  // Owned by one commit drain. Only decisions already appended by that drain
+  // may bypass a predecessor wait, and only within the same physical prefix.
+  struct DeferredCommitBatch {
+    absl::flat_hash_map<const GroupedCommitDecision*, RelocationDurabilityFence>
+        decisions_;
+    std::optional<RelocationDurabilityFence> append_prefix_;
+    bool flush_required_ = false;
+  };
+
   // A non-null retryable_capacity opts the queue into retaining grouped
   // decisions on pre-append foreground exhaustion. It is set false for all
   // other outcomes; direct callers retain the default terminal policy.
+  // deferred_batch requires deferred_decision. An aborted append with
+  // flush_required_ set retains the decision and has written no bytes; the
+  // drain must flush its appended prefix before retrying the same receipt.
   Task<absl::Status> CommitTxWrites(
       std::uint64_t txid, std::vector<TxShardWrites*> shards,
       RelocationDurabilityFence* deferred_decision = nullptr,
       bool* retryable_capacity = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr,
+      DeferredCommitBatch* deferred_batch = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
@@ -4229,14 +4258,21 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+  // Requires parent IX plus this group's S/X hold. Refresh physical metadata
+  // across GC without rejecting publications to unrelated groups. No pin is
+  // implied: each physical read still owns its usual allocation lease.
+  absl::StatusOr<GroupedObject::Handle> RefreshLockedGroup(
+      WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+      std::string_view key, const GroupedObject::Handle& source,
+      GroupedRecordId id);
   // The optional snapshot view must already own physical pins. Ordinary
   // reads instead retry GC relocation against the same logical root version.
   Task<absl::StatusOr<LoadedHashGroupPayload>> LoadHashGroupPayload(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4642,7 +4678,7 @@ class StorageEngine::Impl {
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
       ReadLatencyTrace* trace = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
   Task<absl::StatusOr<ListResult>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4670,7 +4706,7 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
       GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr);
+      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
   enum class SortedSetPageReadMode : bool { kFullDecode, kIndexedProjection };
   // Indexed projection applies only to v2 pages with kTrustStored; v1 and
   // kVerifyUnique retain full decoding. Both modes check identity/CRC and
@@ -4766,12 +4802,15 @@ class StorageEngine::Impl {
 
   // Keep owning handles in the callee so success, failure and cancellation
   // retain the same release/transfer boundary as the awaited write. Tracing
-  // stays last and is absent from non-tracing builds.
+  // is absent from non-tracing builds. deferred_batch is only for a keyless
+  // commit: its append_prefix_ forbids yielding or rolling the append stream
+  // before the drain has completed the predecessor decisions.
   Task<absl::Status> WriteRecordLocked(
       WorkerStore& store, const RecordWriteRequest& request,
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr,
+      DeferredCommitBatch* deferred_batch = nullptr);
 
   Task<absl::StatusOr<IndirectKeyHandle>> EnsureIndirectKey(
       WorkerStore& store, std::string_view key, const Digest& digest,

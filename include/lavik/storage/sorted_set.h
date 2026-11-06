@@ -110,8 +110,9 @@ struct SortedSetOperation {
   std::string_view scan_pattern_ = "*";
   // Explicit permission from a single-key ZADD/ZREM/ZINCRBY caller to prepare
   // a new collection or small compact update without the store-state mutex.
-  // New grouped values include preparation of both indexes. The exclusive key
-  // hold and database admission remain owned by the caller through publication;
+  // New grouped values include preparation of both indexes. Standalone bounded
+  // grouped point writes may use IX and group holds; other writes retain X.
+  // Key protection and database admission remain owned through publication;
   // storage independently checks physical eligibility and revalidates before
   // publishing or returning a no-op.
   // Internal/multi-key operations and GEOADD leave this disabled.
