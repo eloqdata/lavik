@@ -243,9 +243,9 @@ Once a coroutine has entered the worker's ready queue, it must resume before
 its frame can be destroyed. Group lock state has no durable representation and
 does not allocate transaction IDs or revisions.
 
-Standalone grouped Hash point reads and writes use IS/IX with shared/exclusive
-holds on their requested prefix leaves. HSCAN protects its cursor leaf; HLEN
-reads the atomically published cardinality under IS without payload holds.
+Standalone grouped Hash/Set point reads and writes use IS/IX with shared/exclusive
+holds on their requested prefix leaves. HSCAN/SSCAN protect their cursor leaf;
+HLEN/SCARD read the atomically published cardinality under IS without payload holds.
 Multi-field commands acquire all leaves in identity order before capturing one
 logical view. Holds span IO, private preparation and publication. Physical
 loads validate protected leaf revisions while allowing disjoint root updates.
@@ -395,11 +395,11 @@ This includes both Sorted Set graphs and retained EXEC/Lua key holds, but not
 native candidate ingestion. Plans retain their page admission through commit.
 Reacquisition checks population and the protected logical state even for
 no-ops and last-element deletion; physical relocation alone is allowed.
-Whole-key writers validate root identity, while concurrent Hash and Sorted Set
+Whole-key writers validate root identity, while concurrent Hash/Set and Sorted Set
 writers validate their locked groups. The writer refreshes GC coordinates
 under store state.
 
-Existing standalone Hash and Sorted Set updates that preserve page topology and fit
+Existing standalone Hash/Set and Sorted Set updates that preserve page topology and fit
 all changed inline groups plus their root in one append range use a prepared
 batch. Page preparation and append capacity, index-reader and retirement-pin
 waits finish before publication order is assigned. The caller refreshes its
@@ -418,7 +418,7 @@ retain the multi-append path, with X ordering revisions across its resource
 and extent waits. IX point writers require bounded prepared publication;
 ineligible plans fall back before staging any records. Sorted Set writers bound
 the minimum remaining primary payload using locked page contents and the
-headers of untouched pages, whose retirement requires key X. Hash batches
+headers of untouched pages, whose retirement requires key X. Hash/Set batches
 recheck their merged byte total after resource waits and request key X if
 disjoint removals make demotion or final-field deletion necessary.
 Full-image, promotion and random Set-pop adapters retain

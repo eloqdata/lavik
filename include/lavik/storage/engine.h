@@ -1886,6 +1886,8 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr);
+  // Set point/scan operations share Hash group arbitration. Multi-key Set
+  // commands use the pre-locked API and retain their existing atomicity scope.
   bycorf::Task<absl::StatusOr<HashResult>> ExecuteSet(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr,

@@ -84,7 +84,7 @@ intent-exclusive (IX) modes. IS is compatible with IS, S and IX; S with S;
 IX with IX. All other pairs conflict. IS/IX permit partial readers and writers
 to overlap; callers must separately arbitrate their sub-key conflicts. Grouped
 storage provides an independent [sub-key lock API](09-grouped-collections.md#sub-key-arbitration).
-Standalone bounded grouped Hash and Sorted Set writes request IX and arbitrate
+Standalone bounded grouped Hash, Set and Sorted Set writes request IX and arbitrate
 their affected groups separately. Partial readers and resident cardinality
 queries use IS. Whole-key readers retain S; structural writes and externally
 locked multi-key/EXEC/Lua commands retain their whole-key protection. Eligible
