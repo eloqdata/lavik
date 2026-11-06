@@ -39,10 +39,13 @@ struct LockFpIdentityHash {
   std::size_t operator()(LockFp fp) const noexcept { return fp; }
 };
 
-// S protects the complete key from writes. IS and IX allow partial readers
-// and writers, whose callers must separately arbitrate sub-key conflicts.
-// IS is compatible with IS, S and IX; S with S; IX with IX. X excludes every
-// mode. Modes apply to queued intents and executing holds, including IO waits.
+// S protects the complete key from writes. IS/IX are the standard
+// multi-granularity intention modes: the parent permits shared/exclusive locks
+// on sub-key groups, whose conflicts are arbitrated separately. These mode
+// names are distinct from VLL scheduling intents, which every mode registers
+// while queued or executing. IS is compatible with IS, S and IX; S with S; IX
+// with IX. X excludes every mode. Modes apply to queued intents and executing
+// holds, including IO waits.
 enum class LockMode : std::uint8_t {
   kShared,
   kExclusive,

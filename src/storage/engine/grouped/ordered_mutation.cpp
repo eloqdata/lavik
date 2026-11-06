@@ -201,12 +201,15 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
   if (!member_mutation.ok()) co_return member_mutation.status();
   auto& member_plan = member_mutation->plan_;
   if (value_type == ValueType::kSortedSet) {
-    if (!previous && member_plan.expected_sequence_ != 0)
-      co_return absl::AbortedError("prepared member creation is stale");
-    if ((previous &&
-         member_plan.root_.incarnation_ != plan.root_.incarnation_) ||
-        member_plan.root_.field_count_ != plan.root_.item_count_)
-      co_return absl::AbortedError("prepared member index is stale");
+    // Both private plans describe the same edit; publication separately
+    // revalidates their predecessor against current population and page state.
+    assert((previous || member_plan.expected_sequence_ == 0) &&
+           "prepared member creation has a predecessor");
+    assert((!previous ||
+            member_plan.root_.incarnation_ == plan.root_.incarnation_) &&
+           "prepared member index has the wrong incarnation");
+    assert(member_plan.root_.field_count_ == plan.root_.item_count_ &&
+           "prepared member index count disagrees with ordered plan");
   }
   auto planned_root = plan.root_;
   if (value_type == ValueType::kSortedSet)
@@ -668,8 +671,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
       if (!encoded.ok()) return encoded.status();
       // AppendLocked borrows this string's allocation through capacity waits.
       // ZSET roots have fixed width; overwrite without invalidating its view.
-      if (encoded->size() != root_payload->size())
-        return absl::InternalError("prepared root changed encoded size");
+      assert(encoded->size() == root_payload->size() &&
+             "prepared root changed encoded size");
       std::memcpy(root_payload->data(), encoded->data(), encoded->size());
       plan.root_ = std::move(*merged);
       prepared_batch.revision_ = revision;

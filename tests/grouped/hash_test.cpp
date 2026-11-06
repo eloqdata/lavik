@@ -565,8 +565,7 @@ std::vector<RecoveredGroupedRecord> Candidates(
   return candidates;
 }
 
-TEST(GroupedHashTest,
-     MergePublicationPreservesDisjointChangesAndRejectsConflicts) {
+TEST(GroupedHashTest, MergePublicationPreservesDisjointChanges) {
   auto pages = GroupHashValue(Value(128), 17, Seed(), 1024);
   ASSERT_TRUE(pages.ok());
   ASSERT_GT(pages->size(), 2);
@@ -595,26 +594,47 @@ TEST(GroupedHashTest,
   EXPECT_EQ(merged->revision_, 0);
   EXPECT_EQ(merged->group_count_, base->root().group_count_);
 
-  auto overlap = records.front();
-  overlap.sequence_ = overlap.lsn_ = 2;
-  auto overlap_root = base->root();
-  overlap_root.revision_ = 2;
-  auto conflicting = base->Apply(overlap_root, 2, std::span(&overlap, 1));
-  ASSERT_TRUE(conflicting.ok());
-  EXPECT_TRUE(absl::IsAborted(
-      MergeHashPublication(*base, *conflicting, plan_root, writes).status()));
   ++plan_root.group_count_;
   EXPECT_TRUE(absl::IsFailedPrecondition(
       MergeHashPublication(*base, *current, plan_root, writes).status()));
   --plan_root.group_count_;
-  ++plan_root.field_count_;
-  EXPECT_TRUE(absl::IsInvalidArgument(
-      MergeHashPublication(*base, *current, plan_root, writes).status()));
-  --plan_root.field_count_;
   changed.retired_ = true;
   EXPECT_TRUE(absl::IsFailedPrecondition(
       MergeHashPublication(*base, *current, plan_root, writes).status()));
 }
+
+#ifndef NDEBUG
+TEST(GroupedHashDeathTest,
+     MergePublicationRequiresProtectedLeavesAndValidPlan) {
+  auto pages = GroupHashValue(Value(128), 17, Seed(), 1024);
+  ASSERT_TRUE(pages.ok());
+  auto records = Candidates(*pages);
+  auto base = Recover(Root(128, pages->size()), 1, records, {});
+  ASSERT_TRUE(base.ok()) << base.status();
+  auto planned = base->root();
+  const auto writes = std::span(&pages->front(), 1);
+  auto overlap = records.front();
+  overlap.sequence_ = overlap.lsn_ = 2;
+  auto current_root = base->root();
+  current_root.revision_ = 2;
+  auto current = base->Apply(current_root, 2, std::span(&overlap, 1));
+  ASSERT_TRUE(current.ok()) << current.status();
+  EXPECT_DEATH(
+      {
+        const auto merged =
+            MergeHashPublication(*base, *current, planned, writes);
+        (void)merged;
+      },
+      "Hash page changed while protected");
+  --planned.field_count_;
+  EXPECT_DEATH(
+      {
+        const auto merged = MergeHashPublication(*base, *base, planned, writes);
+        (void)merged;
+      },
+      "Hash plan count disagrees with pages");
+}
+#endif
 
 TEST(GroupedHashTest, PrefixBoundsIncludeZeroAndFullWidth) {
   const auto maximum = std::numeric_limits<std::uint64_t>::max();

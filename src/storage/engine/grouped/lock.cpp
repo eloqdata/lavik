@@ -67,31 +67,28 @@ bool GroupedLockTable::Entry::CanHold(GroupedLockMode mode) const noexcept {
 bool GroupedLockTable::Awaiter::await_ready() {
   assert(!started_);
   started_ = true;
-  if (set_.pending_ != nullptr) {
-    status_ = absl::FailedPreconditionError(
-        "a group acquisition is already pending for this lock set");
-    return true;
-  }
-  if ((mode_ != GroupedLockMode::kShared &&
-       mode_ != GroupedLockMode::kExclusive) ||
-      (id_.index_ != GroupedLockIndex::kMember &&
-       id_.index_ != GroupedLockIndex::kOrdered)) {
-    status_ = absl::InvalidArgumentError("invalid group lock mode or index");
-    return true;
-  }
+  assert(set_.pending_ == nullptr &&
+         "a group acquisition is already pending for this lock set");
+  assert((mode_ == GroupedLockMode::kShared ||
+          mode_ == GroupedLockMode::kExclusive) &&
+         "invalid group lock mode");
+  assert((id_.index_ == GroupedLockIndex::kMember ||
+          id_.index_ == GroupedLockIndex::kOrdered) &&
+         "invalid group lock index");
   if (!set_.held_.empty() && id_ <= set_.held_.back().entry_->id_) {
+#ifndef NDEBUG
+    // A valid request can only revisit an already-held identity here. Keep
+    // the diagnostic lookup out of Release's idempotent acquisition path.
     const auto it = std::lower_bound(
         set_.held_.begin(), set_.held_.end(), id_,
         [](const LockSet::Held& held, const GroupedLockId& id) {
           return held.entry_->id_ < id;
         });
-    if (it == set_.held_.end() || it->entry_->id_ != id_) {
-      status_ = absl::FailedPreconditionError(
-          "group locks must be acquired in increasing order");
-    } else if (it->mode_ != mode_ && it->mode_ != GroupedLockMode::kExclusive) {
-      status_ = absl::FailedPreconditionError(
-          "group lock upgrade requires releasing and replanning the lock set");
-    }
+    assert(it != set_.held_.end() && it->entry_->id_ == id_ &&
+           "group locks must be acquired in increasing order");
+    assert((it->mode_ == mode_ || it->mode_ == GroupedLockMode::kExclusive) &&
+           "group lock upgrade requires releasing and replanning the lock set");
+#endif
     return true;
   }
 
@@ -127,13 +124,12 @@ void GroupedLockTable::Awaiter::await_suspend(
   queued_ = true;
 }
 
-absl::Status GroupedLockTable::Awaiter::await_resume() noexcept {
+void GroupedLockTable::Awaiter::await_resume() noexcept {
   if (entry_ != nullptr) {
     assert(granted_ && set_.pending_ == this);
     set_.pending_ = nullptr;
     entry_ = nullptr;
   }
-  return std::move(status_);
 }
 
 GroupedLockTable::Awaiter::~Awaiter() {

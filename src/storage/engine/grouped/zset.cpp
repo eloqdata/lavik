@@ -1190,9 +1190,8 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
       {db_id, tx::FingerprintOf(digest), object->incarnation()});
   unlock.Unlock();
   for (const auto id : groups) {
-    const auto locked = co_await holds.Acquire({GroupedLockIndex::kMember, id},
-                                               GroupedLockMode::kShared);
-    if (!locked.ok()) co_return locked;
+    co_await holds.Acquire({GroupedLockIndex::kMember, id},
+                           GroupedLockMode::kShared);
   }
   // Acquiring a later group can yield to writers. Capture the common logical
   // cut only after all holds exist; never combine scores read before and after
@@ -1262,9 +1261,8 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
     const auto* route = object->directory().Find(operation.members_.front());
     if (!route) co_return absl::DataLossError("missing member prefix route");
     const auto id = route->id_;
-    auto locked = co_await holds.Acquire({GroupedLockIndex::kMember, id},
-                                         GroupedLockMode::kShared);
-    if (!locked.ok()) co_return locked;
+    co_await holds.Acquire({GroupedLockIndex::kMember, id},
+                           GroupedLockMode::kShared);
     // A waiting reader must use the last holder's new leaf, not the revision
     // observed before acquiring S. IS keeps the prefix topology unchanged.
     auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
@@ -1428,8 +1426,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
   std::sort(groups.begin(), groups.end());
   groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
   for (const auto id : groups) {
-    const auto locked = co_await holds.Acquire(id, GroupedLockMode::kShared);
-    if (!locked.ok()) co_return locked;
+    co_await holds.Acquire(id, GroupedLockMode::kShared);
   }
   auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
   if (!current || current->incarnation() != object->incarnation() ||
@@ -1524,9 +1521,8 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
     store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
   auto holds = store.group_locks_->MakeLockSet(
       {db_id, tx::FingerprintOf(digest), object->incarnation()});
-  auto status = co_await holds.Acquire({GroupedLockIndex::kMember, member_id},
-                                       GroupedLockMode::kExclusive);
-  if (!status.ok()) co_return status;
+  co_await holds.Acquire({GroupedLockIndex::kMember, member_id},
+                         GroupedLockMode::kExclusive);
   // A preceding holder may have updated this leaf while we waited. Rebase
   // before reading, rather than mistaking its revision for a failed read.
   auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
@@ -1542,7 +1538,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   auto input_admission = ReserveInputs(operation);
   if (!input_admission.ok()) co_return input_admission.status();
   Members members;
-  status = PrepareMembers(operation, &members);
+  auto status = PrepareMembers(operation, &members);
   if (!status.ok()) co_return status;
   auto& state = members.begin()->second;
   SortedSetResult result;
@@ -1676,9 +1672,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   // Merge both routes before locking: a destination can also be a source's
   // neighbour, and S-to-X upgrades would invalidate the global lock order.
   for (const auto& [id, mode] : selected) {
-    status =
-        co_await holds.Acquire({GroupedLockIndex::kOrdered, {id, 0}}, mode);
-    if (!status.ok()) co_return status;
+    co_await holds.Acquire({GroupedLockIndex::kOrdered, {id, 0}}, mode);
   }
   refreshed = RefreshLockedGroup(partition, db_id, key, object, member_id);
   if (!refreshed.ok()) co_return refreshed.status();
@@ -1839,9 +1833,8 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
   auto holds = store.group_locks_->MakeLockSet(
       {db_id, tx::FingerprintOf(digest), object->incarnation()});
   for (const auto id : member_groups) {
-    status = co_await holds.Acquire({GroupedLockIndex::kMember, id},
-                                    GroupedLockMode::kExclusive);
-    if (!status.ok()) co_return status;
+    co_await holds.Acquire({GroupedLockIndex::kMember, id},
+                           GroupedLockMode::kExclusive);
   }
   auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
   if (!current || current->incarnation() != object->incarnation() ||
@@ -2000,9 +1993,7 @@ StorageEngine::Impl::TryConcurrentSortedSetBatch(
     }
   }
   for (const auto& [id, mode] : ordered_groups) {
-    status =
-        co_await holds.Acquire({GroupedLockIndex::kOrdered, {id, 0}}, mode);
-    if (!status.ok()) co_return status;
+    co_await holds.Acquire({GroupedLockIndex::kOrdered, {id, 0}}, mode);
   }
   for (const auto id : member_groups) {
     auto refreshed = RefreshLockedGroup(partition, db_id, key, object, id);

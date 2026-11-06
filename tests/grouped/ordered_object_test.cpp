@@ -269,6 +269,30 @@ TEST(SortedSetPublicationDeathTest,
       },
       "Sorted Set member page changed while protected");
 }
+
+TEST(SortedSetPublicationDeathTest, PrivatePlanCountsMustAgreeAcrossIndexes) {
+  PublicationFixture f;
+  auto page = f.Page(0);
+  auto member = f.Member(0);
+  auto planned = f.root;
+  ++planned.item_count_;
+  EXPECT_DEATH(
+      {
+        const auto merged = MergeSortedSetPublication(
+            f.directory, f.directory, planned, std::span(&page, 1),
+            std::span(&member, 1));
+        (void)merged;
+      },
+      "Sorted Set plan counts disagree between indexes");
+  planned.member_index_->field_count_ = planned.item_count_;
+  EXPECT_DEATH(
+      {
+        const auto merged = MergeSortedSetPublication(
+            f.directory, f.directory, planned, std::span(&page, 1), {});
+        (void)merged;
+      },
+      "Sorted Set count changed without members");
+}
 #endif
 
 TEST(SortedSetPublicationTest, StructuralPlansRequireWholeKeyProtection) {

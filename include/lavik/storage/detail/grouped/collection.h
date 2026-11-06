@@ -787,8 +787,9 @@ struct OrderedCollectionMutationPlan {
 // Merge an existing Sorted Set's non-structural page replacements into the
 // latest directory. The caller refreshes the base after locking and protects
 // affected member/ordered groups and routing neighbours through publication.
-// Their logical versions must stay unchanged (asserted in Debug); physical
-// relocation is allowed. The owner must not yield between merge and
+// Their logical versions must stay unchanged, and the private plan's counts
+// must agree across both indexes (asserted in Debug). Physical relocation is
+// allowed. The owner must not yield between merge and
 // publication. FailedPrecondition means the plan requires whole-key
 // serialization; Aborted means the current root is incompatible with the base.
 // The returned root has no publication revision yet.

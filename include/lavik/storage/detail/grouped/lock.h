@@ -24,7 +24,6 @@
 
 #include "absl/container/inlined_vector.h"
 #include "absl/container/node_hash_map.h"
-#include "absl/status/status.h"
 #include "lavik/storage/detail/grouped/hash.h"
 #include "lavik/tx/fingerprint.h"
 
@@ -86,9 +85,9 @@ class GroupedLockTable {
 
     // Acquires one group, retaining all earlier groups across the wait and IO.
     // New identities must increase. An already-held identity is a no-op when
-    // its mode suffices. A descending acquisition or S-to-X upgrade returns
-    // FailedPrecondition without changing ownership; the caller must replan
-    // after releasing the set, or fall back to a whole-key X acquisition.
+    // its mode suffices. Descending acquisitions and S-to-X upgrades violate
+    // the caller's lock-order contract and are asserted in Debug. Replanning
+    // or whole-key fallback must release the set first.
     // Only one acquisition may be outstanding per set. After a wait, callers
     // must revalidate routing before accessing the group they intended to use.
     [[nodiscard]] Awaiter Acquire(GroupedLockId id, GroupedLockMode mode);
@@ -127,7 +126,7 @@ class GroupedLockTable {
 
     bool await_ready();
     void await_suspend(std::coroutine_handle<> handle) noexcept;
-    absl::Status await_resume() noexcept;
+    void await_resume() noexcept;
 
    private:
     friend class LockSet;
@@ -138,7 +137,6 @@ class GroupedLockTable {
     LockSet& set_;
     GroupedLockId id_;
     GroupedLockMode mode_;
-    absl::Status status_;
     Entry* entry_ = nullptr;
     Awaiter* previous_ = nullptr;
     Awaiter* next_ = nullptr;

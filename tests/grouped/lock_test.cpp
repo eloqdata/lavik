@@ -104,18 +104,14 @@ void AcquireNow(GroupedLockTable::LockSet& locks, GroupedLockId id,
                 GroupedLockMode mode = kX) {
   auto acquire = locks.Acquire(id, mode);
   ASSERT_TRUE(acquire.await_ready());
-  EXPECT_TRUE(acquire.await_resume().ok());
+  acquire.await_resume();
 }
 
 Task RunWithGroups(GroupedLockTable& table, std::vector<GroupedLockId> ids,
                    GroupedLockMode mode, std::vector<std::string>& events,
                    std::string name, IoWait* io = nullptr) {
   auto locks = table.MakeLockSet(kObject);
-  for (auto id : ids) {
-    auto status = co_await locks.Acquire(id, mode);
-    EXPECT_TRUE(status.ok()) << status;
-    if (!status.ok()) co_return;
-  }
+  for (auto id : ids) co_await locks.Acquire(id, mode);
   events.push_back(name + ":start");
   if (io) co_await *io;
   events.push_back(name + ":done");
@@ -141,7 +137,7 @@ TEST(GroupedLockTest, SameGroupCompatibilityAndUncontendedCleanup) {
       // The grant is installed even before the worker resumes this waiter.
       EXPECT_EQ(second.size(), 1);
       queue.RunAll();
-      EXPECT_TRUE(acquire.await_resume().ok());
+      acquire.await_resume();
       second.Reset();
       EXPECT_EQ(table.size(), 0);
     }
@@ -165,7 +161,7 @@ TEST(GroupedLockTest, DatabaseKeyIncarnationAndGraphScopeIdentities) {
   EXPECT_TRUE(queue.ready_.empty());
 }
 
-TEST(GroupedLockTest, AcquisitionOrderAndUpgradesFailWithoutLosingHolds) {
+TEST(GroupedLockTest, OrderedAcquisitionsCanRevisitSufficientHolds) {
   ResumeQueue queue;
   GroupedLockTable table(queue.queue());
   auto locks = table.MakeLockSet(kObject);
@@ -182,17 +178,55 @@ TEST(GroupedLockTest, AcquisitionOrderAndUpgradesFailWithoutLosingHolds) {
   AcquireNow(locks, member, kS);
   AcquireNow(locks, later_member, kS);
   EXPECT_EQ(locks.size(), 4);
-  for (auto id : {member, GroupedLockId{GroupedLockIndex::kMember, {9, 1}}}) {
-    auto acquire = locks.Acquire(id, kX);
-    ASSERT_TRUE(acquire.await_ready());
-    EXPECT_TRUE(absl::IsFailedPrecondition(acquire.await_resume()));
-    EXPECT_EQ(locks.size(), 4);
-    EXPECT_EQ(table.size(), 4);
-  }
   locks.Reset();
   EXPECT_EQ(table.size(), 0);
   AcquireNow(locks, member, kX);
 }
+
+#ifndef NDEBUG
+TEST(GroupedLockDeathTest, InvalidRequestsViolateAcquisitionContract) {
+  ResumeQueue queue;
+  GroupedLockTable table(queue.queue());
+  auto locks = table.MakeLockSet(kObject);
+  EXPECT_DEATH(
+      {
+        auto acquire = locks.Acquire(Page(1), static_cast<GroupedLockMode>(2));
+        acquire.await_ready();
+      },
+      "invalid group lock mode");
+  EXPECT_DEATH(
+      {
+        auto acquire =
+            locks.Acquire({static_cast<GroupedLockIndex>(2), {1, 0}}, kX);
+        acquire.await_ready();
+      },
+      "invalid group lock index");
+  AcquireNow(locks, Page(2), kS);
+  EXPECT_DEATH(
+      {
+        auto acquire = locks.Acquire(Page(1), kX);
+        acquire.await_ready();
+      },
+      "group locks must be acquired in increasing order");
+  EXPECT_DEATH(
+      {
+        auto acquire = locks.Acquire(Page(2), kX);
+        acquire.await_ready();
+      },
+      "group lock upgrade requires releasing and replanning");
+  auto owner = table.MakeLockSet(kObject);
+  AcquireNow(owner, Page(3));
+  auto pending = locks.Acquire(Page(3), kX);
+  ASSERT_FALSE(pending.await_ready());
+  pending.await_suspend(std::noop_coroutine());
+  EXPECT_DEATH(
+      {
+        auto acquire = locks.Acquire(Page(4), kX);
+        acquire.await_ready();
+      },
+      "a group acquisition is already pending");
+}
+#endif
 
 TEST(GroupedLockTest, RetainsEarlierGroupsWhileOtherGroupsKeepProgressing) {
   ResumeQueue queue;
@@ -327,9 +361,6 @@ TEST(GroupedLockTest, CancellingPendingAcquisitionRetainsEarlierHolds) {
     auto pending = waiting.Acquire(Page(2), kX);
     ASSERT_FALSE(pending.await_ready());
     pending.await_suspend(std::noop_coroutine());
-    auto concurrent = waiting.Acquire(Page(3), kX);
-    ASSERT_TRUE(concurrent.await_ready());
-    EXPECT_TRUE(absl::IsFailedPrecondition(concurrent.await_resume()));
   }
   EXPECT_EQ(waiting.size(), 1);
   AcquireNow(waiting, Page(3));
@@ -410,7 +441,7 @@ TEST(GroupedLockTest, WholeKeyWaiterCannotHideAGroupNeededByAnIxHolder) {
   first_guard.Reset();
   EXPECT_EQ(shard.queue().size(), 1);
   queue.RunAll();
-  EXPECT_TRUE(waiting.await_resume().ok());
+  waiting.await_resume();
   second.Reset();
   second_guard.Reset();
   EXPECT_TRUE(shard.queue().Empty());

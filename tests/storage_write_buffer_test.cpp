@@ -921,9 +921,8 @@ class WriteBufferTestPeer {
       const GroupedLockObject identity{0, tx::FingerprintOf(digest),
                                        object->incarnation()};
       auto gate = store.group_locks_->MakeLockSet(identity);
-      auto locked = co_await gate.Acquire({GroupedLockIndex::kMember, last},
-                                          GroupedLockMode::kExclusive);
-      if (!locked.ok()) co_return locked;
+      co_await gate.Acquire({GroupedLockIndex::kMember, last},
+                            GroupedLockMode::kExclusive);
       const std::array<ScoredMemberView, 1> later{
           {{members[1], scores[1] + 0.25}}};
       const std::array<ScoredMemberView, 1> earlier{
@@ -961,7 +960,7 @@ class WriteBufferTestPeer {
                                      GroupedLockMode::kExclusive);
         const bool available = acquire.await_ready();
         EXPECT_FALSE(available) << "reader released its earlier leaf";
-        if (available) EXPECT_TRUE(acquire.await_resume().ok());
+        if (available) acquire.await_resume();
       }
       auto earlier_write = start(storage.ExecuteSortedSet(0, key, earlier_op));
       EXPECT_FALSE(earlier_write.done());
