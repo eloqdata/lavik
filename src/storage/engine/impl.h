@@ -92,18 +92,26 @@ class GroupReadLimiter;
 
 // A selected operation owns its mutable physical sidecars. Parallel pages and
 // shards share only the root's worker-local recorder, never these payloads.
-inline std::unique_ptr<ReadLatencyTrace> MakeReadTrace(
+// Keep allocation and initialization out of every unsampled caller, including
+// under LTO. A branch hint alone does not prevent these bodies being inlined.
+template <typename Trace>
+[[gnu::cold, gnu::noinline]] std::unique_ptr<Trace> MakePhysicalTrace(
     OnlineLatencyTrace* root) {
-  if (!root) return nullptr;
-  auto trace = std::make_unique<ReadLatencyTrace>();
+  auto trace = std::make_unique<Trace>();
   trace->diagnostics_ = root;
   return trace;
 }
+
+inline std::unique_ptr<ReadLatencyTrace> MakeReadTrace(
+    OnlineLatencyTrace* root) {
+  if (!root) [[likely]]
+    return nullptr;
+  return MakePhysicalTrace<ReadLatencyTrace>(root);
+}
 inline std::unique_ptr<SetLatencyTrace> MakeSetTrace(OnlineLatencyTrace* root) {
-  if (!root) return nullptr;
-  auto trace = std::make_unique<SetLatencyTrace>();
-  trace->diagnostics_ = root;
-  return trace;
+  if (!root) [[likely]]
+    return nullptr;
+  return MakePhysicalTrace<SetLatencyTrace>(root);
 }
 
 // Storage operations occasionally pin immutable physical state, release the
