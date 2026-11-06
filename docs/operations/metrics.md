@@ -44,7 +44,7 @@ these step timings, connection state, lease decisions, expirations, reconnects, 
 directive results. The metrics HTTP service runs on the data workers; the
 last runtime worker remains dedicated to Meta control tasks.
 
-## Remote compact read sharing
+## Immutable read sharing
 
 `lavik_storage_read_flight_joins_total` counts requests joining an existing
 worker-local physical read. `read_flight_leaders_total` counts producers admitted
@@ -62,6 +62,12 @@ reserved or retained shared arena bytes and framing through the final return,
 including consumers blocked on network output. INFO stats exposes the same
 observations with `storage_` names and without counter `_total` suffixes.
 Collection visits state owners; cross-worker totals are not an atomic snapshot.
+
+The same suffixes are exported under `lavik_storage_worker_` with a `worker`
+label for GET, MGET, remote compact and group/page reads. These are sampled
+in the same owner visits as their aggregate counterparts. Use either family
+when summing: combining both would double count. Request paths update only
+owner-local counters; collection introduces no cross-worker hot counter.
 
 Selected latency traces expose `read_flight_wait` for followers instead of
 attributing the producer's physical `read_io` interval to every request.
@@ -515,6 +521,7 @@ synthetic disk phase. These names are shared across command families:
 | `route_to_owner`, `route_back` | Selected cross-worker queue/handoff intervals; same-worker and direct remote reads do not invent hops |
 | `admission_wait` | Actual publisher, database or Lua VM admission waits |
 | `key_lock`, `store_lock`, `lookup` | Key intent acquisition, store-state lock acquisition and index/metadata lookup |
+| `read_flight_wait` | A request waiting for an existing worker-local physical read |
 | `read_buffer`, `read_io`, `decode` | Physical read-buffer acquisition, submitted read through completion/resume, and value/page decoding |
 | `value_process` | Logical value inspection/modification and record encoding/copying |
 | `append_capacity`, `durability_wait` | Staging capacity/related flush waits and awaited durability fences |

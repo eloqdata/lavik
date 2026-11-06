@@ -86,7 +86,8 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
 }
 
 Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
-    std::vector<StorageReplicationLogMetrics>* replication_logs) const {
+    std::vector<StorageReplicationLogMetrics>* replication_logs,
+    std::vector<StorageReadFlightMetrics>* read_flights) const {
   struct WorkerDiagnostics {
     ReadFlightStats read_flights;
     std::uint64_t pending = 0;
@@ -100,6 +101,10 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
   if (replication_logs != nullptr) {
     replication_logs->clear();
     replication_logs->reserve(worker_count_);
+  }
+  if (read_flights != nullptr) {
+    read_flights->clear();
+    read_flights->reserve(worker_count_);
   }
   UpdateDurabilityPending(result.durability_);
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -151,6 +156,14 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
         local.dirty_bytes = LocalDirtyStagingBytes();
       return local;
     });
+    if (read_flights != nullptr) {
+      read_flights->push_back(StorageReadFlightMetrics{
+          .worker_id_ = target,
+          .stats_ = observation.read_flights,
+          .pending_ = observation.pending,
+          .shared_bytes_ = observation.shared_bytes,
+      });
+    }
     const auto& local = observation.read_flights;
     auto& total = result.read_flights_;
     total.leaders += local.leaders;
@@ -180,7 +193,8 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
   };
 
   StorageMetricsSnapshot result;
-  result.diagnostics_ = co_await CollectDiagnostics(&result.replication_logs_);
+  result.diagnostics_ = co_await CollectDiagnostics(&result.replication_logs_,
+                                                    &result.read_flights_);
   result.devices_.reserve(devices_.size());
   for (std::size_t index = 0; index < devices_.size(); ++index) {
     const StorageDevice& device = devices_[index];

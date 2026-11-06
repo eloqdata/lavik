@@ -570,6 +570,13 @@ TEST_F(TxCleanerPipelineTestPeer,
   EXPECT_EQ(full.diagnostics_.durability_.flushes_pending_, 2);
   EXPECT_EQ(full.diagnostics_.durability_.tx_commits_pending_, 7);
   ASSERT_EQ(full.replication_logs_.size(), kWorkers);
+  ASSERT_EQ(full.read_flights_.size(), kWorkers);
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    EXPECT_EQ(full.read_flights_[owner].worker_id_, owner);
+    EXPECT_EQ(full.read_flights_[owner].stats_.leaders, 0);
+    EXPECT_EQ(full.read_flights_[owner].pending_, 0);
+    EXPECT_EQ(full.read_flights_[owner].shared_bytes_, 0);
+  }
   for (unsigned owner = 0; owner < kWorkers; ++owner) {
     EXPECT_EQ(full.replication_logs_[owner].worker_id_, owner);
     EXPECT_EQ(full.replication_logs_[owner].tail_lsn_, 19 + owner);

@@ -337,9 +337,19 @@ struct StorageReplicationLogMetrics {
   bool backpressured_ = false;
 };
 
+// Copied on the submitting worker during the existing diagnostics visit.
+// Hot-path counters remain worker-local; collection adds no shared atomics.
+struct StorageReadFlightMetrics {
+  unsigned worker_id_ = 0;
+  ReadFlightStats stats_;
+  std::uint64_t pending_ = 0;
+  std::uint64_t shared_bytes_ = 0;
+};
+
 struct StorageMetricsSnapshot {
   std::vector<StorageDeviceMetrics> devices_;
   std::vector<StorageReplicationLogMetrics> replication_logs_;
+  std::vector<StorageReadFlightMetrics> read_flights_;
   StorageDiagnosticsSnapshot diagnostics_;
 };
 

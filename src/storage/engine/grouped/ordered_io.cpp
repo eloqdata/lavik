@@ -46,7 +46,9 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadOrderedGroup(
     if (!trace || observer) return;
     trace->buffer_timing_.Merge(detail->buffer_timing_);
     trace->io_timing_.Merge(detail->io_timing_);
-    trace->disk_read_ |= detail->disk_read_ || detail->io_timing_.count != 0;
+    trace->flight_wait_timing_.Merge(detail->flight_wait_timing_);
+    trace->disk_read_ |= detail->disk_read_ || detail->io_timing_.count != 0 ||
+                         detail->flight_wait_timing_.count != 0;
     trace->io_submit_ns_ = trace->io_timing_.first_ns;
     trace->io_complete_ns_ = trace->io_timing_.last_ns;
   };

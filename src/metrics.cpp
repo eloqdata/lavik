@@ -795,11 +795,11 @@ void AppendStorageDiagnostics(
   };
   const auto& flights = diagnostics.read_flights_;
   append("read_flight_leaders_total", "counter",
-         "Remote compact producers admitted, including synchronous submission "
+         "Immutable read producers admitted, including synchronous submission "
          "rejection.",
          flights.leaders);
   append("read_flight_joins_total", "counter",
-         "Remote compact requests joining an in-flight physical read.",
+         "Immutable read requests joining an in-flight physical read.",
          flights.joins);
   append("read_flight_cancellations_total", "counter",
          "Waiters detached before physical completion.", flights.cancellations);
@@ -1379,6 +1379,62 @@ bycorf::Task<absl::Status> RenderPrometheusMetrics(
         "lavik_fullsync_sessions{", labels, "} ", log.fullsync_session_count_,
         "\n", "lavik_fullsync_publish_queue_backpressure_waits_total{", labels,
         "} ", log.fullsync_backpressure_waits_, "\n");
+  }
+  // Export owner detail separately from the compatible aggregate families,
+  // so summing one family never counts both owners and their total.
+  output.append(
+      "# HELP lavik_storage_worker_read_flight_leaders_total Admitted physical "
+      "producers.\n"
+      "# TYPE lavik_storage_worker_read_flight_leaders_total counter\n"
+      "# HELP lavik_storage_worker_read_flight_joins_total Requests joining a "
+      "pending physical read.\n"
+      "# TYPE lavik_storage_worker_read_flight_joins_total counter\n"
+      "# HELP lavik_storage_worker_read_flight_cancellations_total Waiters "
+      "detached before physical completion.\n"
+      "# TYPE lavik_storage_worker_read_flight_cancellations_total counter\n"
+      "# HELP lavik_storage_worker_read_flight_rejections_total Synchronous "
+      "producer submission rejections.\n"
+      "# TYPE lavik_storage_worker_read_flight_rejections_total counter\n"
+      "# HELP lavik_storage_worker_read_flight_table_full_total Admission "
+      "attempts bypassed at the producer limit.\n"
+      "# TYPE lavik_storage_worker_read_flight_table_full_total counter\n"
+      "# HELP lavik_storage_worker_read_flight_waiter_full_total Join attempts "
+      "bypassed at the waiter limit.\n"
+      "# TYPE lavik_storage_worker_read_flight_waiter_full_total counter\n"
+      "# HELP lavik_storage_worker_read_flight_shared_budget_total Join "
+      "attempts bypassed at the shared byte limit.\n"
+      "# TYPE lavik_storage_worker_read_flight_shared_budget_total counter\n"
+      "# HELP lavik_storage_worker_read_flights_pending Current pending "
+      "physical producers.\n"
+      "# TYPE lavik_storage_worker_read_flights_pending gauge\n"
+      "# HELP lavik_storage_worker_shared_read_bytes Reserved or retained "
+      "shared arena bytes including framing.\n"
+      "# TYPE lavik_storage_worker_shared_read_bytes gauge\n");
+  for (const auto& flight : storage_metrics.read_flights_) {
+    const std::string_view labels = g_worker_labels[flight.worker_id_];
+    AppendMetricText(&output, "lavik_storage_worker_read_flight_leaders_total{",
+                     labels, "} ", flight.stats_.leaders, "\n");
+    AppendMetricText(&output, "lavik_storage_worker_read_flight_joins_total{",
+                     labels, "} ", flight.stats_.joins, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_cancellations_total{",
+                     labels, "} ", flight.stats_.cancellations, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_rejections_total{",
+                     labels, "} ", flight.stats_.rejected, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_table_full_total{",
+                     labels, "} ", flight.stats_.table_full, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_waiter_full_total{",
+                     labels, "} ", flight.stats_.waiter_full, "\n");
+    AppendMetricText(&output,
+                     "lavik_storage_worker_read_flight_shared_budget_total{",
+                     labels, "} ", flight.stats_.shared_budget, "\n");
+    AppendMetricText(&output, "lavik_storage_worker_read_flights_pending{",
+                     labels, "} ", flight.pending_, "\n");
+    AppendMetricText(&output, "lavik_storage_worker_shared_read_bytes{", labels,
+                     "} ", flight.shared_bytes_, "\n");
   }
   for (const storage::StorageDeviceMetrics& device : storage_metrics.devices_) {
     std::string labels =

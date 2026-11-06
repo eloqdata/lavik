@@ -3054,11 +3054,11 @@ class StorageEngine::Impl {
   Task<std::uint64_t> CollectLocalDirtyStagingBytes() const;
   void UpdateDurabilityPending(StorageDurabilityStats& stats) const;
 
-  // Full metrics can collect replication in the same worker visits. INFO
-  // leaves this null, avoiding replication traversal and vector allocation.
+  // Full metrics collect per-worker detail in the same owner visits. INFO
+  // leaves these null, avoiding per-worker vector allocation.
   Task<StorageDiagnosticsSnapshot> CollectDiagnostics(
-      std::vector<StorageReplicationLogMetrics>* replication_logs =
-          nullptr) const;
+      std::vector<StorageReplicationLogMetrics>* replication_logs = nullptr,
+      std::vector<StorageReadFlightMetrics>* read_flights = nullptr) const;
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 

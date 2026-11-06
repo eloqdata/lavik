@@ -24,10 +24,16 @@ namespace {
 
 class BatchReadAwaiter;
 
-// One address-stable io_uring/SPDK tag. A whole MGET shard owns a vector of
-// these ordinary objects and has only one awaiting coroutine.
-struct BatchReadOperation final : bycorf::IoCompletion {
+// One stable waiter per wave entry; the shard still has only one awaiting
+// coroutine. A shared producer owns the DMA tag independently of this object.
+struct BatchReadOperation final : ReadFlightWaiter {
   void Complete(Worker& worker, int result, unsigned flags) override;
+  void ReceiveRead(Worker& worker, ReadResultBuffer buffer, int result,
+                   unsigned flags) override;
+  void Finish(Worker& worker, int result);
+  absl::Status Submit();
+  bool TryJoin();
+  void Joined();
 
   ReadLatencyTrace* trace_ = nullptr;
   std::uint64_t io_start_ns_ = 0;
@@ -37,6 +43,17 @@ struct BatchReadOperation final : bycorf::IoCompletion {
   FixedBuffer buffer_{};
   std::uint64_t offset_ = 0;
   bool registered_ = false;
+  bool joined_ = false;
+  bool completed_ = false;
+  bool pending_in_batch_ = false;
+  ReadFlightRegistry* flights_ = nullptr;
+  ReadFlightKey key_;
+  std::size_t hash_ = 0;
+  ReadBufferLease* lease_ = nullptr;
+  bool* owns_pin_ = nullptr;
+  void* pin_context_ = nullptr;
+  void (*release_pin_)(void*) = nullptr;
+  ReadResultBuffer result_buffer_;
   absl::Status submit_status_ = absl::OkStatus();
   int result_ = 0;
 };
@@ -50,50 +67,104 @@ class BatchReadAwaiter {
 
   bool await_suspend(std::coroutine_handle<> awaiting) {
     awaiting_ = awaiting;
-    remaining_ = operations_.size();
-    for (BatchReadOperation* operation : operations_) {
+    // Register the complete barrier before any submission can complete or
+    // join. Pre-delivered followers and synchronous rejections retire exactly
+    // once; no callback can enqueue the parent during this submission loop.
+    for (auto* operation : operations_) {
       operation->batch_ = this;
-      if (operation->trace_)
-        operation->io_start_ns_ = operation->trace_->NowNanos();
-      operation->submit_status_ =
-          operation->registered_
-              ? operation->worker_->SubmitReadFixed(
-                    operation->file_, operation->buffer_, operation->offset_,
-                    operation)
-              : operation->worker_->SubmitRead(
-                    operation->file_,
-                    std::span<std::byte>(operation->buffer_.data_,
-                                         operation->buffer_.size_),
-                    operation->offset_, operation);
-      if (!operation->submit_status_.ok()) {
-        --remaining_;
+      if (!operation->completed_) {
+        operation->pending_in_batch_ = true;
+        ++remaining_;
       }
     }
-    // Count the whole batch before submission and retire immediate rejections
-    // locally. Accepted operations remain outstanding while queued for backend
-    // capacity; each deferred completion retires one count, and only the last
-    // wakes the caller.
+    submitting_ = true;
+    for (auto* operation : operations_) {
+      if (operation->completed_) continue;
+      operation->submit_status_ = operation->Submit();
+      if (!operation->submit_status_.ok()) {
+        operation->completed_ = true;
+        Complete(*operation, *operation->worker_);
+      }
+    }
+    submitting_ = false;
     return remaining_ != 0;
   }
 
   void await_resume() const noexcept {}
 
-  void Complete(Worker& worker) noexcept {
-    assert(remaining_ != 0);
-    if (--remaining_ == 0) worker.Enqueue(awaiting_);
+  void Complete(BatchReadOperation& operation, Worker& worker) noexcept {
+    assert(operation.pending_in_batch_ && remaining_ != 0);
+    operation.pending_in_batch_ = false;
+    if (--remaining_ == 0 && !submitting_) worker.Enqueue(awaiting_);
   }
 
  private:
   std::span<BatchReadOperation*> operations_;
   std::coroutine_handle<> awaiting_{};
   std::size_t remaining_ = 0;
+  bool submitting_ = false;
 };
 
-void BatchReadOperation::Complete(Worker& worker, int result, unsigned flags) {
-  (void)flags;
+void BatchReadOperation::Joined() {
+  joined_ = true;
+  release_pin_(pin_context_);
+  lease_->Reset();
+  if (trace_) io_start_ns_ = trace_->NowNanos();
+}
+
+bool BatchReadOperation::TryJoin() {
+  if (!flights_ || !flights_->TryJoin(key_, hash_, *this)) return false;
+  Joined();
+  return true;
+}
+
+absl::Status BatchReadOperation::Submit() {
+  if (flight_attached()) return absl::OkStatus();
+  bycorf::IoCompletion* tag = this;
+  if (flights_) {
+    const auto admission =
+        flights_->Start(key_, hash_, *lease_, *owns_pin_, *this);
+    if (admission.outcome == ReadFlightRegistry::Outcome::kJoined) {
+      Joined();
+      return absl::OkStatus();
+    }
+    if (admission.outcome == ReadFlightRegistry::Outcome::kStarted)
+      tag = admission.tag;
+  }
+  if (trace_) io_start_ns_ = trace_->NowNanos();
+  auto status =
+      registered_
+          ? worker_->SubmitReadFixed(file_, buffer_, offset_, tag)
+          : worker_->SubmitRead(file_, std::span(buffer_.data_, buffer_.size_),
+                                offset_, tag);
+  if (!status.ok()) {
+    if (tag != this) flights_->Reject(tag, *lease_, *owns_pin_);
+    if (trace_) trace_->RecordIo(io_start_ns_, trace_->NowNanos());
+  }
+  return status;
+}
+
+void BatchReadOperation::Finish(Worker& worker, int result) {
   result_ = result;
-  if (trace_) trace_->RecordIo(io_start_ns_, trace_->NowNanos());
-  batch_->Complete(worker);
+  completed_ = true;
+  if (trace_) {
+    if (joined_)
+      trace_->RecordFlightWait(io_start_ns_, trace_->NowNanos());
+    else
+      trace_->RecordIo(io_start_ns_, trace_->NowNanos());
+  }
+  if (pending_in_batch_) batch_->Complete(*this, worker);
+}
+
+void BatchReadOperation::Complete(Worker& worker, int result, unsigned) {
+  if (result >= 0) worker.RecordStorageReadCompletion(result);
+  Finish(worker, result);
+}
+
+void BatchReadOperation::ReceiveRead(Worker& worker, ReadResultBuffer buffer,
+                                     int result, unsigned) {
+  result_buffer_ = std::move(buffer);
+  Finish(worker, result);
 }
 
 absl::Status BatchReadError(int error) {
@@ -700,6 +771,8 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
     WorkerStore::PartitionStore* partition_ = nullptr;
     RecordLocation location_{};
     std::uint64_t replication_epoch_ = 0;
+    std::uint64_t db_epoch_ = 0;
+    std::uint64_t generation_ = 0;
   };
   std::vector<Candidate> candidates;
   std::vector<std::size_t> fallbacks;
@@ -747,35 +820,43 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
         .partition_ = &partition,
         .location_ = location,
         .replication_epoch_ = partition.replication_epoch_,
+        .db_epoch_ = EffectiveRecordDbEpoch(partition, db_id),
+        .generation_ = store.index_generations_[db_id],
     });
   }
 
   lookup_scope.End();
   struct PendingRead {
     PendingRead(WorkerStore* store, BlockState* state, Candidate candidate,
-                ReadBufferLease lease, std::size_t record_headroom,
-                std::size_t read_bytes)
+                std::size_t record_headroom, std::size_t read_bytes)
         : store_(store),
           state_(state),
           candidate_(candidate),
-          lease_(std::move(lease)),
           record_headroom_(record_headroom),
           read_bytes_(read_bytes) {
-      state_->PinLocal();
+      operation_.lease_ = &lease_;
+      operation_.owns_pin_ = &owns_pin_;
+      operation_.pin_context_ = this;
+      operation_.release_pin_ = [](void* context) {
+        static_cast<PendingRead*>(context)->Unpin();
+      };
     }
 
     PendingRead(const PendingRead&) = delete;
     PendingRead& operator=(const PendingRead&) = delete;
 
-    ~PendingRead() {
-      store_->engine_->UnpinBlock(*store_, *state_,
-                                  candidate_.location_.block_id());
+    ~PendingRead() { Unpin(); }
+    void Unpin() {
+      if (std::exchange(owns_pin_, false))
+        store_->engine_->UnpinBlock(*store_, *state_,
+                                    candidate_.location_.block_id());
     }
 
     WorkerStore* store_ = nullptr;
     BlockState* state_ = nullptr;
     Candidate candidate_{};
     ReadBufferLease lease_;
+    bool owns_pin_ = false;
     std::size_t record_headroom_ = 0;
     std::size_t read_bytes_ = 0;
     BatchReadOperation operation_;
@@ -785,14 +866,21 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
   while (next < candidates.size()) {
     std::vector<std::unique_ptr<PendingRead>> wave;
     std::vector<BatchReadOperation*> operations;
-    wave.reserve(
-        std::min(candidates.size() - next, store.buffers_.read_buffer_count()));
+    // Joined requests do not consume DMA ranges, so arena exhaustion no longer
+    // bounds their metadata. Limit entries by the arena's preferred-buffer
+    // count, including when every candidate joins the same producer.
+    const auto wave_limit =
+        std::min(candidates.size() - next,
+                 std::max(std::size_t{1}, store.buffers_.read_buffer_count()));
+    wave.reserve(wave_limit);
+    operations.reserve(wave_limit);
 
-    while (next < candidates.size()) {
+    while (next < candidates.size() && wave.size() < wave_limit) {
       const Candidate candidate = candidates[next];
       const RecordLocation& location = candidate.location_;
+      const auto [file_id, block_offset] = FileOffset(location.block_id());
       const std::uint64_t absolute_offset =
-          FileOffset(location.block_id()).second + location.record_offset();
+          block_offset + location.record_offset();
       const std::uint64_t direct_io_mask =
           static_cast<std::uint64_t>(direct_io_alignment_ - 1);
       const std::uint64_t aligned_offset = absolute_offset & ~direct_io_mask;
@@ -802,6 +890,49 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
           record_headroom + location.total_disk_bytes();
       const std::size_t read_bytes =
           (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
+      auto* state = FindBlockState(store, location.block_id());
+      if (!state || !state->allocated_ || state->freeing_ ||
+          state->allocation_epoch_ != location.allocation_epoch() ||
+          (location.in_memory() && state->in_memory_)) {
+        fallbacks.push_back(candidate.result_index_);
+        ++next;
+        continue;
+      }
+      auto pending = std::make_unique<PendingRead>(&store, state, candidate,
+                                                   record_headroom, read_bytes);
+      auto& operation = pending->operation_;
+      operation.trace_ = detail.get();
+      if (detail) detail->disk_read_ = true;
+      operation.worker_ = store.worker_;
+      operation.file_ = store.files_[file_id];
+      operation.offset_ = aligned_offset;
+      if (read_bytes <= store.buffers_.read_capacity_bytes()) {
+        operation.flights_ = ReadFlights(store);
+        if (operation.flights_) {
+          operation.key_ = {
+              .engine = reinterpret_cast<std::uintptr_t>(this),
+              .block = location.block_id(),
+              .allocation_epoch = location.allocation_epoch(),
+              .mutation_sequence = location.mutation_sequence_,
+              .aligned_offset = aligned_offset,
+              .read_bytes = read_bytes,
+              .db_epoch = candidate.db_epoch_,
+              .replication_epoch = candidate.replication_epoch_,
+              .population_generation = candidate.generation_,
+              .file = store.files_[file_id].index_,
+              .record_offset = location.record_offset(),
+              .record_bytes = location.total_disk_bytes(),
+              .block_owner = static_cast<std::uint16_t>(location.block_owner()),
+              .db = db_id};
+          operation.hash_ = absl::Hash<ReadFlightKey>{}(operation.key_);
+        }
+      }
+      if (operation.TryJoin()) {
+        operations.push_back(&operation);
+        wave.push_back(std::move(pending));
+        ++next;
+        continue;
+      }
       // Never wait while this wave owns unsubmitted ranges. Submit/drain it
       // first; a record that cannot fit an empty wave uses the chunked reader.
       TraceSpanScope buffer(diagnostics, TraceStage::kReadBuffer);
@@ -817,19 +948,9 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
         ++next;
         continue;
       }
-      ReadBufferLease lease = std::move(*acquired);
-      BlockState* state = FindBlockState(store, location.block_id());
-      if (state == nullptr || !state->allocated_ || state->freeing_ ||
-          state->allocation_epoch_ != location.allocation_epoch() ||
-          (location.in_memory() && state->in_memory_)) {
-        fallbacks.push_back(candidate.result_index_);
-        ++next;
-        continue;
-      }
-
-      auto pending = std::make_unique<PendingRead>(&store, state, candidate,
-                                                   std::move(lease),
-                                                   record_headroom, read_bytes);
+      pending->lease_ = std::move(*acquired);
+      state->PinLocal();
+      pending->owns_pin_ = true;
       FixedBuffer io = pending->lease_.io_buffer();
       if (read_bytes > io.size_) {
         results[candidate.result_index_] = absl::OutOfRangeError(
@@ -837,12 +958,6 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
         ++next;
         continue;
       }
-      const auto [file_id, unused_block_offset] =
-          FileOffset(location.block_id());
-      (void)unused_block_offset;
-      pending->operation_.trace_ = detail.get();
-      pending->operation_.worker_ = store.worker_;
-      pending->operation_.file_ = store.files_[file_id];
       pending->operation_.buffer_ = io;
       pending->operation_.buffer_.size_ = read_bytes;
       pending->operation_.offset_ = aligned_offset;
@@ -874,15 +989,21 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
       }
 
       if (pending->candidate_.partition_->replication_epoch_ !=
-          pending->candidate_.replication_epoch_) [[unlikely]] {
+              pending->candidate_.replication_epoch_ ||
+          EffectiveRecordDbEpoch(*pending->candidate_.partition_, db_id) !=
+              pending->candidate_.db_epoch_ ||
+          store.index_generations_[db_id] != pending->candidate_.generation_)
+          [[unlikely]] {
         results[index] = std::optional<std::string>{};
         continue;
       }
 
       TraceSpanScope decode(diagnostics, TraceStage::kDecode);
       const RecordLocation& location = pending->candidate_.location_;
-      const FixedBuffer io = pending->lease_.io_buffer();
-      const std::byte* record_data = io.data_ + pending->record_headroom_;
+      const auto* io_data = operation.result_buffer_.valid()
+                                ? operation.result_buffer_.io_data()
+                                : pending->lease_.io_buffer().data_;
+      const std::byte* record_data = io_data + pending->record_headroom_;
       const std::span<const std::byte> record_bytes(
           record_data, location.total_disk_bytes());
       RecordHeader record{};
@@ -891,7 +1012,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
           record.db_id_ != db_id ||
           (!record.key_indirect_ && disk_key != request.key_) ||
           record.kind_ != RecordKind::kValue ||
-          record.db_epoch_ != DbEpoch(db_id) ||
+          record.db_epoch_ != pending->candidate_.db_epoch_ ||
           record.mutation_sequence_ != location.mutation_sequence_ ||
           record.replication_epoch_ != pending->candidate_.replication_epoch_ ||
           record.allocation_epoch_ != location.allocation_epoch() ||

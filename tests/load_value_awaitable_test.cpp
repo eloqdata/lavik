@@ -217,6 +217,31 @@ class LoadValueAwaitableTestPeer : public testing::Test {
   }
 
   void ChangePopulation() { ++Store().partitions_[0].replication_epoch_; }
+  void ConfigureBatchKey() {
+    // The narrow fixture owns partition zero only. A shared hash tag also
+    // keeps synthetic missing/corrupt-identity keys in that same partition.
+    for (unsigned i = 0;; ++i) {
+      auto tag = "batch-" + std::to_string(i);
+      if (RedisSlot(tag) != 0) continue;
+      key_ = "{" + tag + "}:value";
+      break;
+    }
+    digest_ = ComputeDigest(key_);
+    header_.key_bytes_ = key_.size();
+    header_.header_bytes_ = RecordHeaderBytes(key_.size());
+    ResizeRecord(value_.size());
+    IndexLocation();
+  }
+  auto ReadBatch(std::span<const BatchGetRequest> requests) {
+    return storage_.impl_->BatchGetLocked(0, requests);
+  }
+  void IndexAlias(std::string_view alias) {
+    ASSERT_NE(Store().partitions_[0].indexes_[0].InsertNew(ComputeDigest(alias),
+                                                           alias, location_),
+              nullptr);
+  }
+  void ChangeIndexGeneration() { ++Store().index_generations_[0]; }
+
   auto ReadLocal() {
     return storage_.impl_->LoadValueLocal(Store(), 0, key_, location_, 1);
   }
@@ -3417,5 +3442,207 @@ TEST_P(GroupPageFlightTest, PopulationChangeRejectsEveryGroupConsumer) {
 
 INSTANTIATE_TEST_SUITE_P(KeyAndBlockOwner, GroupPageFlightTest,
                          testing::Values(0u, 1u));
+
+}  // namespace lavik::storage
+
+namespace lavik::storage {
+
+class BatchReadFlightTest : public LoadValueAwaitableTestPeer {
+ protected:
+  std::size_t ReadBufferCount() const override { return 8; }
+  void SetUp() override {
+    LoadValueAwaitableTestPeer::SetUp();
+    ConfigureBatchKey();
+  }
+  std::vector<BatchGetRequest> Requests(std::size_t n = 4) {
+    return std::vector<BatchGetRequest>(n, BatchGetRequest{key_, digest_});
+  }
+  void ExpectBatch(const std::vector<BatchGetValue>& result,
+                   std::size_t count) {
+    ASSERT_EQ(result.size(), count);
+    for (const auto& item : result) {
+      ASSERT_TRUE(item.ok()) << item.status();
+      ASSERT_TRUE(item->has_value());
+      EXPECT_EQ(**item, value_);
+    }
+  }
+};
+
+TEST_F(BatchReadFlightTest, DuplicateWaveHasOnePhysicalCompletion) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  const auto before = worker_.storage_io_stats();
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  EXPECT_EQ(Flights().stats().leaders, 1);
+  EXPECT_EQ(Flights().stats().joins, 3);
+  EXPECT_EQ(block_.pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  ExpectBatch(std::move(batch).TakeResult(), requests.size());
+  EXPECT_EQ(
+      worker_.storage_io_stats().read_operations_ - before.read_operations_, 1);
+  EXPECT_EQ(Flights().size(), 0);
+  EXPECT_EQ(Pool().shared_read_bytes(), 0);
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, BatchJoinsGetWithNoAvailableArenaRange) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto get = ReadCoalescedTask();
+  Start(get);
+  std::vector<ReadBufferLease> held;
+  while (Pool().available_read_buffers()) {
+    auto lease = Pool().AcquireReadBuffer().await_resume();
+    ASSERT_TRUE(lease.ok());
+    held.push_back(std::move(*lease));
+  }
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  EXPECT_EQ(Flights().stats().leaders, 1);
+  EXPECT_EQ(Flights().stats().joins, requests.size());
+  // The first GET's frame may disappear; it does not own the batch's producer.
+  get = {};
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  ExpectBatch(std::move(batch).TakeResult(), requests.size());
+  held.clear();
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, CancelBatchDoesNotCancelGetFollowingItsProducer) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  auto get = ReadCoalescedTask();
+  Start(get);
+  EXPECT_EQ(Flights().stats().joins, 4);
+  batch = {};
+  EXPECT_EQ(Flights().stats().cancellations, requests.size());
+  EXPECT_EQ(block_.pin_count(), 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(get));
+  auto result = std::move(get).TakeResult();
+  ExpectValue(result);
+  ASSERT_TRUE(result.ok());
+  EXPECT_FALSE(result->lease_.shared());
+  result->lease_.Reset();
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, WavesRemainBoundedAndDoNotCacheCompletedBytes) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  const auto before = worker_.storage_io_stats();
+  auto requests = Requests(19);
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  EXPECT_EQ(Flights().stats().joins, 7);
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  ExpectBatch(std::move(batch).TakeResult(), requests.size());
+  EXPECT_EQ(Flights().stats().leaders, 3);
+  EXPECT_EQ(Flights().stats().joins, 16);
+  EXPECT_EQ(
+      worker_.storage_io_stats().read_operations_ - before.read_operations_, 3);
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, QuotaBypassStillCountsEachPhysicalReadExactlyOnce) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto quota = Pool().TryReserveSharedRead(Pool().read_capacity_bytes() / 4);
+  ASSERT_TRUE(quota.valid());
+  const auto before = worker_.storage_io_stats();
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  EXPECT_EQ(Flights().stats().joins, 0);
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  ExpectBatch(std::move(batch).TakeResult(), requests.size());
+  EXPECT_EQ(
+      worker_.storage_io_stats().read_operations_ - before.read_operations_,
+      requests.size());
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, SharedErrorCompletesTheWholeBarrier) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord(true));
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  const auto result = std::move(batch).TakeResult();
+  ASSERT_EQ(result.size(), requests.size());
+  for (const auto& item : result) EXPECT_TRUE(absl::IsInternal(item.status()));
+  EXPECT_EQ(Flights().stats().leaders, 1);
+  EXPECT_EQ(Flights().stats().joins, 3);
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, SubmissionFailureRetiresEveryBarrierMember) {
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  const auto result = std::move(batch).TakeResult();
+  ASSERT_EQ(result.size(), requests.size());
+  for (const auto& item : result) EXPECT_FALSE(item.ok());
+  EXPECT_EQ(Flights().size(), 0);
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest,
+       MissingAndBadIdentityDoNotBorrowAnotherKeysSuccess) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  const std::string missing = key_ + "-missing";
+  const std::string alias = key_ + "-invalid-alias";
+  IndexAlias(alias);
+  auto requests = Requests(2);
+  requests.push_back({missing, ComputeDigest(missing)});
+  requests.push_back({alias, ComputeDigest(alias)});
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  EXPECT_EQ(Flights().stats().joins, 2);
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  const auto result = std::move(batch).TakeResult();
+  ASSERT_EQ(result.size(), 4);
+  for (unsigned i = 0; i != 2; ++i) {
+    ASSERT_TRUE(result[i].ok());
+    ASSERT_TRUE(result[i]->has_value());
+    EXPECT_EQ(**result[i], value_);
+  }
+  ASSERT_TRUE(result[2].ok());
+  EXPECT_FALSE(result[2]->has_value());
+  EXPECT_FALSE(result[3].ok());
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest, PopulationInvalidationFencesAllJoinedRequests) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  ChangePopulation();
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  const auto result = std::move(batch).TakeResult();
+  for (const auto& item : result) {
+    ASSERT_TRUE(item.ok());
+    EXPECT_FALSE(item->has_value());
+  }
+  ExpectNoPageLeases();
+}
+
+TEST_F(BatchReadFlightTest,
+       IndexGenerationInvalidationFencesAllJoinedRequests) {
+  ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  auto requests = Requests();
+  auto batch = ReadBatch(requests);
+  Start(batch);
+  ChangeIndexGeneration();
+  ASSERT_NO_FATAL_FAILURE(Drain(batch));
+  const auto result = std::move(batch).TakeResult();
+  for (const auto& item : result) {
+    ASSERT_TRUE(item.ok());
+    EXPECT_FALSE(item->has_value());
+  }
+  ExpectNoPageLeases();
+}
 
 }  // namespace lavik::storage
