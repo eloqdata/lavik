@@ -603,7 +603,6 @@ TEST(GroupedHashTest, MergePublicationPreservesDisjointChanges) {
       MergeHashPublication(*base, *current, plan_root, writes).status()));
 }
 
-#ifndef NDEBUG
 TEST(GroupedHashDeathTest,
      MergePublicationRequiresProtectedLeavesAndValidPlan) {
   auto pages = GroupHashValue(Value(128), 17, Seed(), 1024);
@@ -634,7 +633,6 @@ TEST(GroupedHashDeathTest,
       },
       "Hash plan count disagrees with pages");
 }
-#endif
 
 TEST(GroupedHashTest, PrefixBoundsIncludeZeroAndFullWidth) {
   const auto maximum = std::numeric_limits<std::uint64_t>::max();

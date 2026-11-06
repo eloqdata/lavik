@@ -86,8 +86,8 @@ class GroupedLockTable {
     // Acquires one group, retaining all earlier groups across the wait and IO.
     // New identities must increase. An already-held identity is a no-op when
     // its mode suffices. Descending acquisitions and S-to-X upgrades violate
-    // the caller's lock-order contract and are asserted in Debug. Replanning
-    // or whole-key fallback must release the set first.
+    // the caller's lock-order contract. Replanning or whole-key fallback must
+    // release the set first.
     // Only one acquisition may be outstanding per set. After a wait, callers
     // must revalidate routing before accessing the group they intended to use.
     [[nodiscard]] Awaiter Acquire(GroupedLockId id, GroupedLockMode mode);

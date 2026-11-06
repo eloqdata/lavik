@@ -183,7 +183,6 @@ TEST(GroupedLockTest, OrderedAcquisitionsCanRevisitSufficientHolds) {
   AcquireNow(locks, member, kX);
 }
 
-#ifndef NDEBUG
 TEST(GroupedLockDeathTest, InvalidRequestsViolateAcquisitionContract) {
   ResumeQueue queue;
   GroupedLockTable table(queue.queue());
@@ -226,7 +225,6 @@ TEST(GroupedLockDeathTest, InvalidRequestsViolateAcquisitionContract) {
       },
       "a group acquisition is already pending");
 }
-#endif
 
 TEST(GroupedLockTest, RetainsEarlierGroupsWhileOtherGroupsKeepProgressing) {
   ResumeQueue queue;

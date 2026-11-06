@@ -232,7 +232,6 @@ TEST(SortedSetPublicationTest, DisjointCountChangesMergeInEitherOrder) {
   }
 }
 
-#ifndef NDEBUG
 TEST(SortedSetPublicationDeathTest,
      ConflictingPagesAndRoutingNeighboursViolateLockContract) {
   PublicationFixture f;
@@ -293,7 +292,6 @@ TEST(SortedSetPublicationDeathTest, PrivatePlanCountsMustAgreeAcrossIndexes) {
       },
       "Sorted Set count changed without members");
 }
-#endif
 
 TEST(SortedSetPublicationTest, StructuralPlansRequireWholeKeyProtection) {
   PublicationFixture f;
