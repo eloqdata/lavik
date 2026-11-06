@@ -361,9 +361,10 @@ carry the sequence and cardinality of that final publication.
 Structural changes, demotion, external/oversized batches, replay and EXEC/Lua
 retain the multi-append path, with X ordering revisions across its resource
 and extent waits. IX point writers require bounded prepared publication;
-ineligible plans fall back before staging any records. The locked pages also
-bound the minimum remaining primary payload, so distant concurrent removals
-cannot force a compact conversion during the append wait.
+ineligible plans fall back before staging any records. Sorted Set writers bound
+the minimum remaining primary payload using locked page contents and the
+headers of untouched pages, whose retirement requires key X. Distant concurrent
+removals cannot force a compact conversion during the append wait.
 Full-image, promotion and random Set-pop adapters retain
 their separate preparation paths and share the same publication boundary.
 

@@ -66,7 +66,7 @@ TEST(CollectionIngestBudget, RejectsOverflowInsteadOfWrappingAdmission) {
 }
 
 TEST(CollectionIngestBudget, FreshSortedSetBoundsCoverBothPageBuilders) {
-  for (unsigned mode = 0; mode < 4; ++mode) {
+  for (unsigned mode = 0; mode < 5; ++mode) {
     const unsigned count = mode == 0 ? 1 : mode == 3 ? 2 : 1000;
     const DigestSeed seed{};
     CollectionPage page{.value_type_ = ValueType::kSortedSet};
@@ -78,7 +78,8 @@ TEST(CollectionIngestBudget, FreshSortedSetBoundsCoverBothPageBuilders) {
       const auto size = mode == 0   ? 20000
                         : mode == 1 ? 0
                         : mode == 2 ? (candidate % 7) * 2000
-                                    : 5000;
+                        : mode == 3 ? 5000
+                                    : 3000;
       auto member = std::string(size, 'm') + std::to_string(candidate);
       const auto digest = ComputeDigest(member, seed);
       // Force empty siblings across eight prefix levels. A member-count-only
@@ -93,7 +94,9 @@ TEST(CollectionIngestBudget, FreshSortedSetBoundsCoverBothPageBuilders) {
     auto bytes = CollectionCompactEncoder::MeasurePage(page);
     ASSERT_TRUE(bytes.ok());
     const auto bound = BoundInitialSortedSetIngestGroups(*bytes, count);
-    auto score_pages = SplitOrderedGroup(std::move(ordered), 2);
+    auto score_pages = SplitOrderedGroup(
+        std::move(ordered), 2, kCollectionGroupTargetBytes,
+        OrderedGroupSplitFillRatio(OrderedCollectionKind::kSortedSet));
     auto member_pages = GroupHashValue(std::move(members), 1, seed);
     ASSERT_TRUE(score_pages.ok()) << score_pages.status();
     ASSERT_TRUE(member_pages.ok()) << member_pages.status();

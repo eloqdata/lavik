@@ -127,7 +127,8 @@ absl::StatusOr<OrderedCollectionMutationPlan> PlanSortedSetRewrite(
     if (unchanged) {
       drafts.push_back({.page_ = std::move(page), .changed_ = false});
     } else {
-      auto split = SplitOrderedGroup(std::move(page), next_id, target_bytes);
+      auto split = SplitOrderedGroup(std::move(page), next_id, target_bytes,
+                                     OrderedGroupSplitFillRatio(root.kind_));
       if (!split.ok()) return split.status();
       next_id = split->next_group_id_;
       for (auto& part : split->groups_) {

@@ -20,9 +20,10 @@
 
 namespace lavik::storage {
 
-// All collection kinds share the same size policy. Promotion leaves room for
-// roughly two target-sized groups. Indivisible entries and hash collisions may
-// exceed the group target; this is not a hard record or allocation limit.
+// All collection kinds share promotion and group growth thresholds. Split
+// filling is a separate policy so new pages can retain growth headroom.
+// Indivisible entries and hash collisions may exceed the group target; this
+// is not a hard record or allocation limit.
 inline constexpr std::size_t kCollectionGroupTargetBytes = 8 * 1024;
 inline constexpr std::size_t kCollectionPromotionBytes = 16 * 1024;
 
