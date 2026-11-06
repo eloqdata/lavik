@@ -1505,7 +1505,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   {
     auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                               digest, object, member_id, false,
-                                              operation.diagnostics_, true);
+                                              true, operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -1683,8 +1683,8 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
             "injected Sorted Set plan page read failure");
     });
     auto page = co_await LoadEncodedSortedSetGroupSnapshot(
-        store, partition, db_id, key, digest, object, id, nullptr,
-        operation.diagnostics_, true);
+        store, partition, db_id, key, digest, object, id, nullptr, true,
+        operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     auto edited = EditEncodedSortedSetGroup(
         page->snapshot_, member,
@@ -1726,8 +1726,8 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   status = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(plan),
       object->version().root_.expire_at_ms_, nullptr, replication,
-      mutation_precondition, &*member_plan, operation.diagnostics_,
-      &retry_exclusive);
+      mutation_precondition, &*member_plan, &retry_exclusive,
+      operation.diagnostics_);
   if (retry_exclusive) co_return std::nullopt;
   if (!status.ok()) co_return status;
   co_return std::optional(std::move(result));
@@ -1814,7 +1814,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
         const auto committed = co_await CommitGroupedOrderedMutationLocked(
             store, partition, db_id, key, digest, *view, std::move(plan),
             (*view)->version().root_.expire_at_ms_, tx, replication,
-            mutation_precondition, &members, operation.diagnostics_);
+            mutation_precondition, &members, nullptr, operation.diagnostics_);
         if (!committed.ok()) co_return committed;
       }
       co_return prepared;
@@ -1924,7 +1924,7 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
     if (!route) co_return absl::DataLossError("missing member prefix route");
     auto leaf = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, route->id_, false,
-        operation.diagnostics_, group_locked);
+        group_locked, operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -1979,7 +1979,7 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
       co_return absl::CancelledError("member read cancelled by shutdown");
     auto leaf = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, requests[begin].group_,
-        false, operation.diagnostics_, group_locked);
+        false, group_locked, operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -2049,7 +2049,7 @@ StorageEngine::Impl::ScanGroupedSortedSetMembers(
     if (shutdown_flush_requested_)
       co_return absl::CancelledError("member scan cancelled by shutdown");
     auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                              digest, object, id, false,
+                                              digest, object, id, false, false,
                                               operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
@@ -2278,19 +2278,19 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
                                  metadata[i].id_, validation, mode,
-                                 operation.diagnostics_, group_locked);
+                                 group_locked, operation.diagnostics_);
       else if constexpr (std::is_same_v<Page, PackedSortedSetValues>)
         return LoadPackedSortedSetPage(store, partition, db_id, key, digest,
                                        object, metadata[i].id_, limiter,
-                                       operation.diagnostics_, group_locked);
+                                       group_locked, operation.diagnostics_);
       else {
         if (point_write)
           return LoadEncodedSortedSetGroupSnapshot(
               store, partition, db_id, key, digest, object, metadata[i].id_,
-              limiter, operation.diagnostics_, group_locked);
+              limiter, group_locked, operation.diagnostics_);
         return LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object, metadata[i].id_,
-            false, limiter, validation, operation.diagnostics_, group_locked);
+            false, limiter, validation, group_locked, operation.diagnostics_);
       }
     };
     auto page = co_await load();
@@ -2972,7 +2972,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           operation.kind_ == SortedSetOperationKind::kRank) {
         auto leaf = co_await LoadHashGroupPayload(
             store, partition, db_id, key, digest, object, id, false,
-            operation.diagnostics_, group_locked);
+            group_locked, operation.diagnostics_);
         if (!leaf.ok()) co_return leaf.status();
         const auto bytes = leaf->loaded_.value();
         const std::string_view payload(
@@ -2987,9 +2987,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       }
       HashGroupSnapshot snapshot;
       if (!ReadOnly(operation) && members.size() == 1) {
-        auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                  digest, object, id, false,
-                                                  operation.diagnostics_);
+        auto leaf = co_await LoadHashGroupPayload(
+            store, partition, db_id, key, digest, object, id, false, false,
+            operation.diagnostics_);
         if (!leaf.ok()) co_return leaf.status();
         const auto bytes = leaf->loaded_.value();
         const std::string_view payload(
@@ -3284,7 +3284,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(plan),
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition, nullptr, operation.diagnostics_);
+        mutation_precondition, nullptr, nullptr, operation.diagnostics_);
     if (!written.ok()) co_return written;
     co_return result;
   }
@@ -3408,15 +3408,16 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           co_return absl::CancelledError(
               "Sorted Set plan cancelled by shutdown");
       }
-      auto page = co_await (
-          point_write ? LoadEncodedSortedSetGroupSnapshot(
-                            store, partition, db_id, key, digest, object,
-                            metadata[i].id_, nullptr, operation.diagnostics_)
-                      : LoadOrderedGroupSnapshot(
-                            store, partition, db_id, key, digest, object,
-                            metadata[i].id_, false, nullptr,
-                            SortedSetMemberValidation::kVerifyUnique,
-                            operation.diagnostics_));
+      auto page =
+          co_await (point_write ? LoadEncodedSortedSetGroupSnapshot(
+                                      store, partition, db_id, key, digest,
+                                      object, metadata[i].id_, nullptr, false,
+                                      operation.diagnostics_)
+                                : LoadOrderedGroupSnapshot(
+                                      store, partition, db_id, key, digest,
+                                      object, metadata[i].id_, false, nullptr,
+                                      SortedSetMemberValidation::kVerifyUnique,
+                                      false, operation.diagnostics_));
       if (!page.ok()) co_return page.status();
       loaded.emplace(i, std::move(page->snapshot_));
     }
@@ -3582,7 +3583,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         auto page = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object,
             metadata[neighbor].id_, false, nullptr,
-            SortedSetMemberValidation::kVerifyUnique, operation.diagnostics_);
+            SortedSetMemberValidation::kVerifyUnique, false,
+            operation.diagnostics_);
         if (!page.ok()) co_return page.status();
         loaded.emplace(neighbor, std::move(page->snapshot_));
       }
@@ -3661,7 +3663,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
             // location through the ordinary loader, including GC retry checks.
             auto neighbor = co_await LoadOrderedGroupSnapshot(
                 store, partition, db_id, key, digest, object, old.id_, false,
-                nullptr, SortedSetMemberValidation::kVerifyUnique,
+                nullptr, SortedSetMemberValidation::kVerifyUnique, false,
                 operation.diagnostics_);
             if (!neighbor.ok()) co_return neighbor.status();
             plan.writes_.push_back(std::move(neighbor->snapshot_));
@@ -3718,7 +3720,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto written = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition, &member_mutation, operation.diagnostics_);
+      mutation_precondition, &member_mutation, nullptr, operation.diagnostics_);
   if (!written.ok()) co_return written;
   co_return result;
 }

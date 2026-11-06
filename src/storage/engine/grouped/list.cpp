@@ -143,7 +143,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
         if (!scratch.ok()) co_return scratch.status();
         auto page = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object, id.prefix_, false,
-            nullptr, SortedSetMemberValidation::kVerifyUnique,
+            nullptr, SortedSetMemberValidation::kVerifyUnique, false,
             operation.diagnostics_);
         if (!page.ok()) co_return page.status();
         const auto& entries = page->snapshot_.entries_;
@@ -508,7 +508,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object,
         directory.groups()[first->group_index_].id_, false, nullptr,
-        SortedSetMemberValidation::kVerifyUnique, operation.diagnostics_);
+        SortedSetMemberValidation::kVerifyUnique, false,
+        operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     if (first->offset_ >= page->snapshot_.entries_.size())
       co_return absl::DataLossError("List replacement rank exceeds page");
@@ -539,7 +540,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
     if (prepared != nullptr) co_await bycorf::Yield(*store.worker_);
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object, directory.groups()[i].id_,
-        false, nullptr, SortedSetMemberValidation::kVerifyUnique,
+        false, nullptr, SortedSetMemberValidation::kVerifyUnique, false,
         operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     loaded.push_back(std::move(*page));
@@ -672,7 +673,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteGroupedListLocked(
   const auto status = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(*plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition, nullptr, operation.diagnostics_);
+      mutation_precondition, nullptr, nullptr, operation.diagnostics_);
   if (!status.ok()) co_return status;
   co_return result;
 }

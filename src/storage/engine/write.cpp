@@ -599,7 +599,7 @@ Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
 Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards,
     RelocationDurabilityFence* deferred_decision, bool* retryable_capacity,
-    OnlineLatencyTrace* diagnostics, DeferredCommitBatch* deferred_batch) {
+    DeferredCommitBatch* deferred_batch, OnlineLatencyTrace* diagnostics) {
   // Only the queue retains receipts across attempts. Direct callers still
   // fail their decisions on every error, including allocation exhaustion.
   if (retryable_capacity != nullptr) *retryable_capacity = false;
@@ -1123,7 +1123,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
             committed = co_await CommitTxWrites(
                 pending.txid_, std::move(shards),
                 defer_decisions ? &decision : nullptr, &retryable_capacity,
-                nullptr, defer_decisions ? &deferred_batch : nullptr);
+                defer_decisions ? &deferred_batch : nullptr, nullptr);
             const bool prefix_boundary = deferred_batch.flush_required_;
             if (!retryable_capacity && !prefix_boundary) break;
             if (!prefix_boundary && first_attempt)

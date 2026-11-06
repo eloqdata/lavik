@@ -2604,8 +2604,8 @@ class StorageEngine::Impl {
       ReplicationCommandAppend* replication = nullptr,
       const MutationPrecondition* mutation_precondition = nullptr,
       SortedSetMemberMutation* prepared_members = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr,
-      bool* retry_exclusive = nullptr);
+      bool* retry_exclusive = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
   struct SortedSetMemberMutation {
     MemoryReservation scratch_;
     MemoryReservation leaves_;
@@ -3042,8 +3042,8 @@ class StorageEngine::Impl {
       std::uint64_t txid, std::vector<TxShardWrites*> shards,
       RelocationDurabilityFence* deferred_decision = nullptr,
       bool* retryable_capacity = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr,
-      DeferredCommitBatch* deferred_batch = nullptr);
+      DeferredCommitBatch* deferred_batch = nullptr,
+      OnlineLatencyTrace* diagnostics = nullptr);
 
   static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
 
@@ -4282,7 +4282,7 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
   // Requires parent IX plus this group's S/X hold. Refresh physical metadata
   // across GC without rejecting publications to unrelated groups. No pin is
   // implied: each physical read still owns its usual allocation lease.
@@ -4296,7 +4296,7 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4701,8 +4701,8 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id, bool pinned,
       Decode decode, GroupReadLimiter* limiter = nullptr,
-      ReadLatencyTrace* trace = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      ReadLatencyTrace* trace = nullptr, bool group_locked = false,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<ListResult>> LoadOrderedListRange(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -4722,7 +4722,7 @@ class StorageEngine::Impl {
       GroupReadLimiter* limiter = nullptr,
       SortedSetMemberValidation validation =
           SortedSetMemberValidation::kVerifyUnique,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
   // Returns a fully validated encoded_sorted_set_ with entries_ empty, after
   // releasing the physical lease. The snapshot and any copies remain on the
   // key owner worker; a supplied limiter must outlive the task, including
@@ -4731,8 +4731,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
-      GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      GroupReadLimiter* limiter = nullptr, bool group_locked = false,
+      OnlineLatencyTrace* diagnostics = nullptr);
   enum class SortedSetPageReadMode : bool { kFullDecode, kIndexedProjection };
   // Indexed projection applies only to v2 pages with kTrustStored; v1 and
   // kVerifyUnique retain full decoding. Both modes check identity/CRC and
@@ -4744,7 +4744,7 @@ class StorageEngine::Impl {
       SortedSetMemberValidation validation =
           SortedSetMemberValidation::kVerifyUnique,
       SortedSetPageReadMode mode = SortedSetPageReadMode::kFullDecode,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
   // Copies one checked page into a contiguous member block before releasing
   // its lease. The caller admits page scratch/output before launch.
   static absl::StatusOr<PackedSortedSetValues> PackSortedSetPage(
@@ -4753,8 +4753,8 @@ class StorageEngine::Impl {
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, std::uint64_t id,
-      GroupReadLimiter* limiter = nullptr,
-      OnlineLatencyTrace* diagnostics = nullptr, bool group_locked = false);
+      GroupReadLimiter* limiter = nullptr, bool group_locked = false,
+      OnlineLatencyTrace* diagnostics = nullptr);
   Task<absl::StatusOr<std::vector<OrderedCollectionEntry>>>
   LoadGroupedOrderedValue(WorkerStore& store,
                           WorkerStore::PartitionStore& partition,

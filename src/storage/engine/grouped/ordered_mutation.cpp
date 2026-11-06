@@ -50,8 +50,8 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx,
     ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    SortedSetMemberMutation* prepared_members, OnlineLatencyTrace* diagnostics,
-    bool* retry_exclusive) {
+    SortedSetMemberMutation* prepared_members, bool* retry_exclusive,
+    OnlineLatencyTrace* diagnostics) {
   if (retry_exclusive) *retry_exclusive = false;
   const auto needs_x = [&]() {
     assert(retry_exclusive);
@@ -834,7 +834,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedOrderedMutationLocked(
         }
       } else {
         committed = co_await CommitTxWrites(batch.txid_, {&batch}, nullptr,
-                                            nullptr, diagnostics);
+                                            nullptr, nullptr, diagnostics);
       }
       co_await store.store_state_mutex_.Lock();
       if (!committed.ok()) {

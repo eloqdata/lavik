@@ -272,7 +272,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, grouped,
         std::move(prepared.plan_), prepared.expire_at_ms_, tx, replication,
-        mutation_precondition, nullptr, access.diagnostics_);
+        mutation_precondition, nullptr, nullptr, access.diagnostics_);
   }
   if (grouped && access.stream_group_) {
     if (value_type != ValueType::kStream)
@@ -510,7 +510,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       co_return co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, nullptr,
           std::move(*created_groups), expire_at_ms, tx, replication,
-          mutation_precondition, &created_members, access.diagnostics_);
+          mutation_precondition, &created_members, nullptr,
+          access.diagnostics_);
     std::optional<MemoryReservation> stream_promotion_admission;
     OrderedCollectionMutationPlan plan;
     if (grouped == nullptr) {
@@ -569,7 +570,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     }
     co_return co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, grouped, std::move(plan),
-        expire_at_ms, tx, replication, mutation_precondition, nullptr,
+        expire_at_ms, tx, replication, mutation_precondition, nullptr, nullptr,
         access.diagnostics_);
   }
   absl::Status status = co_await AppendLocked(

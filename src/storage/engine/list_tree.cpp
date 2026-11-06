@@ -630,7 +630,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
         const auto committed = co_await CommitGroupedOrderedMutationLocked(
             store, partition, db_id, key, digest, *object, std::move(plan),
             expire_at_ms, tx, replication, mutation_precondition, nullptr,
-            operation.diagnostics_);
+            nullptr, operation.diagnostics_);
         if (!committed.ok()) co_return committed;
       }
       co_return prepared;
@@ -970,7 +970,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (!plan.ok()) co_return plan.status();
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, nullptr, std::move(*plan),
-        expire_at_ms, tx, replication, mutation_precondition, nullptr,
+        expire_at_ms, tx, replication, mutation_precondition, nullptr, nullptr,
         operation.diagnostics_);
     if (!written.ok()) co_return written;
     co_return result;

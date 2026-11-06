@@ -840,7 +840,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashFields(
       ++end;
     auto loaded = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, requests[begin].group_,
-        false, diagnostics);
+        false, false, diagnostics);
     if (!loaded.ok()) [[unlikely]]
       co_return loaded.status();
     const auto bytes = loaded->loaded_.value();
@@ -1069,9 +1069,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     const auto* route = grouped->directory().Find(field);
     if (route == nullptr) [[unlikely]]
       co_return absl::DataLossError("missing Hash field route");
-    auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                digest, grouped, route->id_,
-                                                false, operation.diagnostics_);
+    auto loaded = co_await LoadHashGroupPayload(
+        store, partition, db_id, key, digest, grouped, route->id_, false, false,
+        operation.diagnostics_);
     if (!loaded.ok()) [[unlikely]] {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1131,9 +1131,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     const auto* entry = grouped->FindGroup(route->id_);
     if (entry == nullptr)
       co_return absl::DataLossError("grouped scan has no physical page");
-    auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                digest, grouped, route->id_,
-                                                false, operation.diagnostics_);
+    auto loaded = co_await LoadHashGroupPayload(
+        store, partition, db_id, key, digest, grouped, route->id_, false, false,
+        operation.diagnostics_);
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();
@@ -1329,9 +1329,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       do {
         edits.push_back(leaf_edits[begin++].view_);
       } while (begin < leaf_edits.size() && leaf_edits[begin].id_ == id);
-      auto loaded = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                  digest, grouped, id, false,
-                                                  operation.diagnostics_);
+      auto loaded = co_await LoadHashGroupPayload(
+          store, partition, db_id, key, digest, grouped, id, false, false,
+          operation.diagnostics_);
       if (!loaded.ok()) co_return loaded.status();
       const auto bytes = loaded->loaded_.value();
       auto edited = ApplyHashGroupEdits(
