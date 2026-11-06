@@ -31,6 +31,7 @@ class WriteBufferTestPeer {
     kGroupedReadUnmetered,
     kGroupedReadAdmissionFailure,
     kGroupedReadCommonView,
+    kGroupedRankSingleRead,
     kProgress,
     kEpochChanged,
     kSourceChanged,
@@ -898,6 +899,48 @@ class WriteBufferTestPeer {
     if (!object || !object->has_member_index())
       co_return absl::InternalError("fixture did not create member leaves");
 
+    if (scenario == Scenario::kGroupedRankSingleRead) {
+      auto paused = co_await storage.ConfigureDefrag(
+          {.action_ = DefragConfigAction::kPause});
+      if (!paused.ok()) co_return paused;
+      // Drain staging so each member/ordered payload requires physical IO.
+      // Background cleaners are disabled by the fixture; the short parent
+      // key and resident directory require no separate key/root reads.
+      impl.YieldActiveWriteBuffers(store);
+      while (store.flush_running_ || !store.flush_queue_.empty())
+        co_await bycorf::Yield(*store.worker_);
+      for (unsigned index : {0u, 900u, 1024u}) {
+        const bool present = index < names.size();
+        const std::array<std::string_view, 1> requested{
+            present ? std::string_view(names[index]) : "missing"};
+        for (bool reverse : {false, true}) {
+          const auto before =
+              co_await CollectWorkerMetrics(CommandMetricsDetail::kNone);
+          auto read = co_await storage.ExecuteSortedSet(
+              0, key,
+              {.kind_ = SortedSetOperationKind::kRank,
+               .members_ = requested,
+               .reverse_ = reverse});
+          if (!read.ok()) co_return read.status();
+          const auto after =
+              co_await CollectWorkerMetrics(CommandMetricsDetail::kNone);
+          EXPECT_EQ(after.storage_reads_.operations_ -
+                        before.storage_reads_.operations_,
+                    present ? 2 : 1)
+              << "index=" << index << " reverse=" << reverse;
+          EXPECT_EQ(read->length_, 1024);
+          if (present) {
+            EXPECT_EQ(read->rank_, reverse ? 1023 - index : index);
+            EXPECT_EQ(read->rank_score_, index);
+          } else {
+            EXPECT_FALSE(read->rank_);
+            EXPECT_FALSE(read->rank_score_);
+          }
+        }
+      }
+      co_return absl::OkStatus();
+    }
+
     if (scenario == Scenario::kGroupedReadCommonView) {
       unsigned other = 900;
       auto first = object->directory().Find(names[0])->id_;
@@ -1041,7 +1084,8 @@ class WriteBufferTestPeer {
       co_return co_await RunGroupedPublication(storage);
     if (scenario == Scenario::kGroupedReadUnmetered ||
         scenario == Scenario::kGroupedReadAdmissionFailure ||
-        scenario == Scenario::kGroupedReadCommonView)
+        scenario == Scenario::kGroupedReadCommonView ||
+        scenario == Scenario::kGroupedRankSingleRead)
       co_return co_await RunGroupedRead(storage, scenario);
     if (scenario == Scenario::kResumeActiveStreams)
       co_return co_await RunResumeActiveStreams(storage);
@@ -1403,6 +1447,10 @@ TEST(StorageGroupedReadTest, FailedPlanCountsRejectionAndReleasesState) {
 /// writer until it has captured both scores from the same protected view.
 TEST(StorageGroupedReadTest, RetainsEarlierLeafWhileWaitingForLaterWriter) {
   RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedReadCommonView);
+}
+
+TEST(StorageGroupedReadTest, RanksReadEachRequiredPayloadOnce) {
+  RunWriteBufferScenario(WriteBufferTestPeer::Scenario::kGroupedRankSingleRead);
 }
 
 TEST(StorageWriteBufferResumeTest, ThreeStreamsReuseTwoBuffersWithoutSealing) {
