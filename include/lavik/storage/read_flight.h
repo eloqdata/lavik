@@ -61,11 +61,13 @@ class ReadFlightWaiter : public bycorf::OneShotIoAwaitable {
   bool delivered_ = false;
 
  private:
+  // Fit both flags into the inherited completion's tail padding instead of
+  // extending every request carrier by another alignment unit.
+  bool known_missing_ = false;
   friend class ReadFlightRegistry;
   ReadFlight* flight_ = nullptr;
   ReadFlightWaiter* next_ = nullptr;
   std::uint64_t miss_epoch_ = 0;
-  bool known_missing_ = false;
 };
 
 struct ReadFlightStats {

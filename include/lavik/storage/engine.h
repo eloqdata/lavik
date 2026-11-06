@@ -2299,8 +2299,10 @@ class StorageEngine::RemoteReadAwaitable {
   std::uint64_t generation_ = 0;
   std::uint64_t db_epoch_ = 0;
   std::uint64_t replication_epoch_ = 0;
-  std::size_t record_headroom_ = 0;
-  std::size_t read_bytes_ = 0;
+  // A compact record and its alignment padding fit inside one storage block.
+  // Keep these bounded lengths narrow in every connection's request frame.
+  std::uint32_t record_headroom_ = 0;
+  std::uint32_t read_bytes_ = 0;
   std::uint16_t slot_ = 0;
   std::uint8_t db_id_ = 0;
   ValueType type_ = ValueType::kString;
@@ -2336,9 +2338,9 @@ class StorageEngine::RemoteReadAwaitable {
     std::size_t hash_ = 0;
     bycorf::Worker& worker_;
     bycorf::FixedFile file_;
+    bool fixed_ = false;
     bycorf::FixedBuffer buffer_{};
     std::uint64_t offset_;
-    bool fixed_ = false;
     ReadLatencyTrace* trace_;
   };
   ReadLatencyTrace* trace_;

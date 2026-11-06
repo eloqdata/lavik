@@ -16,16 +16,20 @@ struct ReadFlight final : bycorf::IoCompletion {
   void Complete(bycorf::Worker&, int result, unsigned flags) override {
     registry->Complete(*this, result, flags);
   }
+  // Completion touches the linkage, ownership and hash together. Keep them
+  // before the comparison-only identity tail; pin_owner uses existing padding
+  // so returning the pin does not fetch the last line of that identity.
   ReadFlightRegistry* registry = nullptr;
-  ReadFlightKey key;
-  std::size_t hash = 0;
-  ReadBufferLease lease;
-  SharedReadReservation sharing;
   ReadFlightWaiter* head = nullptr;
   ReadFlight* next_free = nullptr;
+  ReadBufferLease lease;
+  SharedReadReservation sharing;
+  std::size_t hash = 0;
   unsigned consumers = 0;
+  std::uint16_t pin_owner = 0;
   bool owns_pin = false;
   bool active = false;
+  ReadFlightKey key;
 };
 
 ReadFlightWaiter::~ReadFlightWaiter() {
@@ -179,6 +183,7 @@ ReadFlightRegistry::Admission ReadFlightRegistry::Start(
   assert(lease.valid() && owns_pin);
   auto* flight = free_;
   flight->key = key;
+  flight->pin_owner = key.block_owner;
   flight->hash = hash;
   auto& first = direct_[hash & (kDirectSlots - 1)];
   if (!first)
@@ -262,8 +267,7 @@ void ReadFlightRegistry::Complete(ReadFlight& flight, int result,
     ReadResultBuffer buffer(std::move(flight.lease));
     if (flight.owns_pin) {
       flight.owns_pin = false;
-      release_pin_(pin_context_, flight.key.block, flight.key.block_owner,
-                   false);
+      release_pin_(pin_context_, flight.key.block, flight.pin_owner, false);
     }
     Recycle(flight);
     if (waiter) waiter->ReceiveRead(worker_, std::move(buffer), result, flags);
@@ -294,7 +298,7 @@ void ReadFlightRegistry::CompleteShared(ReadFlight& flight, int result,
       std::move(flight.sharing).Publish(std::move(flight.lease));
   if (flight.owns_pin) {
     flight.owns_pin = false;
-    release_pin_(pin_context_, flight.key.block, flight.key.block_owner, false);
+    release_pin_(pin_context_, flight.key.block, flight.pin_owner, false);
   }
   Recycle(flight);
   // Each callback stores its handle and enqueues its continuation. Keep the
@@ -322,8 +326,7 @@ void ReadFlightRegistry::FinalizeQuiesced() noexcept {
     // Request destructors detached every waiter before the all-worker barrier.
     assert(!flight.head && !flight.consumers);
     if (flight.owns_pin) {
-      release_pin_(pin_context_, flight.key.block, flight.key.block_owner,
-                   true);
+      release_pin_(pin_context_, flight.key.block, flight.pin_owner, true);
       flight.owns_pin = false;
     }
     pool_.ReclaimReadAfterQuiesce(std::move(flight.lease));
