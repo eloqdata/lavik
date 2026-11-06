@@ -580,14 +580,14 @@ StorageEngine::Impl::RestoreCollectionValueLocked(
     const auto total = current->is_ordered()
                            ? current->ordered_directory().total_group_bytes()
                            : current->directory().total_group_bytes();
-    if (total < kCollectionGroupTargetBytes) {
+    if (total < kCollectionDemotionBytes) {
       const auto location = current->version().root_;
       auto compact = co_await LoadGroupedValue(
           store, partition, db_id, key, digest, location, nullptr,
           GroupedValueEncoding::kPhysicalStorage);
       if (!compact.ok()) co_return compact.status();
       const auto bytes = compact->value();
-      if (bytes.size() >= kCollectionGroupTargetBytes)
+      if (bytes.size() >= kCollectionDemotionBytes)
         co_return absl::InternalError("collection demotion byte bound failed");
       written = co_await AppendLocked(
           store, partition, db_id, key, digest,

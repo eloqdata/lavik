@@ -310,7 +310,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           total += encoded_sizes[i];
         }
       }
-      if (total < kCollectionGroupTargetBytes) {
+      if (total < kCollectionDemotionBytes) {
         GroupedScratchBudget budget;
         for (const auto& [prefix, metadata] : previous->directory().groups()) {
           (void)prefix;
@@ -325,7 +325,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
               budget.AddGroup(*entry, previous->ExtentsFor(metadata.id_));
           if (!added.ok()) co_return added;
         }
-        auto added = budget.AddBytes(2 * kCollectionGroupTargetBytes +
+        auto added = budget.AddBytes(2 * kCollectionDemotionBytes +
                                      field_count * sizeof(HashEntry));
         if (!added.ok()) co_return added;
         auto scratch = budget.Reserve(2);
@@ -363,7 +363,7 @@ Task<absl::Status> StorageEngine::Impl::CommitGroupedHashMutationLocked(
           co_return absl::DataLossError("Hash demotion cardinality mismatch");
         auto encoded = EncodeHashValue(compact);
         if (!encoded.ok()) co_return encoded.status();
-        if (encoded->size() >= kCollectionGroupTargetBytes)
+        if (encoded->size() >= kCollectionDemotionBytes)
           co_return absl::InternalError("Hash demotion byte bound failed");
         compact_payload = std::move(*encoded);
       }

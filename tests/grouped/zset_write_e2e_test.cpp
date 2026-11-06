@@ -652,7 +652,7 @@ TEST(GroupedSortedSetWriteE2e, EncodedPointEditsPreserveExpiryAndDemote) {
     // Walk a coprime permutation so no ordered page becomes empty before
     // crossing the aggregate demotion threshold with encoded after-images.
     // Leave enough margin for the headers of the less densely filled pages.
-    for (unsigned i = 0; i < 1024 - 128; ++i) {
+    for (unsigned i = 0; i < 1024 - 64; ++i) {
       const auto member = DenseZSetMember((i * 17) % 1024);
       ASSERT_EQ(client.Command({"ZREM", key, member}).text_, "1") << i;
       expected.erase(member);

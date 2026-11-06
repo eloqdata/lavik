@@ -39,7 +39,7 @@ TEST(GroupedStreamE2e, SmallStreamKeepsCompactStorage) {
   {
     Server server(disk);
     Client client(server.port());
-    PopulateStream(client, "small", 32, 256);
+    PopulateStream(client, "small", 32, 128);
     EXPECT_EQ(client.Command({"XLEN", "small"}).text_, "32");
     client.Durable();
     ASSERT_EQ(server.Wait(true), 0) << server.Log();
