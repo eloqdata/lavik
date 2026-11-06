@@ -108,7 +108,7 @@ Task<absl::Status> StorageEngine::Impl::WriteGroupedStringLocked(
         replication, mutation_precondition, diagnostics);
   co_return co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, previous, std::move(plan),
-      expire_at_ms, tx, replication, mutation_precondition, nullptr,
+      expire_at_ms, tx, replication, mutation_precondition, nullptr, nullptr,
       diagnostics);
 }
 
@@ -348,7 +348,8 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       if (id <= grouped->group_count()) {
         auto loaded = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, grouped, id, false, nullptr,
-            SortedSetMemberValidation::kVerifyUnique, operation.diagnostics_);
+            SortedSetMemberValidation::kVerifyUnique, false,
+            operation.diagnostics_);
         if (!loaded.ok()) {
           if (read_only &&
               (EffectiveRecordDbEpoch(partition, db_id) != snapshot.db_epoch_ ||
@@ -390,7 +391,7 @@ StorageEngine::Impl::ExecuteStringSegmentLocked(
       const auto status = co_await CommitGroupedOrderedMutationLocked(
           store, partition, db_id, key, digest, grouped, std::move(plan),
           location.expire_at_ms_, tx, replication, mutation_precondition,
-          nullptr, operation.diagnostics_);
+          nullptr, nullptr, operation.diagnostics_);
       if (!status.ok()) co_return status;
     }
   }

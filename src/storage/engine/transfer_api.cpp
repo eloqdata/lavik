@@ -135,7 +135,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
         auto page = co_await engine->LoadOrderedGroupSnapshot(
             *source.store_, *source.partition_, source.db_id_, source.key_,
             source.digest_, object, id.prefix_, false, nullptr,
-            SortedSetMemberValidation::kVerifyUnique, source.diagnostics_);
+            SortedSetMemberValidation::kVerifyUnique, false,
+            source.diagnostics_);
         if (!page.ok()) co_return page.status();
         auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
         if (!max_key.ok()) co_return max_key.status();
@@ -264,7 +265,7 @@ StorageEngine::Impl::ReadValueForTransferLocked(
                   *source.store_, *source.partition_, source.db_id_,
                   source.key_, source.digest_, object, groups[index].id_, true,
                   window->limiter(), SortedSetMemberValidation::kVerifyUnique,
-                  source.diagnostics_));
+                  false, source.diagnostics_));
         }
       }
       co_await window->Join();
@@ -391,7 +392,8 @@ StorageEngine::Impl::ReadValueForTransferLocked(
           auto from_disk = co_await engine->LoadOrderedGroupSnapshot(
               *source->store_, *source->partition_, source->db_id_,
               source->key_, source->digest_, object, id.prefix_, true, nullptr,
-              SortedSetMemberValidation::kVerifyUnique, source->diagnostics_);
+              SortedSetMemberValidation::kVerifyUnique, false,
+              source->diagnostics_);
           if (!from_disk.ok()) co_return from_disk.status();
           loaded.emplace(std::move(*from_disk));
         }

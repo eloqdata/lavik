@@ -132,7 +132,7 @@ StorageEngine::Impl::ExecuteGroupedHashRandomLocked(
     if (!pop) {
       auto loaded = co_await LoadHashGroupPayload(
           store, partition, db_id, key, digest, object, selection.id_, false,
-          operation.diagnostics_);
+          false, operation.diagnostics_);
       if (!loaded.ok()) co_return loaded.status();
       TraceSpanScope process(operation.diagnostics_, TraceStage::kValueProcess);
       const auto bytes = loaded->loaded_.value();

@@ -1145,6 +1145,19 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
     co_return std::optional(std::move(result));
   }
 
+  if (operation.kind_ != SortedSetOperationKind::kScores) {
+    unlock.Unlock();
+    auto read = co_await TryConcurrentSortedSetRangeRead(
+        store, partition, db_id, key, digest, operation, object);
+    if (!read.ok() &&
+        (EffectiveRecordDbEpoch(partition, db_id) !=
+             object->version().db_epoch_ ||
+         partition.replication_epoch_ != object->version().replication_epoch_ ||
+         partition.grouped_generations_[db_id] !=
+             object->version().index_generation_))
+      co_return std::nullopt;
+    co_return read;
+  }
   if (operation.members_.size() > SIZE_MAX / sizeof(GroupedRecordId)) {
     RecordMemoryRejection();
     co_return absl::ResourceExhaustedError("Sorted Set lock plan overflow");
@@ -1227,6 +1240,202 @@ StorageEngine::Impl::TryConcurrentSortedSetRead(
 }
 
 Task<absl::StatusOr<std::optional<SortedSetResult>>>
+StorageEngine::Impl::TryConcurrentSortedSetRangeRead(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const SortedSetOperation& operation, GroupedObject::Handle object) {
+  if (!store.group_locks_)
+    store.group_locks_ = std::make_unique<GroupedLockTable>(*store.worker_);
+  auto holds = store.group_locks_->MakeLockSet(
+      {db_id, tx::FingerprintOf(digest), object->incarnation()});
+  std::optional<double> member_score;
+  if (operation.kind_ == SortedSetOperationKind::kRank) {
+    const auto* route = object->directory().Find(operation.members_.front());
+    if (!route) co_return absl::DataLossError("missing member prefix route");
+    const auto id = route->id_;
+    auto locked = co_await holds.Acquire({GroupedLockIndex::kMember, id},
+                                         GroupedLockMode::kShared);
+    if (!locked.ok()) co_return locked;
+    // A waiting reader must use the last holder's new leaf, not the revision
+    // observed before acquiring S. IS keeps the prefix topology unchanged.
+    auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
+    if (!current || current->incarnation() != object->incarnation() ||
+        current->version().db_epoch_ != object->version().db_epoch_ ||
+        current->version().replication_epoch_ !=
+            object->version().replication_epoch_ ||
+        current->version().index_generation_ !=
+            object->version().index_generation_)
+      co_return std::nullopt;
+    object = std::move(current);
+    auto scores = operation;
+    scores.kind_ = SortedSetOperationKind::kScores;
+    auto read = co_await ReadGroupedSortedSetScores(
+        store, partition, db_id, key, digest, scores, object, true);
+    if (!read.ok()) co_return read.status();
+    member_score = read->scores_.front();
+  }
+  // Enumerate only payloads used by the operation. Counts for complete score
+  // pages come from one immutable directory, so ZCOUNT needs just boundary
+  // holds. Mixed-score BYLEX has no lexical page index and requires all pages.
+  const auto visit = [&](const GroupedObject::Handle& source, auto emit) {
+    const auto& directory = source->ordered_directory();
+    const auto& pages = directory.groups();
+    const auto length = directory.root().item_count_;
+    std::size_t first = 0, end = pages.size();
+    if (operation.kind_ == SortedSetOperationKind::kRank) {
+      if (!member_score) return true;
+      first = directory.LowerBoundScore(*member_score);
+      end = directory.UpperBoundScore(*member_score);
+      if (end - first <= 1) {
+        if (first < pages.size()) emit(pages[first].id_);
+        return true;
+      }
+      while (first < end) {
+        const auto mid = first + (end - first) / 2;
+        bool less = false;
+        if (pages[mid].max_score_ == *member_score) {
+          const auto bound =
+              pages[mid].max_key_.LessThan(operation.members_.front());
+          if (!bound) return false;
+          less = *bound;
+        }
+        if (less)
+          first = mid + 1;
+        else
+          end = mid;
+      }
+      if (first < pages.size()) emit(pages[first].id_);
+      return true;
+    }
+    if (operation.kind_ == SortedSetOperationKind::kRange &&
+        operation.range_mode_ == SortedSetRangeMode::kRank) {
+      const auto [begin_rank, end_rank] =
+          RankSlice(operation.first_, operation.last_, length);
+      if (begin_rank == end_rank) return true;
+      const auto low = operation.reverse_ ? length - end_rank : begin_rank;
+      const auto high = operation.reverse_ ? length - begin_rank : end_rank;
+      first = directory.FindRank(low)->group_index_;
+      end = directory.FindRank(high - 1)->group_index_ + 1;
+    } else if (operation.range_mode_ == SortedSetRangeMode::kScore) {
+      first = directory.LowerBoundScore(operation.minimum_score_.value_,
+                                        operation.minimum_score_.exclusive_);
+      end = directory.UpperBoundScore(operation.maximum_score_.value_,
+                                      operation.maximum_score_.exclusive_);
+    }
+    if (first >= end || (operation.limit_ && operation.count_ == 0))
+      return true;
+    const auto whole = [&](std::size_t i) {
+      const auto low = operation.minimum_score_,
+                 high = operation.maximum_score_;
+      return (low.exclusive_ ? pages[i].min_score_ > low.value_
+                             : pages[i].min_score_ >= low.value_) &&
+             (high.exclusive_ ? pages[i].max_score_ < high.value_
+                              : pages[i].max_score_ <= high.value_);
+    };
+    if (operation.range_mode_ == SortedSetRangeMode::kScore) {
+      if (operation.kind_ == SortedSetOperationKind::kCount) {
+        // The rank index accounts for the complete interior in O(log G).
+        // Do not turn a metadata-only count into a linear lock-plan scan.
+        if (!whole(first)) emit(pages[first].id_);
+        if (end - 1 != first && !whole(end - 1)) emit(pages[end - 1].id_);
+        return true;
+      }
+      if (operation.limit_) {
+        const auto boundary = operation.reverse_ ? end - 1 : first;
+        const auto unknown = whole(boundary) ? 0 : pages[boundary].item_count_;
+        if (unknown) emit(pages[boundary].id_);
+        // Only the starting boundary's match count is unknown before IO.
+        // Cover its possible displacement, then skip OFFSET through resident
+        // ranks. Large LIMIT offsets must not acquire every skipped page.
+        const auto base = directory.CountBefore(first);
+        const auto available = directory.CountBefore(end) - base;
+        const auto skip = std::min<std::uint64_t>(operation.offset_, available);
+        const auto take =
+            operation.count_ < 0
+                ? available - skip
+                : std::min<std::uint64_t>(
+                      available - skip,
+                      unknown + static_cast<std::uint64_t>(operation.count_));
+        if (!take) return true;
+        const auto low =
+            operation.reverse_ ? base + available - skip - take : base + skip;
+        const auto high =
+            operation.reverse_ ? base + available - skip : base + skip + take;
+        first = directory.FindRank(low)->group_index_;
+        end = directory.FindRank(high - 1)->group_index_ + 1;
+      }
+    }
+    for (auto i = first; i < end; ++i) emit(pages[i].id_);
+    return true;
+  };
+  std::size_t count = 0;
+  if (!visit(object, [&](auto) { ++count; })) co_return std::nullopt;
+  if (count > SIZE_MAX / sizeof(std::uint64_t))
+    co_return absl::ResourceExhaustedError(
+        "Sorted Set read lock plan overflow");
+  auto admission = TryReserveMemory(count * sizeof(std::uint64_t));
+  if (!admission) co_return MemoryLimitError("OOM Sorted Set read lock plan");
+  std::vector<std::uint64_t> groups;
+  groups.reserve(count);
+  if (groups.capacity() > admission->bytes() / sizeof(std::uint64_t))
+    co_return MemoryLimitError("OOM Sorted Set read lock plan");
+  visit(object, [&](auto id) { groups.push_back(id); });
+  std::sort(groups.begin(), groups.end());
+  groups.erase(std::unique(groups.begin(), groups.end()), groups.end());
+  for (const auto id : groups) {
+    const auto locked = co_await holds.Acquire(
+        {GroupedLockIndex::kOrdered, {id, 0}}, GroupedLockMode::kShared);
+    if (!locked.ok()) co_return locked;
+  }
+  auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
+  if (!current || current->incarnation() != object->incarnation() ||
+      current->version().db_epoch_ != object->version().db_epoch_ ||
+      current->version().replication_epoch_ !=
+          object->version().replication_epoch_ ||
+      current->version().index_generation_ !=
+          object->version().index_generation_)
+    co_return std::nullopt;
+  bool covered = true;
+  if (!visit(current,
+             [&](auto id) {
+               covered &= std::binary_search(groups.begin(), groups.end(), id);
+             }) ||
+      !covered)
+    co_return std::nullopt;
+  // This final directory is the logical cut: all selected payloads are now
+  // frozen, while preceding counts and unrelated bounds belong to this root.
+  // A route change while waiting gets one S fallback, never an IX/IS retry
+  // loop.
+  const auto readable = current->ReadStatus();
+  if (!readable.ok()) co_return readable;
+  const auto expires = current->version().root_.expire_at_ms_;
+  if (expires &&
+      expires <= (operation.now_ms_ ? operation.now_ms_ : UnixTimeMillis()))
+    co_return std::nullopt;
+  LAVIK_FAULT_INJECT({
+    if (LAVIK_FAULT_MATCHES("LAVIK_ZSET_RANGE_PAUSE_KEY", key)) {
+      spdlog::info("zset range read locks held before page IO");
+      const auto paused = co_await fault_injection::PauseWhileFileExists(
+          "LAVIK_ZSET_RANGE_PAUSE_FILE");
+      if (!paused.ok()) co_return paused;
+    }
+  });
+  auto read = co_await ExecuteGroupedSortedSetLocked(
+      store, partition, db_id, key, digest, operation, current, nullptr,
+      nullptr, nullptr, nullptr, nullptr, true);
+  if (!read.ok()) {
+    if (EffectiveRecordDbEpoch(partition, db_id) !=
+            current->version().db_epoch_ ||
+        partition.replication_epoch_ != current->version().replication_epoch_ ||
+        partition.grouped_generations_[db_id] !=
+            current->version().index_generation_)
+      co_return std::nullopt;
+    co_return read.status();
+  }
+  co_return std::optional(std::move(*read));
+}
+
+Task<absl::StatusOr<std::optional<SortedSetResult>>>
 StorageEngine::Impl::TryConcurrentSortedSetPoint(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const SortedSetOperation& operation, ReplicationCommandAppend* replication,
@@ -1296,7 +1505,7 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   {
     auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
                                               digest, object, member_id, false,
-                                              operation.diagnostics_, true);
+                                              true, operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -1474,8 +1683,8 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
             "injected Sorted Set plan page read failure");
     });
     auto page = co_await LoadEncodedSortedSetGroupSnapshot(
-        store, partition, db_id, key, digest, object, id, nullptr,
-        operation.diagnostics_, true);
+        store, partition, db_id, key, digest, object, id, nullptr, true,
+        operation.diagnostics_);
     if (!page.ok()) co_return page.status();
     auto edited = EditEncodedSortedSetGroup(
         page->snapshot_, member,
@@ -1517,8 +1726,8 @@ StorageEngine::Impl::TryConcurrentSortedSetPoint(
   status = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(plan),
       object->version().root_.expire_at_ms_, nullptr, replication,
-      mutation_precondition, &*member_plan, operation.diagnostics_,
-      &retry_exclusive);
+      mutation_precondition, &*member_plan, &retry_exclusive,
+      operation.diagnostics_);
   if (retry_exclusive) co_return std::nullopt;
   if (!status.ok()) co_return status;
   co_return std::optional(std::move(result));
@@ -1605,7 +1814,7 @@ StorageEngine::Impl::ExecuteSortedSetLocked(
         const auto committed = co_await CommitGroupedOrderedMutationLocked(
             store, partition, db_id, key, digest, *view, std::move(plan),
             (*view)->version().root_.expire_at_ms_, tx, replication,
-            mutation_precondition, &members, operation.diagnostics_);
+            mutation_precondition, &members, nullptr, operation.diagnostics_);
         if (!committed.ok()) co_return committed;
       }
       co_return prepared;
@@ -1715,7 +1924,7 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
     if (!route) co_return absl::DataLossError("missing member prefix route");
     auto leaf = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, route->id_, false,
-        operation.diagnostics_, group_locked);
+        group_locked, operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -1770,7 +1979,7 @@ StorageEngine::Impl::ReadGroupedSortedSetScores(
       co_return absl::CancelledError("member read cancelled by shutdown");
     auto leaf = co_await LoadHashGroupPayload(
         store, partition, db_id, key, digest, object, requests[begin].group_,
-        false, operation.diagnostics_, group_locked);
+        false, group_locked, operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
     const std::string_view payload(reinterpret_cast<const char*>(bytes.data()),
@@ -1840,7 +2049,7 @@ StorageEngine::Impl::ScanGroupedSortedSetMembers(
     if (shutdown_flush_requested_)
       co_return absl::CancelledError("member scan cancelled by shutdown");
     auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                              digest, object, id, false,
+                                              digest, object, id, false, false,
                                               operation.diagnostics_);
     if (!leaf.ok()) co_return leaf.status();
     const auto bytes = leaf->loaded_.value();
@@ -1879,7 +2088,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     const SortedSetOperation& operation, GroupedObject::Handle object,
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
-    PreparedOrderedMutation* prepared, SortedSetOrderedProbe* ordered_probe) {
+    PreparedOrderedMutation* prepared, SortedSetOrderedProbe* ordered_probe,
+    bool group_locked) {
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -1910,6 +2120,14 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     // let GC relocate and reclaim them. Resolve a current physical view
     // without suspending before inspecting its immutable size fields for
     // admission; the loader refreshes again before resolving physical IO.
+    if (group_locked) {
+      auto current = RefreshLockedGroup(partition, db_id, key, object,
+                                        {metadata[i].id_, 0});
+      if (!current.ok()) return current.status();
+      const auto* entry = (*current)->FindGroup({metadata[i].id_, 0});
+      return budget->AddGroup(*entry,
+                              (*current)->ExtentsFor({metadata[i].id_, 0}));
+    }
     const auto& expected = object->version();
     auto current = partition.grouped_objects_[db_id].CurrentForMutation(key);
     if (!current ||
@@ -2060,19 +2278,19 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       if constexpr (std::is_same_v<Page, LoadedSortedSetPage>)
         return LoadSortedSetPage(store, partition, db_id, key, digest, object,
                                  metadata[i].id_, validation, mode,
-                                 operation.diagnostics_);
+                                 group_locked, operation.diagnostics_);
       else if constexpr (std::is_same_v<Page, PackedSortedSetValues>)
         return LoadPackedSortedSetPage(store, partition, db_id, key, digest,
                                        object, metadata[i].id_, limiter,
-                                       operation.diagnostics_);
+                                       group_locked, operation.diagnostics_);
       else {
         if (point_write)
           return LoadEncodedSortedSetGroupSnapshot(
               store, partition, db_id, key, digest, object, metadata[i].id_,
-              limiter, operation.diagnostics_);
-        return LoadOrderedGroupSnapshot(store, partition, db_id, key, digest,
-                                        object, metadata[i].id_, false, limiter,
-                                        validation, operation.diagnostics_);
+              limiter, group_locked, operation.diagnostics_);
+        return LoadOrderedGroupSnapshot(
+            store, partition, db_id, key, digest, object, metadata[i].id_,
+            false, limiter, validation, group_locked, operation.diagnostics_);
       }
     };
     auto page = co_await load();
@@ -2717,7 +2935,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     for (const auto id : selected) {
       const auto current =
           partition.grouped_objects_[db_id].CurrentForMutation(key);
-      if (!current || !current->SameLogicalRoot(*object) ||
+      if (!current || (!group_locked && !current->SameLogicalRoot(*object)) ||
           current->version().db_epoch_ != object->version().db_epoch_ ||
           current->version().replication_epoch_ !=
               object->version().replication_epoch_ ||
@@ -2752,9 +2970,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       };
       if (operation.kind_ == SortedSetOperationKind::kScores ||
           operation.kind_ == SortedSetOperationKind::kRank) {
-        auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                  digest, object, id, false,
-                                                  operation.diagnostics_);
+        auto leaf = co_await LoadHashGroupPayload(
+            store, partition, db_id, key, digest, object, id, false,
+            group_locked, operation.diagnostics_);
         if (!leaf.ok()) co_return leaf.status();
         const auto bytes = leaf->loaded_.value();
         const std::string_view payload(
@@ -2769,9 +2987,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
       }
       HashGroupSnapshot snapshot;
       if (!ReadOnly(operation) && members.size() == 1) {
-        auto leaf = co_await LoadHashGroupPayload(store, partition, db_id, key,
-                                                  digest, object, id, false,
-                                                  operation.diagnostics_);
+        auto leaf = co_await LoadHashGroupPayload(
+            store, partition, db_id, key, digest, object, id, false, false,
+            operation.diagnostics_);
         if (!leaf.ok()) co_return leaf.status();
         const auto bytes = leaf->loaded_.value();
         const std::string_view payload(
@@ -3066,7 +3284,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     auto written = co_await CommitGroupedOrderedMutationLocked(
         store, partition, db_id, key, digest, object, std::move(plan),
         object->version().root_.expire_at_ms_, tx, replication,
-        mutation_precondition, nullptr, operation.diagnostics_);
+        mutation_precondition, nullptr, nullptr, operation.diagnostics_);
     if (!written.ok()) co_return written;
     co_return result;
   }
@@ -3190,15 +3408,16 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
           co_return absl::CancelledError(
               "Sorted Set plan cancelled by shutdown");
       }
-      auto page = co_await (
-          point_write ? LoadEncodedSortedSetGroupSnapshot(
-                            store, partition, db_id, key, digest, object,
-                            metadata[i].id_, nullptr, operation.diagnostics_)
-                      : LoadOrderedGroupSnapshot(
-                            store, partition, db_id, key, digest, object,
-                            metadata[i].id_, false, nullptr,
-                            SortedSetMemberValidation::kVerifyUnique,
-                            operation.diagnostics_));
+      auto page =
+          co_await (point_write ? LoadEncodedSortedSetGroupSnapshot(
+                                      store, partition, db_id, key, digest,
+                                      object, metadata[i].id_, nullptr, false,
+                                      operation.diagnostics_)
+                                : LoadOrderedGroupSnapshot(
+                                      store, partition, db_id, key, digest,
+                                      object, metadata[i].id_, false, nullptr,
+                                      SortedSetMemberValidation::kVerifyUnique,
+                                      false, operation.diagnostics_));
       if (!page.ok()) co_return page.status();
       loaded.emplace(i, std::move(page->snapshot_));
     }
@@ -3364,7 +3583,8 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
         auto page = co_await LoadOrderedGroupSnapshot(
             store, partition, db_id, key, digest, object,
             metadata[neighbor].id_, false, nullptr,
-            SortedSetMemberValidation::kVerifyUnique, operation.diagnostics_);
+            SortedSetMemberValidation::kVerifyUnique, false,
+            operation.diagnostics_);
         if (!page.ok()) co_return page.status();
         loaded.emplace(neighbor, std::move(page->snapshot_));
       }
@@ -3443,7 +3663,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
             // location through the ordinary loader, including GC retry checks.
             auto neighbor = co_await LoadOrderedGroupSnapshot(
                 store, partition, db_id, key, digest, object, old.id_, false,
-                nullptr, SortedSetMemberValidation::kVerifyUnique,
+                nullptr, SortedSetMemberValidation::kVerifyUnique, false,
                 operation.diagnostics_);
             if (!neighbor.ok()) co_return neighbor.status();
             plan.writes_.push_back(std::move(neighbor->snapshot_));
@@ -3500,7 +3720,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   auto written = co_await CommitGroupedOrderedMutationLocked(
       store, partition, db_id, key, digest, object, std::move(plan),
       object->version().root_.expire_at_ms_, tx, replication,
-      mutation_precondition, &member_mutation, operation.diagnostics_);
+      mutation_precondition, &member_mutation, nullptr, operation.diagnostics_);
   if (!written.ok()) co_return written;
   co_return result;
 }

@@ -111,7 +111,7 @@ struct StorageEngine::Impl::StreamPageAccess {
     page_reservations_.emplace(index, std::move(*admitted));
     auto page = co_await engine_.LoadOrderedGroupSnapshot(
         store_, partition_, db_id_, key_, digest_, object_, id.prefix_, false,
-        nullptr, SortedSetMemberValidation::kVerifyUnique, diagnostics_);
+        nullptr, SortedSetMemberValidation::kVerifyUnique, false, diagnostics_);
     if (!page.ok()) co_return page.status();
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
     if (!max_key.ok()) co_return max_key.status();
@@ -608,7 +608,7 @@ struct StorageEngine::Impl::StreamPageAccess {
     }
     co_return co_await engine_.CommitGroupedOrderedMutationLocked(
         store_, partition_, db_id_, key_, digest_, object_, std::move(plan),
-        expire_at_ms, tx, replication, mutation_precondition, nullptr,
+        expire_at_ms, tx, replication, mutation_precondition, nullptr, nullptr,
         diagnostics_);
   }
 
@@ -1709,7 +1709,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteGroupedStreamRange(
     probe_charge.emplace(std::move(*admitted));
     auto page = co_await LoadOrderedGroupSnapshot(
         store, partition, db_id, key, digest, object, groups[index].id_, false,
-        nullptr, SortedSetMemberValidation::kVerifyUnique, diagnostics);
+        nullptr, SortedSetMemberValidation::kVerifyUnique, false, diagnostics);
     if (!page.ok()) co_return page.status();
     auto max_key = StreamRecordKey(page->snapshot_.entries_.back().value_);
     if (!max_key.ok()) co_return max_key.status();

@@ -70,8 +70,8 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, GroupedRecordId id, bool pinned,
-    Decode decode, GroupReadLimiter* limiter, OnlineLatencyTrace* diagnostics,
-    bool group_locked) {
+    Decode decode, GroupReadLimiter* limiter, bool group_locked,
+    OnlineLatencyTrace* diagnostics) {
   auto detail = diagnostics ? std::make_unique<ReadLatencyTrace>() : nullptr;
   if (detail) detail->diagnostics_ = diagnostics;
   if (object == nullptr) co_return absl::DataLossError("missing grouped view");
@@ -249,7 +249,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     GroupedObject::Handle object, GroupedRecordId id, bool pinned,
-    OnlineLatencyTrace* diagnostics, bool group_locked) {
+    bool group_locked, OnlineLatencyTrace* diagnostics) {
   return LoadHashGroup<LoadedHashGroupPayload>(
       store, partition, db_id, key, digest, std::move(object), id, pinned,
       [](std::string_view, std::uint64_t sequence, std::uint32_t field_count,
@@ -258,7 +258,7 @@ StorageEngine::Impl::LoadHashGroupPayload(
                                       .sequence_ = sequence,
                                       .field_count_ = field_count};
       },
-      nullptr, diagnostics, group_locked);
+      nullptr, group_locked, diagnostics);
 }
 
 Task<absl::StatusOr<LoadedHashGroup>>
@@ -286,7 +286,7 @@ StorageEngine::Impl::LoadHashGroupSnapshot(
         return LoadedHashGroup{.sequence_ = sequence,
                                .snapshot_ = std::move(*decoded)};
       },
-      limiter, diagnostics);
+      limiter, false, diagnostics);
 }
 
 Task<absl::StatusOr<HashValue>> StorageEngine::Impl::LoadGroupedHashValue(
@@ -374,7 +374,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ReadGroupedHashResult(
             return absl::DataLossError(result.status().message());
           return result;
         },
-        limiter, diagnostics);
+        limiter, false, diagnostics);
   };
   struct Selection {
     GroupedRecordId id_;
