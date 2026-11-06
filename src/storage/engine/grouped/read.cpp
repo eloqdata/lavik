@@ -149,6 +149,8 @@ Task<absl::StatusOr<Result>> StorageEngine::Impl::LoadHashGroup(
     // Only the concrete group's physical record joins on its block owner.
     // The root may publish unrelated groups while this record is unchanged;
     // every caller retains its own locks, view and post-I/O envelope checks.
+    // Mutation planners also consume these immutable snapshots, then edit
+    // owned outputs; sharing never grants mutable access to the DMA payload.
     absl::StatusOr<LoadedValue> loaded;
     if (location.external()) {
       loaded = co_await LoadExternalValueLocal(store, location, extents, true,

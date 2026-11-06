@@ -90,8 +90,11 @@ unrelated root publication does not split that physical identity. The key owner
 retains its own lock and immutable routing view, checks population and envelope
 identity after every delivery, and follows same-mutation relocation through the
 existing refresh protocol. Sharing bytes never shares another caller's logical
-success. Foreign result destruction returns a generation-fenced ticket to the
-buffer owner; only that owner updates reference state. External/chunked reads
+success. Snapshot consumers include mutation planners, which retain their
+existing locks and edit owned decoded or re-encoded outputs; the physical
+payload remains immutable. Foreign result destruction returns a
+generation-fenced ticket to the buffer owner; only that owner updates reference
+state. External/chunked reads
 retain their assembly path, and exhausted sharing capacity uses ordinary arena
 admission under the existing per-owner read windows. Completed records are not
 cached.
