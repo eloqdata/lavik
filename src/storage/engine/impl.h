@@ -2725,6 +2725,8 @@ class StorageEngine::Impl {
   // group_locked requires IS plus S on every accessed member/ordered group;
   // previous is the common logical cut captured after acquiring those holds.
   // Its aggregate counts may outlive unrelated root publications.
+  // locked_rank_score reuses a completed member lookup, including a miss,
+  // while its member S hold remains owned. It must outlive the awaited task.
   Task<absl::StatusOr<SortedSetResult>> ExecuteGroupedSortedSetLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -2732,8 +2734,8 @@ class StorageEngine::Impl {
       TxShardWrites* tx, ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition = nullptr,
       PreparedOrderedMutation* prepared = nullptr,
-      SortedSetOrderedProbe* ordered_probe = nullptr,
-      bool group_locked = false);
+      SortedSetOrderedProbe* ordered_probe = nullptr, bool group_locked = false,
+      const std::optional<double>* locked_rank_score = nullptr);
 
   // Caller holds key IX and database admission. A disengaged result requests
   // one X retry after releasing all groups and IX; errors are never retried.

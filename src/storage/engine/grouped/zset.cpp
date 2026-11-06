@@ -1470,9 +1470,11 @@ StorageEngine::Impl::TryConcurrentSortedSetPageRead(
       return ReadGroupedSortedSetRandom(store, partition, db_id, key, digest,
                                         operation, current, random.draws_,
                                         std::move(random_result), true);
-    return ExecuteGroupedSortedSetLocked(store, partition, db_id, key, digest,
-                                         operation, current, nullptr, nullptr,
-                                         nullptr, nullptr, nullptr, true);
+    return ExecuteGroupedSortedSetLocked(
+        store, partition, db_id, key, digest, operation, current, nullptr,
+        nullptr, nullptr, nullptr, nullptr, true,
+        operation.kind_ == SortedSetOperationKind::kRank ? &member_score
+                                                         : nullptr);
   }();
   if (!read.ok()) {
     if (EffectiveRecordDbEpoch(partition, db_id) !=
@@ -2712,7 +2714,9 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     TxShardWrites* tx, ReplicationCommandAppend* replication,
     const MutationPrecondition* mutation_precondition,
     PreparedOrderedMutation* prepared, SortedSetOrderedProbe* ordered_probe,
-    bool group_locked) {
+    bool group_locked, const std::optional<double>* locked_rank_score) {
+  assert(locked_rank_score == nullptr ||
+         (group_locked && operation.kind_ == SortedSetOperationKind::kRank));
   if (!object || !object->is_ordered() ||
       object->ordered_directory().root().kind_ !=
           OrderedCollectionKind::kSortedSet)
@@ -2726,11 +2730,16 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
     co_return co_await ScanGroupedSortedSetMembers(
         store, partition, db_id, key, digest, operation, std::move(object),
         group_locked);
-  auto input_admission = ReserveInputs(operation);
-  if (!input_admission.ok()) co_return input_admission.status();
+  MemoryReservation input_admission;
   Members members;
-  auto status = PrepareMembers(operation, &members);
-  if (!status.ok()) co_return status;
+  absl::Status status;
+  if (locked_rank_score == nullptr) {
+    auto reserved = ReserveInputs(operation);
+    if (!reserved.ok()) co_return reserved.status();
+    input_admission = std::move(*reserved);
+    status = PrepareMembers(operation, &members);
+    if (!status.ok()) co_return status;
+  }
   const auto& directory = object->ordered_directory();
   const auto& metadata = directory.groups();
   SortedSetResult result;
@@ -3518,7 +3527,7 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   }
   std::size_t remaining_sources = 0;
   std::optional<SortedSetMemberProbe> member_probe;
-  {
+  if (locked_rank_score == nullptr) {
     // Prefix routing retains only per-group metadata. Exact members and
     // scores are decoded from the selected Hash leaves, never trusted from
     // a digest alone. Batch requests read each selected leaf just once.
@@ -3689,7 +3698,11 @@ StorageEngine::Impl::ExecuteGroupedSortedSetLocked(
   }
   if (operation.kind_ == SortedSetOperationKind::kRank) {
     const auto member = operation.members_.front();
-    const auto score = members.at(member).before_;
+    // The member S hold spans routing, ordered-lock waits and projection, so
+    // its score (or absence) cannot change. Rank still uses the final common
+    // directory below because unrelated pages may have changed their counts.
+    const auto score =
+        locked_rank_score ? *locked_rank_score : members.at(member).before_;
     if (!score) co_return result;
     // Locate one page by its maximum (score, member), then use Fenwick for
     // the skipped prefix without loading the intervening equal-score pages.
