@@ -58,18 +58,23 @@ enum class TraceStage : std::uint8_t {
 class TraceSpanScope {
  public:
   TraceSpanScope(OnlineLatencyTrace* trace, TraceStage stage) noexcept {
-    if (trace) Begin(trace, stage);
+    if (trace) [[unlikely]]
+      Begin(trace, stage);
   }
   TraceSpanScope(const TraceSpanScope&) = delete;
   TraceSpanScope& operator=(const TraceSpanScope&) = delete;
   ~TraceSpanScope() { End(); }
   void End() noexcept {
-    if (recorder_) Finish();
+    if (recorder_) [[unlikely]]
+      Finish();
   }
 
  private:
-  void Begin(OnlineLatencyTrace* trace, TraceStage stage) noexcept;
-  void Finish() noexcept;
+  // Sampling is exceptional on request paths. Keep clock reads and recording
+  // out of those instruction streams even when the caller is built with LTO.
+  [[gnu::cold, gnu::noinline]] void Begin(OnlineLatencyTrace* trace,
+                                          TraceStage stage) noexcept;
+  [[gnu::cold, gnu::noinline]] void Finish() noexcept;
   void* recorder_ = nullptr;
   // Only the sampled path initializes or reads these fields.
   std::uint64_t start_ns_;
