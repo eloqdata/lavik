@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -107,7 +108,7 @@ class ReadFlightRegistry {
   // After backend quiescence and the all-worker frame-reclamation barrier only.
   // No callbacks, traces, wakeups or maintenance notifications are emitted.
   void FinalizeQuiesced() noexcept;
-  std::size_t size() const noexcept { return map_.size(); }
+  std::size_t size() const noexcept { return active_; }
   std::size_t map_allocations() const noexcept { return allocations_.calls; }
   const ReadFlightStats& stats() const noexcept { return stats_; }
 
@@ -160,6 +161,8 @@ class ReadFlightRegistry {
       absl::flat_hash_set<ReadFlight*, Hash, Equal, Allocator<ReadFlight*>>;
   ReadFlightRegistry(bycorf::Worker&, RegisteredBufferPool&, void*, ReleasePin,
                      std::size_t capacity);
+  ReadFlight* Find(const ReadFlightKey& key, std::size_t hash) const;
+  void Erase(ReadFlight& flight);
   bool Join(ReadFlight& flight, ReadFlightWaiter& waiter);
   void Attach(ReadFlight& flight, ReadFlightWaiter& waiter);
   void Detach(ReadFlightWaiter& waiter) noexcept;
@@ -178,7 +181,14 @@ class ReadFlightRegistry {
   std::unique_ptr<ReadFlight[]> flights_;
   ReadFlight* free_ = nullptr;
   Allocations allocations_;
+  // Most workers have few simultaneous physical reads. A direct pointer slot
+  // avoids Swiss-table insertion/erasure for the non-colliding case. Collisions
+  // retain the bounded table and full identity comparison; a vacant direct
+  // slot never proves absence while an older colliding producer remains there.
+  static constexpr std::size_t kDirectSlots = 256;
+  std::array<ReadFlight*, kDirectSlots> direct_{};
   Map map_;
+  std::size_t active_ = 0;
   ReadFlightStats stats_;
   bool finalized_ = false;
 };

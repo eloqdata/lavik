@@ -126,13 +126,31 @@ bool ReadFlightRegistry::Join(ReadFlight& flight, ReadFlightWaiter& waiter) {
   return true;
 }
 
+ReadFlight* ReadFlightRegistry::Find(const ReadFlightKey& key,
+                                     std::size_t hash) const {
+  auto* first = direct_[hash & (kDirectSlots - 1)];
+  if (first && first->hash == hash && first->key == key) return first;
+  if (map_.empty()) return nullptr;
+  const auto found = map_.find(Lookup{key, hash});
+  return found == map_.end() ? nullptr : *found;
+}
+
+void ReadFlightRegistry::Erase(ReadFlight& flight) {
+  auto& first = direct_[flight.hash & (kDirectSlots - 1)];
+  if (first == &flight)
+    first = nullptr;
+  else
+    map_.erase(&flight);
+  assert(active_ != 0);
+  --active_;
+}
+
 bool ReadFlightRegistry::TryJoin(const ReadFlightKey& key, std::size_t hash,
                                  ReadFlightWaiter& waiter) {
   assert(!finalized_);
-  const auto found = map_.find(Lookup{key, hash});
-  if (found != map_.end()) {
+  if (auto* found = Find(key, hash)) {
     waiter.known_missing_ = false;
-    return Join(**found, waiter);
+    return Join(*found, waiter);
   }
   waiter.miss_epoch_ = stats_.leaders;
   waiter.known_missing_ = true;
@@ -150,8 +168,8 @@ ReadFlightRegistry::Admission ReadFlightRegistry::Start(
   // A retained miss must not span a full 2^64 producer-insertion cycle.
   // Ordinary unsigned wrap needs only equality and keeps this shortcut valid.
   if (!waiter.known_missing_ || waiter.miss_epoch_ != stats_.leaders) {
-    if (auto found = map_.find(Lookup{key, hash}); found != map_.end()) {
-      return {Join(**found, waiter) ? Outcome::kJoined : Outcome::kBypass};
+    if (auto* found = Find(key, hash)) {
+      return {Join(*found, waiter) ? Outcome::kJoined : Outcome::kBypass};
     }
   }
   if (!free_) {
@@ -162,10 +180,16 @@ ReadFlightRegistry::Admission ReadFlightRegistry::Start(
   auto* flight = free_;
   flight->key = key;
   flight->hash = hash;
-  const auto [it, inserted] = map_.insert(flight);
-  assert(inserted);
-  (void)it;
-  (void)inserted;
+  auto& first = direct_[hash & (kDirectSlots - 1)];
+  if (!first)
+    first = flight;
+  else {
+    const auto [it, inserted] = map_.insert(flight);
+    assert(inserted);
+    (void)it;
+    (void)inserted;
+  }
+  ++active_;
   free_ = flight->next_free;
   flight->active = true;
   flight->lease = std::move(lease);
@@ -207,7 +231,7 @@ void ReadFlightRegistry::Reject(bycorf::IoCompletion* tag,
   auto& flight = *static_cast<ReadFlight*>(tag);
   // Publication and submission never suspend, so rejection has one waiter.
   assert(flight.active && flight.consumers == 1 && !lease.valid() && !owns_pin);
-  map_.erase(&flight);
+  Erase(flight);
   auto* waiter = flight.head;
   waiter->flight_ = nullptr;
   waiter->next_ = nullptr;
@@ -222,8 +246,8 @@ void ReadFlightRegistry::Reject(bycorf::IoCompletion* tag,
 void ReadFlightRegistry::Complete(ReadFlight& flight, int result,
                                   unsigned flags) {
   assert(flight.active);
-  map_.erase(&flight);  // Close joining at physical completion, never at send
-                        // completion.
+  // Close joining at physical completion, never at send completion.
+  Erase(flight);
   if (result >= 0) worker_.RecordStorageReadCompletion(result);
   if (flight.consumers <= 1) {
     auto* waiter = flight.head;
@@ -307,5 +331,7 @@ void ReadFlightRegistry::FinalizeQuiesced() noexcept {
     flight.active = false;
   }
   map_.clear();
+  direct_.fill(nullptr);
+  active_ = 0;
 }
 }  // namespace lavik::storage
