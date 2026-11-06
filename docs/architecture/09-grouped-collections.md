@@ -279,6 +279,13 @@ IO. Complete score-page counts need no payload holds; lexical queries spanning
 mixed scores protect all ordered pages because there is no lexical directory.
 Ambiguous member boundaries or newly required pages use one whole-key S fallback.
 
+ZRANDMEMBER samples ranks before locking only the selected ordered pages, then
+revalidates the population and routing before projection. ZSCAN locks the member
+leaves covering its cursor/count window; MATCH does not narrow the examination
+window. When the persisted member seed differs from the public cursor seed,
+the compatibility scan protects all ordered pages. Both retain their selected
+S holds through the complete reply and allow unrelated groups to publish.
+
 ## Durable graph and publication
 
 A small keyed root and auxiliary keyed group records preserve the user-visible
