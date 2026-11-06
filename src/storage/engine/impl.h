@@ -3792,8 +3792,13 @@ class StorageEngine::Impl {
   void ReleaseFlushedStagingBuffer(WorkerStore& store, BlockState& state,
                                    std::uint64_t block_id);
 
+  // Sharing is an explicit immutable-consumer contract. Maintenance and
+  // mutation preparation retain exclusive DMA/assembly ownership by default.
+  enum class ReadSharing { kExclusive, kImmutable };
+  ReadFlightRegistry* ReadFlights(WorkerStore& store);
+
   struct LoadedValue {
-    ReadBufferLease lease_;
+    ReadResultBuffer lease_;
     std::size_t value_offset_ = 0;
     std::size_t value_bytes_ = 0;
     // The physical record tag is needed by defrag when it republishes a
@@ -3807,7 +3812,7 @@ class StorageEngine::Impl {
     absl::Status MakeOwned(RegisteredBufferPool& pool);
 
     std::span<const std::byte> value() const noexcept {
-      const std::span<std::byte> buffer = lease_.bytes();
+      const auto buffer = lease_.bytes();
       if (value_offset_ > buffer.size() ||
           value_bytes_ > buffer.size() - value_offset_) {
         return {};
@@ -3821,7 +3826,7 @@ class StorageEngine::Impl {
   // logical reads and oversized-allocation fallback use a lazy helper Task.
   // Local mode returns stale-location errors to its caller, while logical mode
   // resolves same-mutation relocations before returning.
-  class LoadValueAwaitable final : public bycorf::OneShotIoAwaitable,
+  class LoadValueAwaitable final : public ReadFlightWaiter,
                                    private bycorf::RemoteWork {
    public:
     using Result = absl::StatusOr<LoadedValue>;
@@ -3830,14 +3835,18 @@ class StorageEngine::Impl {
                        std::uint8_t db_id, std::string_view key,
                        const Digest& digest, RecordLocation location,
                        ExtentManifest extents, ReadLatencyTrace* trace,
-                       GroupedObject::Handle grouped_snapshot);
+                       GroupedObject::Handle grouped_snapshot,
+                       ReadSharing sharing);
     LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
                        std::string_view key, RecordLocation location,
                        std::uint64_t replication_epoch, ReadLatencyTrace* trace,
-                       std::optional<std::uint64_t> expected_db_epoch);
+                       std::optional<std::uint64_t> expected_db_epoch,
+                       ReadSharing sharing);
     ~LoadValueAwaitable();
 
-    bool await_ready() const noexcept { return ready_ && !slow_.valid(); }
+    bool await_ready() const noexcept {
+      return (ready_ || flight_completed()) && !slow_.valid();
+    }
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> awaiting);
     Result await_resume();
     void Complete(bycorf::Worker& worker, int result, unsigned flags) override;
@@ -3853,6 +3862,11 @@ class StorageEngine::Impl {
     };
 
     void PrepareLocal();
+    ReadFlightKey FlightKey() const;
+    void Joined();
+    void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer buffer,
+                     int result, unsigned flags) override;
+    void FinishCompletion(bycorf::Worker& worker, int result, unsigned flags);
     void FinishBufferWait();
     static void BufferReady(bycorf::RemoteWork* work);
     std::coroutine_handle<> SuspendRead(std::coroutine_handle<> awaiting);
@@ -3878,6 +3892,11 @@ class StorageEngine::Impl {
     std::size_t read_bytes_ = 0;
     std::uint8_t db_id_;
     BlockState* pinned_ = nullptr;
+    ReadSharing sharing_;
+    ReadFlightRegistry* flights_ = nullptr;
+    std::size_t flight_hash_ = 0;
+    std::uint64_t population_generation_ = 0;
+    ReadResultBuffer completed_buffer_;
     std::optional<Payload> payload_;
     std::optional<Result> ready_;
     // Runtime shutdown drains I/O before destroying suspended frames. The
@@ -4334,12 +4353,14 @@ class StorageEngine::Impl {
       WorkerStore& store, RecordIndex& index, const Digest& digest,
       std::string_view key, const RecordLocation& verified_location);
 
-  LoadValueAwaitable LoadValue(
-      WorkerStore& key_store, WorkerStore::PartitionStore& partition,
-      std::uint8_t db_id, std::string_view key, const Digest& digest,
-      RecordLocation location, ExtentManifest extents,
-      ReadLatencyTrace* trace = nullptr,
-      GroupedObject::Handle grouped_snapshot = nullptr);
+  LoadValueAwaitable LoadValue(WorkerStore& key_store,
+                               WorkerStore::PartitionStore& partition,
+                               std::uint8_t db_id, std::string_view key,
+                               const Digest& digest, RecordLocation location,
+                               ExtentManifest extents,
+                               ReadLatencyTrace* trace = nullptr,
+                               GroupedObject::Handle grouped_snapshot = nullptr,
+                               ReadSharing sharing = ReadSharing::kExclusive);
 
   // Used only for multi-step reads or an aborted direct read. A supplied
   // failure enters relocation resolution without reading the stale bytes again.
@@ -4347,7 +4368,8 @@ class StorageEngine::Impl {
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, Digest digest,
       RecordLocation location, ExtentManifest extents, ReadLatencyTrace* trace,
-      std::optional<absl::Status> failure = std::nullopt);
+      std::optional<absl::Status> failure = std::nullopt,
+      ReadSharing sharing = ReadSharing::kExclusive);
 
   // The synchronous decoder must consume its checked payload before the
   // lease and optional owner permit are released, or move the owning lease
@@ -4420,7 +4442,8 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       ReadLatencyTrace* trace = nullptr,
-      std::optional<std::uint64_t> expected_db_epoch = std::nullopt);
+      std::optional<std::uint64_t> expected_db_epoch = std::nullopt,
+      ReadSharing sharing = ReadSharing::kExclusive);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {

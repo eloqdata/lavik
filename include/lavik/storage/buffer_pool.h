@@ -151,6 +151,13 @@ class ReadResultBuffer {
 
   bool valid() const noexcept { return data_ != nullptr; }
   bool shared() const noexcept { return (return_ticket_ & kSharedBit) != 0; }
+  // Shared results and exclusive DMA ranges both retain finite arena capacity.
+  // Heap assembly outputs do not; mutators must detach arena-backed views
+  // before awaiting another operation that may need the same arena.
+  bool retains_read_arena() const noexcept {
+    return valid() && (shared() || (return_ticket_ &
+                                    ReadBufferLease::kOutputTokenBit) == 0);
+  }
   std::span<const std::byte> bytes() const noexcept { return {data_, size_}; }
   // Checked writable view for exclusive framing. Shared handles always return
   // an empty span, including in release builds; ownership stays in this handle.

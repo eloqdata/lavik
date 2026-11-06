@@ -780,10 +780,13 @@ whole-value callbacks exceeding the bounded inline workspace also retain the
 owner's scratch-admission path. Index misses use the same transaction and
 population admission checks.
 
-Eligible single-chunk remote payload reads join a bounded in-flight registry
-owned by their connection worker. Exact physical record identity and population
-fences determine sharing; workers never share a registry or route these reads
-to the key owner. The producer owns its pin, DMA buffer and stable completion
+Eligible single-chunk immutable reads join a bounded in-flight registry on the
+actual submitting worker. Remote compact reads use their connection worker;
+ordinary GET and read-only compact owner calls use the physical block owner,
+including after relocation retry. Staging, chunked assembly, mutation preparation
+and maintenance retain exclusive paths. Exact physical record identity and
+population fences determine sharing; workers never share a registry. Remote
+compact reads do not add a key-owner hop. The producer owns its pin, DMA buffer and stable completion
 object independently of request frames. Cancellation detaches a waiter without
 cancelling that producer. Completion removes the entry before waking consumers,
 so the registry never caches completed results. Every consumer validates its own
