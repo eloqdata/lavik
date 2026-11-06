@@ -254,8 +254,11 @@ into the latest root after append resource waits, then allocate a revision and
 stage the complete batch without yielding. The current predecessor decision
 remains a recovery dependency. Splits, demotion, final-field deletion and plans
 exceeding one append range release their groups and IX before one key-X retry.
-Compact values, full projections, random operations and externally locked
-commands retain their whole-key paths.
+Bounded HRANDFIELD/SRANDMEMBER acquire shared holds on sampled leaves; sparse SPOP
+uses exclusive holds and the same count-delta publication. Sampling validates
+its cardinality view after lock waits, falling back once to the whole-key path
+if another publication invalidated the selected ranks. Compact values, full
+projections and externally locked commands retain their whole-key paths.
 
 Standalone ZADD, ZREM and ZINCRBY inspect owner-local key state
 without suspension to choose IX for an existing grouped Sorted Set, then
@@ -421,8 +424,8 @@ the minimum remaining primary payload using locked page contents and the
 headers of untouched pages, whose retirement requires key X. Hash/Set batches
 recheck their merged byte total after resource waits and request key X if
 disjoint removals make demotion or final-field deletion necessary.
-Full-image, promotion and random Set-pop adapters retain
-their separate preparation paths and share the same publication boundary.
+Full-image and promotion adapters retain their separate preparation paths
+and share the same publication boundary.
 
 Ordinary single-key creation prepares initial pages without worker store state,
 including the Sorted Set member graph. Private plans own their scratch admission

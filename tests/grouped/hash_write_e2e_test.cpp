@@ -595,6 +595,220 @@ TEST(GroupedSetIntentE2e, RetryDiscardsPreviousIncarnationReplicationTTL) {
   CheckHashLikeRetryReplication(true);
 }
 
+// Observe the sampled leaf rather than seeding the RNG. The test stays
+// deterministic for every draw and proves disjoint IO can finish while the
+// selected payload is still paused and its conflicting command is waiting.
+void CheckHashLikeSampling(bool set, bool pop) {
+  PrivateDisk disk;
+  const std::string key = "hash-like-sampling";
+  constexpr unsigned count = 1024;
+  auto field = [](unsigned i) {
+    return "sample-" + std::to_string(i) + std::string(128, 'f');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{set ? "SADD" : "HSET", key};
+    for (unsigned i = 0; i < count; ++i) {
+      seed.push_back(field(i));
+      if (!set) seed.push_back("old");
+    }
+    ASSERT_EQ(client.Command(seed).text_, std::to_string(count));
+    client.Durable();
+  }
+  const auto layout = InspectHashLayout(disk, key);
+  ASSERT_GT(layout.leaves_.size(), 2);
+  std::string removed, sampled;
+  {
+    const std::string gate = disk.path() + ".sample-gate";
+    std::ofstream(gate).put('1');
+    ScopedEnvironment pause_key("LAVIK_HASH_SAMPLE_PAUSE_KEY", key.c_str());
+    ScopedEnvironment pause_file("LAVIK_HASH_SAMPLE_PAUSE_FILE", gate.c_str());
+    Server server(disk, 1);
+    std::future<Reply> first, disjoint, conflict;
+    absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+    first = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      if (pop) return client.Command({"SPOP", key, "1"});
+      if (set) return client.Command({"SRANDMEMBER", key, "1"});
+      return client.Command({"HRANDFIELD", key, "1", "WITHVALUES"});
+    });
+    bool held = false;
+    for (unsigned i = 0; i < 200; ++i) {
+      held = server.Log().find("hash sample groups held before page IO") !=
+             std::string::npos;
+      if (held) break;
+      std::this_thread::sleep_for(25ms);
+    }
+    ASSERT_TRUE(held) << server.Log();
+    const auto log = server.Log();
+    const std::string prefix_marker = "hash sample group held prefix=";
+    const auto offset = log.find(prefix_marker);
+    ASSERT_NE(offset, std::string::npos);
+    const auto bits = log.find(" bits=", offset);
+    ASSERT_NE(bits, std::string::npos);
+    const GroupedRecordId selected{
+        std::stoull(log.substr(offset + prefix_marker.size())),
+        static_cast<std::uint8_t>(std::stoul(log.substr(bits + 6)))};
+    std::string same;
+    for (unsigned i = 0; i < count && (same.empty() || removed.empty()); ++i) {
+      auto name = field(i);
+      const auto hash = ComputeDigest(name, layout.root_.seed_).value_;
+      if (selected.ContainsHash(hash))
+        same = name;
+      else
+        removed = name;
+    }
+    ASSERT_FALSE(same.empty());
+    ASSERT_FALSE(removed.empty());
+    disjoint = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      return client.Command({set ? "SREM" : "HDEL", key, removed});
+    });
+    ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+    ASSERT_EQ(disjoint.get().text_, "1");
+    conflict = std::async(std::launch::async, [&] {
+      Client client(server.port());
+      if (pop) return client.Command({"SISMEMBER", key, same});
+      if (set) return client.Command({"SREM", key, same});
+      return client.Command({"HSET", key, same, "new"});
+    });
+    EXPECT_EQ(conflict.wait_for(100ms), std::future_status::timeout);
+    ::unlink(gate.c_str());
+    ASSERT_EQ(first.wait_for(5s), std::future_status::ready) << server.Log();
+    const auto reply = first.get();
+    ASSERT_EQ(reply.kind_, '*') << reply.text_ << server.Log();
+    ASSERT_EQ(reply.items_.size(), set ? 1 : 2);
+    sampled = reply.items_[0].text_;
+    EXPECT_TRUE(selected.ContainsHash(
+        ComputeDigest(sampled, layout.root_.seed_).value_));
+    if (!set) EXPECT_EQ(reply.items_[1].text_, "old");
+    ASSERT_EQ(conflict.wait_for(5s), std::future_status::ready) << server.Log();
+    const auto conflicting = conflict.get();
+    EXPECT_EQ(conflicting.kind_, ':') << conflicting.text_;
+    EXPECT_EQ(conflicting.text_,
+              pop ? (sampled == same ? "0" : "1") : (set ? "1" : "0"));
+    Client client(server.port());
+    EXPECT_EQ(client.Command({set ? "SCARD" : "HLEN", key}).text_,
+              std::to_string(count - (set ? 2 : 1)));
+    if (pop) EXPECT_EQ(client.Command({"SISMEMBER", key, sampled}).text_, "0");
+    client.Durable();
+  }
+  Server recovered(disk, 2);
+  Client client(recovered.port());
+  EXPECT_EQ(client.Command({set ? "SCARD" : "HLEN", key}).text_,
+            std::to_string(count - (set ? 2 : 1)));
+  EXPECT_EQ(client.Command({set ? "SISMEMBER" : "HEXISTS", key, removed}).text_,
+            "0");
+  if (pop) EXPECT_EQ(client.Command({"SISMEMBER", key, sampled}).text_, "0");
+}
+
+TEST(GroupedHashSetSamplingE2e, HashReadProtectsSelectedLeaves) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeSampling(false, false);
+}
+
+TEST(GroupedHashSetSamplingE2e, SetReadProtectsSelectedLeaves) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeSampling(true, false);
+}
+
+TEST(GroupedHashSetSamplingE2e, SetPopMergesWithDisjointDeletionAndRecovers) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  CheckHashLikeSampling(true, true);
+}
+
+TEST(GroupedHashSetSamplingE2e, ChangedRankViewFallsBackAfterGroupWait) {
+#if !LAVIK_TEST_FAULTS_AVAILABLE
+  GTEST_SKIP() << "requires a deterministic group-lock pause";
+#endif
+  PrivateDisk disk;
+  const std::string key = "hash-sample-rank-wait";
+  constexpr unsigned count = 1024;
+  auto field = [](unsigned i) {
+    return "rank-" + std::to_string(i) + std::string(128, 'f');
+  };
+  {
+    Server server(disk, 1);
+    Client client(server.port());
+    std::vector<std::string> seed{"HSET", key};
+    for (unsigned i = 0; i < count; ++i)
+      seed.insert(seed.end(), {field(i), "old"});
+    ASSERT_EQ(client.Command(seed).text_, std::to_string(count));
+    client.Durable();
+  }
+  const auto layout = InspectHashLayout(disk, key);
+  ASSERT_GT(layout.leaves_.size(), 2);
+  const auto first_leaf =
+      *std::min_element(layout.leaves_.begin(), layout.leaves_.end());
+  std::string blocked, removed;
+  for (unsigned i = 0; i < count && (blocked.empty() || removed.empty()); ++i) {
+    const auto name = field(i);
+    if (first_leaf.ContainsHash(ComputeDigest(name, layout.root_.seed_).value_))
+      blocked = name;
+    else
+      removed = name;
+  }
+  ASSERT_FALSE(blocked.empty());
+  ASSERT_FALSE(removed.empty());
+  const std::string gate = disk.path() + ".rank-gate";
+  std::ofstream(gate).put('1');
+  ScopedEnvironment pause_key("LAVIK_HASH_GROUP_PAUSE_KEY", key.c_str());
+  ScopedEnvironment pause_field("LAVIK_HASH_GROUP_PAUSE_FIELD",
+                                blocked.c_str());
+  ScopedEnvironment pause_file("LAVIK_HASH_GROUP_PAUSE_FILE", gate.c_str());
+  Server server(disk, 1);
+  std::future<Reply> writer, reader, disjoint;
+  absl::Cleanup release = [&] { ::unlink(gate.c_str()); };
+  writer = std::async(std::launch::async, [&] {
+    Client client(server.port());
+    return client.Command({"HSET", key, blocked, "new"});
+  });
+  bool held = false;
+  for (unsigned i = 0; i < 200; ++i) {
+    held = server.Log().find("hash group locks held before page IO") !=
+           std::string::npos;
+    if (held) break;
+    std::this_thread::sleep_for(25ms);
+  }
+  ASSERT_TRUE(held) << server.Log();
+  reader = std::async(std::launch::async, [&] {
+    Client client(server.port());
+    // Selecting every rank guarantees a wait on the first group, with no
+    // earlier group held that could accidentally serialize the disjoint edit.
+    return client.Command(
+        {"HRANDFIELD", key, std::to_string(count), "WITHVALUES"});
+  });
+  EXPECT_EQ(reader.wait_for(100ms), std::future_status::timeout);
+  disjoint = std::async(std::launch::async, [&] {
+    Client client(server.port());
+    return client.Command({"HDEL", key, removed});
+  });
+  ASSERT_EQ(disjoint.wait_for(3s), std::future_status::ready) << server.Log();
+  ASSERT_EQ(disjoint.get().text_, "1");
+  ::unlink(gate.c_str());
+  ASSERT_EQ(writer.wait_for(5s), std::future_status::ready) << server.Log();
+  ASSERT_EQ(writer.get().text_, "0");
+  ASSERT_EQ(reader.wait_for(5s), std::future_status::ready) << server.Log();
+  const auto reply = reader.get();
+  ASSERT_EQ(reply.kind_, '*') << reply.text_;
+  ASSERT_EQ(reply.items_.size(), 2 * (count - 1));
+  std::set<std::string> seen;
+  for (std::size_t i = 0; i < reply.items_.size(); i += 2) {
+    const auto& name = reply.items_[i].text_;
+    EXPECT_NE(name, removed);
+    EXPECT_TRUE(seen.insert(name).second);
+    EXPECT_EQ(reply.items_[i + 1].text_, name == blocked ? "new" : "old");
+  }
+  EXPECT_TRUE(seen.contains(blocked));
+}
+
 TEST(GroupedSetIntentE2e, WritesMergeDisjointCountsAndWakeConflicts) {
 #if !LAVIK_TEST_FAULTS_AVAILABLE
   GTEST_SKIP() << "requires a deterministic group-lock pause";
@@ -2465,6 +2679,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
+  // Discovery lists cases without starting a server or entering a fixture.
+  if (GTEST_FLAG_GET(list_tests)) return RUN_ALL_TESTS();
   if (argc != 2) return 2;
   grouped_e2e::server_binary = argv[1];
   return RUN_ALL_TESTS();

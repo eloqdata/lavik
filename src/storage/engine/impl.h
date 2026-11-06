@@ -2572,8 +2572,9 @@ class StorageEngine::Impl {
       const HashOperation& operation, ValueType value_type,
       ReplicationCommandAppend* replication,
       const MutationPrecondition* mutation_precondition);
-  // With retry_exclusive, the caller holds IS/IX and all selected groups;
-  // true certifies that no mutation was staged and permits a whole-key retry.
+  // With retry_exclusive, the caller holds IS/IX and point/scan leaf holds;
+  // sampling acquires its leaves internally. True certifies that no mutation
+  // was staged and permits a whole-key retry after releasing group holds.
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, ValueType value_type,
@@ -2845,13 +2846,17 @@ class StorageEngine::Impl {
       bool with_values = false, bool packed_output = false,
       OnlineLatencyTrace* diagnostics = nullptr);
 
+  // Under IS/IX, retry_exclusive makes the adapter acquire selected leaves
+  // itself with store state released. A changed rank view or structural pop
+  // releases those holds before requesting one whole-key retry.
   Task<absl::StatusOr<HashResult>> ExecuteGroupedHashRandomLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, GroupedObject::Handle object,
       ValueType value_type, TxShardWrites* tx,
       ReplicationCommandAppend* replication,
-      const MutationPrecondition* mutation_precondition = nullptr);
+      const MutationPrecondition* mutation_precondition = nullptr,
+      bool* retry_exclusive = nullptr);
   Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                            std::string_view key,
                                            const Digest& digest);

@@ -409,8 +409,9 @@ cmake --build bld-clang18-debug --target lavik lavik_grouped_hash_write_e2e_test
 ctest --test-dir bld-clang18-debug -R '^lavik_grouped_(hash|ordered)_write_e2e($|\.)' --output-on-failure
 ```
 
-The ordered write executable registers each GoogleTest case with CTest under
-the `lavik_grouped_ordered_write_e2e.` prefix, including parameterized cases.
+The Hash and ordered write executables register each GoogleTest case with
+CTest under the `lavik_grouped_hash_write_e2e.` and
+`lavik_grouped_ordered_write_e2e.` prefixes, including parameterized cases.
 Each case has a five-minute deadline and runs serially on its host. CI can
 distribute the cases across its isolated runners; newly added cases are
 discovered automatically. The opt-in large RDB stress invocation below remains

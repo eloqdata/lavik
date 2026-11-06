@@ -44,6 +44,8 @@ bool HasGroupLockPlan(HashOperationKind kind) {
     case HashOperationKind::kStringLength:
     case HashOperationKind::kLength:
     case HashOperationKind::kScan:
+    case HashOperationKind::kRandomFields:
+    case HashOperationKind::kPopRandom:
       return true;
     default:
       return false;
@@ -156,6 +158,19 @@ StorageEngine::Impl::TryConcurrentHashLike(
     result.key_exists_ = true;
     result.length_ = object->directory().root().field_count_;
     co_return std::optional(std::move(result));
+  }
+  if (operation.kind_ == HashOperationKind::kRandomFields ||
+      operation.kind_ == HashOperationKind::kPopRandom) {
+    // Sampling determines its leaves from cardinalities, so its adapter owns
+    // selection, group acquisition and post-wait rank validation together.
+    unlock.Unlock();
+    bool retry = false;
+    auto result = co_await ExecuteHashLikeLocked(
+        db_id, key, digest, operation, value_type, nullptr, replication,
+        mutation_precondition, &retry);
+    if (retry) co_return std::nullopt;
+    if (!result.ok()) co_return result.status();
+    co_return std::optional(std::move(*result));
   }
   const bool scan = operation.kind_ == HashOperationKind::kScan;
   const auto count = scan ? std::size_t{1} : operation.fields_.size();
