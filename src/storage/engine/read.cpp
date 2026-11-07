@@ -1980,7 +1980,7 @@ void StorageEngine::Impl::LoadValueAwaitable::Joined() {
   // its own record header and logical population after it is scheduled.
   Unpin();
   lease_.Reset();
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->disk_read_ = true;
     trace_->flight_wait_start_ns_ = trace_->NowNanos();
   }
@@ -2035,7 +2035,8 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   }
   bool chunked = false;
   if (!lease_.valid()) {
-    if (trace_) trace_->buffer_acquire_start_ns_ = trace_->NowNanos();
+    if (trace_) [[unlikely]]
+      trace_->buffer_acquire_start_ns_ = trace_->NowNanos();
     auto acquired = store_.buffers_.TryAcquireReadBuffer(read_bytes_);
     if (!acquired.ok() && absl::IsResourceExhausted(acquired.status()) &&
         read_bytes_ <= engine_.direct_io_alignment_) {
@@ -2062,7 +2063,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
     }
     lease_ = std::move(*acquired);
   }
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->buffer_acquired_ns_ = trace_->NowNanos();
     trace_->RecordBuffer(trace_->buffer_acquire_start_ns_,
                          trace_->buffer_acquired_ns_);
@@ -2090,7 +2091,7 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
       ready_.emplace(absl::InternalError("invalid in-memory location"));
       return;
     }
-    if (trace_) {
+    if (trace_) [[unlikely]] {
       trace_->io_submit_ns_ = trace_->buffer_acquired_ns_;
       trace_->io_complete_ns_ = trace_->buffer_acquired_ns_;
     }
@@ -2109,7 +2110,8 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   }
   state->PinLocal();
   pinned_ = state;
-  if (trace_) trace_->disk_read_ = true;
+  if (trace_) [[unlikely]]
+    trace_->disk_read_ = true;
   if (chunked) slow_ = ReadInChunks();
 }
 
@@ -2120,11 +2122,13 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
   // with the same decoder/checksum rules as a single read before publishing it.
   const auto buffer_start = trace_ ? trace_->NowNanos() : 0;
   auto acquired = co_await store_.buffers_.AcquireReadChunk();
-  if (trace_) trace_->RecordBuffer(buffer_start, trace_->NowNanos());
+  if (trace_) [[unlikely]]
+    trace_->RecordBuffer(buffer_start, trace_->NowNanos());
   if (!acquired.ok()) co_return acquired.status();
   ReadBufferLease chunk = std::move(*acquired);
   if (PopulationChanged()) co_return absl::NotFoundError("key not found");
-  if (trace_) trace_->io_submit_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->io_submit_ns_ = trace_->NowNanos();
   for (std::size_t offset = 0; offset < read_bytes_;) {
     auto buffer = chunk.io_buffer();
     buffer.size_ = std::min(buffer.size_, read_bytes_ - offset);
@@ -2139,8 +2143,10 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
               "LAVIK_LATENCY_PAUSE_READ_COMPLETION_FILE");
           if (!delayed.ok()) co_return delayed;
         });
-    if (trace_) trace_->io_complete_ns_ = trace_->NowNanos();
-    if (trace_) trace_->RecordIo(io_start, trace_->io_complete_ns_);
+    if (trace_) [[unlikely]]
+      trace_->io_complete_ns_ = trace_->NowNanos();
+    if (trace_) [[unlikely]]
+      trace_->RecordIo(io_start, trace_->io_complete_ns_);
     if (!read.ok()) co_return read.status();
     store_.worker_->RecordStorageReadCompletion(*read);
     if (*read != buffer.size_)
@@ -2260,7 +2266,8 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
       pinned_ = nullptr;
     }
   }
-  if (trace_) trace_->io_submit_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->io_submit_ns_ = trace_->NowNanos();
   auto status =
       fixed ? store_.worker_->SubmitReadFixed(store_.files_[file_id_], buffer,
                                               aligned_offset_, tag)
@@ -2272,7 +2279,7 @@ std::coroutine_handle<> StorageEngine::Impl::LoadValueAwaitable::SuspendRead(
     pinned_ = pinned;
   }
   if (Suspend(awaiting, status)) return std::noop_coroutine();
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->io_complete_ns_ = trace_->NowNanos();
     trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
   }
@@ -2299,7 +2306,7 @@ void StorageEngine::Impl::LoadValueAwaitable::ReceiveRead(
 
 void StorageEngine::Impl::LoadValueAwaitable::FinishCompletion(
     bycorf::Worker& worker, int bytes, unsigned flags) {
-  if (trace_) {
+  if (trace_) [[unlikely]] {
     trace_->io_complete_ns_ = trace_->NowNanos();
     if (trace_->flight_wait_start_ns_)
       trace_->RecordFlightWait(trace_->flight_wait_start_ns_,
@@ -2404,7 +2411,8 @@ StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
   if (completed_buffer_.valid()) {
     const auto offset =
         static_cast<std::size_t>(value - completed_buffer_.bytes().data());
-    if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
+    if (trace_) [[unlikely]]
+      trace_->decode_done_ns_ = trace_->NowNanos();
     return LoadedValue{std::move(completed_buffer_), offset, payload.bytes_,
                        payload.txid_};
   }
@@ -2413,7 +2421,8 @@ StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
     value = lease_.io_buffer().data_;
   }
   const auto offset = static_cast<std::size_t>(value - lease_.bytes().data());
-  if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
+  if (trace_) [[unlikely]]
+    trace_->decode_done_ns_ = trace_->NowNanos();
   return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
 }
 
