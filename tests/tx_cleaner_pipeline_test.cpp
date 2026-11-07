@@ -587,6 +587,47 @@ TEST_F(TxCleanerPipelineTestPeer,
 }
 
 TEST_F(TxCleanerPipelineTestPeer,
+       ConcurrentReadFlightSnapshotsDoNotShareTotals) {
+  constexpr std::array fields{
+      &ReadFlightStats::leaders,       &ReadFlightStats::joins,
+      &ReadFlightStats::cancellations, &ReadFlightStats::rejected,
+      &ReadFlightStats::table_full,    &ReadFlightStats::waiter_full,
+      &ReadFlightStats::shared_budget};
+  for (unsigned owner = 0; owner < kWorkers; ++owner) {
+    On(owner);
+    auto& store = Store(owner);
+    store.read_flights_ = ReadFlightRegistry::TryCreate(
+        workers_[owner], store.buffers_, nullptr, nullptr, 1);
+    ASSERT_NE(store.read_flights_, nullptr);
+    // Seed distinct historical counts without starting physical IO. Overlapping
+    // collectors on different workers must each receive exactly one copy.
+    auto& stats = const_cast<ReadFlightStats&>(store.read_flights_->stats());
+    for (std::size_t i = 0; i < fields.size(); ++i)
+      stats.*fields[i] = (owner + 1) * (i + 1);
+  }
+  auto metrics = storage_.CollectMetrics();
+  StartTask(metrics, 0);
+  auto diagnostics = storage_.CollectDiagnostics();
+  StartTask(diagnostics, 1);
+  ASSERT_FALSE(metrics.done());
+  ASSERT_FALSE(diagnostics.done());
+  ASSERT_TRUE(PumpUntil([&] { return metrics.done() && diagnostics.done(); }));
+  const auto full = std::move(metrics).TakeResult();
+  const auto info = std::move(diagnostics).TakeResult();
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    EXPECT_EQ(full.diagnostics_.read_flights_.*fields[i], 3 * (i + 1));
+    EXPECT_EQ(info.read_flights_.*fields[i], 3 * (i + 1));
+  }
+  // A new collection starts from zero, and an owner without a registry
+  // contributes zero rather than retaining a previous snapshot's counters.
+  On(1);
+  Store(1).read_flights_.reset();
+  const auto subsequent = Diagnostics();
+  for (std::size_t i = 0; i < fields.size(); ++i)
+    EXPECT_EQ(subsequent.read_flights_.*fields[i], i + 1);
+}
+
+TEST_F(TxCleanerPipelineTestPeer,
        DiagnosticScanYieldsAcrossSlotReuseAndGrowth) {
   On(0);
   auto& slots = Store(0).staging_slots_;
