@@ -274,15 +274,15 @@ clear I/O failure is reported but does not block authoritative record recovery;
 the consumed root still prevents reuse.
 
 With a valid checkpoint, recovery still scans the allocation bitmap and reads
-the two header pages of every remaining allocated block. It reads transaction
-block bodies to reconstruct durable commit evidence, KeyRecord bodies and key
-extents to rebuild UUID state, and extent headers for identity validation. It
-skips ordinary record bodies and group payload reads during startup. Its
-disk work is:
+the two header pages of every remaining allocated block. It reads KeyRecord
+bodies and key extents to rebuild UUID state, and extent headers for identity
+validation. Transaction winners were promoted before checkpoint publication;
+remaining transaction headers are stale activation remnants, which recovery
+durably clears before reusing those slots. It skips ordinary record bodies and
+group payload reads during startup. Its disk work is:
 
 ```text
-O(allocated block headers + checkpoint bytes + KeyRecord/key-extent bytes
-  + transaction block bytes)
+O(allocated block headers + checkpoint bytes + KeyRecord/key-extent bytes)
 ```
 
 Recovery still walks the rebuilt winner indexes once to charge live roots and

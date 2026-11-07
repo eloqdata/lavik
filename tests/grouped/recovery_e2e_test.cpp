@@ -318,6 +318,34 @@ class RecordImage {
     Append({}, {}, RecordHeader{.kind_ = RecordKind::kTxCommit, .txid_ = txid});
   }
 
+  // Retirement clears the allocation bit but deliberately leaves the durable
+  // bytes behind. In this image the retired transaction is above every live
+  // block, so a restarted allocator cannot infer its history from the bitmap.
+  void RetireTransactionBlock() {
+    std::erase(allocated_, records_.at(true).header_.block_id_);
+  }
+
+  void RestoreLegacyTransactionHeader() {
+    const auto& block = records_.at(true);
+    std::array<std::byte, kBlockHeaderBytes> header{};
+    Check(::pread(fd_, header.data(), header.size(),
+                  LocalBlockOffset(block.header_.block_id_)) ==
+              static_cast<ssize_t>(header.size()),
+          "reading reactivated transaction header failed");
+    Check(std::all_of(header.begin(), header.end(),
+                      [](std::byte b) { return b == std::byte{0}; }),
+          "reactivated tail retained its old transaction header");
+    // Also cover checkpoints produced before activation invalidated this
+    // unused ready-pool entry. Restore its former header/body, without changing
+    // the checkpoint's complete live graph or its allocation bitmap.
+    std::array<std::byte, kDirectIoAlignment> page{};
+    EncodeBlockHeader(block.header_, page);
+    WriteAt(fd_, page, LocalBlockOffset(block.header_.block_id_));
+    WriteAt(fd_, block.payload_,
+            LocalBlockOffset(block.header_.block_id_) + kBlockHeaderBytes);
+    Check(::fdatasync(fd_) == 0, "syncing legacy transaction header failed");
+  }
+
   void Finish() {
     for (auto& [tx, block] : records_) {
       std::array<std::byte, kDirectIoAlignment> page{};
@@ -1315,6 +1343,39 @@ TEST(GroupedRecoveryE2e, ObsoleteGroupDoesNotReadAlreadyReclaimedValueExtents) {
   ChildServer server(image);
   EXPECT_EQ(server.Command({"HLEN", "hash"}), ":1");
   EXPECT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
+}
+
+TEST(GroupedRecoveryE2e, CheckpointDoesNotReactivateRetiredTransactionTail) {
+  RecordImage image(64);
+  const GroupedHashRoot root{
+      .incarnation_ = 17, .field_count_ = 1, .group_count_ = 1};
+  image.Group("hash", SingleGroup(), 1);
+  image.Root("hash", root, 1);
+  image.Root("hash", root, 1, 7);
+  image.Commit(7);
+  image.RetireTransactionBlock();
+  image.Finish();
+  {
+    ChildServer server(image, true);
+    ASSERT_EQ(server.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
+    ASSERT_EQ(server.Wait(true), 0) << server.Log();
+    ASSERT_NE(server.Log().find("published shutdown checkpoint generation="),
+              std::string::npos)
+        << server.Log();
+  }
+  image.RestoreLegacyTransactionHeader();
+  ChildServer recovered(image, true);
+  EXPECT_EQ(recovered.Command({"HGET", "hash", "field"}),
+            std::string(128, 'v'));
+  EXPECT_EQ(recovered.Wait(true), 0) << recovered.Log();
+  EXPECT_NE(recovered.Log().find("loaded shutdown checkpoint generation="),
+            std::string::npos)
+      << recovered.Log();
+  // The legacy header must also be gone when startup ignores the optional
+  // checkpoint and reconstructs authoritative records from scratch.
+  ChildServer cold(image);
+  EXPECT_EQ(cold.Command({"HGET", "hash", "field"}), std::string(128, 'v'));
+  EXPECT_EQ(cold.Wait(true), 0) << cold.Log();
 }
 
 TEST(GroupedRecoveryE2e, CheckpointRestoresGroupedGraphAndExternalPayload) {

@@ -153,7 +153,7 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
+Task<absl::Status> StorageEngine::Impl::InvalidateActivatedBlockHeadersLocal(
     std::size_t device_index, std::span<const std::uint64_t> block_ids) {
   if (block_ids.empty()) {
     co_return absl::OkStatus();
@@ -179,7 +179,7 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     if (!written.ok() || *written != kBlockHeaderBytes) {
       status = written.ok()
                    ? absl::Status(absl::StatusCode::kInternal,
-                                  "short recycled-block header invalidation")
+                                  "short activated-block header invalidation")
                    : written.status();
       break;
     }
@@ -198,8 +198,6 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
   const StorageDevice& device = devices_[device_index];
   std::vector<std::uint64_t> activated;
   activated.reserve(kActivationBatchBlocks);
-  std::vector<std::uint64_t> reactivated;
-  reactivated.reserve(kActivationBatchBlocks);
   // Reuse reclaimed blocks before touching new offsets. Besides bounding the
   // physical footprint of sparse file-backed devices under overwrite-heavy
   // workloads, this makes blocks released by replication backlog trimming
@@ -209,7 +207,6 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     const std::uint64_t block_id = allocator.cold_free_.back();
     allocator.cold_free_.pop_back();
     activated.push_back(block_id);
-    reactivated.push_back(block_id);
   }
   while (activated.size() < kActivationBatchBlocks &&
          allocator.next_pristine_ < device.capacity_blocks_) {
@@ -221,12 +218,13 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     co_return absl::OkStatus();
   }
 
-  // A cold block deliberately retains its old header while its bitmap bit is
-  // clear. Invalidate that stale header before making the bit durable again,
-  // otherwise a crash between activation and the writer's first flush could
-  // make recovery accept records from the block's previous allocation.
-  absl::Status invalidated = co_await InvalidateReactivatedBlockHeadersLocal(
-      device_index, reactivated);
+  // The bitmap does not retain a durable high-water mark: after restart, even
+  // offsets beyond next_pristine_ may contain retired records from an earlier
+  // allocation. Invalidate every activated header before persisting its bit,
+  // including unused ready-pool entries. Otherwise recovery (or a shutdown
+  // checkpoint's next startup) can resurrect records absent from runtime state.
+  absl::Status invalidated =
+      co_await InvalidateActivatedBlockHeadersLocal(device_index, activated);
   if (!invalidated.ok()) {
     allocator.failed_ = invalidated;
     LatchRuntimeFailure();

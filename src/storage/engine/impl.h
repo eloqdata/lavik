@@ -4115,7 +4115,7 @@ class StorageEngine::Impl {
                                         DeviceAllocator& allocator,
                                         std::vector<std::size_t> page_indexes);
 
-  Task<absl::Status> InvalidateReactivatedBlockHeadersLocal(
+  Task<absl::Status> InvalidateActivatedBlockHeadersLocal(
       std::size_t device_index, std::span<const std::uint64_t> block_ids);
 
   void MaybeRefillDeviceInBackground(std::size_t device_index,

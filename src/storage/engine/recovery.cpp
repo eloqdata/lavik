@@ -438,6 +438,38 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
 
+      if (block.kind_ == BlockKind::kTransaction &&
+          checkpoint_active_.load(std::memory_order_acquire)) {
+        // Checkpoint publication requires all transaction winners to be
+        // promoted and every transaction block retired. Older allocators could
+        // reactivate a retired tail without invalidating its header. Such
+        // copies cannot contribute winners or decisions to this snapshot;
+        // reclaim them before rebuilding runtime ownership. Failed checkpoint
+        // validation still takes the ordinary transactional recovery path.
+        if (!indirect_key_pass) {
+          // A reusable scan slot keeps its allocation bit set. Clear the old
+          // header durably before publishing that slot, so a later cold boot
+          // cannot resurrect it if no new checkpoint was published.
+          std::fill_n(header_buffer.data_, kBlockHeaderBytes, std::byte{0});
+          auto cleared = co_await WriteStorageBuffer(
+              *store.worker_, store.files_[file_id],
+              std::span<const std::byte>(header_buffer.data_,
+                                         kBlockHeaderBytes),
+              store.buffers_.workspace_registered(header_buffer), header_buffer,
+              block_offset);
+          if (!cleared.ok()) co_return cleared.status();
+          if (*cleared != kBlockHeaderBytes)
+            co_return absl::InternalError(
+                "short stale transaction header write");
+          auto synced =
+              co_await bycorf::Fdatasync(*store.worker_, store.files_[file_id]);
+          if (!synced.ok()) co_return synced;
+          zero_blocks->push_back(block_id);
+          ReportRecoveryProgress(0, /*allocated=*/true);
+        }
+        continue;
+      }
+
       const bool key_or_extent = block.kind_ == BlockKind::kIndirectKeys ||
                                  block.kind_ == BlockKind::kPayloadExtent;
       // Each allocated block reports progress in the pass that consumes it.
