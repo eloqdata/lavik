@@ -729,9 +729,9 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   std::optional<CompactListEdit> compact_edit;
   std::optional<LoadedValue> compact_source;
   if (exists) {
-    auto loaded =
-        co_await LoadValue(store, partition, db_id, key, digest, location,
-                           extents, nullptr, read_trace.get());
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     location, extents, nullptr,
+                                     /*coalesce=*/false, read_trace.get());
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return ListResult{};
       co_return loaded.status();

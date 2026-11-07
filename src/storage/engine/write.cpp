@@ -222,9 +222,10 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetWithLockState(
       co_return WrongTypeError();
     }
     auto read_detail = MakeReadTrace(trace ? trace->diagnostics_ : nullptr);
-    auto loaded = co_await LoadValue(
-        store, partition, db_id, key, digest, MaterializeIndexLocation(*found),
-        ExtentsFor(store, found), nullptr, read_detail.get());
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     MaterializeIndexLocation(*found),
+                                     ExtentsFor(store, found), nullptr,
+                                     /*coalesce=*/false, read_detail.get());
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -358,9 +359,9 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     co_return true;
   }
   auto read_detail = MakeReadTrace(diagnostics);
-  auto loaded =
-      co_await LoadValue(store, partition, db_id, key, digest, previous,
-                         ExtentsFor(store, found), nullptr, read_detail.get());
+  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                   previous, ExtentsFor(store, found), nullptr,
+                                   /*coalesce=*/false, read_detail.get());
   if (!loaded.ok()) {
     co_return loaded.status();
   }

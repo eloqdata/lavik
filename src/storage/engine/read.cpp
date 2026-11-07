@@ -656,9 +656,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     }
 
     lookup_scope.End();
-    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     MaterializeIndexLocation(*found),
-                                     ExtentsFor(store, found), nullptr, trace);
+    auto loaded = co_await LoadValue(
+        store, partition, db_id, key, digest, MaterializeIndexLocation(*found),
+        ExtentsFor(store, found), nullptr, /*coalesce=*/true, trace);
     if (optimistic_read && !loaded.ok() &&
         (loaded.status().code() == absl::StatusCode::kNotFound ||
          loaded.status().code() == absl::StatusCode::kAborted)) {
@@ -1134,8 +1134,9 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   unlock.Unlock();
   lookup_scope.End();
 
-  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                   location, extents, nullptr, detail.get());
+  auto loaded =
+      co_await LoadValue(store, partition, db_id, key, digest, location,
+                         extents, nullptr, /*coalesce=*/false, detail.get());
   if (!loaded.ok()) co_return loaded.status();
   if (store.index_generations_[db_id] != index_generation ||
       DbEpoch(db_id) != db_epoch ||
@@ -1310,7 +1311,7 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
                                    Digest digest, RecordLocation location,
                                    ExtentManifest extents,
                                    std::optional<absl::Status> failure,
-                                   ReadLatencyTrace* trace) {
+                                   bool coalesce, ReadLatencyTrace* trace) {
   assert(!location.grouped());
   // The caller already resolved the key's partition for the index lookup.
   // Reuse it across retries instead of recomputing the Redis slot.
@@ -1339,19 +1340,20 @@ StorageEngine::Impl::LoadValueSlow(WorkerStore& key_store,
       loaded = co_await LoadExternalValueLocal(
           key_store, location, std::move(extents), false, trace);
     } else if (location.block_owner() == key_store.worker_->id()) {
-      loaded = co_await LoadValueLocal(key_store, db_id, key, location,
-                                       replication_epoch, db_epoch, trace);
+      loaded =
+          co_await LoadValueLocal(key_store, db_id, key, location,
+                                  replication_epoch, db_epoch, coalesce, trace);
     } else {
       const unsigned owner = location.block_owner();
       std::string owned_key(key);
       loaded = co_await bycorf::SubmitTaskTo(
           owner,
           [this, owner, db_id, key = std::move(owned_key), location,
-           replication_epoch, db_epoch,
+           replication_epoch, db_epoch, coalesce,
            trace]() mutable -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
                                               location, replication_epoch,
-                                              db_epoch, trace);
+                                              db_epoch, coalesce, trace);
           });
     }
     // Replica reset is partition-wide and does not take each key lock. Reject
@@ -1877,25 +1879,29 @@ StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValue(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     RecordLocation location, ExtentManifest extents,
-    GroupedObject::Handle grouped_snapshot, ReadLatencyTrace* trace) {
+    GroupedObject::Handle grouped_snapshot, bool coalesce,
+    ReadLatencyTrace* trace) {
   return LoadValueAwaitable(*this, store, partition, db_id, key, digest,
                             location, std::move(extents),
-                            std::move(grouped_snapshot), trace);
+                            std::move(grouped_snapshot), coalesce, trace);
 }
 
 StorageEngine::Impl::LoadValueAwaitable StorageEngine::Impl::LoadValueLocal(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    std::optional<std::uint64_t> expected_db_epoch, ReadLatencyTrace* trace) {
+    std::optional<std::uint64_t> expected_db_epoch, bool coalesce,
+    ReadLatencyTrace* trace) {
   return LoadValueAwaitable(*this, store, db_id, key, location,
-                            replication_epoch, expected_db_epoch, trace);
+                            replication_epoch, expected_db_epoch, coalesce,
+                            trace);
 }
 
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     RecordLocation location, ExtentManifest extents,
-    GroupedObject::Handle grouped_snapshot, ReadLatencyTrace* trace)
+    GroupedObject::Handle grouped_snapshot, bool coalesce,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       // Grouped snapshots have their own population/pin protocol.
@@ -1906,7 +1912,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       trace_(trace),
       replication_epoch_(partition.replication_epoch_),
       expected_db_epoch_(engine.EffectiveRecordDbEpoch(partition, db_id)),
-      db_id_(db_id) {
+      db_id_(db_id),
+      coalesce_(coalesce) {
   if (location.grouped()) {
     // The grouped task owns its graph/version protocol. Keep its borrowed
     // digest in this awaitable, not in the constructor's argument lifetime.
@@ -1916,8 +1923,9 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
                                 GroupedValueEncoding::kLogicalStream, trace);
   } else if (location.external() ||
              location.block_owner() != store.worker_->id()) {
-    slow_ = engine.LoadValueSlow(store, partition, db_id, key, digest, location,
-                                 std::move(extents), std::nullopt, trace);
+    slow_ =
+        engine.LoadValueSlow(store, partition, db_id, key, digest, location,
+                             std::move(extents), std::nullopt, coalesce, trace);
   } else {
     PrepareLocal();
     if (ready_ && absl::IsAborted(ready_->status())) Retry(ready_->status());
@@ -1927,7 +1935,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
 StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
     Impl& engine, WorkerStore& store, std::uint8_t db_id, std::string_view key,
     RecordLocation location, std::uint64_t replication_epoch,
-    std::optional<std::uint64_t> expected_db_epoch, ReadLatencyTrace* trace)
+    std::optional<std::uint64_t> expected_db_epoch, bool coalesce,
+    ReadLatencyTrace* trace)
     : engine_(engine),
       store_(store),
       key_(key),
@@ -1935,7 +1944,8 @@ StorageEngine::Impl::LoadValueAwaitable::LoadValueAwaitable(
       trace_(trace),
       replication_epoch_(replication_epoch),
       expected_db_epoch_(expected_db_epoch),
-      db_id_(db_id) {
+      db_id_(db_id),
+      coalesce_(coalesce) {
   PrepareLocal();
 }
 
@@ -1995,11 +2005,13 @@ void StorageEngine::Impl::LoadValueAwaitable::PrepareLocal() {
   record_headroom_ = absolute - aligned_offset_;
   read_bytes_ =
       (record_headroom_ + location_.total_disk_bytes() + mask) & ~mask;
-  // Command intent does not change the immutable source version. Decide
-  // coalescing from its physical range; mutation consumers detach before
-  // writes. Probe before taking scarce DMA capacity. A borrowed staging pointer
-  // is used only synchronously; buffer waiting below resolves it again.
-  auto* candidate = engine_.FindBlockState(store_, location_.block_id());
+  // Bypass callers must not create or probe a registry, even if another read
+  // already has a Flight for this record. Admission survives retries and hops.
+  // Probe before taking scarce DMA capacity. A borrowed staging pointer is
+  // used only synchronously; buffer waiting below resolves it again.
+  auto* candidate = coalesce_
+                        ? engine_.FindBlockState(store_, location_.block_id())
+                        : nullptr;
   const auto* staged =
       candidate && location_.in_memory() && candidate->in_memory_
           ? engine_.StagingFor(store_, *candidate)
@@ -2154,9 +2166,9 @@ StorageEngine::Impl::LoadValueAwaitable::ReadInChunks() {
       chunk.Reset();
       Unpin();
       lease_.Reset();
-      co_return co_await engine_.LoadValueSlow(store_, *partition_, db_id_,
-                                               key_, digest_, location_, {},
-                                               parsed.status(), trace_);
+      co_return co_await engine_.LoadValueSlow(
+          store_, *partition_, db_id_, key_, digest_, location_, {},
+          parsed.status(), coalesce_, trace_);
     }
     co_return parsed.status();
   }
@@ -2179,7 +2191,8 @@ void StorageEngine::Impl::LoadValueAwaitable::Retry(absl::Status failure) {
   // resolves the index before any further I/O and preserves corruption errors
   // when the index still endorses the failed physical record.
   slow_ = engine_.LoadValueSlow(store_, *partition_, db_id_, key_, digest_,
-                                location_, {}, std::move(failure), trace_);
+                                location_, {}, std::move(failure), coalesce_,
+                                trace_);
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::FinishBufferWait() {

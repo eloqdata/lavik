@@ -3832,13 +3832,13 @@ class StorageEngine::Impl {
                        std::uint8_t db_id, std::string_view key,
                        const Digest& digest, RecordLocation location,
                        ExtentManifest extents,
-                       GroupedObject::Handle grouped_snapshot,
+                       GroupedObject::Handle grouped_snapshot, bool coalesce,
                        ReadLatencyTrace* trace);
     LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
                        std::string_view key, RecordLocation location,
                        std::uint64_t replication_epoch,
                        std::optional<std::uint64_t> expected_db_epoch,
-                       ReadLatencyTrace* trace);
+                       bool coalesce, ReadLatencyTrace* trace);
     ~LoadValueAwaitable();
 
     bool await_ready() const noexcept {
@@ -3888,6 +3888,7 @@ class StorageEngine::Impl {
     std::size_t record_headroom_ = 0;
     std::size_t read_bytes_ = 0;
     std::uint8_t db_id_;
+    bool coalesce_;
     BlockState* pinned_ = nullptr;
     ReadFlightRegistry* flights_ = nullptr;
     std::size_t flight_hash_ = 0;
@@ -4349,12 +4350,18 @@ class StorageEngine::Impl {
       WorkerStore& store, RecordIndex& index, const Digest& digest,
       std::string_view key, const RecordLocation& verified_location);
 
+  // coalesce controls Flight admission only, not source mutability. Default
+  // bypass keeps mutation preparation and maintenance off the registry path;
+  // read entry points opt in where overlapping requests can reuse physical IO.
+  // Routing and relocation retain this choice. Actual followers determine
+  // whether the result owns an exclusive buffer or a shared read-only handle.
   LoadValueAwaitable LoadValue(WorkerStore& key_store,
                                WorkerStore::PartitionStore& partition,
                                std::uint8_t db_id, std::string_view key,
                                const Digest& digest, RecordLocation location,
                                ExtentManifest extents,
                                GroupedObject::Handle grouped_snapshot = nullptr,
+                               bool coalesce = false,
                                ReadLatencyTrace* trace = nullptr);
 
   // Used only for multi-step reads or an aborted direct read. A supplied
@@ -4363,7 +4370,7 @@ class StorageEngine::Impl {
       WorkerStore& key_store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, Digest digest,
       RecordLocation location, ExtentManifest extents,
-      std::optional<absl::Status> failure = std::nullopt,
+      std::optional<absl::Status> failure = std::nullopt, bool coalesce = false,
       ReadLatencyTrace* trace = nullptr);
 
   // The synchronous decoder must consume its checked payload before the
@@ -4437,7 +4444,7 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       std::optional<std::uint64_t> expected_db_epoch = std::nullopt,
-      ReadLatencyTrace* trace = nullptr);
+      bool coalesce = false, ReadLatencyTrace* trace = nullptr);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {
