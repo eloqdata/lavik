@@ -2328,7 +2328,25 @@ class StorageEngine::RemoteReadAwaitable {
 
    private:
     friend class RemoteGetTestPeer;
-    ReadFlightKey Key() const;
+    // Expose construction so hash-only callers do not materialize the
+    // comparison fields; full equality still checks every identity fence.
+    [[gnu::always_inline]] ReadFlightKey Key() const {
+      const auto& location = read_.location_;
+      return {.engine = reinterpret_cast<std::uintptr_t>(read_.pin_.engine_),
+              .block = location.block_id(),
+              .allocation_epoch = location.allocation_epoch(),
+              .mutation_sequence = location.mutation_sequence_,
+              .aligned_offset = offset_,
+              .read_bytes = read_.read_bytes_,
+              .db_epoch = read_.db_epoch_,
+              .replication_epoch = read_.replication_epoch_,
+              .population_generation = read_.generation_,
+              .file = file_.index_,
+              .record_offset = location.record_offset(),
+              .record_bytes = location.total_disk_bytes(),
+              .block_owner = static_cast<std::uint16_t>(location.block_owner()),
+              .db = read_.db_id_};
+    }
     void ReceiveRead(bycorf::Worker& worker, ReadResultBuffer&& buffer,
                      int result, unsigned flags) override;
     void FinishTrace();

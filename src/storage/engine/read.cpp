@@ -487,24 +487,6 @@ StorageEngine::RemoteReadAwaitable::TracedReadIo::TracedReadIo(
   if (registry_) hash_ = absl::Hash<ReadFlightKey>{}(Key());
 }
 
-ReadFlightKey StorageEngine::RemoteReadAwaitable::TracedReadIo::Key() const {
-  const auto& location = read_.location_;
-  return {.engine = reinterpret_cast<std::uintptr_t>(read_.pin_.engine_),
-          .block = location.block_id(),
-          .allocation_epoch = location.allocation_epoch(),
-          .mutation_sequence = location.mutation_sequence_,
-          .aligned_offset = offset_,
-          .read_bytes = read_.read_bytes_,
-          .db_epoch = read_.db_epoch_,
-          .replication_epoch = read_.replication_epoch_,
-          .population_generation = read_.generation_,
-          .file = file_.index_,
-          .record_offset = location.record_offset(),
-          .record_bytes = location.total_disk_bytes(),
-          .block_owner = static_cast<std::uint16_t>(location.block_owner()),
-          .db = read_.db_id_};
-}
-
 void StorageEngine::RemoteReadAwaitable::TracedReadIo::Joined() {
   // The matching producer now owns the physical pin. This request retains its
   // own captured logical context and must validate it again after completion.
@@ -2087,23 +2069,6 @@ void StorageEngine::Impl::LoadValueAwaitable::Unpin() {
   auto* state = std::exchange(pinned_, nullptr);
   if (!state) return;
   engine_.UnpinBlock(store_, *state, location_.block_id());
-}
-
-ReadFlightKey StorageEngine::Impl::LoadValueAwaitable::FlightKey() const {
-  return {.engine = reinterpret_cast<std::uintptr_t>(&engine_),
-          .block = location_.block_id(),
-          .allocation_epoch = location_.allocation_epoch(),
-          .mutation_sequence = location_.mutation_sequence_,
-          .aligned_offset = aligned_offset_,
-          .read_bytes = read_bytes_,
-          .db_epoch = expected_db_epoch_.value_or(engine_.DbEpoch(db_id_)),
-          .replication_epoch = replication_epoch_,
-          .population_generation = population_generation_,
-          .file = store_.files_[file_id_].index_,
-          .record_offset = location_.record_offset(),
-          .record_bytes = location_.total_disk_bytes(),
-          .block_owner = static_cast<std::uint16_t>(location_.block_owner()),
-          .db = db_id_};
 }
 
 void StorageEngine::Impl::LoadValueAwaitable::Joined() {
