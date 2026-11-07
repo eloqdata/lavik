@@ -15,6 +15,7 @@
  */
 
 #include "../impl.h"
+#include "absl/cleanup/cleanup.h"
 #include "lavik/error_detail.h"
 #include "lavik/storage/detail/grouped/scratch.h"
 #include "lavik/storage/detail/hash_read.h"
@@ -270,6 +271,45 @@ StorageEngine::Impl::LoadHashGroupPayload(
                                       .field_count_ = field_count};
       },
       nullptr, group_locked, diagnostics);
+}
+
+Task<absl::StatusOr<std::size_t>>
+StorageEngine::Impl::LoadSortedSetMemberScores(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    GroupedObject::Handle object, std::span<HashFieldLookup> requests,
+    std::span<std::optional<double>> scores, GroupReadLimiter* limiter,
+    bool group_locked, OnlineLatencyTrace* diagnostics) {
+  assert(!requests.empty());
+  return LoadHashGroup<std::size_t>(
+      store, partition, db_id, key, digest, std::move(object),
+      requests.front().group_, false,
+      [requests, scores](std::string_view payload, std::uint64_t,
+                         std::uint32_t field_count,
+                         LoadedValue&&) -> absl::StatusOr<std::size_t> {
+        // Scalars occupy disjoint request positions. No borrowed field value
+        // or read lease may survive a child completion, including failure.
+        absl::Cleanup clear = [&] {
+          for (auto& request : requests) request.value_.reset();
+        };
+        if (requests.size() == 1) {
+          auto value =
+              FindHashGroupField(payload, field_count, requests.front().field_);
+          if (!value.ok()) return value.status();
+          requests.front().value_ = *value;
+        } else {
+          auto status = FindHashGroupFields(payload, field_count, requests);
+          if (!status.ok()) return status;
+        }
+        for (const auto& request : requests) {
+          if (!request.value_) continue;
+          auto score = DecodeSortedSetMemberScore(*request.value_);
+          if (!score.ok()) return score.status();
+          scores[request.result_index_] = *score;
+        }
+        return requests.size();
+      },
+      limiter, group_locked, diagnostics);
 }
 
 Task<absl::StatusOr<LoadedHashGroup>>

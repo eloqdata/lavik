@@ -89,6 +89,7 @@ using bycorf::Task;
 using bycorf::Worker;
 
 class GroupReadLimiter;
+struct HashFieldLookup;
 
 // A selected operation owns its mutable physical sidecars. Parallel pages and
 // shards share only the root's worker-local recorder, never these payloads.
@@ -1725,6 +1726,9 @@ class StorageEngine::Impl {
     // Created only by grouped point writers; all access and waiter wakeups
     // stay on this key owner. The store outlives every request lock set.
     std::unique_ptr<GroupedLockTable> group_locks_;
+    // Owner-local count controls optional within-command score-read fanout.
+    // This retains neither decoded data nor completed read buffers.
+    std::size_t active_zset_score_batches_ = 0;
     bycorf::AsyncNotification block_pin_progress_;
     // Only genuinely exhausted foreground allocations wait here. Notification
     // delivery remains on this owner; producers inspect just the atomic count.
@@ -2787,6 +2791,17 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const SortedSetOperation& operation, GroupedObject::Handle object,
       bool group_locked = false);
+
+  Task<absl::StatusOr<SortedSetResult>> ReadGroupedSortedSetSingleScore(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedObject::Handle object,
+      bool group_locked);
+  Task<absl::StatusOr<SortedSetResult>> ReadGroupedSortedSetScoreBatch(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const SortedSetOperation& operation, GroupedObject::Handle object,
+      bool group_locked);
 
   /// Caller retains IS. Member-score reads take all leaf S holds before their
   /// common view and retain them through IO. Nullopt requests whole-key S after
@@ -4399,6 +4414,15 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       GroupedObject::Handle object, GroupedRecordId id, bool pinned = false,
       bool group_locked = false, OnlineLatencyTrace* diagnostics = nullptr);
+  // Requests address one member leaf and distinct reply positions. Decode
+  // scalars into the caller's admitted output before releasing the leaf and
+  // its owner permit; all borrowed storage must outlive every started task.
+  Task<absl::StatusOr<std::size_t>> LoadSortedSetMemberScores(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      GroupedObject::Handle object, std::span<HashFieldLookup> requests,
+      std::span<std::optional<double>> scores, GroupReadLimiter* limiter,
+      bool group_locked, OnlineLatencyTrace* diagnostics);
   Task<absl::StatusOr<LoadedHashGroup>> LoadHashGroupSnapshot(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       std::uint8_t db_id, std::string_view key, const Digest& digest,
