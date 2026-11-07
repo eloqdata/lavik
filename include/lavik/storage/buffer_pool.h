@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -142,12 +143,37 @@ static_assert(sizeof(ReadBufferLease) == 32);
 class ReadResultBuffer {
  public:
   ReadResultBuffer() = default;
-  ReadResultBuffer(ReadBufferLease&& lease) noexcept;
+  // Keep ownership-only moves visible across result wrappers. Empty
+  // intermediates need neither a release call nor an out-of-line destructor.
+  [[gnu::always_inline]] ReadResultBuffer(ReadBufferLease&& lease) noexcept
+      : pool_(std::exchange(lease.pool_, nullptr)),
+        data_(std::exchange(lease.data_, nullptr)),
+        size_(lease.size_),
+        headroom_(lease.headroom_bytes_),
+        return_ticket_(std::exchange(lease.release_token_, 0)) {}
   ReadResultBuffer(const ReadResultBuffer&) = delete;
   ReadResultBuffer& operator=(const ReadResultBuffer&) = delete;
-  ReadResultBuffer(ReadResultBuffer&& other) noexcept;
-  ReadResultBuffer& operator=(ReadResultBuffer&& other) noexcept;
-  ~ReadResultBuffer();
+  [[gnu::always_inline]] ReadResultBuffer(ReadResultBuffer&& other) noexcept
+      : pool_(std::exchange(other.pool_, nullptr)),
+        data_(std::exchange(other.data_, nullptr)),
+        size_(other.size_),
+        headroom_(other.headroom_),
+        return_ticket_(std::exchange(other.return_ticket_, 0)) {}
+  [[gnu::always_inline]] ReadResultBuffer& operator=(
+      ReadResultBuffer&& other) noexcept {
+    if (this != &other) {
+      if (pool_) Reset();
+      pool_ = std::exchange(other.pool_, nullptr);
+      data_ = std::exchange(other.data_, nullptr);
+      size_ = other.size_;
+      headroom_ = other.headroom_;
+      return_ticket_ = std::exchange(other.return_ticket_, 0);
+    }
+    return *this;
+  }
+  [[gnu::always_inline]] ~ReadResultBuffer() {
+    if (pool_) Reset();
+  }
 
   bool valid() const noexcept { return data_ != nullptr; }
   bool shared() const noexcept { return (return_ticket_ & kSharedBit) != 0; }
