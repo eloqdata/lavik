@@ -319,6 +319,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   auto& block = BlockStateAt(location.block_id());
   if (!block.TryRemotePin()) return;
   result.pin_.engine_ = this;
+  result.pin_.owns_ = true;
   result.pin_.block_id_ = location.block_id();
   result.location_ = location;
   if (block.owner_.load(std::memory_order_acquire) != owner ||
@@ -343,6 +344,35 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
                         direct_io_alignment_ - 1) &
                        ~mask;
 
+  ReadFlightRegistry* registry = nullptr;
+  if (result.read_bytes_ <= local.buffers_.preferred_read_payload_bytes()) {
+    if (!local.read_flights_attempted_) [[unlikely]] {
+      local.read_flights_attempted_ = true;
+      local.read_flights_ = ReadFlightRegistry::TryCreate(
+          *local.worker_, local.buffers_, this,
+          [](void* context, std::uint64_t block_id, unsigned owner,
+             bool quiesced) noexcept {
+            auto& engine = *static_cast<Impl*>(context);
+            auto& block = engine.BlockStateAt(block_id);
+            if (quiesced) {
+              // Worker stores can already be gone at the all-worker cleanup
+              // barrier. The block directory survives until the engine dies;
+              // no maintenance notification or waiter wakeup is legal here.
+              const auto old =
+                  block.pins_.fetch_sub(1, std::memory_order_release);
+              assert((old & BlockState::kPinMask) != 0);
+              (void)old;
+            } else {
+              engine.UnpinRemoteBlock(block, owner, block_id);
+            }
+          });
+    }
+    registry = local.read_flights_.get();
+  }
+  result.io_.emplace(result, *local.worker_, local.files_[file_id],
+                     aligned_offset, registry);
+  if (result.io_->TryJoin()) return;
+
   // Admission is only an optimization. If the local arena cannot fit the
   // record immediately, let the owner reader stream it or wait for a chunk.
   if (result.trace_) {
@@ -352,6 +382,7 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
   if (!acquired.ok()) {
     // The owner reader can stream a record through smaller arena ranges.
     // Leave this admission attempt empty so its caller takes that route.
+    result.io_.reset();
     if (absl::IsResourceExhausted(acquired.status())) return;
     result.ready_.emplace(acquired.status());
     return;
@@ -362,68 +393,128 @@ void StorageEngine::Impl::PrepareRemoteRead(RemoteReadAwaitable& result) {
     result.trace_->RecordBuffer(result.trace_->buffer_acquire_start_ns_,
                                 result.trace_->buffer_acquired_ns_);
   }
-  auto buffer = result.lease_.io_buffer();
-  assert(result.read_bytes_ <= buffer.size_);
-  buffer.size_ = result.read_bytes_;
-  result.io_.emplace(*local.worker_, local.files_[file_id], buffer,
-                     aligned_offset,
-                     result.lease_.registered()
-                         ? bycorf::SizeIoAwaitable::Operation::kReadFixed
-                         : bycorf::SizeIoAwaitable::Operation::kRead,
-                     result.trace_);
+  result.io_->SetBuffer();
 }
 
 StorageEngine::RemoteReadAwaitable::TracedReadIo::TracedReadIo(
-    bycorf::Worker& worker, bycorf::FixedFile file, bycorf::FixedBuffer buffer,
-    std::uint64_t offset, bycorf::SizeIoAwaitable::Operation operation,
-    ReadLatencyTrace* trace)
-    : worker_(worker),
+    RemoteReadAwaitable& read, bycorf::Worker& worker, bycorf::FixedFile file,
+    std::uint64_t offset, ReadFlightRegistry* registry)
+    : read_(read),
+      registry_(registry),
+      worker_(worker),
       file_(file),
-      buffer_(buffer),
       offset_(offset),
-      fixed_(operation == bycorf::SizeIoAwaitable::Operation::kReadFixed),
-      trace_(trace) {}
+      trace_(read.trace_) {
+  if (registry_) hash_ = absl::Hash<ReadFlightKey>{}(Key());
+}
+
+ReadFlightKey StorageEngine::RemoteReadAwaitable::TracedReadIo::Key() const {
+  const auto& location = read_.location_;
+  return {.engine = reinterpret_cast<std::uintptr_t>(read_.pin_.engine_),
+          .block = location.block_id(),
+          .allocation_epoch = location.allocation_epoch(),
+          .mutation_sequence = location.mutation_sequence_,
+          .aligned_offset = offset_,
+          .read_bytes = read_.read_bytes_,
+          .db_epoch = read_.db_epoch_,
+          .replication_epoch = read_.replication_epoch_,
+          .population_generation = read_.generation_,
+          .file = file_.index_,
+          .record_offset = location.record_offset(),
+          .record_bytes = location.total_disk_bytes(),
+          .block_owner = static_cast<std::uint16_t>(location.block_owner()),
+          .db = read_.db_id_};
+}
+
+void StorageEngine::RemoteReadAwaitable::TracedReadIo::Joined() {
+  // The matching producer now owns the physical pin. This request retains its
+  // own captured logical context and must validate it again after completion.
+  read_.pin_.Reset();
+  read_.lease_.Reset();
+  if (trace_) [[unlikely]]
+    trace_->flight_wait_start_ns_ = trace_->NowNanos();
+}
+bool StorageEngine::RemoteReadAwaitable::TracedReadIo::TryJoin() {
+  if (!registry_ || !registry_->TryJoin(Key(), hash_, *this)) return false;
+  Joined();
+  return true;
+}
+void StorageEngine::RemoteReadAwaitable::TracedReadIo::SetBuffer() {
+  buffer_ = read_.lease_.io_buffer();
+  assert(read_.read_bytes_ <= buffer_.size_);
+  buffer_.size_ = read_.read_bytes_;
+  fixed_ = read_.lease_.registered();
+}
 
 bool StorageEngine::RemoteReadAwaitable::TracedReadIo::await_suspend(
     std::coroutine_handle<> awaiting) {
-  if (trace_) {
+  if (flight_attached()) return Suspend(awaiting, absl::OkStatus());
+  bycorf::IoCompletion* tag = this;
+  if (registry_) {
+    const auto admission =
+        registry_->Start(Key(), hash_, read_.lease_, read_.pin_.owns_, *this);
+    if (admission.outcome == ReadFlightRegistry::Outcome::kJoined) {
+      Joined();
+      return Suspend(awaiting, absl::OkStatus());
+    }
+    if (admission.outcome == ReadFlightRegistry::Outcome::kStarted)
+      tag = admission.tag;
+  }
+  if (trace_) [[unlikely]] {
     trace_->disk_read_ = true;
     trace_->io_submit_ns_ = trace_->NowNanos();
   }
-  auto status = fixed_ ? worker_.SubmitReadFixed(file_, buffer_, offset_, this)
+  auto status = fixed_ ? worker_.SubmitReadFixed(file_, buffer_, offset_, tag)
                        : worker_.SubmitRead(
                              file_, std::span(buffer_.data_, buffer_.size_),
-                             offset_, this);
-  if (!status.ok() && trace_) {
-    trace_->io_complete_ns_ = trace_->NowNanos();
-    trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
+                             offset_, tag);
+  if (!status.ok()) [[unlikely]] {
+    if (tag != this) registry_->Reject(tag, read_.lease_, read_.pin_.owns_);
+    FinishTrace();
   }
   return Suspend(awaiting, std::move(status));
 }
 
-void StorageEngine::RemoteReadAwaitable::TracedReadIo::Complete(
-    bycorf::Worker& worker, int result, unsigned flags) {
-  if (trace_) {
-    trace_->io_complete_ns_ = trace_->NowNanos();
+void StorageEngine::RemoteReadAwaitable::TracedReadIo::FinishTrace() {
+  if (!trace_) [[likely]]
+    return;
+  trace_->io_complete_ns_ = trace_->NowNanos();
+  if (trace_->flight_wait_start_ns_) {
+    trace_->RecordFlightWait(trace_->flight_wait_start_ns_,
+                             trace_->io_complete_ns_);
+  } else {
     trace_->RecordIo(trace_->io_submit_ns_, trace_->io_complete_ns_);
   }
+}
+void StorageEngine::RemoteReadAwaitable::TracedReadIo::Complete(
+    bycorf::Worker& worker, int result, unsigned flags) {
+  if (result >= 0) worker.RecordStorageReadCompletion(result);
+  FinishTrace();
+  OneShotIoAwaitable::Complete(worker, result, flags);
+}
+void StorageEngine::RemoteReadAwaitable::TracedReadIo::ReceiveRead(
+    bycorf::Worker& worker, ReadResultBuffer buffer, int result,
+    unsigned flags) {
+  // This slot holds only ownership until await_resume independently validates
+  // the record. No request inherits another request's success conclusion.
+  read_.ready_.emplace(CompactReadValue{.lease_ = std::move(buffer)});
+  FinishTrace();
   OneShotIoAwaitable::Complete(worker, result, flags);
 }
 
 absl::StatusOr<std::size_t>
 StorageEngine::RemoteReadAwaitable::TracedReadIo::await_resume() {
-  auto result = Resume(fixed_ ? "fixed-buffer read failed" : "read failed");
+  auto result = Resume("compact record read failed");
   if (!result.ok()) return result.status();
-  worker_.RecordStorageReadCompletion(*result);
   return static_cast<std::size_t>(*result);
 }
 
-StorageEngine::RemoteReadAwaitable::Pin::~Pin() {
-  if (engine_ != nullptr) {
+void StorageEngine::RemoteReadAwaitable::Pin::Reset() {
+  if (std::exchange(owns_, false))
     engine_->UnpinRemoteBlock(engine_->BlockStateAt(block_id_), owner_,
                               block_id_);
-  }
 }
+StorageEngine::RemoteReadAwaitable::Pin::~Pin() { Reset(); }
 
 bool StorageEngine::RemoteReadAwaitable::Current(
     const Impl& engine) const noexcept {
@@ -454,19 +545,17 @@ StorageEngine::RemoteReadAwaitable::await_resume() {
   }
   TraceSpanScope decode_scope(trace_ ? trace_->diagnostics_ : nullptr,
                               TraceStage::kDecode);
+  ReadResultBuffer buffer = io_->flight_completed()
+                                ? std::move(ready_->value().lease_)
+                                : ReadResultBuffer(std::move(lease_));
   auto loaded =
-      engine.DecodeRemoteValue(std::move(lease_), db_id_, key_, location_,
+      engine.DecodeRemoteValue(std::move(buffer), db_id_, key_, location_,
                                replication_epoch_, record_headroom_, db_epoch_);
   if (trace_) trace_->decode_done_ns_ = trace_->NowNanos();
   if (!Current(engine) || (!loaded.ok() && absl::IsAborted(loaded.status())))
     return std::nullopt;
   if (!loaded.ok()) return loaded.status();
-  return CompactReadValue{
-      .lease_ = std::move(loaded->lease_),
-      .value_offset_ = static_cast<std::uint32_t>(loaded->value_offset_),
-      .value_bytes_ = static_cast<std::uint32_t>(loaded->value_bytes_),
-      .logical_size_ = location_.logical_size_,
-      .expire_at_ms_ = location_.expire_at_ms_};
+  return loaded;
 }
 
 // Keep optimistic-read admission out of the already large command dispatcher.
@@ -1149,15 +1238,42 @@ absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
       .IntoDiskValue();
 }
 
+std::array<std::span<const std::byte>, 3> DiskValue::network_parts(
+    std::span<std::byte, 32> header) const noexcept {
+  if (!shared()) return {network_bytes(), {}, {}};
+  auto* text = reinterpret_cast<char*>(header.data());
+  text[0] = '$';
+  auto [end, error] =
+      std::to_chars(text + 1, text + header.size() - 2, network_size_);
+  assert(error == std::errc{});
+  (void)error;
+  *end++ = '\r';
+  *end++ = '\n';
+  static constexpr std::array<std::byte, 2> tail{std::byte{'\r'},
+                                                 std::byte{'\n'}};
+  return {header.first(static_cast<std::size_t>(end - text)), value_bytes(),
+          tail};
+}
+
+void DiskValue::AppendNetworkBytes(std::string& output) const {
+  std::array<std::byte, 32> header;
+  for (auto part : network_parts(header)) {
+    if (!part.empty())
+      output.append(reinterpret_cast<const char*>(part.data()), part.size());
+  }
+}
+
 absl::StatusOr<DiskValue> CompactReadValue::IntoDiskValue() && {
-  ReadBufferLease lease = std::move(lease_);
+  if (lease_.shared())
+    return DiskValue(std::move(lease_), value_offset_, value_bytes_);
   const std::size_t value_offset = value_offset_;
   const std::size_t value_bytes = value_bytes_;
-  std::span<std::byte> buffer = lease.bytes();
+  std::span<std::byte> buffer = lease_.exclusive_bytes();
   char length[32];
   auto [end, error] =
       std::to_chars(length, length + sizeof(length), value_bytes);
   if (error != std::errc{}) {
+    lease_.Reset();
     return absl::Status(absl::StatusCode::kInternal,
                         "bulk length formatting failed");
   }
@@ -1166,6 +1282,7 @@ absl::StatusOr<DiskValue> CompactReadValue::IntoDiskValue() && {
   if (value_offset < prefix_bytes || value_offset > buffer.size() ||
       value_bytes > buffer.size() - value_offset ||
       buffer.size() - value_offset - value_bytes < 2) {
+    lease_.Reset();
     return absl::Status(absl::StatusCode::kInternal,
                         "value lacks RESP framing headroom or tailroom");
   }
@@ -1177,7 +1294,7 @@ absl::StatusOr<DiskValue> CompactReadValue::IntoDiskValue() && {
   buffer[value_offset + value_bytes] = std::byte{'\r'};
   buffer[value_offset + value_bytes + 1] = std::byte{'\n'};
   const std::size_t network_offset = value_offset - prefix_bytes;
-  return DiskValue(std::move(lease), network_offset,
+  return DiskValue(std::move(lease_), network_offset,
                    prefix_bytes + value_bytes + 2);
 }
 
@@ -2174,17 +2291,14 @@ StorageEngine::Impl::LoadValueAwaitable::FinishRecord(const std::byte* data,
   return LoadedValue{std::move(lease_), offset, payload.bytes_, payload.txid_};
 }
 
-absl::StatusOr<StorageEngine::Impl::LoadedValue>
-StorageEngine::Impl::DecodeRemoteValue(ReadBufferLease lease,
-                                       std::uint8_t db_id, std::string_view key,
-                                       RecordLocation location,
-                                       std::uint64_t replication_epoch,
-                                       std::size_t record_headroom,
-                                       std::uint64_t expected_db_epoch) {
-  const FixedBuffer io = lease.io_buffer();
+absl::StatusOr<CompactReadValue> StorageEngine::Impl::DecodeRemoteValue(
+    ReadResultBuffer lease, std::uint8_t db_id, std::string_view key,
+    RecordLocation location, std::uint64_t replication_epoch,
+    std::size_t record_headroom, std::uint64_t expected_db_epoch) {
+  const auto* io_data = lease.io_data();
   RecordHeader record{};
   std::string_view disk_key;
-  const std::byte* record_data = io.data_ + record_headroom;
+  const std::byte* record_data = io_data + record_headroom;
   std::span<const std::byte> record_bytes(record_data,
                                           location.total_disk_bytes());
   if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
@@ -2221,13 +2335,20 @@ StorageEngine::Impl::DecodeRemoteValue(ReadBufferLease lease,
                         "record value checksum mismatch");
   }
   const std::byte* framed_value = payload_data;
-  if (value_bytes > DirectGetValueLimit()) {
-    std::memmove(io.data_, payload_data, value_bytes);
-    framed_value = io.data_;
+  if (!lease.shared() && value_bytes > DirectGetValueLimit()) {
+    auto exclusive = lease.TakeExclusive();
+    std::memmove(exclusive.io_buffer().data_, payload_data, value_bytes);
+    framed_value = exclusive.io_buffer().data_;
+    lease = ReadResultBuffer(std::move(exclusive));
   }
   const std::size_t value_offset =
       static_cast<std::size_t>(framed_value - lease.bytes().data());
-  return LoadedValue{std::move(lease), value_offset, value_bytes, record.txid_};
+  return CompactReadValue{
+      .lease_ = std::move(lease),
+      .value_offset_ = static_cast<std::uint32_t>(value_offset),
+      .value_bytes_ = static_cast<std::uint32_t>(value_bytes),
+      .logical_size_ = location.logical_size_,
+      .expire_at_ms_ = location.expire_at_ms_};
 }
 
 }  // namespace lavik::storage

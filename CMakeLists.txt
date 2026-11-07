@@ -440,6 +440,7 @@ add_library(lavik_module
   src/storage/engine/list_tree.cpp
   src/storage/engine/metrics.cpp
   src/storage/engine/read.cpp
+  src/storage/engine/read_flight.cpp
   src/storage/engine/recovery.cpp
   src/storage/engine/replication.cpp
   src/storage/engine/replication_log.cpp
@@ -1834,6 +1835,7 @@ if (BUILD_TESTING)
     tests/record_location_test.cpp
     tests/load_value_awaitable_test.cpp
     tests/remote_get_awaitable_test.cpp
+    tests/read_flight_test.cpp
     tests/request_gate_test.cpp
     tests/replication_command_test.cpp
     tests/replication_group_test.cpp
@@ -2244,6 +2246,11 @@ endforeach()
               $<TARGET_FILE:lavik>
     )
     set_tests_properties(lavik_remote_get_e2e PROPERTIES TIMEOUT 180)
+    add_test(NAME lavik_read_flight_e2e
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/read_flight_e2e.py
+              $<TARGET_FILE:lavik>)
+    set_tests_properties(lavik_read_flight_e2e PROPERTIES TIMEOUT 180)
 
     add_test(
       NAME lavik_defrag_payload_e2e

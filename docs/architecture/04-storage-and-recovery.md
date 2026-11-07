@@ -780,13 +780,30 @@ whole-value callbacks exceeding the bounded inline workspace also retain the
 owner's scratch-admission path. Index misses use the same transaction and
 population admission checks.
 
-An admitted payload read submits I/O directly from an awaitable in the
-requesting coroutine. Completion validates the record and population and
-transfers a buffer lease over the immutable encoded payload. GET adds bulk
-framing in that buffer; collection handlers share their compact evaluation and
-reply logic with owner reads, retaining owned results through reply streaming.
-Command parsing precedes consumption of any captured read error. No borrowed
-index entry survives suspension.
+Eligible single-chunk remote payload reads join a bounded in-flight registry
+owned by their connection worker. Exact physical record identity and population
+fences determine sharing; workers never share a registry or route these reads
+to the key owner. The producer owns its pin, DMA buffer and stable completion
+object independently of request frames. Cancellation detaches a waiter without
+cancelling that producer. Completion removes the entry before waking consumers,
+so the registry never caches completed results. Every consumer validates its own
+record and population context before exposing bytes. Admission exhaustion or
+metadata allocation failure preserves the exclusive read path.
+
+A result with one remaining consumer retains an exclusive lease and GET adds
+bulk framing in that buffer. Multiple consumers receive immutable handles over
+the same physical bytes, with separate GET headers and tails. Shared retained
+bytes have a worker-local limit that lasts through the final consumer's return,
+including socket backpressure. Only the buffer owner changes reference state;
+foreign consumers send generation-fenced return tickets to that owner.
+An in-transit return retains its consumer reference until the owner handles it.
+Slots are reused after their final return, with wrapping 48-bit generations
+matched by equality; stale tickets are assumed not to survive a complete
+generation cycle of the same slot.
+Collection handlers share their compact evaluation and reply logic with owner
+reads, retaining owned results through reply streaming. Command parsing precedes
+consumption of any captured read error. No borrowed index entry survives
+suspension.
 
 The index snapshot orders the read before a subsequently admitted writer. The
 block pin survives I/O and cancellation cleanup, so writes can append and retire
@@ -798,7 +815,9 @@ or the last pin notifies the owner to finish the release. Local fallback reads
 retain their existing pin rules. Database/replication epoch and population-generation
 changes invalidate an in-flight payload read. Worker shutdown drains I/O and
 destroys suspended frames on all workers before destroying any remotely
-referenced index, arena or block state.
+referenced index, arena or block state. After that all-worker barrier, storage
+reclaims any producer or shared result whose completion or return notification
+was suppressed by shutdown, without waking waiters or posting maintenance work.
 
 An owner-local ordinary single-key GET may resolve its complete inline-key index entry
 without registering a shared transaction lock when that logical database's

@@ -48,6 +48,7 @@ enum class TraceStage : std::uint8_t {
   kScriptPrepare,
   kPublishFanout,
   kSnapshotPrepare,
+  kReadFlightWait,
   kCount
 };
 

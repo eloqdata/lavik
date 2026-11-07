@@ -551,8 +551,8 @@ class ReplicationLogService final : public bycorf::Service {
         co_await lavik::ExecuteCommand(*request, reply_builder);
     std::string actual(reply.encoded_);
     if (reply.disk_value_.valid()) {
-      const auto bytes = reply.disk_value_.network_bytes();
-      actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      actual.clear();
+      reply.disk_value_.AppendNetworkBytes(actual);
     }
     if (reply.continuation_ || actual != expected_reply) {
       (void)co_await ReportStorageFailure("client command", db_id,
@@ -601,8 +601,8 @@ class ReplicationLogService final : public bycorf::Service {
     auto reply = co_await lavik::DispatchCommand(connection, *request);
     std::string actual(reply.encoded_);
     if (reply.disk_value_.valid()) {
-      const auto bytes = reply.disk_value_.network_bytes();
-      actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      actual.clear();
+      reply.disk_value_.AppendNetworkBytes(actual);
     }
     if (reply.continuation_) {
       for (const auto& fragment : reply.continuation_->fragments_)

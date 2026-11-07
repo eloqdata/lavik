@@ -19,6 +19,7 @@ class RemoteGetTestPeer : public testing::Test {
   using Awaitable = StorageEngine::RemoteReadAwaitable;
 
   virtual std::size_t ReadSlotBytes() const { return 12 * kKiB; }
+  virtual unsigned ReadChunks() const { return 1; }
 
   void SetUp() override {
     saved_context_ = std::move(bycorf::MutableThisWorker());
@@ -57,10 +58,10 @@ class RemoteGetTestPeer : public testing::Test {
     RegisteredBufferPoolOptions options;
     options.storage_write_buffer_count_ = 2;
     options.read_slot_bytes_ = ReadSlotBytes();
-    options.registered_bytes_ =
-        2 * options.write_buffer_bytes_ + options.read_slot_bytes_;
+    options.registered_bytes_ = 2 * options.write_buffer_bytes_ +
+                                options.read_slot_bytes_ * ReadChunks();
     ASSERT_TRUE(Pool().Init(worker_, options).ok());
-    ASSERT_EQ(Pool().available_read_buffers(), 1);
+    ASSERT_EQ(Pool().available_read_buffers(), ReadChunks());
 
     for (unsigned i = 0;; ++i) {
       key_ = "remote-" + std::to_string(i);
@@ -183,7 +184,7 @@ class RemoteGetTestPeer : public testing::Test {
     EXPECT_EQ(Pool().available_write_buffers(), available);
   }
 
-  void Complete(Awaitable& read, int bytes = -1) {
+  void FillRecord(Awaitable& read) {
     ASSERT_TRUE(read.io_.has_value());
     const auto io = read.lease_.io_buffer();
     auto record =
@@ -194,6 +195,10 @@ class RemoteGetTestPeer : public testing::Test {
         EncodeRecordHeader(header_, key_, record.first(header_.header_bytes_)));
     std::memcpy(record.data() + header_.header_bytes_, value_.data(),
                 value_.size());
+  }
+
+  void Complete(Awaitable& read, int bytes = -1) {
+    ASSERT_NO_FATAL_FAILURE(FillRecord(read));
     // This fixture skips SQ submission; seed its timestamp before exercising
     // the production completion and population-validation paths.
     if (read.trace_) read.trace_->io_submit_ns_ = read.trace_->NowNanos();
@@ -201,6 +206,38 @@ class RemoteGetTestPeer : public testing::Test {
     // worker ignores the empty continuation. await_resume is otherwise real.
     read.io_->Complete(worker_, bytes == -1 ? read.read_bytes_ : bytes, 0);
   }
+
+  std::unique_ptr<Awaitable> NewRead(ReadLatencyTrace* trace = nullptr) {
+    return std::unique_ptr<Awaitable>(new Awaitable(
+        *storage_.impl_, 0, key_, 1, header_.value_type_, false, trace));
+  }
+  ReadFlightRegistry& Flights() {
+    return *storage_.impl_->stores_[0]->read_flights_;
+  }
+  bycorf::IoCompletion* StartFlight(Awaitable& read) {
+    FillRecord(read);
+    auto& io = *read.io_;
+    auto admission = io.registry_->Start(io.Key(), io.hash_, read.lease_,
+                                         read.pin_.owns_, io);
+    EXPECT_EQ(admission.outcome, ReadFlightRegistry::Outcome::kStarted);
+    if (read.trace_) {
+      read.trace_->disk_read_ = true;
+      read.trace_->io_submit_ns_ = read.trace_->NowNanos();
+    }
+    return admission.tag;
+  }
+  void RecheckFlight(Awaitable& read) {
+    auto& io = *read.io_;
+    const auto admission = io.registry_->Start(io.Key(), io.hash_, read.lease_,
+                                               read.pin_.owns_, io);
+    ASSERT_EQ(admission.outcome, ReadFlightRegistry::Outcome::kJoined);
+    io.Joined();
+  }
+  bool HasBuffer(Awaitable& read) { return read.lease_.valid(); }
+  void ChangeExpectedKey(Awaitable& read, std::string_view key) {
+    read.key_ = key;
+  }
+  std::size_t ReadBytes(Awaitable& read) { return read.read_bytes_; }
 
   void Invalidate(unsigned which) {
     auto& engine = *storage_.impl_;
@@ -498,6 +535,233 @@ TEST_F(RemoteGetTestPeer, FlushReturnsStagingBufferAcrossLastRemoteUnpin) {
   // here: the reader saw an open gate and did not post a notification.
   ASSERT_NO_FATAL_FAILURE(CheckFlushedBufferRelease(UnpinPoint::kAfterCount));
 #endif
+}
+
+class RemoteFlightTest : public RemoteGetTestPeer {
+ protected:
+  unsigned ReadChunks() const override { return 8; }
+};
+
+TEST_F(RemoteFlightTest, SameWorkerSharesOneReadAndImmutableReply) {
+  ReadLatencyTrace leader_trace, follower_trace;
+  auto leader = NewRead(&leader_trace);
+  const auto bytes = ReadBytes(*leader);
+  auto* tag = StartFlight(*leader);
+  ASSERT_NE(tag, nullptr);
+  auto follower = NewRead(&follower_trace);
+  EXPECT_FALSE(HasBuffer(*follower));
+  EXPECT_EQ(block_.pin_count(), 1);
+  EXPECT_EQ(Flights().size(), 1);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadChunks() - 1);
+  tag->Complete(worker_, bytes, 0);
+  EXPECT_EQ(Flights().size(), 0);
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_TRUE(leader->await_ready());
+  EXPECT_TRUE(follower->await_ready());
+  auto first = leader->await_resume();
+  auto second = follower->await_resume();
+  ASSERT_TRUE(first && first->ok());
+  ASSERT_TRUE(second && second->ok());
+  EXPECT_TRUE(first->value().lease_.shared());
+  EXPECT_EQ(first->value().view().encoded_.data(),
+            second->value().view().encoded_.data());
+  auto reply1 = std::move(first->value()).IntoDiskValue();
+  auto reply2 = std::move(second->value()).IntoDiskValue();
+  ASSERT_TRUE(reply1.ok());
+  ASSERT_TRUE(reply2.ok());
+  std::array<std::byte, 32> header1{}, header2{};
+  auto parts1 = reply1->network_parts(header1);
+  auto parts2 = reply2->network_parts(header2);
+  EXPECT_NE(parts1[0].data(), parts2[0].data());
+  EXPECT_EQ(parts1[1].data(), parts2[1].data());
+  EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(parts1[1].data()),
+                             parts1[1].size()),
+            value_);
+  std::string wire1, wire2;
+  reply1->AppendNetworkBytes(wire1);
+  reply2->AppendNetworkBytes(wire2);
+  EXPECT_EQ(wire1,
+            "$" + std::to_string(value_.size()) + "\r\n" + value_ + "\r\n");
+  EXPECT_EQ(wire1, wire2);
+  EXPECT_EQ(leader_trace.io_timing_.count, 1);
+  EXPECT_EQ(follower_trace.io_timing_.count, 0);
+  EXPECT_EQ(follower_trace.flight_wait_timing_.count, 1);
+  EXPECT_FALSE(follower_trace.disk_read_);
+  EXPECT_EQ(Flights().stats().leaders, 1);
+  EXPECT_EQ(Flights().stats().joins, 1);
+}
+
+TEST_F(RemoteFlightTest, RechecksDelayedSubmissionAndRetiresBeforeNextRead) {
+  auto leader = NewRead();
+  auto follower = NewRead();  // Both were prepared while the table was empty.
+  auto* tag = StartFlight(*leader);
+  ASSERT_NE(tag, nullptr);
+  RecheckFlight(*follower);
+  EXPECT_FALSE(HasBuffer(*follower));
+  EXPECT_EQ(block_.pin_count(), 1);
+  tag->Complete(worker_, ReadBytes(*leader), 0);
+  auto first = leader->await_resume();
+  auto second = follower->await_resume();
+  ASSERT_TRUE(first && first->ok() && second && second->ok());
+  auto next =
+      NewRead();  // Results can still be in socket send; no result cache.
+  EXPECT_TRUE(HasBuffer(*next));
+  EXPECT_EQ(Flights().size(), 0);
+  EXPECT_EQ(block_.pin_count(), 1);
+}
+
+TEST_F(RemoteFlightTest, LeaderCancellationDoesNotCancelProducerOrFollower) {
+  auto leader = NewRead();
+  const auto bytes = ReadBytes(*leader);
+  auto* tag = StartFlight(*leader);
+  ASSERT_NE(tag, nullptr);
+  auto follower = NewRead();
+  leader.reset();
+  EXPECT_EQ(block_.pin_count(), 1);
+  EXPECT_EQ(Flights().size(), 1);
+  tag->Complete(worker_, bytes, 0);
+  auto result = follower->await_resume();
+  ASSERT_TRUE(result && result->ok());
+  EXPECT_EQ(result->value().view().encoded_, value_);
+  EXPECT_FALSE(result->value().lease_.shared());  // Only one live consumer.
+  EXPECT_EQ(block_.pin_count(), 0);
+}
+
+TEST_F(RemoteFlightTest, AllCancelledProducerLivesThroughCompletion) {
+  auto leader = NewRead();
+  const auto bytes = ReadBytes(*leader);
+  auto* tag = StartFlight(*leader);
+  ASSERT_NE(tag, nullptr);
+  auto follower = NewRead();
+  leader.reset();
+  follower.reset();
+  EXPECT_EQ(block_.pin_count(), 1);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadChunks() - 1);
+  tag->Complete(worker_, bytes, 0);
+  EXPECT_EQ(Flights().size(), 0);
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadChunks());
+}
+
+TEST_F(RemoteFlightTest, EachConsumerValidatesCurrentPopulationAfterWake) {
+  for (unsigned fence = 0; fence != 6; ++fence) {
+    ResetFences();
+    auto leader = NewRead();
+    auto* tag = StartFlight(*leader);
+    ASSERT_NE(tag, nullptr);
+    auto follower = NewRead();
+    tag->Complete(worker_, ReadBytes(*leader), 0);
+    auto first = leader->await_resume();
+    ASSERT_TRUE(first && first->ok());
+    Invalidate(fence);
+    EXPECT_FALSE(follower->await_resume());
+  }
+}
+
+TEST_F(RemoteFlightTest, SharedBytesDoNotShareTheFirstConsumersValidation) {
+  auto leader = NewRead();
+  auto* tag = StartFlight(*leader);
+  ASSERT_NE(tag, nullptr);
+  auto follower = NewRead();
+  ChangeExpectedKey(*follower, "different-logical-key");
+  tag->Complete(worker_, ReadBytes(*leader), 0);
+  auto first = leader->await_resume();
+  ASSERT_TRUE(first && first->ok());
+  EXPECT_FALSE(follower->await_resume());
+}
+
+TEST_F(RemoteFlightTest, ShortReadAndIoErrorReachEveryConsumer) {
+  for (int completion : {-EIO, 1}) {
+    auto leader = NewRead();
+    auto* tag = StartFlight(*leader);
+    ASSERT_NE(tag, nullptr);
+    auto follower = NewRead();
+    tag->Complete(worker_, completion, 0);
+    auto first = leader->await_resume();
+    auto second = follower->await_resume();
+    ASSERT_TRUE(first && second);
+    EXPECT_FALSE(first->ok());
+    EXPECT_EQ(first->status(), second->status());
+    EXPECT_EQ(Flights().size(), 0);
+  }
+}
+
+TEST_F(RemoteFlightTest, DifferentEpochDoesNotJoin) {
+  auto leader = NewRead();
+  auto* tag = StartFlight(*leader);
+  ASSERT_NE(tag, nullptr);
+  Invalidate(2);
+  auto follower = NewRead();
+  EXPECT_TRUE(HasBuffer(*follower));
+  EXPECT_EQ(Flights().stats().joins, 0);
+  tag->Complete(worker_, ReadBytes(*leader), 0);
+  EXPECT_FALSE(leader->await_resume());
+  Complete(*follower);
+  auto result = follower->await_resume();
+  ASSERT_TRUE(result && result->ok());
+}
+
+TEST_F(RemoteFlightTest, FramingFailureReleasesExclusiveResultImmediately) {
+  auto read = NewRead();
+  auto* tag = StartFlight(*read);
+  ASSERT_NE(tag, nullptr);
+  tag->Complete(worker_, ReadBytes(*read), 0);
+  auto result = read->await_resume();
+  ASSERT_TRUE(result && result->ok());
+  result->value().value_offset_ = 0;
+  auto reply = std::move(result->value()).IntoDiskValue();
+  EXPECT_FALSE(reply.ok());
+  // The rvalue conversion consumes ownership even on a malformed value view.
+  // Keeping the failed source object alive must not hold scarce arena space.
+  EXPECT_EQ(Pool().available_read_buffers(), ReadChunks());
+}
+
+TEST_F(RemoteFlightTest, RegistryMemoryAdmissionFailureKeepsExclusiveRead) {
+  ASSERT_TRUE(InitMemoryLimit(1, 2).ok());
+  auto read = NewRead();
+  ASSERT_TRUE(InitMemoryLimit(1024 * kMiB, 2).ok());
+  ASSERT_FALSE(read->await_ready());
+  EXPECT_TRUE(HasBuffer(*read));
+  ASSERT_NO_FATAL_FAILURE(Complete(*read));
+  auto result = read->await_resume();
+  ASSERT_TRUE(result && result->ok());
+  EXPECT_EQ(result->value().view().encoded_, value_);
+  EXPECT_FALSE(result->value().lease_.shared());
+}
+
+TEST_F(RemoteFlightTest, SynchronousRejectionRestoresOriginalOwnership) {
+  auto leader = NewRead();
+  ASSERT_FALSE(leader->await_ready());
+  // Shutdown without RequestStop leaves registry admission open, but makes
+  // the real backend reject submission synchronously. Exercise the production
+  // await_suspend rollback rather than calling the registry's Reject directly.
+  worker_.Shutdown();
+  ASSERT_FALSE(worker_.stop_requested());
+  EXPECT_FALSE(leader->await_suspend(std::noop_coroutine()));
+  EXPECT_EQ(Flights().stats().leaders, 1);
+  EXPECT_EQ(Flights().stats().rejected, 1);
+  EXPECT_TRUE(HasBuffer(*leader));
+  EXPECT_EQ(Flights().size(), 0);
+  EXPECT_EQ(block_.pin_count(), 1);
+  leader.reset();
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadChunks());
+}
+
+TEST_F(RemoteFlightTest, QuiescedShutdownReclaimsCancelledPhysicalRead) {
+  auto leader = NewRead();
+  ASSERT_NE(StartFlight(*leader), nullptr);
+  auto follower = NewRead();
+  worker_.RequestStop();
+  worker_.Shutdown();  // No further DMA or completion can touch the stable tag.
+  leader.reset();
+  follower
+      .reset();  // Models the runtime's all-worker frame-reclamation barrier.
+  Flights().FinalizeQuiesced();
+  Pool().FinalizeReadSharing();
+  EXPECT_EQ(block_.pin_count(), 0);
+  EXPECT_EQ(Flights().size(), 0);
+  EXPECT_EQ(Pool().available_read_buffers(), ReadChunks());
 }
 
 }  // namespace lavik::storage

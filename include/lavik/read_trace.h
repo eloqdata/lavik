@@ -45,6 +45,17 @@ struct ReadLatencyTrace : LatencySegmentClock {
       io_timing_.Add(start, end);
   }
 
+  // A follower waits for somebody else's physical I/O; keep that interval
+  // distinct so neither I/O counts nor submitted-I/O timings are duplicated.
+  void RecordFlightWait(std::uint64_t start, std::uint64_t end) noexcept {
+    if (diagnostics_)
+      RecordTraceInterval(diagnostics_, TraceStage::kReadFlightWait, start,
+                          end);
+    else
+      flight_wait_timing_.Add(start, end);
+  }
+  LatencyIntervals flight_wait_timing_;
+  std::uint64_t flight_wait_start_ns_ = 0;
   LatencyIntervals buffer_timing_;
   LatencyIntervals io_timing_;
   std::uint64_t owner_start_ns_ = 0;

@@ -44,6 +44,28 @@ these step timings, connection state, lease decisions, expirations, reconnects, 
 directive results. The metrics HTTP service runs on the data workers; the
 last runtime worker remains dedicated to Meta control tasks.
 
+## Remote compact read sharing
+
+`lavik_storage_read_flight_joins_total` counts requests joining an existing
+worker-local physical read. `read_flight_leaders_total` counts producers admitted
+and `read_flight_rejections_total` their synchronous backend rejections; these
+suffixes use the same `lavik_storage_` prefix. Physical read counters increment
+once per successful completion, including short completions, regardless of the
+number of waiters. `read_flight_cancellations_total` counts detached waiters.
+
+The `read_flight_table_full_total`, `read_flight_waiter_full_total`, and
+`read_flight_shared_budget_total` counters count unsuccessful admission attempts,
+not unique requests: a delayed submission can recheck admission. Sharing remains
+an optimization and these failures use the existing exclusive path.
+`read_flights_pending` counts current producers. `shared_read_bytes` includes
+reserved or retained shared arena bytes and framing through the final return,
+including consumers blocked on network output. INFO stats exposes the same
+observations with `storage_` names and without counter `_total` suffixes.
+Collection visits state owners; cross-worker totals are not an atomic snapshot.
+
+Selected latency traces expose `read_flight_wait` for followers instead of
+attributing the producer's physical `read_io` interval to every request.
+
 ## Alerting and readiness
 
 The [alert runbook](alerts.md) documents the maintained rule set and its limits.

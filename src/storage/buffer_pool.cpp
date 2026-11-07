@@ -102,7 +102,268 @@ void ReadBufferLease::Reset() noexcept {
   release_token_ = 0;
 }
 
+ReadResultBuffer::ReadResultBuffer(ReadBufferLease lease) noexcept
+    : pool_(std::exchange(lease.pool_, nullptr)),
+      data_(std::exchange(lease.data_, nullptr)),
+      size_(lease.size_),
+      headroom_(lease.headroom_bytes_),
+      return_ticket_(std::exchange(lease.release_token_, 0)) {}
+
+ReadResultBuffer::ReadResultBuffer(ReadResultBuffer&& other) noexcept
+    : pool_(std::exchange(other.pool_, nullptr)),
+      data_(std::exchange(other.data_, nullptr)),
+      size_(other.size_),
+      headroom_(other.headroom_),
+      return_ticket_(std::exchange(other.return_ticket_, 0)) {}
+
+ReadResultBuffer& ReadResultBuffer::operator=(
+    ReadResultBuffer&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    pool_ = std::exchange(other.pool_, nullptr);
+    data_ = std::exchange(other.data_, nullptr);
+    size_ = other.size_;
+    headroom_ = other.headroom_;
+    return_ticket_ = std::exchange(other.return_ticket_, 0);
+  }
+  return *this;
+}
+
+ReadResultBuffer::~ReadResultBuffer() { Reset(); }
+
+ReadBufferLease ReadResultBuffer::TakeExclusive() noexcept {
+  if (!pool_ || shared()) return {};
+  // All arena and heap-output leases use the pool's immutable framing margins.
+  // Keeping only headroom in the const handle preserves the old 32-byte size.
+  ReadBufferLease lease(
+      pool_, {.data_ = const_cast<std::byte*>(data_), .size_ = size_},
+      headroom_, pool_->options_.read_tailroom_bytes_,
+      static_cast<std::uint32_t>(return_ticket_));
+  pool_ = nullptr;
+  data_ = nullptr;
+  return_ticket_ = 0;
+  return lease;
+}
+
+std::optional<ReadResultBuffer> ReadResultBuffer::CloneOnOwner()
+    const noexcept {
+  if (!pool_ || !shared()) return std::nullopt;
+  return pool_->CloneSharedRead(*this);
+}
+
+void ReadResultBuffer::Reset() noexcept {
+  if (!pool_) return;
+  auto* pool = std::exchange(pool_, nullptr);
+  // Arena tokens occupy the low 31 bits. Keep their original direct return
+  // path, without constructing and destroying a temporary mutable lease.
+  if (return_ticket_ < ReadBufferLease::kOutputTokenBit) {
+    pool->ReleaseRead(static_cast<std::uint32_t>(return_ticket_) - 1,
+                      size_ >> pool->read_unit_shift_);
+  } else if (shared()) {
+    pool->ReleaseSharedRead(return_ticket_ & ~kSharedBit);
+  } else {
+    pool->ReleaseOutput(return_ticket_ & ReadBufferLease::kReleaseTokenMask);
+  }
+  data_ = nullptr;
+  size_ = 0;
+  return_ticket_ = 0;
+}
+
+SharedReadReservation::SharedReadReservation(
+    SharedReadReservation&& other) noexcept
+    : pool_(std::exchange(other.pool_, nullptr)), ticket_(other.ticket_) {}
+SharedReadReservation& SharedReadReservation::operator=(
+    SharedReadReservation&& other) noexcept {
+  if (this != &other) {
+    Reset();
+    pool_ = std::exchange(other.pool_, nullptr);
+    ticket_ = other.ticket_;
+  }
+  return *this;
+}
+SharedReadReservation::~SharedReadReservation() { Reset(); }
+void SharedReadReservation::Reset() noexcept {
+  if (auto* pool = std::exchange(pool_, nullptr))
+    pool->CancelSharedRead(ticket_);
+}
+ReadResultBuffer SharedReadReservation::Publish(
+    ReadBufferLease lease) && noexcept {
+  assert(pool_);
+  return std::exchange(pool_, nullptr)
+      ->PublishSharedRead(ticket_, std::move(lease));
+}
+
+SharedReadReservation RegisteredBufferPool::TryReserveSharedRead(
+    std::size_t bytes) noexcept {
+  SharedReadReservation result;
+  const auto& current = bycorf::ThisWorker();
+  if (!initialized() || read_sharing_finalized_ ||
+      current.cross_core_ != cross_core_ || current.id_ != owner_worker_ ||
+      bytes == 0 || bytes > read_arena_.size_ / 4 ||
+      shared_read_bytes_ > read_arena_.size_ / 4 - bytes)
+    return result;
+  if (!shared_reads_) [[unlikely]] {
+    constexpr auto metadata_bytes = sizeof(SharedReadState) * kSharedReadSlots;
+    auto reservation = TryReserveMemory(metadata_bytes);
+    if (!reservation) [[unlikely]]
+      return result;
+    auto states = std::unique_ptr<SharedReadState[]>(
+        new (std::nothrow) SharedReadState[kSharedReadSlots]);
+    if (!states) [[unlikely]]
+      return result;
+    for (unsigned i = 0; i < kSharedReadSlots; ++i)
+      states[i].next_free_ = i + 1;
+    shared_reads_ = std::move(states);
+    shared_metadata_memory_.Adopt(&*reservation, metadata_bytes);
+    shared_free_ = 0;
+  }
+  if (shared_free_ == kSharedReadSlots) return result;
+  const auto slot = shared_free_;
+  auto& state = shared_reads_[slot];
+  shared_free_ = state.next_free_;
+  assert(!state.active_);
+  // Keep all slots reusable: generation is a wrapping 48-bit ticket field,
+  // not a lifetime allocation limit. Matching needs equality, not serial-number
+  // ordering. As with any finite tag, a stale ticket must not survive a full
+  // 2^48 reuse cycle of this slot; that complete-cycle ABA is not detected.
+  state.generation_ = (state.generation_ + 1) & kSharedGenerationMax;
+  state.active_ = true;
+  state.reserved_bytes_ = bytes;
+  state.live_consumers_ = 0;
+  state.issued_consumers_ = 0;
+  shared_read_bytes_ += bytes;
+  shared_read_peak_bytes_ =
+      std::max(shared_read_peak_bytes_, shared_read_bytes_);
+  result.pool_ = this;
+  result.ticket_ = (state.generation_ << 15) | (std::uint64_t{slot} << 5);
+  return result;
+}
+
+RegisteredBufferPool::SharedReadState* RegisteredBufferPool::SharedState(
+    std::uint64_t ticket) noexcept {
+  if (!shared_reads_ || read_sharing_finalized_) [[unlikely]]
+    return nullptr;
+  auto& state = shared_reads_[(ticket >> 5) & (kSharedReadSlots - 1)];
+  return state.active_ && state.generation_ == (ticket >> 15) ? &state
+                                                              : nullptr;
+}
+
+void RegisteredBufferPool::RetireSharedRead(SharedReadState& state,
+                                            unsigned slot) noexcept {
+  assert(state.active_ && !state.live_consumers_);
+  shared_read_bytes_ -= state.reserved_bytes_;
+  state.reserved_bytes_ = 0;
+  state.active_ = false;
+  state.lease_.Reset();
+  // A foreign return keeps its consumer bit live until this owner processes
+  // it. Recycle only after the final return (or an unpublished reservation's
+  // cancellation), including when the next allocation wraps the generation.
+  state.next_free_ = shared_free_;
+  shared_free_ = slot;
+}
+
+void RegisteredBufferPool::CancelSharedRead(std::uint64_t ticket) noexcept {
+  auto* state = SharedState(ticket);
+  if (!state) [[unlikely]]
+    return;
+  assert(!state->lease_.valid() && !state->live_consumers_);
+  RetireSharedRead(*state, (ticket >> 5) & (kSharedReadSlots - 1));
+}
+
+ReadResultBuffer RegisteredBufferPool::PublishSharedRead(
+    std::uint64_t ticket, ReadBufferLease lease) noexcept {
+  auto* state = SharedState(ticket);
+  assert(state && !state->lease_.valid() && !state->live_consumers_);
+  assert(lease.pool_ == this && lease.buffer_id() != 0 &&
+         lease.size_ == state->reserved_bytes_);
+  state->lease_ = std::move(lease);
+  state->issued_consumers_ = state->live_consumers_ = 1;
+  ReadResultBuffer result;
+  result.pool_ = this;
+  result.data_ = state->lease_.data_;
+  result.size_ = state->lease_.size_;
+  result.headroom_ = state->lease_.headroom_bytes_;
+  result.return_ticket_ = ReadResultBuffer::kSharedBit | ticket;
+  return result;
+}
+
+std::optional<ReadResultBuffer> RegisteredBufferPool::CloneSharedRead(
+    const ReadResultBuffer& source) noexcept {
+  const auto& current = bycorf::ThisWorker();
+  if (current.cross_core_ != cross_core_ || current.id_ != owner_worker_)
+      [[unlikely]]
+    return std::nullopt;
+  const auto ticket = source.return_ticket_ & ~ReadResultBuffer::kSharedBit;
+  auto* state = SharedState(ticket);
+  if (!state ||
+      !(state->live_consumers_ & (std::uint32_t{1} << (ticket & 31))) ||
+      state->issued_consumers_ == std::numeric_limits<std::uint32_t>::max())
+    return std::nullopt;
+  const unsigned consumer = std::countr_one(state->issued_consumers_);
+  state->issued_consumers_ |= std::uint32_t{1} << consumer;
+  state->live_consumers_ |= std::uint32_t{1} << consumer;
+  ReadResultBuffer result;
+  result.pool_ = this;
+  result.data_ = source.data_;
+  result.size_ = source.size_;
+  result.headroom_ = source.headroom_;
+  result.return_ticket_ =
+      (source.return_ticket_ & ~std::uint64_t{31}) | consumer;
+  return result;
+}
+
+void RegisteredBufferPool::ReleaseSharedRead(std::uint64_t ticket) noexcept {
+  const auto& current = bycorf::ThisWorker();
+  if (current.cross_core_ == cross_core_ && current.id_ == owner_worker_) {
+    ReleaseSharedReadLocal(ticket);
+  } else if (current.cross_core_ && current.cross_core_ == cross_core_) {
+    bycorf::PostNotification(
+        cross_core_, owner_worker_,
+        {this, ticket, &RegisteredBufferPool::HandleSharedReadRelease});
+  }
+}
+void RegisteredBufferPool::HandleSharedReadRelease(
+    void* context, std::uint64_t ticket) noexcept {
+  static_cast<RegisteredBufferPool*>(context)->ReleaseSharedReadLocal(ticket);
+}
+void RegisteredBufferPool::ReleaseSharedReadLocal(
+    std::uint64_t ticket) noexcept {
+  auto* state = SharedState(ticket);
+  const auto consumer = std::uint32_t{1} << (ticket & 31);
+  if (!state || !(state->live_consumers_ & consumer)) [[unlikely]]
+    return;
+  state->live_consumers_ &= ~consumer;
+  // Frame reclamation after stop must not wake an arena waiter whose frame
+  // has already been destroyed. Finalization reclaims these leases after the
+  // cross-worker barrier, including returns still queued on stopped mailboxes.
+  if (!state->live_consumers_ && !worker_->stop_requested())
+    RetireSharedRead(*state, (ticket >> 5) & (kSharedReadSlots - 1));
+}
+void RegisteredBufferPool::ReclaimReadAfterQuiesce(
+    ReadBufferLease lease) noexcept {
+  if (!lease.valid()) return;
+  assert(lease.pool_ == this && lease.buffer_id() != 0);
+  read_allocator_.Free({.offset = lease.release_token_ - 1,
+                        .units = lease.size_ >> read_unit_shift_});
+  lease.pool_ = nullptr;
+}
+void RegisteredBufferPool::FinalizeReadSharing() noexcept {
+  if (read_sharing_finalized_) return;
+  read_sharing_finalized_ = true;
+  if (shared_reads_) {
+    for (unsigned i = 0; i < kSharedReadSlots; ++i) {
+      auto& state = shared_reads_[i];
+      ReclaimReadAfterQuiesce(std::move(state.lease_));
+      state.active_ = false;
+      state.live_consumers_ = 0;
+      state.reserved_bytes_ = 0;
+    }
+  }
+  shared_read_bytes_ = 0;
+}
+
 RegisteredBufferPool::~RegisteredBufferPool() {
+  FinalizeReadSharing();
   for (const auto& buffer : maintenance_read_buffers_) {
     if (buffer.data_ != nullptr)
       bycorf::FreeStorageBuffer(buffer.data_, maintenance_alignment_);

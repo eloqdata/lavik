@@ -87,6 +87,13 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
 
 Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
     std::vector<StorageReplicationLogMetrics>* replication_logs) const {
+  struct WorkerDiagnostics {
+    ReadFlightStats read_flights;
+    std::uint64_t pending = 0;
+    std::uint64_t shared_bytes = 0;
+    std::optional<std::uint64_t> dirty_bytes;
+  };
+
   StorageDiagnosticsSnapshot result;
   result.tx_cleaner_ = TxCleanerStats();
   result.tx_commit_batches_ = TxCommitBatchStats();
@@ -102,43 +109,61 @@ Task<StorageDiagnosticsSnapshot> StorageEngine::Impl::CollectDiagnostics(
     auto* replication = replication_logs == nullptr
                             ? nullptr
                             : &replication_logs->emplace_back();
-    const auto dirty = co_await bycorf::SubmitTo(
-        target, [this, target, replication]() -> std::optional<std::uint64_t> {
-          if (replication != nullptr) {
-            const ReplicationLogInfo log = LocalReplicationLogInfo();
-            *replication = StorageReplicationLogMetrics{
-                .worker_id_ = target,
-                .floor_lsn_ = log.floor_lsn_,
-                .tail_lsn_ = log.tail_lsn_,
-                .coverage_revocations_ = log.coverage_revocations_,
-                .backpressure_waits_ = log.backpressure_waits_,
-                .chunk_count_ = log.block_count_,
-                .capacity_bytes_ = log.capacity_bytes_,
-                .publish_queue_bytes_ = log.publish_queue_bytes_,
-                .publish_queue_capacity_bytes_ =
-                    log.publish_queue_capacity_bytes_,
-                .fullsync_publish_queue_bytes_ =
-                    log.fullsync_publish_queue_bytes_,
-                .fullsync_publisher_admitted_bytes_ =
-                    log.fullsync_publisher_admitted_bytes_,
-                .fullsync_publish_queue_capacity_bytes_ =
-                    log.fullsync_publish_queue_capacity_bytes_,
-                .fullsync_session_count_ = log.fullsync_session_count_,
-                .pinned_cursors_ = log.retained_cursor_count_,
-                .fullsync_backpressure_waits_ =
-                    log.fullsync_backpressure_waits_,
-                .active_ = log.state_ == ReplicationLogState::kActive,
-                .backpressured_ = log.capacity_backpressured_,
-            };
-          }
-          // The common small-store path keeps its single callback. Only a
-          // large historical slot table needs a separately scheduled coroutine.
-          if (CurrentStore().staging_slots_.size() > kDiagnosticSlotsPerBatch)
-            return std::nullopt;
-          return LocalDirtyStagingBytes();
-        });
-    if (dirty.has_value()) {
-      result.durability_.dirty_staging_bytes_ += *dirty;
+    const auto observation = co_await bycorf::SubmitTo(target, [this, target,
+                                                                replication] {
+      // Snapshot mutable counters on their owner, then return by value.
+      // Only the collecting worker updates the totals; passing &result
+      // would move the same accumulator cache lines through every worker.
+      WorkerDiagnostics local;
+      const auto& store = CurrentStore();
+      if (store.read_flights_) {
+        local.read_flights = store.read_flights_->stats();
+        local.pending = store.read_flights_->size();
+      }
+      local.shared_bytes = store.buffers_.shared_read_bytes();
+      if (replication != nullptr) {
+        const ReplicationLogInfo log = LocalReplicationLogInfo();
+        *replication = StorageReplicationLogMetrics{
+            .worker_id_ = target,
+            .floor_lsn_ = log.floor_lsn_,
+            .tail_lsn_ = log.tail_lsn_,
+            .coverage_revocations_ = log.coverage_revocations_,
+            .backpressure_waits_ = log.backpressure_waits_,
+            .chunk_count_ = log.block_count_,
+            .capacity_bytes_ = log.capacity_bytes_,
+            .publish_queue_bytes_ = log.publish_queue_bytes_,
+            .publish_queue_capacity_bytes_ = log.publish_queue_capacity_bytes_,
+            .fullsync_publish_queue_bytes_ = log.fullsync_publish_queue_bytes_,
+            .fullsync_publisher_admitted_bytes_ =
+                log.fullsync_publisher_admitted_bytes_,
+            .fullsync_publish_queue_capacity_bytes_ =
+                log.fullsync_publish_queue_capacity_bytes_,
+            .fullsync_session_count_ = log.fullsync_session_count_,
+            .pinned_cursors_ = log.retained_cursor_count_,
+            .fullsync_backpressure_waits_ = log.fullsync_backpressure_waits_,
+            .active_ = log.state_ == ReplicationLogState::kActive,
+            .backpressured_ = log.capacity_backpressured_,
+        };
+      }
+      // The common small-store path keeps its single callback. Only a
+      // large historical slot table needs a separately scheduled coroutine.
+      if (store.staging_slots_.size() <= kDiagnosticSlotsPerBatch)
+        local.dirty_bytes = LocalDirtyStagingBytes();
+      return local;
+    });
+    const auto& local = observation.read_flights;
+    auto& total = result.read_flights_;
+    total.leaders += local.leaders;
+    total.joins += local.joins;
+    total.cancellations += local.cancellations;
+    total.rejected += local.rejected;
+    total.table_full += local.table_full;
+    total.waiter_full += local.waiter_full;
+    total.shared_budget += local.shared_budget;
+    result.read_flights_pending_ += observation.pending;
+    result.shared_read_bytes_ += observation.shared_bytes;
+    if (observation.dirty_bytes.has_value()) {
+      result.durability_.dirty_staging_bytes_ += *observation.dirty_bytes;
     } else {
       result.durability_.dirty_staging_bytes_ += co_await bycorf::SubmitTaskTo(
           target, [this] { return CollectLocalDirtyStagingBytes(); });

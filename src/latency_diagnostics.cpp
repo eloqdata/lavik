@@ -125,15 +125,15 @@ constexpr unsigned StageIndex(TraceStage stage) {
   return static_cast<unsigned>(stage);
 }
 constexpr std::array<std::string_view, kStageCount> kStages{
-    "request_queue",   "route_to_owner",    "route_back",
-    "key_lock",        "store_lock",        "lookup",
-    "read_buffer",     "read_io",           "append_capacity",
-    "durability_wait", "response_queue",    "socket_send",
-    "decode",          "value_process",     "admission_wait",
-    "tx_schedule",     "commit_queue_wait", "blocking_wait",
-    "wake_resume",     "replication_fence", "replica_ack_wait",
-    "watch_check",     "script_prepare",    "publish_fanout",
-    "snapshot_prepare"};
+    "request_queue",    "route_to_owner",    "route_back",
+    "key_lock",         "store_lock",        "lookup",
+    "read_buffer",      "read_io",           "append_capacity",
+    "durability_wait",  "response_queue",    "socket_send",
+    "decode",           "value_process",     "admission_wait",
+    "tx_schedule",      "commit_queue_wait", "blocking_wait",
+    "wake_resume",      "replication_fence", "replica_ack_wait",
+    "watch_check",      "script_prepare",    "publish_fanout",
+    "snapshot_prepare", "read_flight_wait"};
 constexpr std::array<std::uint64_t, 15> kBoundsUs{
     1,     4,      16,      64,      256,      1000,     4000,     16000,
     64000, 256000, 1000000, 4000000, 16000000, 64000000, 256000000};
@@ -252,6 +252,10 @@ std::array<Span, kStages.size()> Spans(const OnlineLatencyTrace& t) {
     if (v.io_timing_.count)
       s[StageIndex(kReadIo)] = {v.io_timing_.first_ns, v.io_timing_.last_ns,
                                 &v.io_timing_};
+    if (v.flight_wait_timing_.count)
+      s[StageIndex(kReadFlightWait)] = {v.flight_wait_timing_.first_ns,
+                                        v.flight_wait_timing_.last_ns,
+                                        &v.flight_wait_timing_};
     s[StageIndex(kDecode)] = {v.io_complete_ns_, v.decode_done_ns_};
   }
   s[StageIndex(kResponseQueue)] = {t.dispatch_done_ns_, t.send_ns_};
