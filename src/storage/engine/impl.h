@@ -3792,11 +3792,6 @@ class StorageEngine::Impl {
   void ReleaseFlushedStagingBuffer(WorkerStore& store, BlockState& state,
                                    std::uint64_t block_id);
 
-  // Opt-in for consumers that can retain immutable results. kImmutable permits
-  // coalescing; no followers or failed admission still yields an exclusive
-  // buffer. Maintenance and mutation preparation keep exclusive ownership by
-  // default, so adding a read caller does not silently enable sharing for it.
-  enum class ReadSharing { kExclusive, kImmutable };
   ReadFlightRegistry* ReadFlights(WorkerStore& store);
 
   struct LoadedValue {
@@ -3838,12 +3833,12 @@ class StorageEngine::Impl {
                        const Digest& digest, RecordLocation location,
                        ExtentManifest extents,
                        GroupedObject::Handle grouped_snapshot,
-                       ReadSharing sharing, ReadLatencyTrace* trace);
+                       ReadLatencyTrace* trace);
     LoadValueAwaitable(Impl& engine, WorkerStore& store, std::uint8_t db_id,
                        std::string_view key, RecordLocation location,
                        std::uint64_t replication_epoch,
                        std::optional<std::uint64_t> expected_db_epoch,
-                       ReadSharing sharing, ReadLatencyTrace* trace);
+                       ReadLatencyTrace* trace);
     ~LoadValueAwaitable();
 
     bool await_ready() const noexcept {
@@ -3894,7 +3889,6 @@ class StorageEngine::Impl {
     std::size_t read_bytes_ = 0;
     std::uint8_t db_id_;
     BlockState* pinned_ = nullptr;
-    ReadSharing sharing_;
     ReadFlightRegistry* flights_ = nullptr;
     std::size_t flight_hash_ = 0;
     std::uint64_t population_generation_ = 0;
@@ -4361,7 +4355,6 @@ class StorageEngine::Impl {
                                const Digest& digest, RecordLocation location,
                                ExtentManifest extents,
                                GroupedObject::Handle grouped_snapshot = nullptr,
-                               ReadSharing sharing = ReadSharing::kExclusive,
                                ReadLatencyTrace* trace = nullptr);
 
   // Used only for multi-step reads or an aborted direct read. A supplied
@@ -4371,7 +4364,6 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, Digest digest,
       RecordLocation location, ExtentManifest extents,
       std::optional<absl::Status> failure = std::nullopt,
-      ReadSharing sharing = ReadSharing::kExclusive,
       ReadLatencyTrace* trace = nullptr);
 
   // The synchronous decoder must consume its checked payload before the
@@ -4445,7 +4437,6 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       RecordLocation location, std::uint64_t replication_epoch,
       std::optional<std::uint64_t> expected_db_epoch = std::nullopt,
-      ReadSharing sharing = ReadSharing::kExclusive,
       ReadLatencyTrace* trace = nullptr);
 
   std::uint64_t ForegroundBlocksForDevice(

@@ -1417,9 +1417,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       compact = std::move(*loaded);
     }
   } else if (exists && !replace) {
-    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     location, extents, nullptr,
-                                     ReadSharing::kExclusive, read_trace.get());
+    auto loaded =
+        co_await LoadValue(store, partition, db_id, key, digest, location,
+                           extents, nullptr, read_trace.get());
     if (!loaded.ok()) {
       if (read_epoch_changed()) co_return HashResult{};
       co_return loaded.status();

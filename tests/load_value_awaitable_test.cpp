@@ -128,17 +128,15 @@ class LoadValueAwaitableTestPeer : public testing::Test {
     return storage_.impl_->LoadValue(Store(), Store().partitions_[0], 0, key_,
                                      digest_, location_, {});
   }
-  auto ReadShared(std::string_view key = {}) {
+  auto ReadPhysical(std::string_view key = {}) {
     // Logical and physical forms use the same submitter-local registry.
     return storage_.impl_->LoadValueLocal(
-        Store(), 0, key.empty() ? std::string_view(key_) : key, location_, 1, 1,
-        StorageEngine::Impl::ReadSharing::kImmutable);
+        Store(), 0, key.empty() ? std::string_view(key_) : key, location_, 1,
+        1);
   }
-  Task<Result> ReadSharedTask(bool logical = true, std::string_view key = {}) {
-    if (!logical) co_return co_await ReadShared(key);
-    co_return co_await storage_.impl_->LoadValue(
-        Store(), Store().partitions_[0], 0, key_, digest_, location_, {},
-        nullptr, StorageEngine::Impl::ReadSharing::kImmutable);
+  Task<Result> ReadTask(bool logical = true, std::string_view key = {}) {
+    if (!logical) co_return co_await ReadPhysical(key);
+    co_return co_await Read();
   }
   ReadFlightRegistry& Flights() { return *Store().read_flights_; }
   bool HasFlights() { return Store().read_flights_ != nullptr; }
@@ -1050,6 +1048,12 @@ class LoadValueAwaitableTestPeer : public testing::Test {
 
 TEST_F(LoadValueAwaitableTestPeer, ExhaustedPoolWaitsWithoutGrowingDmaMemory) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
+  {
+    // Exclude one-time registry metadata from this per-read arena-growth check.
+    // Construction admits the registry but submits no I/O before co_await.
+    auto warmup = Read();
+    ASSERT_TRUE(HasFlights());
+  }
   auto held = Pool().AcquireReadBuffer().await_resume();
   ASSERT_TRUE(held.ok());
   const auto retained = RetainedBytes();
@@ -2855,7 +2859,7 @@ TEST_F(LocalReadFlightTest, OverlapSharesOneIoAndCompletionIsNotACache) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
   std::vector<Task<Result>> tasks;
   for (unsigned i = 0; i != 16; ++i) {
-    tasks.push_back(ReadSharedTask());
+    tasks.push_back(ReadTask());
     Start(tasks.back());
   }
   EXPECT_EQ(Flights().stats().leaders, 1);
@@ -2875,7 +2879,7 @@ TEST_F(LocalReadFlightTest, OverlapSharesOneIoAndCompletionIsNotACache) {
   EXPECT_EQ(block_.pin_count(), 0);
   // A completed shared reply can remain retained while a new request must
   // issue a fresh I/O. With no follower its response stays exclusive.
-  auto next = ReadSharedTask();
+  auto next = ReadTask();
   Start(next);
   EXPECT_EQ(Flights().stats().leaders, 2);
   ASSERT_NO_FATAL_FAILURE(Drain(next));
@@ -2896,9 +2900,9 @@ TEST_F(LocalReadFlightTest, OverlapSharesOneIoAndCompletionIsNotACache) {
 TEST_F(LocalReadFlightTest, SingleSubmissionMayExceedPreferredChunkSize) {
   ResizeRecord(6000);
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto first = ReadSharedTask();
+  auto first = ReadTask();
   Start(first);
-  auto second = ReadSharedTask();
+  auto second = ReadTask();
   Start(second);
   EXPECT_EQ(Flights().stats().leaders, 1);
   EXPECT_EQ(Flights().stats().joins, 1);
@@ -2916,7 +2920,7 @@ TEST_F(LocalReadFlightTest, SingleSubmissionMayExceedPreferredChunkSize) {
 
 TEST_F(LocalReadFlightTest, FollowerJoinsEvenWhenTheArenaIsExhausted) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto leader = ReadSharedTask();
+  auto leader = ReadTask();
   Start(leader);
   std::vector<ReadBufferLease> held;
   while (Pool().available_read_buffers()) {
@@ -2924,7 +2928,7 @@ TEST_F(LocalReadFlightTest, FollowerJoinsEvenWhenTheArenaIsExhausted) {
     ASSERT_TRUE(lease.ok());
     held.push_back(std::move(*lease));
   }
-  auto follower = ReadSharedTask();
+  auto follower = ReadTask();
   Start(follower);
   EXPECT_EQ(Flights().stats().joins, 1);
   EXPECT_EQ(block_.pin_count(), 1);
@@ -2940,9 +2944,9 @@ TEST_F(LocalReadFlightTest, SharedBudgetPressureFallsBackToIndependentRead) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
   auto reserved = Pool().TryReserveSharedRead(Pool().read_capacity_bytes() / 4);
   ASSERT_TRUE(reserved.valid());
-  auto first = ReadSharedTask();
+  auto first = ReadTask();
   Start(first);
-  auto second = ReadSharedTask();
+  auto second = ReadTask();
   Start(second);
   EXPECT_EQ(Flights().stats().joins, 0);
   EXPECT_GT(Flights().stats().shared_budget, 0);
@@ -2959,9 +2963,9 @@ TEST_F(LocalReadFlightTest, SharedBudgetPressureFallsBackToIndependentRead) {
 
 TEST_F(LocalReadFlightTest, CancelFirstDoesNotCancelProducerOrFollower) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto leader = ReadSharedTask();
+  auto leader = ReadTask();
   Start(leader);
-  auto follower = ReadSharedTask();
+  auto follower = ReadTask();
   Start(follower);
   leader = {};
   EXPECT_EQ(Flights().stats().cancellations, 1);
@@ -2977,9 +2981,9 @@ TEST_F(LocalReadFlightTest, CancelFirstDoesNotCancelProducerOrFollower) {
 
 TEST_F(LocalReadFlightTest, AllCancelledStillDrainTheIndependentProducer) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto leader = ReadSharedTask();
+  auto leader = ReadTask();
   Start(leader);
-  auto follower = ReadSharedTask();
+  auto follower = ReadTask();
   Start(follower);
   leader = {};
   follower = {};
@@ -2995,9 +2999,9 @@ TEST_F(LocalReadFlightTest, AllCancelledStillDrainTheIndependentProducer) {
 
 TEST_F(LocalReadFlightTest, SharedPhysicalBytesDoNotShareLogicalValidation) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto valid = ReadSharedTask(false);
+  auto valid = ReadTask(false);
   Start(valid);
-  auto wrong_key = ReadSharedTask(false, "other-key");
+  auto wrong_key = ReadTask(false, "other-key");
   Start(wrong_key);
   EXPECT_EQ(Flights().stats().leaders, 1);
   EXPECT_EQ(Flights().stats().joins, 1);
@@ -3013,9 +3017,9 @@ TEST_F(LocalReadFlightTest, SharedPhysicalBytesDoNotShareLogicalValidation) {
 
 TEST_F(LocalReadFlightTest, ConstructedFollowerCanFinishBeforeBeingAwaited) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto leader = ReadSharedTask(false);
+  auto leader = ReadTask(false);
   Start(leader);
-  auto follower = ReadShared();
+  auto follower = ReadPhysical();
   EXPECT_FALSE(follower.await_ready());
   ASSERT_NO_FATAL_FAILURE(Drain(leader));
   EXPECT_TRUE(follower.await_ready());
@@ -3029,7 +3033,7 @@ TEST_F(LocalReadFlightTest, ConstructedFollowerCanFinishBeforeBeingAwaited) {
 TEST_F(LocalReadFlightTest, SubmissionFailureDoesNotLeavePublishedFlight) {
   // No file was registered; both synchronous rejection and an error CQE must
   // roll back the independent producer and return all DMA capacity.
-  auto task = ReadSharedTask();
+  auto task = ReadTask();
   Start(task);
   ASSERT_NO_FATAL_FAILURE(Drain(task));
   EXPECT_FALSE(std::move(task).TakeResult().ok());
@@ -3039,9 +3043,9 @@ TEST_F(LocalReadFlightTest, SubmissionFailureDoesNotLeavePublishedFlight) {
 
 TEST_F(LocalReadFlightTest, EveryWaiterFencesItsPopulationAfterCompletion) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto leader = ReadSharedTask();
+  auto leader = ReadTask();
   Start(leader);
-  auto follower = ReadSharedTask();
+  auto follower = ReadTask();
   Start(follower);
   ChangePopulation();
   ASSERT_NO_FATAL_FAILURE(Drain(leader));
@@ -3054,9 +3058,9 @@ TEST_F(LocalReadFlightTest, EveryWaiterFencesItsPopulationAfterCompletion) {
 TEST_F(LocalReadFlightTest,
        CorruptSharedReadFailsEachConsumerAndReleasesArena) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord(true));
-  auto first = ReadSharedTask();
+  auto first = ReadTask();
   Start(first);
-  auto second = ReadSharedTask();
+  auto second = ReadTask();
   Start(second);
   ASSERT_NO_FATAL_FAILURE(Drain(first));
   ASSERT_NO_FATAL_FAILURE(Drain(second));
@@ -3068,9 +3072,9 @@ TEST_F(LocalReadFlightTest,
 
 TEST_F(LocalReadFlightTest, ShortReadFailsEachConsumerWithoutDecodingPayload) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord(false, kDirectIoAlignment));
-  auto first = ReadSharedTask();
+  auto first = ReadTask();
   Start(first);
-  auto second = ReadSharedTask();
+  auto second = ReadTask();
   Start(second);
   ASSERT_NO_FATAL_FAILURE(Drain(first));
   ASSERT_NO_FATAL_FAILURE(Drain(second));
@@ -3080,33 +3084,57 @@ TEST_F(LocalReadFlightTest, ShortReadFailsEachConsumerWithoutDecodingPayload) {
   ExpectNoPageLeases();
 }
 
-TEST_F(LocalReadFlightTest, StagingAndExclusiveConsumersBypassSharing) {
+TEST_F(LocalReadFlightTest, StagingBypassesFlights) {
   Stage();
-  auto staged = ReadSharedTask();
+  auto staged = ReadTask();
   Start(staged);
   ASSERT_TRUE(staged.done());
   auto value = std::move(staged).TakeResult();
   ExpectValue(value);
   EXPECT_FALSE(HasFlights());
-  value->lease_.Reset();
-  block_.in_memory_ = false;
+}
+
+TEST_F(LocalReadFlightTest, DefaultReadsShareAndWriteSourcesDetach) {
   ASSERT_NO_FATAL_FAILURE(InstallRecord());
-  auto exclusive = Read();
-  auto exclusive_task = AwaitExisting(exclusive);
-  Start(exclusive_task);
-  auto eligible = ReadSharedTask();
-  Start(eligible);
-  EXPECT_EQ(block_.pin_count(), 2);
+  // Ordinary callers need no sharing policy, including a caller that will
+  // prepare a mutation after reading this same immutable physical version.
+  auto read = Read();
+  auto writer = AwaitExisting(read);
+  Start(writer);
+  auto local = ReadLocal();
+  auto reader = AwaitExisting(local);
+  Start(reader);
+  EXPECT_EQ(block_.pin_count(), 1);
   EXPECT_EQ(Flights().stats().leaders, 1);
-  EXPECT_EQ(Flights().stats().joins, 0);
-  ASSERT_NO_FATAL_FAILURE(Drain(exclusive_task));
-  ASSERT_NO_FATAL_FAILURE(Drain(eligible));
-  auto first = std::move(exclusive_task).TakeResult();
-  auto second = std::move(eligible).TakeResult();
+  EXPECT_EQ(Flights().stats().joins, 1);
+  ASSERT_NO_FATAL_FAILURE(Drain(writer));
+  ASSERT_NO_FATAL_FAILURE(Drain(reader));
+  auto first = std::move(writer).TakeResult();
+  auto second = std::move(reader).TakeResult();
+  ASSERT_TRUE(first.ok()) << first.status();
+  ASSERT_TRUE(second.ok()) << second.status();
   ExpectValue(first);
   ExpectValue(second);
+  ASSERT_TRUE(first->lease_.shared());
+  ASSERT_TRUE(second->lease_.shared());
+  EXPECT_EQ(first->value().data(), second->value().data());
+  EXPECT_EQ(Flights().size(), 0);
+  const auto txid = first->txid_;
+  ASSERT_TRUE(first->MakeOwned(Pool()).ok());
+  EXPECT_EQ(first->txid_, txid);
   EXPECT_FALSE(first->lease_.shared());
-  EXPECT_FALSE(second->lease_.shared());
+  EXPECT_FALSE(first->lease_.retains_read_arena());
+  EXPECT_NE(first->value().data(), second->value().data());
+  auto writable = first->lease_.exclusive_bytes();
+  ASSERT_GT(writable.size(), first->value_offset_);
+  writable[first->value_offset_] ^= std::byte{1};
+  EXPECT_NE(first->value().front(), second->value().front());
+  ExpectValue(second);
+  // Detaching one consumer cannot recycle the other consumer's DMA buffer.
+  EXPECT_LT(Pool().available_read_bytes(), Pool().read_capacity_bytes());
+  second->lease_.Reset();
+  EXPECT_EQ(Pool().available_read_bytes(), Pool().read_capacity_bytes());
+  EXPECT_EQ(block_.pin_count(), 0);
 }
 
 }  // namespace lavik::storage
