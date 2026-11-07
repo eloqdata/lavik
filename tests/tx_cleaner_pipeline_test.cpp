@@ -742,8 +742,10 @@ TEST_F(TxCleanerPipelineTestPeer, DiagnosticsCountBatchFencesBeforeFailure) {
   EXPECT_EQ(snapshot.durability_.tx_commits_pending_, 0);
   EXPECT_TRUE(snapshot.durability_.failed_);
   // No pending work must not certify a failed transaction's population.
-  auto durable = storage_.MakeDurable(
-      DurabilityFrontier{.history_context_ = "test", .flow_cursors_ = {1}}, {});
+  // The lazy task borrows this frontier until it finishes.
+  const DurabilityFrontier frontier{.history_context_ = "test",
+                                    .flow_cursors_ = {1}};
+  auto durable = storage_.MakeDurable(frontier, {});
   StartTask(durable, 0);
   ASSERT_TRUE(PumpUntil([&] { return durable.done(); }));
   EXPECT_FALSE(std::move(durable).TakeResult().ok());
@@ -764,8 +766,10 @@ TEST_F(TxCleanerPipelineTestPeer, ShutdownFailureCannotCertifyZeroPending) {
   EXPECT_FALSE(snapshot.durability_.pending());
   EXPECT_TRUE(snapshot.durability_.failed_);
   EXPECT_FALSE(storage_.RuntimeFailureLatched());
-  auto durable = storage_.MakeDurable(
-      DurabilityFrontier{.history_context_ = "test", .flow_cursors_ = {1}}, {});
+  // The lazy task borrows this frontier until it finishes.
+  const DurabilityFrontier frontier{.history_context_ = "test",
+                                    .flow_cursors_ = {1}};
+  auto durable = storage_.MakeDurable(frontier, {});
   StartTask(durable, 0);
   ASSERT_TRUE(PumpUntil([&] { return durable.done(); }));
   EXPECT_FALSE(std::move(durable).TakeResult().ok());
